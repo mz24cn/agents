@@ -223,6 +223,8 @@ python -m runtime.server
 
 ### Web UI
 
+![Web UI Screenshot](resources/screenshot_tools.jpg)
+
 The management console is a Svelte 5 SPA located in `web/`. Build and serve it:
 
 ```bash
@@ -490,6 +492,8 @@ python -c "import runtime; runtime.server.RuntimeHTTPServer().start()"
 ```
 
 ### Web UI 管理控制台
+
+![Web UI 截图](resources/screenshot_chat.jpg)
 
 管理控制台是一个 Svelte 5 SPA，位于 `web/` 目录。构建方式：
 
