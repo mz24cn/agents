@@ -314,8 +314,8 @@ const translations = {
     applyToSystem: 'Apply to system',
 
     // ThinkingBlock
-    collapseThinking: 'Collapse',
-    expandThinking: 'Expand',
+    collapseThinking: 'Collapse ',
+    expandThinking: 'Expand ',
     thinkingProcess: 'thinking',
 
     // ToolCallCard

@@ -199,6 +199,7 @@ python -m runtime.server
 | POST | `/v1/tools` | Register a tool |
 | PUT | `/v1/tools/{tool_id}` | Update a tool |
 | DELETE | `/v1/tools/{tool_id}` | Delete a tool |
+| POST | `/v1/tools/call` | Directly call a tool (bypass LLM) |
 | POST | `/v1/tools/mcp` | Register MCP servers |
 | POST | `/v1/tools/skill` | Register a skill |
 | GET | `/v1/prompt-templates` | List prompt templates |
@@ -244,6 +245,17 @@ Features:
 - Multimodal: image upload and microphone recording
 - Dark/light theme, responsive layout
 
+### Examples
+
+| File | Description |
+|------|-------------|
+| `examples/example_function_register.py` | Register a SearXNG search as a Function Tool; the LLM automatically calls it to answer queries |
+| `examples/example_mcp_ollama.py` | Connect Ollama (qwen3:14b) with MCP `time` and `fetch` servers; supports `--stream` flag |
+| `examples/example_mcp_openai.py` | Same as above but using the OpenAI-compatible protocol; easily switch to OpenAI, vLLM, LiteLLM, etc. |
+| `examples/example_skill.py` | Load a Skill from a directory and run streaming inference with progressive SKILL.md disclosure |
+| `examples/example_vlm_tool_call.py` | VLM reads an image, understands the instruction in it, and calls built-in `bash`/`fetch` tools to execute |
+| `examples/example_browser_use.py` | Client/server split: server registers chrome-devtools MCP; client calls `/v1/tools/call` to open a page directly, then `/v1/infer/stream` to let the LLM inspect and interact with the browser |
+
 ### Data Persistence
 
 All configuration is persisted to `~/.agents_runtime/`:
@@ -253,7 +265,17 @@ All configuration is persisted to `~/.agents_runtime/`:
 ├── models.json
 ├── tools.json
 ├── mcp_servers.json
-└── prompt_templates.json
+├── prompt_templates.json
+└── env.json
+```
+
+`env.json` is a flat key-value map of environment variables loaded at server startup, useful for injecting API keys and other secrets without modifying the system environment:
+
+```json
+{
+  "OPENAI_API_KEY": "sk-...",
+  "SOME_SERVICE_TOKEN": "abc123"
+}
 ```
 
 ### Requirements
@@ -269,6 +291,7 @@ This project was born out of frustrations encountered while using [Qwen-Agent](h
 - MCP tools are registered per-agent, so different agents each spin up their own local MCP process instances — unnecessary overhead since most MCP servers can be shared as stateless services.
 - The combinatorial explosion of models × tools makes static pre-definitions impractical.
 - Function tools cannot be dynamically defined and loaded at runtime.
+- MCP/function tools cannot be called directly — every invocation must go through the LLM, making deterministic automation unreliable.
 - No support for Skills.
 - Hard-coded OpenAI protocol causes abnormal inference behavior when connecting to local Ollama models for VLM tasks.
 - The Web UI and a clean HTTP server API cannot run in the same process simultaneously.
@@ -469,6 +492,7 @@ python -c "import runtime; runtime.server.RuntimeHTTPServer().start()"
 | POST | `/v1/tools` | 注册工具 |
 | PUT | `/v1/tools/{tool_id}` | 更新工具 |
 | DELETE | `/v1/tools/{tool_id}` | 删除工具 |
+| POST | `/v1/tools/call` | 直接调用工具（绕过大模型） |
 | POST | `/v1/tools/mcp` | 注册 MCP 服务器 |
 | POST | `/v1/tools/skill` | 注册 Skill |
 | GET | `/v1/prompt-templates` | 获取提示词模板列表 |
@@ -514,6 +538,17 @@ npm run build
 - 多模态：图片上传与麦克风录音
 - 深色/浅色主题，响应式布局
 
+### 功能示例
+
+| 文件 | 说明 |
+|------|------|
+| `examples/example_function_register.py` | 将 SearXNG 搜索封装为 Function Tool，大模型自动调用搜索工具回答问题 |
+| `examples/example_mcp_ollama.py` | Ollama（qwen3:14b）+ MCP `time`/`fetch` 工具，支持 `--stream` 流式输出 |
+| `examples/example_mcp_openai.py` | 同上，使用 OpenAI 兼容协议，可轻松切换 OpenAI、vLLM、LiteLLM 等服务 |
+| `examples/example_skill.py` | 从目录加载 Skill，流式推理演示 SKILL.md 渐进披露全流程 |
+| `examples/example_vlm_tool_call.py` | VLM 读取图片中的文字指令，自动调用内置 `bash`/`fetch` 工具执行 |
+| `examples/example_browser_use.py` | 客户端/服务端分离：Server 注册 chrome-devtools MCP；Client 通过 `/v1/tools/call` 直接打开页面，再通过 `/v1/infer/stream` 让大模型操控浏览器 |
+
 ### 数据持久化
 
 所有配置持久化到 `~/.agents_runtime/`：
@@ -523,7 +558,17 @@ npm run build
 ├── models.json
 ├── tools.json
 ├── mcp_servers.json
-└── prompt_templates.json
+├── prompt_templates.json
+└── env.json
+```
+
+`env.json` 是一个扁平的键值映射，服务启动时自动加载为环境变量，适合注入 API Key 等敏感配置，无需修改系统环境：
+
+```json
+{
+  "OPENAI_API_KEY": "sk-...",
+  "SOME_SERVICE_TOKEN": "abc123"
+}
 ```
 
 ### 环境要求
@@ -539,6 +584,7 @@ npm run build
 - MCP 工具注册在 Agent 内部，不同 Agent 会重复启动各自的 MCP 本地进程实例，而大多数 MCP 服务完全可以作为无状态服务共享使用，这种重复启动是不必要的开销。
 - 模型与工具的组合数量庞大，预先静态定义远远不够用。
 - Function 工具无法在运行期动态定义和加载。
+- MCP/function 工具不能绕过大模型直接调用，所有调用都必须经过大模型，确定性自动化场景下可靠性差。
 - 不支持 Skill 技能。
 - 固定使用 OpenAI 协议，对接本地 Ollama 模型时 VLM 推理效果异常。
 - Web GUI 与简洁的 HTTP Server 接口无法在同一进程中同时提供服务。
