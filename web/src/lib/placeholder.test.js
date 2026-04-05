@@ -3,7 +3,7 @@ import { extractPlaceholders, replacePlaceholders } from './placeholder.js'
 
 describe('extractPlaceholders', () => {
   it('extracts variable names from template content', () => {
-    expect(extractPlaceholders('Hello {name}, welcome to {city}'))
+    expect(extractPlaceholders('Hello {{name}}, welcome to {{city}}'))
       .toEqual(['name', 'city'])
   })
 
@@ -12,7 +12,7 @@ describe('extractPlaceholders', () => {
   })
 
   it('deduplicates repeated placeholders', () => {
-    expect(extractPlaceholders('{x} and {x} and {y}'))
+    expect(extractPlaceholders('{{x}} and {{x}} and {{y}}'))
       .toEqual(['x', 'y'])
   })
 
@@ -23,12 +23,12 @@ describe('extractPlaceholders', () => {
 
 describe('replacePlaceholders', () => {
   it('replaces placeholders with provided values', () => {
-    expect(replacePlaceholders('Hello {name}!', { name: 'Alice' }))
+    expect(replacePlaceholders('Hello {{name}}!', { name: 'Alice' }))
       .toBe('Hello Alice!')
   })
 
   it('replaces missing values with empty string', () => {
-    expect(replacePlaceholders('{a} and {b}', { a: 'yes' }))
+    expect(replacePlaceholders('{{a}} and {{b}}', { a: 'yes' }))
       .toBe('yes and ')
   })
 
@@ -37,6 +37,6 @@ describe('replacePlaceholders', () => {
   })
 
   it('handles multiple occurrences of same placeholder', () => {
-    expect(replacePlaceholders('{x}+{x}', { x: '1' })).toBe('1+1')
+    expect(replacePlaceholders('{{x}}+{{x}}', { x: '1' })).toBe('1+1')
   })
 })

@@ -231,6 +231,7 @@ class MCPClientManager:
         process_env = dict(os.environ)
         if env:
             process_env.update(env)
+
         process = await asyncio.create_subprocess_exec(
             *cmd_args,
             stdin=asyncio.subprocess.PIPE,
@@ -238,6 +239,12 @@ class MCPClientManager:
             stderr=asyncio.subprocess.PIPE,
             env=process_env,
         )
+
+        # Raise the StreamReader limit to 100 MB to handle MCP tools that return
+        # large payloads (e.g. browser snapshots). The default asyncio limit is
+        # 64 KB which causes "ValueError: chunk is longer than limit" errors.
+        if process.stdout is not None:
+            process.stdout._limit = 100 * 1024 * 1024  # type: ignore[attr-defined]
         conn: dict = {
             "type": "stdio",
             "server_name": server_name,

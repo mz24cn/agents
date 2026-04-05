@@ -8,7 +8,6 @@ Zero third-party dependencies — only Python standard library.
 
 import json
 import os
-import uuid
 from dataclasses import dataclass
 from typing import Optional
 
@@ -73,18 +72,17 @@ class PromptTemplateManager:
         return self._templates.get(template_id)
 
     def create(self, name: str, content: str) -> PromptTemplate:
-        """Create a new prompt template with an auto-generated ID.
+        """Create a new prompt template keyed by name.
 
         Args:
-            name: The template name.
+            name: The template name (used as the unique ID).
             content: The template content (may contain {placeholder} variables).
 
         Returns:
             The newly created PromptTemplate.
         """
-        template_id = str(uuid.uuid4())
-        template = PromptTemplate(template_id=template_id, name=name, content=content)
-        self._templates[template_id] = template
+        template = PromptTemplate(template_id=name, name=name, content=content)
+        self._templates[name] = template
         return template
 
     def update(self, template_id: str, name: str, content: str) -> Optional[PromptTemplate]:
@@ -150,4 +148,4 @@ class PromptTemplateManager:
         self._templates.clear()
         for item in data:
             template = PromptTemplate.from_dict(item)
-            self._templates[template.template_id] = template
+            self._templates[template.name] = template

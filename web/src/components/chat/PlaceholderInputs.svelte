@@ -10,8 +10,8 @@
   let previewHtml = $derived(() => {
     if (!template?.content) return ''
     return template.content.replace(
-      /\{(\w+)\}/g,
-      (match, name) => `<mark class="ph">${match}</mark>`
+      /\{\{(\w+)\}\}/g,
+      (_, name) => `<mark class="ph">${name}</mark>`
     )
   })
 

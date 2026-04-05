@@ -36,6 +36,7 @@ class Runtime:
         tool_registry: ToolRegistry,
         mcp_manager: Optional[object] = None,
         skill_manager: Optional[object] = None,
+        prompt_template_manager: Optional[object] = None,
     ) -> None:
         """Initialize the Runtime.
 
@@ -44,23 +45,30 @@ class Runtime:
             tool_registry: Registry containing tool configurations and callables.
             mcp_manager: Optional MCPClientManager for MCP tool execution.
             skill_manager: Optional SkillManager for Skill progressive disclosure.
+            prompt_template_manager: Optional PromptTemplateManager for resolving
+                prompt_template references in user messages.
         """
         self._model_registry = model_registry
         self._tool_registry = tool_registry
         self._mcp_manager = mcp_manager
         self._skill_manager = skill_manager
+        self._prompt_template_manager = prompt_template_manager
 
     # ------------------------------------------------------------------
     # Input normalization
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _normalize_messages(request: InferenceRequest) -> list:
+    def _normalize_messages(self, request: InferenceRequest) -> list:
         """Normalize request input into a list of Message objects.
 
         If request.text is set, wraps it as a single user message.
         If request.messages is set, uses them directly.
         If both are set, messages takes precedence.
+
+        For user-role messages without content but with a prompt_template key,
+        the template body is fetched from PromptTemplateManager and any
+        {placeholder} variables are replaced using the message's arguments dict.
+        The resolved text is written into the message's content field.
 
         Args:
             request: The inference request to normalize.
@@ -69,7 +77,22 @@ class Runtime:
             A list of Message objects ready for the protocol adapter.
         """
         if request.messages is not None and len(request.messages) > 0:
-            return list(request.messages)
+            messages = list(request.messages)
+            for msg in messages:
+                if (
+                    msg.role == "user"
+                    and not msg.content
+                    and msg.prompt_template is not None
+                    and self._prompt_template_manager is not None
+                ):
+                    template = self._prompt_template_manager.get(msg.prompt_template)
+                    if template is not None:
+                        content = template.content
+                        if msg.arguments:
+                            for key, value in msg.arguments.items():
+                                content = content.replace(f"{{{{{key}}}}}", str(value))
+                        msg.content = content
+            return messages
         if request.text is not None:
             return [Message(role="user", content=request.text)]
         return []

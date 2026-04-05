@@ -158,7 +158,7 @@ const translations = {
     templateNameRequired: '模板名称不能为空',
     templateContentRequired: '模板内容不能为空',
     templateNamePlaceholder: '例如: 代码审查助手',
-    templateContentPlaceholder: '输入提示词内容，可使用 {variable_name} 作为占位符',
+    templateContentPlaceholder: '输入提示词内容，可使用 {{variable_name}} 作为占位符',
 
     // PromptsPage
     promptsPageTitle: '提示词管理',
@@ -371,7 +371,7 @@ const translations = {
     templateNameRequired: 'Template name is required',
     templateContentRequired: 'Template content is required',
     templateNamePlaceholder: 'e.g. Code Review Assistant',
-    templateContentPlaceholder: 'Enter prompt content. Use {variable_name} as placeholders.',
+    templateContentPlaceholder: 'Enter prompt content. Use {{variable_name}} as placeholders.',
 
     // PromptsPage
     promptsPageTitle: 'Prompts',

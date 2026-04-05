@@ -18,6 +18,7 @@ A minimal, zero-dependency composable agent runtime engine built with pure Pytho
 - **Direct MCP/function tool invocation** — bypass the LLM and call MCP/function tools directly, 100% reliability
 - **Skill progressive disclosure** — first round exposes only skill summary; full `SKILL.md` is injected only when the model selects the skill
 - **Streaming inference** — real-time token streaming with thinking/reasoning content support
+- **Prompt template inference** — user messages can reference a named template by ID; `{placeholder}` variables are resolved at runtime from the request's `arguments` dict, enabling dynamic prompt adjustment and model/tool-agnostic parameterization without redeploying
 - **Web UI management console** — Svelte 5 SPA for managing models, tools, prompt templates, and chat
 - **HTTP API server** — lightweight REST API built on `http.server`, no FastAPI/uvicorn needed
 - **Multimodal** — supports image (base64) and audio inputs for VLM models
@@ -33,7 +34,7 @@ runtime/
 ├── runtime.py               # Runtime engine: inference + tool call loop + Skill disclosure
 ├── tools.py                 # Function tool decorator
 ├── skill_manager.py         # SkillManager: SKILL.md parsing and progressive disclosure
-├── mcp_client.py            # MCP Client: pure stdlib stdio/SSE implementation
+├── mcp_client.py            # MCP Client: pure stdlib stdio/SSE implementation (StreamReader limit raised to 100 MB for large payloads)
 ├── builtin_tools.py         # Built-in tools: bash, fetch
 ├── prompt_template_manager.py  # Prompt template CRUD
 └── server.py                # HTTP API server
@@ -149,7 +150,42 @@ for msg in runtime.infer_stream(InferenceRequest(
         print(f"[thinking] {msg.thinking}", end="", flush=True)
 ```
 
-**4. Start the HTTP Server**
+**4. Prompt Template Inference**
+
+Prompt templates let you define reusable, parameterized prompts that are resolved at runtime — no redeployment needed when you want to tweak wording or adapt to a different model.
+
+```python
+from runtime import Runtime, InferenceRequest, Message
+from runtime.prompt_template_manager import PromptTemplateManager
+
+# Create a template with {placeholder} variables
+pt_manager = PromptTemplateManager()
+pt_manager.create(
+    name="summarize",
+    content="Please summarize the following text in {{language}}:\n\n{{text}}",
+)
+
+runtime = Runtime(
+    model_registry=...,
+    tool_registry=...,
+    prompt_template_manager=pt_manager,
+)
+
+# Reference the template by name; supply variables via arguments
+result = runtime.infer(InferenceRequest(
+    model_id="qwen3-14b",
+    messages=[Message(
+        role="user",
+        prompt_template="summarize",
+        arguments={"language": "English", "text": "...long article..."},
+    )],
+))
+print(result.messages[-1].content)
+```
+
+The template content is fetched and all `{variable}` placeholders are substituted before the message is sent to the model. Templates can be created, updated, and deleted at runtime via the HTTP API or Web UI — making prompt iteration fast without touching code.
+
+**5. Start the HTTP Server**
 
 ```python
 python -c "import runtime; runtime.server.RuntimeHTTPServer().start()"
@@ -225,6 +261,7 @@ Features:
 | `examples/example_skill.py` | Load a Skill from a directory and run streaming inference with progressive SKILL.md disclosure |
 | `examples/example_vlm_tool_call.py` | VLM reads an image, understands the instruction in it, and calls built-in `bash`/`fetch` tools to execute |
 | `examples/example_browser_use.py` | Client/server split: server registers chrome-devtools MCP; client calls `/v1/tools/call` to open a page directly, then `/v1/infer/stream` to let the LLM inspect and interact with the browser |
+| `examples/example_stream_as_infer.py` | Use `/v1/infer/stream` (SSE) to receive streaming tokens and reassemble them into the same JSON structure as `/v1/infer` — avoids idle-timeout disconnections on long-running inference |
 
 ### Data Persistence
 
@@ -291,6 +328,7 @@ MIT License — see [LICENSE](LICENSE)
 - **MCP/function工具直接调用** — 可绕过大模型直接调用MCP/function工具，可靠性100%
 - **Skill 渐进披露** — 第一轮推理仅暴露技能摘要，大模型选择后才注入完整 `SKILL.md`
 - **流式推理** — 实时 token 流式输出，支持 thinking/reasoning 内容
+- **提示词模板推理** — 用户消息可通过模板 ID 引用命名模板，`{占位符}` 变量在推理时从请求的 `arguments` 字典动态替换，无需重新部署即可调整提示词，并支持参数化以适应不同模型和工具
 - **Web UI 管理控制台** — Svelte 5 SPA，支持模型、工具、提示词模板管理和对话
 - **HTTP API 服务** — 基于 `http.server` 的轻量 REST API，无需 FastAPI/uvicorn
 - **多模态** — 支持图片（base64）和音频输入，适配 VLM 模型
@@ -306,7 +344,7 @@ runtime/
 ├── runtime.py               # 运行时引擎：推理 + 工具调用循环 + Skill 渐进披露
 ├── tools.py                 # Function 工具装饰器
 ├── skill_manager.py         # SkillManager：SKILL.md 解析与渐进披露管理
-├── mcp_client.py            # MCP Client：纯标准库 stdio/SSE 实现
+├── mcp_client.py            # MCP Client：纯标准库 stdio/SSE 实现（StreamReader 上限扩展至 100 MB，支持大数据量返回）
 ├── builtin_tools.py         # 内置工具：bash、fetch
 ├── prompt_template_manager.py  # 提示词模板 CRUD
 └── server.py                # HTTP API 服务器
@@ -422,7 +460,40 @@ for msg in runtime.infer_stream(InferenceRequest(
         print(f"[思考] {msg.thinking}", end="", flush=True)
 ```
 
-**4. 启动 HTTP 服务**
+**4. 提示词模板推理**
+
+提示词模板支持运行时动态调整提示词，无需重新部署代码。模板内容可通过 Web UI 或 HTTP API 随时增删改，`{占位符}` 变量在推理时从请求参数中替换，使同一套推理逻辑能适配不同模型、工具和业务场景。
+
+```python
+from runtime import Runtime, InferenceRequest, Message
+from runtime.prompt_template_manager import PromptTemplateManager
+
+# 创建带占位符的模板
+pt_manager = PromptTemplateManager()
+pt_manager.create(
+    name="summarize",
+    content="请用{{language}}对以下内容进行摘要：\n\n{{text}}",
+)
+
+runtime = Runtime(
+    model_registry=...,
+    tool_registry=...,
+    prompt_template_manager=pt_manager,
+)
+
+# 通过模板名引用，arguments 提供占位符的值
+result = runtime.infer(InferenceRequest(
+    model_id="qwen3-14b",
+    messages=[Message(
+        role="user",
+        prompt_template="summarize",
+        arguments={"language": "中文", "text": "...长文内容..."},
+    )],
+))
+print(result.messages[-1].content)
+```
+
+**5. 启动 HTTP 服务**
 
 ```python
 python -c "import runtime; runtime.server.RuntimeHTTPServer(port=8080).start()"
@@ -498,6 +569,7 @@ npm run build
 | `examples/example_skill.py` | 从目录加载 Skill，流式推理演示 SKILL.md 渐进披露全流程 |
 | `examples/example_vlm_tool_call.py` | VLM 读取图片中的文字指令，自动调用内置 `bash`/`fetch` 工具执行 |
 | `examples/example_browser_use.py` | 客户端/服务端分离：Server 注册 chrome-devtools MCP；Client 通过 `/v1/tools/call` 直接打开页面，再通过 `/v1/infer/stream` 让大模型操控浏览器 |
+| `examples/example_stream_as_infer.py` | 通过 `/v1/infer/stream`（SSE）接收流式 token，在本地拼装成与 `/v1/infer` 完全一致的 JSON 结果，彻底规避长时推理的网关/代理 idle timeout 断连问题；支持 `--compare` 参数同时调用两个接口对比结果 |
 
 ### 数据持久化
 

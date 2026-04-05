@@ -23,12 +23,14 @@ class Message:
     """
 
     role: str
-    content: str
+    content: str = ""
     name: Optional[str] = None
     tool_calls: Optional[list[dict]] = None
     images: Optional[list] = None
     audio: Optional[str] = None
     thinking: Optional[str] = None
+    prompt_template: Optional[str] = None
+    arguments: Optional[dict] = None
 
     def to_dict(self) -> dict:
         """Serialize to a dictionary, omitting None fields."""
@@ -50,12 +52,14 @@ class Message:
         """Deserialize from a dictionary."""
         return cls(
             role=data["role"],
-            content=data["content"],
+            content=data.get("content", ""),
             name=data.get("name"),
             tool_calls=data.get("tool_calls"),
             images=data.get("images"),
             audio=data.get("audio"),
             thinking=data.get("thinking"),
+            prompt_template=data.get("prompt_template"),
+            arguments=data.get("arguments"),
         )
 
 

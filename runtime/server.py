@@ -956,6 +956,7 @@ class RuntimeHTTPServer:
                 tool_registry=tool_registry,
                 mcp_manager=mcp_manager,
                 skill_manager=skill_manager,
+                prompt_template_manager=self._prompt_template_manager,
             )
 
     def start(self) -> None:
