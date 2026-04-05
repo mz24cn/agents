@@ -149,40 +149,10 @@ for msg in runtime.infer_stream(InferenceRequest(
         print(f"[thinking] {msg.thinking}", end="", flush=True)
 ```
 
-**4. SKILL.md Format**
-
-```markdown
----
-name: my_skill
-description: A skill for querying and managing data via the platform API.
----
-
-# My Skill
-
-## API Reference
-
-### Query Data
-```bash
-curl -X POST http://api.example.com/data/query \
-  -H "Content-Type: application/json" \
-  -d '{"page": 1, "size": 10}'
-```
-```
-
-**5. Start the HTTP Server**
+**4. Start the HTTP Server**
 
 ```python
-from runtime import RuntimeHTTPServer, Runtime, ModelRegistry, ToolRegistry
-
-runtime = Runtime(model_registry=ModelRegistry(), tool_registry=ToolRegistry())
-server = RuntimeHTTPServer(runtime, host="0.0.0.0", port=8080)
-server.start()
-```
-
-Or from the command line:
-
-```bash
-python -m runtime.server
+python -c "import runtime; runtime.server.RuntimeHTTPServer().start()"
 ```
 
 ### HTTP API Reference
@@ -452,30 +422,10 @@ for msg in runtime.infer_stream(InferenceRequest(
         print(f"[思考] {msg.thinking}", end="", flush=True)
 ```
 
-**4. SKILL.md 格式**
-
-```markdown
----
-name: my_skill
-description: 通过平台 API 查询和管理数据的技能。
----
-
-# My Skill
-
-## 接口说明
-
-### 查询数据
-```bash
-curl -X POST http://api.example.com/data/query \
-  -H "Content-Type: application/json" \
-  -d '{"page": 1, "size": 10}'
-```
-```
-
-**5. 启动 HTTP 服务**
+**4. 启动 HTTP 服务**
 
 ```python
-python -c "import runtime; runtime.server.RuntimeHTTPServer().start()"
+python -c "import runtime; runtime.server.RuntimeHTTPServer(port=8080).start()"
 ```
 
 ### HTTP API 接口

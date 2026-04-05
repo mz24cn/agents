@@ -3,7 +3,22 @@
   let { getText } = $props()
 
   function handleCopy() {
-    navigator.clipboard.writeText(getText()).catch(() => {})
+    const text = getText()
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).catch(() => fallbackCopy(text))
+    } else {
+      fallbackCopy(text)
+    }
+  }
+
+  function fallbackCopy(text) {
+    const el = document.createElement('textarea')
+    el.value = text
+    el.style.cssText = 'position:fixed;top:-9999px;left:-9999px'
+    document.body.appendChild(el)
+    el.select()
+    document.execCommand('copy')
+    document.body.removeChild(el)
   }
 </script>
 
