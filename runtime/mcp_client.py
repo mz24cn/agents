@@ -15,6 +15,7 @@ Idle process reaping:
 import asyncio
 import json
 import os
+import signal
 import threading
 import time
 import urllib.request
@@ -238,6 +239,7 @@ class MCPClientManager:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=process_env,
+            start_new_session=True,  # new process group so killpg cleans up all descendants
         )
 
         # Raise the StreamReader limit to 100 MB to handle MCP tools that return
@@ -507,13 +509,26 @@ class MCPClientManager:
             return
         if process.returncode is None:
             try:
-                process.terminate()
-                await asyncio.wait_for(process.wait(), timeout=5.0)
-            except (asyncio.TimeoutError, ProcessLookupError):
+                # Kill the entire process group so child processes spawned by
+                # the MCP server (e.g. chrome-devtools-mcp forked by npm exec)
+                # are also terminated and don't become orphans.
+                pid = process.pid
                 try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
+                    os.killpg(os.getpgid(pid), signal.SIGTERM)
+                except (ProcessLookupError, OSError):
+                    process.terminate()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    try:
+                        os.killpg(os.getpgid(pid), signal.SIGKILL)
+                    except (ProcessLookupError, OSError):
+                        try:
+                            process.kill()
+                        except ProcessLookupError:
+                            pass
+            except (ProcessLookupError, OSError):
+                pass
 
     def _run_async(self, coro) -> object:
         """Submit a coroutine to the dedicated event loop and block until done.

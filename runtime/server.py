@@ -825,7 +825,12 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         if tool_ids_to_remove:
             runtime._tool_registry.save(_TOOLS_PATH)
 
-        # 2. Remove the server entry from mcp_servers.json
+        # 2. Disconnect the live MCP process (if any)
+        mcp_manager = runtime._mcp_manager
+        if mcp_manager is not None:
+            mcp_manager.disconnect(server_name)
+
+        # 3. Remove the server entry from mcp_servers.json
         removed_from_config = False
         if os.path.isfile(_MCP_SERVERS_PATH):
             with open(_MCP_SERVERS_PATH, "r", encoding="utf-8") as f:

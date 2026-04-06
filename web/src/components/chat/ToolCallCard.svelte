@@ -1,13 +1,25 @@
 <script>
   import { t } from '../../lib/i18n.svelte.js'
+  import { highlight } from '../../lib/highlight.js'
+
   let { toolCalls = null } = $props()
+
+  function highlightArgs(args) {
+    if (!args) return ''
+    try {
+      const pretty = JSON.stringify(typeof args === 'string' ? JSON.parse(args) : args, null, 2)
+      return highlight(pretty, 'json')
+    } catch {
+      return highlight(String(args), 'json')
+    }
+  }
 </script>
 
 {#if toolCalls && toolCalls.length > 0}
   {#each toolCalls as tc}
     <div class="tool-call">
       {t('callingTool', { name: tc.name ?? t('unknownTool') })}
-      <pre>{tc.arguments ?? JSON.stringify(tc, null, 2)}</pre>
+      <pre><code>{@html highlightArgs(tc.arguments ?? tc)}</code></pre>
     </div>
   {/each}
 {/if}
@@ -26,4 +38,9 @@
     white-space: pre-wrap;
     word-break: break-all;
   }
+  .tool-call :global(.hl-key)     { color: #82aaff; }
+  .tool-call :global(.hl-string)  { color: #c3e88d; }
+  .tool-call :global(.hl-number)  { color: #f78c6c; }
+  .tool-call :global(.hl-boolean) { color: #ff5874; }
+  .tool-call :global(.hl-null)    { color: #ff5874; }
 </style>

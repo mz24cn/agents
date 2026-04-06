@@ -101,8 +101,8 @@ const translations = {
     applyToSystem: '应用到系统',
 
     // ThinkingBlock
-    collapseThinking: '收起',
-    expandThinking: '展开',
+    collapseThinking: '收起思考过程',
+    expandThinking: '展开思考过程',
     thinkingProcess: '思考过程',
 
     // ToolCallCard

@@ -8,7 +8,24 @@
   import { t } from '../../lib/i18n.svelte.js'
 
   let { msg } = $props()
-  let toolResultExpanded = $state(false)
+
+  // 工具结果：超过5行默认收缩，否则默认展开
+  const toolResultLines = (msg.content ?? '').split('\n').length
+  const toolResultOverLimit = msg.role === 'function' && toolResultLines > 5
+  let toolResultExpanded = $state(!toolResultOverLimit)
+
+  // 思考过程：有正文或工具调用时自动收起；用户手动操作后不再自动跟随
+  let thinkingUserToggled = $state(false)
+  let thinkingExpanded = $state(true)
+  $effect(() => {
+    if (!thinkingUserToggled) {
+      thinkingExpanded = !(msg.content || msg.tool_calls)
+    }
+  })
+  function toggleThinking() {
+    thinkingUserToggled = true
+    thinkingExpanded = !thinkingExpanded
+  }
 </script>
 
 <div class="message {msg.role}">
@@ -17,18 +34,34 @@
       <span>{t('roleUser')}</span>
       <CopyButton getText={() => msg.content ?? ''} />
     {:else if msg.role === 'assistant'}
-      {t('roleAssistant')}
+      <span>{t('roleAssistant')}</span>
+      <div class="role-actions">
+        {#if msg.thinking}
+          <button class="toggle-btn" onclick={toggleThinking}>
+            {thinkingExpanded ? t('collapseThinking') : t('expandThinking')}
+          </button>
+        {/if}
+        <CopyButton getText={() => msg.content ?? ''} />
+      </div>
     {:else if msg.role === 'system'}
       {t('roleSystem')}
     {:else if msg.role === 'function'}
-      {t('roleFunction')}
+      <span>{t('roleFunction')}</span>
+      <div class="role-actions">
+        {#if toolResultOverLimit}
+          <button class="toggle-btn" onclick={() => toolResultExpanded = !toolResultExpanded}>
+            {toolResultExpanded ? t('collapseResult') : t('expandResult')}
+          </button>
+        {/if}
+        <CopyButton getText={() => msg.content ?? ''} />
+      </div>
     {:else}
       {msg.role}
     {/if}
   </div>
 
   {#if msg.thinking}
-    <ThinkingBlock thinking={msg.thinking} />
+    <ThinkingBlock thinking={msg.thinking} expanded={thinkingExpanded} />
   {/if}
 
   {#if msg.content}
@@ -36,11 +69,10 @@
       <MarkdownRenderer content={msg.content} />
     {:else if msg.role === 'function'}
       <div class="tool-result-block">
-        <button class="toggle" onclick={() => toolResultExpanded = !toolResultExpanded}>
-          {toolResultExpanded ? t('collapseResult') : t('expandResult')}
-        </button>
         {#if toolResultExpanded}
           <pre class="tool-result-content">{msg.content}</pre>
+        {:else}
+          <pre class="tool-result-content preview">{msg.content.split('\n').slice(0, 5).join('\n')}</pre>
         {/if}
       </div>
     {:else}
@@ -93,6 +125,7 @@
     border: 1px solid var(--border);
     color: var(--text);
     font-size: 0.85rem;
+    width: 85%;
   }
   .role-label {
     display: flex;
@@ -102,6 +135,28 @@
     font-weight: 600;
     margin-bottom: 4px;
     opacity: 0.8;
+  }
+  .role-actions {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .toggle-btn {
+    padding: 2px 8px;
+    font-size: 0.7em;
+    color: var(--text-secondary, #888);
+    background: var(--bg-tertiary, rgba(0,0,0,0.15));
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    letter-spacing: 0.05em;
+    line-height: 1.4;
+    white-space: nowrap;
+    transition: background 0.1s;
+  }
+  .toggle-btn:hover {
+    background: var(--bg-secondary, rgba(0,0,0,0.2));
+    color: var(--text, #333);
   }
   .content {
     white-space: pre-wrap;
@@ -121,24 +176,19 @@
     color: #fff;
   }
   .tool-result-block { margin-top: 4px; }
-  .toggle {
-    background: none;
-    border: 1px solid var(--border);
-    color: var(--text-secondary);
-    font-size: 0.8rem;
-    cursor: pointer;
-    padding: 4px 8px;
-    border-radius: 4px;
-  }
-  .toggle:hover { background: var(--bg-secondary); }
   .tool-result-content {
-    margin: 4px 0 0;
+    margin: 0;
     font-size: 0.8rem;
     white-space: pre-wrap;
-    word-break: break-all;
+    word-break: break-word;
+    overflow-wrap: anywhere;
     padding: 6px 8px;
     background: rgba(0,0,0,0.05);
     border-radius: 4px;
     color: var(--text-secondary);
+  }
+  .tool-result-content.preview {
+    -webkit-mask-image: linear-gradient(to bottom, black 60%, transparent 100%);
+    mask-image: linear-gradient(to bottom, black 60%, transparent 100%);
   }
 </style>

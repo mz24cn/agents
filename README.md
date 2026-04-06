@@ -18,7 +18,7 @@ A minimal, zero-dependency composable agent runtime engine built with pure Pytho
 - **Direct MCP/function tool invocation** — bypass the LLM and call MCP/function tools directly, 100% reliability
 - **Skill progressive disclosure** — first round exposes only skill summary; full `SKILL.md` is injected only when the model selects the skill
 - **Streaming inference** — real-time token streaming with thinking/reasoning content support
-- **Prompt template inference** — user messages can reference a named template by ID; `{placeholder}` variables are resolved at runtime from the request's `arguments` dict, enabling dynamic prompt adjustment and model/tool-agnostic parameterization without redeploying
+- **Prompt template inference** — user messages can reference a named template by ID; `{{placeholder}}` variables are resolved at runtime from the request's `arguments` dict, enabling dynamic prompt adjustment and model/tool-agnostic parameterization without redeploying
 - **Web UI management console** — Svelte 5 SPA for managing models, tools, prompt templates, and chat
 - **HTTP API server** — lightweight REST API built on `http.server`, no FastAPI/uvicorn needed
 - **Multimodal** — supports image (base64) and audio inputs for VLM models
@@ -94,6 +94,15 @@ print(result.messages[-1].content)
 
 **2. MCP Tools**
 
+Since `MCPClientManager` is a singleton, any code running in the same process as the server can call a registered MCP tool directly in one line:
+
+```python
+from runtime.mcp_client import MCPClientManager
+result = MCPClientManager().call_tool("chrome-devtools", "new_page", {"url": "https://example.com"})
+```
+
+To use MCP tools with model inference:
+
 ```python
 from runtime import ModelRegistry, ToolRegistry, Runtime, InferenceRequest
 from runtime.mcp_client import MCPClientManager
@@ -158,7 +167,7 @@ Prompt templates let you define reusable, parameterized prompts that are resolve
 from runtime import Runtime, InferenceRequest, Message
 from runtime.prompt_template_manager import PromptTemplateManager
 
-# Create a template with {placeholder} variables
+# Create a template with {{placeholder}} variables
 pt_manager = PromptTemplateManager()
 pt_manager.create(
     name="summarize",
@@ -246,7 +255,7 @@ Features:
 - Chat with model selection, tool selection, and prompt template support
 - Model management (CRUD)
 - Tool management (CRUD)
-- Prompt template management with `{placeholder}` variable support
+- Prompt template management with `{{placeholder}}` variable support
 - Markdown rendering with syntax highlighting
 - Multimodal: image upload and microphone recording
 - Dark/light theme, responsive layout
@@ -328,7 +337,7 @@ MIT License — see [LICENSE](LICENSE)
 - **MCP/function工具直接调用** — 可绕过大模型直接调用MCP/function工具，可靠性100%
 - **Skill 渐进披露** — 第一轮推理仅暴露技能摘要，大模型选择后才注入完整 `SKILL.md`
 - **流式推理** — 实时 token 流式输出，支持 thinking/reasoning 内容
-- **提示词模板推理** — 用户消息可通过模板 ID 引用命名模板，`{占位符}` 变量在推理时从请求的 `arguments` 字典动态替换，无需重新部署即可调整提示词，并支持参数化以适应不同模型和工具
+- **提示词模板推理** — 用户消息可通过模板 ID 引用命名模板，`{{占位符}}` 变量在推理时从请求的 `arguments` 字典动态替换，无需重新部署即可调整提示词，并支持参数化以适应不同模型和工具
 - **Web UI 管理控制台** — Svelte 5 SPA，支持模型、工具、提示词模板管理和对话
 - **HTTP API 服务** — 基于 `http.server` 的轻量 REST API，无需 FastAPI/uvicorn
 - **多模态** — 支持图片（base64）和音频输入，适配 VLM 模型
@@ -404,6 +413,15 @@ print(result.messages[-1].content)
 
 **2. MCP 工具**
 
+`MCPClientManager` 是单例，在注册了 MCP server 的进程内，可以一句话直接调用工具，无需持有 server 或 runtime 的引用：
+
+```python
+from runtime.mcp_client import MCPClientManager
+result = MCPClientManager().call_tool("chrome-devtools", "new_page", {"url": "https://example.com"})
+```
+
+配合模型推理使用：
+
 ```python
 from runtime import ModelRegistry, ToolRegistry, Runtime, InferenceRequest
 from runtime.mcp_client import MCPClientManager
@@ -462,7 +480,7 @@ for msg in runtime.infer_stream(InferenceRequest(
 
 **4. 提示词模板推理**
 
-提示词模板支持运行时动态调整提示词，无需重新部署代码。模板内容可通过 Web UI 或 HTTP API 随时增删改，`{占位符}` 变量在推理时从请求参数中替换，使同一套推理逻辑能适配不同模型、工具和业务场景。
+提示词模板支持运行时动态调整提示词，无需重新部署代码。模板内容可通过 Web UI 或 HTTP API 随时增删改，`{{占位符}}` 变量在推理时从请求参数中替换，使同一套推理逻辑能适配不同模型、工具和业务场景。
 
 ```python
 from runtime import Runtime, InferenceRequest, Message
@@ -551,7 +569,7 @@ npm run build
 构建产物 `web/dist/` 会由 HTTP 服务器自动在根路径提供服务。
 
 功能包括：
-- 对话页面：模型选择、工具选择、提示词模板（支持 `{占位符}` 变量）
+- 对话页面：模型选择、工具选择、提示词模板（支持 `{{占位符}}` 变量）
 - 模型管理（增删改查）
 - 工具管理（增删改查）
 - 提示词模板管理
