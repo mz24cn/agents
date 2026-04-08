@@ -1,6 +1,7 @@
 <script>
   import { models } from '../../lib/api.js'
   import { t } from '../../lib/i18n.svelte.js'
+  import JsonEditor from '../JsonEditor.svelte'
 
   let { model = null, onSuccess, onCancel } = $props()
 
@@ -115,7 +116,7 @@
 
   <div class="form-group">
     <label for="generate_params">{t('generateParams')}</label>
-    <textarea id="generate_params" bind:value={generate_params_text} rows="4" placeholder={t('generateParamsPlaceholder')}></textarea>
+    <JsonEditor id="generate_params" bind:value={generate_params_text} rows={4} placeholder={t('generateParamsPlaceholder')} />
     {#if errors.generate_params}<span class="field-error">{errors.generate_params}</span>{/if}
   </div>
 

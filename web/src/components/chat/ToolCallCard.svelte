@@ -38,9 +38,17 @@
     white-space: pre-wrap;
     word-break: break-all;
   }
+  /* Syntax highlighting - dark theme (default) */
   .tool-call :global(.hl-key)     { color: #82aaff; }
   .tool-call :global(.hl-string)  { color: #c3e88d; }
   .tool-call :global(.hl-number)  { color: #f78c6c; }
   .tool-call :global(.hl-boolean) { color: #ff5874; }
   .tool-call :global(.hl-null)    { color: #ff5874; }
+
+  /* Syntax highlighting - light theme overrides */
+  :root[data-theme="light"] .tool-call :global(.hl-key)     { color: #1d4ed8; }
+  :root[data-theme="light"] .tool-call :global(.hl-string)  { color: #16a34a; }
+  :root[data-theme="light"] .tool-call :global(.hl-number)  { color: #c2410c; }
+  :root[data-theme="light"] .tool-call :global(.hl-boolean) { color: #dc2626; }
+  :root[data-theme="light"] .tool-call :global(.hl-null)    { color: #dc2626; }
 </style>

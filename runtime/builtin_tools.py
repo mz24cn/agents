@@ -7,42 +7,114 @@ execute commands described in SKILL.md.
 These tools use only Python standard library modules.
 """
 
-import os
-import subprocess
-
-
 import json
+import os
+import re
+import subprocess
+import sys
+import time
 import urllib.request
 import urllib.error
 from typing import Optional
+
+if sys.platform != "win32":
+    import fcntl
+    import pty
+    import select
+    import struct
+    import termios
 
 from runtime.models import ToolConfig
 from runtime.registry import ToolRegistry
 
 
 def _bash_execute(command: str, cwd: str = "") -> str:
-    """Execute a shell command via subprocess.
+    """Execute a shell command via a pseudo-TTY so programs behave as if
+    running in an interactive terminal (spinner text, color, login prompts, etc.).
+    On Windows, falls back to subprocess.run (no PTY support yet).
 
     Args:
         command: The shell command to execute.
         cwd: Working directory for the command. Empty string means current dir.
     """
+    timeout = int(os.environ.get("BASH_EXEC_TIMEOUT", 300))
+
+    if sys.platform == "win32":
+        # TODO: add Windows PTY support (e.g. via ConPTY / PowerShell)
+        try:
+            result = subprocess.run(
+                command, shell=True, capture_output=True, text=True,
+                timeout=timeout, cwd=cwd if cwd else None,
+            )
+            output = result.stdout.strip()
+            if result.returncode != 0:
+                err = result.stderr.strip()
+                return f"Exit code {result.returncode}\nstderr: {err}\nstdout: {output}"
+            return output if output else "(empty output)"
+        except subprocess.TimeoutExpired:
+            return f"Error: command timed out after {timeout}s"
+        except Exception as e:
+            return f"Error: {type(e).__name__}: {e}"
+
+    output_chunks = []
+
     try:
-        result = subprocess.run(
+        master_fd, slave_fd = pty.openpty()
+
+        # Set terminal size to 80x24 so apps don't complain
+        winsize = struct.pack("HHHH", 24, 80, 0, 0)
+        fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
+
+        proc = subprocess.Popen(
             command,
             shell=True,
-            capture_output=True,
-            text=True,
-            timeout=int(os.environ.get("BASH_EXEC_TIMEOUT", 300)),
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            close_fds=True,
             cwd=cwd if cwd else None,
         )
-        output = result.stdout.strip()
-        if result.returncode != 0:
-            err = result.stderr.strip()
-            return f"Exit code {result.returncode}\nstderr: {err}\nstdout: {output}"
-        return output if output else "(empty output)"
-    except subprocess.TimeoutExpired:
-        return f"Error: command timed out after {os.environ.get('BASH_EXEC_TIMEOUT', 300)}s"
+        os.close(slave_fd)  # parent doesn't need the slave end
+
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                proc.kill()
+                return f"Error: command timed out after {timeout}s"
+            ready, _, _ = select.select([master_fd], [], [], min(remaining, 0.5))
+            if ready:
+                try:
+                    chunk = os.read(master_fd, 4096)
+                    if chunk:
+                        output_chunks.append(chunk)
+                except OSError:
+                    break  # slave closed (process exited)
+            if proc.poll() is not None:
+                # Drain any remaining output
+                while True:
+                    ready, _, _ = select.select([master_fd], [], [], 0.1)
+                    if not ready:
+                        break
+                    try:
+                        chunk = os.read(master_fd, 4096)
+                        if chunk:
+                            output_chunks.append(chunk)
+                    except OSError:
+                        break
+                break
+
+        os.close(master_fd)
+        proc.wait()
+
+        raw = b"".join(output_chunks).decode("utf-8", errors="replace")
+        # Strip ANSI/VT escape sequences, keep plain text
+        clean = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b[()][AB012]|\r", "", raw).strip()
+
+        if proc.returncode != 0:
+            return f"Exit code {proc.returncode}\n{clean}" if clean else f"Exit code {proc.returncode}"
+        return clean if clean else "(empty output)"
+
     except Exception as e:
         return f"Error: {type(e).__name__}: {e}"
 

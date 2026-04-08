@@ -208,7 +208,7 @@
     line-height: 1.5;
   }
 
-  /* Syntax highlighting */
+  /* Syntax highlighting - dark theme (default) */
   .markdown-content :global(.hl-keyword) { color: #c792ea; }
   .markdown-content :global(.hl-string)  { color: #c3e88d; }
   .markdown-content :global(.hl-comment) { color: #546e7a; font-style: italic; }
@@ -217,6 +217,16 @@
   .markdown-content :global(.hl-null)    { color: #ff5874; }
   .markdown-content :global(.hl-key)     { color: #82aaff; }
   .markdown-content :global(.hl-variable){ color: #f07178; }
+
+  /* Syntax highlighting - light theme overrides */
+  :root[data-theme="light"] .markdown-content :global(.hl-keyword) { color: #7c3aed; }
+  :root[data-theme="light"] .markdown-content :global(.hl-string)  { color: #16a34a; }
+  :root[data-theme="light"] .markdown-content :global(.hl-comment) { color: #6b7280; font-style: italic; }
+  :root[data-theme="light"] .markdown-content :global(.hl-number)  { color: #c2410c; }
+  :root[data-theme="light"] .markdown-content :global(.hl-boolean) { color: #dc2626; }
+  :root[data-theme="light"] .markdown-content :global(.hl-null)    { color: #dc2626; }
+  :root[data-theme="light"] .markdown-content :global(.hl-key)     { color: #1d4ed8; }
+  :root[data-theme="light"] .markdown-content :global(.hl-variable){ color: #b45309; }
 
   /* Blockquotes */
   .markdown-content :global(blockquote) {

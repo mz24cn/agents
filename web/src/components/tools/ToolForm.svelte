@@ -1,6 +1,7 @@
 <script>
   import { tools, mcpServers } from '../../lib/api.js'
   import { t } from '../../lib/i18n.svelte.js'
+  import JsonEditor from '../JsonEditor.svelte'
 
   let { tool = null, mcpServer = null, onSuccess, onCancel } = $props()
 
@@ -124,7 +125,7 @@
   {#if tool_type === 'mcp'}
     <div class="form-group">
       <label for="mcp_config">{t('mcpServerConfig')} <span class="required">{t('required')}</span></label>
-      <textarea id="mcp_config" bind:value={mcp_config_text} rows="12" placeholder={MCP_PLACEHOLDER}></textarea>
+      <JsonEditor id="mcp_config" bind:value={mcp_config_text} rows={12} placeholder={MCP_PLACEHOLDER} />
       {#if errors.mcp_config}<span class="field-error">{errors.mcp_config}</span>{/if}
       <span class="hint">{t('mcpConfigHint')}</span>
     </div>
@@ -156,7 +157,7 @@
 
     <div class="form-group">
       <label for="parameters">Parameters (JSON Schema) <span class="required">{t('required')}</span></label>
-      <textarea id="parameters" bind:value={parameters_text} rows="6" placeholder={t('parametersPlaceholder')}></textarea>
+      <JsonEditor id="parameters" bind:value={parameters_text} rows={6} placeholder={t('parametersPlaceholder')} />
       {#if errors.parameters}<span class="field-error">{errors.parameters}</span>{/if}
     </div>
 
