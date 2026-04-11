@@ -6,8 +6,57 @@
   import AudioPlayer from './AudioPlayer.svelte'
   import CopyButton from './CopyButton.svelte'
   import { t } from '../../lib/i18n.svelte.js'
+  import { highlight } from '../../lib/highlight.js'
+
+  /**
+   * Detect the content type of a tool result.
+   * Returns { type: 'json'|'script'|'markdown', lang?: string }
+   */
+  function detectToolResultType(content) {
+    const trimmed = content.trimStart()
+    // JSON: must start with { or [
+    if (trimmed[0] === '{' || trimmed[0] === '[') {
+      try {
+        JSON.parse(content)
+        return { type: 'json', lang: 'json' }
+      } catch {
+        // not valid JSON, fall through
+      }
+    }
+    // Shebang detection
+    const firstLine = content.split('\n')[0]
+    if (firstLine.startsWith('#!')) {
+      if (/\b(bash|sh)\b/.test(firstLine)) return { type: 'script', lang: 'bash' }
+      if (/\bpython\b/.test(firstLine))    return { type: 'script', lang: 'python' }
+    }
+    return { type: 'markdown' }
+  }
+
+  function renderToolResult(content) {
+    const { type, lang } = detectToolResultType(content)
+    if (type === 'json' || type === 'script') {
+      return { html: highlight(content, lang), lang }
+    }
+    return { html: null, lang: null }
+  }
 
   let { msg } = $props()
+
+  function buildStatTooltip(s) {
+    const fmtTokens = (n) => n >= 10000 ? `${(n / 1000).toFixed(1)}k` : `${n}`
+    const fmtMs = (n) => n == null ? 'N/A' : n >= 10000 ? `${(n / 1000).toFixed(1)}s` : `${n}ms`
+
+    const lines = []
+    lines.push(`${t('tokenIn')} ${fmtTokens(s.prompt_tokens)}   ${t('tokenOut')} ${fmtTokens(s.completion_tokens)}   ${t('tokenTotal')} ${fmtTokens(s.total_tokens)}`)
+    if (s.total_prompt_tokens !== s.prompt_tokens || s.total_completion_tokens !== s.completion_tokens) {
+      lines.push(`${t('tokenCumIn')} ${fmtTokens(s.total_prompt_tokens)}   ${t('tokenCumOut')} ${fmtTokens(s.total_completion_tokens)}   ${t('tokenCumTotal')} ${fmtTokens(s.total_all_tokens)}`)
+    }
+    if (s.ttft_ms != null) lines.push(`${t('statTtft')} ${fmtMs(s.ttft_ms)}`)
+    if (s.net_ms != null)  lines.push(`${t('statNet')} ${fmtMs(s.net_ms)}`)
+    if (s.total_ms != null) lines.push(`${t('statRound')} ${fmtMs(s.total_ms)}`)
+    if (s.overall_ms != null) lines.push(`${t('statOverall')} ${fmtMs(s.overall_ms)}`)
+    return lines.join('\n')
+  }
 
   // 工具结果：超过5行默认收缩，否则默认展开
   const toolResultLines = (msg.content ?? '').split('\n').length
@@ -36,6 +85,11 @@
     {:else if msg.role === 'assistant'}
       <span>{t('roleAssistant')}</span>
       <div class="role-actions">
+        {#if msg.stat}
+          <span class="token-stats" title={buildStatTooltip(msg.stat)}>
+            {msg.stat.prompt_tokens >= 10000 ? `${(msg.stat.prompt_tokens/1000).toFixed(1)}k` : msg.stat.prompt_tokens}/{msg.stat.completion_tokens >= 10000 ? `${(msg.stat.completion_tokens/1000).toFixed(1)}k` : msg.stat.completion_tokens} tokens
+          </span>
+        {/if}
         {#if msg.thinking}
           <button class="toggle-btn" onclick={toggleThinking}>
             {thinkingExpanded ? t('collapseThinking') : t('expandThinking')}
@@ -68,11 +122,24 @@
     {#if msg.role === 'assistant'}
       <MarkdownRenderer content={msg.content} />
     {:else if msg.role === 'function'}
+      {@const detected = renderToolResult(msg.content)}
       <div class="tool-result-block">
-        {#if toolResultExpanded}
-          <pre class="tool-result-content">{msg.content}</pre>
+        {#if detected.html}
+          {#if toolResultExpanded}
+            <div class="code-block tool-result-code">
+              {#if detected.lang}<span class="code-lang">{detected.lang.toUpperCase()}</span>{/if}
+              <pre><code class="language-{detected.lang}">{@html detected.html}</code></pre>
+            </div>
+          {:else}
+            <div class="code-block tool-result-code">
+              {#if detected.lang}<span class="code-lang">{detected.lang.toUpperCase()}</span>{/if}
+              <pre class="preview"><code class="language-{detected.lang}">{@html detected.html.split('\n').slice(0, 5).join('\n')}</code></pre>
+            </div>
+          {/if}
+        {:else if toolResultExpanded}
+          <div class="tool-result-markdown"><MarkdownRenderer content={msg.content} /></div>
         {:else}
-          <pre class="tool-result-content preview">{msg.content.split('\n').slice(0, 5).join('\n')}</pre>
+          <div class="tool-result-markdown preview-fade"><MarkdownRenderer content={msg.content.split('\n').slice(0, 5).join('\n')} /></div>
         {/if}
       </div>
     {:else}
@@ -143,7 +210,7 @@
   }
   .toggle-btn {
     padding: 2px 8px;
-    font-size: 0.7em;
+    font-size: 0.75rem;
     color: var(--text-secondary, #888);
     background: var(--bg-tertiary, rgba(0,0,0,0.15));
     border: none;
@@ -157,6 +224,13 @@
   .toggle-btn:hover {
     background: var(--bg-secondary, rgba(0,0,0,0.2));
     color: var(--text, #333);
+  }
+  .token-stats {
+    font-size: 0.75rem;
+    color: var(--text-secondary, #888);
+    opacity: 0.75;
+    white-space: nowrap;
+    letter-spacing: 0.02em;
   }
   .content {
     white-space: pre-wrap;
@@ -176,19 +250,67 @@
     color: #fff;
   }
   .tool-result-block { margin-top: 4px; }
-  .tool-result-content {
+  .tool-result-code {
+    position: relative;
     margin: 0;
+  }
+  .tool-result-code :global(pre) {
     font-size: 0.8rem;
+    padding: 6px 8px;
+    margin: 0;
+    border-radius: 4px;
+    background: var(--bg-tertiary, rgba(0,0,0,0.08));
     white-space: pre-wrap;
     word-break: break-word;
     overflow-wrap: anywhere;
-    padding: 6px 8px;
-    background: rgba(0,0,0,0.05);
-    border-radius: 4px;
-    color: var(--text-secondary);
   }
-  .tool-result-content.preview {
+  .tool-result-code :global(pre.preview) {
     -webkit-mask-image: linear-gradient(to bottom, black 60%, transparent 100%);
     mask-image: linear-gradient(to bottom, black 60%, transparent 100%);
   }
+  .tool-result-code :global(code) {
+    background: none;
+    padding: 0;
+    font-size: inherit;
+    line-height: 1.5;
+  }
+  .tool-result-code :global(.code-lang) {
+    position: absolute;
+    bottom: 0;
+    right: 0;
+    padding: 2px 8px;
+    font-size: 0.7em;
+    color: var(--text-secondary, #888);
+    background: var(--bg-tertiary, rgba(0,0,0,0.15));
+    border-radius: 4px 0 4px 0;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    z-index: 1;
+  }
+  .tool-result-markdown {
+    font-size: 0.85rem;
+  }
+  .tool-result-markdown.preview-fade {
+    -webkit-mask-image: linear-gradient(to bottom, black 60%, transparent 100%);
+    mask-image: linear-gradient(to bottom, black 60%, transparent 100%);
+  }
+
+  /* Syntax highlighting for injected @html spans */
+  .tool-result-code :global(.hl-keyword) { color: #c792ea; }
+  .tool-result-code :global(.hl-string)  { color: #c3e88d; }
+  .tool-result-code :global(.hl-comment) { color: #546e7a; font-style: italic; }
+  .tool-result-code :global(.hl-number)  { color: #f78c6c; }
+  .tool-result-code :global(.hl-boolean) { color: #ff5874; }
+  .tool-result-code :global(.hl-null)    { color: #ff5874; }
+  .tool-result-code :global(.hl-key)     { color: #82aaff; }
+  .tool-result-code :global(.hl-variable){ color: #f07178; }
+
+  :root[data-theme="light"] .tool-result-code :global(.hl-keyword) { color: #7c3aed; }
+  :root[data-theme="light"] .tool-result-code :global(.hl-string)  { color: #16a34a; }
+  :root[data-theme="light"] .tool-result-code :global(.hl-comment) { color: #6b7280; font-style: italic; }
+  :root[data-theme="light"] .tool-result-code :global(.hl-number)  { color: #c2410c; }
+  :root[data-theme="light"] .tool-result-code :global(.hl-boolean) { color: #dc2626; }
+  :root[data-theme="light"] .tool-result-code :global(.hl-null)    { color: #dc2626; }
+  :root[data-theme="light"] .tool-result-code :global(.hl-key)     { color: #1d4ed8; }
+  :root[data-theme="light"] .tool-result-code :global(.hl-variable){ color: #b45309; }
 </style>

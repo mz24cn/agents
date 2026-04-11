@@ -10,7 +10,7 @@ import uuid
 from abc import ABC, abstractmethod
 from typing import Optional
 
-from runtime.models import Message, ModelConfig, ToolConfig
+from runtime.models import Message, ModelConfig, TokenStat, ToolConfig
 
 
 class BaseProtocol(ABC):
@@ -41,15 +41,17 @@ class BaseProtocol(ABC):
         """
 
     @abstractmethod
-    def parse_response(self, response_data: bytes, stream: bool = False) -> list:
-        """Parse an LLM API response into Message objects.
+    def parse_response(self, response_data: bytes, stream: bool = False) -> tuple:
+        """Parse an LLM API response into Message objects and token usage.
 
         Args:
             response_data: Raw response bytes from the API.
             stream: Whether the response is in streaming (SSE) format.
 
         Returns:
-            A list of Message objects extracted from the response.
+            A tuple of (messages, usage) where messages is a list of Message
+            objects and usage is a TokenStat instance (may have all zeros if
+            the backend does not report usage).
         """
 
 
@@ -111,7 +113,7 @@ class OpenAIProtocol(BaseProtocol):
         body_bytes = json.dumps(body).encode("utf-8")
         return (url, headers, body_bytes)
 
-    def parse_response(self, response_data: bytes, stream: bool = False) -> list:
+    def parse_response(self, response_data: bytes, stream: bool = False) -> tuple:
         """Parse an OpenAI Chat Completions API response.
 
         For non-streaming: parses JSON and extracts choices[0].message.
@@ -122,7 +124,7 @@ class OpenAIProtocol(BaseProtocol):
             stream: Whether the response is in SSE streaming format.
 
         Returns:
-            A list of Message objects.
+            A tuple of (messages, usage).
         """
         if stream:
             return self._parse_stream_response(response_data)
@@ -199,14 +201,14 @@ class OpenAIProtocol(BaseProtocol):
             },
         }
 
-    def _parse_non_stream_response(self, response_data: bytes) -> list:
+    def _parse_non_stream_response(self, response_data: bytes) -> tuple:
         """Parse a non-streaming OpenAI response."""
         data = json.loads(response_data.decode("utf-8"))
         messages = []
 
         choices = data.get("choices", [])
         if not choices:
-            return messages
+            return messages, TokenStat()
 
         choice = choices[0]
         msg_data = choice.get("message", {})
@@ -236,12 +238,22 @@ class OpenAIProtocol(BaseProtocol):
             )
         )
 
-        return messages
+        # Extract token usage
+        raw_usage = data.get("usage", {})
+        usage = TokenStat(
+            prompt_tokens=raw_usage.get("prompt_tokens", 0),
+            completion_tokens=raw_usage.get("completion_tokens", 0),
+            total_tokens=raw_usage.get("total_tokens", 0),
+        )
 
-    def _parse_stream_response(self, response_data: bytes) -> list:
+        return messages, usage
+
+    def _parse_stream_response(self, response_data: bytes) -> tuple:
         """Parse a streaming (SSE) OpenAI response.
 
         Accumulates delta content, reasoning_content, and tool_calls from SSE data lines.
+        Usage is reported in the final chunk when stream_options.include_usage is set;
+        falls back to zeros if not present.
         """
         text = response_data.decode("utf-8")
         accumulated_content = ""
@@ -249,6 +261,7 @@ class OpenAIProtocol(BaseProtocol):
         # Dict keyed by tool call index: {index: {"name": str, "arguments": str}}
         accumulated_tool_calls: dict[int, dict] = {}
         role = "assistant"
+        usage = TokenStat()
 
         for line in text.split("\n"):
             line = line.strip()
@@ -263,6 +276,15 @@ class OpenAIProtocol(BaseProtocol):
                 chunk = json.loads(data_str)
             except (json.JSONDecodeError, ValueError):
                 continue
+
+            # Some providers send usage in the final chunk
+            raw_usage = chunk.get("usage")
+            if raw_usage:
+                usage = TokenStat(
+                    prompt_tokens=raw_usage.get("prompt_tokens", 0),
+                    completion_tokens=raw_usage.get("completion_tokens", 0),
+                    total_tokens=raw_usage.get("total_tokens", 0),
+                )
 
             choices = chunk.get("choices", [])
             if not choices:
@@ -312,7 +334,7 @@ class OpenAIProtocol(BaseProtocol):
                 tool_calls=all_tool_calls,
                 thinking=accumulated_thinking or None,
             )
-        ]
+        ], usage
 
 
 class OllamaProtocol(BaseProtocol):
@@ -372,7 +394,7 @@ class OllamaProtocol(BaseProtocol):
         body_bytes = json.dumps(body).encode("utf-8")
         return (url, headers, body_bytes)
 
-    def parse_response(self, response_data: bytes, stream: bool = False) -> list:
+    def parse_response(self, response_data: bytes, stream: bool = False) -> tuple:
         """Parse an Ollama /api/chat response.
 
         For non-streaming: parses JSON and extracts message field.
@@ -383,7 +405,7 @@ class OllamaProtocol(BaseProtocol):
             stream: Whether the response is in streaming format.
 
         Returns:
-            A list of Message objects.
+            A tuple of (messages, usage).
         """
         if stream:
             return self._parse_stream_response(response_data)
@@ -452,14 +474,14 @@ class OllamaProtocol(BaseProtocol):
             },
         }
 
-    def _parse_non_stream_response(self, response_data: bytes) -> list:
+    def _parse_non_stream_response(self, response_data: bytes) -> tuple:
         """Parse a non-streaming Ollama response."""
         data = json.loads(response_data.decode("utf-8"))
         messages = []
 
         msg_data = data.get("message", {})
         if not msg_data:
-            return messages
+            return messages, TokenStat()
 
         content = msg_data.get("content", "")
         thinking = msg_data.get("thinking") or None
@@ -488,20 +510,30 @@ class OllamaProtocol(BaseProtocol):
             )
         )
 
-        return messages
+        # Ollama reports usage at the top level of the response
+        prompt_tokens = data.get("prompt_eval_count", 0)
+        completion_tokens = data.get("eval_count", 0)
+        usage = TokenStat(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+        )
 
-    def _parse_stream_response(self, response_data: bytes) -> list:
+        return messages, usage
+
+    def _parse_stream_response(self, response_data: bytes) -> tuple:
         """Parse a streaming Ollama response.
 
         Ollama streaming returns newline-delimited JSON objects:
         {"model":"...","message":{"role":"assistant","content":"Hi "},"done":false}
         {"model":"...","message":{"role":"assistant","content":"there"},"done":false}
-        {"model":"...","message":{"role":"assistant","content":""},"done":true}
+        {"model":"...","message":{"role":"assistant","content":""},"done":true,"prompt_eval_count":10,"eval_count":5}
         """
         text = response_data.decode("utf-8")
         accumulated_content = ""
         role = "assistant"
         all_tool_calls = None
+        usage = TokenStat()
 
         for line in text.split("\n"):
             line = line.strip()
@@ -514,29 +546,37 @@ class OllamaProtocol(BaseProtocol):
                 continue
 
             msg_data = chunk.get("message", {})
-            if not msg_data:
-                continue
+            if msg_data:
+                if "role" in msg_data:
+                    role = msg_data["role"]
 
-            if "role" in msg_data:
-                role = msg_data["role"]
+                content = msg_data.get("content", "")
+                if content:
+                    accumulated_content += content
 
-            content = msg_data.get("content", "")
-            if content:
-                accumulated_content += content
+                # Handle tool_calls in streaming (usually in the final chunk)
+                tool_calls = msg_data.get("tool_calls")
+                if tool_calls and len(tool_calls) > 0:
+                    all_tool_calls = []
+                    for tc in tool_calls:
+                        fn = tc.get("function", {})
+                        arguments = fn.get("arguments", {})
+                        if isinstance(arguments, dict):
+                            arguments = json.dumps(arguments)
+                        all_tool_calls.append({
+                            "name": fn.get("name", ""),
+                            "arguments": arguments,
+                        })
 
-            # Handle tool_calls in streaming (usually in the final chunk)
-            tool_calls = msg_data.get("tool_calls")
-            if tool_calls and len(tool_calls) > 0:
-                all_tool_calls = []
-                for tc in tool_calls:
-                    fn = tc.get("function", {})
-                    arguments = fn.get("arguments", {})
-                    if isinstance(arguments, dict):
-                        arguments = json.dumps(arguments)
-                    all_tool_calls.append({
-                        "name": fn.get("name", ""),
-                        "arguments": arguments,
-                    })
+            # Usage is in the final "done" chunk
+            if chunk.get("done"):
+                prompt_tokens = chunk.get("prompt_eval_count", 0)
+                completion_tokens = chunk.get("eval_count", 0)
+                usage = TokenStat(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=prompt_tokens + completion_tokens,
+                )
 
         return [
             Message(
@@ -544,7 +584,7 @@ class OllamaProtocol(BaseProtocol):
                 content=accumulated_content,
                 tool_calls=all_tool_calls,
             )
-        ]
+        ], usage
 
 
 # Protocol name to adapter class mapping

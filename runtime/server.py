@@ -9,6 +9,7 @@ Zero third-party dependencies — only Python standard library.
 
 import importlib.util
 import json
+import logging
 import mimetypes
 import os
 import re
@@ -16,6 +17,8 @@ import sys
 import threading
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 from typing import Callable, Optional
+
+logger = logging.getLogger("runtime.server")
 
 from runtime.mcp_client import MCPClientManager
 from runtime.skill_manager import SkillManager
@@ -338,6 +341,8 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             response_data["error"] = result.error
         if result.error_code is not None:
             response_data["error_code"] = result.error_code
+        if result.stat is not None:
+            response_data["stat"] = result.stat.to_dict()
 
         status = 200 if result.success else 500
         self._send_json_response(status, response_data)
@@ -383,6 +388,9 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 event_data = json.dumps(msg.to_dict(), ensure_ascii=False)
                 self.wfile.write(f"data: {event_data}\n\n".encode("utf-8"))
                 self.wfile.flush()
+                # Log error messages from the stream for easier diagnosis
+                if msg.role == "assistant" and msg.content and msg.content.startswith("Error:"):
+                    logger.error("infer_stream error event | model=%s %s", request.model_id, msg.content)
             # Send done event
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
@@ -916,6 +924,12 @@ class RuntimeHTTPServer:
                 exists, otherwise None (static serving disabled).
         """
         _load_env_overrides()
+        # Configure logging if not already configured
+        if not logging.root.handlers:
+            logging.basicConfig(
+                level=logging.INFO,
+                format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            )
         self._host = host
         self._port = port
         self._prompt_template_manager = PromptTemplateManager()

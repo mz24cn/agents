@@ -81,6 +81,8 @@ def infer_via_stream(
     # 当前正在累积的 assistant chunk（None 表示没有未完成的 assistant 消息）
     pending_assistant: Optional[dict] = None
     stream_error: Optional[str] = None
+    # Token stat 累计
+    total_stat: dict = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
     def flush_assistant() -> None:
         """将累积完毕的 assistant 消息写入 merged_messages。"""
@@ -125,6 +127,15 @@ def infer_via_stream(
             if verbose:
                 content_preview = str(event.get("content", "") or event.get("thinking", ""))[:60]
                 print(f"  [stream] role={role}  {content_preview!r}")
+
+            if role == "usage":
+                # Per-round stat event — keep the last one (it has overall_ms if last round)
+                try:
+                    s = json.loads(event.get("content", "{}"))
+                    total_stat = s  # last round's stat has cumulative totals + overall_ms
+                except (json.JSONDecodeError, ValueError):
+                    pass
+                continue
 
             if role == "assistant":
                 # assistant 消息是逐 token 的增量，需要合并
@@ -171,7 +182,10 @@ def infer_via_stream(
     if stream_error:
         return {"success": False, "messages": merged_messages, "error": stream_error}
 
-    return {"success": True, "messages": merged_messages}
+    result: dict = {"success": True, "messages": merged_messages}
+    if total_stat.get("total_tokens", 0) > 0 or total_stat.get("prompt_tokens", 0) > 0:
+        result["stat"] = total_stat
+    return result
 
 
 def infer_direct(
@@ -211,6 +225,11 @@ def print_result(result: dict, label: str = "") -> None:
     print(f"success : {result['success']}")
     if result.get("error"):
         print(f"error   : {result['error']}")
+    if result.get("stat"):
+        s = result["stat"]
+        print(f"tokens  : 输入={s.get('prompt_tokens',0)}  输出={s.get('completion_tokens',0)}  合计={s.get('total_tokens',0)}")
+        if s.get("overall_ms") is not None:
+            print(f"timing  : 首token={s.get('ttft_ms','N/A')}ms  净推理={s.get('net_ms','N/A')}ms  全程={s.get('overall_ms')}ms")
     print(f"messages: {len(result['messages'])} 条")
     for msg in result["messages"]:
         role = msg.get("role", "?")

@@ -79,6 +79,16 @@ const translations = {
     roleFunction: '🔧 工具结果',
     collapseResult: '▾ 收起结果',
     expandResult: '▸ 展开结果',
+    tokenIn: '输入:',
+    tokenOut: '输出:',
+    tokenTotal: '合计:',
+    tokenCumIn: '累计输入:',
+    tokenCumOut: '累计输出:',
+    tokenCumTotal: '累计合计:',
+    statTtft: '首 token 延迟:',
+    statNet: '净推理时间:',
+    statRound: '本轮总时间:',
+    statOverall: '全程总时间:',
 
     // MessageList
     startChat: '开始对话吧 💬',
@@ -292,6 +302,16 @@ const translations = {
     roleFunction: '🔧 Tool result',
     collapseResult: '▾ Collapse',
     expandResult: '▸ Expand',
+    tokenIn: 'in:',
+    tokenOut: 'out:',
+    tokenTotal: 'total:',
+    tokenCumIn: 'cum. in:',
+    tokenCumOut: 'cum. out:',
+    tokenCumTotal: 'cum. total:',
+    statTtft: 'TTFT:',
+    statNet: 'net:',
+    statRound: 'round:',
+    statOverall: 'overall:',
 
     // MessageList
     startChat: 'Start a conversation 💬',

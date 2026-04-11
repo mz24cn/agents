@@ -5,9 +5,61 @@
 
   let { content = '' } = $props()
 
+  // Lightweight LaTeX symbol → Unicode replacement (no external deps)
+  const LATEX_SYMBOLS = {
+    // Arrows
+    rightarrow: '→', Rightarrow: '⇒',
+    leftarrow: '←', Leftarrow: '⇐',
+    leftrightarrow: '↔', Leftrightarrow: '⇔',
+    uparrow: '↑', downarrow: '↓',
+    nearrow: '↗', searrow: '↘', nwarrow: '↖', swarrow: '↙',
+    to: '→', gets: '←',
+    // Greek lowercase
+    alpha: 'α', beta: 'β', gamma: 'γ', delta: 'δ', epsilon: 'ε',
+    zeta: 'ζ', eta: 'η', theta: 'θ', iota: 'ι', kappa: 'κ',
+    lambda: 'λ', mu: 'μ', nu: 'ν', xi: 'ξ', pi: 'π',
+    rho: 'ρ', sigma: 'σ', tau: 'τ', upsilon: 'υ', phi: 'φ',
+    chi: 'χ', psi: 'ψ', omega: 'ω',
+    // Greek uppercase
+    Gamma: 'Γ', Delta: 'Δ', Theta: 'Θ', Lambda: 'Λ', Xi: 'Ξ',
+    Pi: 'Π', Sigma: 'Σ', Upsilon: 'Υ', Phi: 'Φ', Psi: 'Ψ', Omega: 'Ω',
+    // Math operators & relations
+    times: '×', div: '÷', pm: '±', mp: '∓',
+    leq: '≤', geq: '≥', neq: '≠', approx: '≈', equiv: '≡',
+    sim: '∼', simeq: '≃', cong: '≅', propto: '∝',
+    // Sets & logic
+    in: '∈', notin: '∉', subset: '⊂', supset: '⊃',
+    subseteq: '⊆', supseteq: '⊇', cup: '∪', cap: '∩',
+    emptyset: '∅', forall: '∀', exists: '∃', nexists: '∄',
+    land: '∧', lor: '∨', lnot: '¬', neg: '¬',
+    // Misc math
+    infty: '∞', partial: '∂', nabla: '∇', sqrt: '√',
+    sum: '∑', prod: '∏', int: '∫',
+    cdot: '·', cdots: '⋯', ldots: '…', vdots: '⋮', ddots: '⋱',
+    circ: '∘', bullet: '•', star: '★',
+    // Spacing (strip)
+    quad: ' ', qquad: '  ',
+  }
+
+  function replaceLatex(src) {
+    // Replace $$...$$ (block) and $...$ (inline) with Unicode equivalents
+    return src.replace(/\$\$([\s\S]+?)\$\$|\$([^$\n]+?)\$/g, (match, block, inline) => {
+      const inner = block ?? inline
+      return inner
+        .replace(/\\text\{([^}]*)\}/g, '$1')
+        .replace(/\\mathrm\{([^}]*)\}/g, '$1')
+        .replace(/\\mathbf\{([^}]*)\}/g, '$1')
+        .replace(/\\frac\{([^}]*)\}\{([^}]*)\}/g, '($1/$2)')
+        .replace(/\\([A-Za-z]+)/g, (_, cmd) => LATEX_SYMBOLS[cmd] ?? `\\${cmd}`)
+        .replace(/[\^_]\{([^}]*)\}/g, '$1')
+        .replace(/[\^_](\S)/g, '$1')
+        .replace(/[{}]/g, '')
+        .trim()
+    })
+  }
+
   // Simple HTML escaper for XSS prevention — applied after marked renders
   function sanitizeHtml(html) {
-    // Remove script tags and event handlers
     return html
       .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
       .replace(/\bon\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
@@ -21,7 +73,6 @@
   renderer.code = function ({ text, lang }) {
     const normalizedLang = lang || ''
     const highlightedHtml = highlight(text, normalizedLang)
-    // Encode raw text as base64 for safe embedding in HTML attribute (UTF-8 safe)
     const rawBase64 = btoa(unescape(encodeURIComponent(text)))
     const langLabel = normalizedLang
       ? `<span class="code-lang">${normalizedLang.toUpperCase()}</span>`
@@ -45,10 +96,9 @@
   function renderMarkdown(src) {
     if (!src) return ''
     try {
-      const raw = marked.parse(src, markedOptions)
+      const raw = marked.parse(replaceLatex(src), markedOptions)
       return sanitizeHtml(raw)
     } catch {
-      // Fallback to escaped plain text
       return src
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
@@ -58,19 +108,14 @@
 
   let html = $derived(renderMarkdown(content))
 
-  // Bind copy button click events whenever rendered HTML updates
   let markdownContainer
 
   $effect(() => {
-    // Access html to make this effect re-run when content changes
     void html
     if (!markdownContainer) return
-
-    // Use a microtask to ensure the DOM has been updated
     Promise.resolve().then(() => {
       const buttons = markdownContainer.querySelectorAll('[data-copy-btn]')
       buttons.forEach((btn) => {
-        // Avoid double-binding by checking a flag
         if (btn.dataset.copyBound) return
         btn.dataset.copyBound = '1'
         btn.addEventListener('click', () => {
@@ -80,7 +125,7 @@
             const decoded = decodeURIComponent(escape(atob(rawCode)))
             navigator.clipboard.writeText(decoded).catch(() => {})
           } catch {
-            // Silent failure: base64 decode failed
+            // Silent failure
           }
         })
       })
@@ -114,28 +159,20 @@
   .markdown-content :global(h2) { font-size: 1.25em; }
   .markdown-content :global(h3) { font-size: 1.1em; }
 
-  /* Paragraphs */
-  .markdown-content :global(p) {
-    margin: 0.4em 0;
-  }
+  .markdown-content :global(p) { margin: 0.4em 0; }
 
-  /* Lists */
   .markdown-content :global(ul),
   .markdown-content :global(ol) {
     margin: 0.4em 0;
     padding-left: 1.5em;
   }
-  .markdown-content :global(li) {
-    margin: 0.2em 0;
-  }
+  .markdown-content :global(li) { margin: 0.2em 0; }
 
-  /* Links */
   .markdown-content :global(a) {
     color: var(--primary, #4a9eff);
     text-decoration: underline;
   }
 
-  /* Inline code */
   .markdown-content :global(code) {
     background: var(--bg-tertiary, rgba(0,0,0,0.1));
     padding: 0.15em 0.35em;
@@ -144,12 +181,10 @@
     font-family: 'Fira Code', 'Consolas', monospace;
   }
 
-  /* Code blocks */
   .markdown-content :global(.code-block) {
     position: relative;
     margin: 0.6em 0;
   }
-  /* 语言标签：右下角 */
   .markdown-content :global(.code-lang) {
     position: absolute;
     bottom: 0;
@@ -168,7 +203,6 @@
     justify-content: flex-end;
     padding: 2px 4px;
   }
-  /* 复制按钮：代码块内右上角 */
   .markdown-content :global(.code-block > .copy-btn) {
     position: absolute;
     top: 0;
@@ -208,7 +242,7 @@
     line-height: 1.5;
   }
 
-  /* Syntax highlighting - dark theme (default) */
+  /* Syntax highlighting - dark theme */
   .markdown-content :global(.hl-keyword) { color: #c792ea; }
   .markdown-content :global(.hl-string)  { color: #c3e88d; }
   .markdown-content :global(.hl-comment) { color: #546e7a; font-style: italic; }
@@ -218,7 +252,7 @@
   .markdown-content :global(.hl-key)     { color: #82aaff; }
   .markdown-content :global(.hl-variable){ color: #f07178; }
 
-  /* Syntax highlighting - light theme overrides */
+  /* Syntax highlighting - light theme */
   :root[data-theme="light"] .markdown-content :global(.hl-keyword) { color: #7c3aed; }
   :root[data-theme="light"] .markdown-content :global(.hl-string)  { color: #16a34a; }
   :root[data-theme="light"] .markdown-content :global(.hl-comment) { color: #6b7280; font-style: italic; }
@@ -228,7 +262,6 @@
   :root[data-theme="light"] .markdown-content :global(.hl-key)     { color: #1d4ed8; }
   :root[data-theme="light"] .markdown-content :global(.hl-variable){ color: #b45309; }
 
-  /* Blockquotes */
   .markdown-content :global(blockquote) {
     margin: 0.5em 0;
     padding: 0.3em 0.8em;
@@ -238,7 +271,6 @@
     border-radius: 0 4px 4px 0;
   }
 
-  /* Tables */
   .markdown-content :global(table) {
     border-collapse: collapse;
     width: 100%;
@@ -256,19 +288,14 @@
     font-weight: 600;
   }
 
-  /* Horizontal rule */
   .markdown-content :global(hr) {
     border: none;
     border-top: 1px solid var(--border, #ddd);
     margin: 0.8em 0;
   }
 
-  /* Strong / Em */
-  .markdown-content :global(strong) {
-    font-weight: 600;
-  }
+  .markdown-content :global(strong) { font-weight: 600; }
 
-  /* Images */
   .markdown-content :global(img) {
     max-width: 100%;
     border-radius: 4px;

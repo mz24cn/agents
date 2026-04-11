@@ -7,6 +7,7 @@ tool call loop handling. Only uses Python standard library modules.
 
 import json
 import os
+import time
 import urllib.request
 import urllib.error
 from typing import Iterator, Optional
@@ -15,6 +16,7 @@ from runtime.models import (
     InferenceRequest,
     InferenceResult,
     Message,
+    TokenStat,
     ToolConfig,
 )
 from runtime.protocols import PROTOCOL_MAP
@@ -151,6 +153,10 @@ class Runtime:
 
         # 5-7. Inference + tool call loop
         tool_round = 0
+        total_prompt = 0
+        total_completion = 0
+        overall_start = time.monotonic()
+        last_stat: Optional[TokenStat] = None
         while True:
             # Build HTTP request
             url, headers, body_bytes = protocol.build_request(
@@ -161,6 +167,7 @@ class Runtime:
             )
 
             # Send HTTP request
+            round_start = time.monotonic()
             try:
                 http_req = urllib.request.Request(
                     url, data=body_bytes, headers=headers, method="POST"
@@ -173,6 +180,12 @@ class Runtime:
                     error_body = exc.read().decode("utf-8", errors="replace")
                 except Exception:
                     pass
+                import logging
+                _logger = logging.getLogger("runtime.runtime")
+                _logger.error(
+                    "infer HTTP error | url=%s code=%s reason=%s body=%s",
+                    url, exc.code, exc.reason, error_body[:2000],
+                )
                 return InferenceResult(
                     success=False,
                     messages=messages,
@@ -193,10 +206,11 @@ class Runtime:
                     error=f"Request failed: {exc}",
                     error_code="REQUEST_ERROR",
                 )
+            net_ms = (time.monotonic() - round_start) * 1000
 
             # Parse response
             try:
-                response_messages = protocol.parse_response(response_data, stream=False)
+                response_messages, round_token_stat = protocol.parse_response(response_data, stream=False)
             except Exception as exc:
                 return InferenceResult(
                     success=False,
@@ -212,6 +226,20 @@ class Runtime:
                     error="Empty response from model",
                     error_code="EMPTY_RESPONSE",
                 )
+
+            total_prompt += round_token_stat.prompt_tokens
+            total_completion += round_token_stat.completion_tokens
+            round_total_ms = (time.monotonic() - round_start) * 1000
+            last_stat = TokenStat(
+                prompt_tokens=round_token_stat.prompt_tokens,
+                completion_tokens=round_token_stat.completion_tokens,
+                total_tokens=round_token_stat.prompt_tokens + round_token_stat.completion_tokens,
+                net_ms=net_ms,
+                total_ms=round_total_ms,
+                total_prompt_tokens=total_prompt,
+                total_completion_tokens=total_completion,
+                total_all_tokens=total_prompt + total_completion,
+            )
 
             # Add assistant response to conversation
             assistant_msg = response_messages[0]
@@ -287,7 +315,10 @@ class Runtime:
             if skill_triggered:
                 continue
 
-        return InferenceResult(success=True, messages=messages)
+        # Attach overall_ms to the last round's stat
+        if last_stat is not None:
+            last_stat.overall_ms = (time.monotonic() - overall_start) * 1000
+        return InferenceResult(success=True, messages=messages, stat=last_stat)
 
     # ------------------------------------------------------------------
     # Direct tool call (public API)
@@ -688,19 +719,36 @@ class Runtime:
 
         # 2. Streaming tool call loop
         tool_round = 0
+        total_prompt = 0
+        total_completion = 0
+        overall_start = time.monotonic()
         while True:
             url, headers, body_bytes = protocol.build_request(
                 config=model_config, messages=messages,
                 tools=tools if tools else None, stream=True,
             )
 
+            round_start = time.monotonic()
             try:
                 http_req = urllib.request.Request(
                     url, data=body_bytes, headers=headers, method="POST")
                 http_resp = urllib.request.urlopen(http_req)
             except urllib.error.HTTPError as exc:
-                yield Message(role="assistant",
-                              content=f"Error: HTTP {exc.code}: {exc.reason}")
+                error_body = ""
+                try:
+                    error_body = exc.read().decode("utf-8", errors="replace")
+                except Exception:
+                    pass
+                import logging
+                _logger = logging.getLogger("runtime.runtime")
+                _logger.error(
+                    "infer_stream HTTP error | url=%s code=%s reason=%s body=%s",
+                    url, exc.code, exc.reason, error_body[:2000],
+                )
+                detail = f"HTTP {exc.code}: {exc.reason}"
+                if error_body:
+                    detail += f" | body: {error_body[:500]}"
+                yield Message(role="assistant", content=f"Error: {detail}")
                 return
             except Exception as exc:
                 yield Message(role="assistant", content=f"Error: {exc}")
@@ -711,6 +759,9 @@ class Runtime:
             full_thinking = ""
             # Track tool calls by index for multi-tool support
             accumulated_tool_calls: dict[int, dict] = {}
+            round_prompt = 0
+            round_completion = 0
+            first_token_time: Optional[float] = None
 
             try:
                 if protocol_name == "openai":
@@ -719,13 +770,29 @@ class Runtime:
                     stream_iter = self._parse_ollama_stream(http_resp)
                 else:
                     response_data = http_resp.read()
-                    stream_iter = iter(protocol.parse_response(response_data, stream=True))
+                    messages_and_stat = protocol.parse_response(response_data, stream=True)
+                    stream_iter = iter(messages_and_stat[0])
 
                 for msg in stream_iter:
                     # Check for cancellation before yielding
                     if cancel_event is not None and cancel_event.is_set():
                         http_resp.close()
                         return
+
+                    # Intercept usage messages — accumulate, don't yield raw
+                    if msg.role == "usage":
+                        try:
+                            u = json.loads(msg.content)
+                            round_prompt = u.get("prompt_tokens", 0)
+                            round_completion = u.get("completion_tokens", 0)
+                        except (json.JSONDecodeError, ValueError, AttributeError):
+                            pass
+                        continue
+
+                    # Record first-token time
+                    if first_token_time is None and (msg.content or msg.thinking):
+                        first_token_time = time.monotonic()
+
                     # Yield each chunk to the caller for real-time display
                     yield msg
 
@@ -751,7 +818,14 @@ class Runtime:
                 yield Message(role="assistant", content=f"Error: stream parse: {exc}")
                 return
             finally:
+                stream_end_time = time.monotonic()
                 http_resp.close()
+
+            # net_ms = time from request start to stream fully received
+            net_ms = (stream_end_time - round_start) * 1000
+            ttft_ms = (first_token_time - round_start) * 1000 if first_token_time else None
+            total_prompt += round_prompt
+            total_completion += round_completion
 
             # Build tool calls list from accumulated data
             all_tool_calls = None
@@ -770,13 +844,41 @@ class Runtime:
             # Determine tool calls to execute
             tool_calls_to_execute = all_tool_calls
 
-            # No tool call — done
+            # No tool call — done; yield stat and return
             if not tool_calls_to_execute:
+                stat_dict: dict = {
+                    "prompt_tokens": round_prompt,
+                    "completion_tokens": round_completion,
+                    "total_tokens": round_prompt + round_completion,
+                    "total_prompt_tokens": total_prompt,
+                    "total_completion_tokens": total_completion,
+                    "total_all_tokens": total_prompt + total_completion,
+                    "net_ms": round(net_ms, 1),
+                    "total_ms": round(net_ms, 1),  # no tool calls, total == net
+                    "overall_ms": round((time.monotonic() - overall_start) * 1000, 1),
+                }
+                if ttft_ms is not None:
+                    stat_dict["ttft_ms"] = round(ttft_ms, 1)
+                yield Message(role="usage", name="round", content=json.dumps(stat_dict))
                 return
 
             # Max rounds check
             tool_round += 1
             if tool_round > request.max_tool_rounds:
+                stat_dict = {
+                    "prompt_tokens": round_prompt,
+                    "completion_tokens": round_completion,
+                    "total_tokens": round_prompt + round_completion,
+                    "total_prompt_tokens": total_prompt,
+                    "total_completion_tokens": total_completion,
+                    "total_all_tokens": total_prompt + total_completion,
+                    "net_ms": round(net_ms, 1),
+                    "total_ms": round(net_ms, 1),
+                    "overall_ms": round((time.monotonic() - overall_start) * 1000, 1),
+                }
+                if ttft_ms is not None:
+                    stat_dict["ttft_ms"] = round(ttft_ms, 1)
+                yield Message(role="usage", name="round", content=json.dumps(stat_dict))
                 return
 
             # Execute all tool calls sequentially in this round
@@ -820,6 +922,23 @@ class Runtime:
                 messages.append(tool_msg)
                 yield tool_msg
 
+            # total_ms includes tool execution time; yield stat after tools are done
+            if not skill_triggered:
+                round_total_ms = (time.monotonic() - round_start) * 1000
+                stat_dict = {
+                    "prompt_tokens": round_prompt,
+                    "completion_tokens": round_completion,
+                    "total_tokens": round_prompt + round_completion,
+                    "total_prompt_tokens": total_prompt,
+                    "total_completion_tokens": total_completion,
+                    "total_all_tokens": total_prompt + total_completion,
+                    "net_ms": round(net_ms, 1),
+                    "total_ms": round(round_total_ms, 1),
+                }
+                if ttft_ms is not None:
+                    stat_dict["ttft_ms"] = round(ttft_ms, 1)
+                yield Message(role="usage", name="round", content=json.dumps(stat_dict))
+
             if skill_triggered:
                 continue
 
@@ -829,7 +948,11 @@ class Runtime:
         Supports ``reasoning_content`` (thinking) alongside regular ``content``.
         Thinking chunks yield Message(thinking=..., content=""); content
         chunks yield Message(content=...).
+        At stream end, yields a role="usage" Message with token counts in content as JSON.
         """
+        prompt_tokens = 0
+        completion_tokens = 0
+
         for raw_line in http_resp:
             if isinstance(raw_line, bytes):
                 line = raw_line.decode("utf-8", errors="replace")
@@ -842,12 +965,18 @@ class Runtime:
 
             data_str = line[len("data:"):].strip()
             if data_str == "[DONE]":
-                return
+                break
 
             try:
                 chunk = json.loads(data_str)
             except (json.JSONDecodeError, ValueError):
                 continue
+
+            # Usage may appear in the final chunk (when stream_options.include_usage is set)
+            raw_usage = chunk.get("usage")
+            if raw_usage:
+                prompt_tokens = raw_usage.get("prompt_tokens", 0)
+                completion_tokens = raw_usage.get("completion_tokens", 0)
 
             choices = chunk.get("choices", [])
             if not choices:
@@ -886,6 +1015,16 @@ class Runtime:
                             tool_calls=[tc_dict],
                         )
 
+        # Yield usage summary for this round
+        yield Message(
+            role="usage",
+            content=json.dumps({
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            }),
+        )
+
     def _parse_ollama_stream(self, http_resp: object) -> Iterator[Message]:
         """Parse an Ollama newline-delimited JSON stream, yielding Messages.
 
@@ -896,6 +1035,7 @@ class Runtime:
 
         Tool calls may arrive across multiple chunks (one per chunk) or all
         in a single final chunk. We accumulate them and yield once at the end.
+        At stream end, yields a role="usage" Message with token counts in content as JSON.
 
         Args:
             http_resp: The HTTP response object with a readable stream.
@@ -905,6 +1045,8 @@ class Runtime:
         """
         # Accumulate tool calls across chunks — they may arrive one per chunk
         accumulated_tool_calls: dict[int, dict] = {}
+        prompt_tokens = 0
+        completion_tokens = 0
 
         for raw_line in http_resp:
             if isinstance(raw_line, bytes):
@@ -950,8 +1092,10 @@ class Runtime:
                         "arguments": arguments,
                     }
 
-            # Stop if done
+            # Stop if done — also grab usage from the final chunk
             if chunk.get("done", False):
+                prompt_tokens = chunk.get("prompt_eval_count", 0)
+                completion_tokens = chunk.get("eval_count", 0)
                 break
 
         # Yield accumulated tool calls as a single message at the end
@@ -965,5 +1109,15 @@ class Runtime:
                 content="",
                 tool_calls=all_tool_calls,
             )
+
+        # Yield usage summary for this round
+        yield Message(
+            role="usage",
+            content=json.dumps({
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            }),
+        )
 
 

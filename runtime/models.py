@@ -205,6 +205,54 @@ class InferenceRequest:
 
 
 @dataclass
+class TokenStat:
+    """Per-round inference statistics: token counts and timing.
+
+    Attributes:
+        prompt_tokens: Input tokens consumed this round.
+        completion_tokens: Output tokens generated this round.
+        total_tokens: prompt_tokens + completion_tokens for this round.
+        ttft_ms: Time-to-first-token in milliseconds (stream only; None for non-stream).
+        net_ms: Net inference time in milliseconds for this round (request → last token).
+        total_ms: Wall-clock time for this round including tool calls.
+        overall_ms: Total wall-clock time for the entire multi-round loop (last round only).
+        total_prompt_tokens: Cumulative prompt tokens across all rounds so far.
+        total_completion_tokens: Cumulative completion tokens across all rounds so far.
+        total_all_tokens: Cumulative total tokens across all rounds so far.
+    """
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    ttft_ms: Optional[float] = None
+    net_ms: Optional[float] = None
+    total_ms: Optional[float] = None
+    overall_ms: Optional[float] = None
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
+    total_all_tokens: int = 0
+
+    def to_dict(self) -> dict:
+        d: dict = {
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
+            "total_prompt_tokens": self.total_prompt_tokens,
+            "total_completion_tokens": self.total_completion_tokens,
+            "total_all_tokens": self.total_all_tokens,
+        }
+        if self.ttft_ms is not None:
+            d["ttft_ms"] = round(self.ttft_ms, 1)
+        if self.net_ms is not None:
+            d["net_ms"] = round(self.net_ms, 1)
+        if self.total_ms is not None:
+            d["total_ms"] = round(self.total_ms, 1)
+        if self.overall_ms is not None:
+            d["overall_ms"] = round(self.overall_ms, 1)
+        return d
+
+
+@dataclass
 class InferenceResult:
     """Result of a model inference call.
 
@@ -213,9 +261,11 @@ class InferenceResult:
         messages: Complete conversation history including tool calls.
         error: Error description if success is False.
         error_code: Machine-readable error code if success is False.
+        stat: Aggregated token and timing statistics across all inference rounds.
     """
 
     success: bool
     messages: list = field(default_factory=list)
     error: Optional[str] = None
     error_code: Optional[str] = None
+    stat: Optional["TokenStat"] = None

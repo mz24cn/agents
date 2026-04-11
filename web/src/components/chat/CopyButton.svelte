@@ -27,7 +27,7 @@
 <style>
   .copy-btn {
     padding: 2px 8px;
-    font-size: 0.7em;
+    font-size: 0.75rem;
     color: var(--text-secondary, #888);
     background: var(--bg-tertiary, rgba(0,0,0,0.15));
     border: none;
