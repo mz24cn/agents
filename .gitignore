@@ -33,6 +33,8 @@ htmlcov/
 # Node / Vite / Svelte
 node_modules/
 web/node_modules/
+/package.json
+/package-lock.json
 web/dist/
 web/.svelte-kit/
 web/.vite/
