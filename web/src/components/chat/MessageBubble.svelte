@@ -123,7 +123,7 @@
       <MarkdownRenderer content={msg.content} />
     {:else if msg.role === 'function'}
       {@const detected = renderToolResult(msg.content)}
-      <div class="tool-result-block">
+      <div class="tool-result-block" ondblclick={() => toolResultExpanded = !toolResultExpanded}>
         {#if detected.html}
           {#if toolResultExpanded}
             <div class="code-block tool-result-code">
@@ -249,7 +249,11 @@
     background: rgba(255,255,255,0.4);
     color: #fff;
   }
-  .tool-result-block { margin-top: 4px; }
+  .tool-result-block {
+    margin-top: 4px;
+    cursor: pointer;
+    user-select: none;
+  }
   .tool-result-code {
     position: relative;
     margin: 0;

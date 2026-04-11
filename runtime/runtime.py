@@ -269,12 +269,17 @@ class Runtime:
                     # Progressive disclosure: inject SKILL.md body + built-in tools
                     skill_body, skill_dir = self._get_skill_body_and_dir(tool_name)
 
-                    # Inject the full SKILL.md body as a system message
+                    # Change working directory to the skill's directory
+                    if skill_dir:
+                        os.chdir(skill_dir)
+
+                    # Inject the full SKILL.md body as a function/tool result message
                     if skill_body:
                         cwd_hint = f"\n\n技能工作目录: {skill_dir}" if skill_dir else ""
                         messages.append(
                             Message(
-                                role="system",
+                                role="function",
+                                name=tool_name,
                                 content=(
                                     f"用户选择了 {tool_name} 技能。以下是该技能的详细文档，"
                                     f"请根据文档内容和用户的原始请求，使用 bash 或 fetch 等"
@@ -891,18 +896,24 @@ class Runtime:
                 if self._is_skill_tool(tool_name):
                     skill_body, skill_dir = self._get_skill_body_and_dir(tool_name)
 
+                    # Change working directory to the skill's directory
+                    if skill_dir:
+                        os.chdir(skill_dir)
+
+                    # Inject the full SKILL.md body as a function/tool result message
                     if skill_body:
                         cwd_hint = f"\n\n技能工作目录: {skill_dir}" if skill_dir else ""
-                        sys_msg = Message(
-                            role="system",
+                        fn_msg = Message(
+                            role="function",
+                            name=tool_name,
                             content=(
                                 f"用户选择了 {tool_name} 技能。以下是该技能的详细文档，"
                                 f"请根据文档内容和用户的原始请求，使用 bash 或 fetch 等"
                                 f"内置工具来执行相应操作。{cwd_hint}\n\n{skill_body}"
                             ),
                         )
-                        messages.append(sys_msg)
-                        yield sys_msg
+                        messages.append(fn_msg)
+                        yield fn_msg
 
                     self._ensure_builtin_tools(tools)
                     tools = [t for t in tools if t.tool_id != tool_name]

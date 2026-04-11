@@ -88,6 +88,9 @@
     } else if (msg.role === 'function') {
       messages = [...messages, { role: 'function', name: msg.name || '', content: msg.content || '' }]
       aIdxRef.value = -1
+    } else if (msg.role === 'system') {
+      // Skill progressive disclosure — reset so next assistant message gets a fresh bubble
+      aIdxRef.value = -1
     } else if (msg.role === 'usage') {
       // Attach stat to the last assistant message
       try {
