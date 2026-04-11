@@ -31,6 +31,7 @@ htmlcov/
 .ruff_cache/
 
 # Node / Vite / Svelte
+node_modules/
 web/node_modules/
 web/dist/
 web/.svelte-kit/
