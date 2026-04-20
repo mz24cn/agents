@@ -37,6 +37,9 @@ runtime/
 ├── mcp_client.py            # MCP Client: pure stdlib stdio/SSE implementation (StreamReader limit raised to 100 MB for large payloads)
 ├── builtin_tools.py         # Built-in tools: bash, fetch
 ├── prompt_template_manager.py  # Prompt template CRUD
+├── context_manager.py       # Context manager: session management, rolling summary, memory extraction
+├── env_manager.py           # Environment variable manager
+├── session_manager.py       # Session index manager
 └── server.py                # HTTP API server
 
 web/                         # Svelte 5 management console SPA
@@ -151,7 +154,7 @@ for msg in runtime.infer_stream(InferenceRequest(
     model_id="my-model",
     tool_ids=[skill_config.tool_id],
     text="Help me query the latest data",
-    max_tool_rounds=10,
+    max_tool_rounds=20,
 )):
     if msg.content:
         print(msg.content, end="", flush=True)
@@ -196,8 +199,10 @@ The template content is fetched and all `{variable}` placeholders are substitute
 
 **5. Start the HTTP Server**
 
-```python
-python -c "import runtime; runtime.server.RuntimeHTTPServer().start()"
+```bash
+python app.py              # default: 0.0.0.0:8080
+python app.py 8080         # custom port
+python app.py 0.0.0.0:9000 # custom host and port
 ```
 
 ### HTTP API Reference
@@ -221,6 +226,13 @@ python -c "import runtime; runtime.server.RuntimeHTTPServer().start()"
 | POST | `/v1/prompt-templates` | Create a prompt template |
 | PUT | `/v1/prompt-templates/{id}` | Update a prompt template |
 | DELETE | `/v1/prompt-templates/{id}` | Delete a prompt template |
+| GET | `/v1/env` | Get environment variables |
+| POST | `/v1/env` | Set environment variable |
+| POST | `/v1/env/detect` | Auto-detect environment variables |
+| DELETE | `/v1/env/{key}` | Delete environment variable |
+| GET | `/v1/sessions` | List all sessions |
+| GET | `/v1/sessions/{session_id}` | Get session details |
+| DELETE | `/v1/sessions/{session_id}` | Delete session |
 
 **Streaming inference request:**
 
@@ -233,9 +245,12 @@ python -c "import runtime; runtime.server.RuntimeHTTPServer().start()"
     {"role": "user", "content": "Search for the latest AI news."}
   ],
   "stream": true,
-  "max_tool_rounds": 10
+  "max_tool_rounds": 10,
+  "session_id": "new"
 }
 ```
+
+> **Note:** The `session_id` field is optional. Use `"new"` to create a new session, an existing session ID to resume a conversation, or omit it for stateless inference.
 
 ### Web UI
 
@@ -282,7 +297,12 @@ All configuration is persisted to `~/.agents_runtime/`:
 ├── tools.json
 ├── mcp_servers.json
 ├── prompt_templates.json
-└── env.json
+├── env.json
+└── chat_data/              # Session data directory
+    └── {session_id}/
+        ├── conversation.json
+        ├── summary.md
+        └── memory.md
 ```
 
 `env.json` is a flat key-value map of environment variables loaded at server startup, useful for injecting API keys and other secrets without modifying the system environment:
@@ -356,6 +376,9 @@ runtime/
 ├── mcp_client.py            # MCP Client：纯标准库 stdio/SSE 实现（StreamReader 上限扩展至 100 MB，支持大数据量返回）
 ├── builtin_tools.py         # 内置工具：bash、fetch
 ├── prompt_template_manager.py  # 提示词模板 CRUD
+├── context_manager.py       # 上下文管理器：会话管理、滚动摘要、记忆提取
+├── env_manager.py           # 环境变量管理器
+├── session_manager.py       # 会话索引管理器
 └── server.py                # HTTP API 服务器
 
 web/                         # Svelte 5 管理控制台 SPA
@@ -470,7 +493,7 @@ for msg in runtime.infer_stream(InferenceRequest(
     model_id="my-model",
     tool_ids=[skill_config.tool_id],
     text="帮我查一下最近的数据",
-    max_tool_rounds=10,
+    max_tool_rounds=20,
 )):
     if msg.content:
         print(msg.content, end="", flush=True)
@@ -513,8 +536,10 @@ print(result.messages[-1].content)
 
 **5. 启动 HTTP 服务**
 
-```python
-python -c "import runtime; runtime.server.RuntimeHTTPServer(port=8080).start()"
+```bash
+python app.py              # 默认：0.0.0.0:8080
+python app.py 8080         # 自定义端口
+python app.py 0.0.0.0:9000 # 自定义主机和端口
 ```
 
 ### HTTP API 接口
@@ -538,6 +563,13 @@ python -c "import runtime; runtime.server.RuntimeHTTPServer(port=8080).start()"
 | POST | `/v1/prompt-templates` | 创建提示词模板 |
 | PUT | `/v1/prompt-templates/{id}` | 更新提示词模板 |
 | DELETE | `/v1/prompt-templates/{id}` | 删除提示词模板 |
+| GET | `/v1/env` | 获取环境变量 |
+| POST | `/v1/env` | 设置环境变量 |
+| POST | `/v1/env/detect` | 自动检测环境变量 |
+| DELETE | `/v1/env/{key}` | 删除环境变量 |
+| GET | `/v1/sessions` | 列出所有会话 |
+| GET | `/v1/sessions/{session_id}` | 获取会话详情 |
+| DELETE | `/v1/sessions/{session_id}` | 删除会话 |
 
 **流式推理请求示例：**
 
@@ -550,9 +582,12 @@ python -c "import runtime; runtime.server.RuntimeHTTPServer(port=8080).start()"
     {"role": "user", "content": "搜索最新的 AI 新闻。"}
   ],
   "stream": true,
-  "max_tool_rounds": 10
+  "max_tool_rounds": 10,
+  "session_id": "new"
 }
 ```
+
+> **注意：** `session_id` 字段为可选参数。传入 `"new"` 创建新会话，传入已有会话 ID 恢复对话，或省略该字段进行无状态推理。
 
 ### Web UI 管理控制台
 
@@ -599,7 +634,12 @@ npm run build
 ├── tools.json
 ├── mcp_servers.json
 ├── prompt_templates.json
-└── env.json
+├── env.json
+└── chat_data/              # 会话数据目录
+    └── {session_id}/
+        ├── conversation.json
+        ├── summary.md
+        └── memory.md
 ```
 
 `env.json` 是一个扁平的键值映射，服务启动时自动加载为环境变量，适合注入 API Key 等敏感配置，无需修改系统环境：
