@@ -141,3 +141,18 @@ export function inferStream(body, onMessage, onDone, onError) {
 
   return () => controller.abort()
 }
+
+/** 环境变量 API */
+export const env = {
+  list:   ()              => request('GET',    '/v1/env'),
+  set:    (key, value)    => request('POST',   '/v1/env', { key, value }),
+  delete: (key)           => request('DELETE', `/v1/env/${encodeURIComponent(key)}`),
+  detect: ()              => request('POST',   '/v1/env/detect'),
+}
+
+/** 会话 API */
+export const sessions = {
+  list:   ()              => request('GET',    '/v1/sessions'),
+  get:    (sessionId)     => request('GET',    `/v1/sessions/${encodeURIComponent(sessionId)}`),
+  delete: (sessionId)     => request('DELETE', `/v1/sessions/${encodeURIComponent(sessionId)}`),
+}

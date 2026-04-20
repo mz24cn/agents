@@ -7,6 +7,7 @@
   import MessageList from './MessageList.svelte'
   import ChatInput from './ChatInput.svelte'
   import { t } from '../../lib/i18n.svelte.js'
+  import { sessionRestore } from '../../lib/session-state.svelte.js'
 
   const STORAGE_MODEL_KEY = 'chat_selected_model'
   const STORAGE_TOOLS_KEY = 'chat_selected_tools'
@@ -21,6 +22,7 @@
   let applyToSystem = $state(false)
   let inputText = $state('')
   let abortStream = $state(null)
+  let sessionId = $state(null)   // maintained for the lifetime of this chat session
 
   function handleTemplateSelect(result) {
     if (!result) { systemPrompt = ''; pendingTemplate = null; return }
@@ -38,30 +40,26 @@
     pendingTemplate = null
   }
 
-  function buildApiMessage(msg) {
-    const out = { role: msg.role, content: msg.content || '' }
-    if (msg.name) out.name = msg.name
-    if (msg.tool_calls) out.tool_calls = msg.tool_calls
-    if (msg.images) out.images = msg.images
-    if (msg.audio) out.audio = msg.audio
-    return out
-  }
-
   function handleSend(text) {
     if (!selectedModelId || isStreaming) return
     errorMsg = ''
     messages = [...messages, { role: 'user', content: text }]
+    // Only send the current turn's messages to the backend.
+    // History is managed server-side via session_id — the backend assembles
+    // the full context from the stored session, so we must not re-send it here.
     const apiMessages = []
     if (systemPrompt) apiMessages.push({ role: 'system', content: systemPrompt })
-    for (const m of messages) {
-      if (m.role === 'system') continue
-      apiMessages.push(buildApiMessage(m))
-    }
+    apiMessages.push({ role: 'user', content: text })
     isStreaming = true
     let aIdxRef = { value: messages.length }
     messages = [...messages, { role: 'assistant', content: '', thinking: null }]
+    const reqBody = { model_id: selectedModelId, tool_ids: selectedToolIds, messages: apiMessages, stream: true }
+    // Always opt in to session management from the web UI.
+    // First message sends "new" to create a session; subsequent messages
+    // send the session_id returned by the backend.
+    reqBody.session_id = sessionId ?? 'new'
     abortStream = inferStream(
-      { model_id: selectedModelId, tool_ids: selectedToolIds, messages: apiMessages, stream: true },
+      reqBody,
       (msg) => onStreamMsg(msg, aIdxRef),
       () => onStreamDone(),
       (err) => onStreamErr(err),
@@ -73,6 +71,11 @@
   }
 
   function onStreamMsg(msg, aIdxRef) {
+    // session_id handshake event from backend
+    if (msg.session_id && !msg.role) {
+      sessionId = msg.session_id
+      return
+    }
     if (msg.role === 'assistant') {
       if (aIdxRef.value === -1) {
         aIdxRef.value = messages.length
@@ -85,8 +88,8 @@
       if (msg.thinking) u[aIdx] = { ...u[aIdx], thinking: (u[aIdx].thinking || '') + msg.thinking }
       if (msg.tool_calls) u[aIdx] = { ...u[aIdx], tool_calls: msg.tool_calls }
       messages = u
-    } else if (msg.role === 'function') {
-      messages = [...messages, { role: 'function', name: msg.name || '', content: msg.content || '' }]
+    } else if (msg.role === 'tool') {
+      messages = [...messages, { role: 'tool', name: msg.name || '', content: msg.content || '' }]
       aIdxRef.value = -1
     } else if (msg.role === 'system') {
       // Skill progressive disclosure — reset so next assistant message gets a fresh bubble
@@ -121,6 +124,17 @@
     abortStream = null
     errorMsg = err?.message || t('streamError')
   }
+
+  // 监听全局会话恢复状态，当 Sidebar 点击历史会话时恢复
+  $effect(() => {
+    if (sessionRestore.pending) {
+      const { sessionId: sid, messages: msgs } = sessionRestore.pending
+      sessionRestore.pending = null
+      messages = msgs
+      sessionId = sid
+      errorMsg = ''
+    }
+  })
 </script>
 
 <div class="chat-page">
@@ -143,7 +157,7 @@
     <div class="error-bar">{errorMsg}</div>
   {/if}
   <MessageList {messages} />
-  <ChatInput disabled={isStreaming || !selectedModelId} onSend={handleSend} onStop={handleStop} {isStreaming} bind:text={inputText} onClear={() => { messages = []; errorMsg = '' }} hasMessages={messages.length > 0} />
+  <ChatInput disabled={isStreaming || !selectedModelId} onSend={handleSend} onStop={handleStop} {isStreaming} bind:text={inputText} onNewSession={() => { messages = []; errorMsg = ''; sessionId = null }} hasMessages={messages.length > 0} />
 </div>
 
 <style>

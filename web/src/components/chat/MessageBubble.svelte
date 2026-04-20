@@ -60,7 +60,7 @@
 
   // 工具结果：超过5行默认收缩，否则默认展开
   const toolResultLines = (msg.content ?? '').split('\n').length
-  const toolResultOverLimit = msg.role === 'function' && toolResultLines > 5
+  const toolResultOverLimit = msg.role === 'tool' && toolResultLines > 5
   let toolResultExpanded = $state(!toolResultOverLimit)
 
   // 思考过程：有正文或工具调用时自动收起；用户手动操作后不再自动跟随
@@ -99,7 +99,7 @@
       </div>
     {:else if msg.role === 'system'}
       {t('roleSystem')}
-    {:else if msg.role === 'function'}
+    {:else if msg.role === 'tool'}
       <span>{t('roleFunction')}</span>
       <div class="role-actions">
         {#if toolResultOverLimit}
@@ -121,7 +121,7 @@
   {#if msg.content}
     {#if msg.role === 'assistant'}
       <MarkdownRenderer content={msg.content} />
-    {:else if msg.role === 'function'}
+    {:else if msg.role === 'tool'}
       {@const detected = renderToolResult(msg.content)}
       <div class="tool-result-block" ondblclick={() => toolResultExpanded = !toolResultExpanded}>
         {#if detected.html}
@@ -186,7 +186,7 @@
     font-size: 0.85rem;
     max-width: 90%;
   }
-  .message.function {
+  .message.tool {
     align-self: flex-start;
     background: var(--bg-secondary);
     border: 1px solid var(--border);

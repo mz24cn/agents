@@ -102,7 +102,7 @@ def print_result(result):
                     print(f"\n[助手] 调用工具: {tc['name']}({tc.get('arguments', '{}')})")
             if msg.content:
                 print(f"\n[助手] {msg.content}")
-        elif msg.role == "function":
+        elif msg.role == "tool":
             preview = msg.content[:600] + ("..." if len(msg.content) > 600 else "")
             print(f"\n[工具 {msg.name}] {preview}")
 

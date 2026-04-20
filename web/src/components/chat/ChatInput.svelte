@@ -1,7 +1,7 @@
 <script>
   import { t } from '../../lib/i18n.svelte.js'
 
-  let { disabled = false, onSend, onStop, onClear, text = $bindable(''), hasMessages = false, isStreaming = false } = $props()
+  let { disabled = false, onSend, onStop, onNewSession, text = $bindable(''), hasMessages = false, isStreaming = false } = $props()
 
   function handleSend() {
     const trimmed = text.trim()
@@ -37,12 +37,12 @@
     {#if isStreaming}⏹{:else}↑{/if}
   </button>
   <button
-    class="clear-btn"
-    onclick={() => onClear?.()}
-    title={t('clearChat')}
-    disabled={!hasMessages}
+    class="new-session-btn"
+    onclick={() => onNewSession?.()}
+    title={t('newSession')}
+    disabled={isStreaming}
   >
-    🗑
+    +
   </button>
 </div>
 
@@ -88,21 +88,23 @@
   .send-btn:disabled { opacity: 0.5; cursor: not-allowed; }
   .send-btn.stop { background: var(--danger, #e53e3e); }
   .send-btn.stop:hover { background: #c53030; }
-  .clear-btn {
+  .new-session-btn {
     width: 32px;
     height: 32px;
     border-radius: 8px;
     border: 1px solid var(--border);
     background: var(--bg-secondary);
     color: var(--text-secondary);
-    font-size: 1rem;
+    font-size: 1.3rem;
+    font-weight: 300;
     cursor: pointer;
     flex-shrink: 0;
     display: flex;
     align-items: center;
     justify-content: center;
+    line-height: 1;
     transition: background-color 0.15s, color 0.15s;
   }
-  .clear-btn:hover:not(:disabled) { background: var(--danger); color: #fff; border-color: var(--danger); }
-  .clear-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .new-session-btn:hover:not(:disabled) { background: var(--primary); color: #fff; border-color: var(--primary); }
+  .new-session-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 </style>

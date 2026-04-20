@@ -21,7 +21,7 @@ text_input_st = st.text(min_size=1, max_size=200)
 # Strategy for Message objects with various roles
 message_st = st.builds(
     Message,
-    role=st.sampled_from(["system", "user", "assistant", "function"]),
+    role=st.sampled_from(["system", "user", "assistant", "tool"]),
     content=st.text(max_size=200),
     name=st.none(),
     images=st.none(),
@@ -413,7 +413,7 @@ def test_tool_call_loop_terminates_at_max_rounds(max_rounds: int) -> None:
         function_idx = 2 + 2 * i
         assert result.messages[assistant_idx].role == "assistant"
         assert result.messages[assistant_idx].tool_calls is not None
-        assert result.messages[function_idx].role == "function"
+        assert result.messages[function_idx].role == "tool"
         assert result.messages[function_idx].name == "dummy_tool"
 
 
@@ -560,9 +560,9 @@ def test_tool_dispatch_and_execution(tool_name: str, arg_value: str) -> None:
         f"Expected arg '{arg_value}', got '{received_arg}'"
     )
 
-    # The conversation should contain a function role message with the tool result
+    # The conversation should contain a tool role message with the tool result
     function_messages = [
-        m for m in result.messages if m.role == "function"
+        m for m in result.messages if m.role == "tool"
     ]
     assert len(function_messages) >= 1, (
         "No function role message found in conversation"
@@ -593,7 +593,7 @@ def test_tool_dispatch_and_execution(tool_name: str, arg_value: str) -> None:
     assert result.messages[1].role == "assistant"
     assert result.messages[1].tool_calls is not None
     assert result.messages[1].tool_calls[0]["name"] == tool_name
-    assert result.messages[2].role == "function"
+    assert result.messages[2].role == "tool"
     assert result.messages[3].role == "assistant"
     assert result.messages[3].tool_calls is None
 
@@ -693,8 +693,8 @@ def test_tool_error_not_found(bad_tool_name: str) -> None:
     # The inference should still succeed (error is in the function message, not fatal)
     assert result.success is True
 
-    # Find the function role message for the bad tool
-    fn_msgs = [m for m in result.messages if m.role == "function" and m.name == bad_tool_name]
+    # Find the tool role message for the bad tool
+    fn_msgs = [m for m in result.messages if m.role == "tool" and m.name == bad_tool_name]
     assert len(fn_msgs) >= 1, f"No function message for '{bad_tool_name}'"
     assert "not found" in fn_msgs[0].content.lower(), (
         f"Expected 'not found' in function message, got: {fn_msgs[0].content}"
@@ -750,7 +750,7 @@ def test_tool_error_exception(exc_msg: str) -> None:
 
     assert result.success is True
 
-    fn_msgs = [m for m in result.messages if m.role == "function" and m.name == "failing_tool"]
+    fn_msgs = [m for m in result.messages if m.role == "tool" and m.name == "failing_tool"]
     assert len(fn_msgs) >= 1, "No function message for 'failing_tool'"
 
     content = fn_msgs[0].content

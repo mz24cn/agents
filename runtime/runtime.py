@@ -255,7 +255,18 @@ class Runtime:
             # Check max_tool_rounds (once per inference round, not per tool call)
             tool_round += 1
             if tool_round > request.max_tool_rounds:
-                # Exceeded max rounds — stop looping
+                # Exceeded max rounds — inject a function result for every pending
+                # tool call so the conversation history stays valid, then stop.
+                for fn_call in (tool_calls_to_execute or []):
+                    pending_name = fn_call.get("name", "unknown_tool")
+                    messages.append(Message(
+                        role="tool",
+                        name=pending_name,
+                        content=(
+                            f"Error: maximum tool-call rounds ({request.max_tool_rounds}) "
+                            f"reached. Tool '{pending_name}' was not executed."
+                        ),
+                    ))
                 break
 
             # Execute all tool calls sequentially in this round
@@ -278,7 +289,7 @@ class Runtime:
                         cwd_hint = f"\n\n技能工作目录: {skill_dir}" if skill_dir else ""
                         messages.append(
                             Message(
-                                role="function",
+                                role="tool",
                                 name=tool_name,
                                 content=(
                                     f"用户选择了 {tool_name} 技能。以下是该技能的详细文档，"
@@ -308,10 +319,10 @@ class Runtime:
                 # Execute tool and get result
                 tool_result = self._execute_tool_call(tool_name, arguments, tool_scope=tools)
 
-                # Add tool result as function role message
+                # Add tool result as tool role message
                 messages.append(
                     Message(
-                        role="function",
+                        role="tool",
                         content=tool_result,
                         name=tool_name,
                     )
@@ -870,6 +881,19 @@ class Runtime:
             # Max rounds check
             tool_round += 1
             if tool_round > request.max_tool_rounds:
+                # Yield a function-role result for every pending tool call so the
+                # conversation history stays valid (assistant tool_calls must always
+                # be followed by a matching function/tool result).
+                for fn_call in (tool_calls_to_execute or []):
+                    pending_name = fn_call.get("name", "unknown_tool")
+                    yield Message(
+                        role="tool",
+                        name=pending_name,
+                        content=(
+                            f"Error: maximum tool-call rounds ({request.max_tool_rounds}) "
+                            f"reached. Tool '{pending_name}' was not executed."
+                        ),
+                    )
                 stat_dict = {
                     "prompt_tokens": round_prompt,
                     "completion_tokens": round_completion,
@@ -904,7 +928,7 @@ class Runtime:
                     if skill_body:
                         cwd_hint = f"\n\n技能工作目录: {skill_dir}" if skill_dir else ""
                         fn_msg = Message(
-                            role="function",
+                            role="tool",
                             name=tool_name,
                             content=(
                                 f"用户选择了 {tool_name} 技能。以下是该技能的详细文档，"
@@ -929,7 +953,7 @@ class Runtime:
 
                 tool_result = self._execute_tool_call(tool_name, arguments, tool_scope=tools)
 
-                tool_msg = Message(role="function", content=tool_result, name=tool_name)
+                tool_msg = Message(role="tool", content=tool_result, name=tool_name)
                 messages.append(tool_msg)
                 yield tool_msg
 

@@ -15,11 +15,101 @@ import os
 import re
 import sys
 import threading
+import urllib.parse
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 from typing import Callable, Optional
 
 logger = logging.getLogger("runtime.server")
 
+
+# ---------------------------------------------------------------------------
+# Conversation formatting helpers
+# ---------------------------------------------------------------------------
+
+def _truncate_line(line: str, max_chars: int = 200) -> str:
+    """Truncate a single line to *max_chars*, appending '…' if cut."""
+    if len(line) <= max_chars:
+        return line
+    return line[:max_chars] + "…"
+
+
+def _summarise_result(result: str, max_lines: int = 2, max_line_chars: int = 200) -> str:
+    """Return a compact summary of a tool result for conversation.md.
+
+    Keeps at most *max_lines* non-empty lines, each truncated to
+    *max_line_chars* characters.  Appends a note when lines are dropped.
+    """
+    lines = result.splitlines()
+    non_empty = [l for l in lines if l.strip()]
+    kept = non_empty[:max_lines]
+    truncated_lines = [_truncate_line(l, max_line_chars) for l in kept]
+    summary = "\n".join(truncated_lines)
+    if len(non_empty) > max_lines:
+        summary += f"\n… ({len(non_empty) - max_lines} more lines)"
+    return summary
+
+
+def _args_summary(arguments: dict, max_chars: int = 120) -> str:
+    """Render tool arguments as a compact one-liner for conversation.md."""
+    if not arguments:
+        return ""
+    parts = []
+    for k, v in arguments.items():
+        v_str = str(v)
+        if len(v_str) > 40:
+            v_str = v_str[:40] + "…"
+        parts.append(f"{k}={v_str!r}")
+    joined = ", ".join(parts)
+    if len(joined) > max_chars:
+        joined = joined[:max_chars] + "…"
+    return joined
+
+
+def _format_tool_call_line(tool_name: str, arguments: dict) -> str:
+    """Format a tool invocation line for the assistant turn in conversation.md.
+
+    Format::
+
+        **tool:** tool_name(arg1=val1, arg2=val2)
+    """
+    args_str = _args_summary(arguments)
+    return f"**tool:** {tool_name}({args_str})"
+
+
+def _result_is_truncated(result: str, max_lines: int = 2) -> bool:
+    """Return True if the result has more non-empty lines than max_lines."""
+    lines = result.splitlines()
+    non_empty = [l for l in lines if l.strip()]
+    return len(non_empty) > max_lines
+
+
+def _format_tool_result_turn(
+    result: str,
+    tool_call_filename: str,
+) -> str:
+    """Format the result portion of a tool turn for conversation.md.
+
+    When the result fits within 2 lines it is inlined directly::
+
+        **result:**
+        <full result, each line ≤200 chars>
+
+    When the result is longer, a summary + file reference is used::
+
+        **result:**
+        <up to 2 lines of result, each ≤200 chars>
+        … (N more lines)
+        → tool-call-N-name.md
+    """
+    result_summary = _summarise_result(result)
+    if _result_is_truncated(result):
+        ref_line = f"→ {tool_call_filename}"
+        return f"**result:**\n{result_summary}\n{ref_line}"
+    else:
+        return f"**result:**\n{result_summary}"
+
+from runtime.env_manager import EnvManager
+from runtime.session_manager import SessionManager
 from runtime.mcp_client import MCPClientManager
 from runtime.skill_manager import SkillManager
 from runtime.models import (
@@ -32,6 +122,7 @@ from runtime.models import (
 from runtime.prompt_template_manager import PromptTemplateManager
 from runtime.registry import ModelRegistry, ToolRegistry
 from runtime.runtime import Runtime
+from runtime.context_manager import ContextManager, ConversationTurn
 
 _DATA_DIR = os.path.join(os.path.expanduser("~"), ".agents_runtime")
 
@@ -50,7 +141,8 @@ def _load_function_from_file(file_path: str, func_name: str) -> Callable:
         spec.loader.exec_module(module)
     except Exception as e:
         sys.modules.pop(module_name, None)
-        raise RuntimeError(f"执行模块 {file_path} 时出错: {e}") from e
+        logger.exception("执行模块 %s 时出错: %s", file_path, e)
+        raise RuntimeError(f"执行模块 {file_path} 时出错（详情参见日志）: {e}") from e
     if not hasattr(module, func_name):
         raise AttributeError(f"模块 '{file_path}' 中不存在函数 '{func_name}'")
     func = getattr(module, func_name)
@@ -162,6 +254,13 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self._handle_list_mcp_servers()
         elif path == "/v1/prompt-templates":
             self._handle_list_prompt_templates()
+        elif path == "/v1/env":
+            self._handle_get_env()
+        elif path == "/v1/sessions":
+            self._handle_list_sessions()
+        elif re.match(r"^/v1/sessions/[^/]+$", path):
+            session_id = path[len("/v1/sessions/"):]
+            self._handle_get_session(session_id)
         elif path.startswith("/v1/"):
             self._send_json_error(404, f"Not found: {self.path}")
         else:
@@ -228,6 +327,10 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self._handle_register_tool()
         elif path == "/v1/prompt-templates":
             self._handle_create_prompt_template()
+        elif path == "/v1/env":
+            self._handle_set_env()
+        elif path == "/v1/env/detect":
+            self._handle_detect_env()
         else:
             self._send_json_error(404, f"Not found: {self.path}")
 
@@ -270,6 +373,14 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         if m:
             self._handle_delete_prompt_template(m.group(1))
             return
+        m = re.match(r"^/v1/env/([^/]+)$", path)
+        if m:
+            self._handle_delete_env(urllib.parse.unquote(m.group(1)))
+            return
+        m = re.match(r"^/v1/sessions/([^/]+)$", path)
+        if m:
+            self._handle_delete_session(urllib.parse.unquote(m.group(1)))
+            return
         self._send_json_error(404, f"Not found: {self.path}")
 
     # ------------------------------------------------------------------
@@ -305,7 +416,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         """POST /v1/infer — execute model inference.
 
         Expects JSON body with at least model_id. Optional fields:
-        tool_ids, messages, text, max_tool_rounds.
+        tool_ids, messages, text, max_tool_rounds, session_id.
         """
         body = self._read_json_body()
         if body is None:
@@ -315,28 +426,137 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self._send_json_error(400, "Missing required field: model_id")
             return
 
-        # Build InferenceRequest from JSON
-        messages = None
+        # Session management via ContextManager.
+        # Sessions are only created/used when the client explicitly opts in by
+        # passing session_id="new" (create a fresh session) or an existing
+        # session_id string.  Requests that omit session_id entirely (or pass
+        # null/empty) run as stateless single-round inference — no session
+        # directory is created and no history is loaded or saved.
+        context_manager = self.server.context_manager  # type: ignore[attr-defined]
+        raw_session_id: Optional[str] = body.get("session_id") or None
+        session_id: Optional[str] = None
+        use_session: bool = False
+
+        if raw_session_id is not None:
+            if raw_session_id == "new":
+                # Explicit request for a brand-new session
+                try:
+                    session_id = context_manager.create_session()
+                    self.server.session_manager.on_session_created(session_id)  # type: ignore[attr-defined]
+                    use_session = True
+                except OSError as exc:
+                    self._send_json_error(500, f"Failed to create session: {exc}")
+                    return
+            else:
+                # Client supplied a specific session_id — use it only if it
+                # already exists on disk; otherwise fall back to stateless mode.
+                recovered = context_manager.recover_session(raw_session_id)
+                if recovered:
+                    session_id = raw_session_id
+                    use_session = True
+                    logger.info(
+                        "infer: recovered existing session from disk: %s", session_id
+                    )
+                else:
+                    logger.info(
+                        "infer: session_id %s not found on disk; "
+                        "running as stateless inference",
+                        raw_session_id,
+                    )
+
+        # Build original messages from request
+        original_messages = None
         if "messages" in body:
-            messages = [Message.from_dict(m) for m in body["messages"]]
+            original_messages = [Message.from_dict(m) for m in body["messages"]]
+
+        # Assemble context (prepend history from session) only when session is active
+        assembled_messages = original_messages
+        if use_session and session_id is not None:
+            try:
+                new_msgs_dicts = [m.to_dict() for m in original_messages] if original_messages else []
+                assembled_dicts = context_manager.assemble_context(session_id, new_msgs_dicts)
+                assembled_messages = [Message.from_dict(m) for m in assembled_dicts]
+            except OSError as exc:
+                self._send_json_error(500, f"Failed to assemble context: {exc}")
+                return
 
         request = InferenceRequest(
             model_id=body["model_id"],
             tool_ids=body.get("tool_ids", []),
-            messages=messages,
+            messages=assembled_messages,
             text=body.get("text"),
             stream=False,
-            max_tool_rounds=body.get("max_tool_rounds", 10),
+            max_tool_rounds=body.get("max_tool_rounds") or int(os.environ.get("MAX_TOOL_ROUNDS", 20)),
         )
 
         runtime = self._get_runtime()
         result = runtime.infer(request)
+
+        # Persist conversation turns only when a session is active.
+        # Stateless requests (no session_id supplied) skip all persistence.
+        if use_session and session_id is not None:
+            try:
+                import datetime as _dt
+                # Extract usage tokens from the last usage message in the result
+                last_usage_prompt: int = 0
+                last_usage_completion: int = 0
+                last_stat: Optional[dict] = None
+                for m in reversed(result.messages):
+                    if m.role == "usage":
+                        try:
+                            u = json.loads(m.content)
+                            last_usage_prompt = u.get("prompt_tokens", 0)
+                            last_usage_completion = u.get("completion_tokens", 0)
+                            last_stat = u
+                        except (json.JSONDecodeError, ValueError, AttributeError):
+                            pass
+                        break
+                last_total_tokens = last_usage_prompt + last_usage_completion or None
+
+                # Load existing turns so we can append
+                try:
+                    existing_turns = context_manager.load_conversation(session_id)
+                except (FileNotFoundError, ValueError):
+                    existing_turns = []
+                new_turns = list(existing_turns)
+                # Record new user messages; skip system (injected per-request)
+                for m in (original_messages or []):
+                    if m.role == "system":
+                        continue
+                    ts = _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+                    new_turns.append(ConversationTurn(role=m.role, content=m.content or "", timestamp=ts))
+                # Append the final assistant reply (last non-usage message)
+                final_reply = next(
+                    (m for m in reversed(result.messages) if m.role not in ("usage",)),
+                    None,
+                )
+                if final_reply is not None:
+                    ts = _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+                    new_turns.append(ConversationTurn(
+                        role=final_reply.role,
+                        content=final_reply.content or "",
+                        timestamp=ts,
+                        name=getattr(final_reply, "name", None) or None,
+                        tool_calls=getattr(final_reply, "tool_calls", None) or None,
+                        thinking=getattr(final_reply, "thinking", None) or None,
+                        stat=last_stat,
+                    ))
+                context_manager.save_conversation(session_id, new_turns, last_total_tokens=last_total_tokens)
+                # Trigger Phase 2 compression if token threshold exceeded
+                context_manager.update_rolling_summary(session_id, new_turns, last_total_tokens=last_total_tokens)
+                context_manager.extract_memory(session_id, new_turns, last_total_tokens=last_total_tokens)
+                self.server.session_manager.update_index(session_id, last_total_tokens=last_total_tokens)  # type: ignore[attr-defined]
+            except OSError as exc:
+                self._send_json_error(500, f"Failed to save conversation: {exc}")
+                return
 
         # Serialize InferenceResult
         response_data = {
             "success": result.success,
             "messages": [m.to_dict() for m in result.messages],
         }
+        if session_id is not None:
+            response_data["session_id"] = session_id
         if result.error is not None:
             response_data["error"] = result.error
         if result.error_code is not None:
@@ -351,7 +571,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         """POST /v1/infer/stream — execute streaming model inference.
 
         Returns Server-Sent Events (SSE) stream. Each event contains a
-        JSON-encoded Message delta.
+        JSON-encoded Message delta. Optional JSON field: session_id.
         """
         body = self._read_json_body()
         if body is None:
@@ -361,17 +581,67 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self._send_json_error(400, "Missing required field: model_id")
             return
 
-        messages = None
+        # Session management via ContextManager.
+        # Sessions are only created/used when the client explicitly opts in by
+        # passing session_id="new" (create a fresh session) or an existing
+        # session_id string.  Requests that omit session_id entirely (or pass
+        # null/empty) run as stateless single-round inference — no session
+        # directory is created and no history is loaded or saved.
+        context_manager = self.server.context_manager  # type: ignore[attr-defined]
+        raw_session_id: Optional[str] = body.get("session_id") or None
+        session_id: Optional[str] = None
+        use_session: bool = False
+
+        if raw_session_id is not None:
+            if raw_session_id == "new":
+                # Explicit request for a brand-new session
+                try:
+                    session_id = context_manager.create_session()
+                    self.server.session_manager.on_session_created(session_id)  # type: ignore[attr-defined]
+                    use_session = True
+                except OSError as exc:
+                    self._send_json_error(500, f"Failed to create session: {exc}")
+                    return
+            else:
+                # Client supplied a specific session_id — use it only if it
+                # already exists on disk; otherwise fall back to stateless mode.
+                recovered = context_manager.recover_session(raw_session_id)
+                if recovered:
+                    session_id = raw_session_id
+                    use_session = True
+                    logger.info(
+                        "infer_stream: recovered existing session from disk: %s", session_id
+                    )
+                else:
+                    logger.info(
+                        "infer_stream: session_id %s not found on disk; "
+                        "running as stateless inference",
+                        raw_session_id,
+                    )
+
+        # Build original messages from request
+        original_messages = None
         if "messages" in body:
-            messages = [Message.from_dict(m) for m in body["messages"]]
+            original_messages = [Message.from_dict(m) for m in body["messages"]]
+
+        # Assemble context (prepend history from session) only when session is active
+        assembled_messages = original_messages
+        if use_session and session_id is not None:
+            try:
+                new_msgs_dicts = [m.to_dict() for m in original_messages] if original_messages else []
+                assembled_dicts = context_manager.assemble_context(session_id, new_msgs_dicts)
+                assembled_messages = [Message.from_dict(m) for m in assembled_dicts]
+            except OSError as exc:
+                self._send_json_error(500, f"Failed to assemble context: {exc}")
+                return
 
         request = InferenceRequest(
             model_id=body["model_id"],
             tool_ids=body.get("tool_ids", []),
-            messages=messages,
+            messages=assembled_messages,
             text=body.get("text"),
             stream=True,
-            max_tool_rounds=body.get("max_tool_rounds", 10),
+            max_tool_rounds=body.get("max_tool_rounds") or int(os.environ.get("MAX_TOOL_ROUNDS", 20)),
         )
 
         # Send SSE headers
@@ -379,21 +649,144 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "close")
+        if session_id is not None:
+            self.send_header("X-Session-Id", session_id)
         self.end_headers()
 
         cancel_event = threading.Event()
         runtime = self._get_runtime()
+        collected_messages: list[Message] = []
         try:
             for msg in runtime.infer_stream(request, cancel_event=cancel_event):
+                collected_messages.append(msg)
                 event_data = json.dumps(msg.to_dict(), ensure_ascii=False)
                 self.wfile.write(f"data: {event_data}\n\n".encode("utf-8"))
                 self.wfile.flush()
                 # Log error messages from the stream for easier diagnosis
                 if msg.role == "assistant" and msg.content and msg.content.startswith("Error:"):
                     logger.error("infer_stream error event | model=%s %s", request.model_id, msg.content)
+
+            # Send session_id in final SSE event before [DONE] (only when session is active)
+            if use_session and session_id is not None:
+                session_event = json.dumps({"session_id": session_id}, ensure_ascii=False)
+                self.wfile.write(f"data: {session_event}\n\n".encode("utf-8"))
+                self.wfile.flush()
+
             # Send done event
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
+
+            # Persist conversation turns after stream completes.
+            # Skipped entirely for stateless requests (use_session=False).
+            # Strategy:
+            #   - Append new user messages (skip system — injected per-request)
+            #   - Walk collected_messages in order:
+            #       * assistant text deltas → accumulate into text buffer
+            #       * assistant tool_calls messages → flush text buf, save tool_calls
+            #         on the turn; when a function message follows, flush the assistant
+            #         turn first, then record the tool result turn
+            #       * tool-role messages → tool result turn (role="tool")
+            #       * thinking blocks → stored in the assistant turn's thinking field
+            #       * usage/system messages → skip
+            if use_session and session_id is not None:
+                try:
+                    import datetime as _dt
+                    # Load existing turns so we can append
+                    try:
+                        existing_turns = context_manager.load_conversation(session_id)
+                    except (FileNotFoundError, ValueError):
+                        existing_turns = []
+                    new_turns = list(existing_turns)
+                    # Record new user messages; skip system (injected per-request)
+                    for m in (original_messages or []):
+                        if m.role == "system":
+                            continue
+                        ts = _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+                        new_turns.append(ConversationTurn(role=m.role, content=m.content or "", timestamp=ts))
+                    # Walk stream messages
+                    assistant_text_buf: str = ""
+                    assistant_thinking_buf: str = ""
+                    pending_tool_calls: list[dict] = []  # tool_calls from the latest assistant msg
+                    last_usage_prompt: int = 0
+                    last_usage_completion: int = 0
+                    last_stat: Optional[dict] = None
+                    for m in collected_messages:
+                        if m.role == "usage":
+                            try:
+                                u = json.loads(m.content)
+                                last_usage_prompt = u.get("prompt_tokens", 0)
+                                last_usage_completion = u.get("completion_tokens", 0)
+                                last_stat = u
+                            except (json.JSONDecodeError, ValueError, AttributeError):
+                                pass
+                            continue
+                        if m.role == "assistant":
+                            if m.tool_calls:
+                                # Flush accumulated text first
+                                if assistant_text_buf:
+                                    ts = _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+                                    new_turns.append(ConversationTurn(
+                                        role="assistant",
+                                        content=assistant_text_buf,
+                                        timestamp=ts,
+                                        thinking=assistant_thinking_buf or None,
+                                    ))
+                                    assistant_text_buf = ""
+                                    assistant_thinking_buf = ""
+                                pending_tool_calls = m.tool_calls
+                            if m.content:
+                                assistant_text_buf += m.content
+                            if m.thinking:
+                                assistant_thinking_buf += m.thinking
+                        elif m.role == "tool":
+                            # Flush accumulated assistant text + tool_calls as one turn
+                            ts = _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+                            new_turns.append(ConversationTurn(
+                                role="assistant",
+                                content=assistant_text_buf,
+                                timestamp=ts,
+                                tool_calls=pending_tool_calls if pending_tool_calls else None,
+                                thinking=assistant_thinking_buf or None,
+                            ))
+                            assistant_text_buf = ""
+                            assistant_thinking_buf = ""
+                            pending_tool_calls = []
+                            # Tool result turn — full content stored inline
+                            new_turns.append(ConversationTurn(
+                                role="tool",
+                                content=m.content or "",
+                                timestamp=ts,
+                                name=m.name or "",
+                            ))
+                        # skip system deltas
+                    # Flush remaining assistant content
+                    if assistant_text_buf or pending_tool_calls:
+                        ts = _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+                        new_turns.append(ConversationTurn(
+                            role="assistant",
+                            content=assistant_text_buf,
+                            timestamp=ts,
+                            tool_calls=pending_tool_calls if pending_tool_calls else None,
+                            thinking=assistant_thinking_buf or None,
+                            stat=last_stat,
+                        ))
+                    elif assistant_thinking_buf:
+                        # Model produced only thinking output — record it so the turn is not lost
+                        ts = _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+                        new_turns.append(ConversationTurn(
+                            role="assistant",
+                            content=assistant_thinking_buf,
+                            timestamp=ts,
+                            stat=last_stat,
+                        ))
+                    last_total_tokens = (last_usage_prompt + last_usage_completion) or None
+                    context_manager.save_conversation(session_id, new_turns, last_total_tokens=last_total_tokens)
+                    # Trigger Phase 2 compression if token threshold exceeded
+                    context_manager.update_rolling_summary(session_id, new_turns, last_total_tokens=last_total_tokens)
+                    context_manager.extract_memory(session_id, new_turns, last_total_tokens=last_total_tokens)
+                    self.server.session_manager.update_index(session_id, last_total_tokens=last_total_tokens)  # type: ignore[attr-defined]
+                except OSError as exc:
+                    logger.error("infer_stream: failed to save conversation for session %s: %s", session_id, exc)
         except (BrokenPipeError, ConnectionResetError):
             # Client disconnected — signal infer_stream to stop
             cancel_event.set()
@@ -638,6 +1031,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                     config.function_file_path, config.function_name
                 )
             except (FileNotFoundError, AttributeError, TypeError, RuntimeError) as exc:
+                logger.error("加载函数工具失败 [tool_id=%s]: %s", config.tool_id, exc, exc_info=True)
                 self._send_json_error(400, f"加载函数失败: {exc}")
                 return
 
@@ -742,6 +1136,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                     config.function_file_path, config.function_name
                 )
             except (FileNotFoundError, AttributeError, TypeError, RuntimeError) as exc:
+                logger.error("更新函数工具失败 [tool_id=%s]: %s", tool_id, exc, exc_info=True)
                 self._send_json_error(400, f"加载函数失败: {exc}")
                 return
 
@@ -885,6 +1280,93 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         mgr.save(_PROMPT_TEMPLATES_PATH)
         self._send_json_response(200, {"status": "deleted", "template_id": template_id})
 
+    # ------------------------------------------------------------------
+    # Env handlers
+    # ------------------------------------------------------------------
+
+    def _handle_get_env(self) -> None:
+        """GET /v1/env — 返回所有环境变量键值对。"""
+        env_manager = self.server.env_manager  # type: ignore[attr-defined]
+        try:
+            env_map = env_manager.read()
+        except ValueError as exc:
+            self._send_json_error(500, f"env.json format error: {exc}")
+            return
+        self._send_json_response(200, {"env": env_map})
+
+    def _handle_set_env(self) -> None:
+        """POST /v1/env — 新增或更新一个环境变量。"""
+        body = self._read_json_body()
+        if body is None:
+            return
+        if "key" not in body:
+            self._send_json_error(400, "Missing required field: key")
+            return
+        key = body["key"]
+        if not key:
+            self._send_json_error(400, "key 不能为空")
+            return
+        value = str(body.get("value", ""))
+        env_manager = self.server.env_manager  # type: ignore[attr-defined]
+        try:
+            updated = env_manager.set(key, value)
+        except OSError as exc:
+            self._send_json_error(500, f"Failed to write env.json: {exc}")
+            return
+        self._send_json_response(200, {"env": updated})
+
+    def _handle_delete_env(self, key: str) -> None:
+        """DELETE /v1/env/{key} — 删除指定环境变量。"""
+        env_manager = self.server.env_manager  # type: ignore[attr-defined]
+        try:
+            updated = env_manager.delete(key)
+        except OSError as exc:
+            self._send_json_error(500, f"Failed to write env.json: {exc}")
+            return
+        self._send_json_response(200, {"env": updated})
+
+    def _handle_detect_env(self) -> None:
+        """POST /v1/env/detect — 扫描项目目录，返回检测到的 key 列表。"""
+        env_manager = self.server.env_manager  # type: ignore[attr-defined]
+        keys = env_manager.detect_used_keys(os.path.dirname(os.path.abspath(__file__)))
+        self._send_json_response(200, {"keys": keys})
+
+    # ------------------------------------------------------------------
+    # Session handlers
+    # ------------------------------------------------------------------
+
+    def _handle_list_sessions(self) -> None:
+        """GET /v1/sessions — 返回所有历史会话列表。"""
+        session_manager = self.server.session_manager  # type: ignore[attr-defined]
+        sessions = session_manager.list_sessions()
+        self._send_json_response(200, {"sessions": sessions})
+
+    def _handle_get_session(self, session_id: str) -> None:
+        """GET /v1/sessions/{session_id} — 返回指定会话的完整消息记录。"""
+        session_manager = self.server.session_manager  # type: ignore[attr-defined]
+        try:
+            data = session_manager.get_session(session_id)
+        except FileNotFoundError:
+            self._send_json_error(404, f"Session not found: {session_id}")
+            return
+        except ValueError as exc:
+            self._send_json_error(400, f"Invalid conversation format: {exc}")
+            return
+        self._send_json_response(200, data)
+
+    def _handle_delete_session(self, session_id: str) -> None:
+        """DELETE /v1/sessions/{session_id} — 删除指定会话目录。"""
+        session_manager = self.server.session_manager  # type: ignore[attr-defined]
+        try:
+            session_manager.delete_session(session_id)
+        except FileNotFoundError:
+            self._send_json_error(404, f"Session not found: {session_id}")
+            return
+        except ValueError as exc:
+            self._send_json_error(400, str(exc))
+            return
+        self._send_json_response(200, {"status": "deleted", "session_id": session_id})
+
 
 class RuntimeHTTPServer:
     """Lightweight HTTP API server wrapping a Runtime instance.
@@ -908,6 +1390,7 @@ class RuntimeHTTPServer:
         host: str = "0.0.0.0",
         port: int = 8080,
         static_dir: Optional[str] = None,
+        chats_dir: Optional[str] = None,
     ) -> None:
         """Initialize the HTTP server.
 
@@ -922,6 +1405,8 @@ class RuntimeHTTPServer:
                 with / and unknown paths falling back to index.html (SPA mode).
                 Defaults to the web/dist directory next to this package if it
                 exists, otherwise None (static serving disabled).
+            chats_dir: Base directory for session storage. Defaults to
+                ``~/.agents_runtime/chat_data`` (alongside other config files).
         """
         _load_env_overrides()
         # Configure logging if not already configured
@@ -978,6 +1463,35 @@ class RuntimeHTTPServer:
                 prompt_template_manager=self._prompt_template_manager,
             )
 
+        # Initialize ContextManager between Server and Runtime
+        self._context_manager = ContextManager(
+            infer_fn=self._runtime.infer,
+            chats_dir=chats_dir if chats_dir is not None else os.path.join(_DATA_DIR, "chat_data"),
+        )
+        # Initialize EnvManager and SessionManager
+        self._env_manager = EnvManager(env_path=_ENV_PATH)
+        self._session_manager = SessionManager(
+            chats_dir=chats_dir if chats_dir is not None else os.path.join(_DATA_DIR, "chat_data"),
+            infer_fn=self._runtime.infer,
+        )
+        # Log Phase 2 configuration status
+        _summary_model = os.environ.get("SUMMARY_MODEL_ID", "")
+        _max_tokens = os.environ.get("MAX_TOKENS_IN_CONTEXT", "")
+        if _summary_model:
+            logger.info(
+                "ContextManager Phase 2 enabled: SUMMARY_MODEL_ID=%s, "
+                "MAX_TOKENS_IN_CONTEXT=%s (default 65536 if unset). "
+                "Both values are re-read from env vars at runtime.",
+                _summary_model,
+                _max_tokens if _max_tokens else "65536 (default)",
+            )
+        else:
+            logger.info(
+                "ContextManager running in Phase 1 (storage-only) mode. "
+                "Set SUMMARY_MODEL_ID env var to enable Phase 2 compression "
+                "(takes effect immediately without restart)."
+            )
+
     def start(self) -> None:
         """Start the HTTP server (blocking).
 
@@ -987,6 +1501,9 @@ class RuntimeHTTPServer:
         self._server.runtime = self._runtime  # type: ignore[attr-defined]
         self._server.prompt_template_manager = self._prompt_template_manager  # type: ignore[attr-defined]
         self._server.static_dir = self._static_dir  # type: ignore[attr-defined]
+        self._server.context_manager = self._context_manager  # type: ignore[attr-defined]
+        self._server.env_manager = self._env_manager  # type: ignore[attr-defined]
+        self._server.session_manager = self._session_manager  # type: ignore[attr-defined]
         self._server.serve_forever()
 
     def start_background(self) -> None:
@@ -998,6 +1515,9 @@ class RuntimeHTTPServer:
         self._server.runtime = self._runtime  # type: ignore[attr-defined]
         self._server.prompt_template_manager = self._prompt_template_manager  # type: ignore[attr-defined]
         self._server.static_dir = self._static_dir  # type: ignore[attr-defined]
+        self._server.context_manager = self._context_manager  # type: ignore[attr-defined]
+        self._server.env_manager = self._env_manager  # type: ignore[attr-defined]
+        self._server.session_manager = self._session_manager  # type: ignore[attr-defined]
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
 

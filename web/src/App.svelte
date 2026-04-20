@@ -5,6 +5,7 @@
   import ModelsPage from './components/models/ModelsPage.svelte'
   import ToolsPage from './components/tools/ToolsPage.svelte'
   import PromptsPage from './components/prompts/PromptsPage.svelte'
+  import EnvPage from './components/env/EnvPage.svelte'
 </script>
 
 <Layout>
@@ -16,6 +17,8 @@
     <ToolsPage />
   {:else if router.current === '#/prompts'}
     <PromptsPage />
+  {:else if router.current === '#/env'}
+    <EnvPage />
   {:else}
     <ChatPage />
   {/if}

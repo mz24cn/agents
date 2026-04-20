@@ -247,7 +247,7 @@ def print_result(result: dict, label: str = "") -> None:
                     print(f"\n  [助手→工具] {tc.get('name')}({tc.get('arguments', {})})")
             if content:
                 print(f"\n  [助手] {content}")
-        elif role == "function":
+        elif role == "tool":
             name = msg.get("name", "")
             preview = content[:200] + ("..." if len(content) > 200 else "")
             print(f"\n  [工具 {name}] {preview}")

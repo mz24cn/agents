@@ -95,7 +95,7 @@ def print_result(result):
                     print(f"\n[助手] 调用工具: {tc['name']}({tc.get('arguments', '{}')})")
             if msg.content:
                 print(f"\n[助手] {msg.content}")
-        elif msg.role == "function":
+        elif msg.role == "tool":
             preview = msg.content[:300] + ("..." if len(msg.content) > 300 else "")
             print(f"\n[工具 {msg.name}] {preview}")
 
@@ -133,7 +133,7 @@ def run_stream(runtime, request):
                     if len(args_str) > 150:
                         args_str = args_str[:150] + "..."
                     print(f"\n{YELLOW}[调用] {tc['name']}({args_str}){RESET}", flush=True)
-        elif msg.role == "function":
+        elif msg.role == "tool":
             preview = msg.content[:300] + ("..." if len(msg.content) > 300 else "")
             print(f"\n{CYAN}[工具 {msg.name}] {preview}{RESET}", flush=True)
 

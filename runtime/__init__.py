@@ -11,7 +11,6 @@ from runtime.registry import ModelRegistry, ToolRegistry
 from runtime.mcp_client import MCPClientManager
 from runtime.skill_manager import SkillManager
 from runtime.runtime import Runtime
-from runtime.server import RuntimeHTTPServer
 from runtime.tools import register_function_tool
 from runtime.builtin_tools import register_builtin_tools
 
@@ -31,8 +30,6 @@ __all__ = [
     "MCPClientManager",
     # Skill
     "SkillManager",
-    # HTTP server
-    "RuntimeHTTPServer",
     # Decorators
     "register_function_tool",
     # Built-in tools

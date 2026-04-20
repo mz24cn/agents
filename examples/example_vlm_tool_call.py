@@ -125,7 +125,7 @@ def main():
                     if len(args_str) > 200:
                         args_str = args_str[:200] + "..."
                     print(f"\n{YELLOW}[调用] {tc['name']}({args_str}){RESET}", flush=True)
-        elif msg.role == "function":
+        elif msg.role == "tool":
             preview = msg.content[:500] + ("..." if len(msg.content) > 500 else "")
             print(f"\n{CYAN}[工具 {msg.name}] {preview}{RESET}", flush=True)
 

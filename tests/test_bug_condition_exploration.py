@@ -205,7 +205,7 @@ def test_openai_non_stream_extracts_all_tool_calls(tool_calls: list[dict]) -> No
     """
     response_data = _build_openai_non_stream_response(tool_calls)
     proto = OpenAIProtocol()
-    messages = proto._parse_non_stream_response(response_data)
+    messages, _stat = proto._parse_non_stream_response(response_data)
 
     assert len(messages) == 1
     msg = messages[0]

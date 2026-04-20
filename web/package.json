@@ -20,6 +20,7 @@
   "dependencies": {
     "marked": "^15.0.0",
     "pnpm": "^10.33.0",
-    "typescript": "^6.0.2"
+    "typescript": "^6.0.2",
+    "vite-plugin-svelte-monorepo": "github:sveltejs/vite-plugin-svelte"
   }
 }

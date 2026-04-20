@@ -136,9 +136,9 @@ class OpenAIProtocol(BaseProtocol):
         For messages with images, content becomes an array of content parts
         with text and image_url objects.
         """
-        # Handle function/tool result messages:
+        # Handle tool result messages:
         # OpenAI API requires role="tool" with a tool_call_id
-        if msg.role == "function":
+        if msg.role == "tool":
             tool_call_id = self._tool_call_ids.get(msg.name, "call_" + (msg.name or "unknown"))
             return {
                 "role": "tool",
@@ -166,7 +166,7 @@ class OpenAIProtocol(BaseProtocol):
                 })
             return result
 
-        # Handle function role messages (legacy, shouldn't reach here)
+        # Handle tool role messages (legacy, shouldn't reach here)
         if msg.name is not None:
             result["name"] = msg.name
 
@@ -417,11 +417,11 @@ class OllamaProtocol(BaseProtocol):
         For messages with images, the images field is placed at the same level
         as content. Images are raw base64 strings without data URI prefix.
         """
-        # Ollama uses "tool" role for tool results, not "function"
-        role = "tool" if msg.role == "function" else msg.role
+        # Ollama uses "tool" role for tool results
+        role = msg.role
         result = {"role": role, "content": msg.content or ""}
 
-        # Handle function role messages
+        # Handle tool role messages
         if msg.name is not None:
             result["name"] = msg.name
 

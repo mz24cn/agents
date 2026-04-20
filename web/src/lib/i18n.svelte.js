@@ -54,6 +54,7 @@ const translations = {
     // ChatInput
     inputPlaceholder: '输入消息...',
     clearChat: '清除对话',
+    newSession: '新建会话',
 
     // ChatPage
     systemPromptLabel: '系统提示词:',
@@ -177,6 +178,32 @@ const translations = {
     deleteTemplateFailed: '删除模板失败',
     confirmDeleteTemplate: '确定要删除模板「{name}」吗？',
 
+    // SessionPanel
+    sessionPanelTitle: '历史会话',
+    noSessions: '暂无历史会话',
+    fetchSessionsFailed: '获取会话列表失败',
+    restoreSessionFailed: '恢复会话失败',
+    deleteSession: '删除会话',
+    deleteSessionFailed: '删除会话失败',
+    confirmDeleteSession: '确定要删除会话「{id}」吗？',
+
+    // EnvPage
+    nav_env: '环境变量',
+    envPageTitle: '环境变量管理',
+    noEnvVars: '暂无环境变量',
+    fetchEnvFailed: '获取环境变量失败',
+    deleteEnvFailed: '删除环境变量失败',
+    saveEnvFailed: '保存环境变量失败',
+    detectEnvFailed: '检测环境变量失败',
+    confirmDeleteEnv: '确定要删除环境变量「{key}」吗？',
+    envKey: '变量名',
+    envValue: '变量值',
+    addEnvVar: '新增变量',
+    detectEnvVars: '检测',
+    detectedUnsetKeys: '检测到以下未配置的变量：',
+    noUnsetKeys: '所有检测到的变量均已配置',
+    envKeyRequired: '变量名不能为空',
+
     // ToolDetail
     toolDetail: '工具详情',
     toolId: '工具 ID',
@@ -277,6 +304,7 @@ const translations = {
     // ChatInput
     inputPlaceholder: 'Type a message...',
     clearChat: 'Clear chat',
+    newSession: 'New session',
 
     // ChatPage
     systemPromptLabel: 'System prompt:',
@@ -399,6 +427,32 @@ const translations = {
     fetchTemplateListFailed: 'Failed to fetch template list',
     deleteTemplateFailed: 'Failed to delete template',
     confirmDeleteTemplate: 'Delete template "{name}"?',
+
+    // SessionPanel
+    sessionPanelTitle: 'History',
+    noSessions: 'No sessions yet',
+    fetchSessionsFailed: 'Failed to fetch sessions',
+    restoreSessionFailed: 'Failed to restore session',
+    deleteSession: 'Delete session',
+    deleteSessionFailed: 'Failed to delete session',
+    confirmDeleteSession: 'Delete session "{id}"?',
+
+    // EnvPage
+    nav_env: 'Env Vars',
+    envPageTitle: 'Environment Variables',
+    noEnvVars: 'No environment variables',
+    fetchEnvFailed: 'Failed to fetch environment variables',
+    deleteEnvFailed: 'Failed to delete environment variable',
+    saveEnvFailed: 'Failed to save environment variable',
+    detectEnvFailed: 'Failed to detect environment variables',
+    confirmDeleteEnv: 'Delete environment variable "{key}"?',
+    envKey: 'Key',
+    envValue: 'Value',
+    addEnvVar: 'Add Variable',
+    detectEnvVars: 'Detect',
+    detectedUnsetKeys: 'Detected unconfigured variables:',
+    noUnsetKeys: 'All detected variables are configured',
+    envKeyRequired: 'Key is required',
 
     // ToolDetail
     toolDetail: 'Tool Detail',

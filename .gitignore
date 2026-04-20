@@ -10,6 +10,7 @@ build/
 .eggs/
 *.so
 *.dylib
+chat_data
 
 # Virtual environments
 .venv/
@@ -24,6 +25,7 @@ env/
 coverage.xml
 htmlcov/
 *.lcov
+/tests
 
 # Type checking
 .mypy_cache/
@@ -32,6 +34,7 @@ htmlcov/
 
 # Node / Vite / Svelte
 node_modules/
+web/node_modules
 web/node_modules/
 /package.json
 /package-lock.json
@@ -51,8 +54,11 @@ yarn-error.log*
 Thumbs.db
 
 # IDE
-.vscode/settings.json
+.vscode/
 .idea/
 
 # Kiro
 .kiro/
+
+# user data
+/chats

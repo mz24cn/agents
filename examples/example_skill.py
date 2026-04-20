@@ -126,7 +126,7 @@ def main():
                         args_str = args_str[:150] + "..."
                     print(f"\n{YELLOW}[调用] {tc['name']}({args_str}){RESET}", flush=True)
 
-        elif msg.role == "function":
+        elif msg.role == "tool":
             preview = msg.content[:400] + ("..." if len(msg.content) > 400 else "")
             print(f"\n{CYAN}[工具 {msg.name}] {preview}{RESET}", flush=True)
 

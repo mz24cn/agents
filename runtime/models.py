@@ -13,9 +13,9 @@ class Message:
     """A single message in a conversation.
 
     Attributes:
-        role: Message role - "system", "user", "assistant", or "function".
+        role: Message role - "system", "user", "assistant", or "tool".
         content: Text content of the message.
-        name: Optional name (used for function role messages).
+        name: Optional name (used for tool role messages).
         tool_calls: Optional list of tool call dicts for parallel tool calls.
         images: Optional list of base64-encoded image strings (multimodal).
         audio: Optional base64-encoded audio string (multimodal).
@@ -201,7 +201,7 @@ class InferenceRequest:
     messages: Optional[list] = None
     text: Optional[str] = None
     stream: bool = False
-    max_tool_rounds: int = 10
+    max_tool_rounds: int = 20
 
 
 @dataclass

@@ -252,7 +252,7 @@ def run_client():
                         args_str = args_str[:150] + "..."
                     print(f"\n{YELLOW}[调用] {tc['name']}({args_str}){RESET}", flush=True)
 
-        elif role == "function":
+        elif role == "tool":
             name = event.get("name", "?")
             result = event.get("content", "")
             preview = result[:400] + ("..." if len(result) > 400 else "")
