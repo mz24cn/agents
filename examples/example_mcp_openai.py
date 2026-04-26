@@ -21,8 +21,8 @@
   本示例默认使用 Ollama 的 OpenAI 兼容端点（http://localhost:11434/v1）。
   如需切换到其他服务，修改下方 API_BASE、MODEL_NAME、API_KEY 即可：
 
-  # OpenAI 官方（协议层自动拼接 /v1/chat/completions，所以不要带 /v1）
-  API_BASE = "https://api.openai.com"
+  # OpenAI 官方（协议层自动拼接 /chat/completions）
+  API_BASE = "https://api.openai.com/v1"
   MODEL_NAME = "gpt-4o"
   API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
@@ -58,7 +58,7 @@ BOLD = "\033[1m"
 # ============================================================
 # 模型配置 —— 修改这三行即可切换不同的 OpenAI 兼容服务
 # ============================================================
-API_BASE = "http://localhost:11434"              # Ollama OpenAI 兼容端点（协议层自动拼接 /v1/chat/completions）
+API_BASE = "http://localhost:11434/v1"              # Ollama OpenAI 兼容端点（协议层自动拼接 /chat/completions）
 MODEL_NAME = "qwen3:14b"                        # Ollama 中的模型名
 API_KEY = os.environ.get("OPENAI_API_KEY", "")  # Ollama 不需要 key，留空即可
 

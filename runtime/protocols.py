@@ -59,7 +59,7 @@ class OpenAIProtocol(BaseProtocol):
     """OpenAI Chat Completions API protocol adapter.
 
     Constructs requests in the OpenAI Chat Completions format:
-    - URL: {api_base}/v1/chat/completions
+    - URL: {api_base}/chat/completions
     - Multimodal: images encoded as image_url objects in content array
     - Tools: standard OpenAI tools format with type "function"
     - Supports both streaming and non-streaming responses
@@ -86,7 +86,7 @@ class OpenAIProtocol(BaseProtocol):
         Returns:
             A tuple of (url, headers, body_bytes).
         """
-        url = config.api_base.rstrip("/") + "/v1/chat/completions"
+        url = config.api_base.rstrip("/") + "/chat/completions"
 
         # Reset tool_call_id mapping for this request
         self._tool_call_ids = {}
