@@ -8,7 +8,7 @@
   const isEdit = template !== null
   const _init = template ?? {}
 
-  let name = $state(_init.name ?? '')
+  let templateId = $state(_init.template_id ?? '')
   let content = $state(_init.content ?? '')
 
   let errors = $state({})
@@ -19,7 +19,7 @@
 
   function validate() {
     const e = {}
-    if (!name.trim()) e.name = t('templateNameRequired')
+    if (!templateId.trim()) e.templateId = t('templateIdRequired')
     if (!content.trim()) e.content = t('templateContentRequired')
     errors = e
     return Object.keys(e).length === 0
@@ -29,7 +29,7 @@
     if (!validate()) return
     submitting = true
     submitError = ''
-    const payload = { name: name.trim(), content: content.trim() }
+    const payload = { template_id: templateId.trim(), content: content.trim() }
     try {
       if (isEdit) await promptTemplates.update(template.template_id, payload)
       else await promptTemplates.create(payload)
@@ -50,9 +50,9 @@
   {/if}
 
   <div class="form-group">
-    <label for="tpl_name">{t('templateName')} <span class="required">{t('required')}</span></label>
-    <input id="tpl_name" type="text" bind:value={name} placeholder={t('templateNamePlaceholder')} />
-    {#if errors.name}<span class="field-error">{errors.name}</span>{/if}
+    <label for="tpl_id">{t('templateId')} <span class="required">{t('required')}</span></label>
+    <input id="tpl_id" type="text" bind:value={templateId} placeholder={t('templateIdPlaceholder')} />
+    {#if errors.templateId}<span class="field-error">{errors.templateId}</span>{/if}
   </div>
 
   <div class="form-group">

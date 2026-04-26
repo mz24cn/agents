@@ -82,8 +82,7 @@ class Runtime:
             messages = list(request.messages)
             for msg in messages:
                 if (
-                    msg.role == "user"
-                    and not msg.content
+                    not msg.content
                     and msg.prompt_template is not None
                     and self._prompt_template_manager is not None
                 ):
@@ -303,7 +302,7 @@ class Runtime:
                     self._ensure_builtin_tools(tools)
 
                     # Remove the Skill itself from tools to avoid re-selection
-                    tools = [t for t in tools if t.tool_id != tool_name]
+                    tools = [t for t in tools if t.tool_id != tool_name and t.name != tool_name]
 
                     # Don't consume a tool_round for skill disclosure
                     tool_round -= 1
@@ -940,7 +939,7 @@ class Runtime:
                         yield fn_msg
 
                     self._ensure_builtin_tools(tools)
-                    tools = [t for t in tools if t.tool_id != tool_name]
+                    tools = [t for t in tools if t.tool_id != tool_name and t.name != tool_name]
                     tool_round -= 1
                     skill_triggered = True
                     break  # Break inner loop; continue outer while loop

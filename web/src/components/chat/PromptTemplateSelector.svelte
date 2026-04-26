@@ -3,7 +3,12 @@
   import { extractPlaceholders } from '../../lib/placeholder.js'
   import { t } from '../../lib/i18n.svelte.js'
 
-  let { onSelect, applyToSystem = $bindable(false) } = $props()
+  /**
+   * 面板右侧：模板列表
+   * selectedTemplateId: 当前选中的模板 ID（持久保留）
+   * onSelect(result): result = null | { type: 'direct', content } | { type: 'template', template }
+   */
+  let { selectedTemplateId = $bindable(null), onSelect } = $props()
 
   let templateList = $state([])
   let loading = $state(true)
@@ -22,65 +27,91 @@
     }
   }
 
-  function handleChange(e) {
-    const templateId = e.target.value
-    if (!templateId) { onSelect?.(null); return }
-    const template = templateList.find(t => t.template_id === templateId)
-    if (!template) return
-    const placeholders = extractPlaceholders(template.content)
+  function handleSelect(tpl) {
+    selectedTemplateId = tpl.template_id
+    const placeholders = extractPlaceholders(tpl.content)
     if (placeholders.length === 0) {
-      onSelect?.({ type: 'direct', content: template.content })
+      onSelect?.({ type: 'direct', content: tpl.content, template: tpl })
     } else {
-      onSelect?.({ type: 'template', template })
+      onSelect?.({ type: 'template', template: tpl })
     }
   }
 
-  $effect(() => { fetchTemplates() })
+  $effect(() => {
+    fetchTemplates()
+  })
+
+  // 当模板列表加载完成后，如果有已选中的模板，自动触发选中
+  $effect(() => {
+    if (!loading && selectedTemplateId && templateList.length > 0) {
+      const tpl = templateList.find(t => t.template_id === selectedTemplateId)
+      if (tpl) {
+        const placeholders = extractPlaceholders(tpl.content)
+        if (placeholders.length === 0) {
+          onSelect?.({ type: 'direct', content: tpl.content, template: tpl })
+        } else {
+          onSelect?.({ type: 'template', template: tpl })
+        }
+      }
+    }
+  })
 </script>
 
-<div class="template-selector">
-  <label for="template-select">{t('promptTemplateLabel')}</label>
+<div class="template-list">
   {#if loading}
-    <span class="hint">{t('loading')}</span>
+    <div class="hint">{t('loading')}</div>
   {:else if error}
-    <span class="hint error">{error}</span>
+    <div class="hint error">{error}</div>
+  {:else if templateList.length === 0}
+    <div class="hint">{t('noTemplates')}</div>
   {:else}
-    <select id="template-select" onchange={handleChange}>
-      <option value="">{t('selectTemplatePlaceholder')}</option>
-      {#each templateList as tpl (tpl.template_id)}
-        <option value={tpl.template_id}>{tpl.name}</option>
-      {/each}
-    </select>
+    {#each templateList as tpl (tpl.template_id)}
+      <button
+        class="template-item"
+        class:selected={selectedTemplateId === tpl.template_id}
+        onclick={() => handleSelect(tpl)}
+      >
+        <span class="tpl-name">{tpl.template_id}</span>
+      </button>
+    {/each}
   {/if}
-  <label class="checkbox-label">
-    <input type="checkbox" bind:checked={applyToSystem} />
-    {t('applyToSystem')}
-  </label>
 </div>
 
 <style>
-  .template-selector { display: flex; align-items: center; gap: 8px; }
-  label { font-size: 0.85rem; font-weight: 600; color: var(--text-secondary); white-space: nowrap; }
-  select {
-    padding: 6px 10px;
-    border-radius: 6px;
-    border: 1px solid var(--border);
-    background: var(--bg);
-    color: var(--text);
-    font-size: 0.9rem;
-    min-width: 180px;
-  }
-  .hint { font-size: 0.8rem; color: var(--text-secondary); }
-  .hint.error { color: var(--danger); }
-  .checkbox-label {
+  .template-list {
     display: flex;
-    align-items: center;
-    gap: 4px;
+    flex-direction: column;
+    gap: 2px;
+    padding: 4px;
+  }
+  .hint {
     font-size: 0.85rem;
-    font-weight: 600;
     color: var(--text-secondary);
+    padding: 8px 4px;
+  }
+  .hint.error { color: var(--danger); }
+  .template-item {
+    display: block;
+    width: 100%;
+    text-align: left;
+    padding: 8px 10px;
+    border-radius: 6px;
+    border: 1px solid transparent;
+    background: none;
+    color: var(--text);
+    font-size: 0.85rem;
     cursor: pointer;
+    transition: background-color 0.12s, border-color 0.12s;
     white-space: nowrap;
   }
-  .checkbox-label input[type="checkbox"] { cursor: pointer; }
+  .template-item:hover {
+    background: var(--bg-secondary);
+    border-color: var(--border);
+  }
+  .template-item.selected {
+    background: var(--primary);
+    color: #fff;
+    border-color: var(--primary);
+  }
+  .tpl-name { font-weight: 500; }
 </style>

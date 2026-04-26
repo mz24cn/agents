@@ -124,7 +124,7 @@ class SkillManager:
 
         # Generate Skill ToolConfig (lightweight — only name + description)
         skill_tool_config = ToolConfig(
-            tool_id=skill_name,
+            tool_id=f"skill-{skill_name}",
             tool_type="skill",
             name=skill_name,
             description=description,

@@ -10,7 +10,6 @@
   const isMcpEdit = mcpServer !== null
 
   let tool_type = $state(isMcpEdit ? 'mcp' : (_init.tool_type ?? 'function'))
-  let tool_id = $state(_init.tool_id ?? '')
   let name = $state(_init.name ?? '')
   let description = $state(_init.description ?? '')
   let parameters_text = $state(
@@ -51,7 +50,6 @@
     } else if (tool_type === 'skill') {
       if (!skill_dir.trim()) e.skill_dir = t('skillDirRequired')
     } else {
-      if (!tool_id.trim()) e.tool_id = t('toolIdRequired')
       if (!name.trim()) e.name = t('toolNameRequired')
       if (!description.trim()) e.description = t('toolDescRequired')
       if (!parameters_text.trim()) {
@@ -59,10 +57,8 @@
       } else {
         try { JSON.parse(parameters_text) } catch { e.parameters = t('jsonInvalid') }
       }
-      if (tool_type === 'function') {
-        if (!function_file_path.trim()) e.function_file_path = t('functionFileRequired')
-        if (!function_name.trim()) e.function_name = t('functionNameRequired')
-      }
+      if (!function_file_path.trim()) e.function_file_path = t('functionFileRequired')
+      if (!function_name.trim()) e.function_name = t('functionNameRequired')
     }
     errors = e
     return Object.keys(e).length === 0
@@ -81,17 +77,14 @@
         await tools.createSkill(skill_dir.trim())
       } else {
         const config = {
-          tool_id: tool_id.trim(),
           tool_type,
           name: name.trim(),
           description: description.trim(),
           parameters: JSON.parse(parameters_text),
         }
-        if (tool_type === 'function') {
-          if (function_file_path.trim()) config.function_file_path = function_file_path.trim()
-          if (function_name.trim()) config.function_name = function_name.trim()
-        }
-        if (isEdit) await tools.update(config.tool_id, config)
+        if (function_file_path.trim()) config.function_file_path = function_file_path.trim()
+        if (function_name.trim()) config.function_name = function_name.trim()
+        if (isEdit) await tools.update(_init.tool_id, config)
         else await tools.create(config)
       }
       onSuccess()
@@ -138,12 +131,6 @@
     </div>
   {:else}
     <div class="form-group">
-      <label for="tool_id">{t('toolId')} <span class="required">{t('required')}</span></label>
-      <input id="tool_id" type="text" bind:value={tool_id} disabled={isEdit} placeholder={t('toolIdPlaceholder')} />
-      {#if errors.tool_id}<span class="field-error">{errors.tool_id}</span>{/if}
-    </div>
-
-    <div class="form-group">
       <label for="name">{t('name')} <span class="required">{t('required')}</span></label>
       <input id="name" type="text" bind:value={name} placeholder={t('toolNamePlaceholder')} />
       {#if errors.name}<span class="field-error">{errors.name}</span>{/if}
@@ -161,21 +148,19 @@
       {#if errors.parameters}<span class="field-error">{errors.parameters}</span>{/if}
     </div>
 
-    {#if tool_type === 'function'}
-      <div class="form-group">
-        <label for="function_file_path">{t('functionFilePath')} <span class="required">{t('required')}</span></label>
-        <input id="function_file_path" type="text" bind:value={function_file_path} placeholder={t('functionFilePathPlaceholder')} />
-        {#if errors.function_file_path}<span class="field-error">{errors.function_file_path}</span>{/if}
-        <span class="hint">{t('functionFilePathHint')}</span>
-      </div>
+    <div class="form-group">
+      <label for="function_file_path">{t('functionFilePath')} <span class="required">{t('required')}</span></label>
+      <input id="function_file_path" type="text" bind:value={function_file_path} placeholder={t('functionFilePathPlaceholder')} />
+      {#if errors.function_file_path}<span class="field-error">{errors.function_file_path}</span>{/if}
+      <span class="hint">{t('functionFilePathHint')}</span>
+    </div>
 
-      <div class="form-group">
-        <label for="function_name">{t('functionName')} <span class="required">{t('required')}</span></label>
-        <input id="function_name" type="text" bind:value={function_name} placeholder={t('functionNamePlaceholder')} />
-        {#if errors.function_name}<span class="field-error">{errors.function_name}</span>{/if}
-        <span class="hint">{t('functionNameHint')}</span>
-      </div>
-    {/if}
+    <div class="form-group">
+      <label for="function_name">{t('functionName')} <span class="required">{t('required')}</span></label>
+      <input id="function_name" type="text" bind:value={function_name} placeholder={t('functionNamePlaceholder')} />
+      {#if errors.function_name}<span class="field-error">{errors.function_name}</span>{/if}
+      <span class="hint">{t('functionNameHint')}</span>
+    </div>
   {/if}
 
   <div class="form-actions">

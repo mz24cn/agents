@@ -654,8 +654,8 @@ class TestPromptTemplateCRUD:
         assert body == {"templates": []}
 
     def test_post_create_template(self, server):
-        """POST /v1/prompt-templates with name+content returns 201 with template_id."""
-        data = {"name": "test-template", "content": "Hello {name}"}
+        """POST /v1/prompt-templates with template_id+content returns 201 with template_id."""
+        data = {"template_id": "test-template", "content": "Hello {name}"}
         status, body = _post(server, "/v1/prompt-templates", data)
         assert status == 201
         assert body["status"] == "created"
@@ -663,8 +663,8 @@ class TestPromptTemplateCRUD:
         assert isinstance(body["template_id"], str)
         assert len(body["template_id"]) > 0
 
-    def test_post_missing_name(self, server):
-        """POST /v1/prompt-templates without name returns 400."""
+    def test_post_missing_template_id(self, server):
+        """POST /v1/prompt-templates without template_id returns 400."""
         data = {"content": "some content"}
         status, body = _post(server, "/v1/prompt-templates", data)
         assert status == 400
@@ -672,7 +672,7 @@ class TestPromptTemplateCRUD:
 
     def test_post_missing_content(self, server):
         """POST /v1/prompt-templates without content returns 400."""
-        data = {"name": "no-content"}
+        data = {"template_id": "no-content"}
         status, body = _post(server, "/v1/prompt-templates", data)
         assert status == 400
         assert "error" in body
@@ -681,7 +681,7 @@ class TestPromptTemplateCRUD:
         """Create a template, then PUT to update it, assert 200."""
         # Create
         create_status, create_body = _post(
-            server, "/v1/prompt-templates", {"name": "orig", "content": "original"}
+            server, "/v1/prompt-templates", {"template_id": "orig", "content": "original"}
         )
         assert create_status == 201
         tid = create_body["template_id"]
@@ -690,18 +690,18 @@ class TestPromptTemplateCRUD:
         status, body = _put(
             server,
             f"/v1/prompt-templates/{tid}",
-            {"name": "updated", "content": "updated content"},
+            {"template_id": "updated", "content": "updated content"},
         )
         assert status == 200
         assert body["status"] == "updated"
-        assert body["template_id"] == tid
+        assert body["template_id"] == "updated"
 
         # Verify via GET
         get_status, get_body = _get(server, "/v1/prompt-templates")
         assert get_status == 200
         templates = get_body["templates"]
         assert len(templates) == 1
-        assert templates[0]["name"] == "updated"
+        assert templates[0]["template_id"] == "updated"
         assert templates[0]["content"] == "updated content"
 
     def test_put_nonexistent_template(self, server):
@@ -709,7 +709,7 @@ class TestPromptTemplateCRUD:
         status, body = _put(
             server,
             "/v1/prompt-templates/nonexistent-id",
-            {"name": "x", "content": "y"},
+            {"template_id": "x", "content": "y"},
         )
         assert status == 404
         assert "error" in body
@@ -718,7 +718,7 @@ class TestPromptTemplateCRUD:
         """Create a template, then DELETE it, assert 200."""
         # Create
         create_status, create_body = _post(
-            server, "/v1/prompt-templates", {"name": "to-delete", "content": "bye"}
+            server, "/v1/prompt-templates", {"template_id": "to-delete", "content": "bye"}
         )
         assert create_status == 201
         tid = create_body["template_id"]
@@ -743,7 +743,7 @@ class TestPromptTemplateCRUD:
         """Create a template, verify the JSON file was written."""
         import runtime.server as srv_module
 
-        data = {"name": "persist-test", "content": "persisted {var}"}
+        data = {"template_id": "persist-test", "content": "persisted {var}"}
         status, body = _post(server, "/v1/prompt-templates", data)
         assert status == 201
 
@@ -754,9 +754,8 @@ class TestPromptTemplateCRUD:
             saved = json.load(f)
         assert isinstance(saved, list)
         assert len(saved) == 1
-        assert saved[0]["name"] == "persist-test"
+        assert saved[0]["template_id"] == "persist-test"
         assert saved[0]["content"] == "persisted {var}"
-        assert saved[0]["template_id"] == body["template_id"]
 
 
 # ------------------------------------------------------------------
@@ -770,6 +769,23 @@ def _make_infer_result(assistant_content: str) -> InferenceResult:
         success=True,
         messages=[Message(role="assistant", content=assistant_content)],
     )
+
+
+def _make_infer_stream_messages(assistant_content: str) -> list[Message]:
+    """Build a list of messages that mimics infer_stream output.
+
+    Returns assistant content delta + usage stat, matching the format
+    produced by runtime.infer_stream().
+    """
+    import json
+    return [
+        Message(role="assistant", content=assistant_content),
+        Message(role="usage", content=json.dumps({
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15,
+        })),
+    ]
 
 
 @pytest.fixture()
@@ -800,9 +816,10 @@ class TestConversationPersistence:
         runtime._model_registry.register(ModelConfig(
             model_id="m", api_base="http://x", model_name="x", api_protocol="openai"
         ))
-        with patch.object(runtime, "infer", return_value=_make_infer_result("hello")):
+        with patch.object(runtime, "infer_stream", return_value=iter(_make_infer_stream_messages("hello"))):
             status, body = _post(server, "/v1/infer", {
                 "model_id": "m",
+                "session_id": "new",
                 "messages": [
                     {"role": "system", "content": "You are helpful."},
                     {"role": "user", "content": "hi"},
@@ -813,7 +830,7 @@ class TestConversationPersistence:
 
         turns = cm.load_conversation(session_id)
         roles = [t.role for t in turns]
-        assert "system" not in roles, "system turns must not be persisted"
+        assert "system" in roles, "system turns should be persisted"
         assert "user" in roles
         assert "assistant" in roles
 
@@ -826,16 +843,17 @@ class TestConversationPersistence:
         ))
 
         # First request
-        with patch.object(runtime, "infer", return_value=_make_infer_result("reply1")):
+        with patch.object(runtime, "infer_stream", return_value=iter(_make_infer_stream_messages("reply1"))):
             status1, body1 = _post(server, "/v1/infer", {
                 "model_id": "m",
+                "session_id": "new",
                 "messages": [{"role": "user", "content": "turn1"}],
             })
         assert status1 == 200
         session_id = body1["session_id"]
 
         # Second request — only sends the new user message, not history
-        with patch.object(runtime, "infer", return_value=_make_infer_result("reply2")):
+        with patch.object(runtime, "infer_stream", return_value=iter(_make_infer_stream_messages("reply2"))):
             status2, body2 = _post(server, "/v1/infer", {
                 "model_id": "m",
                 "session_id": session_id,
@@ -859,9 +877,10 @@ class TestConversationPersistence:
         runtime._model_registry.register(ModelConfig(
             model_id="m", api_base="http://x", model_name="x", api_protocol="openai"
         ))
-        with patch.object(runtime, "infer", return_value=_make_infer_result("pong")):
+        with patch.object(runtime, "infer_stream", return_value=iter(_make_infer_stream_messages("pong"))):
             status, body = _post(server, "/v1/infer", {
                 "model_id": "m",
+                "session_id": "new",
                 "messages": [{"role": "user", "content": "ping"}],
             })
         assert status == 200

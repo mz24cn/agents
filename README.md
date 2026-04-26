@@ -19,6 +19,7 @@ A minimal, zero-dependency composable agent runtime engine built with pure Pytho
 - **Skill progressive disclosure** — first round exposes only skill summary; full `SKILL.md` is injected only when the model selects the skill
 - **Streaming inference** — real-time token streaming with thinking/reasoning content support
 - **Prompt template inference** — user messages can reference a named template by ID; `{{placeholder}}` variables are resolved at runtime from the request's `arguments` dict, enabling dynamic prompt adjustment and model/tool-agnostic parameterization without redeploying
+- **Multi-agent collaboration** — delegate subtasks to independent Subagents via the built-in `delegate` tool; each Subagent runs with its own model and toolset, returning results to the parent agent. Supports streaming output, nested delegation, and automatic session persistence
 - **Web UI management console** — Svelte 5 SPA for managing models, tools, prompt templates, and chat
 - **HTTP API server** — lightweight REST API built on `http.server`, no FastAPI/uvicorn needed
 - **Multimodal** — supports image (base64) and audio inputs for VLM models
@@ -197,7 +198,39 @@ print(result.messages[-1].content)
 
 The template content is fetched and all `{variable}` placeholders are substituted before the message is sent to the model. Templates can be created, updated, and deleted at runtime via the HTTP API or Web UI — making prompt iteration fast without touching code.
 
-**5. Start the HTTP Server**
+**5. Multi-Agent Collaboration (Delegate Tool)**
+
+The built-in `delegate` tool enables hierarchical task delegation. A parent agent can spawn Subagents with different models and toolsets to handle specialized subtasks:
+
+```python
+from runtime import Runtime, InferenceRequest, Message
+
+runtime = Runtime(model_registry=..., tool_registry=...)
+
+# The parent agent uses a general-purpose model with the delegate tool
+result = runtime.infer(InferenceRequest(
+    model_id="qwen3-14b",
+    tool_ids=["delegate", "web_search"],  # delegate + other tools
+    messages=[Message(
+        role="user",
+        content="Research the latest AI breakthroughs and write a summary report.",
+    )],
+))
+
+# The model may call delegate() with:
+# - model_id: a specialized model (e.g., a coding model for code generation)
+# - tool_names: subset of available tools for the Subagent
+# - task: the subtask description
+# - context: optional system prompt for the Subagent
+```
+
+Key features:
+- **Streaming output**: Subagent responses stream back in real-time via SSE
+- **Nested delegation**: Subagents can further delegate to deeper-level agents
+- **Tool scoping**: Parent agent's tools are automatically listed in a Markdown table and injected into the Subagent's system prompt
+- **Session persistence**: Each Subagent session is saved to `~/.agents_runtime/chat_data/{session_id}/sub_{timestamp}/`
+
+**6. Start the HTTP Server**
 
 ```bash
 python app.py              # default: 0.0.0.0:8080
@@ -335,7 +368,7 @@ This project was born out of frustrations encountered while using [Qwen-Agent](h
 
 These issues made rebuilding the agent runtime worthwhile. Leveraging the power of modern AI-assisted development, this project was built from scratch to address all of the above. It intentionally avoids introducing third-party dependencies so it can be embedded into any existing project — usable as either an SDK or a standalone HTTP service.
 
-The project is under active development. Next steps include a multi-agent collaboration framework and the closely related topic of secure user data management.
+The project is under active development. Next steps include enhancing the multi-agent collaboration framework with more orchestration patterns and the closely related topic of secure user data management.
 
 ### License
 
@@ -358,6 +391,7 @@ MIT License — see [LICENSE](LICENSE)
 - **Skill 渐进披露** — 第一轮推理仅暴露技能摘要，大模型选择后才注入完整 `SKILL.md`
 - **流式推理** — 实时 token 流式输出，支持 thinking/reasoning 内容
 - **提示词模板推理** — 用户消息可通过模板 ID 引用命名模板，`{{占位符}}` 变量在推理时从请求的 `arguments` 字典动态替换，无需重新部署即可调整提示词，并支持参数化以适应不同模型和工具
+- **多智能体协作** — 通过内置 `delegate` 工具将子任务委派给独立的 Subagent 执行；每个 Subagent 可使用不同的模型和工具集，完成后将结果返回给父 Agent。支持流式输出、嵌套委派和自动会话持久化
 - **Web UI 管理控制台** — Svelte 5 SPA，支持模型、工具、提示词模板管理和对话
 - **HTTP API 服务** — 基于 `http.server` 的轻量 REST API，无需 FastAPI/uvicorn
 - **多模态** — 支持图片（base64）和音频输入，适配 VLM 模型
@@ -534,7 +568,39 @@ result = runtime.infer(InferenceRequest(
 print(result.messages[-1].content)
 ```
 
-**5. 启动 HTTP 服务**
+**5. 多智能体协作（Delegate 工具）**
+
+内置 `delegate` 工具支持层级化任务委派。父 Agent 可以生成使用不同模型和工具集的 Subagent 来处理专门的子任务：
+
+```python
+from runtime import Runtime, InferenceRequest, Message
+
+runtime = Runtime(model_registry=..., tool_registry=...)
+
+# 父 Agent 使用通用模型，并启用 delegate 工具
+result = runtime.infer(InferenceRequest(
+    model_id="qwen3-14b",
+    tool_ids=["delegate", "web_search"],  # delegate + 其他工具
+    messages=[Message(
+        role="user",
+        content="研究最新的 AI 突破并撰写一份总结报告。",
+    )],
+))
+
+# 模型可能会调用 delegate()，参数包括：
+# - model_id: 专用模型（如代码生成模型）
+# - tool_names: Subagent 可用的工具子集
+# - task: 子任务描述
+# - context: 可选的 Subagent 系统提示词
+```
+
+主要特性：
+- **流式输出**：Subagent 响应通过 SSE 实时流式返回
+- **嵌套委派**：Subagent 可继续向更深层级委派任务
+- **工具作用域**：父 Agent 的工具自动生成 Markdown 表格并注入到 Subagent 的系统提示词
+- **会话持久化**：每个 Subagent 会话保存到 `~/.agents_runtime/chat_data/{session_id}/sub_{timestamp}/`
+
+**6. 启动 HTTP 服务**
 
 ```bash
 python app.py              # 默认：0.0.0.0:8080
@@ -672,7 +738,7 @@ npm run build
 
 基于以上问题，重新构建 Agent Runtime 就有了必要性。借助现代 AI 辅助开发的强大能力，本项目从零开始开发，解决了上述所有问题。它有意避免引入第三方依赖，以便嵌入到任何现有项目中使用——既可作为 SDK 引入，也可作为独立 HTTP 服务运行。
 
-此项目仍在积极迭代中。下一步计划完善多 Agent 协同工作框架，以及与之密切相关的用户数据安全管理机制。
+此项目仍在积极迭代中。下一步计划完善多 Agent 协同工作框架（增加更多编排模式），以及与之密切相关的用户数据安全管理机制。
 
 ### 开源协议
 

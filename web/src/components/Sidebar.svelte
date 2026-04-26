@@ -46,6 +46,8 @@
         if (m.stat != null) msg.stat = m.stat
         if (m.images != null) msg.images = m.images
         if (m.audio != null) msg.audio = m.audio
+        if (m.prompt_template != null) msg.prompt_template = m.prompt_template
+        if (m.arguments != null) msg.arguments = m.arguments
         return msg
       })
       sessionRestore.pending = { sessionId, messages: msgs }

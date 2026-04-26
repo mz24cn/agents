@@ -14,21 +14,19 @@ from typing import Optional
 
 @dataclass
 class PromptTemplate:
-    """A prompt template with an ID, name, and content.
+    """A prompt template with an ID and content.
 
     Content may contain {variable_name} placeholders that are replaced
     with user-provided values at application time.
     """
 
     template_id: str
-    name: str
     content: str
 
     def to_dict(self) -> dict:
         """Serialize to a plain dict."""
         return {
             "template_id": self.template_id,
-            "name": self.name,
             "content": self.content,
         }
 
@@ -37,7 +35,6 @@ class PromptTemplate:
         """Deserialize from a plain dict."""
         return cls(
             template_id=data["template_id"],
-            name=data["name"],
             content=data["content"],
         )
 
@@ -71,26 +68,26 @@ class PromptTemplateManager:
         """
         return self._templates.get(template_id)
 
-    def create(self, name: str, content: str) -> PromptTemplate:
-        """Create a new prompt template keyed by name.
+    def create(self, template_id: str, content: str) -> PromptTemplate:
+        """Create a new prompt template.
 
         Args:
-            name: The template name (used as the unique ID).
+            template_id: The unique identifier for the template.
             content: The template content (may contain {placeholder} variables).
 
         Returns:
             The newly created PromptTemplate.
         """
-        template = PromptTemplate(template_id=name, name=name, content=content)
-        self._templates[name] = template
+        template = PromptTemplate(template_id=template_id, content=content)
+        self._templates[template_id] = template
         return template
 
-    def update(self, template_id: str, name: str, content: str) -> Optional[PromptTemplate]:
+    def update(self, template_id: str, new_template_id: str, content: str) -> Optional[PromptTemplate]:
         """Update an existing prompt template.
 
         Args:
-            template_id: The unique identifier of the template to update.
-            name: The new template name.
+            template_id: The current unique identifier of the template to update.
+            new_template_id: The new unique identifier (may be the same as template_id).
             content: The new template content.
 
         Returns:
@@ -98,8 +95,9 @@ class PromptTemplateManager:
         """
         if template_id not in self._templates:
             return None
-        template = PromptTemplate(template_id=template_id, name=name, content=content)
-        self._templates[template_id] = template
+        template = PromptTemplate(template_id=new_template_id, content=content)
+        del self._templates[template_id]
+        self._templates[new_template_id] = template
         return template
 
     def delete(self, template_id: str) -> bool:
@@ -148,4 +146,4 @@ class PromptTemplateManager:
         self._templates.clear()
         for item in data:
             template = PromptTemplate.from_dict(item)
-            self._templates[template.name] = template
+            self._templates[template.template_id] = template

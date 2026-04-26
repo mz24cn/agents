@@ -124,6 +124,92 @@ from runtime.registry import ModelRegistry, ToolRegistry
 from runtime.runtime import Runtime
 from runtime.context_manager import ContextManager, ConversationTurn
 
+
+def merge_stream_messages(stream_messages: list) -> tuple[list, Optional[dict]]:
+    """将流式推理产生的原始 Message 列表合并为 ConversationTurn 列表。
+
+    流式推理中每个 token 都是一条独立的 Message，本函数将它们按语义合并：
+    - 连续的 assistant content/thinking delta 合并为一条 assistant turn
+    - assistant tool_calls 消息触发 flush，将已积累的文本先保存
+    - tool 角色消息先 flush 当前 assistant turn，再保存 tool result turn
+    - usage 消息提取 stat，不生成 turn
+    - system 消息跳过
+
+    Args:
+        stream_messages: runtime.infer_stream() 产生的原始 Message 对象列表。
+
+    Returns:
+        (turns, last_stat) 元组：
+        - turns: ConversationTurn 列表，可直接追加到会话历史
+        - last_stat: 最后一条 usage 消息解析出的 stat dict，若无则为 None
+    """
+    import datetime as _dt
+    import json as _json
+
+    turns: list = []
+    assistant_text_buf: str = ""
+    assistant_thinking_buf: str = ""
+    pending_tool_calls: list = []
+    last_stat: Optional[dict] = None
+
+    def _flush_assistant(stat=None):
+        nonlocal assistant_text_buf, assistant_thinking_buf, pending_tool_calls
+        if assistant_text_buf or pending_tool_calls or assistant_thinking_buf:
+            ts = _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            turns.append(ConversationTurn(
+                role="assistant",
+                content=assistant_text_buf,
+                timestamp=ts,
+                tool_calls=pending_tool_calls if pending_tool_calls else None,
+                thinking=assistant_thinking_buf or None,
+                stat=stat,
+            ))
+            assistant_text_buf = ""
+            assistant_thinking_buf = ""
+            pending_tool_calls = []
+
+    for m in stream_messages:
+        if m.role == "usage":
+            try:
+                last_stat = _json.loads(m.content)
+            except (ValueError, AttributeError):
+                pass
+            continue
+        if m.role == "assistant":
+            if m.tool_calls:
+                # tool_calls 到来时先 flush 已积累的纯文本
+                if assistant_text_buf or assistant_thinking_buf:
+                    ts = _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+                    turns.append(ConversationTurn(
+                        role="assistant",
+                        content=assistant_text_buf,
+                        timestamp=ts,
+                        thinking=assistant_thinking_buf or None,
+                    ))
+                    assistant_text_buf = ""
+                    assistant_thinking_buf = ""
+                pending_tool_calls = m.tool_calls
+            if m.content:
+                assistant_text_buf += m.content
+            if m.thinking:
+                assistant_thinking_buf += m.thinking
+        elif m.role == "tool":
+            # tool result 到来时先 flush assistant turn（含 tool_calls）
+            _flush_assistant()
+            ts = _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            turns.append(ConversationTurn(
+                role="tool",
+                content=m.content or "",
+                timestamp=ts,
+                name=m.name or "",
+            ))
+        # skip system deltas
+
+    # Flush 剩余 assistant 内容，附上 stat
+    _flush_assistant(stat=last_stat)
+
+    return turns, last_stat
+
 _DATA_DIR = os.path.join(os.path.expanduser("~"), ".agents_runtime")
 
 
@@ -412,26 +498,15 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
     # POST handlers
     # ------------------------------------------------------------------
 
-    def _handle_infer(self) -> None:
-        """POST /v1/infer — execute model inference.
-
-        Expects JSON body with at least model_id. Optional fields:
-        tool_ids, messages, text, max_tool_rounds, session_id.
-        """
+    def _prepare_infer_request(self):
         body = self._read_json_body()
         if body is None:
-            return
+            return None
 
         if "model_id" not in body:
             self._send_json_error(400, "Missing required field: model_id")
-            return
+            return None
 
-        # Session management via ContextManager.
-        # Sessions are only created/used when the client explicitly opts in by
-        # passing session_id="new" (create a fresh session) or an existing
-        # session_id string.  Requests that omit session_id entirely (or pass
-        # null/empty) run as stateless single-round inference — no session
-        # directory is created and no history is loaded or saved.
         context_manager = self.server.context_manager  # type: ignore[attr-defined]
         raw_session_id: Optional[str] = body.get("session_id") or None
         session_id: Optional[str] = None
@@ -439,37 +514,29 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
 
         if raw_session_id is not None:
             if raw_session_id == "new":
-                # Explicit request for a brand-new session
                 try:
                     session_id = context_manager.create_session()
                     self.server.session_manager.on_session_created(session_id)  # type: ignore[attr-defined]
                     use_session = True
                 except OSError as exc:
                     self._send_json_error(500, f"Failed to create session: {exc}")
-                    return
+                    return None
             else:
-                # Client supplied a specific session_id — use it only if it
-                # already exists on disk; otherwise fall back to stateless mode.
                 recovered = context_manager.recover_session(raw_session_id)
                 if recovered:
                     session_id = raw_session_id
                     use_session = True
-                    logger.info(
-                        "infer: recovered existing session from disk: %s", session_id
-                    )
+                    logger.info("recovered existing session from disk: %s", session_id)
                 else:
                     logger.info(
-                        "infer: session_id %s not found on disk; "
-                        "running as stateless inference",
+                        "session_id %s not found on disk; running as stateless inference",
                         raw_session_id,
                     )
 
-        # Build original messages from request
         original_messages = None
         if "messages" in body:
             original_messages = [Message.from_dict(m) for m in body["messages"]]
 
-        # Assemble context (prepend history from session) only when session is active
         assembled_messages = original_messages
         if use_session and session_id is not None:
             try:
@@ -478,94 +545,183 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 assembled_messages = [Message.from_dict(m) for m in assembled_dicts]
             except OSError as exc:
                 self._send_json_error(500, f"Failed to assemble context: {exc}")
-                return
+                return None
+
+        tool_ids = body.get("tool_ids", [])
+        has_delegate = "delegate" in tool_ids
+
+        tool_scope: list = []
+        if has_delegate and len(tool_ids) > 1:
+            runtime = self._get_runtime()
+            mcp_by_server: dict[str, list[str]] = {}
+            non_mcp_rows: list[tuple[str, str]] = []
+
+            for tid in tool_ids:
+                if tid == "delegate":
+                    tool_scope.append(runtime._tool_registry.get("delegate"))
+                    continue
+                tc = runtime._tool_registry.get(tid)
+                if tc is None:
+                    continue
+                tool_scope.append(tc)
+                if tc.tool_type == "mcp" and tc.mcp_server_name:
+                    mcp_by_server.setdefault(tc.mcp_server_name, []).append(tc.name)
+                else:
+                    non_mcp_rows.append((tc.name, tc.description))
+
+            rows: list[tuple[str, str]] = list(non_mcp_rows)
+            for server_name, names in mcp_by_server.items():
+                rows.append((", ".join(names), server_name))
+
+            if rows:
+                max_name = max(len(r[0]) for r in rows)
+                max_desc = max(len(r[1]) for r in rows)
+                header = f"| {'Tool'.ljust(max_name)} | {'Description'.ljust(max_desc)} |"
+                sep = f"| {'-' * max_name} | {'-' * max_desc} |"
+                lines = [header, sep]
+                for name, desc in rows:
+                    lines.append(f"| {name.ljust(max_name)} | {desc.ljust(max_desc)} |")
+                tools_markdown = "\n".join(lines)
+            else:
+                tools_markdown = ""
+
+            if tools_markdown and assembled_messages:
+                for msg in assembled_messages:
+                    if msg.role == "system":
+                        if msg.arguments is None:
+                            msg.arguments = {}
+                        if not msg.arguments.get("TOOLS"):
+                            msg.arguments["TOOLS"] = tools_markdown
+                        break
+
+            tool_ids = ["delegate"]
 
         request = InferenceRequest(
             model_id=body["model_id"],
-            tool_ids=body.get("tool_ids", []),
+            tool_ids=tool_ids,
             messages=assembled_messages,
             text=body.get("text"),
-            stream=False,
+            stream=True,
             max_tool_rounds=body.get("max_tool_rounds") or int(os.environ.get("MAX_TOOL_ROUNDS", 20)),
         )
 
-        runtime = self._get_runtime()
-        result = runtime.infer(request)
+        from runtime.builtin_tools import _thread_local
+        _thread_local.sse_callback = None
+        _thread_local.session_id = session_id
+        _thread_local.depth = 0
+        _thread_local.chats_dir = context_manager._chats_dir
+        _thread_local.tool_scope = tool_scope
 
-        # Persist conversation turns only when a session is active.
-        # Stateless requests (no session_id supplied) skip all persistence.
-        if use_session and session_id is not None:
+        return body, request, session_id, use_session, original_messages, context_manager
+
+    def _cleanup_thread_local(self):
+        from runtime.builtin_tools import _thread_local
+        _thread_local.sse_callback = None
+        _thread_local.session_id = None
+        _thread_local.depth = 0
+        _thread_local.chats_dir = None
+        _thread_local.tool_scope = []
+
+    def _persist_conversation(self, context_manager, session_id, original_messages, collected_messages):
+        if session_id is None:
+            return None
+        try:
+            import datetime as _dt
             try:
-                import datetime as _dt
-                # Extract usage tokens from the last usage message in the result
-                last_usage_prompt: int = 0
-                last_usage_completion: int = 0
-                last_stat: Optional[dict] = None
-                for m in reversed(result.messages):
-                    if m.role == "usage":
-                        try:
-                            u = json.loads(m.content)
-                            last_usage_prompt = u.get("prompt_tokens", 0)
-                            last_usage_completion = u.get("completion_tokens", 0)
-                            last_stat = u
-                        except (json.JSONDecodeError, ValueError, AttributeError):
-                            pass
-                        break
-                last_total_tokens = last_usage_prompt + last_usage_completion or None
+                existing_turns = context_manager.load_conversation(session_id)
+            except (FileNotFoundError, ValueError):
+                existing_turns = []
+            new_turns = list(existing_turns)
+            for m in (original_messages or []):
+                ts = _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+                new_turns.append(ConversationTurn(
+                    role=m.role,
+                    content=m.content or "",
+                    timestamp=ts,
+                    images=getattr(m, "images", None) or None,
+                    audio=getattr(m, "audio", None) or None,
+                    prompt_template=getattr(m, "prompt_template", None) or None,
+                    arguments=getattr(m, "arguments", None) or None,
+                ))
+            merged_turns, last_stat = merge_stream_messages(collected_messages)
+            new_turns.extend(merged_turns)
+            last_total_tokens = (
+                (last_stat.get("prompt_tokens", 0) + last_stat.get("completion_tokens", 0))
+                if last_stat else None
+            ) or None
+            context_manager.save_conversation(session_id, new_turns, last_total_tokens=last_total_tokens)
+            context_manager.update_rolling_summary(session_id, new_turns, last_total_tokens=last_total_tokens)
+            context_manager.extract_memory(session_id, new_turns, last_total_tokens=last_total_tokens)
+            self.server.session_manager.update_index(session_id, last_total_tokens=last_total_tokens)  # type: ignore[attr-defined]
+        except OSError as exc:
+            return exc
+        return None
 
-                # Load existing turns so we can append
-                try:
-                    existing_turns = context_manager.load_conversation(session_id)
-                except (FileNotFoundError, ValueError):
-                    existing_turns = []
-                new_turns = list(existing_turns)
-                # Record new user messages; skip system (injected per-request)
-                for m in (original_messages or []):
-                    if m.role == "system":
-                        continue
-                    ts = _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-                    new_turns.append(ConversationTurn(role=m.role, content=m.content or "", timestamp=ts))
-                # Append the final assistant reply (last non-usage message)
-                final_reply = next(
-                    (m for m in reversed(result.messages) if m.role not in ("usage",)),
-                    None,
-                )
-                if final_reply is not None:
-                    ts = _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-                    new_turns.append(ConversationTurn(
-                        role=final_reply.role,
-                        content=final_reply.content or "",
-                        timestamp=ts,
-                        name=getattr(final_reply, "name", None) or None,
-                        tool_calls=getattr(final_reply, "tool_calls", None) or None,
-                        thinking=getattr(final_reply, "thinking", None) or None,
-                        stat=last_stat,
-                    ))
-                context_manager.save_conversation(session_id, new_turns, last_total_tokens=last_total_tokens)
-                # Trigger Phase 2 compression if token threshold exceeded
-                context_manager.update_rolling_summary(session_id, new_turns, last_total_tokens=last_total_tokens)
-                context_manager.extract_memory(session_id, new_turns, last_total_tokens=last_total_tokens)
-                self.server.session_manager.update_index(session_id, last_total_tokens=last_total_tokens)  # type: ignore[attr-defined]
-            except OSError as exc:
-                self._send_json_error(500, f"Failed to save conversation: {exc}")
+    def _handle_infer(self) -> None:
+        """POST /v1/infer — execute model inference (non-streaming).
+
+        This is a thin wrapper around infer_stream that collects all stream
+        messages and returns them as a single JSON response. This ensures
+        non-streaming inference automatically benefits from any improvements
+        to the streaming implementation.
+        """
+        result = self._prepare_infer_request()
+        if result is None:
+            return
+        _body, request, session_id, use_session, original_messages, context_manager = result
+
+        try:
+            runtime = self._get_runtime()
+
+            collected_messages: list[Message] = []
+            try:
+                for msg in runtime.infer_stream(request):
+                    collected_messages.append(msg)
+                    if msg.role == "assistant" and msg.content and msg.content.startswith("Error:"):
+                        logger.error("infer error event | model=%s %s", request.model_id, msg.content)
+            except Exception as exc:
+                self._send_json_error(500, f"Inference failed: {exc}")
                 return
 
-        # Serialize InferenceResult
-        response_data = {
-            "success": result.success,
-            "messages": [m.to_dict() for m in result.messages],
-        }
-        if session_id is not None:
-            response_data["session_id"] = session_id
-        if result.error is not None:
-            response_data["error"] = result.error
-        if result.error_code is not None:
-            response_data["error_code"] = result.error_code
-        if result.stat is not None:
-            response_data["stat"] = result.stat.to_dict()
+            if use_session:
+                persist_exc = self._persist_conversation(context_manager, session_id, original_messages, collected_messages)
+                if persist_exc is not None:
+                    self._send_json_error(500, f"Failed to save conversation: {persist_exc}")
+                    return
 
-        status = 200 if result.success else 500
-        self._send_json_response(status, response_data)
+            has_error = any(
+                m.role == "assistant" and m.content and m.content.startswith("Error:")
+                for m in collected_messages
+            )
+            success = not has_error
+
+            stat_dict = None
+            for m in reversed(collected_messages):
+                if m.role == "usage":
+                    try:
+                        stat_dict = json.loads(m.content)
+                    except (json.JSONDecodeError, ValueError, AttributeError):
+                        pass
+                    break
+
+            response_data: dict = {
+                "success": success,
+                "messages": [m.to_dict() for m in collected_messages],
+            }
+            if session_id is not None:
+                response_data["session_id"] = session_id
+            if not success:
+                for m in collected_messages:
+                    if m.role == "assistant" and m.content and m.content.startswith("Error:"):
+                        response_data["error"] = m.content
+                        break
+            if stat_dict is not None:
+                response_data["stat"] = stat_dict
+
+            status = 200 if success else 500
+            self._send_json_response(status, response_data)
+        finally:
+            self._cleanup_thread_local()
 
     def _handle_infer_stream(self) -> None:
         """POST /v1/infer/stream — execute streaming model inference.
@@ -573,78 +729,11 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         Returns Server-Sent Events (SSE) stream. Each event contains a
         JSON-encoded Message delta. Optional JSON field: session_id.
         """
-        body = self._read_json_body()
-        if body is None:
+        result = self._prepare_infer_request()
+        if result is None:
             return
+        _body, request, session_id, use_session, original_messages, context_manager = result
 
-        if "model_id" not in body:
-            self._send_json_error(400, "Missing required field: model_id")
-            return
-
-        # Session management via ContextManager.
-        # Sessions are only created/used when the client explicitly opts in by
-        # passing session_id="new" (create a fresh session) or an existing
-        # session_id string.  Requests that omit session_id entirely (or pass
-        # null/empty) run as stateless single-round inference — no session
-        # directory is created and no history is loaded or saved.
-        context_manager = self.server.context_manager  # type: ignore[attr-defined]
-        raw_session_id: Optional[str] = body.get("session_id") or None
-        session_id: Optional[str] = None
-        use_session: bool = False
-
-        if raw_session_id is not None:
-            if raw_session_id == "new":
-                # Explicit request for a brand-new session
-                try:
-                    session_id = context_manager.create_session()
-                    self.server.session_manager.on_session_created(session_id)  # type: ignore[attr-defined]
-                    use_session = True
-                except OSError as exc:
-                    self._send_json_error(500, f"Failed to create session: {exc}")
-                    return
-            else:
-                # Client supplied a specific session_id — use it only if it
-                # already exists on disk; otherwise fall back to stateless mode.
-                recovered = context_manager.recover_session(raw_session_id)
-                if recovered:
-                    session_id = raw_session_id
-                    use_session = True
-                    logger.info(
-                        "infer_stream: recovered existing session from disk: %s", session_id
-                    )
-                else:
-                    logger.info(
-                        "infer_stream: session_id %s not found on disk; "
-                        "running as stateless inference",
-                        raw_session_id,
-                    )
-
-        # Build original messages from request
-        original_messages = None
-        if "messages" in body:
-            original_messages = [Message.from_dict(m) for m in body["messages"]]
-
-        # Assemble context (prepend history from session) only when session is active
-        assembled_messages = original_messages
-        if use_session and session_id is not None:
-            try:
-                new_msgs_dicts = [m.to_dict() for m in original_messages] if original_messages else []
-                assembled_dicts = context_manager.assemble_context(session_id, new_msgs_dicts)
-                assembled_messages = [Message.from_dict(m) for m in assembled_dicts]
-            except OSError as exc:
-                self._send_json_error(500, f"Failed to assemble context: {exc}")
-                return
-
-        request = InferenceRequest(
-            model_id=body["model_id"],
-            tool_ids=body.get("tool_ids", []),
-            messages=assembled_messages,
-            text=body.get("text"),
-            stream=True,
-            max_tool_rounds=body.get("max_tool_rounds") or int(os.environ.get("MAX_TOOL_ROUNDS", 20)),
-        )
-
-        # Send SSE headers
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -656,139 +745,41 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         cancel_event = threading.Event()
         runtime = self._get_runtime()
         collected_messages: list[Message] = []
+
+        from runtime.builtin_tools import _thread_local
+
+        def _sse_write(frame: dict) -> None:
+            try:
+                event_data = json.dumps(frame, ensure_ascii=False)
+                self.wfile.write(f"data: {event_data}\n\n".encode("utf-8"))
+                self.wfile.flush()
+            except Exception:
+                pass
+
+        _thread_local.sse_callback = _sse_write
+
         try:
             for msg in runtime.infer_stream(request, cancel_event=cancel_event):
                 collected_messages.append(msg)
                 event_data = json.dumps(msg.to_dict(), ensure_ascii=False)
                 self.wfile.write(f"data: {event_data}\n\n".encode("utf-8"))
                 self.wfile.flush()
-                # Log error messages from the stream for easier diagnosis
                 if msg.role == "assistant" and msg.content and msg.content.startswith("Error:"):
                     logger.error("infer_stream error event | model=%s %s", request.model_id, msg.content)
 
-            # Send session_id in final SSE event before [DONE] (only when session is active)
             if use_session and session_id is not None:
                 session_event = json.dumps({"session_id": session_id}, ensure_ascii=False)
                 self.wfile.write(f"data: {session_event}\n\n".encode("utf-8"))
                 self.wfile.flush()
 
-            # Send done event
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
 
-            # Persist conversation turns after stream completes.
-            # Skipped entirely for stateless requests (use_session=False).
-            # Strategy:
-            #   - Append new user messages (skip system — injected per-request)
-            #   - Walk collected_messages in order:
-            #       * assistant text deltas → accumulate into text buffer
-            #       * assistant tool_calls messages → flush text buf, save tool_calls
-            #         on the turn; when a function message follows, flush the assistant
-            #         turn first, then record the tool result turn
-            #       * tool-role messages → tool result turn (role="tool")
-            #       * thinking blocks → stored in the assistant turn's thinking field
-            #       * usage/system messages → skip
-            if use_session and session_id is not None:
-                try:
-                    import datetime as _dt
-                    # Load existing turns so we can append
-                    try:
-                        existing_turns = context_manager.load_conversation(session_id)
-                    except (FileNotFoundError, ValueError):
-                        existing_turns = []
-                    new_turns = list(existing_turns)
-                    # Record new user messages; skip system (injected per-request)
-                    for m in (original_messages or []):
-                        if m.role == "system":
-                            continue
-                        ts = _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-                        new_turns.append(ConversationTurn(role=m.role, content=m.content or "", timestamp=ts))
-                    # Walk stream messages
-                    assistant_text_buf: str = ""
-                    assistant_thinking_buf: str = ""
-                    pending_tool_calls: list[dict] = []  # tool_calls from the latest assistant msg
-                    last_usage_prompt: int = 0
-                    last_usage_completion: int = 0
-                    last_stat: Optional[dict] = None
-                    for m in collected_messages:
-                        if m.role == "usage":
-                            try:
-                                u = json.loads(m.content)
-                                last_usage_prompt = u.get("prompt_tokens", 0)
-                                last_usage_completion = u.get("completion_tokens", 0)
-                                last_stat = u
-                            except (json.JSONDecodeError, ValueError, AttributeError):
-                                pass
-                            continue
-                        if m.role == "assistant":
-                            if m.tool_calls:
-                                # Flush accumulated text first
-                                if assistant_text_buf:
-                                    ts = _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-                                    new_turns.append(ConversationTurn(
-                                        role="assistant",
-                                        content=assistant_text_buf,
-                                        timestamp=ts,
-                                        thinking=assistant_thinking_buf or None,
-                                    ))
-                                    assistant_text_buf = ""
-                                    assistant_thinking_buf = ""
-                                pending_tool_calls = m.tool_calls
-                            if m.content:
-                                assistant_text_buf += m.content
-                            if m.thinking:
-                                assistant_thinking_buf += m.thinking
-                        elif m.role == "tool":
-                            # Flush accumulated assistant text + tool_calls as one turn
-                            ts = _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-                            new_turns.append(ConversationTurn(
-                                role="assistant",
-                                content=assistant_text_buf,
-                                timestamp=ts,
-                                tool_calls=pending_tool_calls if pending_tool_calls else None,
-                                thinking=assistant_thinking_buf or None,
-                            ))
-                            assistant_text_buf = ""
-                            assistant_thinking_buf = ""
-                            pending_tool_calls = []
-                            # Tool result turn — full content stored inline
-                            new_turns.append(ConversationTurn(
-                                role="tool",
-                                content=m.content or "",
-                                timestamp=ts,
-                                name=m.name or "",
-                            ))
-                        # skip system deltas
-                    # Flush remaining assistant content
-                    if assistant_text_buf or pending_tool_calls:
-                        ts = _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-                        new_turns.append(ConversationTurn(
-                            role="assistant",
-                            content=assistant_text_buf,
-                            timestamp=ts,
-                            tool_calls=pending_tool_calls if pending_tool_calls else None,
-                            thinking=assistant_thinking_buf or None,
-                            stat=last_stat,
-                        ))
-                    elif assistant_thinking_buf:
-                        # Model produced only thinking output — record it so the turn is not lost
-                        ts = _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-                        new_turns.append(ConversationTurn(
-                            role="assistant",
-                            content=assistant_thinking_buf,
-                            timestamp=ts,
-                            stat=last_stat,
-                        ))
-                    last_total_tokens = (last_usage_prompt + last_usage_completion) or None
-                    context_manager.save_conversation(session_id, new_turns, last_total_tokens=last_total_tokens)
-                    # Trigger Phase 2 compression if token threshold exceeded
-                    context_manager.update_rolling_summary(session_id, new_turns, last_total_tokens=last_total_tokens)
-                    context_manager.extract_memory(session_id, new_turns, last_total_tokens=last_total_tokens)
-                    self.server.session_manager.update_index(session_id, last_total_tokens=last_total_tokens)  # type: ignore[attr-defined]
-                except OSError as exc:
-                    logger.error("infer_stream: failed to save conversation for session %s: %s", session_id, exc)
+            if use_session:
+                persist_exc = self._persist_conversation(context_manager, session_id, original_messages, collected_messages)
+                if persist_exc is not None:
+                    logger.error("infer_stream: failed to save conversation for session %s: %s", session_id, persist_exc)
         except (BrokenPipeError, ConnectionResetError):
-            # Client disconnected — signal infer_stream to stop
             cancel_event.set()
         except Exception as exc:
             try:
@@ -797,6 +788,8 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             except Exception:
                 pass
+        finally:
+            self._cleanup_thread_local()
 
     def _handle_tool_call(self) -> None:
         """POST /v1/tools/call — directly call a tool.
@@ -991,9 +984,12 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         if body is None:
             return
 
+        if body.get("tool_type") == "function":
+            body.setdefault("tool_id", f"function-{body.get('name', '')}")
+
         required = ["tool_id", "tool_type", "name", "description", "parameters"]
         for field in required:
-            if field not in body:
+            if field not in body or not str(body[field]).strip():
                 self._send_json_error(400, f"Missing required field: {field}")
                 return
 
@@ -1042,21 +1038,21 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
     def _handle_create_prompt_template(self) -> None:
         """POST /v1/prompt-templates — create a new prompt template.
 
-        Expects JSON body with name and content fields.
+        Expects JSON body with template_id and content fields.
         """
         body = self._read_json_body()
         if body is None:
             return
 
-        if "name" not in body:
-            self._send_json_error(400, "Missing required field: name")
+        if "template_id" not in body:
+            self._send_json_error(400, "Missing required field: template_id")
             return
         if "content" not in body:
             self._send_json_error(400, "Missing required field: content")
             return
 
         mgr = self.server.prompt_template_manager  # type: ignore[attr-defined]
-        template = mgr.create(name=body["name"], content=body["content"])
+        template = mgr.create(template_id=body["template_id"], content=body["content"])
         mgr.save(_PROMPT_TEMPLATES_PATH)
         self._send_json_response(201, {
             "status": "created",
@@ -1104,6 +1100,9 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self._send_json_error(403, f"Cannot update built-in tool: {tool_id}")
             return
 
+        if body.get("tool_type") == "function":
+            body["tool_id"] = f"function-{body.get('name', '')}"
+
         try:
             config = ToolConfig.from_dict(body)
         except (KeyError, TypeError, ValueError) as exc:
@@ -1140,9 +1139,11 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 self._send_json_error(400, f"加载函数失败: {exc}")
                 return
 
+        if config.tool_id != tool_id:
+            runtime._tool_registry.remove(tool_id)
         runtime._tool_registry.register(config, callable_fn=callable_fn)
         runtime._tool_registry.save(_TOOLS_PATH)
-        self._send_json_response(200, {"status": "updated", "tool_id": tool_id})
+        self._send_json_response(200, {"status": "updated", "tool_id": config.tool_id})
 
     def _handle_update_prompt_template(self, template_id: str) -> None:
         """PUT /v1/prompt-templates/{template_id} — update a prompt template."""
@@ -1150,10 +1151,11 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         if body is None:
             return
 
+        new_template_id = body.get("template_id", template_id)
         mgr = self.server.prompt_template_manager  # type: ignore[attr-defined]
         updated = mgr.update(
             template_id,
-            name=body.get("name", ""),
+            new_template_id=new_template_id,
             content=body.get("content", ""),
         )
         if updated is None:
@@ -1161,7 +1163,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             return
 
         mgr.save(_PROMPT_TEMPLATES_PATH)
-        self._send_json_response(200, {"status": "updated", "template_id": template_id})
+        self._send_json_response(200, {"status": "updated", "template_id": new_template_id})
 
     # ------------------------------------------------------------------
     # DELETE handlers (stubs)
@@ -1454,7 +1456,6 @@ class RuntimeHTTPServer:
             if os.path.isfile(_PROMPT_TEMPLATES_PATH):
                 self._prompt_template_manager.load(_PROMPT_TEMPLATES_PATH)
             from runtime.builtin_tools import register_builtin_tools
-            register_builtin_tools(tool_registry)
             self._runtime = Runtime(
                 model_registry=model_registry,
                 tool_registry=tool_registry,
@@ -1462,6 +1463,7 @@ class RuntimeHTTPServer:
                 skill_manager=skill_manager,
                 prompt_template_manager=self._prompt_template_manager,
             )
+            register_builtin_tools(tool_registry, runtime=self._runtime)
 
         # Initialize ContextManager between Server and Runtime
         self._context_manager = ContextManager(

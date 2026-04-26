@@ -104,12 +104,16 @@ const translations = {
     templatePreview: '模板预览',
     inputPlaceholderValue: '输入 {name} 的值',
     applyTemplate: '应用模板',
+    applyAs: '作为',
+    applyAsSystem: '系统提示词',
+    applyAsUserSend: '用户输入发送',
 
     // PromptTemplateSelector
     promptTemplateLabel: '提示词模板',
     fetchTemplatesFailed: '获取模板列表失败',
     selectTemplatePlaceholder: '选择提示词模板',
     applyToSystem: '应用到系统',
+    promptTemplatePanelTitle: '提示词模板',
 
     // ThinkingBlock
     collapseThinking: '收起思考过程',
@@ -163,12 +167,12 @@ const translations = {
     // PromptForm
     editTemplate: '编辑模板',
     newTemplate: '新建模板',
-    templateName: '模板名称',
+    templateId: '模板 ID',
     templateContent: '模板内容',
     detectedPlaceholders: '检测到的占位符变量：',
-    templateNameRequired: '模板名称不能为空',
+    templateIdRequired: '模板 ID 不能为空',
     templateContentRequired: '模板内容不能为空',
-    templateNamePlaceholder: '例如: 代码审查助手',
+    templateIdPlaceholder: '例如: code-review-assistant',
     templateContentPlaceholder: '输入提示词内容，可使用 {{variable_name}} 作为占位符',
 
     // PromptsPage
@@ -176,7 +180,7 @@ const translations = {
     noTemplates: '暂无提示词模板',
     fetchTemplateListFailed: '获取提示词模板列表失败',
     deleteTemplateFailed: '删除模板失败',
-    confirmDeleteTemplate: '确定要删除模板「{name}」吗？',
+    confirmDeleteTemplate: '确定要删除模板「{id}」吗？',
 
     // SessionPanel
     sessionPanelTitle: '历史会话',
@@ -223,7 +227,6 @@ const translations = {
     mcpConfigRequired: 'MCP 配置不能为空',
     mcpServersMissing: '必须包含 "mcpServers" 对象',
     skillDirRequired: '技能文件夹路径不能为空',
-    toolIdRequired: '工具 ID 不能为空',
     toolNameRequired: '工具名称不能为空',
     toolDescRequired: '工具描述不能为空',
     parametersRequired: 'Parameters 不能为空',
@@ -354,12 +357,16 @@ const translations = {
     templatePreview: 'Template preview',
     inputPlaceholderValue: 'Enter value for {name}',
     applyTemplate: 'Apply template',
+    applyAs: 'Apply as',
+    applyAsSystem: 'System prompt',
+    applyAsUserSend: 'Send as user',
 
     // PromptTemplateSelector
     promptTemplateLabel: 'Prompt template',
     fetchTemplatesFailed: 'Failed to fetch templates',
     selectTemplatePlaceholder: 'Select a template',
     applyToSystem: 'Apply to system',
+    promptTemplatePanelTitle: 'Prompt Templates',
 
     // ThinkingBlock
     collapseThinking: 'Collapse ',
@@ -413,12 +420,12 @@ const translations = {
     // PromptForm
     editTemplate: 'Edit Template',
     newTemplate: 'New Template',
-    templateName: 'Template Name',
+    templateId: 'Template ID',
     templateContent: 'Template Content',
     detectedPlaceholders: 'Detected placeholders:',
-    templateNameRequired: 'Template name is required',
+    templateIdRequired: 'Template ID is required',
     templateContentRequired: 'Template content is required',
-    templateNamePlaceholder: 'e.g. Code Review Assistant',
+    templateIdPlaceholder: 'e.g. code-review-assistant',
     templateContentPlaceholder: 'Enter prompt content. Use {{variable_name}} as placeholders.',
 
     // PromptsPage
@@ -426,7 +433,7 @@ const translations = {
     noTemplates: 'No templates yet',
     fetchTemplateListFailed: 'Failed to fetch template list',
     deleteTemplateFailed: 'Failed to delete template',
-    confirmDeleteTemplate: 'Delete template "{name}"?',
+    confirmDeleteTemplate: 'Delete template "{id}"?',
 
     // SessionPanel
     sessionPanelTitle: 'History',
@@ -473,7 +480,6 @@ const translations = {
     mcpConfigRequired: 'MCP config is required',
     mcpServersMissing: 'Must contain "mcpServers" object',
     skillDirRequired: 'Skill directory is required',
-    toolIdRequired: 'Tool ID is required',
     toolNameRequired: 'Tool name is required',
     toolDescRequired: 'Tool description is required',
     parametersRequired: 'Parameters are required',

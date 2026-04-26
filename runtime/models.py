@@ -45,6 +45,10 @@ class Message:
             d["audio"] = self.audio
         if self.thinking is not None:
             d["thinking"] = self.thinking
+        if self.prompt_template is not None:
+            d["prompt_template"] = self.prompt_template
+        if self.arguments is not None:
+            d["arguments"] = self.arguments
         return d
 
     @classmethod

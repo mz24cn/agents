@@ -1,7 +1,10 @@
 <script>
   import { t } from '../../lib/i18n.svelte.js'
 
-  let { disabled = false, onSend, onStop, onNewSession, text = $bindable(''), hasMessages = false, isStreaming = false } = $props()
+  let { disabled = false, onSend, onStop, onNewSession, onOpenTemplatePanel, text = $bindable(''), hasMessages = false, isStreaming = false } = $props()
+
+  // 输入框为空且不在流式状态时，显示"?"按钮（提示词模板入口）
+  let showTemplateBtn = $derived(!isStreaming && !text.trim())
 
   function handleSend() {
     const trimmed = text.trim()
@@ -28,14 +31,27 @@
     {disabled}
     rows="2"
   ></textarea>
-  <button
-    class="send-btn"
-    class:stop={isStreaming}
-    onclick={isStreaming ? () => onStop?.() : handleSend}
-    disabled={isStreaming ? false : (disabled || !text.trim())}
-  >
-    {#if isStreaming}⏹{:else}↑{/if}
-  </button>
+  {#if showTemplateBtn}
+    <!-- 输入框为空时显示"?"提示词模板按钮 -->
+    <button
+      class="send-btn template-btn"
+      onclick={() => onOpenTemplatePanel?.()}
+      title={t('promptTemplatePanelTitle')}
+      disabled={disabled}
+    >
+      ?
+    </button>
+  {:else}
+    <!-- 有内容或流式时显示发送/停止按钮 -->
+    <button
+      class="send-btn"
+      class:stop={isStreaming}
+      onclick={isStreaming ? () => onStop?.() : handleSend}
+      disabled={isStreaming ? false : (disabled || !text.trim())}
+    >
+      {#if isStreaming}⏹{:else}↑{/if}
+    </button>
+  {/if}
   <button
     class="new-session-btn"
     onclick={() => onNewSession?.()}
@@ -88,6 +104,19 @@
   .send-btn:disabled { opacity: 0.5; cursor: not-allowed; }
   .send-btn.stop { background: var(--danger, #e53e3e); }
   .send-btn.stop:hover { background: #c53030; }
+  /* "?"模板按钮样式：使用次要色调，区别于发送按钮 */
+  .send-btn.template-btn {
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
+    font-size: 1rem;
+    font-weight: 700;
+  }
+  .send-btn.template-btn:hover:not(:disabled) {
+    background: var(--primary);
+    color: #fff;
+    border-color: var(--primary);
+  }
   .new-session-btn {
     width: 32px;
     height: 32px;

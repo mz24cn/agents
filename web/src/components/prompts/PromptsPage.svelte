@@ -2,6 +2,7 @@
   import { promptTemplates } from '../../lib/api.js'
   import PromptForm from './PromptForm.svelte'
   import ConfirmDialog from '../ConfirmDialog.svelte'
+  import { extractPlaceholders } from '../../lib/placeholder.js'
   import { t } from '../../lib/i18n.svelte.js'
 
   let templateList = $state([])
@@ -77,7 +78,14 @@
       {#each templateList as tpl (tpl.template_id)}
         <div class="template-card">
           <div class="template-info">
-            <div class="template-name">{tpl.name}</div>
+            <div class="template-name-row">
+              <span class="template-name">{tpl.template_id}</span>
+              <div class="template-tags">
+                {#each extractPlaceholders(tpl.content) as ph}
+                  <span class="placeholder-tag">{ph}</span>
+                {/each}
+              </div>
+            </div>
             <div class="template-preview">{truncate(tpl.content)}</div>
           </div>
           <div class="template-actions">
@@ -92,7 +100,7 @@
 
 <ConfirmDialog
   open={deleteTarget !== null}
-  title={t('confirmDeleteTemplate', { name: deleteTarget?.name ?? '' })}
+  title={t('confirmDeleteTemplate', { id: deleteTarget?.template_id ?? '' })}
   onConfirm={handleDeleteConfirm}
   onCancel={handleDeleteCancel}
 />
@@ -113,7 +121,10 @@
   .template-list { display: flex; flex-direction: column; gap: 12px; }
   .template-card { display: flex; justify-content: space-between; align-items: center; padding: 14px 16px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; }
   .template-info { flex: 1; min-width: 0; }
-  .template-name { font-weight: 600; color: var(--text); font-size: 0.95rem; margin-bottom: 4px; }
+  .template-name-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; gap: 8px; }
+  .template-name { font-weight: 600; color: var(--text); font-size: 0.95rem; }
+  .template-tags { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }
+  .placeholder-tag { display: inline-block; padding: 1px 7px; background: var(--primary); color: #fff; border-radius: 4px; font-size: 0.78rem; font-family: monospace; }
   .template-preview { color: var(--text-secondary); font-size: 0.85rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .template-actions { display: flex; gap: 8px; margin-left: 16px; flex-shrink: 0; }
+  .template-actions { display: flex; align-items: center; gap: 8px; margin-left: 16px; flex-shrink: 0; }
 </style>

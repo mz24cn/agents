@@ -38,6 +38,8 @@ class ConversationTurn:
     stat: Optional[dict] = None
     images: Optional[list] = None
     audio: Optional[str] = None
+    prompt_template: Optional[str] = None
+    arguments: Optional[dict] = None
 
 
 @dataclass
@@ -762,6 +764,10 @@ class ContextManager:
                 msg["images"] = turn.images
             if turn.audio:
                 msg["audio"] = turn.audio
+            if turn.prompt_template:
+                msg["prompt_template"] = turn.prompt_template
+            if turn.arguments:
+                msg["arguments"] = turn.arguments
             messages.append(msg)
 
         data = {"meta": meta, "messages": messages}
@@ -793,6 +799,8 @@ class ContextManager:
                 stat=msg.get("stat"),
                 images=msg.get("images"),
                 audio=msg.get("audio"),
+                prompt_template=msg.get("prompt_template"),
+                arguments=msg.get("arguments"),
             ))
         return turns
 
