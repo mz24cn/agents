@@ -502,6 +502,31 @@ class TestModelCRUD:
         assert cfg.model_name == "updated:latest"
         assert cfg.api_protocol == "ollama"
 
+    def test_put_update_model_with_id_change(self, server, runtime):
+        """PUT /v1/models/{id} should support changing model_id."""
+        # Register a model first
+        self._register_model(server, "old-model-id")
+        assert runtime._model_registry.get("old-model-id") is not None
+
+        # Update with a new model_id
+        updated_data = {
+            "model_id": "new-model-id",
+            "api_base": "http://localhost:9999",
+            "model_name": "updated:latest",
+            "api_protocol": "ollama",
+        }
+        status, body = _put(server, "/v1/models/old-model-id", updated_data)
+        assert status == 200
+        assert body["status"] == "updated"
+        assert body["model_id"] == "new-model-id"
+
+        # Verify old ID is removed and new ID exists
+        assert runtime._model_registry.get("old-model-id") is None
+        cfg = runtime._model_registry.get("new-model-id")
+        assert cfg is not None
+        assert cfg.api_base == "http://localhost:9999"
+        assert cfg.model_name == "updated:latest"
+
     def test_put_update_nonexistent_model(self, server):
         """PUT /v1/models/{id} for a model that doesn't exist should return 404."""
         data = {

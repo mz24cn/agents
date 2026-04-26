@@ -1081,9 +1081,13 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self._send_json_error(400, f"Invalid model config: {exc}")
             return
 
+        new_model_id = config.model_id
+        if new_model_id != model_id:
+            # ID changed: remove old entry and register with new ID
+            runtime._model_registry.remove(model_id)
         runtime._model_registry.register(config)
         runtime._model_registry.save(_MODELS_PATH)
-        self._send_json_response(200, {"status": "updated", "model_id": model_id})
+        self._send_json_response(200, {"status": "updated", "model_id": new_model_id})
 
     def _handle_update_tool(self, tool_id: str) -> None:
         """PUT /v1/tools/{tool_id} — update a tool configuration."""

@@ -7,6 +7,7 @@
 
   const _init = model ?? {}
   const isEdit = model !== null
+  const originalModelId = _init.model_id ?? ''  // 保存原始ID用于API调用
 
   let model_id = $state(_init.model_id ?? '')
   let api_base = $state(_init.api_base ?? '')
@@ -48,7 +49,7 @@
       generate_params: generate_params_text.trim() ? JSON.parse(generate_params_text) : {},
     }
     try {
-      if (isEdit) await models.update(config.model_id, config)
+      if (isEdit) await models.update(originalModelId, config)
       else await models.create(config)
       onSuccess()
     } catch (err) {
@@ -68,7 +69,7 @@
 
   <div class="form-group">
     <label for="model_id">{t('modelId')} <span class="required">{t('required')}</span></label>
-    <input id="model_id" type="text" bind:value={model_id} disabled={isEdit} placeholder={t('modelIdPlaceholder')} />
+    <input id="model_id" type="text" bind:value={model_id} placeholder={t('modelIdPlaceholder')} />
     {#if errors.model_id}<span class="field-error">{errors.model_id}</span>{/if}
   </div>
 
