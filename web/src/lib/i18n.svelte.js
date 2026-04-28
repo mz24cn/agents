@@ -190,6 +190,8 @@ const translations = {
     deleteSession: '删除会话',
     deleteSessionFailed: '删除会话失败',
     confirmDeleteSession: '确定要删除会话「{id}」吗？',
+    generateTitle: '生成标题',
+    generateTitleFailed: '生成标题失败',
 
     // EnvPage
     nav_env: '环境变量',
@@ -443,6 +445,8 @@ const translations = {
     deleteSession: 'Delete session',
     deleteSessionFailed: 'Failed to delete session',
     confirmDeleteSession: 'Delete session "{id}"?',
+    generateTitle: 'Generate Title',
+    generateTitleFailed: 'Failed to generate title',
 
     // EnvPage
     nav_env: 'Env Vars',

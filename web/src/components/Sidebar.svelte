@@ -3,7 +3,7 @@
   import ThemeToggle from './ThemeToggle.svelte'
   import { t, i18n, setLang } from '../lib/i18n.svelte.js'
   import { sessions } from '../lib/api.js'
-  import { sessionRestore } from '../lib/session-state.svelte.js'
+  import { sessionRestore, newSessionCreated } from '../lib/session-state.svelte.js'
 
   const navItems = [
     { hash: '#/chat', key: 'nav_chat' },
@@ -75,6 +75,22 @@
     menuOpenId = null
   }
 
+  async function handleGenerateTitle(e, sid) {
+    e.stopPropagation()
+    closeMenu()
+    try {
+      const result = await sessions.generateTitle(sid)
+      if (result.status === 'success') {
+        // 更新本地列表中的标题
+        sessionList = sessionList.map(s => 
+          s.session_id === sid ? { ...s, title: result.title } : s
+        )
+      }
+    } catch (err) {
+      restoreError = err.message || t('generateTitleFailed')
+    }
+  }
+
   async function handleDeleteSession(e, sid) {
     e.stopPropagation()
     closeMenu()
@@ -88,6 +104,21 @@
   }
 
   $effect(() => { loadSessions() })
+
+  // 监听新会话创建，动态添加到列表
+  $effect(() => {
+    const sid = newSessionCreated.sessionId
+    if (sid) {
+      // 检查是否已存在
+      const exists = sessionList.some(s => s.session_id === sid)
+      if (!exists) {
+        // 动态添加新会话条目到列表顶部
+        sessionList = [{ session_id: sid, title: sid }, ...sessionList]
+      }
+      // 重置状态，避免重复处理
+      newSessionCreated.sessionId = null
+    }
+  })
 </script>
 
 <!-- 点击空白处关闭菜单 -->
@@ -101,6 +132,18 @@
     style="left:{menuPos.x}px; top:{menuPos.y}px;"
     onclick={(e) => e.stopPropagation()}
   >
+    <button
+      class="session-dropdown-item"
+      role="menuitem"
+      onclick={(e) => handleGenerateTitle(e, menuOpenId)}
+    >
+      <svg class="menu-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+        <path d="M2 4h12M2 8h10M2 12h8"/>
+        <circle cx="13" cy="12" r="2.5" fill="none"/>
+        <line x1="14.5" y1="13.5" x2="16" y2="15"/>
+      </svg>
+      {t('generateTitle')}
+    </button>
     <button
       class="session-dropdown-item session-dropdown-danger"
       role="menuitem"
@@ -180,7 +223,8 @@
 <style>
   .sidebar {
     width: 220px;
-    min-height: 100vh;
+    height: 100vh;
+    overflow: hidden;
     background: var(--bg-secondary);
     border-right: 1px solid var(--border);
     display: flex;

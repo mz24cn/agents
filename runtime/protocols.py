@@ -9,6 +9,9 @@ import json
 import uuid
 from abc import ABC, abstractmethod
 from typing import Optional
+import os
+import base64
+import urllib.request
 
 from runtime.models import Message, ModelConfig, TokenStat, ToolConfig
 
@@ -53,6 +56,27 @@ class BaseProtocol(ABC):
             objects and usage is a TokenStat instance (may have all zeros if
             the backend does not report usage).
         """
+
+
+    @staticmethod
+    def _convert_image_to_base64(img_data: str) -> str:
+        """Convert an image source (URL, local path, or data URI) to a raw base64 string."""
+        if img_data.startswith("data:"):
+            return img_data.split(",", 1)[1]
+        
+        if img_data.startswith("http://") or img_data.startswith("https://"):
+            try:
+                with urllib.request.urlopen(img_data) as response:
+                    return base64.b64encode(response.read()).decode("utf-8")
+            except Exception as e:
+                raise ValueError(f"Failed to download image: {e}")
+        
+        expanded_path = os.path.expanduser(img_data)
+        try:
+            with open(expanded_path, "rb") as f:
+                return base64.b64encode(f.read()).decode("utf-8")
+        except (FileNotFoundError, PermissionError, IsADirectoryError) as e:
+            raise ValueError(f"Failed to read image: {e}")
 
 
 class OpenAIProtocol(BaseProtocol):
@@ -176,13 +200,9 @@ class OpenAIProtocol(BaseProtocol):
             if msg.content:
                 content_parts.append({"type": "text", "text": msg.content})
             for img_data in msg.images:
-                # Add data URI prefix if not already present
-                if img_data.startswith("data:"):
-                    img_url = img_data
-                else:
-                    img_url = "data:image/jpeg;base64," + img_data
+                raw_base64 = self._convert_image_to_base64(img_data)
                 content_parts.append(
-                    {"type": "image_url", "image_url": {"url": img_url}}
+                    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + raw_base64}}
                 )
             result["content"] = content_parts
         else:
@@ -446,22 +466,9 @@ class OllamaProtocol(BaseProtocol):
         # Handle multimodal messages with images
         # Images are placed at the same level as content, as raw base64 strings
         if msg.images:
-            result["images"] = [self._strip_data_uri(img) for img in msg.images]
+            result["images"] = [self._convert_image_to_base64(img) for img in msg.images]
 
         return result
-
-    def _strip_data_uri(self, img_data: str) -> str:
-        """Strip data URI prefix from base64 image string if present.
-
-        Ollama expects raw base64 strings without the data:image/...;base64, prefix.
-        """
-        if img_data.startswith("data:"):
-            # Find the base64 marker and strip everything before it
-            marker = ";base64,"
-            idx = img_data.find(marker)
-            if idx != -1:
-                return img_data[idx + len(marker):]
-        return img_data
 
     def _encode_tool(self, tool: ToolConfig) -> dict:
         """Encode a ToolConfig into Ollama tools format."""

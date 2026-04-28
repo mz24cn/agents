@@ -8,7 +8,7 @@ library — zero third-party dependencies.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from typing import Optional
 
 
@@ -1322,7 +1322,8 @@ trivial or uncertain items.
         if summary_msg is None:
             # No compression has occurred yet — inject full history verbatim.
             turn_msgs: list[dict] = [
-                {"role": t.role, "content": t.content} for t in turns
+                {k: v for k, v in asdict(t).items() if v is not None}
+                for t in turns
             ]
             assembled = turn_msgs + list(new_messages)
 
@@ -1350,7 +1351,8 @@ trivial or uncertain items.
         k = self._recent_turns_k
         recent_turns = turns[-k:] if len(turns) > k else turns
         turn_msgs = [
-            {"role": t.role, "content": t.content} for t in recent_turns
+            {k: v for k, v in asdict(t).items() if v is not None}
+            for t in recent_turns
         ]
 
         # Assemble full list

@@ -162,20 +162,42 @@ class SessionManager:
         """
         if last_total_tokens is None or last_total_tokens <= 10000:
             return
+        self._do_generate_title(session_id)
+
+    def generate_title_forced(self, session_id: str) -> Optional[str]:
+        """强制为会话生成标题（手动触发，跳过 token 阈值检查）。
+
+        Args:
+            session_id: 会话 ID。
+
+        Returns:
+            生成的标题，失败时返回 None。
+        """
+        return self._do_generate_title(session_id)
+
+    def _do_generate_title(self, session_id: str) -> Optional[str]:
+        """实际执行标题生成的内部方法。
+
+        Args:
+            session_id: 会话 ID。
+
+        Returns:
+            生成的标题，失败时返回 None。
+        """
         summary_model_id = os.environ.get("SUMMARY_MODEL_ID", "")
         if not summary_model_id:
-            return
+            logger.warning("generate_title: SUMMARY_MODEL_ID 环境变量未配置")
+            return None
         if self._infer_fn is None:
-            return
+            logger.warning("generate_title: 推理函数未设置")
+            return None
 
         try:
             index = self._read_index()
             entry = index.get(session_id)
             if entry is None:
-                return
-            if entry.get("title", "") and entry.get("title") != session_id:
-                # 已有真实标题（非 session_id 占位），不重复生成
-                return
+                logger.warning("generate_title: 会话不存在 (session=%s)", session_id)
+                return None
 
             # 读取 conversation.json 前几条消息
             conv_path = os.path.join(self._chats_dir, session_id, "conversation.json")
@@ -183,8 +205,9 @@ class SessionManager:
                 with open(conv_path, "r", encoding="utf-8") as fh:
                     conv_data = json.load(fh)
                 messages = conv_data.get("messages", [])
-            except Exception:
-                return
+            except Exception as e:
+                logger.warning("generate_title: 读取会话文件失败 (session=%s): %s", session_id, e)
+                return None
 
             # 取前 10 条 user/assistant 消息
             excerpt_parts = []
@@ -197,7 +220,8 @@ class SessionManager:
                         excerpt_parts.append(f"{role}: {content[:200]}")
                         count += 1
             if not excerpt_parts:
-                return
+                logger.warning("generate_title: 会话无有效消息 (session=%s)", session_id)
+                return None
 
             conversation_excerpt = "\n".join(excerpt_parts)
             prompt = (
@@ -219,7 +243,8 @@ class SessionManager:
                     title = msg.content.strip()
                     break
             if not title:
-                return
+                logger.warning("generate_title: 模型未返回有效标题 (session=%s)", session_id)
+                return None
 
             # 截断至 100 字符
             title = title[:100]
@@ -229,8 +254,12 @@ class SessionManager:
             if session_id in index:
                 index[session_id]["title"] = title
                 self._write_index(index)
+                logger.info("generate_title: 成功生成标题 (session=%s): %s", session_id, title)
+                return title
+            return None
         except Exception as exc:
             logger.warning("generate_title: 生成标题失败 (session=%s): %s", session_id, exc)
+            return None
 
     def list_sessions(self) -> list[dict]:
         """读取 index.json，返回所有 SessionIndexEntry 列表，按 last_inference_at 降序排列。

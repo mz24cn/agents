@@ -232,7 +232,7 @@ DELEGATE_TOOL_CONFIG = ToolConfig(
                 "type": "string",
                 "description": "Subagent 使用的模型 ID，必须已在 ModelRegistry 中注册",
             },
-            "tool_names": {
+            "tools": {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "Subagent 可用的工具名称列表（使用工具的 name 字段）。传入空数组表示纯推理模式（不使用任何工具）",
@@ -256,13 +256,13 @@ DELEGATE_TOOL_CONFIG = ToolConfig(
                 ),
             },
         },
-        "required": ["model_id", "tool_names", "task"],
+        "required": ["model_id", "tools", "task"],
     },
     builtin=True,
 )
 
 
-def resolve_tool_ids(tool_names: list[str], scope: list) -> list[str]:
+def resolve_tool_ids(tools: list[str], scope: list) -> list[str]:
     """将工具 name 列表解析为 tool_id 列表，仅在 scope 内查找。
 
     大模型生成的工具名来自 ToolConfig.name，而 InferenceRequest 需要 tool_id。
@@ -271,7 +271,7 @@ def resolve_tool_ids(tool_names: list[str], scope: list) -> list[str]:
     找不到对应工具的 name 会被跳过并记录警告。
 
     Args:
-        tool_names: 工具 name 列表
+        tools: 工具 name 列表
         scope: 当前请求的 ToolConfig 列表（即 infer_stream 构建的 tools）
 
     Returns:
@@ -279,7 +279,7 @@ def resolve_tool_ids(tool_names: list[str], scope: list) -> list[str]:
     """
     name_to_id = {tc.name: tc.tool_id for tc in scope}
     tool_ids = []
-    for name in tool_names:
+    for name in tools:
         if name in name_to_id:
             tool_ids.append(name_to_id[name])
         else:
@@ -336,7 +336,7 @@ def _make_delegate_fn(runtime, thread_local):
     Returns:
         delegate 可调用函数
     """
-    def delegate(model_id: str, tool_names: list[str], task: str, context: str = "", images: list[str] | None = None) -> str:
+    def delegate(model_id: str, tools: list[str], task: str, context: str = "", images: list[str] | None = None) -> str:
         tool_call_id = "call_" + uuid.uuid4().hex[:8]
         session_id = getattr(thread_local, "session_id", None)
         current_depth = getattr(thread_local, "depth", 0)
@@ -345,7 +345,7 @@ def _make_delegate_fn(runtime, thread_local):
         tool_scope = getattr(thread_local, "tool_scope", [])
 
         try:
-            resolved_ids = resolve_tool_ids(tool_names, tool_scope)
+            resolved_ids = resolve_tool_ids(tools, tool_scope)
             messages = build_messages(context=context, task=task, images=images)
             request = InferenceRequest(
                 model_id=model_id,
@@ -385,7 +385,8 @@ def _make_delegate_fn(runtime, thread_local):
 
             result = accumulate_content(chunks)
 
-            # 推送结束帧
+            # 推送结束帧：通知前端流式消息框已完成，并重置 assistant 消息索引
+            # 不携带 content（内容已通过流式增量帧完整推送），仅作状态信号
             if sse_callback is not None:
                 try:
                     sse_callback({
@@ -393,11 +394,10 @@ def _make_delegate_fn(runtime, thread_local):
                         "name": "delegate",
                         "tool_call_id": tool_call_id,
                         "streaming": False,
-                        "content": result,
-                        "depth": current_depth + 1,
+                        "content": "",
                     })
                 except Exception:
-                    pass  # SSE 写入失败不中断推理
+                    pass
 
             # 持久化 Subagent Session
             persistence_warning = ""

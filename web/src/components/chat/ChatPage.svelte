@@ -9,7 +9,7 @@
   import ChatInput from './ChatInput.svelte'
   import { extractPlaceholders } from '../../lib/placeholder.js'
   import { t } from '../../lib/i18n.svelte.js'
-  import { sessionRestore } from '../../lib/session-state.svelte.js'
+  import { sessionRestore, newSessionCreated } from '../../lib/session-state.svelte.js'
 
   const STORAGE_MODEL_KEY = 'chat_selected_model'
   const STORAGE_TOOLS_KEY = 'chat_selected_tools'
@@ -105,10 +105,14 @@
     errorMsg = ''
     messages = [...messages, { role: 'user', content: text }]
     const apiMessages = []
-    if (systemPromptTemplate) {
-      apiMessages.push({ role: 'system', content: '', prompt_template: systemPromptTemplate.template_id, arguments: systemPromptTemplate.arguments })
-    } else if (systemPromptText) {
-      apiMessages.push({ role: 'system', content: systemPromptText })
+    // Only send system message on the first request (no session yet)
+    // On subsequent requests, the backend will restore it from session history
+    if (!sessionId) {
+      if (systemPromptTemplate) {
+        apiMessages.push({ role: 'system', content: '', prompt_template: systemPromptTemplate.template_id, arguments: systemPromptTemplate.arguments })
+      } else if (systemPromptText) {
+        apiMessages.push({ role: 'system', content: systemPromptText })
+      }
     }
     apiMessages.push({ role: 'user', content: text })
     _doSend(apiMessages)
@@ -119,10 +123,13 @@
     errorMsg = ''
     messages = [...messages, { role: 'user', content: '', prompt_template: templateId, arguments: args }]
     const apiMessages = []
-    if (systemPromptTemplate) {
-      apiMessages.push({ role: 'system', content: '', prompt_template: systemPromptTemplate.template_id, arguments: systemPromptTemplate.arguments })
-    } else if (systemPromptText) {
-      apiMessages.push({ role: 'system', content: systemPromptText })
+    // Only send system message on the first request (no session yet)
+    if (!sessionId) {
+      if (systemPromptTemplate) {
+        apiMessages.push({ role: 'system', content: '', prompt_template: systemPromptTemplate.template_id, arguments: systemPromptTemplate.arguments })
+      } else if (systemPromptText) {
+        apiMessages.push({ role: 'system', content: systemPromptText })
+      }
     }
     apiMessages.push({ role: 'user', content: '', prompt_template: templateId, arguments: args })
     _doSend(apiMessages)
@@ -149,6 +156,10 @@
   function onStreamMsg(msg, aIdxRef) {
     if (msg.session_id && !msg.role) {
       sessionId = msg.session_id
+      // 通知 Sidebar 有新会话创建（仅当之前没有 sessionId 时才是新会话）
+      if (!newSessionCreated.sessionId) {
+        newSessionCreated.sessionId = msg.session_id
+      }
       return
     }
     if (msg.role === 'assistant') {
@@ -187,16 +198,21 @@
         }
         // 流式帧不重置 aIdxRef，让 assistant 消息继续累积
       } else if (msg.streaming === false) {
-        // delegate 结束帧：用最终内容更新对应工具消息
+        // delegate 结束帧：标记流式消息框已完成
         const tcId = msg.tool_call_id
         const existingIdx = tcId
           ? messages.findLastIndex(m => m.role === 'tool' && m.tool_call_id === tcId)
           : -1
         if (existingIdx >= 0) {
           const arr = [...messages]
-          arr[existingIdx] = { ...arr[existingIdx], content: msg.content || '', streaming: false }
+          // 只更新 streaming 状态，不覆盖 content（内容已通过流式增量帧完整推送）
+          arr[existingIdx] = { ...arr[existingIdx], streaming: false }
+          // 如果结束帧携带了 content（非空），才更新
+          if (msg.content) {
+            arr[existingIdx] = { ...arr[existingIdx], content: msg.content }
+          }
           messages = arr
-        } else {
+        } else if (msg.content) {
           messages = [...messages, { role: 'tool', name: msg.name || '', content: msg.content || '' }]
         }
         aIdxRef.value = -1

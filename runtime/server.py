@@ -129,8 +129,7 @@ def merge_stream_messages(stream_messages: list) -> tuple[list, Optional[dict]]:
     """将流式推理产生的原始 Message 列表合并为 ConversationTurn 列表。
 
     流式推理中每个 token 都是一条独立的 Message，本函数将它们按语义合并：
-    - 连续的 assistant content/thinking delta 合并为一条 assistant turn
-    - assistant tool_calls 消息触发 flush，将已积累的文本先保存
+    - 连续的 assistant content/thinking/tool_calls 合并为一条 assistant turn
     - tool 角色消息先 flush 当前 assistant turn，再保存 tool result turn
     - usage 消息提取 stat，不生成 turn
     - system 消息跳过
@@ -177,17 +176,7 @@ def merge_stream_messages(stream_messages: list) -> tuple[list, Optional[dict]]:
             continue
         if m.role == "assistant":
             if m.tool_calls:
-                # tool_calls 到来时先 flush 已积累的纯文本
-                if assistant_text_buf or assistant_thinking_buf:
-                    ts = _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-                    turns.append(ConversationTurn(
-                        role="assistant",
-                        content=assistant_text_buf,
-                        timestamp=ts,
-                        thinking=assistant_thinking_buf or None,
-                    ))
-                    assistant_text_buf = ""
-                    assistant_thinking_buf = ""
+                # tool_calls 到来时，合并到当前 assistant turn（不单独 flush）
                 pending_tool_calls = m.tool_calls
             if m.content:
                 assistant_text_buf += m.content
@@ -417,6 +406,10 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self._handle_set_env()
         elif path == "/v1/env/detect":
             self._handle_detect_env()
+        elif re.match(r"^/v1/sessions/[^/]+/generate-title$", path):
+            # POST /v1/sessions/{session_id}/generate-title
+            session_id = path[len("/v1/sessions/"):-len("/generate-title")]
+            self._handle_generate_session_title(urllib.parse.unquote(session_id))
         else:
             self._send_json_error(404, f"Not found: {self.path}")
 
@@ -576,7 +569,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             if rows:
                 max_name = max(len(r[0]) for r in rows)
                 max_desc = max(len(r[1]) for r in rows)
-                header = f"| {'Tool'.ljust(max_name)} | {'Description'.ljust(max_desc)} |"
+                header = f"| {'Tool(s)'.ljust(max_name)} | {'Description'.ljust(max_desc)} |"
                 sep = f"| {'-' * max_name} | {'-' * max_desc} |"
                 lines = [header, sep]
                 for name, desc in rows:
@@ -761,6 +754,9 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         try:
             for msg in runtime.infer_stream(request, cancel_event=cancel_event):
                 collected_messages.append(msg)
+                # delegate 工具通过 sse_callback 自行管理流式帧和结束帧，跳过 infer_stream 的重复输出
+                if msg.role == "tool" and msg.name == "delegate":
+                    continue
                 event_data = json.dumps(msg.to_dict(), ensure_ascii=False)
                 self.wfile.write(f"data: {event_data}\n\n".encode("utf-8"))
                 self.wfile.flush()
@@ -1372,6 +1368,23 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self._send_json_error(400, str(exc))
             return
         self._send_json_response(200, {"status": "deleted", "session_id": session_id})
+
+    def _handle_generate_session_title(self, session_id: str) -> None:
+        """POST /v1/sessions/{session_id}/generate-title — 手动生成会话标题。"""
+        session_manager = self.server.session_manager  # type: ignore[attr-defined]
+        try:
+            # 强制生成标题（传入 None 表示强制生成，跳过 token 阈值检查）
+            title = session_manager.generate_title_forced(session_id)
+            if title:
+                self._send_json_response(200, {"status": "success", "session_id": session_id, "title": title})
+            else:
+                self._send_json_error(500, f"Failed to generate title for session: {session_id}")
+        except FileNotFoundError:
+            self._send_json_error(404, f"Session not found: {session_id}")
+            return
+        except ValueError as exc:
+            self._send_json_error(400, str(exc))
+            return
 
 
 class RuntimeHTTPServer:

@@ -152,7 +152,8 @@ export const env = {
 
 /** 会话 API */
 export const sessions = {
-  list:   ()              => request('GET',    '/v1/sessions'),
-  get:    (sessionId)     => request('GET',    `/v1/sessions/${encodeURIComponent(sessionId)}`),
-  delete: (sessionId)     => request('DELETE', `/v1/sessions/${encodeURIComponent(sessionId)}`),
+  list:          ()              => request('GET',    '/v1/sessions'),
+  get:           (sessionId)     => request('GET',    `/v1/sessions/${encodeURIComponent(sessionId)}`),
+  delete:        (sessionId)     => request('DELETE', `/v1/sessions/${encodeURIComponent(sessionId)}`),
+  generateTitle: (sessionId)     => request('POST',   `/v1/sessions/${encodeURIComponent(sessionId)}/generate-title`),
 }
