@@ -45,11 +45,6 @@
 
   function handleDeleteCancel() { deleteTarget = null }
 
-  function truncate(text, max = 80) {
-    if (!text) return ''
-    return text.length > max ? text.slice(0, max) + '...' : text
-  }
-
   $effect(() => { fetchTemplates() })
 </script>
 
@@ -69,33 +64,35 @@
     <div class="error-msg">{error}</div>
   {/if}
 
-  {#if loading}
-    <div class="loading">{t('loading')}</div>
-  {:else if templateList.length === 0 && !error}
-    <div class="empty">{t('noTemplates')}</div>
-  {:else if templateList.length > 0}
-    <div class="template-list">
-      {#each templateList as tpl (tpl.template_id)}
-        <div class="template-card">
-          <div class="template-info">
-            <div class="template-name-row">
-              <span class="template-name">{tpl.template_id}</span>
-              <div class="template-tags">
-                {#each extractPlaceholders(tpl.content) as ph}
-                  <span class="placeholder-tag">{ph}</span>
-                {/each}
+  <div class="page-content">
+    {#if loading}
+      <div class="loading">{t('loading')}</div>
+    {:else if templateList.length === 0 && !error}
+      <div class="empty">{t('noTemplates')}</div>
+    {:else if templateList.length > 0}
+      <div class="template-list">
+        {#each templateList as tpl (tpl.template_id)}
+          <div class="template-card">
+            <div class="template-info">
+              <div class="template-name-row">
+                <span class="template-name">{tpl.template_id}</span>
+                <div class="template-tags">
+                  {#each extractPlaceholders(tpl.content) as ph}
+                    <span class="placeholder-tag">{ph}</span>
+                  {/each}
+                </div>
               </div>
+              <div class="template-preview">{tpl.content || ''}</div>
             </div>
-            <div class="template-preview">{truncate(tpl.content)}</div>
+            <div class="template-actions">
+              <button class="btn btn-sm" onclick={() => handleEdit(tpl)}>{t('edit')}</button>
+              <button class="btn btn-sm btn-danger" onclick={() => handleDeleteClick(tpl)}>{t('delete')}</button>
+            </div>
           </div>
-          <div class="template-actions">
-            <button class="btn btn-sm" onclick={() => handleEdit(tpl)}>{t('edit')}</button>
-            <button class="btn btn-sm btn-danger" onclick={() => handleDeleteClick(tpl)}>{t('delete')}</button>
-          </div>
-        </div>
-      {/each}
-    </div>
-  {/if}
+        {/each}
+      </div>
+    {/if}
+  </div>
 </div>
 
 <ConfirmDialog
@@ -106,8 +103,21 @@
 />
 
 <style>
-  .prompts-page { padding: 20px; }
-  .page-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+  .prompts-page {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    overflow: hidden;
+  }
+  .page-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 20px;
+    flex-shrink: 0;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg);
+  }
   h2 { margin: 0; color: var(--text); }
   .btn { padding: 8px 18px; border-radius: 6px; border: none; cursor: pointer; font-size: 0.9rem; }
   .btn-primary { background: var(--primary); color: #fff; }
@@ -116,7 +126,13 @@
   .btn-sm:hover { opacity: 0.8; }
   .btn-danger { background: var(--danger); color: #fff; border: none; }
   .btn-danger:hover { background: var(--danger-hover); }
-  .error-msg { background: var(--danger); color: #fff; padding: 10px 14px; border-radius: 6px; margin-bottom: 16px; font-size: 0.9rem; }
+  .error-msg { background: var(--danger); color: #fff; padding: 10px 14px; border-radius: 6px; margin: 0 20px; font-size: 0.9rem; flex-shrink: 0; }
+  .page-content {
+    flex: 1;
+    overflow-y: auto;
+    min-height: 0;
+    padding: 20px;
+  }
   .loading, .empty { text-align: center; padding: 40px 0; color: var(--text-secondary); font-size: 1rem; }
   .template-list { display: flex; flex-direction: column; gap: 12px; }
   .template-card { display: flex; justify-content: space-between; align-items: center; padding: 14px 16px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; }
@@ -125,6 +141,47 @@
   .template-name { font-weight: 600; color: var(--text); font-size: 0.95rem; }
   .template-tags { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }
   .placeholder-tag { display: inline-block; padding: 1px 7px; background: var(--primary); color: #fff; border-radius: 4px; font-size: 0.78rem; font-family: monospace; }
-  .template-preview { color: var(--text-secondary); font-size: 0.85rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .template-preview { 
+    color: var(--text-secondary); 
+    font-size: 0.85rem; 
+    white-space: pre-wrap; 
+    word-break: break-word;
+    overflow-wrap: break-word;
+    max-height: 4.5em;
+    overflow-y: auto;
+    line-height: 1.5;
+  }
   .template-actions { display: flex; align-items: center; gap: 8px; margin-left: 16px; flex-shrink: 0; }
+  
+  /* 滚动条样式：默认隐藏，悬停时显示 */
+  .page-content::-webkit-scrollbar {
+    width: 8px;
+  }
+  .page-content::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .page-content::-webkit-scrollbar-thumb {
+    background: transparent;
+    border-radius: 4px;
+    transition: background 0.2s;
+  }
+  .page-content:hover::-webkit-scrollbar-thumb {
+    background: var(--border);
+  }
+  .page-content:hover::-webkit-scrollbar-thumb:hover {
+    background: var(--text-secondary);
+  }
+  .template-preview::-webkit-scrollbar {
+    width: 4px;
+  }
+  .template-preview::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .template-preview::-webkit-scrollbar-thumb {
+    background: transparent;
+    border-radius: 2px;
+  }
+  .template-preview:hover::-webkit-scrollbar-thumb {
+    background: var(--border);
+  }
 </style>

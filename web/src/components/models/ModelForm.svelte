@@ -6,8 +6,8 @@
   let { model = null, onSuccess, onCancel } = $props()
 
   const _init = model ?? {}
-  const isEdit = model !== null
   const originalModelId = _init.model_id ?? ''  // 保存原始ID用于API调用
+  const isEdit = originalModelId !== ''  // 有原始ID才是编辑模式，复制时model_id为空算创建
 
   let model_id = $state(_init.model_id ?? '')
   let api_base = $state(_init.api_base ?? '')

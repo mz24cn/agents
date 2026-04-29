@@ -163,6 +163,8 @@ const translations = {
     typeHeader: '类型',
     protocolHeader: '协议',
     confirmDeleteModel: '确定要删除模型「{id}」吗？',
+    copyModel: '复制',
+    copyModelIdHint: '（复制自 {id}）',
 
     // PromptForm
     editTemplate: '编辑模板',
@@ -192,6 +194,10 @@ const translations = {
     confirmDeleteSession: '确定要删除会话「{id}」吗？',
     generateTitle: '生成标题',
     generateTitleFailed: '生成标题失败',
+
+    // Sidebar
+    collapseSidebar: '收起侧边栏',
+    expandSidebar: '展开侧边栏',
 
     // EnvPage
     nav_env: '环境变量',
@@ -418,6 +424,8 @@ const translations = {
     typeHeader: 'Type',
     protocolHeader: 'Protocol',
     confirmDeleteModel: 'Delete model "{id}"?',
+    copyModel: 'Copy',
+    copyModelIdHint: ' (copied from {id})',
 
     // PromptForm
     editTemplate: 'Edit Template',
@@ -447,6 +455,10 @@ const translations = {
     confirmDeleteSession: 'Delete session "{id}"?',
     generateTitle: 'Generate Title',
     generateTitleFailed: 'Failed to generate title',
+
+    // Sidebar
+    collapseSidebar: 'Collapse sidebar',
+    expandSidebar: 'Expand sidebar',
 
     // EnvPage
     nav_env: 'Env Vars',

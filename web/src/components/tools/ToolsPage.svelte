@@ -133,69 +133,71 @@
     <div class="error-msg">{error}</div>
   {/if}
 
-  {#if loading}
-    <div class="loading">{t('loading')}</div>
-  {:else if toolList.length === 0 && !error}
-    <div class="empty">{t('noTools2')}</div>
-  {:else if toolList.length > 0}
-    <div class="groups-wrap">
-      {#each [...groups.entries()] as [key, groupTools] (key)}
-        {@const collapsed = !expandedGroups.has(key)}
-        <div class="group-block">
-          <div class="group-header">
-            <button class="collapse-btn" onclick={() => toggleCollapse(key)}>
-              {collapsed ? '▶' : '▼'}
-            </button>
-            <span class="group-title">
+  <div class="page-content">
+    {#if loading}
+      <div class="loading">{t('loading')}</div>
+    {:else if toolList.length === 0 && !error}
+      <div class="empty">{t('noTools2')}</div>
+    {:else if toolList.length > 0}
+      <div class="groups-wrap">
+        {#each [...groups.entries()] as [key, groupTools] (key)}
+          {@const collapsed = !expandedGroups.has(key)}
+          <div class="group-block">
+            <div class="group-header">
+              <button class="collapse-btn" onclick={() => toggleCollapse(key)}>
+                {collapsed ? '▶' : '▼'}
+              </button>
+              <span class="group-title">
+                {#if isMcpGroup(key)}
+                  <span class="badge badge-mcp">MCP</span>
+                {/if}
+                {groupLabel(key)}
+                <span class="group-count">{t('toolCount', { n: groupTools.length })}</span>
+              </span>
               {#if isMcpGroup(key)}
-                <span class="badge badge-mcp">MCP</span>
+                <button class="btn btn-sm" onclick={() => handleEditMcpServer(key)} title={t('editMcpServerTitle')}>{t('edit')}</button>
+                <button class="btn btn-sm btn-danger" onclick={() => handleDeleteGroupClick(key)} title={t('deleteMcpServerTitle')}>{t('delete')}</button>
               {/if}
-              {groupLabel(key)}
-              <span class="group-count">{t('toolCount', { n: groupTools.length })}</span>
-            </span>
-            {#if isMcpGroup(key)}
-              <button class="btn btn-sm" onclick={() => handleEditMcpServer(key)} title={t('editMcpServerTitle')}>{t('edit')}</button>
-              <button class="btn btn-sm btn-danger" onclick={() => handleDeleteGroupClick(key)} title={t('deleteMcpServerTitle')}>{t('delete')}</button>
+            </div>
+
+            {#if !collapsed}
+              <table>
+                <thead>
+                  <tr>
+                    <th>{t('toolIdHeader')}</th>
+                    <th>{t('toolNameHeader')}</th>
+                    <th>{t('toolDescHeader')}</th>
+                    <th>{t('actions')}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {#each groupTools as tool (tool.tool_id)}
+                    <tr>
+                      <td class="id-cell">{tool.tool_id}</td>
+                      <td class="name-cell">
+                        <button class="link-btn" onclick={() => handleShowDetail(tool)}>{tool.name}</button>
+                      </td>
+                      <td class="desc-cell">{tool.description}</td>
+                      <td class="actions">
+                        {#if !isMcpGroup(key) && !tool.builtin}
+                          <button class="btn btn-sm" onclick={() => handleEdit(tool)}>{t('edit')}</button>
+                        {/if}
+                        {#if !tool.builtin}
+                          <button class="btn btn-sm btn-danger" onclick={() => handleDeleteClick(tool)}>{t('delete')}</button>
+                        {:else}
+                          <span class="badge badge-builtin">{t('builtin')}</span>
+                        {/if}
+                      </td>
+                    </tr>
+                  {/each}
+                </tbody>
+              </table>
             {/if}
           </div>
-
-          {#if !collapsed}
-            <table>
-              <thead>
-                <tr>
-                  <th>{t('toolIdHeader')}</th>
-                  <th>{t('toolNameHeader')}</th>
-                  <th>{t('toolDescHeader')}</th>
-                  <th>{t('actions')}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {#each groupTools as tool (tool.tool_id)}
-                  <tr>
-                    <td class="id-cell">{tool.tool_id}</td>
-                    <td class="name-cell">
-                      <button class="link-btn" onclick={() => handleShowDetail(tool)}>{tool.name}</button>
-                    </td>
-                    <td class="desc-cell">{tool.description}</td>
-                    <td class="actions">
-                      {#if !isMcpGroup(key) && !tool.builtin}
-                        <button class="btn btn-sm" onclick={() => handleEdit(tool)}>{t('edit')}</button>
-                      {/if}
-                      {#if !tool.builtin}
-                        <button class="btn btn-sm btn-danger" onclick={() => handleDeleteClick(tool)}>{t('delete')}</button>
-                      {:else}
-                        <span class="badge badge-builtin">{t('builtin')}</span>
-                      {/if}
-                    </td>
-                  </tr>
-                {/each}
-              </tbody>
-            </table>
-          {/if}
-        </div>
-      {/each}
-    </div>
-  {/if}
+        {/each}
+      </div>
+    {/if}
+  </div>
 </div>
 
 <ConfirmDialog
@@ -206,8 +208,21 @@
 />
 
 <style>
-  .tools-page { padding: 20px; }
-  .page-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+  .tools-page {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    overflow: hidden;
+  }
+  .page-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 20px;
+    flex-shrink: 0;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg);
+  }
   h2 { margin: 0; color: var(--text); }
   .btn { padding: 8px 18px; border-radius: 6px; border: none; cursor: pointer; font-size: 0.9rem; }
   .btn-primary { background: var(--primary); color: #fff; }
@@ -218,7 +233,13 @@
   .btn-danger:hover { background: var(--danger-hover, #c0392b); }
   .link-btn { background: none; border: none; color: var(--primary); cursor: pointer; padding: 0; font-size: inherit; text-decoration: underline; }
   .link-btn:hover { opacity: 0.8; }
-  .error-msg { background: var(--danger); color: #fff; padding: 10px 14px; border-radius: 6px; margin-bottom: 16px; font-size: 0.9rem; }
+  .error-msg { background: var(--danger); color: #fff; padding: 10px 14px; border-radius: 6px; margin: 0 20px; font-size: 0.9rem; flex-shrink: 0; }
+  .page-content {
+    flex: 1;
+    overflow-y: auto;
+    min-height: 0;
+    padding: 20px;
+  }
   .loading, .empty { text-align: center; padding: 40px 0; color: var(--text-secondary); }
   .groups-wrap { display: flex; flex-direction: column; gap: 12px; }
   .group-block { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
@@ -239,4 +260,23 @@
   .name-cell { white-space: nowrap; }
   .desc-cell { max-width: 0; width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .actions { display: flex; gap: 6px; white-space: nowrap; }
+  
+  /* 滚动条样式：默认隐藏，悬停时显示 */
+  .page-content::-webkit-scrollbar {
+    width: 8px;
+  }
+  .page-content::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .page-content::-webkit-scrollbar-thumb {
+    background: transparent;
+    border-radius: 4px;
+    transition: background 0.2s;
+  }
+  .page-content:hover::-webkit-scrollbar-thumb {
+    background: var(--border);
+  }
+  .page-content:hover::-webkit-scrollbar-thumb:hover {
+    background: var(--text-secondary);
+  }
 </style>

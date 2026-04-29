@@ -4,6 +4,7 @@
   import { t, i18n, setLang } from '../lib/i18n.svelte.js'
   import { sessions } from '../lib/api.js'
   import { sessionRestore, newSessionCreated } from '../lib/session-state.svelte.js'
+  import { sidebarWidth, setSidebarWidth, toggleSidebarCollapsed, SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH } from '../lib/sidebar-width.svelte.js'
 
   const navItems = [
     { hash: '#/chat', key: 'nav_chat' },
@@ -20,6 +21,14 @@
   // 弹出菜单状态
   let menuOpenId = $state(null)   // 当前展开菜单的 session id
   let menuPos = $state({ x: 0, y: 0 })  // fixed 定位坐标
+
+  // 拖动状态
+  let isDragging = $state(false)
+  let dragStartX = 0        // mousedown 时的 clientX
+  let dragStartWidth = 0    // mousedown 时的侧边栏宽度
+  // footer 高度，用于对齐 fixed 按钮
+  let footerEl = $state(null)
+  let footerHeight = $derived(footerEl ? footerEl.offsetHeight : 49)
 
   async function loadSessions() {
     sessionLoading = true
@@ -103,6 +112,46 @@
     }
   }
 
+  // 拖动处理：记录起始点，用增量计算，避免按钮偏移导致宽度跳变
+  function handleDragStart(e) {
+    // 只响应鼠标左键
+    if (e.type === 'mousedown' && e.button !== 0) return
+    e.preventDefault()
+    isDragging = false  // 先不标记，等真正移动再标记
+    dragStartX = e.type.startsWith('touch') ? e.touches[0].clientX : e.clientX
+    dragStartWidth = sidebarWidth.current
+    document.addEventListener('mousemove', handleDragMove)
+    document.addEventListener('mouseup', handleDragEnd)
+    document.addEventListener('touchmove', handleDragMove, { passive: false })
+    document.addEventListener('touchend', handleDragEnd)
+  }
+
+  function handleDragMove(e) {
+    e.preventDefault()
+    const clientX = e.type.startsWith('touch') ? e.touches[0].clientX : e.clientX
+    const delta = clientX - dragStartX
+    // 超过 3px 才认为是拖动，避免误触
+    if (!isDragging && Math.abs(delta) < 3) return
+    isDragging = true
+    const newWidth = Math.max(SIDEBAR_MIN_WIDTH, Math.min(SIDEBAR_MAX_WIDTH, dragStartWidth + delta))
+    setSidebarWidth(newWidth)
+  }
+
+  function handleDragEnd() {
+    document.removeEventListener('mousemove', handleDragMove)
+    document.removeEventListener('mouseup', handleDragEnd)
+    document.removeEventListener('touchmove', handleDragMove)
+    document.removeEventListener('touchend', handleDragEnd)
+    // 延迟重置 isDragging，让 click 事件能检测到
+    setTimeout(() => { isDragging = false }, 0)
+  }
+
+  function handleToggleClick(e) {
+    // 如果刚刚发生了拖动，不触发收缩切换
+    if (isDragging) return
+    toggleSidebarCollapsed()
+  }
+
   $effect(() => { loadSessions() })
 
   // 监听新会话创建，动态添加到列表
@@ -161,7 +210,7 @@
   </div>
 {/if}
 
-<aside class="sidebar">
+<aside class="sidebar" class:collapsed={sidebarWidth.collapsed} style="width: {sidebarWidth.collapsed ? 0 : sidebarWidth.current}px">
   <nav class="nav">
     {#each navItems as item}
       <a
@@ -176,14 +225,14 @@
   <!-- 历史会话面板 -->
   <div class="session-panel">
     <div class="session-panel-title">{t('sessionPanelTitle')}</div>
-    {#if sessionLoading}
-      <div class="session-loading">{t('loading')}</div>
-    {:else if sessionError}
-      <div class="session-error">{sessionError}</div>
-    {:else if sessionList.length === 0}
-      <div class="session-empty">{t('noSessions')}</div>
-    {:else}
-      <div class="session-list">
+    <div class="session-list">
+      {#if sessionLoading}
+        <div class="session-loading">{t('loading')}</div>
+      {:else if sessionError}
+        <div class="session-error">{sessionError}</div>
+      {:else if sessionList.length === 0}
+        <div class="session-empty">{t('noSessions')}</div>
+      {:else}
         {#each sessionList as entry (entry.session_id)}
           <div class="session-row">
             <button class="session-item" onclick={() => handleSessionClick(entry.session_id)}>
@@ -196,13 +245,13 @@
             >···</button>
           </div>
         {/each}
-      </div>
-    {/if}
-    {#if restoreError}
-      <div class="session-error">{restoreError}</div>
-    {/if}
+      {/if}
+      {#if restoreError}
+        <div class="session-error">{restoreError}</div>
+      {/if}
+    </div>
   </div>
-  <div class="sidebar-footer">
+  <div class="sidebar-footer" bind:this={footerEl}>
     <div class="footer-theme-wrap">
       <ThemeToggle />
     </div>
@@ -220,9 +269,29 @@
   </div>
 </aside>
 
+<!-- 统一的收缩/展开按钮，固定在侧边栏右边缘底部 -->
+<button
+  class="sidebar-toggle-btn"
+  style="left: {sidebarWidth.collapsed ? 0 : sidebarWidth.current}px; height: {footerHeight}px;"
+  onclick={handleToggleClick}
+  onmousedown={handleDragStart}
+  ontouchstart={handleDragStart}
+  aria-label={sidebarWidth.collapsed ? t('expandSidebar') : t('collapseSidebar')}
+  title={sidebarWidth.collapsed ? t('expandSidebar') : t('collapseSidebar')}
+>
+  {#if sidebarWidth.collapsed}
+    <svg class="toggle-arrow" viewBox="0 0 8 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <polyline points="1,1 7,7 1,13"/>
+    </svg>
+  {:else}
+    <svg class="toggle-arrow" viewBox="0 0 8 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <polyline points="7,1 1,7 7,13"/>
+    </svg>
+  {/if}
+</button>
+
 <style>
   .sidebar {
-    width: 220px;
     height: 100vh;
     overflow: hidden;
     background: var(--bg-secondary);
@@ -230,6 +299,11 @@
     display: flex;
     flex-direction: column;
     flex-shrink: 0;
+    transition: width 0.2s ease;
+  }
+  .sidebar.collapsed {
+    border-right: none;
+    overflow: hidden;
   }
   .nav {
     display: flex;
@@ -262,6 +336,34 @@
     flex-direction: row;
     gap: 8px;
     align-items: stretch;
+  }
+  .sidebar-toggle-btn {
+    position: fixed;
+    bottom: 0;
+    /* left & height 由 style 属性动态设置 */
+    width: fit-content;
+    min-width: 0;
+    padding: 0 2px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-left: none;
+    border-radius: 0 6px 6px 0;
+    cursor: ew-resize;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 50;
+    transition: background-color 0.15s, left 0.2s ease;
+  }
+  .sidebar-toggle-btn:hover {
+    background: var(--border);
+  }
+  .toggle-arrow {
+    width: 8px;
+    height: 14px;
+    color: var(--text-secondary);
+    display: block;
+    pointer-events: none;
   }
   .footer-theme-wrap {
     flex: 1;
@@ -317,10 +419,10 @@
     border-color: var(--primary);
   }
   .session-panel {
-    padding: 8px 0;
     flex: 1;
-    overflow-y: auto;
     min-height: 0;
+    display: flex;
+    flex-direction: column;
   }
   .session-panel-title {
     padding: 6px 20px 4px;
@@ -329,8 +431,15 @@
     color: var(--text-secondary);
     text-transform: uppercase;
     letter-spacing: 0.05em;
+    flex-shrink: 0;
   }
-  .session-list { display: flex; flex-direction: column; }
+  .session-list {
+    flex: 1;
+    overflow-y: auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
   .session-row {
     position: relative;
     display: flex;
@@ -427,4 +536,23 @@
     color: var(--text-secondary);
   }
   .session-error { color: var(--danger); }
+  
+  /* 滚动条样式：默认隐藏，悬停时显示 */
+  .session-list::-webkit-scrollbar {
+    width: 8px;
+  }
+  .session-list::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .session-list::-webkit-scrollbar-thumb {
+    background: transparent;
+    border-radius: 4px;
+    transition: background 0.2s;
+  }
+  .session-list:hover::-webkit-scrollbar-thumb {
+    background: var(--border);
+  }
+  .session-list:hover::-webkit-scrollbar-thumb:hover {
+    background: var(--text-secondary);
+  }
 </style>

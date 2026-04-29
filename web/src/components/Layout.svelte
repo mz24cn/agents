@@ -1,6 +1,7 @@
 <script>
   import Sidebar from './Sidebar.svelte'
   import { t } from '../lib/i18n.svelte.js'
+  import { sidebarWidth } from '../lib/sidebar-width.svelte.js'
 
   let { children } = $props()
 
@@ -31,7 +32,7 @@
     <div class="mobile-overlay" onclick={closeSidebar} onkeydown={() => {}}></div>
   {/if}
 
-  <div class="sidebar-wrapper" class:open={sidebarOpen}>
+  <div class="sidebar-wrapper" class:open={sidebarOpen} style="width: {sidebarWidth.collapsed ? 0 : sidebarWidth.current}px">
     <Sidebar />
   </div>
 
@@ -63,11 +64,11 @@
   }
   .sidebar-wrapper {
     display: flex;
+    transition: width 0.2s ease;
   }
   .content {
     flex: 1;
-    padding: 24px;
-    overflow-y: auto;
+    overflow: hidden;
     position: relative;
   }
 
@@ -84,6 +85,7 @@
       left: 0;
       z-index: 150;
       height: 100vh;
+      width: auto !important;
     }
     .sidebar-wrapper.open {
       display: flex;
