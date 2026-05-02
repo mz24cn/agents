@@ -119,21 +119,21 @@
     {/if}
   </div>
 
-  {#if showForm}
-    {#key editingTool?.tool_id ?? editingMcpServer?.serverName ?? '__new__'}
-      <ToolForm tool={editingTool} mcpServer={editingMcpServer} onSuccess={handleFormSuccess} onCancel={handleFormCancel} />
-    {/key}
-  {/if}
-
-  {#if detailTool}
-    <ToolDetail tool={detailTool} onClose={handleCloseDetail} />
-  {/if}
-
   {#if error}
     <div class="error-msg">{error}</div>
   {/if}
 
   <div class="page-content">
+    {#if showForm}
+      {#key editingTool?.tool_id ?? editingMcpServer?.serverName ?? '__new__'}
+        <ToolForm tool={editingTool} mcpServer={editingMcpServer} onSuccess={handleFormSuccess} onCancel={handleFormCancel} />
+      {/key}
+    {/if}
+
+    {#if detailTool}
+      <ToolDetail tool={detailTool} onClose={handleCloseDetail} />
+    {/if}
+
     {#if loading}
       <div class="loading">{t('loading')}</div>
     {:else if toolList.length === 0 && !error}

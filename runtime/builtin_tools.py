@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import datetime
 import urllib.request
 import urllib.error
 import uuid
@@ -222,7 +223,7 @@ DELEGATE_TOOL_CONFIG = ToolConfig(
     tool_type="function",
     name="delegate",
     description=(
-        "将子任务委派给独立的 Subagent 执行。Subagent 使用指定的模型和工具集，"
+        "将子任务委派给独立的 SubAgent 执行。SubAgent 使用指定的模型和工具集，"
         "独立完成任务后返回最终文本结果。适用于任务分解、专用模型调用、并行子任务等场景。"
     ),
     parameters={
@@ -230,26 +231,26 @@ DELEGATE_TOOL_CONFIG = ToolConfig(
         "properties": {
             "model_id": {
                 "type": "string",
-                "description": "Subagent 使用的模型 ID，必须已在 ModelRegistry 中注册",
+                "description": "SubAgent 使用的模型 ID，必须已在 ModelRegistry 中注册",
             },
             "tools": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Subagent 可用的工具名称列表（使用工具的 name 字段）。传入空数组表示纯推理模式（不使用任何工具）",
+                "description": "SubAgent 可用的工具名称列表（使用工具的 name 字段）。传入空数组表示纯推理模式（不使用任何工具）",
             },
             "task": {
                 "type": "string",
-                "description": "委派给 Subagent 的任务描述，作为 user 角色消息",
+                "description": "委派给 SubAgent 的任务描述，作为 user 角色消息",
             },
             "context": {
                 "type": "string",
-                "description": "（可选）Subagent 的系统提示词，作为 system 角色消息插入对话首条",
+                "description": "（可选）SubAgent 的系统提示词，作为 system 角色消息插入对话首条。如果是继续前一次 SubAgent 会话，传入 `[continue]`",
             },
             "images": {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": (
-                    "（可选）传递给 Subagent 的图片列表。"
+                    "（可选）传递给 SubAgent 的图片列表。"
                     "每个元素可以是：本地文件路径（/path/to/img.png）、"
                     "HTTP/HTTPS URL（https://...）、或 base64 编码字符串。"
                     "适用于需要 VLM 处理图片的场景。"
@@ -262,7 +263,7 @@ DELEGATE_TOOL_CONFIG = ToolConfig(
 )
 
 
-def resolve_tool_ids(tools: list[str], scope: list) -> list[str]:
+def resolve_tool_ids(tools: list[str] | str, scope: list) -> list[str]:
     """将工具 name 列表解析为 tool_id 列表，仅在 scope 内查找。
 
     大模型生成的工具名来自 ToolConfig.name，而 InferenceRequest 需要 tool_id。
@@ -270,54 +271,36 @@ def resolve_tool_ids(tools: list[str], scope: list) -> list[str]:
     避免全局 registry 中同名工具导致的歧义。
     找不到对应工具的 name 会被跳过并记录警告。
 
+    兼容大模型输出不稳定的情况：
+    - tools 可能是字符串而非列表，如 "bash, ppt-master" 或 "[bash, ppt-master]"
+    - 单个工具名可能携带多余的括号、引号、空格等噪声字符
+
     Args:
-        tools: 工具 name 列表
+        tools: 工具 name 列表，或逗号/空格分隔的工具名字符串
         scope: 当前请求的 ToolConfig 列表（即 infer_stream 构建的 tools）
 
     Returns:
         对应的 tool_id 列表（顺序与输入一致，跳过未找到的项）
     """
+    # 兼容：tools 整体是字符串（大模型未按 array 格式输出）
+    if isinstance(tools, str):
+        # 去掉首尾的 [ ] 括号，再按逗号或空格分割
+        tools = tools.strip().strip("[]")
+        tools = [t for t in re.split(r"[,\s]+", tools) if t]
+
     name_to_id = {tc.name: tc.tool_id for tc in scope}
     tool_ids = []
     for name in tools:
+        # 兼容：单个工具名携带多余的括号、引号、空格等噪声字符
+        name = re.sub(r"[^\w\-]", "", str(name).strip())
+        if not name:
+            continue
         if name in name_to_id:
             tool_ids.append(name_to_id[name])
         else:
-            logger.warning("delegate: scope 中找不到工具 name=%r，已跳过", name)
+            raise ValueError(f"工具 {name!r} 在当前 scope 中不存在，请检查工具名称是否正确")
     return tool_ids
 
-
-def build_messages(context: str, task: str, images: list[str] | None = None) -> list[Message]:
-    """构造 Subagent 的初始消息列表。
-
-    若 context 非空，首条插入 role="system" 消息；
-    然后追加 role="user" 的 task 消息。若 images 非空，附加到 user 消息。
-
-    Args:
-        context: 系统提示词，非空时作为首条 system 消息
-        task: 用户任务描述，作为 user 消息
-        images: 可选图片列表，每个元素为本地路径、HTTP URL 或 base64 字符串
-
-    Returns:
-        Message 列表
-    """
-    messages: list[Message] = []
-    if context:
-        messages.append(Message(role="system", content=context))
-    messages.append(Message(role="user", content=task, images=images))
-    return messages
-
-
-def accumulate_content(chunks: list[str]) -> str:
-    """将流式内容片段拼接为完整字符串。
-
-    Args:
-        chunks: 内容片段列表
-
-    Returns:
-        所有片段按顺序拼接的结果
-    """
-    return "".join(chunks)
 
 
 BUILTIN_TOOLS = [
@@ -330,7 +313,7 @@ def _make_delegate_fn(runtime, thread_local):
     """创建 delegate 工具的可调用函数。
 
     Args:
-        runtime: Runtime 实例，用于执行 Subagent 推理
+        runtime: Runtime 实例，用于执行 SubAgent 推理
         thread_local: threading.local 实例，用于读取上下文信息
 
     Returns:
@@ -340,28 +323,49 @@ def _make_delegate_fn(runtime, thread_local):
         tool_call_id = "call_" + uuid.uuid4().hex[:8]
         session_id = getattr(thread_local, "session_id", None)
         current_depth = getattr(thread_local, "depth", 0)
-        chats_dir = getattr(thread_local, "chats_dir", None)
         sse_callback = getattr(thread_local, "sse_callback", None)
         tool_scope = getattr(thread_local, "tool_scope", [])
+        context_manager = getattr(thread_local, "context_manager", None)
+        sub_session_manager = getattr(thread_local, "session_manager", None)
 
         try:
             resolved_ids = resolve_tool_ids(tools, tool_scope)
-            messages = build_messages(context=context, task=task, images=images)
+            messages = []
+            # 生成子 session_id：{parent_session_id}-sub_YYMMDD_HHmmss
+            sub_session_id = None
+            if '[continue]' in context and thread_local.last_session_id:
+                sub_session_id = thread_local.last_session_id
+                if context_manager is not None:
+                    try:
+                        messages = context_manager.load(sub_session_id)
+                    except Exception as load_err:
+                        logger.warning("delegate: 恢复 SubAgent 会话历史失败: %s", load_err)
+            elif session_id is not None:
+                sub_ts = datetime.datetime.now().strftime("%y%m%d_%H%M%S")
+                sub_session_id = f"{session_id}-sub_{sub_ts}"
+                if context:
+                    messages.append(Message(role="system", content=context))
+
+            messages.append(Message(role="user", content=task, images=images))
             request = InferenceRequest(
                 model_id=model_id,
                 tool_ids=resolved_ids,
                 messages=messages,
+                max_tool_rounds=int(os.environ.get("MAX_TOOL_ROUNDS", 20))
             )
 
-            # 保存旧 depth 和 tool_scope，设置子级值
+            # 保存旧值，切换到子 session 上下文
             old_depth = current_depth
-            old_tool_scope = tool_scope
+            old_session_id = session_id
             thread_local.depth = current_depth + 1
+            if sub_session_id is not None:
+                thread_local.session_id = sub_session_id
 
             chunks = []
             collected_msgs = []
             try:
-                for msg in runtime.infer_stream(request):
+                cancel_event = getattr(thread_local, "cancel_event", None)
+                for msg in runtime.infer_stream(request, cancel_event=cancel_event):
                     collected_msgs.append(msg)
                     if msg.role == "assistant" and msg.content:
                         chunks.append(msg.content)
@@ -379,11 +383,13 @@ def _make_delegate_fn(runtime, thread_local):
                             except Exception:
                                 pass  # SSE 写入失败不中断推理
             finally:
-                # 恢复 depth 和 tool_scope
+                # 恢复 depth、tool_scope 和 session_id
                 thread_local.depth = old_depth
-                thread_local.tool_scope = old_tool_scope
+                thread_local.session_id = old_session_id
+                if sub_session_id is not None:
+                    thread_local.last_session_id = sub_session_id
 
-            result = accumulate_content(chunks)
+            result = "".join(chunks)
 
             # 推送结束帧：通知前端流式消息框已完成，并重置 assistant 消息索引
             # 不携带 content（内容已通过流式增量帧完整推送），仅作状态信号
@@ -399,52 +405,40 @@ def _make_delegate_fn(runtime, thread_local):
                 except Exception:
                     pass
 
-            # 持久化 Subagent Session
+            # 持久化 SubAgent Session
             persistence_warning = ""
-            if chats_dir is not None and session_id is not None:
+            if context_manager is not None and sub_session_id is not None:
                 try:
-                    import datetime as _dt
-                    from runtime.server import merge_stream_messages
-                    from runtime.context_manager import ConversationTurn
-                    ts_us = int(time.time() * 1000000)
-                    sub_session_dir = os.path.join(chats_dir, session_id, f"sub_{ts_us}")
+                    from runtime.server import persist_conversation
+                    # 子 session 目录路径：chats_dir/<parent>/<sub_session_id 中 - 替换为 />
+                    sub_session_dir = os.path.join(
+                        context_manager._chats_dir,
+                        sub_session_id.replace("-", os.sep),
+                    )
                     os.makedirs(sub_session_dir, exist_ok=True)
-                    now_iso = _dt.datetime.now().isoformat()
-
-                    # 构造初始消息 turns（system + user）
-                    init_turns = []
-                    for init_msg in messages:
-                        if init_msg.role in ("system", "user"):
-                            init_turns.append({
-                                "role": init_msg.role,
-                                "content": init_msg.content or "",
-                                "timestamp": now_iso,
-                            })
-
-                    # 合并流式消息为 turns
-                    merged_turns, _ = merge_stream_messages(collected_msgs)
-                    import dataclasses as _dc
-                    merged_dicts = [
-                        {k: v for k, v in _dc.asdict(t).items() if v is not None}
-                        for t in merged_turns
-                    ]
-
-                    all_messages = init_turns + merged_dicts
-                    conversation_data = {
-                        "meta": {
-                            "session_id": f"sub_{ts_us}",
-                            "parent_session_id": session_id,
-                            "created_at": now_iso,
-                            "updated_at": now_iso,
-                            "turn_count": len(all_messages),
-                        },
-                        "messages": all_messages,
-                    }
-                    conv_path = os.path.join(sub_session_dir, "conversation.json")
-                    with open(conv_path, "w", encoding="utf-8") as f:
-                        json.dump(conversation_data, f, ensure_ascii=False, indent=2)
+                    import copy as _copy
+                    sub_cm = _copy.copy(context_manager)
+                    # sub_cm 的 _chats_dir 指向父 session 目录，sub_session_id 只含最后一段
+                    sub_cm._chats_dir = os.path.join(
+                        context_manager._chats_dir,
+                        session_id.replace("-", os.sep),
+                    )
+                    sub_cm._memory_store = {}  # 隔离 memory 缓存，避免污染父 context_manager
+                    # persist 时使用不含父路径前缀的短 ID（最后一段）
+                    short_sub_id = sub_session_id[len(session_id) + 1:]  # "sub_YYMMDD_HHmmss"
+                    exc = persist_conversation(
+                        context_manager=sub_cm,
+                        session_id=short_sub_id,
+                        original_messages=messages,
+                        collected_messages=collected_msgs,
+                        session_manager=None,  # sub session 不更新顶层 index
+                        tool_ids=resolved_ids,
+                        extra_meta={"parent_session_id": session_id},
+                    )
+                    if exc is not None:
+                        raise exc
                 except Exception as persist_err:
-                    logger.warning("delegate: 持久化 Subagent Session 失败: %s", persist_err)
+                    logger.warning("delegate: 持久化 SubAgent Session 失败: %s", persist_err)
                     persistence_warning = f" [Warning: session persistence failed: {persist_err}]"
 
             return result + persistence_warning

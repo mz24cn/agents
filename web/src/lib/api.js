@@ -142,6 +142,26 @@ export function inferStream(body, onMessage, onDone, onError) {
   return () => controller.abort()
 }
 
+/**
+ * Abort an active stream inference by session_id.
+ * Sends POST /v1/infer/abort so the backend can set the cancel_event
+ * even while a delegate sub-agent is running (no SSE writes happening).
+ *
+ * @param {string} sessionId
+ * @returns {Promise<void>}
+ */
+export async function abortInferStream(sessionId) {
+  try {
+    await fetch('/v1/infer/abort', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId }),
+    })
+  } catch {
+    // best-effort — ignore network errors
+  }
+}
+
 /** 环境变量 API */
 export const env = {
   list:   ()              => request('GET',    '/v1/env'),

@@ -6,8 +6,14 @@ Usage:
     python app.py 0.0.0.0:8080 # custom host and port
 """
 
+import os
 import sys
 from runtime.server import RuntimeHTTPServer
+
+# 切换工作目录到当前文件所在目录的 ./workspace
+workspace_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workspace")
+os.makedirs(workspace_dir, exist_ok=True)
+os.chdir(workspace_dir)
 
 host = "0.0.0.0"
 port = 8080

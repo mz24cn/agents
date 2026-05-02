@@ -64,6 +64,8 @@
       router.current = '#/chat'
     } catch (err) {
       restoreError = err.message || t('restoreSessionFailed')
+      // 后端在 session not found 时会删除该记录，前端同步移除
+      sessionList = sessionList.filter(s => s.session_id !== sessionId)
     }
   }
 
@@ -154,6 +156,39 @@
 
   $effect(() => { loadSessions() })
 
+  /**
+   * 将 session_id（YYMMDD_HHmmss）解析为 "MM/DD HH:mm:ss" 格式的时间字符串。
+   * 解析失败时返回空字符串。
+   */
+  function sessionIdToTime(sessionId) {
+    const m = /^(\d{2})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})$/.exec(sessionId)
+    if (!m) return ''
+    const [, , MM, DD, HH, mm, ss] = m
+    return `${MM}/${DD} ${HH}:${mm}:${ss}`
+  }
+
+  /**
+   * 计算会话条目的显示标题和 tooltip。
+   * - 长度 < 10：display 追加时间字符串
+   * - 长度 > 30：display 截断至 30 字符
+   * - tooltip 始终为完整标题 + 时间（供 CSS ellipsis 和手动截断两种情况使用）
+   * 返回 { display, tooltip }
+   */
+  function getSessionDisplay(entry) {
+    const raw = entry.title || entry.session_id
+    const time = sessionIdToTime(entry.session_id)
+    // tooltip 始终携带完整内容，浏览器在文字被 CSS 截断时也会显示
+    const tooltip = time ? `${raw}\n${time}` : raw
+    let display = raw
+
+    if (raw.length < 10) {
+      display = time ? `${raw}  ${time}` : raw
+    } else if (raw.length > 30) {
+      display = raw.slice(0, 30) + '…'
+    }
+    return { display, tooltip }
+  }
+
   // 监听新会话创建，动态添加到列表
   $effect(() => {
     const sid = newSessionCreated.sessionId
@@ -161,11 +196,15 @@
       // 检查是否已存在
       const exists = sessionList.some(s => s.session_id === sid)
       if (!exists) {
+        // 用第一条用户消息作为临时标题，回退到 session_id
+        const firstMsg = newSessionCreated.firstUserMessage
+        const title = (firstMsg && firstMsg.trim()) ? firstMsg.trim() : sid
         // 动态添加新会话条目到列表顶部
-        sessionList = [{ session_id: sid, title: sid }, ...sessionList]
+        sessionList = [{ session_id: sid, title }, ...sessionList]
       }
       // 重置状态，避免重复处理
       newSessionCreated.sessionId = null
+      newSessionCreated.firstUserMessage = null
     }
   })
 </script>
@@ -235,8 +274,12 @@
       {:else}
         {#each sessionList as entry (entry.session_id)}
           <div class="session-row">
-            <button class="session-item" onclick={() => handleSessionClick(entry.session_id)}>
-              {entry.title}
+            <button
+              class="session-item"
+              onclick={() => handleSessionClick(entry.session_id)}
+              title={getSessionDisplay(entry).tooltip}
+            >
+              {getSessionDisplay(entry).display}
             </button>
             <button
               class="session-menu-btn"

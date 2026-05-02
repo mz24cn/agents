@@ -26,87 +26,6 @@ logger = logging.getLogger("runtime.server")
 # Conversation formatting helpers
 # ---------------------------------------------------------------------------
 
-def _truncate_line(line: str, max_chars: int = 200) -> str:
-    """Truncate a single line to *max_chars*, appending '…' if cut."""
-    if len(line) <= max_chars:
-        return line
-    return line[:max_chars] + "…"
-
-
-def _summarise_result(result: str, max_lines: int = 2, max_line_chars: int = 200) -> str:
-    """Return a compact summary of a tool result for conversation.md.
-
-    Keeps at most *max_lines* non-empty lines, each truncated to
-    *max_line_chars* characters.  Appends a note when lines are dropped.
-    """
-    lines = result.splitlines()
-    non_empty = [l for l in lines if l.strip()]
-    kept = non_empty[:max_lines]
-    truncated_lines = [_truncate_line(l, max_line_chars) for l in kept]
-    summary = "\n".join(truncated_lines)
-    if len(non_empty) > max_lines:
-        summary += f"\n… ({len(non_empty) - max_lines} more lines)"
-    return summary
-
-
-def _args_summary(arguments: dict, max_chars: int = 120) -> str:
-    """Render tool arguments as a compact one-liner for conversation.md."""
-    if not arguments:
-        return ""
-    parts = []
-    for k, v in arguments.items():
-        v_str = str(v)
-        if len(v_str) > 40:
-            v_str = v_str[:40] + "…"
-        parts.append(f"{k}={v_str!r}")
-    joined = ", ".join(parts)
-    if len(joined) > max_chars:
-        joined = joined[:max_chars] + "…"
-    return joined
-
-
-def _format_tool_call_line(tool_name: str, arguments: dict) -> str:
-    """Format a tool invocation line for the assistant turn in conversation.md.
-
-    Format::
-
-        **tool:** tool_name(arg1=val1, arg2=val2)
-    """
-    args_str = _args_summary(arguments)
-    return f"**tool:** {tool_name}({args_str})"
-
-
-def _result_is_truncated(result: str, max_lines: int = 2) -> bool:
-    """Return True if the result has more non-empty lines than max_lines."""
-    lines = result.splitlines()
-    non_empty = [l for l in lines if l.strip()]
-    return len(non_empty) > max_lines
-
-
-def _format_tool_result_turn(
-    result: str,
-    tool_call_filename: str,
-) -> str:
-    """Format the result portion of a tool turn for conversation.md.
-
-    When the result fits within 2 lines it is inlined directly::
-
-        **result:**
-        <full result, each line ≤200 chars>
-
-    When the result is longer, a summary + file reference is used::
-
-        **result:**
-        <up to 2 lines of result, each ≤200 chars>
-        … (N more lines)
-        → tool-call-N-name.md
-    """
-    result_summary = _summarise_result(result)
-    if _result_is_truncated(result):
-        ref_line = f"→ {tool_call_filename}"
-        return f"**result:**\n{result_summary}\n{ref_line}"
-    else:
-        return f"**result:**\n{result_summary}"
 
 from runtime.env_manager import EnvManager
 from runtime.session_manager import SessionManager
@@ -198,6 +117,81 @@ def merge_stream_messages(stream_messages: list) -> tuple[list, Optional[dict]]:
     _flush_assistant(stat=last_stat)
 
     return turns, last_stat
+
+
+def persist_conversation(
+    context_manager: "ContextManager",
+    session_id: str,
+    original_messages: list,
+    collected_messages: list,
+    session_manager=None,
+    tool_ids: Optional[list] = None,
+    extra_meta: Optional[dict] = None,
+) -> Optional[Exception]:
+    """将一次推理的消息持久化到会话存储。
+
+    提取自 _RuntimeRequestHandler._persist_conversation，供 server 和
+    delegate 工具共用，避免两处维护不同的持久化逻辑。
+
+    Args:
+        context_manager: ContextManager 实例，负责读写会话文件。
+        session_id: 目标会话 ID。
+        original_messages: 本次推理的原始输入消息列表（Message 对象）。
+        collected_messages: infer_stream 产生的原始流式消息列表（Message 对象）。
+        session_manager: 可选的 SessionManager 实例，用于更新 index.json 和
+            生成标题。为 None 时跳过 index 更新（适用于 sub-session 场景）。
+        tool_ids: 可选的工具 ID 列表，记录到会话 meta 中，便于回溯。
+        extra_meta: 可选的额外 meta 字段（如 parent_session_id），与 tool_ids
+            一并通过 save_conversation 的 extra_meta 参数一次写入。
+
+    Returns:
+        成功时返回 None；失败时返回捕获的异常（OSError 或其他）。
+    """
+    import datetime as _dt
+
+    try:
+        try:
+            existing_turns = context_manager.load_conversation(session_id)
+        except (FileNotFoundError, ValueError):
+            existing_turns = []
+        new_turns = list(existing_turns)
+        for m in (original_messages or []):
+            ts = _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            new_turns.append(ConversationTurn(
+                role=m.role,
+                content=m.content or "",
+                timestamp=ts,
+                images=getattr(m, "images", None) or None,
+                audio=getattr(m, "audio", None) or None,
+                prompt_template=getattr(m, "prompt_template", None) or None,
+                arguments=getattr(m, "arguments", None) or None,
+            ))
+        merged_turns, last_stat = merge_stream_messages(collected_messages)
+        new_turns.extend(merged_turns)
+        last_total_tokens = (
+            (last_stat.get("prompt_tokens", 0) + last_stat.get("completion_tokens", 0))
+            if last_stat else None
+        ) or None
+        merged_extra: Optional[dict] = None
+        if tool_ids is not None or extra_meta:
+            merged_extra = {}
+            if tool_ids is not None:
+                merged_extra["tool_ids"] = tool_ids
+            if extra_meta:
+                merged_extra.update(extra_meta)
+        context_manager.save_conversation(
+            session_id, new_turns,
+            last_total_tokens=last_total_tokens,
+            extra_meta=merged_extra,
+        )
+        context_manager.update_rolling_summary(session_id, new_turns, last_total_tokens=last_total_tokens)
+        context_manager.extract_memory(session_id, new_turns, last_total_tokens=last_total_tokens)
+        if session_manager is not None:
+            session_manager.update_index(session_id, last_total_tokens=last_total_tokens)
+    except Exception as exc:
+        return exc
+    return None
+
 
 _DATA_DIR = os.path.join(os.path.expanduser("~"), ".agents_runtime")
 
@@ -390,6 +384,8 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self._handle_infer()
         elif path == "/v1/infer/stream":
             self._handle_infer_stream()
+        elif path == "/v1/infer/abort":
+            self._handle_infer_abort()
         elif path == "/v1/tools/call":
             self._handle_tool_call()
         elif path == "/v1/tools/mcp":
@@ -509,7 +505,16 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             if raw_session_id == "new":
                 try:
                     session_id = context_manager.create_session()
-                    self.server.session_manager.on_session_created(session_id)  # type: ignore[attr-defined]
+                    # 提取第一条用户消息文本作为初始标题
+                    first_user_msg: Optional[str] = None
+                    if "messages" in body:
+                        for m in body["messages"]:
+                            if m.get("role") == "user":
+                                content = m.get("content", "")
+                                if isinstance(content, str) and content.strip():
+                                    first_user_msg = content.strip()
+                                break
+                    self.server.session_manager.on_session_created(session_id, first_user_msg)  # type: ignore[attr-defined]
                     use_session = True
                 except OSError as exc:
                     self._send_json_error(500, f"Failed to create session: {exc}")
@@ -550,13 +555,12 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             non_mcp_rows: list[tuple[str, str]] = []
 
             for tid in tool_ids:
-                if tid == "delegate":
-                    tool_scope.append(runtime._tool_registry.get("delegate"))
-                    continue
                 tc = runtime._tool_registry.get(tid)
                 if tc is None:
                     continue
                 tool_scope.append(tc)
+                if tid == "delegate" and os.environ.get("DISABLE_NESTED_DELEGATE", "false").lower() == "true":
+                    continue
                 if tc.tool_type == "mcp" and tc.mcp_server_name:
                     mcp_by_server.setdefault(tc.mcp_server_name, []).append(tc.name)
                 else:
@@ -602,53 +606,33 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         _thread_local.sse_callback = None
         _thread_local.session_id = session_id
         _thread_local.depth = 0
-        _thread_local.chats_dir = context_manager._chats_dir
         _thread_local.tool_scope = tool_scope
+        _thread_local.context_manager = context_manager
+        _thread_local.session_manager = self.server.session_manager  # type: ignore[attr-defined]
 
         return body, request, session_id, use_session, original_messages, context_manager
 
     def _cleanup_thread_local(self):
         from runtime.builtin_tools import _thread_local
         _thread_local.sse_callback = None
+        _thread_local.cancel_event = None
         _thread_local.session_id = None
         _thread_local.depth = 0
-        _thread_local.chats_dir = None
         _thread_local.tool_scope = []
+        _thread_local.context_manager = None
+        _thread_local.session_manager = None
 
     def _persist_conversation(self, context_manager, session_id, original_messages, collected_messages):
         if session_id is None:
             return None
-        try:
-            import datetime as _dt
-            try:
-                existing_turns = context_manager.load_conversation(session_id)
-            except (FileNotFoundError, ValueError):
-                existing_turns = []
-            new_turns = list(existing_turns)
-            for m in (original_messages or []):
-                ts = _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-                new_turns.append(ConversationTurn(
-                    role=m.role,
-                    content=m.content or "",
-                    timestamp=ts,
-                    images=getattr(m, "images", None) or None,
-                    audio=getattr(m, "audio", None) or None,
-                    prompt_template=getattr(m, "prompt_template", None) or None,
-                    arguments=getattr(m, "arguments", None) or None,
-                ))
-            merged_turns, last_stat = merge_stream_messages(collected_messages)
-            new_turns.extend(merged_turns)
-            last_total_tokens = (
-                (last_stat.get("prompt_tokens", 0) + last_stat.get("completion_tokens", 0))
-                if last_stat else None
-            ) or None
-            context_manager.save_conversation(session_id, new_turns, last_total_tokens=last_total_tokens)
-            context_manager.update_rolling_summary(session_id, new_turns, last_total_tokens=last_total_tokens)
-            context_manager.extract_memory(session_id, new_turns, last_total_tokens=last_total_tokens)
-            self.server.session_manager.update_index(session_id, last_total_tokens=last_total_tokens)  # type: ignore[attr-defined]
-        except OSError as exc:
-            return exc
-        return None
+        exc = persist_conversation(
+            context_manager=context_manager,
+            session_id=session_id,
+            original_messages=original_messages,
+            collected_messages=collected_messages,
+            session_manager=self.server.session_manager,  # type: ignore[attr-defined]
+        )
+        return exc
 
     def _handle_infer(self) -> None:
         """POST /v1/infer — execute model inference (non-streaming).
@@ -750,6 +734,12 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 pass
 
         _thread_local.sse_callback = _sse_write
+        _thread_local.cancel_event = cancel_event
+
+        # 注册到 active_streams，使 /v1/infer/abort 可以主动触发中止
+        active_streams = getattr(self.server, "active_streams", None)
+        if active_streams is not None and session_id is not None:
+            active_streams[session_id] = cancel_event
 
         try:
             for msg in runtime.infer_stream(request, cancel_event=cancel_event):
@@ -777,7 +767,17 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                     logger.error("infer_stream: failed to save conversation for session %s: %s", session_id, persist_exc)
         except (BrokenPipeError, ConnectionResetError):
             cancel_event.set()
+            if use_session:
+                collected_messages.append(Message(role="assistant", content="\n\nError: interrupted"))
+                persist_exc = self._persist_conversation(context_manager, session_id, original_messages, collected_messages)
+                if persist_exc is not None:
+                    logger.error("infer_stream: failed to save aborted conversation for session %s: %s", session_id, persist_exc)
         except Exception as exc:
+            if use_session:
+                collected_messages.append(Message(role="assistant", content=f"\n\nError: interrupted ({exc})"))
+                persist_exc = self._persist_conversation(context_manager, session_id, original_messages, collected_messages)
+                if persist_exc is not None:
+                    logger.error("infer_stream: failed to save aborted conversation for session %s: %s", session_id, persist_exc)
             try:
                 error_data = json.dumps({"error": str(exc)}, ensure_ascii=False)
                 self.wfile.write(f"data: {error_data}\n\n".encode("utf-8"))
@@ -785,7 +785,31 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
         finally:
+            # 注销 active_streams 中的 cancel_event
+            if active_streams is not None and session_id is not None:
+                active_streams.pop(session_id, None)
             self._cleanup_thread_local()
+
+    def _handle_infer_abort(self) -> None:
+        """POST /v1/infer/abort — 主动中止指定会话的流式推理。
+
+        请求体: {"session_id": "<session_id>"}
+        找到对应的 cancel_event 并 set()，使推理线程在下一个检查点退出。
+        """
+        body = self._read_json_body()
+        if body is None:
+            return
+        session_id = body.get("session_id")
+        if not session_id:
+            self._send_json_error(400, "Missing required field: session_id")
+            return
+        active_streams = getattr(self.server, "active_streams", None)
+        if active_streams is not None and session_id in active_streams:
+            active_streams[session_id].set()
+            self._send_json_response(200, {"ok": True})
+        else:
+            # 会话不存在或已结束，视为成功（幂等）
+            self._send_json_response(200, {"ok": True, "note": "session not found or already done"})
 
     def _handle_tool_call(self) -> None:
         """POST /v1/tools/call — directly call a tool.
@@ -1349,6 +1373,8 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         try:
             data = session_manager.get_session(session_id)
         except FileNotFoundError:
+            # conversation.json 不存在（人为删除或磁盘故障），顺手清理 index
+            session_manager.remove_from_index(session_id)
             self._send_json_error(404, f"Session not found: {session_id}")
             return
         except ValueError as exc:
@@ -1516,6 +1542,7 @@ class RuntimeHTTPServer:
 
         This method blocks until the server is shut down via stop().
         """
+        self._active_streams: dict = {}
         self._server = ThreadingHTTPServer((self._host, self._port), _RuntimeRequestHandler)
         self._server.runtime = self._runtime  # type: ignore[attr-defined]
         self._server.prompt_template_manager = self._prompt_template_manager  # type: ignore[attr-defined]
@@ -1523,6 +1550,7 @@ class RuntimeHTTPServer:
         self._server.context_manager = self._context_manager  # type: ignore[attr-defined]
         self._server.env_manager = self._env_manager  # type: ignore[attr-defined]
         self._server.session_manager = self._session_manager  # type: ignore[attr-defined]
+        self._server.active_streams = self._active_streams  # type: ignore[attr-defined]
         self._server.serve_forever()
 
     def start_background(self) -> None:
@@ -1530,6 +1558,7 @@ class RuntimeHTTPServer:
 
         Returns immediately. Use stop() to shut down.
         """
+        self._active_streams: dict = {}
         self._server = ThreadingHTTPServer((self._host, self._port), _RuntimeRequestHandler)
         self._server.runtime = self._runtime  # type: ignore[attr-defined]
         self._server.prompt_template_manager = self._prompt_template_manager  # type: ignore[attr-defined]
@@ -1537,6 +1566,7 @@ class RuntimeHTTPServer:
         self._server.context_manager = self._context_manager  # type: ignore[attr-defined]
         self._server.env_manager = self._env_manager  # type: ignore[attr-defined]
         self._server.session_manager = self._session_manager  # type: ignore[attr-defined]
+        self._server.active_streams = self._active_streams  # type: ignore[attr-defined]
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
 

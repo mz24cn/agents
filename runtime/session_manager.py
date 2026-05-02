@@ -79,19 +79,27 @@ class SessionManager:
     # 公共方法
     # ------------------------------------------------------------------
 
-    def on_session_created(self, session_id: str) -> None:
+    def on_session_created(self, session_id: str, first_user_message: Optional[str] = None) -> None:
         """新会话创建后调用，在 index.json 中新增对应的 SessionIndexEntry。
 
         Args:
             session_id: 新创建的会话 ID。
+            first_user_message: 用户的第一条消息文本，用作初始标题（可选）。
         """
         import datetime as _dt
         now = _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        # 用第一条用户消息作为初始标题，超过 30 字符则截断
+        if first_user_message and first_user_message.strip():
+            initial_title = first_user_message.strip()
+            if len(initial_title) > 30:
+                initial_title = initial_title[:30]
+        else:
+            initial_title = session_id
         try:
             index = self._read_index()
             index[session_id] = {
                 "session_id": session_id,
-                "title": session_id,
+                "title": initial_title,
                 "created_at": now,
                 "last_inference_at": now,
                 "turn_count": 0,
@@ -261,7 +269,24 @@ class SessionManager:
             logger.warning("generate_title: 生成标题失败 (session=%s): %s", session_id, exc)
             return None
 
-    def list_sessions(self) -> list[dict]:
+    def remove_from_index(self, session_id: str) -> None:
+        """从 index.json 中移除指定会话条目（不删除目录）。
+
+        用于 conversation.json 不存在时的清理（人为删除或磁盘故障）。
+        失败时静默忽略。
+
+        Args:
+            session_id: 要移除的会话 ID。
+        """
+        try:
+            index = self._read_index()
+            if session_id in index:
+                del index[session_id]
+                self._write_index(index)
+        except Exception as exc:
+            logger.warning("remove_from_index: 更新 index.json 失败 (session=%s): %s", session_id, exc)
+
+    def list_sessions(self) -> list[dict]:        
         """读取 index.json，返回所有 SessionIndexEntry 列表，按 last_inference_at 降序排列。
 
         Returns:
@@ -269,7 +294,6 @@ class SessionManager:
         """
         index = self._read_index()
         entries = list(index.values())
-        # 按 last_inference_at 降序排列，缺失时排在最后
         entries.sort(
             key=lambda e: e.get("last_inference_at") or "",
             reverse=True,

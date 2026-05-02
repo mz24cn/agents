@@ -662,7 +662,7 @@ class ContextManager:
         Returns:
             The session_id string.
         """
-        session_id = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        session_id = datetime.datetime.now().strftime("%y%m%d_%H%M%S")
         session_dir = os.path.join(self._chats_dir, session_id)
         os.makedirs(session_dir, exist_ok=True)
         return session_id
@@ -709,6 +709,7 @@ class ContextManager:
         session_id: str,
         turns: list[ConversationTurn],
         last_total_tokens: Optional[int] = None,
+        extra_meta: Optional[dict] = None,
     ) -> None:
         """Serialize *turns* and atomically write to ``conversation.json``.
 
@@ -722,6 +723,10 @@ class ContextManager:
             last_total_tokens: Total token count (prompt + completion) of the
                 most recent inference round.  Stored in ``meta`` so that
                 ``update_rolling_summary`` can use it as a compression trigger.
+            extra_meta: Optional dict of additional fields to merge into the
+                ``meta`` block (e.g. ``parent_session_id``, ``tool_ids``).
+                These are written alongside the standard fields in one atomic
+                write, so no second read-modify-write pass is needed.
         """
         conv_path = self._conversation_path(session_id)
 
@@ -744,31 +749,13 @@ class ContextManager:
         }
         if last_total_tokens is not None:
             meta["last_total_tokens"] = last_total_tokens
+        if extra_meta:
+            meta.update(extra_meta)
 
-        messages = []
-        for turn in turns:
-            msg: dict = {
-                "role": turn.role,
-                "content": turn.content,
-                "timestamp": turn.timestamp,
-            }
-            if turn.name:
-                msg["name"] = turn.name
-            if turn.tool_calls:
-                msg["tool_calls"] = turn.tool_calls
-            if turn.thinking:
-                msg["thinking"] = turn.thinking
-            if turn.stat:
-                msg["stat"] = turn.stat
-            if turn.images:
-                msg["images"] = turn.images
-            if turn.audio:
-                msg["audio"] = turn.audio
-            if turn.prompt_template:
-                msg["prompt_template"] = turn.prompt_template
-            if turn.arguments:
-                msg["arguments"] = turn.arguments
-            messages.append(msg)
+        messages = [
+            {k: v for k, v in asdict(turn).items() if v is not None}
+            for turn in turns
+        ]
 
         data = {"meta": meta, "messages": messages}
         text = json.dumps(data, ensure_ascii=False, indent=2)

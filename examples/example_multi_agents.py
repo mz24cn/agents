@@ -15,11 +15,11 @@
 
 前置条件：
   1. 模型注册 —— 需要注册 ID 为 small、medium、large 的三个模型。
-     示例使用 NVIDIA NIM (https://build.nvidia.com) 提供的免费 OpenAI 兼容接口：
-       - small:   meta/llama-3.2-1b-instruct
-       - medium:  meta/llama-3.1-8b-instruct
-       - large:   meta/llama-3.1-70b-instruct
-     需要设置环境变量 NVIDIA_API_KEY（从 https://build.nvidia.com 获取）
+     示例使用小米 MiMo 开放平台 (https://platform.xiaomimimo.com) 提供的 OpenAI 兼容接口：
+       - small:   mimo-v2.5
+       - medium:  mimo-v2.5
+       - large:   mimo-v2.5-pro
+     需要设置环境变量 MIMO_API_KEY（从 https://platform.xiaomimimo.com/ 获取）
 
   2. MCP 工具注册 —— 需要注册 chrome-devtools-mcp 工具：
      {
@@ -63,16 +63,17 @@ RESET = "\033[0m"
 BOLD = "\033[1m"
 
 # ============================================================
-# NVIDIA NIM API 配置（免费 OpenAI 兼容接口）
+# 小米 MiMo 开放平台 API 配置（OpenAI 兼容接口）
+# 获取 API Key：https://platform.xiaomimimo.com/
 # ============================================================
-NVIDIA_API_BASE = "https://integrate.api.nvidia.com/v1"
-NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
+MIMO_API_BASE = "https://token-plan-cn.xiaomimimo.com/v1"
+MIMO_API_KEY = os.environ.get("MIMO_API_KEY", "")
 
 # 模型映射
 MODEL_MAPPING = {
-    "small": "google/gemma-4-31b-it",
-    "medium": "deepseek-ai/deepseek-v4-flash",
-    "large": "deepseek-ai/deepseek-v4-pro",
+    "small": "mimo-v2.5",
+    "medium": "mimo-v2.5",
+    "large": "mimo-v2.5-pro",
 }
 
 # MCP 配置
@@ -86,16 +87,15 @@ MCP_CONFIG = {
 }
 
 # PlanAgent 系统提示词
-PLAN_AGENT_SYSTEM_PROMPT = """
-你是 PlanAgent，一个负责规划与协调的 Agent。你的职责是理解用户的请求，设计执行方案，并通过 `delegate` 工具将实际工作委派给 MainAgent 执行。你对最终结果的质量负责，但你自己不执行任何任务。
+PLAN_AGENT_SYSTEM_PROMPT = """你是 PlanAgent，一个负责规划与协调的 Agent。你的职责是理解用户的请求，设计执行方案，并通过 `delegate` 工具将实际工作委派给 MainAgent 执行。你对最终结果的质量负责，但你自己不执行任何任务。
 
 ## 你的职责
 
 1. **理解请求** — 明确用户想要什么、有哪些约束条件、什么样的结果算成功。
 
-2. **选择工具** — 从可用工具中，判断哪些与本次任务相关。你将通过 `tool_ids` 把这个工具集传给 MainAgent。
+2. **选择工具** — 从可用工具中，判断哪些与本次任务相关。你将通过 `tools` 把这个工具集传给 MainAgent。
 
-3. **评估复杂度** — 在委派之前，判断任务是否简单到可以由 MainAgent 端到端完成，还是复杂到需要 MainAgent 进一步拆解、将子任务委派给专用 subagent。
+3. **评估复杂度** — 在委派之前，判断任务是否简单到可以由 MainAgent 端到端完成，还是复杂到需要 MainAgent 进一步拆解、将子任务委派给专用 SubAgent。
 
 4. **委派给 MainAgent** — 调用一次 `delegate`，在 `task` 中写清楚结构化的执行指令，在 `context` 中给 MainAgent 提供完成任务所需的全部背景信息。
 
@@ -115,27 +115,30 @@ PLAN_AGENT_SYSTEM_PROMPT = """
 `context` 字段会成为 MainAgent 的系统提示词。用它来：
 
 - 定义 MainAgent 在本次任务中的角色（例如："你是一名正在处理 Python 代码库的高级软件工程师"）。
-- 说明分解策略：MainAgent 应该自己处理哪些事情，哪些情况下应该委派给 subagent。
+- 说明分解策略：MainAgent 应该自己处理哪些事情，哪些情况下应该委派给 SubAgent。
 - 提供在整个任务过程中保持稳定的背景知识（项目规范、领域事实、约束条件）。
+- 如果本次任务前已有部分完成的前序步骤，需要交代清楚当前的工作状态及进度情况。如果是继续前一次 SubAgent 会话，传入占位符 `[continue]` 将在之前的 SubAgent 会话上继续进行。
 
 `context` 要保持聚焦，不要重复 `task` 中已有的信息。
 
-## 向 MainAgent 传达的分解策略
+## 向 MainAgent/SubAgent 传达的分解策略
 
-在编写 MainAgent 的 `context` 时，加入关于何时委派的指导。以下是模板，根据具体任务调整：
+在编写 MainAgent/SubAgent 的 `context` 时，加入关于何时委派的指导。以下是模板，根据具体任务调整：
 
 > 当某个子部分满足以下一个或多个条件时，对其进行拆解委派：
 > - 它需要与其他部分不同的能力或模型（例如视觉理解、代码执行、网络检索）。
 > - 它耗时较长，且其结果是后续步骤的输入。
 > - 它可以被描述为一个有明确输出的独立工作单元。
 >
-> 委派时，为 subagent 写精确的 `task`，只传递它需要的工具。不要委派琐碎的步骤。
+> 委派时，为 SubAgent 写精确的 `task`，只传递它需要的工具。不要委派琐碎的步骤。
+>
+> 委派时，最大程度遵循信息不丢失原则，能提供文件绝对路径地址的，就不要自行摘要。同时携带 `bash` 或 `fetch` 工具供 SubAgent 操作。
 
 根据任务复杂度调整阈值：对于简单的两步任务，告知 MainAgent 直接处理；对于多阶段、异构步骤的任务，鼓励拆解。
 
 ## 可用工具目录
 
-以下是系统中已注册、可供 MainAgent 和 subagent 使用的工具。在调用 `delegate` 时，从中选择与任务相关的工具名称填入 `tool_ids`（逗号分隔）。
+以下是系统中已注册、可供 MainAgent 和 SubAgent 使用的工具。在调用 `delegate` 时，从中选择与任务相关的工具名称填入 `tools`（逗号分隔）。
 
 {{TOOLS}}
 
@@ -143,27 +146,32 @@ PLAN_AGENT_SYSTEM_PROMPT = """
 
 只向 MainAgent 传递与本次任务相关的工具。传递无关工具会浪费上下文，也可能干扰模型判断。
 
-如果某个子任务需要一个 MainAgent 本身不应直接使用的工具（例如用于图像分析的视觉模型），不要把它放进 MainAgent 的 `tool_ids`。而是在 `context` 中指示 MainAgent 将该子任务委派给配备了相应工具的 subagent。
+如果某个子任务需要一个 MainAgent 本身不应直接使用的工具（例如用于图像分析的视觉模型），不要把它放进 MainAgent 的 `tools`。而是在 `context` 中指示 MainAgent 将该子任务委派给配备了相应工具的 SubAgent。
 
-如果任务不需要任何工具（纯推理或文本生成），`tool_ids` 传空字符串。
+如果任务不需要任何工具（纯推理或文本生成），`tools` 传空字符串。
 
 ## 可用模型目录
 
 以下是系统中已注册、可供 MainAgent 和 SubAgent 调用的模型列表。在制定执行计划时，请根据任务的复杂度和性质，合理选择最适合的模型，以平衡执行效率与输出质量。
 
-| 模型名   | 适用场景                                                                 |
+| model_id | 适用场景                                                                 |
 |----------|--------------------------------------------------------------------------|
 | `small`  | 适用于目标明确、逻辑简单的任务，响应速度快，优先考虑执行效率。           |
 | `medium` | 适用于需要较强理解能力与指令跟随能力的任务，可处理中等复杂度的工具调用。 |
 | `large`  | 适用于需要深度推理与多步骤思考的复杂任务，优先保证输出质量与准确性。     |
 
-**选型建议：** 优先使用 `small` 处理简单子任务以提升整体效率；当任务涉及复杂逻辑、多轮工具调用或需要高质量输出时，升级至 `medium` 或 `large`。
+## 模型选择
+
+优先使用 `small` 处理简单子任务以提升整体效率；当任务涉及复杂逻辑、多轮工具调用或需要高质量输出时，升级至 `medium` 或 `large`。
+
+**注意:** 当把 `delegate` 工具提供给 MainAgent 或由 MainAgent 提供给 SubAgent，都务必在 `context` 中说明可供选择的 `model_id` 。
 
 ## 你不能做的事
 
 - 不要自己调用 `bash`、`fetch` 或任何其他执行类工具。你负责规划，MainAgent 负责执行。
-- 不要在一次用户请求中多次调用 delegate。唯一的例外是第一次委派的结果明显有误，需要修正指令后重试。
+- 原则上不要多次调用 delegate。但如果第一次委派的结果明显有误，需要修正指令后重试；或工作没有完成，或没有得到完成结果的清晰答案，有必要再次委派以获得关于结果的明确说明。
 - 不要过度拆解。如果 MainAgent 能合理地完成整个任务，就让它完成。
+- 不要使用相对路径。涉及文件的操作，使用绝对路径才是安全的。
 
 ## 向用户输出结果
 
@@ -201,9 +209,9 @@ def print_result(result):
 
 def main():
     # 检查 API Key
-    if not NVIDIA_API_KEY:
-        print("错误: 请设置环境变量 NVIDIA_API_KEY")
-        print("从 https://build.nvidia.com 获取免费 API Key")
+    if not MIMO_API_KEY:
+        print("错误: 请设置环境变量 MIMO_API_KEY")
+        print("从 https://platform.xiaomimimo.com/ 获取 API Key")
         sys.exit(1)
 
     # 1. 注册模型 —— small, medium, large
@@ -211,10 +219,10 @@ def main():
     for model_id, model_name in MODEL_MAPPING.items():
         model_registry.register(ModelConfig(
             model_id=model_id,
-            api_base=NVIDIA_API_BASE,# "http://localhost:11435",
-            model_name=model_name,# "qwen3.5:9b"
-            api_key=NVIDIA_API_KEY,
-            api_protocol="openai",# "ollama"
+            api_base=MIMO_API_BASE,
+            model_name=model_name,
+            api_key=MIMO_API_KEY,
+            api_protocol="openai",
             model_type="llm",
             generate_params={"temperature": 0.7},
         ))

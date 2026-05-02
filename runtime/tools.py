@@ -24,13 +24,6 @@ _TYPE_MAP: dict[type, str] = {
 }
 
 
-def _python_type_to_json_schema(annotation: type) -> str:
-    """Map a Python type annotation to a JSON Schema type string.
-
-    Falls back to "string" for unknown types.
-    """
-    return _TYPE_MAP.get(annotation, "string")
-
 
 def _parse_docstring(fn) -> tuple[str, dict[str, str]]:
     """Extract function description and parameter descriptions from docstring.
@@ -117,7 +110,7 @@ def _extract_tool_config(fn, name: Optional[str] = None, description: Optional[s
     for param_name, param in sig.parameters.items():
         # Determine JSON Schema type from annotation
         if param.annotation is not inspect.Parameter.empty:
-            json_type = _python_type_to_json_schema(param.annotation)
+            json_type = _TYPE_MAP.get(param.annotation, "string")
         else:
             json_type = "string"
 

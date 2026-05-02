@@ -61,15 +61,15 @@
     {/if}
   </div>
 
-  {#if showForm}
-    <ModelForm model={editingModel} onSuccess={handleFormSuccess} onCancel={handleFormCancel} />
-  {/if}
-
   {#if error}
     <div class="error-msg">{error}</div>
   {/if}
 
   <div class="page-content">
+    {#if showForm}
+      <ModelForm model={editingModel} onSuccess={handleFormSuccess} onCancel={handleFormCancel} />
+    {/if}
+
     {#if loading}
       <div class="loading">{t('loading')}</div>
     {:else if modelList.length === 0 && !error}

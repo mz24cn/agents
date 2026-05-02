@@ -1,5 +1,5 @@
 <script>
-  import { inferStream } from '../../lib/api.js'
+  import { inferStream, abortInferStream } from '../../lib/api.js'
   import ModelSelector from './ModelSelector.svelte'
   import ToolSelector from './ToolSelector.svelte'
   import PromptTemplateSelector from './PromptTemplateSelector.svelte'
@@ -141,24 +141,33 @@
     messages = [...messages, { role: 'assistant', content: '', thinking: null }]
     const reqBody = { model_id: selectedModelId, tool_ids: selectedToolIds, messages: apiMessages, stream: true }
     reqBody.session_id = sessionId ?? 'new'
+    // 记录本次发送的第一条用户消息，用于新会话的临时标题
+    const pendingFirstUserMsg = !sessionId
+      ? (apiMessages.find(m => m.role === 'user')?.content || null)
+      : null
     abortStream = inferStream(
       reqBody,
-      (msg) => onStreamMsg(msg, aIdxRef),
+      (msg) => onStreamMsg(msg, aIdxRef, pendingFirstUserMsg),
       () => onStreamDone(),
       (err) => onStreamErr(err),
     )
   }
 
   function handleStop() {
-    if (abortStream) { abortStream(); abortStream = null }
+    if (abortStream) {
+      // 先通知后端 set cancel_event（覆盖 delegate 子推理期间无 SSE 写入的情况）
+      if (sessionId) abortInferStream(sessionId)
+      abortStream(); abortStream = null
+    }
   }
 
-  function onStreamMsg(msg, aIdxRef) {
+  function onStreamMsg(msg, aIdxRef, pendingFirstUserMsg) {
     if (msg.session_id && !msg.role) {
       sessionId = msg.session_id
       // 通知 Sidebar 有新会话创建（仅当之前没有 sessionId 时才是新会话）
       if (!newSessionCreated.sessionId) {
         newSessionCreated.sessionId = msg.session_id
+        newSessionCreated.firstUserMessage = pendingFirstUserMsg ?? null
       }
       return
     }

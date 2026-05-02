@@ -12,6 +12,7 @@ from typing import Optional
 import os
 import base64
 import urllib.request
+import datetime
 
 from runtime.models import Message, ModelConfig, TokenStat, ToolConfig
 
@@ -57,6 +58,45 @@ class BaseProtocol(ABC):
             the backend does not report usage).
         """
 
+
+    @staticmethod
+    def _dump_request_if_debug(body: dict) -> None:
+        """If DEBUG_INFER_REQUEST=true, pretty-print the request body to
+        <chats_dir>/<session_path>/request_YYMMDD_HHmmss_SSS.json.
+
+        The session path is derived from session_id by replacing '-' with '/'.
+        For example, session_id "260501_143022-sub_260501_143025" maps to
+        "<chats_dir>/260501_143022/sub_260501_143025/".
+
+        Falls back to <chats_dir>/request_<timestamp>.json when no session is
+        active, and silently skips the dump if chats_dir is also unavailable.
+        """
+        if os.environ.get("DEBUG_INFER_REQUEST", "").lower() != "true":
+            return
+        try:
+            from runtime.builtin_tools import _thread_local
+            context_manager = getattr(_thread_local, "context_manager", None)
+            session_id = getattr(_thread_local, "session_id", None)
+        except Exception:
+            return
+        if not context_manager:
+            return
+        chats_dir = context_manager._chats_dir
+        if not chats_dir:
+            return
+        now = datetime.datetime.now()
+        date_time = now.strftime("%y%m%d_%H%M%S")
+        millisec = now.microsecond // 1000
+        filename = f"request_{date_time}_{millisec:03d}.json"
+        if session_id:
+            # Replace '-' with os.sep to convert session hierarchy into a path
+            out_dir = os.path.join(chats_dir, session_id.replace("-", os.sep))
+        else:
+            out_dir = chats_dir
+        os.makedirs(out_dir, exist_ok=True)
+        filepath = os.path.join(out_dir, filename)
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(body, f, ensure_ascii=False, indent=2)
 
     @staticmethod
     def _convert_image_to_base64(img_data: str) -> str:
@@ -135,6 +175,7 @@ class OpenAIProtocol(BaseProtocol):
             body["tools"] = [self._encode_tool(tool) for tool in tools]
 
         body_bytes = json.dumps(body).encode("utf-8")
+        self._dump_request_if_debug(body)
         return (url, headers, body_bytes)
 
     def parse_response(self, response_data: bytes, stream: bool = False) -> tuple:
@@ -412,6 +453,7 @@ class OllamaProtocol(BaseProtocol):
             body["tools"] = [self._encode_tool(tool) for tool in tools]
 
         body_bytes = json.dumps(body).encode("utf-8")
+        self._dump_request_if_debug(body)
         return (url, headers, body_bytes)
 
     def parse_response(self, response_data: bytes, stream: bool = False) -> tuple:

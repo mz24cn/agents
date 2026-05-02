@@ -246,6 +246,7 @@ python app.py 0.0.0.0:9000 # custom host and port
 |--------|------|-------------|
 | POST | `/v1/infer` | Non-streaming inference |
 | POST | `/v1/infer/stream` | Streaming inference (SSE) |
+| POST | `/v1/infer/abort` | Abort an active streaming inference by session ID |
 | GET | `/v1/models` | List registered models |
 | POST | `/v1/models` | Register a model |
 | PUT | `/v1/models/{model_id}` | Update a model |
@@ -303,12 +304,13 @@ The built files in `web/dist/` are automatically served by the HTTP server at th
 
 Features:
 - Chat with model selection, tool selection, and prompt template support
-- Model management (CRUD)
+- Model management (CRUD) — copy an existing model config to quickly create a new one
 - Tool management (CRUD)
 - Prompt template management with `{{placeholder}}` variable support
 - Markdown rendering with syntax highlighting
 - Multimodal: image upload and microphone recording
 - Dark/light theme, responsive layout
+- Resizable sidebar with collapse/expand toggle; width persisted to localStorage
 
 ### Examples
 
@@ -617,6 +619,7 @@ python app.py 0.0.0.0:9000 # 自定义主机和端口
 |------|------|------|
 | POST | `/v1/infer` | 非流式推理 |
 | POST | `/v1/infer/stream` | 流式推理（SSE） |
+| POST | `/v1/infer/abort` | 中止指定会话的流式推理 |
 | GET | `/v1/models` | 获取模型列表 |
 | POST | `/v1/models` | 注册模型 |
 | PUT | `/v1/models/{model_id}` | 更新模型 |
@@ -674,12 +677,13 @@ npm run build
 
 功能包括：
 - 对话页面：模型选择、工具选择、提示词模板（支持 `{{占位符}}` 变量）
-- 模型管理（增删改查）
+- 模型管理（增删改查）— 支持复制现有模型配置，快速创建新模型
 - 工具管理（增删改查）
 - 提示词模板管理
 - Markdown 渲染与语法高亮
 - 多模态：图片上传与麦克风录音
 - 深色/浅色主题，响应式布局
+- 侧边栏支持拖拽调整宽度与折叠/展开，宽度自动持久化到 localStorage
 
 ### 功能示例
 

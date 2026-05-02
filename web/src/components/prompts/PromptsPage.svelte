@@ -56,15 +56,15 @@
     {/if}
   </div>
 
-  {#if showForm}
-    <PromptForm template={editingTemplate} onSuccess={handleFormSuccess} onCancel={handleFormCancel} />
-  {/if}
-
   {#if error}
     <div class="error-msg">{error}</div>
   {/if}
 
   <div class="page-content">
+    {#if showForm}
+      <PromptForm template={editingTemplate} onSuccess={handleFormSuccess} onCancel={handleFormCancel} />
+    {/if}
+
     {#if loading}
       <div class="loading">{t('loading')}</div>
     {:else if templateList.length === 0 && !error}

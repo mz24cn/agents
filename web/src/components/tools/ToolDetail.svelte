@@ -1,6 +1,10 @@
 <script>
   import { t } from '../../lib/i18n.svelte.js'
+  import { highlight } from '../../lib/highlight.js'
   let { tool, onClose } = $props()
+
+  let parametersJson = $derived(JSON.stringify(tool.parameters, null, 2))
+  let parametersHighlighted = $derived(highlight(parametersJson, 'json'))
 </script>
 
 <div class="tool-detail">
@@ -31,7 +35,7 @@
     </div>
     <div class="detail-row">
       <span class="detail-label">Parameters (JSON Schema)</span>
-      <pre class="detail-json">{JSON.stringify(tool.parameters, null, 2)}</pre>
+      <pre class="detail-json"><code>{@html parametersHighlighted}</code></pre>
     </div>
     {#if tool.tool_type === 'function' && tool.function_file_path}
       <div class="detail-row">
@@ -59,5 +63,18 @@
   .detail-row { display: flex; flex-direction: column; gap: 4px; }
   .detail-label { font-size: 0.85rem; color: var(--text-secondary); font-weight: 600; }
   .detail-value { font-size: 0.9rem; color: var(--text); }
-  .detail-json { background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 6px; padding: 12px; font-family: monospace; font-size: 0.85rem; color: var(--text); overflow-x: auto; margin: 0; white-space: pre-wrap; word-break: break-word; }
+  .detail-json { background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 6px; padding: 12px; font-family: 'Fira Code', 'Consolas', monospace; font-size: 0.85rem; color: var(--text); overflow-x: auto; margin: 0; white-space: pre-wrap; word-break: break-word; }
+  .detail-json code { font-family: inherit; font-size: inherit; background: none; padding: 0; }
+  /* Syntax colors - dark theme */
+  .detail-json :global(.hl-key)     { color: #82aaff; }
+  .detail-json :global(.hl-string)  { color: #c3e88d; }
+  .detail-json :global(.hl-number)  { color: #f78c6c; }
+  .detail-json :global(.hl-boolean) { color: #ff5874; }
+  .detail-json :global(.hl-null)    { color: #ff5874; }
+  /* Syntax colors - light theme */
+  :root[data-theme="light"] .detail-json :global(.hl-key)     { color: #1d4ed8; }
+  :root[data-theme="light"] .detail-json :global(.hl-string)  { color: #16a34a; }
+  :root[data-theme="light"] .detail-json :global(.hl-number)  { color: #c2410c; }
+  :root[data-theme="light"] .detail-json :global(.hl-boolean) { color: #dc2626; }
+  :root[data-theme="light"] .detail-json :global(.hl-null)    { color: #dc2626; }
 </style>

@@ -279,10 +279,6 @@ class Runtime:
                     # Progressive disclosure: inject SKILL.md body + built-in tools
                     skill_body, skill_dir = self._get_skill_body_and_dir(tool_name)
 
-                    # Change working directory to the skill's directory
-                    if skill_dir:
-                        os.chdir(skill_dir)
-
                     # Inject the full SKILL.md body as a function/tool result message
                     if skill_body:
                         cwd_hint = f"\n\n技能工作目录: {skill_dir}" if skill_dir else ""

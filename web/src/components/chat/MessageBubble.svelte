@@ -150,7 +150,7 @@
       <span class="template-ref-id">{msg.prompt_template}</span>
       {#if msg.arguments && Object.keys(msg.arguments).length > 0}
         {#each Object.entries(msg.arguments) as [k, v]}
-          <span class="template-ref-arg"><span class="arg-key">{k}</span><span class="arg-val">{v}</span></span>
+          <span class="template-ref-arg"><span class="arg-key">{k}</span><span class="arg-val"><MarkdownRenderer content={v} /></span></span>
         {/each}
       {/if}
     </div>
@@ -246,12 +246,12 @@
     line-height: 1.5;
     font-size: 0.9rem;
   }
-  .template-ref { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; white-space: normal; }
+  .template-ref { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 6px; white-space: normal; }
   .template-ref-id { font-family: monospace; font-weight: 600; font-size: 0.9rem; }
-  .template-ref-arg { display: inline-flex; align-items: center; gap: 2px; font-size: 0.82rem; background: rgba(255,255,255,0.15); border-radius: 4px; padding: 1px 6px; }
-  .arg-key { opacity: 0.75; }
+  .template-ref-arg { display: flex; align-items: flex-start; gap: 2px; font-size: 0.82rem; background: rgba(255,255,255,0.15); border-radius: 4px; padding: 1px 6px; }
+  .arg-key { opacity: 0.75; flex-shrink: 0; }
   .arg-key::after { content: ':'; margin-right: 3px; }
-  .arg-val { font-weight: 500; }
+  .arg-val { font-weight: 500; min-width: 0; }
   .message.user :global(.copy-btn) {
     color: rgba(255,255,255,0.7);
     background: rgba(255,255,255,0.15);
