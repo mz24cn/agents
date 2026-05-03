@@ -1,5 +1,5 @@
 <script>
-  import { inferStream, abortInferStream } from '../../lib/api.js'
+  import { inferStream, abortInferStream, agents as agentsApi, tools as toolsApi } from '../../lib/api.js'
   import ModelSelector from './ModelSelector.svelte'
   import ToolSelector from './ToolSelector.svelte'
   import PromptTemplateSelector from './PromptTemplateSelector.svelte'
@@ -34,6 +34,16 @@
   // 系统提示词：纯文本或模板引用
   let systemPromptText = $state('')          // 纯文本形式
   let systemPromptTemplate = $state(null)    // { template_id, arguments } 形式，非 null 时优先使用
+
+  // 添加为智能体状态
+  let addAgentMode = $state(false)
+  let addAgentNickname = $state('')
+  let addAgentSaving = $state(false)
+
+  // 智能体选择器状态
+  let agentList = $state([])
+  let selectedAgentId = $state('')
+  let loadingAgents = $state(true)
 
   function openTemplatePanel() {
     templatePanelOpen = true
@@ -101,7 +111,7 @@
   }
 
   function handleSend(text) {
-    if (!selectedModelId || isStreaming) return
+    if (!selectedModelId && !selectedAgentId || isStreaming) return
     errorMsg = ''
     messages = [...messages, { role: 'user', content: text }]
     const apiMessages = []
@@ -119,7 +129,7 @@
   }
 
   function handleSendTemplate(templateId, args) {
-    if (!selectedModelId || isStreaming) return
+    if (!selectedModelId && !selectedAgentId || isStreaming) return
     errorMsg = ''
     messages = [...messages, { role: 'user', content: '', prompt_template: templateId, arguments: args }]
     const apiMessages = []
@@ -138,8 +148,15 @@
   function _doSend(apiMessages) {
     isStreaming = true
     let aIdxRef = { value: messages.length }
-    messages = [...messages, { role: 'assistant', content: '', thinking: null }]
+    // Find the agent nickname if one is selected
+    const agentNickname = selectedAgentId
+      ? (agentList.find(a => a.agent_id === selectedAgentId)?.nickname ?? '')
+      : ''
+    messages = [...messages, { role: 'assistant', content: '', thinking: null, agent_nickname: agentNickname || undefined }]
     const reqBody = { model_id: selectedModelId, tool_ids: selectedToolIds, messages: apiMessages, stream: true }
+    if (selectedAgentId) {
+      reqBody.agent_id = selectedAgentId
+    }
     reqBody.session_id = sessionId ?? 'new'
     // 记录本次发送的第一条用户消息，用于新会话的临时标题
     const pendingFirstUserMsg = !sessionId
@@ -174,7 +191,9 @@
     if (msg.role === 'assistant') {
       if (aIdxRef.value === -1) {
         aIdxRef.value = messages.length
-        messages = [...messages, { role: 'assistant', content: '', thinking: null }]
+        // Inherit agent_nickname from the previous assistant message (if any)
+        const prevAgent = [...messages].reverse().find(m => m.role === 'assistant' && m.agent_nickname)
+        messages = [...messages, { role: 'assistant', content: '', thinking: null, agent_nickname: prevAgent?.agent_nickname }]
       }
       let u = [...messages]
       const aIdx = aIdxRef.value
@@ -271,12 +290,104 @@
       errorMsg = ''
     }
   })
+
+  // 加载智能体列表
+  async function fetchAgents() {
+    loadingAgents = true
+    try {
+      const data = await agentsApi.list()
+      agentList = data.agents ?? []
+    } catch {
+      agentList = []
+    } finally {
+      loadingAgents = false
+    }
+  }
+
+  $effect(() => { fetchAgents() })
+
+  function handleAgentChange(e) {
+    selectedAgentId = e.target.value
+    if (selectedAgentId) {
+      localStorage.setItem('chat_selected_agent', selectedAgentId)
+    }
+  }
+
+  // 生成添加智能体的默认昵称
+  function generateAgentDefaultNickname() {
+    const model = selectedModelId || 'unknown'
+    const toolCount = selectedToolIds.length
+    const toolSummary = toolCount > 0 ? `+${toolCount}tools` : ''
+    const tpl = systemPromptTemplate ? systemPromptTemplate.template_id : ''
+    return `${model}${toolSummary}${tpl ? '+' + tpl : ''}`
+  }
+
+  function openAddAgent() {
+    addAgentNickname = generateAgentDefaultNickname()
+    addAgentMode = true
+  }
+
+  function cancelAddAgent() {
+    addAgentMode = false
+    addAgentNickname = ''
+  }
+
+  async function confirmAddAgent() {
+    if (!addAgentNickname.trim() || addAgentSaving) return
+    addAgentSaving = true
+    try {
+      // 获取选中工具的详细信息用于描述
+      const toolsData = await toolsApi.list()
+      const toolNames = (toolsData.tools ?? [])
+        .filter(t => selectedToolIds.includes(t.tool_id))
+        .map(t => t.name)
+
+      const payload = {
+        model_id: selectedModelId,
+        tool_ids: selectedToolIds,
+        template_id: systemPromptTemplate?.template_id ?? null,
+        template_arguments: systemPromptTemplate?.arguments ?? {},
+        system_prompt: systemPromptText,
+        nickname: addAgentNickname.trim(),
+        myself_view: '',
+        description: `Model: ${selectedModelId}, Tools: ${toolNames.join(', ') || 'none'}`,
+      }
+      await agentsApi.create(payload)
+      addAgentMode = false
+      addAgentNickname = ''
+      // 重新加载智能体列表
+      fetchAgents()
+    } catch (err) {
+      errorMsg = err.message || t('addAsAgentFailed')
+    } finally {
+      addAgentSaving = false
+    }
+  }
+
+  function handleAgentNicknameFocus(e) {
+    // 当用户点击输入框时，选中全部文本，方便编辑
+    e.target.select()
+  }
 </script>
 
 <div class="chat-page">
   <div class="selection-bar">
     <ModelSelector bind:selectedModelId onchange={(id) => localStorage.setItem(STORAGE_MODEL_KEY, id)} />
     <ToolSelector bind:selectedToolIds onchange={(ids) => localStorage.setItem(STORAGE_TOOLS_KEY, JSON.stringify(ids))} />
+    <div class="agent-selector-spacer"></div>
+    <div class="agent-selector">
+      <label for="agent-select">{t('agentSelector')}</label>
+      {#if loadingAgents}
+        <span class="hint">{t('loading')}</span>
+      {:else}
+        <select id="agent-select" value={selectedAgentId} onchange={handleAgentChange}>
+          <option value="">—</option>
+          {#each agentList as a (a.agent_id)}
+            <option value={a.agent_id}>{a.nickname}{a.myself_view ? ' (' + a.myself_view + ')' : ''}</option>
+          {/each}
+        </select>
+      {/if}
+    </div>
   </div>
   {#if systemPromptTemplate || systemPromptText}
     <div class="system-prompt-bar">
@@ -286,7 +397,27 @@
       {:else}
         <span class="sp-text">{systemPromptText.length > 80 ? systemPromptText.slice(0, 80) + '...' : systemPromptText}</span>
       {/if}
-      <button class="sp-clear" onclick={() => { systemPromptText = ''; systemPromptTemplate = null }}>✕</button>
+      <div class="sp-right-section">
+        {#if !addAgentMode}
+          <a class="sp-add-agent" onclick={openAddAgent}>{t('addAsAgent')}</a>
+        {/if}
+        {#if addAgentMode}
+          <input
+            class="sp-nickname-input"
+            type="text"
+            value={addAgentNickname}
+            oninput={(e) => addAgentNickname = e.target.value}
+            onfocus={handleAgentNicknameFocus}
+            placeholder={t('addAsAgentNickname')}
+            disabled={addAgentSaving}
+          />
+          <button class="sp-confirm" onclick={confirmAddAgent} disabled={addAgentSaving || !addAgentNickname.trim()}>
+            {addAgentSaving ? t('submitting') : t('addAsAgentConfirm')}
+          </button>
+          <button class="sp-cancel" onclick={cancelAddAgent}>✕</button>
+        {/if}
+        <button class="sp-clear" onclick={() => { systemPromptText = ''; systemPromptTemplate = null; addAgentMode = false }}>✕</button>
+      </div>
     </div>
   {/if}
   {#if errorMsg}
@@ -382,6 +513,19 @@
     background: var(--bg);
     align-items: center;
   }
+  .agent-selector-spacer { flex: 1; }
+  .agent-selector { display: flex; align-items: center; gap: 8px; }
+  .agent-selector label { font-size: 0.85rem; font-weight: 600; color: var(--text-secondary); white-space: nowrap; }
+  .agent-selector select {
+    padding: 6px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+    font-size: 0.9rem;
+    min-width: 180px;
+  }
+  .agent-selector .hint { font-size: 0.8rem; color: var(--text-secondary); }
   .system-prompt-bar {
     display: flex;
     align-items: center;
@@ -396,6 +540,36 @@
   .sp-text.sp-template { color: var(--primary); font-family: monospace; font-size: 0.85rem; }
   .sp-clear { background: none; border: none; color: var(--text-secondary); cursor: pointer; font-size: 0.9rem; padding: 2px 6px; border-radius: 4px; }
   .sp-clear:hover { background: var(--border); }
+  .sp-right-section { display: flex; align-items: center; gap: 8px; }
+  .sp-add-agent { color: var(--primary); cursor: pointer; text-decoration: underline; font-size: 0.8rem; white-space: nowrap; }
+  .sp-add-agent:hover { color: var(--primary-hover); }
+  .sp-nickname-input {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 0.8rem;
+    font-family: monospace;
+    width: 200px;
+  }
+  .sp-nickname-input:focus {
+    border-color: var(--primary);
+    color: var(--text);
+    outline: none;
+  }
+  .sp-confirm {
+    background: var(--primary);
+    color: #fff;
+    border: none;
+    padding: 2px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.8rem;
+  }
+  .sp-confirm:disabled { opacity: 0.5; cursor: not-allowed; }
+  .sp-cancel { background: none; border: none; color: var(--text-secondary); cursor: pointer; font-size: 0.9rem; padding: 2px 6px; border-radius: 4px; }
+  .sp-cancel:hover { background: var(--border); }
   .error-bar { padding: 8px 12px; background: var(--danger); color: #fff; font-size: 0.85rem; }
 
   .message-area {

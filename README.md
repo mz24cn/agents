@@ -22,7 +22,8 @@ A minimal, zero-dependency composable agent runtime engine built with pure Pytho
 - **Streaming inference** — real-time token streaming with thinking/reasoning content support
 - **Prompt template inference** — user messages can reference a named template by ID; `{{placeholder}}` variables are resolved at runtime from the request's `arguments` dict, enabling dynamic prompt adjustment and model/tool-agnostic parameterization without redeploying
 - **Multi-agent collaboration** — delegate subtasks to independent Subagents via the built-in `delegate` tool; each Subagent runs with its own model and toolset, returning results to the parent agent. Supports streaming output, nested delegation, and automatic session persistence
-- **Web UI management console** — Svelte 5 SPA for managing models, tools, prompt templates, and chat
+- **Agent management** — save current model, tools, and system prompt configurations as reusable Agents; quickly switch between saved Agents in the chat interface
+- **Web UI management console** — Svelte 5 SPA for managing models, tools, prompt templates, agents, and chat
 - **HTTP API server** — lightweight REST API built on `http.server`, no FastAPI/uvicorn needed
 - **Multimodal** — supports image (base64) and audio inputs for VLM models
 
@@ -269,6 +270,11 @@ python app.py 0.0.0.0:9000 # custom host and port
 | GET | `/v1/sessions` | List all sessions |
 | GET | `/v1/sessions/{session_id}` | Get session details |
 | DELETE | `/v1/sessions/{session_id}` | Delete session |
+| GET | `/v1/agents` | List all agents |
+| GET | `/v1/agents/{agent_id}` | Get a single agent |
+| POST | `/v1/agents` | Create an agent |
+| PUT | `/v1/agents/{agent_id}` | Update an agent |
+| DELETE | `/v1/agents/{agent_id}` | Delete an agent |
 
 **Streaming inference request:**
 
@@ -303,10 +309,11 @@ npm run build
 The built files in `web/dist/` are automatically served by the HTTP server at the root path.
 
 Features:
-- Chat with model selection, tool selection, and prompt template support
+- Chat with model selection, tool selection, prompt template support, and agent selection
 - Model management (CRUD) — copy an existing model config to quickly create a new one
 - Tool management (CRUD)
 - Prompt template management with `{{placeholder}}` variable support
+- Agent management — save current configuration as a reusable agent; switch agents in the chat interface
 - Markdown rendering with syntax highlighting
 - Multimodal: image upload and microphone recording
 - Dark/light theme, responsive layout
@@ -336,6 +343,8 @@ All configuration is persisted to `~/.agents_runtime/`:
 ├── mcp_servers.json
 ├── prompt_templates.json
 ├── env.json
+├── agents/                  # Agent data directory
+│   └── {agent_id}.json      # Individual agent configuration files
 └── chat_data/              # Session data directory
     └── {session_id}/
         ├── conversation.json
@@ -397,7 +406,8 @@ MIT License — see [LICENSE](LICENSE)
 - **流式推理** — 实时 token 流式输出，支持 thinking/reasoning 内容
 - **提示词模板推理** — 用户消息可通过模板 ID 引用命名模板，`{{占位符}}` 变量在推理时从请求的 `arguments` 字典动态替换，无需重新部署即可调整提示词，并支持参数化以适应不同模型和工具
 - **多智能体协作** — 通过内置 `delegate` 工具将子任务委派给独立的 Subagent 执行；每个 Subagent 可使用不同的模型和工具集，完成后将结果返回给父 Agent。支持流式输出、嵌套委派和自动会话持久化
-- **Web UI 管理控制台** — Svelte 5 SPA，支持模型、工具、提示词模板管理和对话
+- **智能体管理** — 将当前模型、工具和系统提示词配置保存为可复用的智能体；在聊天界面中快速切换已保存的智能体
+- **Web UI 管理控制台** — Svelte 5 SPA，支持模型、工具、提示词模板、智能体管理和对话
 - **HTTP API 服务** — 基于 `http.server` 的轻量 REST API，无需 FastAPI/uvicorn
 - **多模态** — 支持图片（base64）和音频输入，适配 VLM 模型
 
@@ -642,6 +652,11 @@ python app.py 0.0.0.0:9000 # 自定义主机和端口
 | GET | `/v1/sessions` | 列出所有会话 |
 | GET | `/v1/sessions/{session_id}` | 获取会话详情 |
 | DELETE | `/v1/sessions/{session_id}` | 删除会话 |
+| GET | `/v1/agents` | 列出所有智能体 |
+| GET | `/v1/agents/{agent_id}` | 获取单个智能体 |
+| POST | `/v1/agents` | 创建智能体 |
+| PUT | `/v1/agents/{agent_id}` | 更新智能体 |
+| DELETE | `/v1/agents/{agent_id}` | 删除智能体 |
 
 **流式推理请求示例：**
 
@@ -676,10 +691,11 @@ npm run build
 构建产物 `web/dist/` 会由 HTTP 服务器自动在根路径提供服务。
 
 功能包括：
-- 对话页面：模型选择、工具选择、提示词模板（支持 `{{占位符}}` 变量）
+- 对话页面：模型选择、工具选择、提示词模板（支持 `{{占位符}}` 变量）、智能体选择
 - 模型管理（增删改查）— 支持复制现有模型配置，快速创建新模型
 - 工具管理（增删改查）
 - 提示词模板管理
+- 智能体管理 — 将当前配置保存为可复用的智能体；在对话中快速切换智能体
 - Markdown 渲染与语法高亮
 - 多模态：图片上传与麦克风录音
 - 深色/浅色主题，响应式布局
@@ -709,6 +725,8 @@ npm run build
 ├── mcp_servers.json
 ├── prompt_templates.json
 ├── env.json
+├── agents/                  # 智能体数据目录
+│   └── {agent_id}.json     # 智能体配置文件
 └── chat_data/              # 会话数据目录
     └── {session_id}/
         ├── conversation.json

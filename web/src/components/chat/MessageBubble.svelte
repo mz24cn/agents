@@ -83,7 +83,7 @@
       <span>{t('roleUser')}</span>
       <CopyButton getText={() => msg.content ?? ''} />
     {:else if msg.role === 'assistant'}
-      <span>{t('roleAssistant')}</span>
+      <span>{msg.agent_nickname || t('roleAssistant')}</span>
       <div class="role-actions">
         {#if msg.stat}
           <span class="token-stats" title={buildStatTooltip(msg.stat)}>

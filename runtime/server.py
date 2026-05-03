@@ -7,6 +7,7 @@ tool calling, and registry management.
 Zero third-party dependencies — only Python standard library.
 """
 
+import datetime
 import importlib.util
 import json
 import logging
@@ -223,6 +224,7 @@ _TOOLS_PATH = os.path.join(_DATA_DIR, "tools.json")
 _MCP_SERVERS_PATH = os.path.join(_DATA_DIR, "mcp_servers.json")
 _PROMPT_TEMPLATES_PATH = os.path.join(_DATA_DIR, "prompt_templates.json")
 _ENV_PATH = os.path.join(_DATA_DIR, "env.json")
+_AGENTS_DIR = os.path.join(_DATA_DIR, "agents")
 
 
 class _RuntimeRequestHandler(BaseHTTPRequestHandler):
@@ -312,6 +314,11 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         elif re.match(r"^/v1/sessions/[^/]+$", path):
             session_id = path[len("/v1/sessions/"):]
             self._handle_get_session(session_id)
+        elif path == "/v1/agents":
+            self._handle_list_agents()
+        elif re.match(r"^/v1/agents/[^/]+$", path):
+            agent_id = path[len("/v1/agents/"):]
+            self._handle_get_agent(agent_id)
         elif path.startswith("/v1/"):
             self._send_json_error(404, f"Not found: {self.path}")
         else:
@@ -388,6 +395,8 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             # POST /v1/sessions/{session_id}/generate-title
             session_id = path[len("/v1/sessions/"):-len("/generate-title")]
             self._handle_generate_session_title(urllib.parse.unquote(session_id))
+        elif path == "/v1/agents":
+            self._handle_create_agent()
         else:
             self._send_json_error(404, f"Not found: {self.path}")
 
@@ -405,6 +414,10 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         m = re.match(r"^/v1/prompt-templates/([^/]+)$", path)
         if m:
             self._handle_update_prompt_template(m.group(1))
+            return
+        m = re.match(r"^/v1/agents/([^/]+)$", path)
+        if m:
+            self._handle_update_agent(m.group(1))
             return
         self._send_json_error(404, f"Not found: {self.path}")
 
@@ -437,6 +450,10 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         m = re.match(r"^/v1/sessions/([^/]+)$", path)
         if m:
             self._handle_delete_session(urllib.parse.unquote(m.group(1)))
+            return
+        m = re.match(r"^/v1/agents/([^/]+)$", path)
+        if m:
+            self._handle_delete_agent(m.group(1))
             return
         self._send_json_error(404, f"Not found: {self.path}")
 
@@ -473,6 +490,41 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         body = self._read_json_body()
         if body is None:
             return None
+
+        # Resolve agent_id: override model_id, tool_ids, and inject system prompt into messages
+        agent_id = body.get("agent_id")
+        agent = None
+        if agent_id:
+            agent_fpath = os.path.join(_AGENTS_DIR, f"{agent_id}.json")
+            if os.path.isfile(agent_fpath):
+                try:
+                    with open(agent_fpath, "r", encoding="utf-8") as f:
+                        agent = json.load(f)
+                except (json.JSONDecodeError, OSError):
+                    pass
+            if agent is None:
+                self._send_json_error(400, f"Agent not found: {agent_id}")
+                return None
+            body["model_id"] = agent["model_id"]
+            body["tool_ids"] = agent.get("tool_ids", [])
+
+            # On first turn (new session or stateless), prepend agent system prompt to messages
+            raw_sid = body.get("session_id") or None
+            if raw_sid in ("new", None):
+                sys_prompt = agent.get("system_prompt", "")
+                template_id = agent.get("template_id")
+                template_args = agent.get("template_arguments", {})
+                if template_id is not None:
+                    sys_msg = {"role": "system", "content": "", "prompt_template": template_id, "arguments": template_args or {}}
+                elif sys_prompt:
+                    sys_msg = {"role": "system", "content": sys_prompt}
+                else:
+                    sys_msg = None
+                if sys_msg:
+                    msgs = body.get("messages", [])
+                    # Remove any existing system message, then prepend agent's
+                    msgs = [m for m in msgs if m.get("role") != "system"]
+                    body["messages"] = [sys_msg] + msgs
 
         if "model_id" not in body:
             self._send_json_error(400, "Missing required field: model_id")
@@ -1389,6 +1441,115 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._send_json_error(400, str(exc))
             return
+
+
+    # ------------------------------------------------------------------
+    # Agent handlers
+    # ------------------------------------------------------------------
+
+    def _handle_list_agents(self) -> None:
+        """GET /v1/agents — list all agents."""
+        os.makedirs(_AGENTS_DIR, exist_ok=True)
+        agents = []
+        if os.path.isdir(_AGENTS_DIR):
+            for fname in sorted(os.listdir(_AGENTS_DIR), reverse=True):
+                if fname.endswith(".json"):
+                    fpath = os.path.join(_AGENTS_DIR, fname)
+                    try:
+                        with open(fpath, "r", encoding="utf-8") as f:
+                            agents.append(json.load(f))
+                    except (json.JSONDecodeError, OSError):
+                        pass
+        self._send_json_response(200, {"agents": agents})
+
+    def _handle_get_agent(self, agent_id: str) -> None:
+        """GET /v1/agents/{agent_id} — get a single agent."""
+        fpath = os.path.join(_AGENTS_DIR, f"{agent_id}.json")
+        if not os.path.isfile(fpath):
+            self._send_json_error(404, f"Agent not found: {agent_id}")
+            return
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                self._send_json_response(200, json.load(f))
+        except (json.JSONDecodeError, OSError) as exc:
+            self._send_json_error(500, f"Failed to read agent: {exc}")
+
+    def _handle_create_agent(self) -> None:
+        """POST /v1/agents — create a new agent."""
+        body = self._read_json_body()
+        if body is None:
+            return
+        required = ["model_id", "nickname"]
+        for field in required:
+            if field not in body:
+                self._send_json_error(400, f"Missing required field: {field}")
+                return
+        agent_id = datetime.datetime.now().strftime("%y%m%d_%H%M%S")
+        agent = {
+            "agent_id": agent_id,
+            "model_id": body["model_id"],
+            "tool_ids": body.get("tool_ids", []),
+            "template_id": body.get("template_id"),
+            "template_arguments": body.get("template_arguments", {}),
+            "system_prompt": body.get("system_prompt", ""),
+            "nickname": body["nickname"],
+            "myself_view": body.get("myself_view", ""),
+            "description": body.get("description", ""),
+            "last_modified": datetime.datetime.now().isoformat(),
+            "avatar": "",
+        }
+        os.makedirs(_AGENTS_DIR, exist_ok=True)
+        fpath = os.path.join(_AGENTS_DIR, f"{agent_id}.json")
+        try:
+            with open(fpath, "w", encoding="utf-8") as f:
+                json.dump(agent, f, ensure_ascii=False, indent=2)
+            self._send_json_response(201, {"status": "created", "agent_id": agent_id})
+        except OSError as exc:
+            self._send_json_error(500, f"Failed to save agent: {exc}")
+
+    def _handle_update_agent(self, agent_id: str) -> None:
+        """PUT /v1/agents/{agent_id} — update an agent."""
+        fpath = os.path.join(_AGENTS_DIR, f"{agent_id}.json")
+        if not os.path.isfile(fpath):
+            self._send_json_error(404, f"Agent not found: {agent_id}")
+            return
+        body = self._read_json_body()
+        if body is None:
+            return
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                agent = json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            self._send_json_error(500, f"Failed to read agent: {exc}")
+            return
+        # Update mutable fields
+        for key in ("model_id", "tool_ids", "template_id", "template_arguments",
+                     "system_prompt", "nickname", "myself_view", "description", "avatar"):
+            if key in body:
+                agent[key] = body[key]
+        agent["last_modified"] = datetime.datetime.now().isoformat()
+        try:
+            with open(fpath, "w", encoding="utf-8") as f:
+                json.dump(agent, f, ensure_ascii=False, indent=2)
+            self._send_json_response(200, {"status": "updated", "agent_id": agent_id})
+        except OSError as exc:
+            self._send_json_error(500, f"Failed to save agent: {exc}")
+
+    def _handle_delete_agent(self, agent_id: str) -> None:
+        """DELETE /v1/agents/{agent_id} — delete an agent."""
+        fpath = os.path.join(_AGENTS_DIR, f"{agent_id}.json")
+        if not os.path.isfile(fpath):
+            self._send_json_error(404, f"Agent not found: {agent_id}")
+            return
+        try:
+            os.remove(fpath)
+            self._send_json_response(200, {"status": "deleted", "agent_id": agent_id})
+        except OSError as exc:
+            self._send_json_error(500, f"Failed to delete agent: {exc}")
+
+    # ------------------------------------------------------------------
+    # RuntimeHTTPServer
+    # ------------------------------------------------------------------
 
 
 class RuntimeHTTPServer:

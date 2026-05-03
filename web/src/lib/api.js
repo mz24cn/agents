@@ -177,3 +177,12 @@ export const sessions = {
   delete:        (sessionId)     => request('DELETE', `/v1/sessions/${encodeURIComponent(sessionId)}`),
   generateTitle: (sessionId)     => request('POST',   `/v1/sessions/${encodeURIComponent(sessionId)}/generate-title`),
 }
+
+/** 智能体 API */
+export const agents = {
+  list:   ()              => request('GET',    '/v1/agents'),
+  get:    (agentId)       => request('GET',    `/v1/agents/${encodeURIComponent(agentId)}`),
+  create: (data)          => request('POST',   '/v1/agents', data),
+  update: (agentId, data) => request('PUT',    `/v1/agents/${encodeURIComponent(agentId)}`, data),
+  delete: (agentId)       => request('DELETE', `/v1/agents/${encodeURIComponent(agentId)}`),
+}

@@ -59,6 +59,16 @@ const translations = {
     // ChatPage
     systemPromptLabel: '系统提示词:',
     streamError: '流式响应出错',
+    addAsAgent: '使用当前设定添加为智能体',
+    addAsAgentNickname: '输入智能体昵称',
+    addAsAgentConfirm: '确认添加',
+    addAsAgentSuccess: '智能体已添加',
+    addAsAgentFailed: '添加智能体失败',
+    agentSelector: '智能体',
+    noAgents: '暂无智能体',
+    fetchAgentsFailed: '获取智能体列表失败',
+    deleteAgentFailed: '删除智能体失败',
+    confirmDeleteAgent: '确定要删除智能体「{nickname}」吗？',
 
     // CopyButton / MarkdownRenderer
     copy: '复制',
@@ -320,6 +330,16 @@ const translations = {
     // ChatPage
     systemPromptLabel: 'System prompt:',
     streamError: 'Streaming error',
+    addAsAgent: 'Add as Agent with current settings',
+    addAsAgentNickname: 'Agent nickname',
+    addAsAgentConfirm: 'Confirm',
+    addAsAgentSuccess: 'Agent added',
+    addAsAgentFailed: 'Failed to add agent',
+    agentSelector: 'Agents',
+    noAgents: 'No agents yet',
+    fetchAgentsFailed: 'Failed to fetch agents',
+    deleteAgentFailed: 'Failed to delete agent',
+    confirmDeleteAgent: 'Delete agent "{nickname}"?',
 
     // CopyButton / MarkdownRenderer
     copy: 'Copy',
