@@ -1,8 +1,9 @@
 """MCP Client Manager for the Composable Agent Runtime.
 
 Provides MCPClientManager, a singleton that manages connections to MCP servers
-via stdio (subprocess) or HTTP SSE/Streamable HTTP. Communicates using JSON-RPC
-2.0 over the appropriate transport. Only uses Python standard library modules.
+via stdio (subprocess) or Streamable HTTP (MCP 2025-03-26). Communicates using
+JSON-RPC 2.0 over the appropriate transport. Only uses Python standard library
+modules.
 
 Idle process reaping:
     stdio connections that have not been used for ``idle_timeout`` seconds are
@@ -29,7 +30,7 @@ _DEFAULT_IDLE_TIMEOUT = 300
 
 
 class MCPClientManager:
-    """Singleton MCP Client manager supporting stdio and HTTP SSE transports."""
+    """Singleton MCP Client manager supporting stdio and Streamable HTTP transports."""
 
     _instance: Optional["MCPClientManager"] = None
     _initialized: bool = False
@@ -135,7 +136,7 @@ class MCPClientManager:
 
     async def _stdio_initialize(self, conn: dict) -> None:
         request = self._build_jsonrpc("initialize", {
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": "2025-03-26",
             "capabilities": {},
             "clientInfo": {"name": "runtime", "version": "1.0.0"},
         })
@@ -149,44 +150,106 @@ class MCPClientManager:
         await conn["process"].stdin.drain()
 
     # ------------------------------------------------------------------
-    # HTTP SSE transport helpers
+    # HTTP Streamable HTTP transport helpers
     # ------------------------------------------------------------------
 
     def _http_send(self, conn: dict, request: dict) -> dict:
+        """Send a JSON-RPC request over Streamable HTTP and return the response.
+
+        Handles both plain JSON responses and SSE streams.  For SSE, reads
+        line-by-line so we return as soon as the first JSON-RPC response
+        arrives without waiting for the server to close the connection
+        (servers may keep it open for server-initiated messages).
+
+        Also captures the ``mcp-session-id`` header from the response and
+        stores it on *conn* so subsequent requests include it automatically.
+        """
         url = conn["url"]
         headers = dict(conn.get("headers") or {})
         headers.setdefault("Content-Type", "application/json")
         headers.setdefault("Accept", "application/json, text/event-stream")
+        # Attach session ID for all requests after initialize
+        session_id = conn.get("session_id")
+        if session_id:
+            headers["mcp-session-id"] = session_id
         body = json.dumps(request).encode("utf-8")
         req = urllib.request.Request(url, data=body, headers=headers, method="POST")
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
+                # Capture session ID from response headers (set during initialize)
+                new_session_id = resp.headers.get("mcp-session-id")
+                if new_session_id:
+                    conn["session_id"] = new_session_id
                 content_type = resp.headers.get("Content-Type", "")
-                raw = resp.read()
                 if "text/event-stream" in content_type:
-                    return self._parse_sse_response(raw)
-                return json.loads(raw.decode("utf-8"))
+                    return self._read_sse_stream(resp)
+                return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             raise RuntimeError(f"MCP HTTP error {exc.code}: {exc.reason}") from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"MCP connection error: {exc.reason}") from exc
 
-    def _parse_sse_response(self, raw: bytes) -> dict:
-        text = raw.decode("utf-8")
-        for line in text.split("\n"):
-            line = line.strip()
-            if line.startswith("data:"):
-                data_str = line[len("data:"):].strip()
-                if data_str and data_str != "[DONE]":
-                    try:
-                        return json.loads(data_str)
-                    except (json.JSONDecodeError, ValueError):
-                        continue
+    def _read_sse_stream(self, resp) -> dict:
+        """Read an SSE stream line-by-line and return the first JSON-RPC response.
+
+        Returns as soon as a ``data:`` line containing a JSON-RPC response
+        (with an ``id`` field) is found, without consuming the rest of the
+        stream.  This avoids blocking indefinitely on long-lived SSE connections
+        that servers keep open for server-initiated messages.
+        """
+        import io
+        # resp is a http.client.HTTPResponse; wrap in a text reader
+        reader = io.TextIOWrapper(resp, encoding="utf-8", errors="replace")
+        for raw_line in reader:
+            line = raw_line.strip()
+            if not line.startswith("data:"):
+                continue
+            data_str = line[len("data:"):].strip()
+            if not data_str or data_str == "[DONE]":
+                continue
+            try:
+                parsed = json.loads(data_str)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            # Skip notifications (no "id") — only return actual responses
+            if "id" in parsed or "error" in parsed:
+                return parsed
         raise RuntimeError("No valid JSON-RPC response found in SSE stream")
 
+    def _http_delete_session(self, conn: dict) -> None:
+        """Send DELETE to release the server-side session (Streamable HTTP spec)."""
+        url = conn["url"]
+        headers = dict(conn.get("headers") or {})
+        headers["mcp-session-id"] = conn["session_id"]
+        req = urllib.request.Request(url, headers=headers, method="DELETE")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                resp.read()
+        except (urllib.error.HTTPError, urllib.error.URLError):
+            pass  # best-effort; server may have already cleaned up
+
+    def _http_send_notification(self, conn: dict, method: str) -> None:
+        """Send a JSON-RPC notification (no id, expects 202 with empty body)."""
+        url = conn["url"]
+        headers = dict(conn.get("headers") or {})
+        headers.setdefault("Content-Type", "application/json")
+        session_id = conn.get("session_id")
+        if session_id:
+            headers["mcp-session-id"] = session_id
+        # Notifications have no "id" field per JSON-RPC spec
+        body = json.dumps({"jsonrpc": "2.0", "method": method}).encode("utf-8")
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                resp.read()  # drain; typically 202 with empty body
+        except (urllib.error.HTTPError, urllib.error.URLError):
+            pass  # notifications are fire-and-forget
+
     def _http_initialize(self, conn: dict) -> None:
+        # Ensure session_id starts empty so the first request has none
+        conn.setdefault("session_id", None)
         request = self._build_jsonrpc("initialize", {
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": "2025-03-26",
             "capabilities": {},
             "clientInfo": {"name": "runtime", "version": "1.0.0"},
         })
@@ -194,11 +257,8 @@ class MCPClientManager:
         if "error" in response:
             raise RuntimeError(f"MCP initialize failed: {response['error']}")
         conn["server_info"] = response.get("result", {})
-        notification = {"jsonrpc": "2.0", "method": "notifications/initialized"}
-        try:
-            self._http_send(conn, notification)
-        except RuntimeError:
-            pass
+        # notifications/initialized has no id — use dedicated notification sender
+        self._http_send_notification(conn, "notifications/initialized")
 
     # ------------------------------------------------------------------
     # Public API: connect
@@ -272,9 +332,10 @@ class MCPClientManager:
         url: str,
         headers: Optional[dict] = None,
     ) -> None:
-        """Connect to an MCP server via HTTP SSE / Streamable HTTP.
+        """Connect to an MCP server via Streamable HTTP (MCP 2025-03-26).
 
-        Performs the MCP initialize handshake immediately.
+        Performs the MCP initialize handshake immediately and captures the
+        session ID returned by the server for use in subsequent requests.
         If the server is already connected, this is a no-op.
         """
         if server_name in self._connections:
@@ -285,6 +346,7 @@ class MCPClientManager:
             "server_name": server_name,
             "url": url,
             "headers": headers,
+            "session_id": None,
             "connected": True,
             "server_info": {},
             "tools_cache": None,
@@ -362,6 +424,11 @@ class MCPClientManager:
             return
         if conn["type"] == "stdio":
             self._run_async(self._async_disconnect_stdio(conn))
+        elif conn["type"] == "url":
+            # Notify the server to release the session (Streamable HTTP spec)
+            session_id = conn.get("session_id")
+            if session_id and conn.get("connected"):
+                self._http_delete_session(conn)
         conn["connected"] = False
         conn["tools_cache"] = None
 
@@ -459,6 +526,7 @@ class MCPClientManager:
             "server_name": server_name,
             "url": url,
             "headers": headers,
+            "session_id": None,
             "connected": False,
             "server_info": {},
             "tools_cache": None,

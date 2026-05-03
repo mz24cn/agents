@@ -8,6 +8,10 @@ ToolRegistry.
 
 import inspect
 import re
+import base64
+import os
+import time
+
 from typing import Optional
 
 from runtime.models import ToolConfig
@@ -22,7 +26,6 @@ _TYPE_MAP: dict[type, str] = {
     list: "array",
     dict: "object",
 }
-
 
 
 def _parse_docstring(fn) -> tuple[str, dict[str, str]]:
@@ -173,3 +176,34 @@ def register_function_tool(registry: ToolRegistry, name: str = None, description
         registry.register(tool_config, callable_fn=fn)
         return fn
     return decorator
+
+
+def save_and_replace_base64(text: str, output_dir: str ="/tmp"):
+    # 1. 确保输出目录存在
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    # 2. 正则表达式：匹配 "key": "base64内容"
+    # 这里的 key 涵盖了 windows-mcp 和 chrome-devtools 常用的字段名
+    # {1000,} 确保只抓取长字符串，避免误伤普通的 JSON 字段
+    pattern = r'"(screenshot|data|image|base64)":\s*"([A-Za-z0-9+/]{100,}={0,2})"'
+
+    def replace_logic(match):
+        # match.group(1) 是原来的 key，group(2) 是 base64 内容
+        b64_content = match.group(2)
+        
+        # 生成唯一文件名
+        file_name = f"snap_{int(time.time()*1000)}.png"
+        file_path = os.path.abspath(os.path.join(output_dir, file_name))
+        
+        # 解码并写入文件
+        with open(file_path, "wb") as f:
+            f.write(base64.b64decode(b64_content))
+        
+        # 返回替换后的内容：将 key 换成 filePath，将内容换成路径
+        # 注意：Windows 路径需要处理斜杠，这里统一用正斜杠
+        safe_path = file_path.replace("\\", "/")
+        return f'"filePath": "{safe_path}"'
+
+    # 3. 执行全局替换
+    return re.sub(pattern, replace_logic, text)

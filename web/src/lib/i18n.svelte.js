@@ -250,7 +250,7 @@ const translations = {
     functionNameHint: 'py 文件中的函数名，注册时将从文件动态加载',
     skillDirPlaceholder: '例如: /home/user/skills/my_skill 或 ./skills/my_skill',
     skillDirHint: '文件夹内须包含 SKILL.md，名称和描述将从其 front-matter 自动读取',
-    mcpConfigHint: '支持一次配置多个 MCP server，工具将在首次调用时自动启动',
+    mcpConfigHint: '支持 stdio（command）和 HTTP（url）两种模式，可一次配置多个 MCP server，工具将在首次调用时自动启动',
 
     // ToolsPage
     toolsPageTitle: '工具管理',
@@ -511,7 +511,7 @@ const translations = {
     functionNameHint: 'Function name in the .py file, loaded dynamically on registration',
     skillDirPlaceholder: 'e.g. /home/user/skills/my_skill or ./skills/my_skill',
     skillDirHint: 'Directory must contain SKILL.md; name and description are read from its front-matter',
-    mcpConfigHint: 'Multiple MCP servers can be configured at once; tools start automatically on first call',
+    mcpConfigHint: 'Supports stdio (command) and HTTP (url) modes; multiple servers can be configured at once and tools start automatically on first call',
 
     // ToolsPage
     toolsPageTitle: 'Tools',

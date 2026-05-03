@@ -267,7 +267,6 @@
   .tool-result-block {
     margin-top: 4px;
     cursor: pointer;
-    user-select: none;
   }
   .tool-result-code {
     position: relative;

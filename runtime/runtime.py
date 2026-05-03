@@ -391,7 +391,15 @@ class Runtime:
         if tool_config.tool_type == "function":
             return self._execute_function_tool(tool_config, arguments)
         elif tool_config.tool_type == "mcp":
-            return self._execute_mcp_tool(tool_config, arguments)
+            result_str = self._execute_mcp_tool(tool_config, arguments)
+
+            # --- Base64 image interception (inference loop only) ---
+            # Long base64 payloads (e.g. screenshots from windows-mcp / chrome-devtools)
+            # are harmful to the model context. Replace them with saved file paths.
+            if len(result_str) > int(os.environ.get("BASE64_CHECK_THRESHOLD", "65536")):
+                from runtime.tools import save_and_replace_base64
+                result_str = save_and_replace_base64(result_str)
+            return result_str
         elif tool_config.tool_type == "skill":
             return f"Error: skill '{tool_name}' should be triggered via progressive disclosure, not direct execution"
         else:

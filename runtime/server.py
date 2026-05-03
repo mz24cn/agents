@@ -225,24 +225,6 @@ _PROMPT_TEMPLATES_PATH = os.path.join(_DATA_DIR, "prompt_templates.json")
 _ENV_PATH = os.path.join(_DATA_DIR, "env.json")
 
 
-def _load_env_overrides() -> None:
-    """Load environment variable overrides from _DATA_DIR/env.json if it exists.
-
-    The file should be a flat JSON object mapping string keys to string values.
-    Loaded values overwrite the corresponding entries in os.environ.
-    """
-    if not os.path.isfile(_ENV_PATH):
-        return
-    try:
-        with open(_ENV_PATH, "r", encoding="utf-8") as f:
-            env_map = json.load(f)
-        if isinstance(env_map, dict):
-            for k, v in env_map.items():
-                os.environ[str(k)] = str(v)
-    except Exception:
-        pass  # silently ignore malformed / unreadable env.json
-
-
 class _RuntimeRequestHandler(BaseHTTPRequestHandler):
     """HTTP request handler that routes requests to the Runtime instance.
 
@@ -571,13 +553,9 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 rows.append((", ".join(names), server_name))
 
             if rows:
-                max_name = max(len(r[0]) for r in rows)
-                max_desc = max(len(r[1]) for r in rows)
-                header = f"| {'Tool(s)'.ljust(max_name)} | {'Description'.ljust(max_desc)} |"
-                sep = f"| {'-' * max_name} | {'-' * max_desc} |"
-                lines = [header, sep]
+                lines = ["| Tool(s) | Description |", "| --- | --- |"]
                 for name, desc in rows:
-                    lines.append(f"| {name.ljust(max_name)} | {desc.ljust(max_desc)} |")
+                    lines.append(f"| {name} | {desc} |")
                 tools_markdown = "\n".join(lines)
             else:
                 tools_markdown = ""
@@ -1453,7 +1431,10 @@ class RuntimeHTTPServer:
             chats_dir: Base directory for session storage. Defaults to
                 ``~/.agents_runtime/chat_data`` (alongside other config files).
         """
-        _load_env_overrides()
+        # Initialize EnvManager
+        self._env_manager = EnvManager(env_path=_ENV_PATH)
+        self._env_manager._sync_to_environ(self._env_manager.read())
+
         # Configure logging if not already configured
         if not logging.root.handlers:
             logging.basicConfig(
@@ -1513,8 +1494,7 @@ class RuntimeHTTPServer:
             infer_fn=self._runtime.infer,
             chats_dir=chats_dir if chats_dir is not None else os.path.join(_DATA_DIR, "chat_data"),
         )
-        # Initialize EnvManager and SessionManager
-        self._env_manager = EnvManager(env_path=_ENV_PATH)
+        # Initialize SessionManager
         self._session_manager = SessionManager(
             chats_dir=chats_dir if chats_dir is not None else os.path.join(_DATA_DIR, "chat_data"),
             infer_fn=self._runtime.infer,
