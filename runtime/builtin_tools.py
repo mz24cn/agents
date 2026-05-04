@@ -1364,7 +1364,9 @@ SEARCH_CODE_TOOL_CONFIG = ToolConfig(
         "Search the workspace codebase for a regex pattern. "
         "Returns structured results with file, line, column, and context. "
         "Uses ripgrep if available, falls back to grep. "
-        "Automatically excludes .git, node_modules, and dist directories."
+        "Automatically excludes .git, node_modules, and dist directories. "
+        "Supports | in query for regex alternation (OR). "
+        "Multiple include/exclude patterns can be separated by |."
     ),
     parameters={
         "type": "object",
