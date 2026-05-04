@@ -1287,17 +1287,17 @@ def _search_code(query: str, include: Optional[str] = None, exclude: Optional[st
 
     # Fall back to grep
     if shutil.which("grep") is not None:
-        cmd = ["grep", "-r", "-n", "--include=*"]
-        # Add include pattern
-        if include:
-            cmd = ["grep", "-r", "-n", f"--include={include}"]
-        else:
-            cmd = ["grep", "-r", "-n"]
-        # Add exclude patterns
+        cmd = ["grep", "-r", "-n"]
         for excl in default_excludes:
             cmd += [f"--exclude-dir={excl}"]
+        # Add user-specified include patterns (support | as OR)
+        if include:
+            for pat in _split_patterns(include):
+                cmd += [f"--include={pat}"]
+        # Add user-specified exclude patterns (support | as OR)
         if exclude:
-            cmd += [f"--exclude={exclude}"]
+            for pat in _split_patterns(exclude):
+                cmd += [f"--exclude={pat}"]
         # Add the query and search path
         cmd += ["-E", query, "."]
 
