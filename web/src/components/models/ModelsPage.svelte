@@ -1,14 +1,13 @@
 <script>
   import { models } from '../../lib/api.js'
-  import ModelForm from './ModelForm.svelte'
   import ConfirmDialog from '../ConfirmDialog.svelte'
   import { t } from '../../lib/i18n.svelte.js'
+
+  let { onEdit = null } = $props()
 
   let modelList = $state([])
   let loading = $state(true)
   let error = $state('')
-  let showForm = $state(false)
-  let editingModel = $state(null)
   let deleteTarget = $state(null)
 
   async function fetchModels() {
@@ -24,17 +23,11 @@
     }
   }
 
-  function handleCreate() { editingModel = null; showForm = true }
-  function handleEdit(model) { editingModel = model; showForm = true }
-  function handleCopy(model) {
-    // 复制模型配置，清空 model_id 让用户填写新的
-    const copied = { ...model, model_id: '' }
-    editingModel = copied
-    showForm = true
-  }
-  function handleFormSuccess() { showForm = false; editingModel = null; fetchModels() }
-  function handleFormCancel() { showForm = false; editingModel = null }
   function handleDeleteClick(model) { deleteTarget = model }
+
+  function handleEditClick(model) {
+    if (onEdit) onEdit(model)
+  }
 
   async function handleDeleteConfirm() {
     if (!deleteTarget) return
@@ -54,22 +47,11 @@
 </script>
 
 <div class="models-page">
-  <div class="page-header">
-    <h2>{t('modelsPageTitle')}</h2>
-    {#if !showForm}
-      <button class="btn btn-primary" onclick={handleCreate}>{t('registerModel')}</button>
-    {/if}
-  </div>
-
   {#if error}
     <div class="error-msg">{error}</div>
   {/if}
 
   <div class="page-content">
-    {#if showForm}
-      <ModelForm model={editingModel} onSuccess={handleFormSuccess} onCancel={handleFormCancel} />
-    {/if}
-
     {#if loading}
       <div class="loading">{t('loading')}</div>
     {:else if modelList.length === 0 && !error}
@@ -96,8 +78,7 @@
                 <td>{m.model_type}</td>
                 <td>{m.api_protocol}</td>
                 <td class="actions">
-                  <button class="btn btn-sm" onclick={() => handleEdit(m)}>{t('edit')}</button>
-                  <button class="btn btn-sm btn-secondary" onclick={() => handleCopy(m)}>{t('copyModel')}</button>
+                  <button class="btn btn-sm" onclick={() => handleEditClick(m)}>{t('edit')}</button>
                   <button class="btn btn-sm btn-danger" onclick={() => handleDeleteClick(m)}>{t('delete')}</button>
                 </td>
               </tr>
@@ -118,35 +99,18 @@
 
 <style>
   .models-page {
+    height: 100%;
     display: flex;
     flex-direction: column;
-    height: 100vh;
-    overflow: hidden;
   }
-  .page-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 20px;
-    flex-shrink: 0;
-    border-bottom: 1px solid var(--border);
-    background: var(--bg);
-  }
-  h2 { margin: 0; color: var(--text); }
-  .btn { padding: 8px 18px; border-radius: 6px; border: none; cursor: pointer; font-size: 0.9rem; }
-  .btn-primary { background: var(--primary); color: #fff; }
-  .btn-primary:hover { background: var(--primary-hover); }
   .btn-sm { padding: 4px 12px; font-size: 0.85rem; background: var(--bg-secondary); color: var(--text); border: 1px solid var(--border); border-radius: 4px; }
   .btn-sm:hover { opacity: 0.8; }
-  .btn-secondary { background: var(--bg-secondary); color: var(--text); border: 1px solid var(--border); }
-  .btn-secondary:hover { background: var(--primary); color: #fff; border-color: var(--primary); }
   .btn-danger { background: var(--danger); color: #fff; border: none; }
   .btn-danger:hover { background: var(--danger-hover); }
-  .error-msg { background: var(--danger); color: #fff; padding: 10px 14px; border-radius: 6px; margin: 0 20px; font-size: 0.9rem; flex-shrink: 0; }
+  .error-msg { background: var(--danger); color: #fff; padding: 10px 14px; border-radius: 6px; margin: 0 20px; font-size: 0.9rem; }
   .page-content {
     flex: 1;
     overflow-y: auto;
-    min-height: 0;
     padding: 20px;
   }
   .loading, .empty { text-align: center; padding: 40px 0; color: var(--text-secondary); font-size: 1rem; }

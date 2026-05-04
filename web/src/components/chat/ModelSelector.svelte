@@ -34,7 +34,6 @@
 </script>
 
 <div class="model-selector">
-  <label for="model-select">{t('modelLabel')}</label>
   {#if loading}
     <span class="hint">{t('loading')}</span>
   {:else if error}
@@ -54,7 +53,6 @@
 
 <style>
   .model-selector { display: flex; align-items: center; gap: 8px; }
-  label { font-size: 0.85rem; font-weight: 600; color: var(--text-secondary); white-space: nowrap; }
   select {
     padding: 6px 10px;
     border-radius: 6px;

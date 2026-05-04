@@ -15,6 +15,7 @@
   let systemPrompt = $state(_init.system_prompt ?? '')
   let myselfView = $state(_init.myself_view ?? '')
   let description = $state(_init.description ?? '')
+  let avatar = $state(_init.avatar ?? '')
 
   let modelList = $state([])
   let templateList = $state([])
@@ -70,6 +71,7 @@
       system_prompt: systemPrompt.trim(),
       myself_view: myselfView.trim(),
       description: description.trim(),
+      avatar: avatar.trim(),
     }
     try {
       if (isEdit) await agents.update(agent.agent_id, payload)
@@ -144,6 +146,11 @@
   <div class="form-group">
     <label for="agent_desc">{t('agentDescription')}</label>
     <textarea id="agent_desc" bind:value={description} rows="2" placeholder={t('agentDescriptionPlaceholder')}></textarea>
+  </div>
+
+  <div class="form-group">
+    <label for="agent_avatar">{t('agentAvatar')}</label>
+    <input id="agent_avatar" type="text" bind:value={avatar} placeholder={t('agentAvatarPlaceholder')} />
   </div>
 
   <div class="form-actions">

@@ -312,7 +312,7 @@ class Runtime:
                     arguments = {}
 
                 # Execute tool and get result
-                tool_result = self._execute_tool_call(tool_name, arguments, tool_scope=tools)
+                tool_result, tool_config = self._execute_tool_call(tool_name, arguments, tool_scope=tools)
 
                 # Add tool result as tool role message
                 messages.append(
@@ -320,6 +320,7 @@ class Runtime:
                         role="tool",
                         content=tool_result,
                         name=tool_name,
+                        tool_id=tool_config.tool_id if tool_config else None,
                     )
                 )
 
@@ -365,7 +366,7 @@ class Runtime:
 
     def _execute_tool_call(
         self, tool_name: str, arguments: dict, tool_scope: Optional[list] = None
-    ) -> str:
+    ) -> tuple[str, Optional[ToolConfig]]:
         """Execute a tool call by name.
 
         Looks up the tool within tool_scope first (the set of tools sent in the
@@ -381,15 +382,15 @@ class Runtime:
                 restricted to this set before falling back to the registry.
 
         Returns:
-            The tool result as a string, or an error message string.
+            A tuple of (result_str, tool_config). tool_config is None if tool not found.
         """
         tool_config = self._find_tool_by_name(tool_name, scope=tool_scope)
 
         if tool_config is None:
-            return f"Error: tool '{tool_name}' not found in registry"
+            return f"Error: tool '{tool_name}' not found in registry", None
 
         if tool_config.tool_type == "function":
-            return self._execute_function_tool(tool_config, arguments)
+            return self._execute_function_tool(tool_config, arguments), tool_config
         elif tool_config.tool_type == "mcp":
             result_str = self._execute_mcp_tool(tool_config, arguments)
 
@@ -399,11 +400,11 @@ class Runtime:
             if len(result_str) > int(os.environ.get("BASE64_CHECK_THRESHOLD", "65536")):
                 from runtime.tools import save_and_replace_base64
                 result_str = save_and_replace_base64(result_str)
-            return result_str
+            return result_str, tool_config
         elif tool_config.tool_type == "skill":
-            return f"Error: skill '{tool_name}' should be triggered via progressive disclosure, not direct execution"
+            return f"Error: skill '{tool_name}' should be triggered via progressive disclosure, not direct execution", tool_config
         else:
-            return f"Error: unsupported tool_type '{tool_config.tool_type}' for tool '{tool_name}'"
+            return f"Error: unsupported tool_type '{tool_config.tool_type}' for tool '{tool_name}'", tool_config
 
     def _find_tool_by_name(
         self, tool_name: str, scope: Optional[list] = None
@@ -954,9 +955,9 @@ class Runtime:
                 except (json.JSONDecodeError, ValueError):
                     arguments = {}
 
-                tool_result = self._execute_tool_call(tool_name, arguments, tool_scope=tools)
+                tool_result, tool_config = self._execute_tool_call(tool_name, arguments, tool_scope=tools)
 
-                tool_msg = Message(role="tool", content=tool_result, name=tool_name)
+                tool_msg = Message(role="tool", content=tool_result, name=tool_name, tool_id=tool_config.tool_id if tool_config else None)
                 messages.append(tool_msg)
                 yield tool_msg
 

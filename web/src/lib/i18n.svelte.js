@@ -12,11 +12,12 @@ const translations = {
     openMenu: '打开菜单',
 
     // Sidebar
-    nav_chat: '对话',
+    nav_chat: '💬 对话',
     nav_models: '模型管理',
     nav_tools: '工具管理',
     nav_prompts: '提示词管理',
     nav_agents: '智能体管理',
+    nav_setup: '设置',
 
     // ThemeToggle
     toggleTheme: '切换主题',
@@ -27,6 +28,11 @@ const translations = {
 
     // Common
     loading: '加载中...',
+    models: '模型',
+    tools: '工具',
+    prompts: '提示词',
+    agents: '智能体',
+    addNew: '新增',
     edit: '编辑',
     delete: '删除',
     save: '保存',
@@ -91,6 +97,8 @@ const translations = {
     agentMyselfViewPlaceholder: '简短的自我表达',
     agentDescription: '描述',
     agentDescriptionPlaceholder: '客观记录，长期记忆',
+    agentAvatar: '头像',
+    agentAvatarPlaceholder: '输入头像 URL 或 emoji',
 
     // CopyButton / MarkdownRenderer
     copy: '复制',
@@ -108,7 +116,7 @@ const translations = {
     // MessageBubble
     roleUser: '👤 用户',
     roleAssistant: '🤖 助手',
-    roleSystem: '⚙️ 系统',
+    roleSystem: '📜 系统',
     roleFunction: '🔧 工具结果',
     collapseResult: '▾ 收起结果',
     expandResult: '▸ 展开结果',
@@ -217,7 +225,7 @@ const translations = {
     confirmDeleteTemplate: '确定要删除模板「{id}」吗？',
 
     // SessionPanel
-    sessionPanelTitle: '历史会话',
+    sessionPanelTitle: '📚 历史会话',
     noSessions: '暂无历史会话',
     fetchSessionsFailed: '获取会话列表失败',
     restoreSessionFailed: '恢复会话失败',
@@ -305,11 +313,12 @@ const translations = {
     openMenu: 'Open menu',
 
     // Sidebar
-    nav_chat: 'Chat',
+    nav_chat: '💬 Chat',
     nav_models: 'Models',
     nav_tools: 'Tools',
     nav_prompts: 'Prompts',
     nav_agents: 'Agents',
+    nav_setup: 'Settings',
 
     // ThemeToggle
     toggleTheme: 'Toggle theme',
@@ -320,6 +329,11 @@ const translations = {
 
     // Common
     loading: 'Loading...',
+    models: 'Models',
+    tools: 'Tools',
+    prompts: 'Prompts',
+    agents: 'Agents',
+    addNew: 'Add',
     edit: 'Edit',
     delete: 'Delete',
     save: 'Save',
@@ -384,6 +398,8 @@ const translations = {
     agentMyselfViewPlaceholder: 'Brief self-expression',
     agentDescription: 'Description',
     agentDescriptionPlaceholder: 'Objective record, long-term memory',
+    agentAvatar: 'Avatar',
+    agentAvatarPlaceholder: 'Enter avatar URL or emoji',
 
     // CopyButton / MarkdownRenderer
     copy: 'Copy',
@@ -401,7 +417,7 @@ const translations = {
     // MessageBubble
     roleUser: '👤 User',
     roleAssistant: '🤖 Assistant',
-    roleSystem: '⚙️ System',
+    roleSystem: '📜 System',
     roleFunction: '🔧 Tool result',
     collapseResult: '▾ Collapse',
     expandResult: '▸ Expand',
@@ -510,7 +526,7 @@ const translations = {
     confirmDeleteTemplate: 'Delete template "{id}"?',
 
     // SessionPanel
-    sessionPanelTitle: 'History',
+    sessionPanelTitle: '📚 History',
     noSessions: 'No sessions yet',
     fetchSessionsFailed: 'Failed to fetch sessions',
     restoreSessionFailed: 'Failed to restore session',

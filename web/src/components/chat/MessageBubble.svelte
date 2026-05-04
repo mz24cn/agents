@@ -40,7 +40,12 @@
     return { html: null, lang: null }
   }
 
-  let { msg } = $props()
+  let { msg, agentList = [] } = $props()
+
+  // 获取智能体信息
+  const matchedAgent = $derived(msg.assistant_id ? agentList.find(a => a.agent_id === msg.assistant_id) : null)
+  const agentNickname = $derived(matchedAgent?.nickname)
+  const displayName = $derived(agentNickname || msg.name || t('roleAssistant'))
 
   function buildStatTooltip(s) {
     const fmtTokens = (n) => n >= 10000 ? `${(n / 1000).toFixed(1)}k` : `${n}`
@@ -83,7 +88,18 @@
       <span>{t('roleUser')}</span>
       <CopyButton getText={() => msg.content ?? ''} />
     {:else if msg.role === 'assistant'}
-      <span>{msg.agent_nickname || t('roleAssistant')}</span>
+      {#if matchedAgent}
+        {#if matchedAgent.avatar}
+          {#if matchedAgent.avatar.startsWith('data:') || matchedAgent.avatar.startsWith('http') || matchedAgent.avatar.startsWith('//')}
+            <img src={matchedAgent.avatar} class="agent-avatar" alt="" />
+          {:else}
+            <span>{matchedAgent.avatar}</span>
+          {/if}
+        {:else}
+          <span>🤖</span>
+        {/if}
+      {/if}
+      <span>{displayName}</span>
       <div class="role-actions">
         {#if msg.stat}
           <span class="token-stats" title={buildStatTooltip(msg.stat)}>
@@ -206,11 +222,18 @@
   .role-label {
     display: flex;
     align-items: center;
+    gap: 4px;
     justify-content: space-between;
     font-size: 0.75rem;
     font-weight: 600;
     margin-bottom: 4px;
     opacity: 0.8;
+  }
+  .agent-avatar {
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    object-fit: cover;
   }
   .role-actions {
     display: flex;

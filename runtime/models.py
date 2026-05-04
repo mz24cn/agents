@@ -20,6 +20,8 @@ class Message:
         images: Optional list of base64-encoded image strings (multimodal).
         audio: Optional base64-encoded audio string (multimodal).
         thinking: Optional thinking/reasoning content from the model.
+        tool_id: Optional tool_id (used for tool role messages, records the tool_id of the tool that produced this result).
+        assistant_id: Optional assistant_id (used for assistant role messages, records the agent_id of the agent that sent this message).
     """
 
     role: str
@@ -31,6 +33,8 @@ class Message:
     thinking: Optional[str] = None
     prompt_template: Optional[str] = None
     arguments: Optional[dict] = None
+    tool_id: Optional[str] = None
+    assistant_id: Optional[str] = None
 
     def to_dict(self) -> dict:
         """Serialize to a dictionary, omitting None fields."""
@@ -49,6 +53,10 @@ class Message:
             d["prompt_template"] = self.prompt_template
         if self.arguments is not None:
             d["arguments"] = self.arguments
+        if self.tool_id is not None:
+            d["tool_id"] = self.tool_id
+        if self.assistant_id is not None:
+            d["assistant_id"] = self.assistant_id
         return d
 
     @classmethod
@@ -64,6 +72,8 @@ class Message:
             thinking=data.get("thinking"),
             prompt_template=data.get("prompt_template"),
             arguments=data.get("arguments"),
+            tool_id=data.get("tool_id"),
+            assistant_id=data.get("assistant_id"),
         )
 
 

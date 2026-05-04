@@ -8,10 +8,6 @@
 
   const navItems = [
     { hash: '#/chat', key: 'nav_chat' },
-    { hash: '#/models', key: 'nav_models' },
-    { hash: '#/tools', key: 'nav_tools' },
-    { hash: '#/prompts', key: 'nav_prompts' },
-    { hash: '#/agents', key: 'nav_agents' },
   ]
 
   let sessionList = $state([])
@@ -48,18 +44,8 @@
     restoreError = ''
     try {
       const data = await sessions.get(sessionId)
-      const msgs = (data.messages ?? []).map(m => {
-        const msg = { role: m.role, content: m.content }
-        if (m.thinking != null) msg.thinking = m.thinking
-        if (m.tool_calls != null) msg.tool_calls = m.tool_calls
-        if (m.name != null) msg.name = m.name
-        if (m.stat != null) msg.stat = m.stat
-        if (m.images != null) msg.images = m.images
-        if (m.audio != null) msg.audio = m.audio
-        if (m.prompt_template != null) msg.prompt_template = m.prompt_template
-        if (m.arguments != null) msg.arguments = m.arguments
-        return msg
-      })
+      // 直接展开所有字段，保持与后端数据一致
+      const msgs = (data.messages ?? []).map(m => ({ ...m }))
       sessionRestore.pending = { sessionId, messages: msgs }
       // 恢复会话后跳转到对话页
       router.current = '#/chat'
@@ -305,11 +291,11 @@
       title={i18n.lang === 'zh' ? 'Switch to English' : '切换为中文'}
     >{i18n.lang === 'zh' ? '中' : 'En'}</button>
     <a
-      href="#/env"
+      href="#/setup"
       class="env-btn"
-      class:active={router.current === '#/env'}
-      title={t('nav_env')}
-    >Env</a>
+      class:active={router.current === '#/setup'}
+      title={t('nav_setup')}
+    >⚙️</a>
   </div>
 </aside>
 
@@ -357,7 +343,7 @@
   }
   .nav-item {
     display: block;
-    padding: 12px 20px;
+    padding: 12px 0 12px 10px;
     color: var(--text-secondary);
     text-decoration: none;
     font-size: 0.95rem;
@@ -469,7 +455,7 @@
     flex-direction: column;
   }
   .session-panel-title {
-    padding: 6px 20px 4px;
+    padding: 6px 0 4px 10px;
     font-size: 0.78rem;
     font-weight: 600;
     color: var(--text-secondary);
@@ -488,11 +474,12 @@
     position: relative;
     display: flex;
     align-items: center;
+    overflow: hidden;
   }
   .session-item {
     flex: 1;
     min-width: 0;
-    padding: 7px 4px 7px 20px;
+    padding: 7px 6px 7px 10px;
     text-align: left;
     background: none;
     border: none;
@@ -509,10 +496,10 @@
     color: var(--text);
   }
   .session-menu-btn {
-    flex-shrink: 0;
+    position: absolute;
+    right: 6px;
     width: 26px;
     height: 26px;
-    margin-right: 6px;
     padding: 0;
     background: none;
     border: none;
@@ -575,7 +562,7 @@
     flex-shrink: 0;
   }
   .session-loading, .session-empty, .session-error {
-    padding: 6px 20px;
+    padding: 6px 0 6px 10px;
     font-size: 0.82rem;
     color: var(--text-secondary);
   }

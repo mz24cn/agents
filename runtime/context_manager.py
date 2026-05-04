@@ -25,8 +25,16 @@ class ConversationTurn:
         role: Message role — "user", "assistant", or "tool".
         content: Text content of the turn.
         timestamp: ISO 8601 timestamp string (e.g. "2026-04-15T14:30:22").
-        name: Optional tool/function name (used for tool-role turns).
+        name: Optional tool/function name (used for tool-role turns), or agent nickname for assistant-role turns.
         tool_calls: Optional list of tool call dicts for parallel tool calls.
+        thinking: Optional thinking/reasoning content from the model.
+        stat: Optional dict of token and timing statistics.
+        images: Optional list of base64-encoded image strings (multimodal).
+        audio: Optional base64-encoded audio string (multimodal).
+        prompt_template: Optional prompt template ID for this turn.
+        arguments: Optional dict of template arguments for this turn.
+        assistant_id: Optional agent_id for assistant-role turns, identifying which agent sent this message.
+        tool_id: Optional tool_id for tool-role turns, identifying which tool produced this result.
     """
 
     role: str
@@ -40,6 +48,8 @@ class ConversationTurn:
     audio: Optional[str] = None
     prompt_template: Optional[str] = None
     arguments: Optional[dict] = None
+    assistant_id: Optional[str] = None
+    tool_id: Optional[str] = None
 
 
 @dataclass
@@ -788,6 +798,8 @@ class ContextManager:
                 audio=msg.get("audio"),
                 prompt_template=msg.get("prompt_template"),
                 arguments=msg.get("arguments"),
+                assistant_id=msg.get("assistant_id"),
+                tool_id=msg.get("tool_id"),
             ))
         return turns
 

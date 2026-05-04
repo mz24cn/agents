@@ -1,5 +1,5 @@
 <script>
-  import { router } from './lib/router.svelte.js'
+  import { router, parseRoute } from './lib/router.svelte.js'
   import Layout from './components/Layout.svelte'
   import ChatPage from './components/chat/ChatPage.svelte'
   import ModelsPage from './components/models/ModelsPage.svelte'
@@ -7,21 +7,26 @@
   import PromptsPage from './components/prompts/PromptsPage.svelte'
   import AgentsPage from './components/agents/AgentsPage.svelte'
   import EnvPage from './components/env/EnvPage.svelte'
+  import SetupPage from './components/setup/SetupPage.svelte'
+
+  let currentPath = $derived(parseRoute().path)
 </script>
 
 <Layout>
-  {#if router.current === '#/chat'}
+  {#if currentPath === '#/chat'}
     <ChatPage />
-  {:else if router.current === '#/models'}
+  {:else if currentPath === '#/models'}
     <ModelsPage />
-  {:else if router.current === '#/tools'}
+  {:else if currentPath === '#/tools'}
     <ToolsPage />
-  {:else if router.current === '#/prompts'}
+  {:else if currentPath === '#/prompts'}
     <PromptsPage />
-  {:else if router.current === '#/agents'}
+  {:else if currentPath === '#/agents'}
     <AgentsPage />
-  {:else if router.current === '#/env'}
+  {:else if currentPath === '#/env'}
     <EnvPage />
+  {:else if currentPath === '#/setup'}
+    <SetupPage />
   {:else}
     <ChatPage />
   {/if}

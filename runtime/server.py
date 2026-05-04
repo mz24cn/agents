@@ -112,6 +112,7 @@ def merge_stream_messages(stream_messages: list) -> tuple[list, Optional[dict]]:
                 content=m.content or "",
                 timestamp=ts,
                 name=m.name or "",
+                tool_id=getattr(m, "tool_id", None),
             ))
         # skip system deltas
 
@@ -129,6 +130,8 @@ def persist_conversation(
     session_manager=None,
     tool_ids: Optional[list] = None,
     extra_meta: Optional[dict] = None,
+    agent_id: Optional[str] = None,
+    agent_nickname: Optional[str] = None,
 ) -> Optional[Exception]:
     """将一次推理的消息持久化到会话存储。
 
@@ -145,6 +148,8 @@ def persist_conversation(
         tool_ids: 可选的工具 ID 列表，记录到会话 meta 中，便于回溯。
         extra_meta: 可选的额外 meta 字段（如 parent_session_id），与 tool_ids
             一并通过 save_conversation 的 extra_meta 参数一次写入。
+        agent_id: 可选的 agent ID，用于标记 role=assistant 的消息的 assistant_id。
+        agent_nickname: 可选的 agent nickname，用于标记 role=assistant 的消息的 name 字段。
 
     Returns:
         成功时返回 None；失败时返回捕获的异常（OSError 或其他）。
@@ -167,8 +172,17 @@ def persist_conversation(
                 audio=getattr(m, "audio", None) or None,
                 prompt_template=getattr(m, "prompt_template", None) or None,
                 arguments=getattr(m, "arguments", None) or None,
+                name=getattr(m, "name", None),
+                tool_id=getattr(m, "tool_id", None),
             ))
         merged_turns, last_stat = merge_stream_messages(collected_messages)
+        # 如果有 agent_id，为所有 role=assistant 的消息设置 name（nickname）和 assistant_id 字段
+        if agent_id:
+            for turn in merged_turns:
+                if turn.role == "assistant":
+                    if agent_nickname:
+                        turn.name = agent_nickname
+                    turn.assistant_id = agent_id
         new_turns.extend(merged_turns)
         last_total_tokens = (
             (last_stat.get("prompt_tokens", 0) + last_stat.get("completion_tokens", 0))
@@ -635,7 +649,8 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         _thread_local.context_manager = context_manager
         _thread_local.session_manager = self.server.session_manager  # type: ignore[attr-defined]
 
-        return body, request, session_id, use_session, original_messages, context_manager
+        agent_nickname = agent.get("nickname") if agent else None
+        return body, request, session_id, use_session, original_messages, context_manager, agent_id, agent_nickname
 
     def _cleanup_thread_local(self):
         from runtime.builtin_tools import _thread_local
@@ -647,7 +662,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         _thread_local.context_manager = None
         _thread_local.session_manager = None
 
-    def _persist_conversation(self, context_manager, session_id, original_messages, collected_messages):
+    def _persist_conversation(self, context_manager, session_id, original_messages, collected_messages, agent_id=None, agent_nickname=None):
         if session_id is None:
             return None
         exc = persist_conversation(
@@ -656,6 +671,8 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             original_messages=original_messages,
             collected_messages=collected_messages,
             session_manager=self.server.session_manager,  # type: ignore[attr-defined]
+            agent_id=agent_id,
+            agent_nickname=agent_nickname,
         )
         return exc
 
@@ -670,7 +687,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         result = self._prepare_infer_request()
         if result is None:
             return
-        _body, request, session_id, use_session, original_messages, context_manager = result
+        _body, request, session_id, use_session, original_messages, context_manager, agent_id, agent_nickname = result
 
         try:
             runtime = self._get_runtime()
@@ -685,8 +702,15 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 self._send_json_error(500, f"Inference failed: {exc}")
                 return
 
+            if agent_id:
+                for msg in collected_messages:
+                    if msg.role == "assistant":
+                        msg.assistant_id = agent_id
+                        if agent_nickname:
+                            msg.name = agent_nickname
+
             if use_session:
-                persist_exc = self._persist_conversation(context_manager, session_id, original_messages, collected_messages)
+                persist_exc = self._persist_conversation(context_manager, session_id, original_messages, collected_messages, agent_id, agent_nickname)
                 if persist_exc is not None:
                     self._send_json_error(500, f"Failed to save conversation: {persist_exc}")
                     return
@@ -734,7 +758,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         result = self._prepare_infer_request()
         if result is None:
             return
-        _body, request, session_id, use_session, original_messages, context_manager = result
+        _body, request, session_id, use_session, original_messages, context_manager, agent_id, agent_nickname = result
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -769,6 +793,10 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         try:
             for msg in runtime.infer_stream(request, cancel_event=cancel_event):
                 collected_messages.append(msg)
+                if msg.role == "assistant" and agent_id:
+                    msg.assistant_id = agent_id
+                    if agent_nickname:
+                        msg.name = agent_nickname
                 # delegate 工具通过 sse_callback 自行管理流式帧和结束帧，跳过 infer_stream 的重复输出
                 if msg.role == "tool" and msg.name == "delegate":
                     continue
@@ -787,20 +815,20 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self.wfile.flush()
 
             if use_session:
-                persist_exc = self._persist_conversation(context_manager, session_id, original_messages, collected_messages)
+                persist_exc = self._persist_conversation(context_manager, session_id, original_messages, collected_messages, agent_id, agent_nickname)
                 if persist_exc is not None:
                     logger.error("infer_stream: failed to save conversation for session %s: %s", session_id, persist_exc)
         except (BrokenPipeError, ConnectionResetError):
             cancel_event.set()
             if use_session:
                 collected_messages.append(Message(role="assistant", content="\n\nError: interrupted"))
-                persist_exc = self._persist_conversation(context_manager, session_id, original_messages, collected_messages)
+                persist_exc = self._persist_conversation(context_manager, session_id, original_messages, collected_messages, agent_id, agent_nickname)
                 if persist_exc is not None:
                     logger.error("infer_stream: failed to save aborted conversation for session %s: %s", session_id, persist_exc)
         except Exception as exc:
             if use_session:
                 collected_messages.append(Message(role="assistant", content=f"\n\nError: interrupted ({exc})"))
-                persist_exc = self._persist_conversation(context_manager, session_id, original_messages, collected_messages)
+                persist_exc = self._persist_conversation(context_manager, session_id, original_messages, collected_messages, agent_id, agent_nickname)
                 if persist_exc is not None:
                     logger.error("infer_stream: failed to save aborted conversation for session %s: %s", session_id, persist_exc)
             try:

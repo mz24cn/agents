@@ -7,7 +7,7 @@
 
   const _init = tool ?? {}
   const isEdit = tool !== null
-  const isMcpEdit = mcpServer !== null
+  const isMcpEdit = mcpServer !== null || (_init.mcpServerConfig !== undefined && _init.mcpServerConfig !== null)
 
   let tool_type = $state(isMcpEdit ? 'mcp' : (_init.tool_type ?? 'function'))
   let name = $state(_init.name ?? '')
@@ -26,7 +26,7 @@
     }
   }, null, 2)
 
-  let mcp_config_text = $state(isMcpEdit ? JSON.stringify(mcpServer.config, null, 2) : '')
+  let mcp_config_text = $state(isMcpEdit ? JSON.stringify(mcpServer?.config ?? _init.mcpServerConfig ?? {}, null, 2) : '')
 
   let errors = $state({})
   let submitError = $state('')
@@ -71,7 +71,8 @@
     try {
       if (tool_type === 'mcp') {
         const config = JSON.parse(mcp_config_text)
-        if (isMcpEdit) await mcpServers.delete(mcpServer.serverName)
+        const serverName = mcpServer?.serverName ?? _init.mcpServerName
+        if (isMcpEdit && serverName) await mcpServers.delete(serverName)
         await tools.createMcp(config)
       } else if (tool_type === 'skill') {
         await tools.createSkill(skill_dir.trim())

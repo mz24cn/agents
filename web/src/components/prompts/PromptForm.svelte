@@ -57,7 +57,7 @@
 
   <div class="form-group">
     <label for="tpl_content">{t('templateContent')} <span class="required">{t('required')}</span></label>
-    <textarea id="tpl_content" bind:value={content} rows="8" placeholder={t('templateContentPlaceholder')}></textarea>
+    <textarea id="tpl_content" bind:value={content} rows="24" placeholder={t('templateContentPlaceholder')}></textarea>
     {#if errors.content}<span class="field-error">{errors.content}</span>{/if}
   </div>
 

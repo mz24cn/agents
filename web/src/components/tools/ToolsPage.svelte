@@ -1,15 +1,14 @@
 <script>
   import { tools, mcpServers } from '../../lib/api.js'
-  import ToolForm from './ToolForm.svelte'
   import ToolDetail from './ToolDetail.svelte'
   import ConfirmDialog from '../ConfirmDialog.svelte'
   import { t } from '../../lib/i18n.svelte.js'
 
+  let { onEdit = null } = $props()
+
   let toolList = $state([])
   let loading = $state(true)
   let error = $state('')
-  let showForm = $state(false)
-  let editingTool = $state(null)
   let deleteTarget = $state(null)
   let detailTool = $state(null)
   let expandedGroups = $state(new Set())
@@ -57,26 +56,6 @@
     expandedGroups = next
   }
 
-  function handleCreate() { editingTool = null; showForm = true }
-  function handleEdit(tool) { editingTool = tool; showForm = true }
-
-  let editingMcpServer = $state(null)
-
-  async function handleEditMcpServer(key) {
-    const serverName = key.slice(4)
-    try {
-      const data = await mcpServers.list()
-      const serverCfg = data.mcpServers?.[serverName] ?? {}
-      editingMcpServer = { serverName, config: { mcpServers: { [serverName]: serverCfg } } }
-      editingTool = null
-      showForm = true
-    } catch (err) {
-      error = err.message || t('fetchMcpConfigFailed')
-    }
-  }
-
-  function handleFormSuccess() { showForm = false; editingTool = null; editingMcpServer = null; fetchTools() }
-  function handleFormCancel() { showForm = false; editingTool = null; editingMcpServer = null }
   function handleDeleteClick(tool) { deleteTarget = { type: 'single', tool } }
 
   function handleDeleteGroupClick(key) {
@@ -102,6 +81,18 @@
   function handleShowDetail(tool) { detailTool = tool }
   function handleCloseDetail() { detailTool = null }
 
+  function handleEditGroupClick(key) {
+    const serverName = key.slice(4)
+    const firstTool = (groups.get(key) ?? [])[0]
+    if (onEdit && firstTool) {
+      onEdit(firstTool, serverName)
+    }
+  }
+
+  function handleEditClick(tool) {
+    if (onEdit) onEdit(tool, null)
+  }
+
   let confirmTitle = $derived(
     deleteTarget?.type === 'group'
       ? t('confirmDeleteMcpServer', { label: deleteTarget.label, count: deleteTarget.ids.length })
@@ -112,24 +103,11 @@
 </script>
 
 <div class="tools-page">
-  <div class="page-header">
-    <h2>{t('toolsPageTitle')}</h2>
-    {#if !showForm}
-      <button class="btn btn-primary" onclick={handleCreate}>{t('registerTool')}</button>
-    {/if}
-  </div>
-
   {#if error}
     <div class="error-msg">{error}</div>
   {/if}
 
   <div class="page-content">
-    {#if showForm}
-      {#key editingTool?.tool_id ?? editingMcpServer?.serverName ?? '__new__'}
-        <ToolForm tool={editingTool} mcpServer={editingMcpServer} onSuccess={handleFormSuccess} onCancel={handleFormCancel} />
-      {/key}
-    {/if}
-
     {#if detailTool}
       <ToolDetail tool={detailTool} onClose={handleCloseDetail} />
     {/if}
@@ -155,7 +133,7 @@
                 <span class="group-count">{t('toolCount', { n: groupTools.length })}</span>
               </span>
               {#if isMcpGroup(key)}
-                <button class="btn btn-sm" onclick={() => handleEditMcpServer(key)} title={t('editMcpServerTitle')}>{t('edit')}</button>
+                <button class="btn btn-sm" onclick={() => handleEditGroupClick(key)} title={t('editMcpServerTitle')}>{t('edit')}</button>
                 <button class="btn btn-sm btn-danger" onclick={() => handleDeleteGroupClick(key)} title={t('deleteMcpServerTitle')}>{t('delete')}</button>
               {/if}
             </div>
@@ -167,7 +145,9 @@
                     <th>{t('toolIdHeader')}</th>
                     <th>{t('toolNameHeader')}</th>
                     <th>{t('toolDescHeader')}</th>
-                    <th>{t('actions')}</th>
+                    {#if !isMcpGroup(key)}
+                      <th>{t('actions')}</th>
+                    {/if}
                   </tr>
                 </thead>
                 <tbody>
@@ -178,16 +158,16 @@
                         <button class="link-btn" onclick={() => handleShowDetail(tool)}>{tool.name}</button>
                       </td>
                       <td class="desc-cell">{tool.description}</td>
-                      <td class="actions">
-                        {#if !isMcpGroup(key) && !tool.builtin}
-                          <button class="btn btn-sm" onclick={() => handleEdit(tool)}>{t('edit')}</button>
-                        {/if}
-                        {#if !tool.builtin}
-                          <button class="btn btn-sm btn-danger" onclick={() => handleDeleteClick(tool)}>{t('delete')}</button>
-                        {:else}
-                          <span class="badge badge-builtin">{t('builtin')}</span>
-                        {/if}
-                      </td>
+                      {#if !isMcpGroup(key)}
+                        <td class="actions">
+                          {#if !tool.builtin}
+                            <button class="btn btn-sm" onclick={() => handleEditClick(tool)}>{t('edit')}</button>
+                            <button class="btn btn-sm btn-danger" onclick={() => handleDeleteClick(tool)}>{t('delete')}</button>
+                          {:else}
+                            <span class="badge badge-builtin">{t('builtin')}</span>
+                          {/if}
+                        </td>
+                      {/if}
                     </tr>
                   {/each}
                 </tbody>
@@ -209,35 +189,20 @@
 
 <style>
   .tools-page {
+    height: 100%;
     display: flex;
     flex-direction: column;
-    height: 100vh;
-    overflow: hidden;
   }
-  .page-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 20px;
-    flex-shrink: 0;
-    border-bottom: 1px solid var(--border);
-    background: var(--bg);
-  }
-  h2 { margin: 0; color: var(--text); }
-  .btn { padding: 8px 18px; border-radius: 6px; border: none; cursor: pointer; font-size: 0.9rem; }
-  .btn-primary { background: var(--primary); color: #fff; }
-  .btn-primary:hover { background: var(--primary-hover); }
   .btn-sm { padding: 4px 10px; font-size: 0.82rem; background: var(--bg-secondary); color: var(--text); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; }
   .btn-sm:hover { opacity: 0.8; }
   .btn-danger { background: var(--danger); color: #fff; border: none; }
   .btn-danger:hover { background: var(--danger-hover, #c0392b); }
   .link-btn { background: none; border: none; color: var(--primary); cursor: pointer; padding: 0; font-size: inherit; text-decoration: underline; }
   .link-btn:hover { opacity: 0.8; }
-  .error-msg { background: var(--danger); color: #fff; padding: 10px 14px; border-radius: 6px; margin: 0 20px; font-size: 0.9rem; flex-shrink: 0; }
+  .error-msg { background: var(--danger); color: #fff; padding: 10px 14px; border-radius: 6px; margin: 0 20px; font-size: 0.9rem; }
   .page-content {
     flex: 1;
     overflow-y: auto;
-    min-height: 0;
     padding: 20px;
   }
   .loading, .empty { text-align: center; padding: 40px 0; color: var(--text-secondary); }

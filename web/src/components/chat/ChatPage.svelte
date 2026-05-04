@@ -148,11 +148,7 @@
   function _doSend(apiMessages) {
     isStreaming = true
     let aIdxRef = { value: messages.length }
-    // Find the agent nickname if one is selected
-    const agentNickname = selectedAgentId
-      ? (agentList.find(a => a.agent_id === selectedAgentId)?.nickname ?? '')
-      : ''
-    messages = [...messages, { role: 'assistant', content: '', thinking: null, agent_nickname: agentNickname || undefined }]
+    messages = [...messages, { role: 'assistant', content: '', thinking: null }]
     const reqBody = { model_id: selectedModelId, tool_ids: selectedToolIds, messages: apiMessages, stream: true }
     if (selectedAgentId) {
       reqBody.agent_id = selectedAgentId
@@ -193,14 +189,17 @@
         aIdxRef.value = messages.length
         // Inherit agent_nickname from the previous assistant message (if any)
         const prevAgent = [...messages].reverse().find(m => m.role === 'assistant' && m.agent_nickname)
-        messages = [...messages, { role: 'assistant', content: '', thinking: null, agent_nickname: prevAgent?.agent_nickname }]
+        // 直接展开 msg 的所有字段，同时设置初始值
+        messages = [...messages, { role: 'assistant', content: '', thinking: null, agent_nickname: prevAgent?.agent_nickname, ...msg }]
       }
       let u = [...messages]
       const aIdx = aIdxRef.value
       if (!u[aIdx]) return
-      if (msg.content) u[aIdx] = { ...u[aIdx], content: (u[aIdx].content || '') + msg.content }
-      if (msg.thinking) u[aIdx] = { ...u[aIdx], thinking: (u[aIdx].thinking || '') + msg.thinking }
-      if (msg.tool_calls) u[aIdx] = { ...u[aIdx], tool_calls: msg.tool_calls }
+      // 合并 msg 的所有字段，content 和 thinking 特殊处理（增量追加）
+      const newMsg = { ...u[aIdx], ...msg }
+      if (msg.content) newMsg.content = (u[aIdx].content || '') + msg.content
+      if (msg.thinking) newMsg.thinking = (u[aIdx].thinking || '') + msg.thinking
+      u[aIdx] = newMsg
       messages = u
     } else if (msg.role === 'tool') {
       if (msg.streaming === true) {
@@ -212,7 +211,9 @@
           : -1
         if (existingIdx >= 0) {
           const arr = [...messages]
-          arr[existingIdx] = { ...arr[existingIdx], content: (arr[existingIdx].content || '') + delta }
+          const newMsg = { ...arr[existingIdx], ...msg }
+          newMsg.content = (arr[existingIdx].content || '') + delta
+          arr[existingIdx] = newMsg
           messages = arr
         } else {
           // 第一帧：创建新的工具消息占位
@@ -222,6 +223,7 @@
             content: delta,
             tool_call_id: tcId,
             streaming: true,
+            ...msg
           }]
         }
         // 流式帧不重置 aIdxRef，让 assistant 消息继续累积
@@ -234,19 +236,20 @@
         if (existingIdx >= 0) {
           const arr = [...messages]
           // 只更新 streaming 状态，不覆盖 content（内容已通过流式增量帧完整推送）
-          arr[existingIdx] = { ...arr[existingIdx], streaming: false }
+          const newMsg = { ...arr[existingIdx], ...msg, streaming: false }
           // 如果结束帧携带了 content（非空），才更新
           if (msg.content) {
-            arr[existingIdx] = { ...arr[existingIdx], content: msg.content }
+            newMsg.content = msg.content
           }
+          arr[existingIdx] = newMsg
           messages = arr
         } else if (msg.content) {
-          messages = [...messages, { role: 'tool', name: msg.name || '', content: msg.content || '' }]
+          messages = [...messages, { role: 'tool', ...msg }]
         }
         aIdxRef.value = -1
       } else {
         // 普通工具结果帧（bash、fetch 等）
-        messages = [...messages, { role: 'tool', name: msg.name || '', content: msg.content || '' }]
+        messages = [...messages, { role: 'tool', ...msg }]
         aIdxRef.value = -1
       }
     } else if (msg.role === 'system') {
@@ -372,11 +375,17 @@
 
 <div class="chat-page">
   <div class="selection-bar">
-    <ModelSelector bind:selectedModelId onchange={(id) => localStorage.setItem(STORAGE_MODEL_KEY, id)} />
-    <ToolSelector bind:selectedToolIds onchange={(ids) => localStorage.setItem(STORAGE_TOOLS_KEY, JSON.stringify(ids))} />
+    <div class="selector-wrapper">
+      <a href="#/setup?tab=models" class="nav-link">{t('modelLabel')}</a>
+      <ModelSelector bind:selectedModelId onchange={(id) => localStorage.setItem(STORAGE_MODEL_KEY, id)} />
+    </div>
+    <div class="selector-wrapper">
+      <a href="#/setup?tab=tools" class="nav-link">{t('tools')}</a>
+      <ToolSelector bind:selectedToolIds onchange={(ids) => localStorage.setItem(STORAGE_TOOLS_KEY, JSON.stringify(ids))} />
+    </div>
     <div class="agent-selector-spacer"></div>
     <div class="agent-selector">
-      <label for="agent-select">{t('agentSelector')}</label>
+      <a href="#/setup?tab=agents" class="nav-link">{t('agentSelector')}</a>
       {#if loadingAgents}
         <span class="hint">{t('loading')}</span>
       {:else}
@@ -425,7 +434,7 @@
   {/if}
 
   <div class="message-area">
-    <MessageList {messages} />
+    <MessageList {messages} {agentList} />
 
     {#if templatePanelOpen}
       <div class="template-panel">
@@ -513,9 +522,23 @@
     background: var(--bg);
     align-items: center;
   }
+  .selector-wrapper {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .nav-link {
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--primary);
+    text-decoration: none;
+    white-space: nowrap;
+  }
+  .nav-link:hover {
+    text-decoration: underline;
+  }
   .agent-selector-spacer { flex: 1; }
   .agent-selector { display: flex; align-items: center; gap: 8px; }
-  .agent-selector label { font-size: 0.85rem; font-weight: 600; color: var(--text-secondary); white-space: nowrap; }
   .agent-selector select {
     padding: 6px 10px;
     border-radius: 6px;
