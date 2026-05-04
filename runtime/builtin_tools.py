@@ -1375,11 +1375,11 @@ SEARCH_CODE_TOOL_CONFIG = ToolConfig(
             },
             "include": {
                 "type": "string",
-                "description": "Optional glob pattern to restrict search to matching files (e.g. '*.py')",
+                "description": "Optional glob pattern to restrict search to matching files. Multiple patterns can be separated by | (e.g. '*.svelte|*.js').",
             },
             "exclude": {
                 "type": "string",
-                "description": "Optional glob pattern to exclude files from search (e.g. '*.min.js')",
+                "description": "Optional glob pattern to exclude files from search. Multiple patterns can be separated by | (e.g. '*.log|*.bak').",
             },
         },
         "required": ["query"],
