@@ -1226,12 +1226,14 @@ def _search_code(query: str, include: Optional[str] = None, exclude: Optional[st
         # Add default excludes
         for excl in default_excludes:
             cmd += ["--glob", f"!{excl}"]
-        # Add user-specified include
+        # Add user-specified include patterns (support | as OR)
         if include:
-            cmd += ["--glob", include]
-        # Add user-specified exclude
+            for pat in _split_patterns(include):
+                cmd += ["--glob", pat]
+        # Add user-specified exclude patterns (support | as OR)
         if exclude:
-            cmd += ["--glob", f"!{exclude}"]
+            for pat in _split_patterns(exclude):
+                cmd += ["--glob", f"!{pat}"]
 
         try:
             result = subprocess.run(
