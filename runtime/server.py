@@ -40,6 +40,7 @@ from runtime.models import (
     ToolConfig,
 )
 from runtime.prompt_template_manager import PromptTemplateManager
+from runtime.agent_manager import AgentManager
 from runtime.registry import ModelRegistry, ToolRegistry
 from runtime.runtime import Runtime
 from runtime.context_manager import ContextManager, ConversationTurn
@@ -495,13 +496,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         agent_id = body.get("agent_id")
         agent = None
         if agent_id:
-            agent_fpath = os.path.join(_AGENTS_DIR, f"{agent_id}.json")
-            if os.path.isfile(agent_fpath):
-                try:
-                    with open(agent_fpath, "r", encoding="utf-8") as f:
-                        agent = json.load(f)
-                except (json.JSONDecodeError, OSError):
-                    pass
+            agent = self.server.agent_manager.get(agent_id)  # type: ignore[attr-defined]
             if agent is None:
                 self._send_json_error(400, f"Agent not found: {agent_id}")
                 return None
@@ -1449,30 +1444,16 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
 
     def _handle_list_agents(self) -> None:
         """GET /v1/agents — list all agents."""
-        os.makedirs(_AGENTS_DIR, exist_ok=True)
-        agents = []
-        if os.path.isdir(_AGENTS_DIR):
-            for fname in sorted(os.listdir(_AGENTS_DIR), reverse=True):
-                if fname.endswith(".json"):
-                    fpath = os.path.join(_AGENTS_DIR, fname)
-                    try:
-                        with open(fpath, "r", encoding="utf-8") as f:
-                            agents.append(json.load(f))
-                    except (json.JSONDecodeError, OSError):
-                        pass
+        agents = self.server.agent_manager.list_all()  # type: ignore[attr-defined]
         self._send_json_response(200, {"agents": agents})
 
     def _handle_get_agent(self, agent_id: str) -> None:
         """GET /v1/agents/{agent_id} — get a single agent."""
-        fpath = os.path.join(_AGENTS_DIR, f"{agent_id}.json")
-        if not os.path.isfile(fpath):
+        agent = self.server.agent_manager.get(agent_id)  # type: ignore[attr-defined]
+        if agent is None:
             self._send_json_error(404, f"Agent not found: {agent_id}")
             return
-        try:
-            with open(fpath, "r", encoding="utf-8") as f:
-                self._send_json_response(200, json.load(f))
-        except (json.JSONDecodeError, OSError) as exc:
-            self._send_json_error(500, f"Failed to read agent: {exc}")
+        self._send_json_response(200, agent)
 
     def _handle_create_agent(self) -> None:
         """POST /v1/agents — create a new agent."""
@@ -1485,67 +1466,38 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 self._send_json_error(400, f"Missing required field: {field}")
                 return
         agent_id = datetime.datetime.now().strftime("%y%m%d_%H%M%S")
-        agent = {
-            "agent_id": agent_id,
-            "model_id": body["model_id"],
-            "tool_ids": body.get("tool_ids", []),
-            "template_id": body.get("template_id"),
-            "template_arguments": body.get("template_arguments", {}),
-            "system_prompt": body.get("system_prompt", ""),
-            "nickname": body["nickname"],
-            "myself_view": body.get("myself_view", ""),
-            "description": body.get("description", ""),
-            "last_modified": datetime.datetime.now().isoformat(),
-            "avatar": "",
-        }
-        os.makedirs(_AGENTS_DIR, exist_ok=True)
-        fpath = os.path.join(_AGENTS_DIR, f"{agent_id}.json")
-        try:
-            with open(fpath, "w", encoding="utf-8") as f:
-                json.dump(agent, f, ensure_ascii=False, indent=2)
-            self._send_json_response(201, {"status": "created", "agent_id": agent_id})
-        except OSError as exc:
-            self._send_json_error(500, f"Failed to save agent: {exc}")
+        self.server.agent_manager.create(  # type: ignore[attr-defined]
+            agent_id=agent_id,
+            model_id=body["model_id"],
+            nickname=body["nickname"],
+            tool_ids=body.get("tool_ids"),
+            template_id=body.get("template_id"),
+            template_arguments=body.get("template_arguments"),
+            system_prompt=body.get("system_prompt", ""),
+            myself_view=body.get("myself_view", ""),
+            description=body.get("description", ""),
+            avatar=body.get("avatar", ""),
+        )
+        self._send_json_response(201, {"status": "created", "agent_id": agent_id})
 
     def _handle_update_agent(self, agent_id: str) -> None:
         """PUT /v1/agents/{agent_id} — update an agent."""
-        fpath = os.path.join(_AGENTS_DIR, f"{agent_id}.json")
-        if not os.path.isfile(fpath):
-            self._send_json_error(404, f"Agent not found: {agent_id}")
-            return
         body = self._read_json_body()
         if body is None:
             return
-        try:
-            with open(fpath, "r", encoding="utf-8") as f:
-                agent = json.load(f)
-        except (json.JSONDecodeError, OSError) as exc:
-            self._send_json_error(500, f"Failed to read agent: {exc}")
+        updated = self.server.agent_manager.update(agent_id, body)  # type: ignore[attr-defined]
+        if updated is None:
+            self._send_json_error(404, f"Agent not found: {agent_id}")
             return
-        # Update mutable fields
-        for key in ("model_id", "tool_ids", "template_id", "template_arguments",
-                     "system_prompt", "nickname", "myself_view", "description", "avatar"):
-            if key in body:
-                agent[key] = body[key]
-        agent["last_modified"] = datetime.datetime.now().isoformat()
-        try:
-            with open(fpath, "w", encoding="utf-8") as f:
-                json.dump(agent, f, ensure_ascii=False, indent=2)
-            self._send_json_response(200, {"status": "updated", "agent_id": agent_id})
-        except OSError as exc:
-            self._send_json_error(500, f"Failed to save agent: {exc}")
+        self._send_json_response(200, {"status": "updated", "agent_id": agent_id})
 
     def _handle_delete_agent(self, agent_id: str) -> None:
         """DELETE /v1/agents/{agent_id} — delete an agent."""
-        fpath = os.path.join(_AGENTS_DIR, f"{agent_id}.json")
-        if not os.path.isfile(fpath):
+        deleted = self.server.agent_manager.delete(agent_id)  # type: ignore[attr-defined]
+        if not deleted:
             self._send_json_error(404, f"Agent not found: {agent_id}")
             return
-        try:
-            os.remove(fpath)
-            self._send_json_response(200, {"status": "deleted", "agent_id": agent_id})
-        except OSError as exc:
-            self._send_json_error(500, f"Failed to delete agent: {exc}")
+        self._send_json_response(200, {"status": "deleted", "agent_id": agent_id})
 
     # ------------------------------------------------------------------
     # RuntimeHTTPServer
@@ -1605,6 +1557,7 @@ class RuntimeHTTPServer:
         self._host = host
         self._port = port
         self._prompt_template_manager = PromptTemplateManager()
+        self._agent_manager = AgentManager()
         self._server: Optional[HTTPServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -1640,6 +1593,7 @@ class RuntimeHTTPServer:
                 mcp_manager.load_config(mcp_cfg)
             if os.path.isfile(_PROMPT_TEMPLATES_PATH):
                 self._prompt_template_manager.load(_PROMPT_TEMPLATES_PATH)
+            self._agent_manager.load()
             from runtime.builtin_tools import register_builtin_tools
             self._runtime = Runtime(
                 model_registry=model_registry,
@@ -1687,6 +1641,7 @@ class RuntimeHTTPServer:
         self._server = ThreadingHTTPServer((self._host, self._port), _RuntimeRequestHandler)
         self._server.runtime = self._runtime  # type: ignore[attr-defined]
         self._server.prompt_template_manager = self._prompt_template_manager  # type: ignore[attr-defined]
+        self._server.agent_manager = self._agent_manager  # type: ignore[attr-defined]
         self._server.static_dir = self._static_dir  # type: ignore[attr-defined]
         self._server.context_manager = self._context_manager  # type: ignore[attr-defined]
         self._server.env_manager = self._env_manager  # type: ignore[attr-defined]
@@ -1703,6 +1658,7 @@ class RuntimeHTTPServer:
         self._server = ThreadingHTTPServer((self._host, self._port), _RuntimeRequestHandler)
         self._server.runtime = self._runtime  # type: ignore[attr-defined]
         self._server.prompt_template_manager = self._prompt_template_manager  # type: ignore[attr-defined]
+        self._server.agent_manager = self._agent_manager  # type: ignore[attr-defined]
         self._server.static_dir = self._static_dir  # type: ignore[attr-defined]
         self._server.context_manager = self._context_manager  # type: ignore[attr-defined]
         self._server.env_manager = self._env_manager  # type: ignore[attr-defined]

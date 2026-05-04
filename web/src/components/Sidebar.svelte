@@ -11,6 +11,7 @@
     { hash: '#/models', key: 'nav_models' },
     { hash: '#/tools', key: 'nav_tools' },
     { hash: '#/prompts', key: 'nav_prompts' },
+    { hash: '#/agents', key: 'nav_agents' },
   ]
 
   let sessionList = $state([])

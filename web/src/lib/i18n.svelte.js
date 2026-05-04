@@ -16,6 +16,7 @@ const translations = {
     nav_models: '模型管理',
     nav_tools: '工具管理',
     nav_prompts: '提示词管理',
+    nav_agents: '智能体管理',
 
     // ThemeToggle
     toggleTheme: '切换主题',
@@ -59,7 +60,7 @@ const translations = {
     // ChatPage
     systemPromptLabel: '系统提示词:',
     streamError: '流式响应出错',
-    addAsAgent: '使用当前设定添加为智能体',
+    addAsAgent: '添加为智能体',
     addAsAgentNickname: '输入智能体昵称',
     addAsAgentConfirm: '确认添加',
     addAsAgentSuccess: '智能体已添加',
@@ -68,7 +69,28 @@ const translations = {
     noAgents: '暂无智能体',
     fetchAgentsFailed: '获取智能体列表失败',
     deleteAgentFailed: '删除智能体失败',
-    confirmDeleteAgent: '确定要删除智能体「{nickname}」吗？',
+    confirmDeleteAgent: '确定要删除智能体「{id}」吗？',
+
+    // AgentsPage
+    agentsPageTitle: '智能体管理',
+    noAgentsPage: '暂无智能体',
+    createAgent: '创建智能体',
+    editAgent: '编辑智能体',
+    agentNickname: '昵称',
+    agentNicknameRequired: '昵称不能为空',
+    agentNicknamePlaceholder: '例如: 代码助手',
+    agentModelId: '模型',
+    agentModelIdRequired: '模型不能为空',
+    agentModelSelectHint: '请选择模型',
+    agentTemplateId: '提示词模板',
+    agentTemplateArgs: '模板参数 (JSON)',
+    agentTemplateArgsInvalid: '模板参数 JSON 格式无效',
+    agentSystemPrompt: '系统提示词',
+    agentSystemPromptPlaceholder: '输入系统提示词内容',
+    agentMyselfView: '自况',
+    agentMyselfViewPlaceholder: '简短的自我表达',
+    agentDescription: '描述',
+    agentDescriptionPlaceholder: '客观记录，长期记忆',
 
     // CopyButton / MarkdownRenderer
     copy: '复制',
@@ -287,6 +309,7 @@ const translations = {
     nav_models: 'Models',
     nav_tools: 'Tools',
     nav_prompts: 'Prompts',
+    nav_agents: 'Agents',
 
     // ThemeToggle
     toggleTheme: 'Toggle theme',
@@ -330,7 +353,7 @@ const translations = {
     // ChatPage
     systemPromptLabel: 'System prompt:',
     streamError: 'Streaming error',
-    addAsAgent: 'Add as Agent with current settings',
+    addAsAgent: 'Add as Agent',
     addAsAgentNickname: 'Agent nickname',
     addAsAgentConfirm: 'Confirm',
     addAsAgentSuccess: 'Agent added',
@@ -339,7 +362,28 @@ const translations = {
     noAgents: 'No agents yet',
     fetchAgentsFailed: 'Failed to fetch agents',
     deleteAgentFailed: 'Failed to delete agent',
-    confirmDeleteAgent: 'Delete agent "{nickname}"?',
+    confirmDeleteAgent: 'Delete agent "{id}"?',
+
+    // AgentsPage
+    agentsPageTitle: 'Agents',
+    noAgentsPage: 'No agents yet',
+    createAgent: 'Create Agent',
+    editAgent: 'Edit Agent',
+    agentNickname: 'Nickname',
+    agentNicknameRequired: 'Nickname is required',
+    agentNicknamePlaceholder: 'e.g. Code Assistant',
+    agentModelId: 'Model',
+    agentModelIdRequired: 'Model is required',
+    agentModelSelectHint: 'Please select a model',
+    agentTemplateId: 'Prompt Template',
+    agentTemplateArgs: 'Template Args (JSON)',
+    agentTemplateArgsInvalid: 'Invalid JSON for template args',
+    agentSystemPrompt: 'System Prompt',
+    agentSystemPromptPlaceholder: 'Enter system prompt content',
+    agentMyselfView: 'Myself View',
+    agentMyselfViewPlaceholder: 'Brief self-expression',
+    agentDescription: 'Description',
+    agentDescriptionPlaceholder: 'Objective record, long-term memory',
 
     // CopyButton / MarkdownRenderer
     copy: 'Copy',
