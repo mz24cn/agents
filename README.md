@@ -2,6 +2,8 @@
 
 [English](#english) | [中文](#中文)
 
+![Setup](resources/screenshot_setup.jpg)
+
 ![Prompt Template Chat](resources/screenshot_chat_using_prompt_template.jpg)
 
 ---
