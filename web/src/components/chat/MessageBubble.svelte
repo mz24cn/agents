@@ -99,7 +99,7 @@
           <span>🤖</span>
         {/if}
       {/if}
-      <span>{displayName}</span>
+      <span class="agent-name">{displayName}</span>
       <div class="role-actions">
         {#if msg.stat}
           <span class="token-stats" title={buildStatTooltip(msg.stat)}>
@@ -228,6 +228,9 @@
     font-weight: 600;
     margin-bottom: 4px;
     opacity: 0.8;
+  }
+  .agent-name {
+    margin-right: auto;
   }
   .agent-avatar {
     width: 18px;
