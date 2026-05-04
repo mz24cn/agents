@@ -1185,13 +1185,22 @@ BUILTIN_TOOLS.append((EDIT_FILE_TOOL_CONFIG, _edit_file))
 # Task 8.1 — _search_code implementation
 # ---------------------------------------------------------------------------
 
+def _split_patterns(pattern: str | None) -> list[str]:
+    """Split a pattern string by | into a list of non-empty patterns."""
+    if not pattern:
+        return []
+    return [p.strip() for p in pattern.split("|") if p.strip()]
+
+
 def _search_code(query: str, include: Optional[str] = None, exclude: Optional[str] = None) -> str:
     """Search the workspace codebase for a regex pattern using ripgrep or grep.
 
     Args:
         query: A regular expression pattern to search for.
         include: Optional glob pattern to restrict search to matching files.
+                 Multiple patterns can be separated by | (e.g. '*.svelte|*.js').
         exclude: Optional glob pattern to exclude matching files from search.
+                 Multiple patterns can be separated by | (e.g. '*.log|*.bak').
 
     Returns:
         JSON string with keys: results, truncated, total_found on success.
