@@ -372,9 +372,9 @@
     gap: 8px;
   }
   .detect-chip {
-    padding: 6px 14px;
+    padding: 4px 12px;
     border: 1px solid var(--primary);
-    border-radius: 20px;
+    border-radius: 4px;
     background: transparent;
     color: var(--primary);
     font-family: monospace;
