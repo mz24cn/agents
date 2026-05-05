@@ -194,13 +194,14 @@
         aIdxRef.value = messages.length
         // Inherit agent_nickname from the previous assistant message (if any)
         const prevAgent = [...messages].reverse().find(m => m.role === 'assistant' && m.agent_nickname)
-        // 直接展开 msg 的所有字段，同时设置初始值
+        // 首次帧：直接展开 msg 的所有字段（含 content/thinking/tool_calls 等），无需增量拼接
         messages = [...messages, { role: 'assistant', content: '', thinking: null, agent_nickname: prevAgent?.agent_nickname, ...msg }]
+        return  // 首次创建已完成所有字段的设置，跳过后续合并逻辑
       }
+      // 后续帧：增量追加 content 和 thinking
       let u = [...messages]
       const aIdx = aIdxRef.value
       if (!u[aIdx]) return
-      // 合并 msg 的所有字段，content 和 thinking 特殊处理（增量追加）
       const newMsg = { ...u[aIdx], ...msg }
       if (msg.content) newMsg.content = (u[aIdx].content || '') + msg.content
       if (msg.thinking) newMsg.thinking = (u[aIdx].thinking || '') + msg.thinking
