@@ -9,9 +9,6 @@
   let isDragging = $state(false)
   let dragStartX = 0
   let dragStartWidth = 0
-  // footer 高度，用于对齐 fixed 按钮
-  let footerEl = $state(null)
-  let footerHeight = $derived(footerEl ? footerEl.offsetHeight : 49)
 
   function handleDragStart(e) {
     if (e.type === 'mousedown' && e.button !== 0) return
@@ -52,13 +49,13 @@
 <div class="layout">
   <!-- Sidebar wrapper -->
   <div class="sidebar-wrapper" class:open={!sidebarWidth.collapsed} style="width: {sidebarWidth.collapsed ? 0 : sidebarWidth.current}px">
-    <Sidebar bind:footerEl />
+    <Sidebar />
   </div>
 
   <!-- Sidebar toggle button: fixed 定位，不在 sidebar-wrapper 内，移动端 display:none 不影响 -->
   <button
     class="sidebar-toggle-btn"
-    style="left: {sidebarWidth.collapsed ? 0 : sidebarWidth.current}px; height: {footerHeight}px;"
+    style="left: {sidebarWidth.collapsed ? 0 : sidebarWidth.current}px;"
     onclick={handleToggleClick}
     onmousedown={handleDragStart}
     ontouchstart={handleDragStart}
@@ -99,7 +96,7 @@
   .sidebar-toggle-btn {
     position: fixed;
     bottom: 0;
-    /* left & height 由 style 属性动态设置 */
+    /* left 由 style 属性动态设置 */
     width: fit-content;
     min-width: 0;
     padding: 0 2px;

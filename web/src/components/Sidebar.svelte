@@ -4,7 +4,7 @@
   import { t, i18n, setLang } from '../lib/i18n.svelte.js'
   import { sessions } from '../lib/api.js'
   import { sessionRestore, newSessionCreated } from '../lib/session-state.svelte.js'
-  import { sidebarWidth } from '../lib/sidebar-width.svelte.js'
+  import { sidebarWidth, setSidebarWidth, toggleSidebarCollapsed, SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH } from '../lib/sidebar-width.svelte.js'
 
   const navItems = [
     { hash: '#/chat', key: 'nav_chat' },
@@ -16,8 +16,16 @@
   let restoreError = $state('')
 
   // 弹出菜单状态
-  let menuOpenId = $state(null)
-  let menuPos = $state({ x: 0, y: 0 })
+  let menuOpenId = $state(null)   // 当前展开菜单的 session id
+  let menuPos = $state({ x: 0, y: 0 })  // fixed 定位坐标
+
+  // 拖动状态
+  let isDragging = $state(false)
+  let dragStartX = 0        // mousedown 时的 clientX
+  let dragStartWidth = 0    // mousedown 时的侧边栏宽度
+  // footer 高度，用于对齐 fixed 按钮
+  let footerEl = $state(null)
+  let footerHeight = $derived(footerEl ? footerEl.offsetHeight : 49)
 
   async function loadSessions() {
     sessionLoading = true
@@ -36,11 +44,14 @@
     restoreError = ''
     try {
       const data = await sessions.get(sessionId)
+      // 直接展开所有字段，保持与后端数据一致
       const msgs = (data.messages ?? []).map(m => ({ ...m }))
       sessionRestore.pending = { sessionId, messages: msgs }
+      // 恢复会话后跳转到对话页
       router.current = '#/chat'
     } catch (err) {
       restoreError = err.message || t('restoreSessionFailed')
+      // 后端在 session not found 时会删除该记录，前端同步移除
       sessionList = sessionList.filter(s => s.session_id !== sessionId)
     }
   }
@@ -53,6 +64,7 @@
     }
     const btn = e.currentTarget
     const rect = btn.getBoundingClientRect()
+    // 菜单出现在按钮右下角，用 fixed 定位浮于最顶层
     menuPos = { x: rect.right + 4, y: rect.top }
     menuOpenId = sid
   }
@@ -67,6 +79,7 @@
     try {
       const result = await sessions.generateTitle(sid)
       if (result.status === 'success') {
+        // 更新本地列表中的标题
         sessionList = sessionList.map(s => 
           s.session_id === sid ? { ...s, title: result.title } : s
         )
@@ -88,8 +101,52 @@
     }
   }
 
+  // 拖动处理：记录起始点，用增量计算，避免按钮偏移导致宽度跳变
+  function handleDragStart(e) {
+    // 只响应鼠标左键
+    if (e.type === 'mousedown' && e.button !== 0) return
+    e.preventDefault()
+    isDragging = false  // 先不标记，等真正移动再标记
+    dragStartX = e.type.startsWith('touch') ? e.touches[0].clientX : e.clientX
+    dragStartWidth = sidebarWidth.current
+    document.addEventListener('mousemove', handleDragMove)
+    document.addEventListener('mouseup', handleDragEnd)
+    document.addEventListener('touchmove', handleDragMove, { passive: false })
+    document.addEventListener('touchend', handleDragEnd)
+  }
+
+  function handleDragMove(e) {
+    e.preventDefault()
+    const clientX = e.type.startsWith('touch') ? e.touches[0].clientX : e.clientX
+    const delta = clientX - dragStartX
+    // 超过 3px 才认为是拖动，避免误触
+    if (!isDragging && Math.abs(delta) < 3) return
+    isDragging = true
+    const newWidth = Math.max(SIDEBAR_MIN_WIDTH, Math.min(SIDEBAR_MAX_WIDTH, dragStartWidth + delta))
+    setSidebarWidth(newWidth)
+  }
+
+  function handleDragEnd() {
+    document.removeEventListener('mousemove', handleDragMove)
+    document.removeEventListener('mouseup', handleDragEnd)
+    document.removeEventListener('touchmove', handleDragMove)
+    document.removeEventListener('touchend', handleDragEnd)
+    // 延迟重置 isDragging，让 click 事件能检测到
+    setTimeout(() => { isDragging = false }, 0)
+  }
+
+  function handleToggleClick(e) {
+    // 如果刚刚发生了拖动，不触发收缩切换
+    if (isDragging) return
+    toggleSidebarCollapsed()
+  }
+
   $effect(() => { loadSessions() })
 
+  /**
+   * 将 session_id（YYMMDD_HHmmss）解析为 "MM/DD HH:mm:ss" 格式的时间字符串。
+   * 解析失败时返回空字符串。
+   */
   function sessionIdToTime(sessionId) {
     const m = /^(\d{2})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})$/.exec(sessionId)
     if (!m) return ''
@@ -97,9 +154,17 @@
     return `${MM}/${DD} ${HH}:${mm}:${ss}`
   }
 
+  /**
+   * 计算会话条目的显示标题和 tooltip。
+   * - 长度 < 10：display 追加时间字符串
+   * - 长度 > 30：display 截断至 30 字符
+   * - tooltip 始终为完整标题 + 时间（供 CSS ellipsis 和手动截断两种情况使用）
+   * 返回 { display, tooltip }
+   */
   function getSessionDisplay(entry) {
     const raw = entry.title || entry.session_id
     const time = sessionIdToTime(entry.session_id)
+    // tooltip 始终携带完整内容，浏览器在文字被 CSS 截断时也会显示
     const tooltip = time ? `${raw}\n${time}` : raw
     let display = raw
 
@@ -115,20 +180,26 @@
   $effect(() => {
     const sid = newSessionCreated.sessionId
     if (sid) {
+      // 检查是否已存在
       const exists = sessionList.some(s => s.session_id === sid)
       if (!exists) {
+        // 用第一条用户消息作为临时标题，回退到 session_id
         const firstMsg = newSessionCreated.firstUserMessage
         const title = (firstMsg && firstMsg.trim()) ? firstMsg.trim() : sid
+        // 动态添加新会话条目到列表顶部
         sessionList = [{ session_id: sid, title }, ...sessionList]
       }
+      // 重置状态，避免重复处理
       newSessionCreated.sessionId = null
       newSessionCreated.firstUserMessage = null
     }
   })
 </script>
 
+<!-- 点击空白处关闭菜单 -->
 <svelte:window onclick={closeMenu} />
 
+<!-- 浮层菜单：fixed 定位，渲染在 sidebar 之外确保不被裁剪 -->
 {#if menuOpenId !== null}
   <div
     class="session-dropdown"
@@ -210,7 +281,7 @@
       {/if}
     </div>
   </div>
-  <div class="sidebar-footer">
+  <div class="sidebar-footer" bind:this={footerEl}>
     <div class="footer-theme-wrap">
       <ThemeToggle />
     </div>
@@ -227,6 +298,27 @@
     >⚙️</a>
   </div>
 </aside>
+
+<!-- 统一的收缩/展开按钮，固定在侧边栏右边缘底部 -->
+<button
+  class="sidebar-toggle-btn"
+  style="left: {sidebarWidth.collapsed ? 0 : sidebarWidth.current}px; height: {footerHeight}px;"
+  onclick={handleToggleClick}
+  onmousedown={handleDragStart}
+  ontouchstart={handleDragStart}
+  aria-label={sidebarWidth.collapsed ? t('expandSidebar') : t('collapseSidebar')}
+  title={sidebarWidth.collapsed ? t('expandSidebar') : t('collapseSidebar')}
+>
+  {#if sidebarWidth.collapsed}
+    <svg class="toggle-arrow" viewBox="0 0 8 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <polyline points="1,1 7,7 1,13"/>
+    </svg>
+  {:else}
+    <svg class="toggle-arrow" viewBox="0 0 8 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <polyline points="7,1 1,7 7,13"/>
+    </svg>
+  {/if}
+</button>
 
 <style>
   .sidebar {
@@ -275,6 +367,34 @@
     gap: 8px;
     align-items: stretch;
   }
+  .sidebar-toggle-btn {
+    position: fixed;
+    bottom: 0;
+    /* left & height 由 style 属性动态设置 */
+    width: fit-content;
+    min-width: 0;
+    padding: 0 2px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-left: none;
+    border-radius: 0 6px 6px 0;
+    cursor: ew-resize;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 50;
+    transition: background-color 0.15s, left 0.2s ease;
+  }
+  .sidebar-toggle-btn:hover {
+    background: var(--border);
+  }
+  .toggle-arrow {
+    width: 8px;
+    height: 14px;
+    color: var(--text-secondary);
+    display: block;
+    pointer-events: none;
+  }
   .footer-theme-wrap {
     flex: 1;
     display: flex;
@@ -313,6 +433,7 @@
     font-weight: 600;
     cursor: pointer;
     transition: background 0.15s, color 0.15s;
+    text-align: center;
     text-decoration: none;
     display: flex;
     align-items: center;
