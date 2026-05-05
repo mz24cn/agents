@@ -7,7 +7,7 @@
 </script>
 
 <div class="layout">
-  <!-- Mobile hamburger button -->
+  <!-- Mobile hamburger button (替身，直接操作全局 collapsed 状态) -->
   <button class="hamburger" onclick={() => sidebarWidth.collapsed = !sidebarWidth.collapsed} aria-label={t('openMenu')}>
     <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
       <line x1="3" y1="6" x2="21" y2="6"/>
@@ -16,10 +16,10 @@
     </svg>
   </button>
 
-  <!-- Mobile overlay -->
-  {#if !sidebarWidth.collapsed}
+  <!-- Mobile overlay (collapsed=true 时显示遮罩) -->
+  {#if sidebarWidth.collapsed}
     <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div class="mobile-overlay" onclick={() => sidebarWidth.collapsed = true} onkeydown={() => {}}></div>
+    <div class="mobile-overlay" onclick={() => sidebarWidth.collapsed = false} onkeydown={() => {}}></div>
   {/if}
 
   <div class="sidebar-wrapper" class:open={!sidebarWidth.collapsed} style="width: {sidebarWidth.collapsed ? 0 : sidebarWidth.current}px">
