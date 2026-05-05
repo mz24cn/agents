@@ -369,6 +369,32 @@
     max-width: 480px;
   }
   .actions { display: flex; gap: 8px; }
+  .btn-secondary {
+    background: var(--bg-secondary);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    cursor: pointer;
+    padding: 4px 12px;
+    font-size: 0.85rem;
+  }
+  .btn-secondary:hover {
+    background: var(--border);
+  }
+  .editing-row {
+    background: var(--bg-secondary);
+  }
+  .inline-input {
+    width: 100%;
+    padding: 4px 10px;
+    border: 1px solid var(--primary);
+    border-radius: 4px;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 0.85rem;
+    outline: none;
+    box-sizing: border-box;
+  }
 
   /* ---- 新增表单 ---- */
   .add-form {
