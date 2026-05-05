@@ -295,22 +295,6 @@
     max-width: 480px;
   }
   .actions { display: flex; gap: 8px; }
-  .btn-sm {
-    padding: 4px 12px;
-    font-size: 0.85rem;
-    background: var(--bg-secondary);
-    color: var(--text);
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    cursor: pointer;
-  }
-  .btn-sm:hover { opacity: 0.8; }
-  .btn-danger {
-    background: var(--danger);
-    color: #fff;
-    border: none;
-  }
-  .btn-danger:hover { background: var(--danger-hover); }
 
   /* ---- 新增表单 ---- */
   .add-form {
