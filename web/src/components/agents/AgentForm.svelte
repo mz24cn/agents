@@ -2,6 +2,7 @@
   import { agents, models, promptTemplates } from '../../lib/api.js'
   import { t } from '../../lib/i18n.svelte.js'
   import JsonEditor from '../JsonEditor.svelte'
+  import ToolSelector from '../chat/ToolSelector.svelte'
 
   let { agent = null, onSuccess, onCancel } = $props()
 
@@ -10,6 +11,7 @@
 
   let nickname = $state(_init.nickname ?? '')
   let modelId = $state(_init.model_id ?? '')
+  let selectedToolIds = $state((_init.tool_ids ?? []).slice())
   let templateId = $state(_init.template_id ?? '')
   let templateArguments = $state(JSON.stringify(_init.template_arguments ?? {}, null, 2))
   let systemPrompt = $state(_init.system_prompt ?? '')
@@ -68,6 +70,7 @@
     const payload = {
       nickname: nickname.trim(),
       model_id: modelId.trim(),
+      tool_ids: selectedToolIds,
       template_id: templateId.trim() || null,
       template_arguments: parsedArgs,
       system_prompt: systemPrompt.trim(),
@@ -113,6 +116,11 @@
       </select>
     {/if}
     {#if errors.modelId}<span class="field-error">{errors.modelId}</span>{/if}
+  </div>
+
+  <div class="form-group">
+    <label>{t('tools')}</label>
+    <ToolSelector bind:selectedToolIds />
   </div>
 
   <div class="form-group">

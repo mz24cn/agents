@@ -4,7 +4,7 @@
   import { t, i18n, setLang } from '../lib/i18n.svelte.js'
   import { sessions } from '../lib/api.js'
   import { sessionRestore, newSessionCreated } from '../lib/session-state.svelte.js'
-  import { sidebarWidth, setSidebarWidth, toggleSidebarCollapsed, SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH } from '../lib/sidebar-width.svelte.js'
+  import { sidebarWidth, setSidebarWidth, toggleSidebarCollapsed, collapseSidebar, SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH } from '../lib/sidebar-width.svelte.js'
 
   const navItems = [
     { hash: '#/chat', key: 'nav_chat' },
@@ -14,6 +14,7 @@
   let sessionError = $state('')
   let sessionLoading = $state(false)
   let restoreError = $state('')
+  let lastClickTime = $state(0)
 
   // 弹出菜单状态
   let menuOpenId = $state(null)   // 当前展开菜单的 session id
@@ -41,7 +42,17 @@
   }
 
   async function handleSessionClick(sessionId) {
+    const now = Date.now()
+    if (now - lastClickTime < 300) {
+      return
+    }
+    lastClickTime = now
     restoreError = ''
+    // 移动端：立即收起侧边栏，不能等网络请求返回后再收起，
+    // 否则 fixed 遮罩持续挡住对话内容，用户体验为"点两下"
+    if (window.innerWidth < 1024) {
+      collapseSidebar()
+    }
     try {
       const data = await sessions.get(sessionId)
       // 直接展开所有字段，保持与后端数据一致
@@ -71,6 +82,34 @@
 
   function closeMenu() {
     menuOpenId = null
+  }
+
+  // 移动端长按手势：长按会话条目 500ms 后弹出操作菜单
+  let longPressTimer = $state(null)
+
+  function handleRowTouchStart(e, sid) {
+    // 记录触摸位置，后续移动超过 10px 则取消长按（区分滚动）
+    const touch = e.touches[0]
+    longPressTimer = setTimeout(() => {
+      longPressTimer = null
+      // 在触摸位置弹出菜单
+      menuPos = { x: touch.clientX, y: touch.clientY }
+      menuOpenId = sid
+    }, 500)
+  }
+
+  function handleRowTouchMove(e) {
+    if (longPressTimer) {
+      clearTimeout(longPressTimer)
+      longPressTimer = null
+    }
+  }
+
+  function handleRowTouchEnd(_e, _sid) {
+    if (longPressTimer) {
+      clearTimeout(longPressTimer)
+      longPressTimer = null
+    }
   }
 
   async function handleGenerateTitle(e, sid) {
@@ -260,10 +299,16 @@
         <div class="session-empty">{t('noSessions')}</div>
       {:else}
         {#each sessionList as entry (entry.session_id)}
-          <div class="session-row">
+          <div
+            class="session-row"
+            ontouchstart={(e) => handleRowTouchStart(e, entry.session_id)}
+            ontouchmove={handleRowTouchMove}
+            ontouchend={(e) => handleRowTouchEnd(e, entry.session_id)}
+          >
             <button
               class="session-item"
               onclick={() => handleSessionClick(entry.session_id)}
+              ontouchend={(e) => { e.preventDefault(); handleSessionClick(entry.session_id) }}
               title={getSessionDisplay(entry).tooltip}
             >
               {getSessionDisplay(entry).display}
@@ -323,6 +368,7 @@
 <style>
   .sidebar {
     height: 100vh;
+    height: 100dvh; /* 移动端动态视口高度，自动适配浏览器地址栏显隐 */
     overflow: hidden;
     background: var(--bg-secondary);
     border-right: 1px solid var(--border);
@@ -366,6 +412,7 @@
     flex-direction: row;
     gap: 8px;
     align-items: stretch;
+    flex-shrink: 0; /* 防止 footer 被挤压，确保始终可见 */
   }
   .sidebar-toggle-btn {
     position: fixed;
@@ -475,6 +522,7 @@
     display: flex;
     align-items: center;
     overflow: hidden;
+    flex-shrink: 0; /* 禁止条目高度被压缩，确保超出时触发滚动 */
   }
   .session-item {
     flex: 1;
@@ -510,6 +558,7 @@
     letter-spacing: 0.05em;
     cursor: pointer;
     opacity: 0;
+    pointer-events: none; /* 默认禁止交互，防止移动端误触吞掉点击事件 */
     transition: opacity 0.15s, background-color 0.15s;
     display: flex;
     align-items: center;
@@ -517,6 +566,7 @@
   }
   .session-row:hover .session-menu-btn {
     opacity: 1;
+    pointer-events: auto; /* 桌面端 hover 时才恢复交互能力 */
   }
   .session-menu-btn:hover {
     background-color: var(--border);
@@ -565,6 +615,7 @@
     padding: 6px 0 6px 10px;
     font-size: 0.82rem;
     color: var(--text-secondary);
+    flex-shrink: 0;
   }
   .session-error { color: var(--danger); }
   

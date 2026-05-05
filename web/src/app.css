@@ -28,6 +28,8 @@
 /* ===== Base Styles ===== */
 *, *::before, *::after {
   box-sizing: border-box;
+  /* 消除移动端 300ms 点击延迟：禁止双击缩放，浏览器无需等待判断手势，立即触发 click */
+  touch-action: manipulation;
 }
 
 body {

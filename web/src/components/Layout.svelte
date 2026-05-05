@@ -39,6 +39,7 @@
       left: 0;
       z-index: 150;
       height: 100vh;
+      height: 100dvh; /* 移动端动态视口高度，自动适配浏览器地址栏显隐 */
       overflow: hidden;
       transition: width 0.2s ease;
     }
