@@ -410,6 +410,10 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             # POST /v1/sessions/{session_id}/generate-title
             session_id = path[len("/v1/sessions/"):-len("/generate-title")]
             self._handle_generate_session_title(urllib.parse.unquote(session_id))
+        elif re.match(r"^/v1/sessions/[^/]+/revoke$", path):
+            # POST /v1/sessions/{session_id}/revoke
+            session_id = path[len("/v1/sessions/"):-len("/revoke")]
+            self._handle_revoke_session(urllib.parse.unquote(session_id))
         elif path == "/v1/agents":
             self._handle_create_agent()
         else:
@@ -821,13 +825,13 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             cancel_event.set()
             if use_session:
-                collected_messages.append(Message(role="assistant", content="\n\nError: interrupted"))
+                collected_messages.append(Message(role="assistant", content="\n\nError: user interrupted."))
                 persist_exc = self._persist_conversation(context_manager, session_id, original_messages, collected_messages, agent_id, agent_nickname)
                 if persist_exc is not None:
                     logger.error("infer_stream: failed to save aborted conversation for session %s: %s", session_id, persist_exc)
         except Exception as exc:
             if use_session:
-                collected_messages.append(Message(role="assistant", content=f"\n\nError: interrupted ({exc})"))
+                collected_messages.append(Message(role="assistant", content=f"\n\nError: system aborted. ({exc})"))
                 persist_exc = self._persist_conversation(context_manager, session_id, original_messages, collected_messages, agent_id, agent_nickname)
                 if persist_exc is not None:
                     logger.error("infer_stream: failed to save aborted conversation for session %s: %s", session_id, persist_exc)
@@ -1458,6 +1462,32 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 self._send_json_response(200, {"status": "success", "session_id": session_id, "title": title})
             else:
                 self._send_json_error(500, f"Failed to generate title for session: {session_id}")
+        except FileNotFoundError:
+            self._send_json_error(404, f"Session not found: {session_id}")
+            return
+        except ValueError as exc:
+            self._send_json_error(400, str(exc))
+            return
+
+    def _handle_revoke_session(self, session_id: str) -> None:
+        """POST /v1/sessions/{session_id}/revoke — 撤回指定用户消息及其后的所有消息。"""
+        body = self._read_json_body()
+        if body is None:
+            return
+
+        timestamp = body.get("timestamp")
+        if not timestamp:
+            self._send_json_error(400, "Missing required field: timestamp")
+            return
+
+        context_manager = self.server.context_manager  # type: ignore[attr-defined]
+        try:
+            removed_count = context_manager.revoke_conversation(session_id, timestamp)
+            self._send_json_response(200, {
+                "status": "success",
+                "session_id": session_id,
+                "removed_count": removed_count,
+            })
         except FileNotFoundError:
             self._send_json_error(404, f"Session not found: {session_id}")
             return

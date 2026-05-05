@@ -2,7 +2,7 @@
   import MessageBubble from './MessageBubble.svelte'
   import { t } from '../../lib/i18n.svelte.js'
 
-  let { messages = [], agentList = [] } = $props()
+  let { messages = [], agentList = [], onRevoke } = $props()
   let listEl = $state(null)
   let isAtBottom = $state(true)
 
@@ -24,7 +24,7 @@
     <div class="empty">{t('startChat')}</div>
   {:else}
     {#each messages as msg, i (i)}
-      <MessageBubble {msg} {agentList} />
+      <MessageBubble {msg} {agentList} {onRevoke} />
     {/each}
   {/if}
 </div>

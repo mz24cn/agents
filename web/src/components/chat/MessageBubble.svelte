@@ -8,6 +8,8 @@
   import { t } from '../../lib/i18n.svelte.js'
   import { highlight } from '../../lib/highlight.js'
 
+  let { msg, agentList = [], onRevoke } = $props()
+
   /**
    * Detect the content type of a tool result.
    * Returns { type: 'json'|'script'|'markdown', lang?: string }
@@ -39,8 +41,6 @@
     }
     return { html: null, lang: null }
   }
-
-  let { msg, agentList = [] } = $props()
 
   // 获取智能体信息
   const matchedAgent = $derived(msg.assistant_id ? agentList.find(a => a.agent_id === msg.assistant_id) : null)
@@ -86,7 +86,14 @@
   <div class="role-label">
     {#if msg.role === 'user'}
       <span>{t('roleUser')}</span>
-      <CopyButton getText={() => msg.content ?? ''} />
+      <div class="role-actions">
+        {#if onRevoke && msg.timestamp}
+          <button class="revoke-btn" onclick={() => onRevoke(msg.timestamp)}>
+            {t('revoke')}
+          </button>
+        {/if}
+        <CopyButton getText={() => msg.content ?? ''} />
+      </div>
     {:else if msg.role === 'assistant'}
       {#if matchedAgent}
         {#if matchedAgent.avatar}
@@ -289,6 +296,31 @@
   .message.user :global(.copy-btn:active) {
     background: rgba(255,255,255,0.4);
     color: #fff;
+  }
+  .revoke-btn {
+    padding: 2px 8px;
+    font-size: 0.75rem;
+    color: rgba(255,255,255,0.7);
+    background: rgba(255,255,255,0.15);
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    letter-spacing: 0.05em;
+    line-height: 1.4;
+    white-space: nowrap;
+    transition: background 0.1s;
+  }
+  .revoke-btn:hover {
+    color: #fff;
+    background: rgba(239, 68, 68, 0.6);
+  }
+  .message.user .revoke-btn {
+    color: rgba(255,255,255,0.7);
+    background: rgba(255,255,255,0.15);
+  }
+  .message.user .revoke-btn:hover {
+    color: #fff;
+    background: rgba(239, 68, 68, 0.6);
   }
   .tool-result-block {
     margin-top: 4px;

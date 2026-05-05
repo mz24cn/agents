@@ -1,5 +1,5 @@
 <script>
-  import { inferStream, abortInferStream, agents as agentsApi, tools as toolsApi } from '../../lib/api.js'
+  import { inferStream, abortInferStream, agents as agentsApi, tools as toolsApi, sessions as sessionsApi } from '../../lib/api.js'
   import ModelSelector from './ModelSelector.svelte'
   import ToolSelector from './ToolSelector.svelte'
   import PromptTemplateSelector from './PromptTemplateSelector.svelte'
@@ -289,6 +289,30 @@
     errorMsg = err?.message || t('streamError')
   }
 
+  async function handleRevoke(timestamp) {
+    if (!sessionId) return
+    // 弹出确认对话框
+    if (!confirm(t('confirmRevoke'))) {
+      return
+    }
+    // 查找被撤回的用户消息内容
+    const revokeIndex = messages.findIndex(m => m.timestamp === timestamp)
+    const revokedMessage = revokeIndex >= 0 ? messages[revokeIndex] : null
+    // 向后端发送撤回请求
+    try {
+      await sessionsApi.revoke(sessionId, timestamp)
+      // 后端操作成功后，才从前端移除消息并填入输入框
+      if (revokeIndex >= 0) {
+        messages = messages.slice(0, revokeIndex)
+      }
+      if (revokedMessage?.content) {
+        inputText = revokedMessage.content
+      }
+    } catch (err) {
+      console.error('Failed to revoke message:', err)
+    }
+  }
+
   $effect(() => {
     if (sessionRestore.pending) {
       const { sessionId: sid, messages: msgs } = sessionRestore.pending
@@ -445,7 +469,7 @@
   {/if}
 
   <div class="message-area">
-    <MessageList {messages} {agentList} />
+    <MessageList {messages} {agentList} onRevoke={handleRevoke} />
 
     {#if templatePanelOpen}
       <div class="template-panel">

@@ -803,6 +803,59 @@ class ContextManager:
             ))
         return turns
 
+    def revoke_conversation(
+        self,
+        session_id: str,
+        timestamp: str,
+    ) -> int:
+        """Revoke messages from the conversation starting from the message with the given timestamp.
+
+        Args:
+            session_id: Target session.
+            timestamp: The timestamp of the user message to revoke from.
+
+        Returns:
+            The number of messages removed.
+
+        Raises:
+            FileNotFoundError: When the conversation file does not exist.
+            ValueError: When the file content is malformed JSON or no message found with the given timestamp.
+        """
+        conv_path = self._conversation_path(session_id)
+        if not os.path.isfile(conv_path):
+            raise FileNotFoundError(f"Conversation file not found: {conv_path}")
+
+        with open(conv_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+
+        messages = data.get("messages", [])
+        
+        # Find the index of the message with the given timestamp
+        revoke_index = -1
+        for i, msg in enumerate(messages):
+            if msg.get("role") == "user" and msg.get("timestamp") == timestamp:
+                revoke_index = i
+                break
+
+        if revoke_index == -1:
+            raise ValueError(f"No user message found with timestamp: {timestamp}")
+
+        # Remove all messages from the revoke_index onwards
+        removed_count = len(messages) - revoke_index
+        new_messages = messages[:revoke_index]
+
+        # Update meta and save
+        now = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        meta = data.get("meta", {})
+        meta["updated_at"] = now
+        meta["turn_count"] = len(new_messages)
+
+        data = {"meta": meta, "messages": new_messages}
+        text = json.dumps(data, ensure_ascii=False, indent=2)
+        self._atomic_write(conv_path, text)
+
+        return removed_count
+
     # ------------------------------------------------------------------
     # Tool call recording
     # ------------------------------------------------------------------
