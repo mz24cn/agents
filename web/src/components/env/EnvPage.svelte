@@ -18,6 +18,12 @@
   let saving = $state(false)
   let saveError = $state('')
 
+  // --- 编辑中 ---
+  let editing = $state(null)      // 正在编辑的 { key, value }，null 表示不在编辑
+  let editValue = $state('')
+  let editSaving = $state(false)
+  let editError = $state('')
+
   // --- 删除确认 ---
   let deleteTarget = $state(null)
 
@@ -25,6 +31,9 @@
   let detecting = $state(false)
   let detectError = $state('')
   let unsetKeys = $state([])     // 检测到但尚未配置的 key 列表
+
+  // --- 数据就绪标记 ---
+  let loaded = $state(false)
 
   // ============================
   // 加载
