@@ -9,6 +9,9 @@
   let isDragging = $state(false)
   let dragStartX = 0
   let dragStartWidth = 0
+  // footer 高度，用于对齐 fixed 按钮
+  let footerEl = $state(null)
+  let footerHeight = $derived(footerEl ? footerEl.offsetHeight : 49)
 
   function handleDragStart(e) {
     if (e.type === 'mousedown' && e.button !== 0) return
@@ -49,13 +52,13 @@
 <div class="layout">
   <!-- Sidebar wrapper -->
   <div class="sidebar-wrapper" class:open={!sidebarWidth.collapsed} style="width: {sidebarWidth.collapsed ? 0 : sidebarWidth.current}px">
-    <Sidebar />
+    <Sidebar bind:footerEl />
   </div>
 
   <!-- Sidebar toggle button: fixed 定位，不在 sidebar-wrapper 内，移动端 display:none 不影响 -->
   <button
     class="sidebar-toggle-btn"
-    style="left: {sidebarWidth.collapsed ? 0 : sidebarWidth.current}px; height: {sidebarWidth.collapsed ? 40 : sidebarWidth.current > 0 ? '100%' : 40}px; bottom: 0;"
+    style="left: {sidebarWidth.collapsed ? 0 : sidebarWidth.current}px; height: {footerHeight}px;"
     onclick={handleToggleClick}
     onmousedown={handleDragStart}
     ontouchstart={handleDragStart}
@@ -93,10 +96,10 @@
     position: relative;
   }
 
-  /* toggle button: 桌面端固定在 sidebar 右边缘底部，用于折叠/展开 + 拖拽调整宽度 */
   .sidebar-toggle-btn {
     position: fixed;
-    z-index: 50;
+    bottom: 0;
+    /* left & height 由 style 属性动态设置 */
     width: fit-content;
     min-width: 0;
     padding: 0 2px;
@@ -108,6 +111,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
+    z-index: 50;
     transition: background-color 0.15s, left 0.2s ease;
   }
   .sidebar-toggle-btn:hover {
@@ -133,18 +137,6 @@
     }
     .sidebar-wrapper.open {
       display: flex;
-    }
-    /* 移动端 toggle button: 固定在左上角 */
-    .sidebar-toggle-btn {
-      top: 12px;
-      left: 12px !important;
-      bottom: auto !important;
-      height: 40px !important;
-      width: 40px;
-      padding: 0;
-      border-radius: 6px;
-      cursor: pointer;
-      z-index: 200;
     }
     .content {
       padding-top: 56px;
