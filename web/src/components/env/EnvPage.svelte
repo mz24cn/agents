@@ -314,54 +314,59 @@
 
   /* ---- 新增表单 ---- */
   .add-form {
-    margin-top: 20px;
-    padding: 16px;
+    margin-bottom: 16px;
+    padding: 10px 14px;
     border: 1px solid var(--border);
-    border-radius: 8px;
+    border-radius: 6px;
     background: var(--bg-secondary);
-  }
-  .add-form h3 {
-    margin: 0 0 12px 0;
-    font-size: 0.95rem;
-    color: var(--text);
   }
   .form-row {
     display: flex;
-    gap: 10px;
+    gap: 8px;
     align-items: center;
     flex-wrap: wrap;
   }
   .form-input {
     flex: 1;
-    min-width: 160px;
-    padding: 8px 12px;
+    min-width: 140px;
+    padding: 4px 10px;
     border: 1px solid var(--border);
-    border-radius: 6px;
+    border-radius: 4px;
     background: var(--bg);
     color: var(--text);
-    font-size: 0.9rem;
+    font-size: 0.85rem;
     outline: none;
   }
   .form-input:focus {
     border-color: var(--primary);
   }
-  .btn {
-    padding: 8px 18px;
-    border: none;
-    border-radius: 6px;
+  /* btn-sm 与 ModelsPage 完全一致 */
+  .btn-sm {
+    padding: 4px 12px;
+    font-size: 0.85rem;
+    background: var(--bg-secondary);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
     cursor: pointer;
-    font-size: 0.9rem;
-    white-space: nowrap;
   }
+  .btn-sm:hover { opacity: 0.8; }
   .btn-primary {
     background: var(--primary);
     color: #fff;
+    border: 1px solid var(--primary);
   }
   .btn-primary:hover { opacity: 0.85; }
   .btn-primary:disabled {
     opacity: 0.5;
     cursor: not-allowed;
   }
+  .btn-danger {
+    background: var(--danger);
+    color: #fff;
+    border: none;
+  }
+  .btn-danger:hover { background: var(--danger-hover); }
 
   /* ---- 检测结果 ---- */
   .detect-section {
