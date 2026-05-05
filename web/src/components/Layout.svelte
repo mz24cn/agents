@@ -4,16 +4,6 @@
   import { sidebarWidth } from '../lib/sidebar-width.svelte.js'
 
   let { children } = $props()
-
-  let sidebarOpen = $state(false)
-
-  function toggleSidebar() {
-    sidebarOpen = !sidebarOpen
-  }
-
-  function closeSidebar() {
-    sidebarOpen = false
-  }
 </script>
 
 <div class="layout">
