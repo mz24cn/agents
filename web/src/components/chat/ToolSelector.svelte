@@ -2,7 +2,7 @@
   import { tools } from '../../lib/api.js'
   import { t } from '../../lib/i18n.svelte.js'
 
-  let { selectedToolIds = $bindable([]), onchange } = $props()
+  let { selectedToolIds = $bindable([]), onchange, disabled = false } = $props()
 
   let toolList = $state([])
   let loading = $state(true)
@@ -87,7 +87,7 @@
 </script>
 
 <div class="tool-selector">
-  <button class="toggle-btn" onclick={() => expanded = !expanded}>
+  <button class="toggle-btn" onclick={() => expanded = !expanded} disabled={disabled}>
     {t('toolsButton', { count: selectedToolIds.length })}
     <span class="arrow">{expanded ? '▲' : '▼'}</span>
   </button>
@@ -153,6 +153,7 @@
     gap: 6px;
   }
   .toggle-btn:hover { background: var(--bg-secondary); }
+  .toggle-btn:disabled { opacity: 0.6; cursor: not-allowed; }
   .arrow { font-size: 0.7rem; }
   .tool-list {
     position: absolute;

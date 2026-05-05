@@ -410,13 +410,13 @@
 
 <div class="chat-page">
   <div class="selection-bar">
-    <div class="selector-wrapper">
+    <div class="selector-wrapper" class:disabled={!!selectedAgentId}>
       📦<a href="#/setup?tab=models" class="nav-link">{t('modelLabel')}</a>
-      <ModelSelector bind:selectedModelId onchange={(id) => localStorage.setItem(STORAGE_MODEL_KEY, id)} />
+      <ModelSelector bind:selectedModelId onchange={(id) => localStorage.setItem(STORAGE_MODEL_KEY, id)} disabled={!!selectedAgentId} />
     </div>
-    <div class="selector-wrapper">
+    <div class="selector-wrapper" class:disabled={!!selectedAgentId}>
       🔧<a href="#/setup?tab=tools" class="nav-link">{t('tools')}</a>
-      <ToolSelector bind:selectedToolIds onchange={(ids) => localStorage.setItem(STORAGE_TOOLS_KEY, JSON.stringify(ids))} />
+      <ToolSelector bind:selectedToolIds onchange={(ids) => localStorage.setItem(STORAGE_TOOLS_KEY, JSON.stringify(ids))} disabled={!!selectedAgentId} />
     </div>
     <div class="agent-selector-spacer"></div>
     <div class="agent-selector">
@@ -560,6 +560,11 @@
     display: flex;
     align-items: center;
     gap: 8px;
+    transition: opacity 0.2s;
+  }
+  .selector-wrapper.disabled {
+    opacity: 0.5;
+    pointer-events: none;
   }
   .nav-link {
     font-size: 0.85rem;

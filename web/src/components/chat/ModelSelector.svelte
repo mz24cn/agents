@@ -2,7 +2,7 @@
   import { models } from '../../lib/api.js'
   import { t } from '../../lib/i18n.svelte.js'
 
-  let { selectedModelId = $bindable(''), onchange } = $props()
+  let { selectedModelId = $bindable(''), onchange, disabled = false } = $props()
 
   let modelList = $state([])
   let loading = $state(true)
@@ -39,7 +39,7 @@
   {:else if error}
     <span class="hint error">{error}</span>
   {:else}
-    <select id="model-select" value={selectedModelId} onchange={handleChange}>
+    <select id="model-select" value={selectedModelId} onchange={handleChange} disabled={disabled}>
       <option value="">{t('selectModelPlaceholder')}</option>
       {#each modelList as m (m.model_id)}
         <option value={m.model_id}>{m.model_id} [{m.model_name}]</option>
@@ -62,6 +62,7 @@
     font-size: 0.9rem;
     min-width: 180px;
   }
+  select:disabled { opacity: 0.6; cursor: not-allowed; }
   .hint { font-size: 0.8rem; color: var(--text-secondary); }
   .hint.error { color: var(--danger); }
 </style>
