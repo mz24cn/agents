@@ -49,6 +49,7 @@
       error = err.message || t('fetchEnvFailed')
     } finally {
       loading = false
+      loaded = true
     }
   }
 
