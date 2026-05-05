@@ -131,6 +131,10 @@
   // 检测
   // ============================
   async function handleDetect() {
+    // 确保环境变量列表已加载后再执行检测过滤
+    if (!loaded) {
+      await fetchEnvVars()
+    }
     detecting = true
     detectError = ''
     unsetKeys = []
