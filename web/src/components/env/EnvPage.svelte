@@ -279,7 +279,7 @@
                         class="btn btn-sm"
                         onclick={handleEditSave}
                         disabled={editSaving}
-                      >{editSaving ? '...' : t('save') ?? 'Save'}</button>
+                      >{editSaving ? '...' : t('save')}</button>
                       <button
                         class="btn btn-sm btn-secondary"
                         onclick={handleEditCancel}
