@@ -17,12 +17,12 @@
   </button>
 
   <!-- Mobile overlay -->
-  {#if sidebarOpen}
+  {#if !sidebarWidth.collapsed}
     <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div class="mobile-overlay" onclick={closeSidebar} onkeydown={() => {}}></div>
+    <div class="mobile-overlay" onclick={() => sidebarWidth.collapsed = true} onkeydown={() => {}}></div>
   {/if}
 
-  <div class="sidebar-wrapper" class:open={sidebarOpen} style="width: {sidebarWidth.collapsed ? 0 : sidebarWidth.current}px">
+  <div class="sidebar-wrapper" class:open={!sidebarWidth.collapsed} style="width: {sidebarWidth.collapsed ? 0 : sidebarWidth.current}px">
     <Sidebar />
   </div>
 
