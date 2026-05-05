@@ -1,8 +1,9 @@
 <script>
-  import { agents, models, promptTemplates } from '../../lib/api.js'
+  import { agents, promptTemplates } from '../../lib/api.js'
   import { t } from '../../lib/i18n.svelte.js'
   import JsonEditor from '../JsonEditor.svelte'
   import ToolSelector from '../chat/ToolSelector.svelte'
+  import ModelSelector from '../chat/ModelSelector.svelte'
 
   let { agent = null, onSuccess, onCancel } = $props()
 
@@ -21,7 +22,6 @@
 
   const isTemplateSelected = $derived(templateId.trim() !== '')
 
-  let modelList = $state([])
   let templateList = $state([])
   let loadingMeta = $state(true)
 
@@ -32,11 +32,10 @@
   async function fetchMeta() {
     loadingMeta = true
     try {
-      const [modelsData, tplData] = await Promise.all([models.list(), promptTemplates.list()])
-      modelList = modelsData.models ?? []
+      const tplData = await promptTemplates.list()
       templateList = tplData.templates ?? []
     } catch {
-      // fallback: empty lists
+      // fallback: empty list
     } finally {
       loadingMeta = false
     }
@@ -105,16 +104,7 @@
 
   <div class="form-group">
     <label for="agent_model">{t('agentModelId')} <span class="required">{t('required')}</span></label>
-    {#if loadingMeta}
-      <span class="hint">{t('loading')}</span>
-    {:else}
-      <select id="agent_model" bind:value={modelId}>
-        <option value="">{t('agentModelSelectHint')}</option>
-        {#each modelList as m (m.model_id)}
-          <option value={m.model_id}>{m.model_name} ({m.model_id})</option>
-        {/each}
-      </select>
-    {/if}
+    <ModelSelector bind:selectedModelId={modelId} />
     {#if errors.modelId}<span class="field-error">{errors.modelId}</span>{/if}
   </div>
 

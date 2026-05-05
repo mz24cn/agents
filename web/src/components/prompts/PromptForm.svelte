@@ -5,7 +5,7 @@
 
   let { template = null, onSuccess, onCancel } = $props()
 
-  const isEdit = template !== null
+  let isEdit = $derived(template !== null)
 
   let templateId = $state(template?.template_id ?? '')
   let content = $state(template?.content ?? '')
