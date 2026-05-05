@@ -261,16 +261,47 @@
             </thead>
             <tbody>
               {#each envVars as item (item.key)}
-                <tr>
-                  <td class="key-cell">{item.key}</td>
-                  <td class="value-cell">{item.value}</td>
-                  <td class="actions">
-                    <button
-                      class="btn btn-sm btn-danger"
-                      onclick={() => handleDeleteClick(item)}
-                    >{t('delete')}</button>
-                  </td>
-                </tr>
+                {#if editing?.key === item.key}
+                  <tr class="editing-row">
+                    <td class="key-cell">{item.key}</td>
+                    <td class="value-cell">
+                      <input
+                        type="text"
+                        bind:value={editValue}
+                        class="inline-input"
+                      />
+                      {#if editError}
+                        <div class="error-msg">{editError}</div>
+                      {/if}
+                    </td>
+                    <td class="actions">
+                      <button
+                        class="btn btn-sm"
+                        onclick={handleEditSave}
+                        disabled={editSaving}
+                      >{editSaving ? '...' : t('save') ?? 'Save'}</button>
+                      <button
+                        class="btn btn-sm btn-secondary"
+                        onclick={handleEditCancel}
+                      >{t('cancel')}</button>
+                    </td>
+                  </tr>
+                {:else}
+                  <tr>
+                    <td class="key-cell">{item.key}</td>
+                    <td class="value-cell">{item.value}</td>
+                    <td class="actions">
+                      <button
+                        class="btn btn-sm"
+                        onclick={() => handleEditClick(item)}
+                      >{t('edit')}</button>
+                      <button
+                        class="btn btn-sm btn-danger"
+                        onclick={() => handleDeleteClick(item)}
+                      >{t('delete')}</button>
+                    </td>
+                  </tr>
+                {/if}
               {/each}
             </tbody>
           </table>
