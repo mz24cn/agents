@@ -527,7 +527,7 @@
   </div>
 
   <ChatInput
-    disabled={isStreaming || !selectedModelId}
+    disabled={isStreaming || (!selectedModelId && !selectedAgentId)}
     onSend={handleSend}
     onStop={handleStop}
     onOpenTemplatePanel={openTemplatePanel}
