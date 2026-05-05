@@ -99,6 +99,35 @@
   }
 
   // ============================
+  // 编辑
+  // ============================
+  function handleEditClick(item) {
+    editing = item
+    editValue = item.value
+    editError = ''
+  }
+
+  async function handleEditSave() {
+    if (!editing) return
+    editSaving = true
+    editError = ''
+    try {
+      await env.set(editing.key, editValue)
+      editing = null
+      await fetchEnvVars()
+    } catch (err) {
+      editError = err.message || t('saveEnvFailed')
+    } finally {
+      editSaving = false
+    }
+  }
+
+  function handleEditCancel() {
+    editing = null
+    editError = ''
+  }
+
+  // ============================
   // 检测
   // ============================
   async function handleDetect() {
