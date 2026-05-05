@@ -354,10 +354,10 @@
 
   /* ---- 检测结果 ---- */
   .detect-section {
-    margin-top: 20px;
-    padding: 16px;
+    margin-bottom: 16px;
+    padding: 10px 14px;
     border: 1px solid var(--border);
-    border-radius: 8px;
+    border-radius: 6px;
     background: var(--bg-secondary);
   }
   .detect-header {
