@@ -15,7 +15,7 @@ chat_data
 # Virtual environments
 .venv/
 venv/
-env/
+/env/
 .env
 
 # Testing
