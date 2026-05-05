@@ -143,7 +143,67 @@
     {#if loading}
       <div class="loading">{t('loading')}</div>
     {:else}
-      <!-- ============ 变量列表 ============ -->
+      <!-- ============ 检测结果（顶部） ============ -->
+      {#if detecting}
+        <div class="detect-section">
+          <div class="loading">{t('detectEnvVars')}...</div>
+        </div>
+      {:else if detectError}
+        <div class="detect-section">
+          <div class="error-msg">{detectError}</div>
+        </div>
+      {:else if unsetKeys.length > 0}
+        <div class="detect-section">
+          <div class="detect-header">{t('detectedUnsetKeys')}</div>
+          <div class="detect-list">
+            {#each unsetKeys as key}
+              <button
+                class="detect-chip"
+                onclick={() => fillKey(key)}
+                title={t('addEnvVar')}
+              >
+                {key}
+              </button>
+            {/each}
+          </div>
+        </div>
+      {:else if triggerDetect > 0}
+        <div class="detect-section">
+          <div class="detect-ok">{t('noUnsetKeys')}</div>
+        </div>
+      {/if}
+
+      <!-- ============ 新增表单（顶部） ============ -->
+      {#if showAddForm}
+        <div class="add-form">
+          <div class="form-row">
+            <input
+              type="text"
+              placeholder={t('envKey')}
+              bind:value={newKey}
+              class="form-input"
+            />
+            <input
+              type="text"
+              placeholder={t('envValue')}
+              bind:value={newValue}
+              class="form-input"
+            />
+            <button
+              class="btn btn-sm btn-primary"
+              onclick={handleAdd}
+              disabled={saving}
+            >
+              {saving ? '...' : t('addEnvVar')}
+            </button>
+          </div>
+          {#if saveError}
+            <div class="error-msg">{saveError}</div>
+          {/if}
+        </div>
+      {/if}
+
+      <!-- ============ 变量列表（底部） ============ -->
       {#if envVars.length === 0 && !showAddForm}
         <div class="empty">{t('noEnvVars')}</div>
       {:else}
@@ -171,67 +231,6 @@
               {/each}
             </tbody>
           </table>
-        </div>
-      {/if}
-
-      <!-- ============ 新增表单 ============ -->
-      {#if showAddForm}
-        <div class="add-form">
-          <h3>{t('addEnvVar')}</h3>
-          {#if saveError}
-            <div class="error-msg">{saveError}</div>
-          {/if}
-          <div class="form-row">
-            <input
-              type="text"
-              placeholder={t('envKey')}
-              bind:value={newKey}
-              class="form-input"
-            />
-            <input
-              type="text"
-              placeholder={t('envValue')}
-              bind:value={newValue}
-              class="form-input"
-            />
-            <button
-              class="btn btn-primary"
-              onclick={handleAdd}
-              disabled={saving}
-            >
-              {saving ? '...' : t('addEnvVar')}
-            </button>
-          </div>
-        </div>
-      {/if}
-
-      <!-- ============ 检测结果 ============ -->
-      {#if detecting}
-        <div class="detect-section">
-          <div class="loading">{t('detectEnvVars')}...</div>
-        </div>
-      {:else if detectError}
-        <div class="detect-section">
-          <div class="error-msg">{detectError}</div>
-        </div>
-      {:else if unsetKeys.length > 0}
-        <div class="detect-section">
-          <div class="detect-header">{t('detectedUnsetKeys')}</div>
-          <div class="detect-list">
-            {#each unsetKeys as key}
-              <button
-                class="detect-chip"
-                onclick={() => fillKey(key)}
-                title={t('addEnvVar')}
-              >
-                {key}
-              </button>
-            {/each}
-          </div>
-        </div>
-      {:else if triggerDetect > 0}
-        <div class="detect-section">
-          <div class="detect-ok">{t('noUnsetKeys')}</div>
         </div>
       {/if}
     {/if}
