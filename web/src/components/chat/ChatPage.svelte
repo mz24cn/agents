@@ -148,7 +148,12 @@
   function _doSend(apiMessages) {
     isStreaming = true
     let aIdxRef = { value: messages.length }
-    messages = [...messages, { role: 'assistant', content: '', thinking: null }]
+    // 创建空assistant消息时带上当前选中的智能体ID
+    const assistantMsg = { role: 'assistant', content: '', thinking: null }
+    if (selectedAgentId) {
+      assistantMsg.assistant_id = selectedAgentId
+    }
+    messages = [...messages, assistantMsg]
     const reqBody = { model_id: selectedModelId, tool_ids: selectedToolIds, messages: apiMessages, stream: true }
     if (selectedAgentId) {
       reqBody.agent_id = selectedAgentId
@@ -291,6 +296,12 @@
       messages = msgs
       sessionId = sid
       errorMsg = ''
+      // 检查最后一条assistant消息的assistant_id，设置智能体选择框
+      const lastAssistantMsg = [...msgs].reverse().find(m => m.role === 'assistant')
+      if (lastAssistantMsg?.assistant_id) {
+        selectedAgentId = lastAssistantMsg.assistant_id
+        localStorage.setItem('chat_selected_agent', lastAssistantMsg.assistant_id)
+      }
     }
   })
 
@@ -376,16 +387,16 @@
 <div class="chat-page">
   <div class="selection-bar">
     <div class="selector-wrapper">
-      <a href="#/setup?tab=models" class="nav-link">{t('modelLabel')}</a>
+      📦<a href="#/setup?tab=models" class="nav-link">{t('modelLabel')}</a>
       <ModelSelector bind:selectedModelId onchange={(id) => localStorage.setItem(STORAGE_MODEL_KEY, id)} />
     </div>
     <div class="selector-wrapper">
-      <a href="#/setup?tab=tools" class="nav-link">{t('tools')}</a>
+      🔧<a href="#/setup?tab=tools" class="nav-link">{t('tools')}</a>
       <ToolSelector bind:selectedToolIds onchange={(ids) => localStorage.setItem(STORAGE_TOOLS_KEY, JSON.stringify(ids))} />
     </div>
     <div class="agent-selector-spacer"></div>
     <div class="agent-selector">
-      <a href="#/setup?tab=agents" class="nav-link">{t('agentSelector')}</a>
+      🤖<a href="#/setup?tab=agents" class="nav-link">{t('agentSelector')}</a>
       {#if loadingAgents}
         <span class="hint">{t('loading')}</span>
       {:else}
@@ -440,7 +451,7 @@
       <div class="template-panel">
         <div class="panel-header">
           <!-- 标题 -->
-          <span class="panel-title">{t('promptTemplatePanelTitle')}</span>
+          📝<a href="#/setup?tab=prompts" class="nav-link">{t('promptTemplatePanelTitle')}</a>
           {#if panelSelectedResult}
             <!-- 占位符标签列表紧跟在标题后面 -->
             {#each extractPlaceholders(panelSelectedResult.template?.content ?? '') as ph}
@@ -450,8 +461,7 @@
           <!-- 撑满中间空间，右对齐区域 -->
           <div class="header-apply-row">
             {#if panelSelectedResult}
-              <!-- template_id 紧靠"作为"前面，复用 panel-title 样式 -->
-              <span class="panel-title">{panelSelectedResult.template?.template_id ?? ''}</span>
+              <a href="#/setup?tab=prompt-edit&templateId={panelSelectedResult.template?.template_id}" class="nav-link">{panelSelectedResult.template?.template_id ?? ''}</a>
               <span class="apply-as-label">{t('applyAs')}</span>
               <button class="btn btn-secondary" onclick={() => handleHeaderApply('system')}>{t('applyAsSystem')}</button>
               <button class="btn btn-primary" onclick={() => handleHeaderApply('user')}>{t('applyAsUserSend')}</button>
@@ -530,11 +540,12 @@
   .nav-link {
     font-size: 0.85rem;
     font-weight: 600;
-    color: var(--primary);
+    color: inherit;
     text-decoration: none;
     white-space: nowrap;
   }
   .nav-link:hover {
+    color: var(--primary);
     text-decoration: underline;
   }
   .agent-selector-spacer { flex: 1; }
@@ -626,13 +637,6 @@
     flex-shrink: 0;
     flex-wrap: nowrap;
     overflow: hidden;
-  }
-  .panel-title {
-    font-size: 0.9rem;
-    font-weight: 600;
-    color: var(--text);
-    white-space: nowrap;
-    flex-shrink: 0;
   }
   .header-placeholder-tag {
     display: inline-block;

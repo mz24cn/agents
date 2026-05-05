@@ -76,6 +76,7 @@ const translations = {
     fetchAgentsFailed: '获取智能体列表失败',
     deleteAgentFailed: '删除智能体失败',
     confirmDeleteAgent: '确定要删除智能体「{id}」吗？',
+    copyAgent: '复制',
 
     // AgentsPage
     agentsPageTitle: '智能体管理',
@@ -223,6 +224,7 @@ const translations = {
     fetchTemplateListFailed: '获取提示词模板列表失败',
     deleteTemplateFailed: '删除模板失败',
     confirmDeleteTemplate: '确定要删除模板「{id}」吗？',
+    copyPrompt: '复制',
 
     // SessionPanel
     sessionPanelTitle: '📚 历史会话',
@@ -377,6 +379,7 @@ const translations = {
     fetchAgentsFailed: 'Failed to fetch agents',
     deleteAgentFailed: 'Failed to delete agent',
     confirmDeleteAgent: 'Delete agent "{id}"?',
+    copyAgent: 'Copy',
 
     // AgentsPage
     agentsPageTitle: 'Agents',
@@ -524,6 +527,7 @@ const translations = {
     fetchTemplateListFailed: 'Failed to fetch template list',
     deleteTemplateFailed: 'Failed to delete template',
     confirmDeleteTemplate: 'Delete template "{id}"?',
+    copyPrompt: 'Copy',
 
     // SessionPanel
     sessionPanelTitle: '📚 History',

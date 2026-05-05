@@ -6,10 +6,14 @@
   let { template = null, onSuccess, onCancel } = $props()
 
   const isEdit = template !== null
-  const _init = template ?? {}
 
-  let templateId = $state(_init.template_id ?? '')
-  let content = $state(_init.content ?? '')
+  let templateId = $state(template?.template_id ?? '')
+  let content = $state(template?.content ?? '')
+
+  $effect(() => {
+    templateId = template?.template_id ?? ''
+    content = template?.content ?? ''
+  })
 
   let errors = $state({})
   let submitError = $state('')

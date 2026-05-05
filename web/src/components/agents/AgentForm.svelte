@@ -17,6 +17,8 @@
   let description = $state(_init.description ?? '')
   let avatar = $state(_init.avatar ?? '')
 
+  const isTemplateSelected = $derived(templateId.trim() !== '')
+
   let modelList = $state([])
   let templateList = $state([])
   let loadingMeta = $state(true)
@@ -129,13 +131,13 @@
 
   <div class="form-group">
     <label for="agent_template_args">{t('agentTemplateArgs')}</label>
-    <JsonEditor id="agent_template_args" bind:value={templateArguments} rows={3} placeholder={"{}"} />
+    <JsonEditor id="agent_template_args" bind:value={templateArguments} rows={3} placeholder={"{}"} disabled={!isTemplateSelected} />
     {#if errors.templateArgs}<span class="field-error">{errors.templateArgs}</span>{/if}
   </div>
 
   <div class="form-group">
     <label for="agent_system_prompt">{t('agentSystemPrompt')}</label>
-    <textarea id="agent_system_prompt" bind:value={systemPrompt} rows="4" placeholder={t('agentSystemPromptPlaceholder')}></textarea>
+    <textarea id="agent_system_prompt" bind:value={systemPrompt} rows="4" placeholder={t('agentSystemPromptPlaceholder')} disabled={isTemplateSelected}></textarea>
   </div>
 
   <div class="form-group">
@@ -172,6 +174,9 @@
   textarea { resize: vertical; }
   .field-error { color: var(--danger); font-size: 0.8rem; margin-top: 2px; }
   .hint { font-size: 0.85rem; color: var(--text-secondary); }
+  .json-editor:has(textarea:disabled) { opacity: 0.6; }
+  .json-editor:has(textarea:disabled)::after { content: ''; position: absolute; inset: 0; cursor: not-allowed; }
+  input:disabled, textarea:disabled, select:disabled { opacity: 0.6; cursor: not-allowed; }
   .form-actions { display: flex; justify-content: flex-end; gap: 12px; margin-top: 16px; }
   .btn { padding: 8px 20px; border-radius: 6px; border: none; cursor: pointer; font-size: 0.9rem; }
   .btn:disabled { opacity: 0.6; cursor: not-allowed; }

@@ -3,7 +3,7 @@
   import ConfirmDialog from '../ConfirmDialog.svelte'
   import { t } from '../../lib/i18n.svelte.js'
 
-  let { onEdit = null } = $props()
+  let { onEdit = null, onCopy = null } = $props()
 
   let modelList = $state([])
   let loading = $state(true)
@@ -27,6 +27,10 @@
 
   function handleEditClick(model) {
     if (onEdit) onEdit(model)
+  }
+
+  function handleCopyClick(model) {
+    if (onCopy) onCopy(model)
   }
 
   async function handleDeleteConfirm() {
@@ -79,6 +83,7 @@
                 <td>{m.api_protocol}</td>
                 <td class="actions">
                   <button class="btn btn-sm" onclick={() => handleEditClick(m)}>{t('edit')}</button>
+                  <button class="btn btn-sm btn-secondary" onclick={() => handleCopyClick(m)}>{t('copyModel')}</button>
                   <button class="btn btn-sm btn-danger" onclick={() => handleDeleteClick(m)}>{t('delete')}</button>
                 </td>
               </tr>
@@ -105,6 +110,8 @@
   }
   .btn-sm { padding: 4px 12px; font-size: 0.85rem; background: var(--bg-secondary); color: var(--text); border: 1px solid var(--border); border-radius: 4px; }
   .btn-sm:hover { opacity: 0.8; }
+  .btn-secondary { background: var(--bg-secondary); color: var(--text); border: 1px solid var(--border); }
+  .btn-secondary:hover { background: var(--primary); color: #fff; border-color: var(--primary); }
   .btn-danger { background: var(--danger); color: #fff; border: none; }
   .btn-danger:hover { background: var(--danger-hover); }
   .error-msg { background: var(--danger); color: #fff; padding: 10px 14px; border-radius: 6px; margin: 0 20px; font-size: 0.9rem; }

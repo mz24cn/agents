@@ -42,7 +42,7 @@
     <select id="model-select" value={selectedModelId} onchange={handleChange}>
       <option value="">{t('selectModelPlaceholder')}</option>
       {#each modelList as m (m.model_id)}
-        <option value={m.model_id}>{m.model_name} ({m.model_id})</option>
+        <option value={m.model_id}>{m.model_id} [{m.model_name}]</option>
       {/each}
     </select>
     {#if !selectedModelId}

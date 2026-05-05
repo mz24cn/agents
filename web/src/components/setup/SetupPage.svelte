@@ -1,6 +1,7 @@
 <script>
   import { router, getQueryParam } from '../../lib/router.svelte.js'
   import { t } from '../../lib/i18n.svelte.js'
+  import { promptTemplates } from '../../lib/api.js'
   import ModelsPage from '../models/ModelsPage.svelte'
   import ToolsPage from '../tools/ToolsPage.svelte'
   import PromptsPage from '../prompts/PromptsPage.svelte'
@@ -21,6 +22,33 @@
   let editingTool = $state(null)
   let editingPrompt = $state(null)
   let editingAgent = $state(null)
+
+  $effect(() => {
+    const hash = router.current
+    const tabParam = (() => {
+      const q = hash.split('?')[1] || ''
+      const p = new URLSearchParams(q)
+      return p.get('tab') || ''
+    })()
+    if (validTabs.includes(tabParam)) {
+      activeTab = tabParam
+    }
+  })
+
+  $effect(() => {
+    const tab = activeTab
+    if (tab === 'prompt-edit') {
+      const hash = router.current
+      const params = new URLSearchParams(hash.split('?')[1] || '')
+      const templateId = params.get('templateId') || ''
+      if (templateId) {
+        promptTemplates.list().then(data => {
+          const found = data.templates?.find(t => t.template_id === templateId)
+          if (found) editingPrompt = found
+        })
+      }
+    }
+  })
 
   const tabGroups = $derived.by(() => [
     {
@@ -92,6 +120,12 @@
     activeTab = 'model-edit'
   }
 
+  function handleCopyModel(model) {
+    const copied = { ...model, model_id: '' }
+    editingModel = copied
+    activeTab = 'model-edit'
+  }
+
   function handleEditTool(tool, serverName) {
     if (tool.tool_type === 'mcp' && serverName) {
       mcpServers.list().then(data => {
@@ -115,8 +149,20 @@
     activeTab = 'prompt-edit'
   }
 
+  function handleCopyPrompt(prompt) {
+    const copied = { ...prompt, template_id: '' }
+    editingPrompt = copied
+    activeTab = 'prompt-edit'
+  }
+
   function handleEditAgent(agent) {
     editingAgent = agent
+    activeTab = 'agent-edit'
+  }
+
+  function handleCopyAgent(agent) {
+    const copied = { ...agent, agent_id: '' }
+    editingAgent = copied
     activeTab = 'agent-edit'
   }
 </script>
@@ -150,7 +196,7 @@
 
   <div class="setup-content">
     {#if activeTab === 'models'}
-      <ModelsPage onEdit={handleEditModel} />
+      <ModelsPage onEdit={handleEditModel} onCopy={handleCopyModel} />
     {:else if activeTab === 'model-add'}
       <div class="form-wrapper">
         <ModelForm onSuccess={handleModelFormSuccess} onCancel={handleFormCancel} />
@@ -170,7 +216,7 @@
         <ToolForm tool={editingTool} onSuccess={handleToolFormSuccess} onCancel={handleFormCancel} />
       </div>
     {:else if activeTab === 'prompts'}
-      <PromptsPage onEdit={handleEditPrompt} />
+      <PromptsPage onEdit={handleEditPrompt} onCopy={handleCopyPrompt} />
     {:else if activeTab === 'prompt-add'}
       <div class="form-wrapper">
         <PromptForm onSuccess={handlePromptFormSuccess} onCancel={handleFormCancel} />
@@ -180,7 +226,7 @@
         <PromptForm template={editingPrompt} onSuccess={handlePromptFormSuccess} onCancel={handleFormCancel} />
       </div>
     {:else if activeTab === 'agents'}
-      <AgentsPage onEdit={handleEditAgent} />
+      <AgentsPage onEdit={handleEditAgent} onCopy={handleCopyAgent} />
     {:else if activeTab === 'agent-add'}
       <div class="form-wrapper">
         <AgentForm onSuccess={handleAgentFormSuccess} onCancel={handleFormCancel} />
