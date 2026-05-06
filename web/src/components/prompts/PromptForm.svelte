@@ -37,7 +37,7 @@
     submitError = ''
     const payload = { template_id: templateId.trim(), content: content.trim() }
     try {
-      if (isEdit) await promptTemplates.update(template.template_id, payload)
+      if (isEdit) await promptTemplates.update(originalTemplateId, payload)
       else await promptTemplates.create(payload)
       onSuccess()
     } catch (err) {
