@@ -10,6 +10,7 @@ import os
 import time
 import urllib.request
 import urllib.error
+import datetime as _dt
 from typing import Iterator, Optional
 
 from runtime.models import (
@@ -81,6 +82,9 @@ class Runtime:
         if request.messages is not None and len(request.messages) > 0:
             messages = list(request.messages)
             for msg in messages:
+                if msg.timestamp is None:
+                    import datetime as _dt
+                    msg.timestamp = _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
                 if (
                     not msg.content
                     and msg.prompt_template is not None
@@ -95,7 +99,8 @@ class Runtime:
                         msg.content = content
             return messages
         if request.text is not None:
-            return [Message(role="user", content=request.text)]
+            import datetime as _dt
+            return [Message(role="user", content=request.text, timestamp=_dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"))]
         return []
 
     # ------------------------------------------------------------------
@@ -715,9 +720,13 @@ class Runtime:
             Message objects incrementally.
         """
         # 1. Setup (same as infer)
+        def _now_ts() -> str:
+            """Return current wall-clock timestamp in ISO 8601 format."""
+            return _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
         model_config = self._model_registry.get(request.model_id)
         if model_config is None:
-            yield Message(role="assistant",
+            yield Message(role="assistant", timestamp=_now_ts(),
                           content=f"Error: Model '{request.model_id}' not found")
             return
 
@@ -730,7 +739,7 @@ class Runtime:
         protocol_name = model_config.api_protocol
         protocol_cls = PROTOCOL_MAP.get(protocol_name)
         if protocol_cls is None:
-            yield Message(role="assistant",
+            yield Message(role="assistant", timestamp=_now_ts(),
                           content=f"Error: Unsupported protocol '{protocol_name}'")
             return
         protocol = protocol_cls()
@@ -768,10 +777,10 @@ class Runtime:
                 detail = f"HTTP {exc.code}: {exc.reason}"
                 if error_body:
                     detail += f" | body: {error_body[:500]}"
-                yield Message(role="assistant", content=f"Error: {detail}")
+                yield Message(role="assistant", timestamp=_now_ts(), content=f"Error: {detail}")
                 return
             except Exception as exc:
-                yield Message(role="assistant", content=f"Error: {exc}")
+                yield Message(role="assistant", timestamp=_now_ts(), content=f"Error: {exc}")
                 return
 
             # Stream this round and collect the full assistant message
@@ -835,7 +844,7 @@ class Runtime:
                             if tc.get("arguments"):
                                 accumulated_tool_calls[idx]["arguments"] += tc["arguments"]
             except Exception as exc:
-                yield Message(role="assistant", content=f"Error: stream parse: {exc}")
+                yield Message(role="assistant", timestamp=_now_ts(), content=f"Error: stream parse: {exc}")
                 return
             finally:
                 stream_end_time = time.monotonic()
@@ -856,6 +865,7 @@ class Runtime:
             assistant_msg = Message(
                 role="assistant",
                 content=full_content,
+                timestamp=_now_ts(),
                 thinking=full_thinking if full_thinking else None,
                 tool_calls=all_tool_calls,
             )
@@ -879,7 +889,7 @@ class Runtime:
                 }
                 if ttft_ms is not None:
                     stat_dict["ttft_ms"] = round(ttft_ms, 1)
-                yield Message(role="usage", name="round", content=json.dumps(stat_dict))
+                yield Message(role="usage", timestamp=_now_ts(), name="round", content=json.dumps(stat_dict))
                 return
 
             # Max rounds check
@@ -892,12 +902,13 @@ class Runtime:
                     pending_name = fn_call.get("name", "unknown_tool")
                     yield Message(
                         role="tool",
+                        timestamp=_now_ts(),
                         name=pending_name,
-                        content=(
-                            f"Error: maximum tool-call rounds ({request.max_tool_rounds}) "
-                            f"reached. Tool '{pending_name}' was not executed."
-                        ),
-                    )
+                    content=(
+                        f"Error: maximum tool-call rounds ({request.max_tool_rounds}) "
+                        f"reached. Tool '{pending_name}' was not executed."
+                    ),
+                )
                 stat_dict = {
                     "prompt_tokens": round_prompt,
                     "completion_tokens": round_completion,
@@ -911,7 +922,7 @@ class Runtime:
                 }
                 if ttft_ms is not None:
                     stat_dict["ttft_ms"] = round(ttft_ms, 1)
-                yield Message(role="usage", name="round", content=json.dumps(stat_dict))
+                yield Message(role="usage", timestamp=_now_ts(), name="round", content=json.dumps(stat_dict))
                 return
 
             # Execute all tool calls sequentially in this round
@@ -933,6 +944,7 @@ class Runtime:
                         cwd_hint = f"\n\n技能工作目录: {skill_dir}" if skill_dir else ""
                         fn_msg = Message(
                             role="tool",
+                            timestamp=_now_ts(),
                             name=tool_name,
                             content=(
                                 f"用户选择了 {tool_name} 技能。以下是该技能的详细文档，"
@@ -957,7 +969,7 @@ class Runtime:
 
                 tool_result, tool_config = self._execute_tool_call(tool_name, arguments, tool_scope=tools)
 
-                tool_msg = Message(role="tool", content=tool_result, name=tool_name, tool_id=tool_config.tool_id if tool_config else None)
+                tool_msg = Message(role="tool", timestamp=_now_ts(), content=tool_result, name=tool_name, tool_id=tool_config.tool_id if tool_config else None)
                 messages.append(tool_msg)
                 yield tool_msg
 

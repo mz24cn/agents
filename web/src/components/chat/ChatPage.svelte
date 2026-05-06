@@ -113,7 +113,6 @@
   function handleSend(text) {
     if (!selectedModelId && !selectedAgentId || isStreaming) return
     errorMsg = ''
-    messages = [...messages, { role: 'user', content: text }]
     const apiMessages = []
     // Only send system message on the first request (no session yet)
     // On subsequent requests, the backend will restore it from session history
@@ -125,13 +124,13 @@
       }
     }
     apiMessages.push({ role: 'user', content: text })
-    _doSend(apiMessages)
+    const pendingUserMsg = { role: 'user', content: text, timestamp: new Date().toISOString().slice(0, 19).replace('T', ' ') }
+    _doSend(apiMessages, pendingUserMsg)
   }
 
   function handleSendTemplate(templateId, args) {
     if (!selectedModelId && !selectedAgentId || isStreaming) return
     errorMsg = ''
-    messages = [...messages, { role: 'user', content: '', prompt_template: templateId, arguments: args }]
     const apiMessages = []
     // Only send system message on the first request (no session yet)
     if (!sessionId) {
@@ -142,18 +141,13 @@
       }
     }
     apiMessages.push({ role: 'user', content: '', prompt_template: templateId, arguments: args })
-    _doSend(apiMessages)
+    const pendingUserMsg = { role: 'user', content: '', timestamp: new Date().toISOString().slice(0, 19).replace('T', ' '), prompt_template: templateId, arguments: args }
+    _doSend(apiMessages, pendingUserMsg)
   }
 
-  function _doSend(apiMessages) {
+  function _doSend(apiMessages, pendingUserMsg) {
     isStreaming = true
-    let aIdxRef = { value: messages.length }
-    // 创建空assistant消息时带上当前选中的智能体ID
-    const assistantMsg = { role: 'assistant', content: '', thinking: null }
-    if (selectedAgentId) {
-      assistantMsg.assistant_id = selectedAgentId
-    }
-    messages = [...messages, assistantMsg]
+    let aIdxRef = { value: -1 }
     const reqBody = { model_id: selectedModelId, tool_ids: selectedToolIds, messages: apiMessages, stream: true }
     if (selectedAgentId) {
       reqBody.agent_id = selectedAgentId
@@ -163,11 +157,47 @@
     const pendingFirstUserMsg = !sessionId
       ? (apiMessages.find(m => m.role === 'user')?.content || null)
       : null
+
+    // 收到 init 事件后，才创建用户消息和助手占位消息
+    const onInit = (initData) => {
+      // 同步 sessionId
+      if (initData.session_id) {
+        sessionId = initData.session_id
+      }
+      // 通知 Sidebar 有新会话创建（仅当之前没有 sessionId 时）
+      if (!newSessionCreated.sessionId && initData.session_id) {
+        newSessionCreated.sessionId = initData.session_id
+        newSessionCreated.firstUserMessage = pendingFirstUserMsg ?? null
+        if (initData.title) {
+          newSessionCreated.title = initData.title
+        }
+      }
+      // 创建用户消息（带服务端返回的时间戳）
+      if (initData.user_message_timestamp) {
+        const userMsg = { ...pendingUserMsg }
+        userMsg.timestamp = initData.user_message_timestamp
+        messages = [...messages, userMsg]
+      }
+      // 创建空助手消息占位
+      const assistantMsg = { role: 'assistant', content: '', thinking: null }
+      if (selectedAgentId) {
+        assistantMsg.assistant_id = selectedAgentId
+      }
+      messages = [...messages, assistantMsg]
+      aIdxRef.value = messages.length - 1
+      // 继承 agent_nickname
+      const prevAgent = [...messages].reverse().find(m => m.role === 'assistant' && m.agent_nickname)
+      if (prevAgent) {
+        messages[aIdxRef.value].agent_nickname = prevAgent.agent_nickname
+      }
+    }
+
     abortStream = inferStream(
       reqBody,
       (msg) => onStreamMsg(msg, aIdxRef, pendingFirstUserMsg),
       () => onStreamDone(),
       (err) => onStreamErr(err),
+      onInit,
     )
   }
 

@@ -15,6 +15,7 @@ class Message:
     Attributes:
         role: Message role - "system", "user", "assistant", or "tool".
         content: Text content of the message.
+        timestamp: ISO 8601 timestamp indicating when this message was generated.
         name: Optional name (used for tool role messages).
         tool_calls: Optional list of tool call dicts for parallel tool calls.
         images: Optional list of base64-encoded image strings (multimodal).
@@ -26,6 +27,7 @@ class Message:
 
     role: str
     content: str = ""
+    timestamp: Optional[str] = None
     name: Optional[str] = None
     tool_calls: Optional[list[dict]] = None
     images: Optional[list] = None
@@ -39,6 +41,8 @@ class Message:
     def to_dict(self) -> dict:
         """Serialize to a dictionary, omitting None fields."""
         d: dict = {"role": self.role, "content": self.content}
+        if self.timestamp is not None:
+            d["timestamp"] = self.timestamp
         if self.name is not None:
             d["name"] = self.name
         if self.tool_calls is not None:
@@ -65,6 +69,7 @@ class Message:
         return cls(
             role=data["role"],
             content=data.get("content", ""),
+            timestamp=data.get("timestamp"),
             name=data.get("name"),
             tool_calls=data.get("tool_calls"),
             images=data.get("images"),

@@ -37,7 +37,16 @@
   function renderToolResult(content) {
     const { type, lang } = detectToolResultType(content)
     if (type === 'json' || type === 'script') {
-      return { html: highlight(content, lang), lang }
+      let displayContent = content
+      // Pretty-print JSON to match tool call argument display
+      if (type === 'json') {
+        try {
+          displayContent = JSON.stringify(JSON.parse(content), null, 2)
+        } catch {
+          // Invalid JSON — fall back to raw content
+        }
+      }
+      return { html: highlight(displayContent, lang), lang }
     }
     return { html: null, lang: null }
   }

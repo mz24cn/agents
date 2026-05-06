@@ -75,7 +75,8 @@ def merge_stream_messages(stream_messages: list) -> tuple[list, Optional[dict]]:
     def _flush_assistant(stat=None):
         nonlocal assistant_text_buf, assistant_thinking_buf, pending_tool_calls
         if assistant_text_buf or pending_tool_calls or assistant_thinking_buf:
-            ts = _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            # 优先使用第一条 assistant delta 的时间戳作为本轮时间戳
+            ts = first_assistant_ts if first_assistant_ts else _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
             turns.append(ConversationTurn(
                 role="assistant",
                 content=assistant_text_buf,
@@ -88,6 +89,8 @@ def merge_stream_messages(stream_messages: list) -> tuple[list, Optional[dict]]:
             assistant_thinking_buf = ""
             pending_tool_calls = []
 
+    first_assistant_ts: Optional[str] = None
+
     for m in stream_messages:
         if m.role == "usage":
             try:
@@ -96,6 +99,9 @@ def merge_stream_messages(stream_messages: list) -> tuple[list, Optional[dict]]:
                 pass
             continue
         if m.role == "assistant":
+            # 记录第一条 assistant delta 的时间戳
+            if first_assistant_ts is None and m.timestamp:
+                first_assistant_ts = m.timestamp
             if m.tool_calls:
                 # tool_calls 到来时，合并到当前 assistant turn（不单独 flush）
                 pending_tool_calls = m.tool_calls
@@ -106,7 +112,8 @@ def merge_stream_messages(stream_messages: list) -> tuple[list, Optional[dict]]:
         elif m.role == "tool":
             # tool result 到来时先 flush assistant turn（含 tool_calls）
             _flush_assistant()
-            ts = _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            # 复用 Message 自带的时间戳，无则 fallback
+            ts = m.timestamp if m.timestamp else _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
             turns.append(ConversationTurn(
                 role="tool",
                 content=m.content or "",
@@ -163,7 +170,8 @@ def persist_conversation(
             existing_turns = []
         new_turns = list(existing_turns)
         for m in (original_messages or []):
-            ts = _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            # 复用 Message 自带的时间戳，无则 fallback 为当前时间
+            ts = m.timestamp if m.timestamp else _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
             new_turns.append(ConversationTurn(
                 role=m.role,
                 content=m.content or "",
@@ -580,7 +588,15 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
 
         original_messages = None
         if "messages" in body:
-            original_messages = [Message.from_dict(m) for m in body["messages"]]
+            import datetime as _dt
+            now_ts = _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            original_messages = []
+            for m in body["messages"]:
+                msg = Message.from_dict(m)
+                # 为每条消息注入实际创建时间戳
+                if msg.timestamp is None:
+                    msg.timestamp = now_ts
+                original_messages.append(msg)
 
         assembled_messages = original_messages
         if use_session and session_id is not None:
@@ -756,8 +772,9 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
     def _handle_infer_stream(self) -> None:
         """POST /v1/infer/stream — execute streaming model inference.
 
-        Returns Server-Sent Events (SSE) stream. Each event contains a
-        JSON-encoded Message delta. Optional JSON field: session_id.
+        Returns Server-Sent Events (SSE) stream. 
+        First event: 'init' containing session_id and user_message_timestamp.
+        Subsequent events: Assistant messages.
         """
         result = self._prepare_infer_request()
         if result is None:
@@ -771,6 +788,53 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         if session_id is not None:
             self.send_header("X-Session-Id", session_id)
         self.end_headers()
+
+        # === 前置发送 Session Init 消息 ===
+        # 从 original_messages 中提取用户消息时间戳（已在 _prepare_infer_request 中注入）
+        user_message_ts = None
+        has_system_prompt = False
+        if original_messages:
+            if original_messages[0].role == "system":
+                has_system_prompt = True
+            for m in original_messages:
+                if m.role == "user":
+                    user_message_ts = m.timestamp
+                    break
+
+        # === 生成会话标题（如果尚未设置） ===
+        session_title = None
+        session = None
+        if use_session and session_id:
+            try:
+                session_manager = self.server.session_manager  # type: ignore[attr-defined]
+                session = session_manager.get_session(session_id)
+            except Exception:
+                pass
+        if session and session.get("title"):
+            session_title = session["title"]
+        elif user_message_ts:
+            # 从 original_messages 中提取第一条用户消息内容作为预览标题
+            for m in original_messages:
+                if m.role == "user":
+                    content = m.content.strip() if m.content else ""
+                    session_title = content[:30] + ".." if len(content) > 30 else content
+                    break
+        if not session_title:
+            session_title = session_id  # 兜底：用 session_id 作为标题
+
+        init_payload = {
+            "session_id": session_id,
+            "type": "init",
+            "user_message_timestamp": user_message_ts,
+            "has_system_prompt": has_system_prompt,
+            "agent_id": agent_id,
+            "agent_nickname": agent_nickname,
+            "title": session_title,
+        }
+        # 发送 event: init 帧
+        self.wfile.write(f"event: init\ndata: {json.dumps(init_payload, ensure_ascii=False)}\n\n".encode("utf-8"))
+        self.wfile.flush()
+        # ================================
 
         cancel_event = threading.Event()
         runtime = self._get_runtime()
@@ -810,10 +874,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 if msg.role == "assistant" and msg.content and msg.content.startswith("Error:"):
                     logger.error("infer_stream error event | model=%s %s", request.model_id, msg.content)
 
-            if use_session and session_id is not None:
-                session_event = json.dumps({"session_id": session_id}, ensure_ascii=False)
-                self.wfile.write(f"data: {session_event}\n\n".encode("utf-8"))
-                self.wfile.flush()
+            # 【已移除】尾部发送 session_id 的逻辑，已在第一条消息中发送
 
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
@@ -825,13 +886,15 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             cancel_event.set()
             if use_session:
-                collected_messages.append(Message(role="assistant", content="\n\nError: user interrupted."))
+                import datetime as _dt
+                collected_messages.append(Message(role="assistant", timestamp=_dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"), content="\n\nError: user interrupted."))
                 persist_exc = self._persist_conversation(context_manager, session_id, original_messages, collected_messages, agent_id, agent_nickname)
                 if persist_exc is not None:
                     logger.error("infer_stream: failed to save aborted conversation for session %s: %s", session_id, persist_exc)
         except Exception as exc:
             if use_session:
-                collected_messages.append(Message(role="assistant", content=f"\n\nError: system aborted. ({exc})"))
+                import datetime as _dt
+                collected_messages.append(Message(role="assistant", timestamp=_dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"), content=f"\n\nError: system aborted. ({exc})"))
                 persist_exc = self._persist_conversation(context_manager, session_id, original_messages, collected_messages, agent_id, agent_nickname)
                 if persist_exc is not None:
                     logger.error("infer_stream: failed to save aborted conversation for session %s: %s", session_id, persist_exc)

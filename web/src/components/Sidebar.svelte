@@ -222,15 +222,17 @@
       // 检查是否已存在
       const exists = sessionList.some(s => s.session_id === sid)
       if (!exists) {
-        // 用第一条用户消息作为临时标题，回退到 session_id
+        // 优先使用后端生成的标题，回退到第一条用户消息，再回退到 session_id
         const firstMsg = newSessionCreated.firstUserMessage
-        const title = (firstMsg && firstMsg.trim()) ? firstMsg.trim() : sid
+        const title = newSessionCreated.title
+            || (firstMsg && firstMsg.trim() ? firstMsg.trim() : sid)
         // 动态添加新会话条目到列表顶部
         sessionList = [{ session_id: sid, title }, ...sessionList]
       }
       // 重置状态，避免重复处理
       newSessionCreated.sessionId = null
       newSessionCreated.firstUserMessage = null
+      newSessionCreated.title = null
     }
   })
 </script>

@@ -6,5 +6,6 @@ export const sessionRestore = $state({ pending: null })
 
 // 新会话创建通知：ChatPage 通知 Sidebar 动态添加新会话条目
 // firstUserMessage: 用户第一条消息文本，用于在标题生成前作为临时标题
-export const newSessionCreated = $state({ sessionId: null, firstUserMessage: null })
+export const newSessionCreated = $state({ sessionId: null, firstUserMessage: null, title: null })
 // sessionId: string | null — 新创建的会话 ID
+// title: string | null — 后端生成的会话标题

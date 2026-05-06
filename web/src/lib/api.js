@@ -75,7 +75,7 @@ export const promptTemplates = {
  * @param {function} onError    Called on fetch or parse errors
  * @returns {function}          Call to abort the stream
  */
-export function inferStream(body, onMessage, onDone, onError) {
+export function inferStream(body, onMessage, onDone, onError, onInit = null) {
   const controller = new AbortController()
 
   fetch('/v1/infer/stream', {
@@ -93,6 +93,7 @@ export function inferStream(body, onMessage, onDone, onError) {
       const reader = res.body.getReader()
       const decoder = new TextDecoder()
       let buffer = ''
+      let currentEvent = 'message'
 
       function pump() {
         reader.read().then(({ done, value }) => {
@@ -106,16 +107,26 @@ export function inferStream(body, onMessage, onDone, onError) {
           buffer = lines.pop() || ''
           for (const line of lines) {
             const trimmed = line.trim()
-            if (!trimmed || !trimmed.startsWith('data:')) continue
-            const payload = trimmed.slice(5).trim()
-            if (payload === '[DONE]') {
-              onDone()
-              return
-            }
-            try {
-              onMessage(JSON.parse(payload))
-            } catch {
-              // skip malformed JSON chunks
+            if (trimmed.startsWith('event: ')) {
+              currentEvent = trimmed.slice(7).trim()
+            } else if (trimmed.startsWith('data: ')) {
+              const payload = trimmed.slice(6).trim()
+              if (payload === '[DONE]') {
+                onDone()
+                return
+              }
+              try {
+                const data = JSON.parse(payload)
+                if (currentEvent === 'init' && onInit) {
+                  onInit(data)
+                } else if (currentEvent !== 'init') {
+                  onMessage(data)
+                }
+              } catch {
+                // skip malformed JSON chunks
+              }
+            } else if (trimmed === '') {
+              currentEvent = 'message'  // Reset to default event type after blank line
             }
           }
           pump()
