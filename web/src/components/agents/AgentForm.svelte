@@ -79,7 +79,7 @@
       avatar: avatar.trim(),
     }
     try {
-      if (isEdit) await agents.update(agent.agent_id, payload)
+      if (isEdit) await agents.update(originalAgentId, payload)
       else await agents.create(payload)
       onSuccess()
     } catch (err) {
