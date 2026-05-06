@@ -7,8 +7,9 @@
 
   let { agent = null, onSuccess, onCancel } = $props()
 
-  const isEdit = agent !== null
   const _init = agent ?? {}
+  const originalAgentId = _init.agent_id ?? ''  // 保存原始ID用于API调用
+  const isEdit = originalAgentId !== ''  // 有原始ID才是编辑模式，复制时agent_id为空算创建
 
   let nickname = $state(_init.nickname ?? '')
   let modelId = $state(_init.model_id ?? '')
