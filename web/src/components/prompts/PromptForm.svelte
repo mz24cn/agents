@@ -5,14 +5,16 @@
 
   let { template = null, onSuccess, onCancel } = $props()
 
-  let isEdit = $derived(template !== null)
+  const _init = template ?? {}
+  const originalTemplateId = _init.template_id ?? ''  // 保存原始ID用于API调用
+  let isEdit = $derived(originalTemplateId !== '')  // 有原始ID才是编辑模式，复制时template_id为空算创建
 
-  let templateId = $state(template?.template_id ?? '')
-  let content = $state(template?.content ?? '')
+  let templateId = $state(_init.template_id ?? '')
+  let content = $state(_init.content ?? '')
 
   $effect(() => {
-    templateId = template?.template_id ?? ''
-    content = template?.content ?? ''
+    templateId = _init.template_id ?? ''
+    content = _init.content ?? ''
   })
 
   let errors = $state({})
