@@ -23,6 +23,21 @@
   let submitError = $state('')
   let submitting = $state(false)
 
+  let apiBasePlaceholder = $derived(
+    api_protocol === 'anthropic'
+      ? 'https://api.anthropic.com/v1'
+      : api_protocol === 'ollama'
+        ? 'http://localhost:11434'
+        : 'https://api.openai.com/v1'
+  )
+  let apiBaseHint = $derived(
+    api_protocol === 'anthropic'
+      ? 'Anthropic API 地址'
+      : api_protocol === 'ollama'
+        ? 'Ollama 本地地址'
+        : 'OpenAI API 地址'
+  )
+
   function validate() {
     const e = {}
     if (!model_id.trim()) e.model_id = t('modelIdRequired')
@@ -81,8 +96,9 @@
 
   <div class="form-group">
     <label for="api_base">{t('apiBase')} <span class="required">{t('required')}</span></label>
-    <input id="api_base" type="text" bind:value={api_base} placeholder={t('apiBasePlaceholder')} />
+    <input id="api_base" type="text" bind:value={api_base} placeholder={apiBasePlaceholder} />
     {#if errors.api_base}<span class="field-error">{errors.api_base}</span>{/if}
+    {#if apiBaseHint}<span class="field-hint">{apiBaseHint}</span>{/if}
   </div>
 
   <div class="form-group">
@@ -102,17 +118,17 @@
         {/each}
       </div>
     </div>
-    <div class="form-group">
-      <span class="radio-label">{t('apiProtocol')}</span>
-      <div class="radio-group">
-        {#each [['openai','OpenAI'],['ollama','Ollama']] as [val, label]}
-          <label class="radio-item">
-            <input type="radio" name="api_protocol" value={val} bind:group={api_protocol} />
-            {label}
-          </label>
-        {/each}
+      <div class="form-group">
+        <span class="radio-label">{t('apiProtocol')}</span>
+        <div class="radio-group">
+          {#each [['openai','OpenAI'],['ollama','Ollama'],['anthropic','Anthropic']] as [val, label]}
+            <label class="radio-item">
+              <input type="radio" name="api_protocol" value={val} bind:group={api_protocol} />
+              {label}
+            </label>
+          {/each}
+        </div>
       </div>
-    </div>
   </div>
 
   <div class="form-group">
@@ -145,7 +161,8 @@
   .radio-item { display: flex; align-items: center; gap: 6px; font-size: 0.9rem; color: var(--text); cursor: pointer; }
   .radio-item input[type="radio"] { padding: 0; border: none; background: none; width: auto; cursor: pointer; }
   textarea { resize: vertical; font-family: monospace; }
-  .field-error { color: var(--danger); font-size: 0.8rem; margin-top: 2px; }
+   .field-error { color: var(--danger); font-size: 0.8rem; margin-top: 2px; }
+   .field-hint { color: var(--text-secondary); font-size: 0.8rem; margin-top: 2px; font-style: italic; }
   .form-actions { display: flex; justify-content: flex-end; gap: 12px; margin-top: 16px; }
   .btn { padding: 8px 20px; border-radius: 6px; border: none; cursor: pointer; font-size: 0.9rem; }
   .btn:disabled { opacity: 0.6; cursor: not-allowed; }

@@ -261,6 +261,11 @@ python app.py 0.0.0.0:9000 # custom host and port
 | POST | `/v1/tools/call` | Directly call a tool (bypass LLM) |
 | POST | `/v1/tools/mcp` | Register MCP servers |
 | POST | `/v1/tools/skill` | Register a skill |
+| GET | `/v1/mcp-servers` | List registered MCP servers |
+| DELETE | `/v1/mcp-servers/{server_name}` | Delete an MCP server |
+| POST | `/v1/sessions/{session_id}/generate-title` | Auto-generate session title |
+| POST | `/v1/sessions/{session_id}/revoke` | Revoke a session |
+| DELETE | `/v1/tools/batch` | Batch delete tools |
 | GET | `/v1/prompt-templates` | List prompt templates |
 | POST | `/v1/prompt-templates` | Create a prompt template |
 | PUT | `/v1/prompt-templates/{id}` | Update a prompt template |
@@ -643,6 +648,11 @@ python app.py 0.0.0.0:9000 # 自定义主机和端口
 | POST | `/v1/tools/call` | 直接调用工具（绕过大模型） |
 | POST | `/v1/tools/mcp` | 注册 MCP 服务器 |
 | POST | `/v1/tools/skill` | 注册 Skill |
+| GET | `/v1/mcp-servers` | 列出已注册的 MCP servers |
+| DELETE | `/v1/mcp-servers/{server_name}` | 删除一个 MCP server |
+| POST | `/v1/sessions/{session_id}/generate-title` | 为会话自动生成标题 |
+| POST | `/v1/sessions/{session_id}/revoke` | 撤销/取消一个会话 |
+| DELETE | `/v1/tools/batch` | 批量删除工具 |
 | GET | `/v1/prompt-templates` | 获取提示词模板列表 |
 | POST | `/v1/prompt-templates` | 创建提示词模板 |
 | PUT | `/v1/prompt-templates/{id}` | 更新提示词模板 |

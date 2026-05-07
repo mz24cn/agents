@@ -73,7 +73,7 @@ def merge_stream_messages(stream_messages: list) -> tuple[list, Optional[dict]]:
     last_stat: Optional[dict] = None
 
     def _flush_assistant(stat=None):
-        nonlocal assistant_text_buf, assistant_thinking_buf, pending_tool_calls
+        nonlocal assistant_text_buf, assistant_thinking_buf, pending_tool_calls, first_assistant_ts
         if assistant_text_buf or pending_tool_calls or assistant_thinking_buf:
             # 优先使用第一条 assistant delta 的时间戳作为本轮时间戳
             ts = first_assistant_ts if first_assistant_ts else _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
@@ -88,6 +88,7 @@ def merge_stream_messages(stream_messages: list) -> tuple[list, Optional[dict]]:
             assistant_text_buf = ""
             assistant_thinking_buf = ""
             pending_tool_calls = []
+            first_assistant_ts = None  # Reset for next round
 
     first_assistant_ts: Optional[str] = None
 

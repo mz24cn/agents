@@ -791,16 +791,10 @@ class Runtime:
             round_prompt = 0
             round_completion = 0
             first_token_time: Optional[float] = None
+            tool_calls_first_ts: Optional[str] = None  # Reset for each round
 
             try:
-                if protocol_name == "openai":
-                    stream_iter = self._parse_openai_stream(http_resp)
-                elif protocol_name == "ollama":
-                    stream_iter = self._parse_ollama_stream(http_resp)
-                else:
-                    response_data = http_resp.read()
-                    messages_and_stat = protocol.parse_response(response_data, stream=True)
-                    stream_iter = iter(messages_and_stat[0])
+                stream_iter = protocol.parse_stream(http_resp)
 
                 for msg in stream_iter:
                     # Check for cancellation before yielding
@@ -822,6 +816,17 @@ class Runtime:
                     if first_token_time is None and (msg.content or msg.thinking):
                         first_token_time = time.monotonic()
 
+                    # Set timestamp before yielding
+                    if msg.role == "assistant":
+                        if msg.tool_calls:
+                            # For tool calls, record the first timestamp
+                            if tool_calls_first_ts is None:
+                                tool_calls_first_ts = _now_ts()
+                            msg.timestamp = tool_calls_first_ts
+                        else:
+                            # For regular content/thinking, use current time
+                            msg.timestamp = _now_ts()
+
                     # Yield each chunk to the caller for real-time display
                     yield msg
 
@@ -842,7 +847,12 @@ class Runtime:
                             if tc.get("name"):
                                 accumulated_tool_calls[idx]["name"] += tc["name"]
                             if tc.get("arguments"):
-                                accumulated_tool_calls[idx]["arguments"] += tc["arguments"]
+                                # Anthropic protocol sends arguments as a dict (already parsed JSON),
+                                # while OpenAI/Ollama send them as strings (delta chunks)
+                                if isinstance(tc["arguments"], dict):
+                                    accumulated_tool_calls[idx]["arguments"] = tc["arguments"]
+                                else:
+                                    accumulated_tool_calls[idx]["arguments"] += tc["arguments"]
             except Exception as exc:
                 yield Message(role="assistant", timestamp=_now_ts(), content=f"Error: stream parse: {exc}")
                 return
@@ -862,10 +872,11 @@ class Runtime:
                 all_tool_calls = [accumulated_tool_calls[idx] for idx in sorted(accumulated_tool_calls.keys())]
 
             # Build the complete assistant message for conversation history
+            assistant_ts = tool_calls_first_ts if tool_calls_first_ts else _now_ts()
             assistant_msg = Message(
                 role="assistant",
                 content=full_content,
-                timestamp=_now_ts(),
+                timestamp=assistant_ts,
                 thinking=full_thinking if full_thinking else None,
                 tool_calls=all_tool_calls,
             )
@@ -992,183 +1003,5 @@ class Runtime:
 
             if skill_triggered:
                 continue
-
-    def _parse_openai_stream(self, http_resp: object) -> Iterator[Message]:
-        """Parse an OpenAI SSE stream, yielding Message objects for each delta.
-
-        Supports ``reasoning_content`` (thinking) alongside regular ``content``.
-        Thinking chunks yield Message(thinking=..., content=""); content
-        chunks yield Message(content=...).
-        At stream end, yields a role="usage" Message with token counts in content as JSON.
-        """
-        prompt_tokens = 0
-        completion_tokens = 0
-
-        for raw_line in http_resp:
-            if isinstance(raw_line, bytes):
-                line = raw_line.decode("utf-8", errors="replace")
-            else:
-                line = raw_line
-            line = line.rstrip("\r\n")
-
-            if not line.startswith("data:"):
-                continue
-
-            data_str = line[len("data:"):].strip()
-            if data_str == "[DONE]":
-                break
-
-            try:
-                chunk = json.loads(data_str)
-            except (json.JSONDecodeError, ValueError):
-                continue
-
-            # Usage may appear in the final chunk (when stream_options.include_usage is set)
-            raw_usage = chunk.get("usage")
-            if raw_usage:
-                prompt_tokens = raw_usage.get("prompt_tokens", 0)
-                completion_tokens = raw_usage.get("completion_tokens", 0)
-
-            choices = chunk.get("choices", [])
-            if not choices:
-                continue
-
-            delta = choices[0].get("delta", {})
-
-            # Thinking / reasoning content
-            # OpenAI uses "reasoning_content"; Ollama's OpenAI-compat endpoint uses "thinking"
-            reasoning = delta.get("reasoning_content") or delta.get("thinking")
-            if reasoning:
-                yield Message(role="assistant", content="", thinking=reasoning)
-
-            # Regular content
-            content = delta.get("content")
-            if content:
-                yield Message(role="assistant", content=content)
-
-            # Handle streamed tool_calls (yield as tool_calls message)
-            tool_calls = delta.get("tool_calls")
-            if tool_calls:
-                for tc in tool_calls:
-                    idx = tc.get("index", 0)
-                    fn = tc.get("function", {})
-                    fn_name = fn.get("name", "")
-                    fn_args = fn.get("arguments", "")
-                    if fn_name or fn_args:
-                        tc_dict: dict = {"_index": idx}
-                        if fn_name:
-                            tc_dict["name"] = fn_name
-                        if fn_args:
-                            tc_dict["arguments"] = fn_args
-                        yield Message(
-                            role="assistant",
-                            content="",
-                            tool_calls=[tc_dict],
-                        )
-
-        # Yield usage summary for this round
-        yield Message(
-            role="usage",
-            content=json.dumps({
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
-            }),
-        )
-
-    def _parse_ollama_stream(self, http_resp: object) -> Iterator[Message]:
-        """Parse an Ollama newline-delimited JSON stream, yielding Messages.
-
-        Ollama thinking-capable models emit a ``thinking`` field in each chunk
-        before the final ``content``. Thinking chunks yield a Message with
-        ``thinking`` set and ``content`` empty; content chunks yield a Message
-        with ``content`` set.
-
-        Tool calls may arrive across multiple chunks (one per chunk) or all
-        in a single final chunk. We accumulate them and yield once at the end.
-        At stream end, yields a role="usage" Message with token counts in content as JSON.
-
-        Args:
-            http_resp: The HTTP response object with a readable stream.
-
-        Yields:
-            Message objects with incremental content or thinking.
-        """
-        # Accumulate tool calls across chunks — they may arrive one per chunk
-        accumulated_tool_calls: dict[int, dict] = {}
-        prompt_tokens = 0
-        completion_tokens = 0
-
-        for raw_line in http_resp:
-            if isinstance(raw_line, bytes):
-                line = raw_line.decode("utf-8", errors="replace")
-            else:
-                line = raw_line
-            line = line.strip()
-
-            if not line:
-                continue
-
-            try:
-                chunk = json.loads(line)
-            except (json.JSONDecodeError, ValueError):
-                continue
-
-            msg_data = chunk.get("message", {})
-            if not msg_data:
-                continue
-
-            # Thinking content (reasoning trace)
-            thinking = msg_data.get("thinking", "")
-            if thinking:
-                yield Message(role="assistant", content="", thinking=thinking)
-
-            # Regular content
-            content = msg_data.get("content", "")
-            if content:
-                yield Message(role="assistant", content=content)
-
-            # Accumulate tool_calls across chunks
-            tool_calls = msg_data.get("tool_calls")
-            if tool_calls and len(tool_calls) > 0:
-                for tc in tool_calls:
-                    fn = tc.get("function", {})
-                    # Use explicit index if present, otherwise append
-                    idx = fn.get("index", len(accumulated_tool_calls))
-                    arguments = fn.get("arguments", {})
-                    if isinstance(arguments, dict):
-                        arguments = json.dumps(arguments)
-                    accumulated_tool_calls[idx] = {
-                        "name": fn.get("name", ""),
-                        "arguments": arguments,
-                    }
-
-            # Stop if done — also grab usage from the final chunk
-            if chunk.get("done", False):
-                prompt_tokens = chunk.get("prompt_eval_count", 0)
-                completion_tokens = chunk.get("eval_count", 0)
-                break
-
-        # Yield accumulated tool calls as a single message at the end
-        if accumulated_tool_calls:
-            all_tool_calls = [
-                accumulated_tool_calls[idx]
-                for idx in sorted(accumulated_tool_calls.keys())
-            ]
-            yield Message(
-                role="assistant",
-                content="",
-                tool_calls=all_tool_calls,
-            )
-
-        # Yield usage summary for this round
-        yield Message(
-            role="usage",
-            content=json.dumps({
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
-            }),
-        )
 
 

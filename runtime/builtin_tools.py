@@ -698,7 +698,7 @@ def _read_file(path: str, start_line: Optional[int] = None, end_line: Optional[i
 
     # Check file exists
     if not os.path.isfile(resolved_path):
-        return json.dumps({"error": "FileNotFound", "message": "The specified file does not exist"})
+        return json.dumps({"error": "FileNotFound", "message": f"The specified file `{resolved_path}` does not exist"})
 
     # Read all lines
     with open(resolved_path, "r", encoding="utf-8", errors="replace") as f:
@@ -944,7 +944,7 @@ def _edit_file(
 
     # Check file exists
     if not os.path.isfile(resolved_path):
-        return json.dumps({"error": "FileNotFound", "message": "The specified file does not exist"})
+        return json.dumps({"error": "FileNotFound", "message": f"The specified file `{resolved_path}` does not exist"})
 
     # Create pre-action snapshot
     snapshot_manager = _SnapshotManager(workspace)

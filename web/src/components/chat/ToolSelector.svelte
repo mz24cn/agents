@@ -87,7 +87,7 @@
 </script>
 
 <div class="tool-selector">
-  <button class="toggle-btn" onclick={() => expanded = !expanded} disabled={disabled}>
+  <button type="button" class="toggle-btn" onclick={() => expanded = !expanded} disabled={disabled}>
     {t('toolsButton', { count: selectedToolIds.length })}
     <span class="arrow">{expanded ? '▲' : '▼'}</span>
   </button>
@@ -106,7 +106,7 @@
           {@const collapsed = !expandedGroups.has(key)}
           <div class="group">
             <div class="group-header">
-              <button class="collapse-btn" onclick={() => toggleCollapse(key)} title={collapsed ? t('expand') : t('collapse')}>
+              <button type="button" class="collapse-btn" onclick={() => toggleCollapse(key)} title={collapsed ? t('expand') : t('collapse')}>
                 {collapsed ? '▶' : '▼'}
               </button>
               <label class="group-label">
