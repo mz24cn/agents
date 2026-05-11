@@ -12,3 +12,7 @@ export const currentSession = $state({ sessionId: null })
 export const newSessionCreated = $state({ sessionId: null, firstUserMessage: null, title: null })
 // sessionId: string | null — 新创建的会话 ID
 // title: string | null — 后端生成的会话标题
+
+// 会话删除通知：Sidebar 通知 ChatPage 同步清空右侧面板
+export const sessionDeleted = $state({ sessionId: null })
+// sessionId: string | null — 被删除的会话 ID

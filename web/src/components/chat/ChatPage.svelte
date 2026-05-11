@@ -9,7 +9,7 @@
   import ChatInput from './ChatInput.svelte'
   import { extractPlaceholders } from '../../lib/placeholder.js'
   import { t } from '../../lib/i18n.svelte.js'
-  import { sessionRestore, newSessionCreated, currentSession } from '../../lib/session-state.svelte.js'
+  import { sessionRestore, newSessionCreated, sessionDeleted, currentSession } from '../../lib/session-state.svelte.js'
 
   const STORAGE_MODEL_KEY = 'chat_selected_model'
   const STORAGE_TOOLS_KEY = 'chat_selected_tools'
@@ -361,6 +361,17 @@
         selectedAgentId = lastAssistantMsg.assistant_id
         localStorage.setItem('chat_selected_agent', lastAssistantMsg.assistant_id)
       }
+    }
+  })
+
+  // 监听会话删除事件：同步清空右侧面板（效果等同新建会话）
+  $effect(() => {
+    const deletedSid = sessionDeleted.sessionId
+    if (deletedSid) {
+      sessionDeleted.sessionId = null
+      messages = []
+      errorMsg = ''
+      sessionId = null
     }
   })
 

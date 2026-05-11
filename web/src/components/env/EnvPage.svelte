@@ -263,7 +263,7 @@
               {#each envVars as item (item.key)}
                 {#if editing?.key === item.key}
                   <tr class="editing-row">
-                    <td class="key-cell">{item.key}</td>
+                    <td>{item.key}</td>
                     <td class="value-cell">
                       <input
                         type="text"
@@ -288,7 +288,7 @@
                   </tr>
                 {:else}
                   <tr>
-                    <td class="key-cell">{item.key}</td>
+                    <td>{item.key}</td>
                     <td class="value-cell">{item.value}</td>
                     <td class="actions">
                       <button
@@ -359,11 +359,6 @@
     font-size: 0.85rem;
   }
   td { font-size: 0.9rem; color: var(--text); }
-  .key-cell {
-    font-family: monospace;
-    font-weight: 600;
-    white-space: nowrap;
-  }
   .value-cell {
     word-break: break-all;
     max-width: 480px;

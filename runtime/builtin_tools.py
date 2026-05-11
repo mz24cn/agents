@@ -47,16 +47,17 @@ def _get_snapshot_manager(workspace: str) -> '_SnapshotManager':
         A _SnapshotManager instance associated with the current thread.
     """
     session_id = getattr(_thread_local, "session_id", None)
+    user_message_timestamp = getattr(_thread_local, "user_message_timestamp", None)
     
     # Check if there's already a snapshot manager in thread_local
     snapshot_manager = getattr(_thread_local, "snapshot_manager", None)
     
     if snapshot_manager is None:
-        snapshot_manager = _SnapshotManager(workspace, session_id)
+        snapshot_manager = _SnapshotManager(workspace, session_id, user_message_timestamp)
         _thread_local.snapshot_manager = snapshot_manager
     elif snapshot_manager.workspace != workspace:
         # Workspace changed, create a new instance
-        snapshot_manager = _SnapshotManager(workspace, session_id)
+        snapshot_manager = _SnapshotManager(workspace, session_id, user_message_timestamp)
         _thread_local.snapshot_manager = snapshot_manager
     
     return snapshot_manager
@@ -383,6 +384,7 @@ def _make_delegate_fn(runtime, thread_local):
             # 保存旧值，切换到子 session 上下文
             old_depth = current_depth
             old_session_id = session_id
+            old_user_message_timestamp = getattr(thread_local, "user_message_timestamp", None)
             thread_local.depth = current_depth + 1
             if sub_session_id is not None:
                 thread_local.session_id = sub_session_id
@@ -409,9 +411,10 @@ def _make_delegate_fn(runtime, thread_local):
                             except Exception:
                                 pass  # SSE 写入失败不中断推理
             finally:
-                # 恢复 depth、tool_scope 和 session_id
+                # 恢复 depth、tool_scope、session_id 和用户消息时间戳
                 thread_local.depth = old_depth
                 thread_local.session_id = old_session_id
+                thread_local.user_message_timestamp = old_user_message_timestamp
                 if sub_session_id is not None:
                     thread_local.last_session_id = sub_session_id
 
@@ -549,12 +552,22 @@ class _SnapshotManager:
     workspace:
         The workspace root directory (must be a git repository).
     session_id:
-        Optional session ID to associate with this snapshot via git notes.
+        Optional session ID to associate with this snapshot via git commit messages.
+    user_message_timestamp:
+        Optional timestamp of the user message that triggered this snapshot.
+        Used together with ``session_id`` to restore file state when a user
+        message is revoked.
     """
 
-    def __init__(self, workspace: str, session_id: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        workspace: str,
+        session_id: Optional[str] = None,
+        user_message_timestamp: Optional[str] = None,
+    ) -> None:
         self.workspace = workspace
         self.session_id = session_id
+        self.user_message_timestamp = user_message_timestamp
         self._previous_staged = None  # Store previously staged changes
         self._modified_files = []  # Track files modified during this session
         # Check if git operations are disabled
@@ -630,7 +643,12 @@ class _SnapshotManager:
         # Commit with --allow-empty to ensure we always create a marker commit
         # This ensures complete traceability even when file has no pre-existing changes
         session_suffix = f" [session: {self.session_id}]" if self.session_id else ""
-        commit_msg = f"Agent pre-action: {tool_name}{session_suffix}"
+        timestamp_suffix = (
+            f" [timestamp: {self.user_message_timestamp}]"
+            if self.user_message_timestamp
+            else ""
+        )
+        commit_msg = f"Agent pre-action: {tool_name}{session_suffix}{timestamp_suffix}"
         commit_args = ["commit", "-m", commit_msg]
         if not has_changes:
             commit_args.append("--allow-empty")
@@ -703,7 +721,12 @@ class _SnapshotManager:
 
         # Commit
         session_suffix = f" [session: {self.session_id}]" if self.session_id else ""
-        commit_msg = f"Agent post-action: session end{session_suffix}"
+        timestamp_suffix = (
+            f" [timestamp: {self.user_message_timestamp}]"
+            if self.user_message_timestamp
+            else ""
+        )
+        commit_msg = f"Agent post-action: session end{session_suffix}{timestamp_suffix}"
         commit_result = self._run_git(["commit", "-m", commit_msg])
         if commit_result.returncode != 0:
             return {

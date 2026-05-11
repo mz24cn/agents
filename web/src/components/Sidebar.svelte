@@ -3,7 +3,7 @@
   import ThemeToggle from './ThemeToggle.svelte'
   import { t, i18n, setLang } from '../lib/i18n.svelte.js'
   import { sessions } from '../lib/api.js'
-  import { sessionRestore, newSessionCreated, currentSession } from '../lib/session-state.svelte.js'
+  import { sessionRestore, newSessionCreated, sessionDeleted, currentSession } from '../lib/session-state.svelte.js'
   import { sidebarWidth, setSidebarWidth, toggleSidebarCollapsed, collapseSidebar, SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH } from '../lib/sidebar-width.svelte.js'
 
   const navItems = [
@@ -135,6 +135,10 @@
     try {
       await sessions.delete(sid)
       sessionList = sessionList.filter(s => s.session_id !== sid)
+      // 通知 ChatPage 同步清空右侧面板
+      if (currentSession.sessionId === sid) {
+        sessionDeleted.sessionId = sid
+      }
     } catch (err) {
       restoreError = err.message || t('deleteSessionFailed')
     }

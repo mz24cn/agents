@@ -573,8 +573,135 @@ import datetime
 import json
 import logging
 import os
+import subprocess
 import tempfile
 from typing import Callable, Optional
+
+
+def _run_git_for_revoke(workspace: str, args: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git"] + args,
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+    )
+
+
+def revoke_session_git_changes(
+    workspace: str,
+    session_id: str,
+    timestamp: str,
+) -> dict:
+    """Remove git commits created for a session at/after a revoked user turn.
+
+    Built-in write/edit tools create git commits whose messages include both
+    ``[session: <session_id>]`` and ``[timestamp: <user_message_timestamp>]``.
+    When a user message is revoked, these commits should disappear as well so
+    the workspace files return to the state before that message was handled.
+
+    The implementation intentionally rewrites the current branch instead of
+    creating additional "revert" commits. It finds all commits in the current
+    branch whose messages belong to the session, filters them by the user-turn
+    timestamp, and then removes the selected commits with ``git rebase --onto``
+    from newest to oldest. Processing newest first preserves older commit ids
+    long enough to target them reliably.
+    """
+    if os.environ.get("DISABLE_GIT_OPERATION", "true").lower() == "true":
+        return {"skipped": True, "reason": "git_disabled", "removed_commits": []}
+
+    workspace = os.path.realpath(workspace)
+    if not workspace or not os.path.isdir(os.path.join(workspace, ".git")):
+        return {"skipped": True, "reason": "git_not_initialized", "removed_commits": []}
+
+    def _parse_ts(value: str) -> Optional[datetime.datetime]:
+        if not value:
+            return None
+        try:
+            # Accept both the app's ``YYYY-mm-ddTHH:MM:SS`` timestamps and
+            # ISO strings with timezone / trailing Z if clients provide them.
+            dt = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+            return dt
+        except ValueError:
+            return None
+
+    threshold_dt = _parse_ts(timestamp)
+    if threshold_dt is None:
+        return {"error": "InvalidTimestamp", "message": f"Invalid timestamp: {timestamp}"}
+
+    status_result = _run_git_for_revoke(workspace, ["status", "--porcelain"])
+    if status_result.returncode != 0:
+        return {"error": "GitStatusFailed", "message": status_result.stderr.strip()}
+    if status_result.stdout.strip():
+        return {
+            "error": "GitWorkingTreeDirty",
+            "message": "Cannot revoke git changes while the workspace has uncommitted changes",
+        }
+
+    log_result = _run_git_for_revoke(workspace, ["log", "--format=%H%x00%B%x00%x1e"])
+    if log_result.returncode != 0:
+        return {"error": "GitLogFailed", "message": log_result.stderr.strip()}
+
+    session_pattern = re.compile(r"\[session:\s*([^\]]+)\]")
+    ts_pattern = re.compile(r"\[timestamp:\s*([^\]]+)\]")
+    commits_to_remove: list[dict[str, str]] = []
+
+    for raw_record in log_result.stdout.split("\x1e"):
+        record = raw_record.strip("\n\x00")
+        if not record:
+            continue
+        parts = record.split("\x00", 1)
+        if len(parts) != 2:
+            continue
+        sha, message = parts
+        session_match = session_pattern.search(message)
+        if not session_match:
+            continue
+        commit_session = session_match.group(1).strip()
+        if commit_session != session_id and not commit_session.startswith(f"{session_id}-sub_"):
+            continue
+        match = ts_pattern.search(message)
+        if not match:
+            # Old commits without timestamp cannot be attributed to a user turn
+            # safely; leave them in history.
+            continue
+        commit_ts = _parse_ts(match.group(1).strip())
+        if commit_ts is None:
+            continue
+        if commit_ts >= threshold_dt:
+            commits_to_remove.append({
+                "sha": sha,
+                "session_id": commit_session,
+                "timestamp": match.group(1).strip(),
+            })
+
+    removed: list[dict[str, str]] = []
+    for item in commits_to_remove:  # git log is newest -> oldest; keep that order.
+        sha = item["sha"]
+        exists_result = _run_git_for_revoke(workspace, ["merge-base", "--is-ancestor", sha, "HEAD"])
+        if exists_result.returncode != 0:
+            continue
+
+        parent_result = _run_git_for_revoke(workspace, ["rev-parse", f"{sha}^"])
+        if parent_result.returncode != 0:
+            return {"error": "GitRewriteFailed", "message": f"Cannot remove root commit: {sha}"}
+        parent_sha = parent_result.stdout.strip()
+
+        rebase_result = _run_git_for_revoke(workspace, ["rebase", "--onto", parent_sha, sha, "HEAD"])
+        if rebase_result.returncode != 0:
+            abort_result = _run_git_for_revoke(workspace, ["rebase", "--abort"])
+            abort_msg = abort_result.stderr.strip() if abort_result.returncode != 0 else ""
+            message = rebase_result.stderr.strip() or rebase_result.stdout.strip()
+            if abort_msg:
+                message = f"{message}; rebase --abort failed: {abort_msg}"
+            return {"error": "GitRewriteFailed", "message": message}
+        removed.append(item)
+
+    return {
+        "removed_commits": removed,
+        "removed_count": len(removed),
+    }
 
 
 class ContextManager:
@@ -810,7 +937,7 @@ class ContextManager:
         self,
         session_id: str,
         timestamp: str,
-    ) -> int:
+    ) -> dict:
         """Revoke messages from the conversation starting from the message with the given timestamp.
 
         Args:
@@ -818,11 +945,14 @@ class ContextManager:
             timestamp: The timestamp of the user message to revoke from.
 
         Returns:
-            The number of messages removed.
+            A result dict containing the number of removed messages and the
+            git rewrite result for workspace commits associated with the same
+            session/timestamp.
 
         Raises:
             FileNotFoundError: When the conversation file does not exist.
             ValueError: When the file content is malformed JSON or no message found with the given timestamp.
+            RuntimeError: When git history rewriting fails.
         """
         conv_path = self._conversation_path(session_id)
         if not os.path.isfile(conv_path):
@@ -832,7 +962,7 @@ class ContextManager:
             data = json.load(fh)
 
         messages = data.get("messages", [])
-        
+
         # Find the index of the message with the given timestamp
         revoke_index = -1
         for i, msg in enumerate(messages):
@@ -847,7 +977,14 @@ class ContextManager:
         removed_count = len(messages) - revoke_index
         new_messages = messages[:revoke_index]
 
-        # Update meta and save
+        workspace = os.environ.get("AGENT_WORKSPACE", "") or os.getcwd()
+        git_result = revoke_session_git_changes(workspace, session_id, timestamp)
+        if isinstance(git_result, dict) and git_result.get("error"):
+            raise RuntimeError(git_result.get("message") or git_result["error"])
+
+        # Update meta and save only after git validation/rewrite succeeds. This
+        # keeps conversation history and workspace files in sync if git refuses
+        # to rewrite (for example, because the working tree is dirty).
         now = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
         meta = data.get("meta", {})
         meta["updated_at"] = now
@@ -857,7 +994,10 @@ class ContextManager:
         text = json.dumps(data, ensure_ascii=False, indent=2)
         self._atomic_write(conv_path, text)
 
-        return removed_count
+        return {
+            "removed_count": removed_count,
+            "git": git_result,
+        }
 
     # ------------------------------------------------------------------
     # Tool call recording

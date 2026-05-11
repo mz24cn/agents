@@ -608,6 +608,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                     )
 
         original_messages = None
+        user_message_timestamp = None
         if "messages" in body:
             import datetime as _dt
             now_ts = _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
@@ -617,6 +618,8 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 # 为每条消息注入实际创建时间戳
                 if msg.timestamp is None:
                     msg.timestamp = now_ts
+                if user_message_timestamp is None and msg.role == "user":
+                    user_message_timestamp = msg.timestamp
                 original_messages.append(msg)
 
         assembled_messages = original_messages
@@ -685,6 +688,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         from runtime.builtin_tools import _thread_local
         _thread_local.sse_callback = None
         _thread_local.session_id = session_id
+        _thread_local.user_message_timestamp = user_message_timestamp
         _thread_local.depth = 0
         _thread_local.tool_scope = tool_scope
         _thread_local.context_manager = context_manager
@@ -716,6 +720,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         _thread_local.sse_callback = None
         _thread_local.cancel_event = None
         _thread_local.session_id = None
+        _thread_local.user_message_timestamp = None
         _thread_local.depth = 0
         _thread_local.tool_scope = []
         _thread_local.context_manager = None
@@ -1639,17 +1644,22 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
 
         context_manager = self.server.context_manager  # type: ignore[attr-defined]
         try:
-            removed_count = context_manager.revoke_conversation(session_id, timestamp)
+            revoke_result = context_manager.revoke_conversation(session_id, timestamp)
+
             self._send_json_response(200, {
                 "status": "success",
                 "session_id": session_id,
-                "removed_count": removed_count,
+                "removed_count": revoke_result.get("removed_count", 0),
+                "git": revoke_result.get("git", {}),
             })
         except FileNotFoundError:
             self._send_json_error(404, f"Session not found: {session_id}")
             return
         except ValueError as exc:
             self._send_json_error(400, str(exc))
+            return
+        except RuntimeError as exc:
+            self._send_json_error(500, str(exc))
             return
 
 
