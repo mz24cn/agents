@@ -4,6 +4,9 @@
 export const sessionRestore = $state({ pending: null })
 // pending: { sessionId: string, messages: Array<{role, content}> } | null
 
+// 当前活跃的会话 ID（用于侧边栏高亮）
+export const currentSession = $state({ sessionId: null })
+
 // 新会话创建通知：ChatPage 通知 Sidebar 动态添加新会话条目
 // firstUserMessage: 用户第一条消息文本，用于在标题生成前作为临时标题
 export const newSessionCreated = $state({ sessionId: null, firstUserMessage: null, title: null })

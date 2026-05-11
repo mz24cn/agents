@@ -141,7 +141,7 @@ class OpenAIProtocol(BaseProtocol):
     """
 
     def __init__(self):
-        self._tool_call_ids: dict[str, str] = {}
+        pass
 
     def parse_stream(self, http_resp: object) -> Iterator[Message]:
         """Parse an OpenAI SSE stream, yielding Message objects for each delta.
@@ -206,6 +206,8 @@ class OpenAIProtocol(BaseProtocol):
                     fn_args = fn.get("arguments", "")
                     if fn_name or fn_args:
                         tc_dict: dict = {"_index": idx}
+                        if tc.get("id"):
+                            tc_dict["id"] = tc["id"]
                         if fn_name:
                             tc_dict["name"] = fn_name
                         if fn_args:
@@ -245,9 +247,6 @@ class OpenAIProtocol(BaseProtocol):
             A tuple of (url, headers, body_bytes).
         """
         url = config.api_base.rstrip("/") + "/chat/completions"
-
-        # Reset tool_call_id mapping for this request
-        self._tool_call_ids = {}
 
         headers = {"Content-Type": "application/json"}
         if config.api_key:
@@ -298,7 +297,7 @@ class OpenAIProtocol(BaseProtocol):
         # Handle tool result messages:
         # OpenAI API requires role="tool" with a tool_call_id
         if msg.role == "tool":
-            tool_call_id = self._tool_call_ids.get(msg.name, "call_" + (msg.name or "unknown"))
+            tool_call_id = msg.tool_use_id or "call_" + uuid.uuid4().hex[:8]
             return {
                 "role": "tool",
                 "tool_call_id": tool_call_id,
@@ -312,9 +311,8 @@ class OpenAIProtocol(BaseProtocol):
             result["content"] = msg.content if msg.content else None
             result["tool_calls"] = []
             for tc in msg.tool_calls:
-                call_id = "call_" + uuid.uuid4().hex[:8]
+                call_id = tc.get("id") or tc.get("tool_use_id") or "call_" + uuid.uuid4().hex[:8]
                 fn_name = tc.get("name", "unknown")
-                self._tool_call_ids[fn_name] = call_id
                 result["tool_calls"].append({
                     "id": call_id,
                     "type": "function",
@@ -380,6 +378,7 @@ class OpenAIProtocol(BaseProtocol):
             for tc in tool_calls:
                 fn = tc.get("function", {})
                 all_tool_calls.append({
+                    "id": tc.get("id", ""),
                     "name": fn.get("name", ""),
                     "arguments": fn.get("arguments", "{}"),
                 })
@@ -465,7 +464,9 @@ class OpenAIProtocol(BaseProtocol):
                 for tc in tool_calls:
                     idx = tc.get("index", 0)
                     if idx not in accumulated_tool_calls:
-                        accumulated_tool_calls[idx] = {"name": "", "arguments": ""}
+                        accumulated_tool_calls[idx] = {"id": "", "name": "", "arguments": ""}
+                    if tc.get("id"):
+                        accumulated_tool_calls[idx]["id"] = tc["id"]
                     fn = tc.get("function", {})
                     if "name" in fn:
                         accumulated_tool_calls[idx]["name"] += fn["name"]
@@ -478,6 +479,7 @@ class OpenAIProtocol(BaseProtocol):
             for idx in sorted(accumulated_tool_calls.keys()):
                 tc = accumulated_tool_calls[idx]
                 all_tool_calls.append({
+                    "id": tc.get("id", ""),
                     "name": tc["name"],
                     "arguments": tc["arguments"] or "{}",
                 })
@@ -565,6 +567,7 @@ class OllamaProtocol(BaseProtocol):
                     if isinstance(arguments, dict):
                         arguments = json.dumps(arguments)
                     accumulated_tool_calls[idx] = {
+                        "id": tc.get("id", ""),
                         "name": fn.get("name", ""),
                         "arguments": arguments,
                     }
@@ -735,6 +738,7 @@ class OllamaProtocol(BaseProtocol):
                 if isinstance(arguments, dict):
                     arguments = json.dumps(arguments)
                 all_tool_calls.append({
+                    "id": tc.get("id", ""),
                     "name": fn.get("name", ""),
                     "arguments": arguments,
                 })
@@ -802,6 +806,7 @@ class OllamaProtocol(BaseProtocol):
                         if isinstance(arguments, dict):
                             arguments = json.dumps(arguments)
                         all_tool_calls.append({
+                            "id": tc.get("id", ""),
                             "name": fn.get("name", ""),
                             "arguments": arguments,
                         })
@@ -840,7 +845,27 @@ class AnthropicProtocol(BaseProtocol):
     ANTHROPIC_VERSION = "2023-06-01"
 
     def __init__(self):
-        self._tool_call_ids: dict[str, str] = {}
+        pass
+
+    @staticmethod
+    def _extract_usage(chunk: dict) -> dict:
+        usage_data = {}
+        if isinstance(chunk.get("message"), dict):
+            usage_data = chunk["message"].get("usage") or usage_data
+        usage_data = chunk.get("usage") or usage_data
+        if isinstance(chunk.get("delta"), dict):
+            usage_data = chunk["delta"].get("usage") or usage_data
+        if not usage_data and any(key in chunk for key in ("input_tokens", "output_tokens")):
+            usage_data = chunk
+        return usage_data if isinstance(usage_data, dict) else {}
+
+    @staticmethod
+    def _input_tokens_from_usage(usage_data: dict) -> int:
+        return (
+            usage_data.get("input_tokens", 0)
+            + usage_data.get("cache_creation_input_tokens", 0)
+            + usage_data.get("cache_read_input_tokens", 0)
+        )
 
     def parse_stream(self, http_resp: object) -> Iterator[Message]:
         """Parse an Anthropic Messages API SSE stream, yielding Messages.
@@ -884,10 +909,15 @@ class AnthropicProtocol(BaseProtocol):
                 continue
 
             event_type = chunk.get("type")
+            raw_usage_data = self._extract_usage(chunk)
+            if not event_type and raw_usage_data:
+                prompt_tokens = max(prompt_tokens, self._input_tokens_from_usage(raw_usage_data))
+                completion_tokens = max(completion_tokens, raw_usage_data.get("output_tokens", 0))
+                continue
 
             if event_type == "message_start":
-                usage_data = chunk.get("usage", {})
-                prompt_tokens = usage_data.get("input_tokens", 0)
+                usage_data = self._extract_usage(chunk)
+                prompt_tokens = self._input_tokens_from_usage(usage_data)
 
             elif event_type == "content_block_start":
                 block = chunk.get("content_block", {})
@@ -899,6 +929,7 @@ class AnthropicProtocol(BaseProtocol):
                 elif block_type == "tool_use":
                     idx = len(accumulated_tool_calls)
                     accumulated_tool_calls[idx] = {
+                        "id": block.get("id", ""),
                         "name": block.get("name", ""),
                         "arguments": "",
                     }
@@ -942,10 +973,11 @@ class AnthropicProtocol(BaseProtocol):
             elif event_type == "message_delta":
                 delta = chunk.get("delta", {})
                 stop_reason = delta.get("stop_reason")
-                usage_data = delta.get("usage", {})
+                usage_data = self._extract_usage(chunk)
                 if usage_data:
-                    output = usage_data.get("output_tokens", 0)
-                    completion_tokens += output
+                    prompt_tokens = max(prompt_tokens, self._input_tokens_from_usage(usage_data))
+                    completion_tokens = max(completion_tokens, usage_data.get("output_tokens", 0))
+
 
             elif event_type == "message_stop":
                 pass
@@ -979,8 +1011,6 @@ class AnthropicProtocol(BaseProtocol):
             A tuple of (url, headers, body_bytes).
         """
         url = config.api_base.rstrip("/") + "/messages"
-
-        self._tool_call_ids = {}
 
         headers = {
             "Content-Type": "application/json",
@@ -1048,7 +1078,7 @@ class AnthropicProtocol(BaseProtocol):
 
         # Handle tool result messages
         if msg.role == "tool":
-            tool_use_id = self._tool_call_ids.get(msg.name, msg.name or "unknown")
+            tool_use_id = msg.tool_use_id or msg.name or "unknown"
             return {
                 "role": "user",
                 "content": [{
@@ -1062,9 +1092,8 @@ class AnthropicProtocol(BaseProtocol):
         if msg.tool_calls is not None:
             content_blocks = []
             for tc in msg.tool_calls:
-                call_id = "call_" + uuid.uuid4().hex[:8]
+                call_id = tc.get("id") or tc.get("tool_use_id") or "call_" + uuid.uuid4().hex[:8]
                 fn_name = tc.get("name", "unknown")
-                self._tool_call_ids[fn_name] = call_id
                 arguments = tc.get("arguments", "{}")
                 if isinstance(arguments, str):
                     try:
@@ -1135,6 +1164,7 @@ class AnthropicProtocol(BaseProtocol):
                 if all_tool_calls is None:
                     all_tool_calls = []
                 all_tool_calls.append({
+                    "id": block.get("id", ""),
                     "name": block.get("name", ""),
                     "arguments": block.get("input", {}),
                 })
@@ -1205,6 +1235,16 @@ class AnthropicProtocol(BaseProtocol):
                 except (json.JSONDecodeError, ValueError):
                     continue
                 event_type = chunk.get("type")
+                raw_usage_data = self._extract_usage(chunk)
+                if not event_type and raw_usage_data:
+                    prompt_tokens = max(usage.prompt_tokens, self._input_tokens_from_usage(raw_usage_data))
+                    completion_tokens = max(usage.completion_tokens, raw_usage_data.get("output_tokens", 0))
+                    usage = TokenStat(
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        total_tokens=prompt_tokens + completion_tokens,
+                    )
+                    continue
                 if event_type in ("content_block_start", "content_block_delta",
                                   "content_block_stop", "message_start",
                                   "message_delta", "message_stop"):
@@ -1253,15 +1293,31 @@ class AnthropicProtocol(BaseProtocol):
             return accumulated_content, accumulated_thinking, role, current_tool_use_idx, usage
 
         event_type = chunk.get("type")
+        raw_usage_data = self._extract_usage(chunk)
+        if not event_type and raw_usage_data:
+            prompt_tokens = max(usage.prompt_tokens, self._input_tokens_from_usage(raw_usage_data))
+            completion_tokens = max(usage.completion_tokens, raw_usage_data.get("output_tokens", 0))
+            return (
+                accumulated_content,
+                accumulated_thinking,
+                role,
+                current_tool_use_idx,
+                TokenStat(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=prompt_tokens + completion_tokens,
+                ),
+            )
         if not event_type:
             return accumulated_content, accumulated_thinking, role, current_tool_use_idx, usage
 
         if event_type == "message_start":
-            usage_data = chunk.get("usage", {})
+            usage_data = self._extract_usage(chunk)
+            input_tokens = self._input_tokens_from_usage(usage_data)
             usage = TokenStat(
-                prompt_tokens=usage_data.get("input_tokens", 0),
+                prompt_tokens=input_tokens,
                 completion_tokens=0,
-                total_tokens=usage_data.get("input_tokens", 0),
+                total_tokens=input_tokens,
             )
 
         elif event_type == "content_block_start":
@@ -1274,6 +1330,7 @@ class AnthropicProtocol(BaseProtocol):
             elif block_type == "tool_use":
                 idx = len(all_tool_calls)
                 all_tool_calls.append({
+                    "id": block.get("id", ""),
                     "name": block.get("name", ""),
                     "arguments": "",
                 })
@@ -1299,13 +1356,14 @@ class AnthropicProtocol(BaseProtocol):
             stop_reason = delta.get("stop_reason")
             if stop_reason:
                 role = "assistant"
-            usage_data = delta.get("usage", {})
+            usage_data = self._extract_usage(chunk)
             if usage_data:
-                output = usage_data.get("output_tokens", 0)
+                prompt_tokens = max(usage.prompt_tokens, self._input_tokens_from_usage(usage_data))
+                completion_tokens = max(usage.completion_tokens, usage_data.get("output_tokens", 0))
                 usage = TokenStat(
-                    prompt_tokens=usage.prompt_tokens,
-                    completion_tokens=usage.completion_tokens + output,
-                    total_tokens=usage.total_tokens + output,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=prompt_tokens + completion_tokens,
                 )
 
         return accumulated_content, accumulated_thinking, role, current_tool_use_idx, usage

@@ -17,9 +17,9 @@ A minimal, zero-dependency composable agent runtime engine built with pure Pytho
 ### Features
 
 - **Zero third-party dependencies** — core runtime uses only Python standard library
-- **Multi-protocol support** — OpenAI-compatible API and Ollama native `/api/chat`
+- **Multi-protocol support** — OpenAI-compatible API, Ollama native `/api/chat`, and Anthropic Messages API
 - **Three tool types** — in-process Function tools, MCP (Model Context Protocol) tools, and Skills
-- **Direct MCP/function tool invocation** — bypass the LLM and call MCP/function tools directly, 100% reliability
+- **Direct MCP/function tool invocation** — bypass the LLM and call MCP/function tools directly, 100% reliability; optionally return parsed JSON with `format: "json"`
 - **Skill progressive disclosure** — first round exposes only skill summary; full `SKILL.md` is injected only when the model selects the skill
 - **Streaming inference** — real-time token streaming with thinking/reasoning content support
 - **Prompt template inference** — user messages can reference a named template by ID; `{{placeholder}}` variables are resolved at runtime from the request's `arguments` dict, enabling dynamic prompt adjustment and model/tool-agnostic parameterization without redeploying
@@ -36,7 +36,7 @@ runtime/
 ├── __init__.py              # Public API exports
 ├── models.py                # Data models: Message, ModelConfig, ToolConfig, etc.
 ├── registry.py              # ModelRegistry + ToolRegistry
-├── protocols.py             # Protocol adapters: OpenAI / Ollama
+├── protocols.py             # Protocol adapters: OpenAI / Ollama / Anthropic
 ├── runtime.py               # Runtime engine: inference + tool call loop + Skill disclosure
 ├── tools.py                 # Function tool decorator
 ├── skill_manager.py         # SkillManager: SKILL.md parsing and progressive disclosure
@@ -57,13 +57,14 @@ examples/                    # Usage examples
 **1. Python API — Function Tool**
 
 ```python
+import os
 from runtime import (
     ModelConfig, ModelRegistry,
     ToolConfig, ToolRegistry,
     Runtime, InferenceRequest, Message,
 )
 
-# Register a model
+# Register a model (Ollama)
 model_registry = ModelRegistry()
 model_registry.register(ModelConfig(
     model_id="qwen3-14b",
@@ -322,6 +323,7 @@ Features:
 - Prompt template management with `{{placeholder}}` variable support
 - Agent management — save current configuration as a reusable agent; switch agents in the chat interface
 - Markdown rendering with syntax highlighting
+- Expandable long JSON string previews that auto-fit the available code block width
 - Multimodal: image upload and microphone recording
 - Dark/light theme, responsive layout
 - Resizable sidebar with collapse/expand toggle; width persisted to localStorage
@@ -406,9 +408,9 @@ MIT License — see [LICENSE](LICENSE)
 ### 特性
 
 - **零第三方依赖** — 核心运行时仅使用 Python 标准库
-- **多协议支持** — OpenAI 兼容 API 与 Ollama 原生 `/api/chat`
+- **多协议支持** — OpenAI 兼容 API、Ollama 原生 `/api/chat` 和 Anthropic Messages API
 - **三种工具类型** — 进程内 Function 工具、MCP（模型上下文协议）工具、Skill 技能
-- **MCP/function工具直接调用** — 可绕过大模型直接调用MCP/function工具，可靠性100%
+- **MCP/function工具直接调用** — 可绕过大模型直接调用MCP/function工具，可靠性100%；支持通过 `format: "json"` 返回解析后的 JSON
 - **Skill 渐进披露** — 第一轮推理仅暴露技能摘要，大模型选择后才注入完整 `SKILL.md`
 - **流式推理** — 实时 token 流式输出，支持 thinking/reasoning 内容
 - **提示词模板推理** — 用户消息可通过模板 ID 引用命名模板，`{{占位符}}` 变量在推理时从请求的 `arguments` 字典动态替换，无需重新部署即可调整提示词，并支持参数化以适应不同模型和工具
@@ -425,7 +427,7 @@ runtime/
 ├── __init__.py              # 公开 API 导出
 ├── models.py                # 数据模型：Message、ModelConfig、ToolConfig 等
 ├── registry.py              # ModelRegistry + ToolRegistry
-├── protocols.py             # 协议适配器：OpenAI / Ollama
+├── protocols.py             # 协议适配器：OpenAI / Ollama / Anthropic
 ├── runtime.py               # 运行时引擎：推理 + 工具调用循环 + Skill 渐进披露
 ├── tools.py                 # Function 工具装饰器
 ├── skill_manager.py         # SkillManager：SKILL.md 解析与渐进披露管理
@@ -446,13 +448,14 @@ examples/                    # 使用示例
 **1. Python API — Function 工具**
 
 ```python
+import os
 from runtime import (
     ModelConfig, ModelRegistry,
     ToolConfig, ToolRegistry,
     Runtime, InferenceRequest, Message,
 )
 
-# 注册模型
+# 注册模型（Ollama）
 model_registry = ModelRegistry()
 model_registry.register(ModelConfig(
     model_id="qwen3-14b",
@@ -709,6 +712,7 @@ npm run build
 - 提示词模板管理
 - 智能体管理 — 将当前配置保存为可复用的智能体；在对话中快速切换智能体
 - Markdown 渲染与语法高亮
+- JSON 长字符串可折叠预览，并自动适配代码块可用宽度
 - 多模态：图片上传与麦克风录音
 - 深色/浅色主题，响应式布局
 - 侧边栏支持拖拽调整宽度与折叠/展开，宽度自动持久化到 localStorage

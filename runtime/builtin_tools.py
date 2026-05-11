@@ -37,6 +37,31 @@ from runtime.registry import ToolRegistry
 _thread_local = threading.local()
 
 
+def _get_snapshot_manager(workspace: str) -> '_SnapshotManager':
+    """Get or create a _SnapshotManager instance from thread_local.
+
+    Args:
+        workspace: The workspace root directory.
+
+    Returns:
+        A _SnapshotManager instance associated with the current thread.
+    """
+    session_id = getattr(_thread_local, "session_id", None)
+    
+    # Check if there's already a snapshot manager in thread_local
+    snapshot_manager = getattr(_thread_local, "snapshot_manager", None)
+    
+    if snapshot_manager is None:
+        snapshot_manager = _SnapshotManager(workspace, session_id)
+        _thread_local.snapshot_manager = snapshot_manager
+    elif snapshot_manager.workspace != workspace:
+        # Workspace changed, create a new instance
+        snapshot_manager = _SnapshotManager(workspace, session_id)
+        _thread_local.snapshot_manager = snapshot_manager
+    
+    return snapshot_manager
+
+
 def _bash_execute(command: str, cwd: str = "") -> str:
     """Execute a shell command via a pseudo-TTY so programs behave as if
     running in an interactive terminal (spinner text, color, login prompts, etc.).
@@ -523,10 +548,17 @@ class _SnapshotManager:
     ----------
     workspace:
         The workspace root directory (must be a git repository).
+    session_id:
+        Optional session ID to associate with this snapshot via git notes.
     """
 
-    def __init__(self, workspace: str) -> None:
+    def __init__(self, workspace: str, session_id: Optional[str] = None) -> None:
         self.workspace = workspace
+        self.session_id = session_id
+        self._previous_staged = None  # Store previously staged changes
+        self._modified_files = []  # Track files modified during this session
+        # Check if git operations are disabled
+        self._disabled = os.environ.get("DISABLE_GIT_OPERATION", "true").lower() == "true"
 
     def _run_git(self, args: list[str]) -> subprocess.CompletedProcess:
         return subprocess.run(
@@ -536,12 +568,28 @@ class _SnapshotManager:
             text=True,
         )
 
-    def snapshot(self, tool_name: str) -> str | dict:
-        """Stage all changes and create a pre-action commit.
+    def snapshot(self, tool_name: str, file_path: Optional[str] = None) -> str | dict:
+        """Stage changes for specific file(s) and create a pre-action commit.
 
-        Returns the commit SHA string on success, or a dict with
-        ``{"error": ..., "message": ...}`` on failure.
+        Always creates a commit to track the edit operation, even if the file
+        has no pre-existing changes. This ensures complete traceability of all
+        agent operations within a session.
+
+        Args:
+            tool_name: Name of the tool creating this snapshot.
+            file_path: Optional path to the specific file being modified.
+                If provided, only this file will be staged and committed.
+                If None, all changes will be staged (backward compatible).
+
+        Returns:
+            The commit SHA string on success, or a dict with
+            ``{"error": ..., "message": ...}`` on failure, or
+            ``{"skipped": True}`` if git operations are disabled.
         """
+        # Skip all git operations if disabled
+        if self._disabled:
+            return {"skipped": True}
+        
         # Verify git repo exists
         git_dir = os.path.join(self.workspace, ".git")
         if not os.path.exists(git_dir):
@@ -550,17 +598,43 @@ class _SnapshotManager:
                 "message": "Workspace is not a Git repository",
             }
 
-        # Stage all changes
-        add_result = self._run_git(["add", "."])
-        if add_result.returncode != 0:
-            return {
-                "error": "SnapshotFailed",
-                "message": "Pre-action snapshot could not be created",
-            }
+        has_changes = False
+        
+        if file_path:
+            # Get relative path from workspace
+            rel_path = os.path.relpath(file_path, self.workspace) if os.path.isabs(file_path) else file_path
+            
+            # Check if file exists and has changes (including staged changes)
+            status_result = self._run_git(["status", "--porcelain", rel_path])
+            if status_result.stdout.strip():
+                # Stage only this specific file (overwrites any staged changes for this file)
+                add_result = self._run_git(["add", rel_path])
+                if add_result.returncode != 0:
+                    return {
+                        "error": "SnapshotFailed",
+                        "message": f"Failed to stage file: {rel_path}",
+                    }
+                has_changes = True
+        else:
+            # Backward compatible: stage all changes
+            add_result = self._run_git(["add", "."])
+            if add_result.returncode != 0:
+                return {
+                    "error": "SnapshotFailed",
+                    "message": "Pre-action snapshot could not be created",
+                }
+            # Check if there's anything staged
+            diff_result = self._run_git(["diff", "--cached", "--exit-code"])
+            has_changes = diff_result.returncode != 0
 
-        # Commit
-        commit_msg = f"Agent pre-action: {tool_name}"
-        commit_result = self._run_git(["commit", "-m", commit_msg, "--allow-empty"])
+        # Commit with --allow-empty to ensure we always create a marker commit
+        # This ensures complete traceability even when file has no pre-existing changes
+        session_suffix = f" [session: {self.session_id}]" if self.session_id else ""
+        commit_msg = f"Agent pre-action: {tool_name}{session_suffix}"
+        commit_args = ["commit", "-m", commit_msg]
+        if not has_changes:
+            commit_args.append("--allow-empty")
+        commit_result = self._run_git(commit_args)
         if commit_result.returncode != 0:
             return {
                 "error": "SnapshotFailed",
@@ -574,7 +648,79 @@ class _SnapshotManager:
                 "error": "SnapshotFailed",
                 "message": "Pre-action snapshot could not be created",
             }
-        return rev_result.stdout.strip()
+        commit_sha = rev_result.stdout.strip()
+
+        return commit_sha
+
+    def record_modified_file(self, file_path: str) -> None:
+        """Record a file that was modified during this session.
+
+        Args:
+            file_path: Absolute path to the modified file.
+        """
+        rel_path = os.path.relpath(file_path, self.workspace) if os.path.isabs(file_path) else file_path
+        if rel_path not in self._modified_files:
+            self._modified_files.append(rel_path)
+
+    def post_action(self) -> str | dict:
+        """Create a post-action commit marking the end of the session.
+
+        Creates a commit with all modified files and adds session_id note.
+
+        Returns:
+            The commit SHA string on success, or a dict with
+            ``{"error": ..., "message": ...}`` on failure, or
+            ``{"skipped": True}`` if no files were modified or git operations are disabled.
+        """
+        if not self._modified_files:
+            return {"skipped": True}
+        
+        # Skip all git operations if disabled
+        if self._disabled:
+            return {"skipped": True}
+
+        # Verify git repo exists
+        git_dir = os.path.join(self.workspace, ".git")
+        if not os.path.exists(git_dir):
+            return {
+                "error": "GitNotInitialized",
+                "message": "Workspace is not a Git repository",
+            }
+
+        # Stage all modified files
+        for file_path in self._modified_files:
+            add_result = self._run_git(["add", file_path])
+            if add_result.returncode != 0:
+                return {
+                    "error": "SnapshotFailed",
+                    "message": f"Failed to stage file: {file_path}",
+                }
+
+        # Check if there's anything to commit
+        diff_result = self._run_git(["diff", "--cached", "--exit-code"])
+        if diff_result.returncode == 0:
+            return {"skipped": True}
+
+        # Commit
+        session_suffix = f" [session: {self.session_id}]" if self.session_id else ""
+        commit_msg = f"Agent post-action: session end{session_suffix}"
+        commit_result = self._run_git(["commit", "-m", commit_msg])
+        if commit_result.returncode != 0:
+            return {
+                "error": "SnapshotFailed",
+                "message": "Post-action snapshot could not be created",
+            }
+
+        # Extract the commit SHA
+        rev_result = self._run_git(["rev-parse", "HEAD"])
+        if rev_result.returncode != 0:
+            return {
+                "error": "SnapshotFailed",
+                "message": "Post-action snapshot could not be created",
+            }
+        commit_sha = rev_result.stdout.strip()
+
+        return commit_sha
 
     def undo(self) -> dict:
         """Revert the workspace to the previous Git commit.
@@ -582,6 +728,13 @@ class _SnapshotManager:
         Returns a dict with ``reverted_commit`` and ``restored_commit`` on
         success, or ``{"error": ..., "message": ...}`` on failure.
         """
+        # Skip all git operations if disabled
+        if self._disabled:
+            return {
+                "error": "GitDisabled",
+                "message": "Git operations are disabled via DISABLE_GIT_OPERATION environment variable",
+            }
+        
         # Get current HEAD (the commit we are about to revert)
         head_result = self._run_git(["rev-parse", "HEAD"])
         if head_result.returncode != 0:
@@ -678,82 +831,46 @@ class _Linter:
 # ---------------------------------------------------------------------------
 
 def _read_file(path: str, start_line: Optional[int] = None, end_line: Optional[int] = None) -> str:
-    """Read a file and return its contents as line-numbered output.
+    """Read a file and return its contents as line-numbered JSON output."""
 
-    Args:
-        path: Path to the file (relative to AGENT_WORKSPACE or absolute within it).
-        start_line: First line to return (1-indexed, inclusive). None means start of file.
-        end_line: Last line to return (1-indexed, inclusive). None means end of file.
+    def error(code: str, message: str) -> str:
+        return json.dumps({"error": code, "message": message})
 
-    Returns:
-        JSON string with keys: content, total_lines, truncated, and optionally omitted_lines.
-        On error, returns JSON string with keys: error, message.
-    """
     workspace = os.path.realpath(os.environ.get("AGENT_WORKSPACE", ""))
 
     try:
         resolved_path = _validate_path(workspace, path)
     except ValueError as exc:
-        return json.dumps({"error": exc.error_code, "message": str(exc)})  # type: ignore[attr-defined]
+        return error(exc.error_code, str(exc))  # type: ignore[attr-defined]
 
-    # Check file exists
     if not os.path.isfile(resolved_path):
-        return json.dumps({"error": "FileNotFound", "message": f"The specified file `{resolved_path}` does not exist"})
+        return error("FileNotFound", f"The specified file `{resolved_path}` does not exist")
 
-    # Read all lines
     with open(resolved_path, "r", encoding="utf-8", errors="replace") as f:
-        all_lines = f.readlines()
+        lines = f.readlines()
 
-    total_lines = len(all_lines)
+    total_lines = len(lines)
 
-    # Validate range parameters before applying them
-    if start_line is not None and end_line is not None:
-        if start_line > end_line:
-            return json.dumps({"error": "InvalidRange", "message": "start_line must be less than or equal to end_line"})
-
-    # Validate individual line numbers against file bounds
-    if start_line is not None:
-        if start_line < 1 or start_line > total_lines:
-            return json.dumps({"error": "LineOutOfRange", "message": "Line number is out of file bounds"})
-    if end_line is not None:
-        if end_line < 1 or end_line > total_lines:
-            return json.dumps({"error": "LineOutOfRange", "message": "Line number is out of file bounds"})
-
-    # Determine which lines to return
-    truncated = False
-    omitted_lines = 0
+    if start_line is not None and end_line is not None and start_line > end_line:
+        return error("InvalidRange", "start_line must be less than or equal to end_line")
+    if start_line is not None and not 1 <= start_line <= total_lines:
+        return error("LineOutOfRange", "Line number is out of file bounds")
+    if end_line is not None and not 1 <= end_line <= total_lines:
+        end_line = total_lines
 
     if start_line is None and end_line is None:
-        # No range specified — apply truncation threshold
         threshold = int(os.environ.get("READ_TRUNCATION_LINES", 500))
-        if total_lines > threshold:
-            selected_lines = all_lines[:threshold]
-            truncated = True
-            omitted_lines = total_lines - threshold
-        else:
-            selected_lines = all_lines
-        line_offset = 1  # 1-indexed start
-    elif start_line is not None and end_line is not None:
-        # Both specified
-        selected_lines = all_lines[start_line - 1:end_line]
-        line_offset = start_line
-    elif start_line is not None:
-        # Only start_line
-        selected_lines = all_lines[start_line - 1:]
-        line_offset = start_line
+        start, end = 1, min(total_lines, threshold)
+        truncated = total_lines > threshold
     else:
-        # Only end_line
-        selected_lines = all_lines[:end_line]
-        line_offset = 1
+        start, end = start_line or 1, end_line or total_lines
+        truncated = False
 
-    # Format lines as "{n}: {content}"
-    content_parts = []
-    for i, line in enumerate(selected_lines):
-        line_num = line_offset + i
-        # Preserve the line content as-is (including newline if present)
-        content_parts.append(f"{line_num}: {line}")
-
-    content = "".join(content_parts)
+    selected_lines = lines[start - 1:end]
+    content = "".join(
+        f"{line_number}: {line}"
+        for line_number, line in enumerate(selected_lines, start=start)
+    )
 
     result: dict = {
         "content": content,
@@ -761,7 +878,7 @@ def _read_file(path: str, start_line: Optional[int] = None, end_line: Optional[i
         "truncated": truncated,
     }
     if truncated:
-        result["omitted_lines"] = omitted_lines
+        result["omitted_lines"] = total_lines - len(selected_lines)
 
     return json.dumps(result)
 
@@ -823,13 +940,20 @@ def _write_file(path: str, content: str) -> str:
     except ValueError as exc:
         return json.dumps({"error": exc.error_code, "message": str(exc)})  # type: ignore[attr-defined]
 
+    # Get snapshot manager from thread_local (creates if not exists)
+    snapshot_manager = _get_snapshot_manager(workspace)
+
     # Create pre-action snapshot
-    snapshot_manager = _SnapshotManager(workspace)
-    snapshot_result = snapshot_manager.snapshot("write_file")
+    # Always creates a commit (even empty) for traceability
+    snapshot_result = snapshot_manager.snapshot("write_file", resolved_path)
+    
+    # Handle return cases
+    commit_id = None
     if isinstance(snapshot_result, dict):
-        # snapshot returned an error dict
+        # snapshot returned an error
         return json.dumps(snapshot_result)
-    commit_id = snapshot_result
+    else:
+        commit_id = snapshot_result
 
     # Create parent directories if they don't exist
     parent_dir = os.path.dirname(resolved_path)
@@ -859,6 +983,9 @@ def _write_file(path: str, content: str) -> str:
 
         os.replace(tmp_path, resolved_path)
         tmp_path = None  # successfully replaced, no cleanup needed
+        
+        # Record the modified file for post-action commit
+        snapshot_manager.record_modified_file(resolved_path)
     except OSError as exc:
         return json.dumps({"error": "WriteFailure", "message": str(exc)})
     except Exception as exc:
@@ -946,25 +1073,45 @@ def _edit_file(
     if not os.path.isfile(resolved_path):
         return json.dumps({"error": "FileNotFound", "message": f"The specified file `{resolved_path}` does not exist"})
 
+    # Get snapshot manager from thread_local (creates if not exists)
+    snapshot_manager = _get_snapshot_manager(workspace)
+
     # Create pre-action snapshot
-    snapshot_manager = _SnapshotManager(workspace)
-    snapshot_result = snapshot_manager.snapshot("edit_file")
+    # Always creates a commit (even empty) for traceability
+    snapshot_result = snapshot_manager.snapshot("edit_file", resolved_path)
+    
+    # Handle return cases
+    commit_id = None
     if isinstance(snapshot_result, dict):
+        # snapshot returned an error
         return json.dumps(snapshot_result)
-    commit_id = snapshot_result
+    else:
+        commit_id = snapshot_result
 
     rel_path = os.path.relpath(resolved_path, workspace)
 
+    result = None
     if mode == "search_replace":
-        return _edit_file_search_replace(
+        result = _edit_file_search_replace(
             resolved_path, rel_path, workspace, old_str, new_str, commit_id
         )
     elif mode == "diff":
-        return _edit_file_diff(
+        result = _edit_file_diff(
             resolved_path, rel_path, workspace, patch, commit_id
         )
     else:
         return json.dumps({"error": "InvalidMode", "message": f"Unknown mode: {mode!r}. Use 'search_replace' or 'diff'."})
+
+    # Record the modified file for post-action commit (only if edit succeeded)
+    if result and isinstance(result, str):
+        try:
+            result_data = json.loads(result)
+            if "error" not in result_data:
+                snapshot_manager.record_modified_file(resolved_path)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    return result
 
 
 def _strip_lines(text: str) -> list[str]:
@@ -1084,6 +1231,81 @@ def _edit_file_search_replace(
     })
 
 
+def _strip_diff_fence(patch: str) -> str:
+    lines = patch.splitlines(keepends=True)
+    first = next((i for i, line in enumerate(lines) if line.strip()), None)
+    if first is None or not lines[first].lstrip().startswith("```"):
+        return patch
+
+    last = next((i for i in range(len(lines) - 1, first, -1) if lines[i].strip()), None)
+    if last is not None and lines[last].strip() == "```":
+        return "".join(lines[first + 1:last])
+    return patch
+
+
+def _normalize_patch_for_path(patch: str, rel_path: str) -> str:
+    patch = _strip_diff_fence(patch)
+    lines = patch.splitlines(keepends=True)
+    first_text = next((line.lstrip() for line in lines if line.strip()), "")
+    if first_text.startswith("@@ "):
+        return f"--- {rel_path}\n+++ {rel_path}\n" + patch
+
+    normalized = []
+    before_first_hunk = True
+    for line in lines:
+        if before_first_hunk and line.startswith("--- "):
+            suffix = "\n" if line.endswith("\n") else ""
+            normalized.append(f"--- {rel_path}{suffix}")
+            continue
+        if before_first_hunk and line.startswith("+++ "):
+            suffix = "\n" if line.endswith("\n") else ""
+            normalized.append(f"+++ {rel_path}{suffix}")
+            continue
+        if line.startswith("@@ "):
+            before_first_hunk = False
+        normalized.append(line)
+    return "".join(normalized)
+
+
+def _patch_process_output(result: subprocess.CompletedProcess) -> str:
+    output = "\n".join(
+        part.strip() for part in (result.stdout, result.stderr) if part and part.strip()
+    )
+    return output or "Patch did not apply cleanly"
+
+
+def _cleanup_patch_artifacts(resolved_path: str) -> None:
+    for suffix in (".orig", ".rej"):
+        try:
+            os.unlink(resolved_path + suffix)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.warning("Failed to remove patch artifact: %s", resolved_path + suffix)
+
+
+def _restore_patched_file(workspace: str, rel_path: str, resolved_path: str) -> None:
+    subprocess.run(
+        ["git", "checkout", "--", rel_path],
+        cwd=workspace,
+        capture_output=True,
+    )
+    _cleanup_patch_artifacts(resolved_path)
+
+
+def _run_patch(workspace: str, patch: str, dry_run: bool) -> subprocess.CompletedProcess:
+    args = ["patch", "--batch", "--forward", "-p0"]
+    if dry_run:
+        args.append("--dry-run")
+    return subprocess.run(
+        args,
+        input=patch,
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+    )
+
+
 def _edit_file_diff(
     resolved_path: str,
     rel_path: str,
@@ -1095,36 +1317,32 @@ def _edit_file_diff(
     if patch is None:
         return json.dumps({"error": "PatchFailed", "message": "patch parameter is required for diff mode"})
 
-    # Apply the patch using `patch -p1` with stdin
+    normalized_patch = _normalize_patch_for_path(patch, rel_path)
+
     try:
-        result = subprocess.run(
-            ["patch", "-p1"],
-            input=patch,
-            cwd=workspace,
-            capture_output=True,
-            text=True,
-        )
+        dry_run = _run_patch(workspace, normalized_patch, dry_run=True)
     except FileNotFoundError:
         return json.dumps({"error": "PatchFailed", "message": "patch command not found"})
 
-    if result.returncode != 0:
-        return json.dumps({"error": "PatchFailed", "message": "Patch did not apply cleanly"})
+    if dry_run.returncode != 0:
+        _cleanup_patch_artifacts(resolved_path)
+        return json.dumps({"error": "PatchFailed", "message": _patch_process_output(dry_run)})
 
-    # Run linter
+    result = _run_patch(workspace, normalized_patch, dry_run=False)
+    if result.returncode != 0:
+        _restore_patched_file(workspace, rel_path, resolved_path)
+        return json.dumps({"error": "PatchFailed", "message": _patch_process_output(result)})
+
+    _cleanup_patch_artifacts(resolved_path)
+
     linter = _Linter()
     passed, lint_output = linter.check(resolved_path)
     if not passed:
-        # Revert the file
-        subprocess.run(
-            ["git", "checkout", "--", rel_path],
-            cwd=workspace,
-            capture_output=True,
-        )
+        _restore_patched_file(workspace, rel_path, resolved_path)
         return json.dumps({"error": "LintFailed", "message": lint_output})
 
-    # Count lines changed from the patch (lines starting with + or - excluding +++ and ---)
     lines_changed = 0
-    for line in patch.splitlines():
+    for line in normalized_patch.splitlines():
         if (line.startswith("+") and not line.startswith("+++")) or \
            (line.startswith("-") and not line.startswith("---")):
             lines_changed += 1

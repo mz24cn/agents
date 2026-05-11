@@ -3,7 +3,7 @@
   import ThemeToggle from './ThemeToggle.svelte'
   import { t, i18n, setLang } from '../lib/i18n.svelte.js'
   import { sessions } from '../lib/api.js'
-  import { sessionRestore, newSessionCreated } from '../lib/session-state.svelte.js'
+  import { sessionRestore, newSessionCreated, currentSession } from '../lib/session-state.svelte.js'
   import { sidebarWidth, setSidebarWidth, toggleSidebarCollapsed, collapseSidebar, SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH } from '../lib/sidebar-width.svelte.js'
 
   const navItems = [
@@ -309,6 +309,7 @@
           >
             <button
               class="session-item"
+              class:active={entry.session_id === currentSession.sessionId}
               onclick={() => handleSessionClick(entry.session_id)}
               ontouchend={(e) => { e.preventDefault(); handleSessionClick(entry.session_id) }}
               title={getSessionDisplay(entry).tooltip}
@@ -544,6 +545,9 @@
   .session-item:hover {
     background-color: var(--border);
     color: var(--text);
+  }
+  .session-item.active {
+    font-weight: 700;
   }
   .session-menu-btn {
     position: absolute;

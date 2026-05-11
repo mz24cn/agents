@@ -105,7 +105,25 @@ def merge_stream_messages(stream_messages: list) -> tuple[list, Optional[dict]]:
                 first_assistant_ts = m.timestamp
             if m.tool_calls:
                 # tool_calls 到来时，合并到当前 assistant turn（不单独 flush）
-                pending_tool_calls = m.tool_calls
+                for tc in m.tool_calls:
+                    idx = tc.get("_index")
+                    if idx is None:
+                        pending_tool_calls.append(dict(tc))
+                        continue
+                    while len(pending_tool_calls) <= idx:
+                        pending_tool_calls.append({"id": "", "name": "", "arguments": ""})
+                    target = pending_tool_calls[idx]
+                    if tc.get("id"):
+                        target["id"] = tc["id"]
+                    if tc.get("tool_use_id"):
+                        target["id"] = tc["tool_use_id"]
+                    if tc.get("name"):
+                        target["name"] = target.get("name", "") + tc["name"]
+                    if tc.get("arguments"):
+                        if isinstance(tc["arguments"], dict):
+                            target["arguments"] = tc["arguments"]
+                        else:
+                            target["arguments"] = target.get("arguments", "") + tc["arguments"]
             if m.content:
                 assistant_text_buf += m.content
             if m.thinking:
@@ -121,6 +139,7 @@ def merge_stream_messages(stream_messages: list) -> tuple[list, Optional[dict]]:
                 timestamp=ts,
                 name=m.name or "",
                 tool_id=getattr(m, "tool_id", None),
+                tool_use_id=getattr(m, "tool_use_id", None),
             ))
         # skip system deltas
 
@@ -183,6 +202,7 @@ def persist_conversation(
                 arguments=getattr(m, "arguments", None) or None,
                 name=getattr(m, "name", None),
                 tool_id=getattr(m, "tool_id", None),
+                tool_use_id=getattr(m, "tool_use_id", None),
             ))
         merged_turns, last_stat = merge_stream_messages(collected_messages)
         # 如果有 agent_id，为所有 role=assistant 的消息设置 name（nickname）和 assistant_id 字段
@@ -675,6 +695,24 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
 
     def _cleanup_thread_local(self):
         from runtime.builtin_tools import _thread_local
+        from runtime.models import Message
+        import logging
+        logger = logging.getLogger("runtime.server")
+
+        # Create post-action commit if there are modified files
+        snapshot_manager = getattr(_thread_local, "snapshot_manager", None)
+        if snapshot_manager is not None:
+            try:
+                post_result = snapshot_manager.post_action()
+                if isinstance(post_result, dict) and post_result.get("error"):
+                    logger.warning("Failed to create post-action commit: %s", post_result.get("message"))
+                elif isinstance(post_result, str):
+                    logger.debug("Created post-action commit: %s", post_result)
+            except Exception as post_err:
+                logger.warning("Error creating post-action commit: %s", post_err)
+            finally:
+                _thread_local.snapshot_manager = None
+
         _thread_local.sse_callback = None
         _thread_local.cancel_event = None
         _thread_local.session_id = None
@@ -932,10 +970,56 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             # 会话不存在或已结束，视为成功（幂等）
             self._send_json_response(200, {"ok": True, "note": "session not found or already done"})
 
+    @staticmethod
+    def _extract_json(text: str) -> Optional[dict | list]:
+        """Extract valid JSON from a string.
+
+        Handles:
+        - Direct valid JSON
+        - JSON wrapped in markdown code blocks (```json ... ```)
+        """
+        if not text or not isinstance(text, str):
+            return None
+
+        s = text.strip()
+        if not s:
+            return None
+
+        # 1. Try direct parse
+        try:
+            parsed = json.loads(s)
+            if isinstance(parsed, (dict, list)):
+                return parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        # 2. Try extracting from markdown code blocks
+        code_block_pattern = re.compile(
+            r'`{3}(?:json|JSON)?\s*\n?([\s\S]*?)\n?`{3}',
+            re.IGNORECASE,
+        )
+        match = code_block_pattern.search(s)
+        if match:
+            block_content = match.group(1).strip()
+            try:
+                parsed = json.loads(block_content)
+                if isinstance(parsed, (dict, list)):
+                    return parsed
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        return None
+
     def _handle_tool_call(self) -> None:
         """POST /v1/tools/call — directly call a tool.
 
         Expects JSON body with tool_id and arguments.
+        Optional 'format' field: if 'json', the result is returned as a parsed JSON object
+        instead of a raw string.
+
+        When format='json', the method attempts to extract valid JSON from the result.
+        It handles: direct JSON, markdown code blocks, escaped JSON, and embedded JSON
+        within mixed text.
         """
         body = self._read_json_body()
         if body is None:
@@ -951,12 +1035,21 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self._send_json_error(400, "Field 'arguments' must be a JSON object")
             return
 
+        fmt = body.get("format", "text")
+
         runtime = self._get_runtime()
         result = runtime.call_tool(tool_id, arguments)
 
         # If result starts with "Error:", treat as error
         if result.startswith("Error:"):
             self._send_json_response(400, {"error": result})
+        elif fmt == "json":
+            parsed = self._extract_json(result)
+            if parsed is not None:
+                self._send_json_response(200, {"result": parsed})
+            else:
+                self._send_json_error(400, "Result is not valid JSON and no embedded JSON could be extracted")
+                return
         else:
             self._send_json_response(200, {"result": result})
 

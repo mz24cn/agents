@@ -9,7 +9,7 @@
   import ChatInput from './ChatInput.svelte'
   import { extractPlaceholders } from '../../lib/placeholder.js'
   import { t } from '../../lib/i18n.svelte.js'
-  import { sessionRestore, newSessionCreated } from '../../lib/session-state.svelte.js'
+  import { sessionRestore, newSessionCreated, currentSession } from '../../lib/session-state.svelte.js'
 
   const STORAGE_MODEL_KEY = 'chat_selected_model'
   const STORAGE_TOOLS_KEY = 'chat_selected_tools'
@@ -163,6 +163,7 @@
       // 同步 sessionId
       if (initData.session_id) {
         sessionId = initData.session_id
+        currentSession.sessionId = initData.session_id
       }
       // 通知 Sidebar 有新会话创建（仅当之前没有 sessionId 时）
       if (!newSessionCreated.sessionId && initData.session_id) {
@@ -203,15 +204,17 @@
 
   function handleStop() {
     if (abortStream) {
-      // 先通知后端 set cancel_event（覆盖 delegate 子推理期间无 SSE 写入的情况）
+      // 通知后端 set cancel_event，后端会发送中止消息并关闭连接
       if (sessionId) abortInferStream(sessionId)
-      abortStream(); abortStream = null
+      // 不再主动中止前端连接，等待后端发送中止消息后自然关闭
+      abortStream = null
     }
   }
 
   function onStreamMsg(msg, aIdxRef, pendingFirstUserMsg) {
     if (msg.session_id && !msg.role) {
       sessionId = msg.session_id
+      currentSession.sessionId = msg.session_id
       // 通知 Sidebar 有新会话创建（仅当之前没有 sessionId 时才是新会话）
       if (!newSessionCreated.sessionId) {
         newSessionCreated.sessionId = msg.session_id
@@ -350,6 +353,7 @@
       sessionRestore.pending = null
       messages = msgs
       sessionId = sid
+      currentSession.sessionId = sid
       errorMsg = ''
       // 检查最后一条assistant消息的assistant_id，设置智能体选择框
       const lastAssistantMsg = [...msgs].reverse().find(m => m.role === 'assistant')

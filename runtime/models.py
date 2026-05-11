@@ -22,6 +22,7 @@ class Message:
         audio: Optional base64-encoded audio string (multimodal).
         thinking: Optional thinking/reasoning content from the model.
         tool_id: Optional tool_id (used for tool role messages, records the tool_id of the tool that produced this result).
+        tool_use_id: Optional protocol-level tool call ID linking a tool result to its assistant tool call.
         assistant_id: Optional assistant_id (used for assistant role messages, records the agent_id of the agent that sent this message).
     """
 
@@ -36,6 +37,7 @@ class Message:
     prompt_template: Optional[str] = None
     arguments: Optional[dict] = None
     tool_id: Optional[str] = None
+    tool_use_id: Optional[str] = None
     assistant_id: Optional[str] = None
 
     def to_dict(self) -> dict:
@@ -59,6 +61,8 @@ class Message:
             d["arguments"] = self.arguments
         if self.tool_id is not None:
             d["tool_id"] = self.tool_id
+        if self.tool_use_id is not None:
+            d["tool_use_id"] = self.tool_use_id
         if self.assistant_id is not None:
             d["assistant_id"] = self.assistant_id
         return d
@@ -78,6 +82,7 @@ class Message:
             prompt_template=data.get("prompt_template"),
             arguments=data.get("arguments"),
             tool_id=data.get("tool_id"),
+            tool_use_id=data.get("tool_use_id"),
             assistant_id=data.get("assistant_id"),
         )
 

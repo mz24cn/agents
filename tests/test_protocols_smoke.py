@@ -2,7 +2,7 @@
 
 import json
 from runtime.models import Message, ModelConfig, ToolConfig
-from runtime.protocols import OpenAIProtocol
+from runtime.protocols import OpenAIProtocol, AnthropicProtocol, OllamaProtocol, PROTOCOL_MAP
 
 
 def test_basic_text_message():
@@ -247,9 +247,33 @@ def test_stream_flag_in_body():
     assert body["stream"] is True
 
 
-# ---- OllamaProtocol tests (Task 4.2) ----
+def test_anthropic_parse_stream_uses_latest_nonzero_usage():
+    proto = AnthropicProtocol()
+    lines = [
+        'data: {"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}',
+        'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hi"}}',
+        'data: {"input_tokens":355,"output_tokens":25,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}',
+        'data: [DONE]',
+    ]
+    messages = list(proto.parse_stream(lines))
+    usage = json.loads(messages[-1].content)
+    assert usage["prompt_tokens"] == 355
+    assert usage["completion_tokens"] == 25
+    assert usage["total_tokens"] == 380
 
-from runtime.protocols import OllamaProtocol, PROTOCOL_MAP
+
+def test_anthropic_parse_stream_reads_standard_sse_usage_locations():
+    proto = AnthropicProtocol()
+    lines = [
+        'data: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0,"cache_creation_input_tokens":20,"cache_read_input_tokens":30}}}',
+        'data: {"type":"message_delta","usage":{"output_tokens":7},"delta":{"stop_reason":"end_turn"}}',
+        'data: [DONE]',
+    ]
+    messages = list(proto.parse_stream(lines))
+    usage = json.loads(messages[-1].content)
+    assert usage["prompt_tokens"] == 60
+    assert usage["completion_tokens"] == 7
+    assert usage["total_tokens"] == 67
 
 
 def test_ollama_basic_text_message():

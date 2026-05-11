@@ -171,6 +171,42 @@ describe('highlight() unit tests — JSON', () => {
     const result = highlight('{"active": true}', 'json')
     expect(result).toContain('<span class="hl-boolean">true</span>')
   })
+
+  it('collapses long object string values with an expandable pre containing decoded text', () => {
+    const longText = `0123456789`.repeat(8) + 'line1\nline2 "quoted"'
+    const result = highlight(JSON.stringify({ text: longText }, null, 2), 'json')
+    expect(result).toContain('hl-json-string-preview')
+    expect(result).toContain('<details class="hl-json-expand"><summary')
+    expect(result.indexOf('hl-json-expand-icon')).toBeLessThan(result.indexOf('hl-json-string-preview'))
+    expect(result).toContain('&quot;01234567890123456789012345678901234567890123456789012345678901234567890123456789…&quot;')
+    expect(result).toContain('<pre>0123456789')
+    expect(result).toContain('line1\nline2 &quot;quoted&quot;</pre>')
+    expect(result).not.toContain('\\nline2')
+    expect(result).not.toContain('\\&quot;quoted\\&quot;')
+  })
+
+  it('keeps an inline trailing comma inside the collapsible JSON string summary without an extra blank line', () => {
+    const result = highlight(JSON.stringify({ text: 'x'.repeat(81), next: true }, null, 2), 'json')
+    const summaryEnd = result.indexOf('</summary>')
+    const comma = result.indexOf(',', result.indexOf('hl-json-string-preview'))
+    expect(comma).toBeGreaterThan(-1)
+    expect(comma).toBeLessThan(summaryEnd)
+    expect(result).toContain('</details>  <span class="hl-key">&quot;next&quot;</span>')
+  })
+
+  it('uses jsonPreviewColumns to adapt the collapsed preview length', () => {
+    const longText = 'x'.repeat(200)
+    const result = highlight(JSON.stringify({ text: longText }, null, 2), 'json', { jsonPreviewColumns: 60 })
+    expect(result).toContain('&quot;'.concat('x'.repeat(24), '…&quot;'))
+    expect(result).not.toContain('&quot;'.concat('x'.repeat(80), '…&quot;'))
+  })
+
+  it('can disable JSON long string collapsing for editor overlays', () => {
+    const longText = 'x'.repeat(81)
+    const result = highlight(JSON.stringify({ text: longText }), 'json', { collapseLongStrings: false })
+    expect(result).not.toContain('hl-json-expand')
+    expect(result).toContain(`&quot;${longText}&quot;`)
+  })
 })
 
 describe('highlight() unit tests — Bash', () => {

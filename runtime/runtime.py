@@ -266,6 +266,7 @@ class Runtime:
                     messages.append(Message(
                         role="tool",
                         name=pending_name,
+                        tool_use_id=fn_call.get("id") or fn_call.get("tool_use_id"),
                         content=(
                             f"Error: maximum tool-call rounds ({request.max_tool_rounds}) "
                             f"reached. Tool '{pending_name}' was not executed."
@@ -291,6 +292,7 @@ class Runtime:
                             Message(
                                 role="tool",
                                 name=tool_name,
+                                tool_use_id=fn_call.get("id") or fn_call.get("tool_use_id"),
                                 content=(
                                     f"用户选择了 {tool_name} 技能。以下是该技能的详细文档，"
                                     f"请根据文档内容和用户的原始请求，使用 bash 或 fetch 等"
@@ -326,6 +328,7 @@ class Runtime:
                         content=tool_result,
                         name=tool_name,
                         tool_id=tool_config.tool_id if tool_config else None,
+                        tool_use_id=fn_call.get("id") or fn_call.get("tool_use_id"),
                     )
                 )
 
@@ -800,6 +803,7 @@ class Runtime:
                     # Check for cancellation before yielding
                     if cancel_event is not None and cancel_event.is_set():
                         http_resp.close()
+                        yield Message(role="assistant", timestamp=_now_ts(), content="Error: user interrupted.")
                         return
 
                     # Intercept usage messages — accumulate, don't yield raw
@@ -839,11 +843,15 @@ class Runtime:
                         # Tool calls arrive as a complete list (Ollama) or
                         # as individual delta dicts with _index (OpenAI)
                         for tc in msg.tool_calls:
-                            idx = tc.pop("_index", None)
+                            idx = tc.get("_index")
                             if idx is None:
                                 idx = len(accumulated_tool_calls)
                             if idx not in accumulated_tool_calls:
-                                accumulated_tool_calls[idx] = {"name": "", "arguments": ""}
+                                accumulated_tool_calls[idx] = {"id": "", "name": "", "arguments": ""}
+                            if tc.get("id"):
+                                accumulated_tool_calls[idx]["id"] = tc["id"]
+                            if tc.get("tool_use_id"):
+                                accumulated_tool_calls[idx]["id"] = tc["tool_use_id"]
                             if tc.get("name"):
                                 accumulated_tool_calls[idx]["name"] += tc["name"]
                             if tc.get("arguments"):
@@ -915,11 +923,12 @@ class Runtime:
                         role="tool",
                         timestamp=_now_ts(),
                         name=pending_name,
-                    content=(
-                        f"Error: maximum tool-call rounds ({request.max_tool_rounds}) "
-                        f"reached. Tool '{pending_name}' was not executed."
-                    ),
-                )
+                        tool_use_id=fn_call.get("id") or fn_call.get("tool_use_id"),
+                        content=(
+                            f"Error: maximum tool-call rounds ({request.max_tool_rounds}) "
+                            f"reached. Tool '{pending_name}' was not executed."
+                        ),
+                    )
                 stat_dict = {
                     "prompt_tokens": round_prompt,
                     "completion_tokens": round_completion,
@@ -957,6 +966,7 @@ class Runtime:
                             role="tool",
                             timestamp=_now_ts(),
                             name=tool_name,
+                            tool_use_id=fn_call.get("id") or fn_call.get("tool_use_id"),
                             content=(
                                 f"用户选择了 {tool_name} 技能。以下是该技能的详细文档，"
                                 f"请根据文档内容和用户的原始请求，使用 bash 或 fetch 等"
@@ -980,7 +990,14 @@ class Runtime:
 
                 tool_result, tool_config = self._execute_tool_call(tool_name, arguments, tool_scope=tools)
 
-                tool_msg = Message(role="tool", timestamp=_now_ts(), content=tool_result, name=tool_name, tool_id=tool_config.tool_id if tool_config else None)
+                tool_msg = Message(
+                    role="tool",
+                    timestamp=_now_ts(),
+                    content=tool_result,
+                    name=tool_name,
+                    tool_id=tool_config.tool_id if tool_config else None,
+                    tool_use_id=fn_call.get("id") or fn_call.get("tool_use_id"),
+                )
                 messages.append(tool_msg)
                 yield tool_msg
 

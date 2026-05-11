@@ -35,6 +35,7 @@ class ConversationTurn:
         arguments: Optional dict of template arguments for this turn.
         assistant_id: Optional agent_id for assistant-role turns, identifying which agent sent this message.
         tool_id: Optional tool_id for tool-role turns, identifying which tool produced this result.
+        tool_use_id: Optional protocol-level tool call ID linking a tool result to its assistant tool call.
     """
 
     role: str
@@ -50,6 +51,7 @@ class ConversationTurn:
     arguments: Optional[dict] = None
     assistant_id: Optional[str] = None
     tool_id: Optional[str] = None
+    tool_use_id: Optional[str] = None
 
 
 @dataclass
@@ -800,6 +802,7 @@ class ContextManager:
                 arguments=msg.get("arguments"),
                 assistant_id=msg.get("assistant_id"),
                 tool_id=msg.get("tool_id"),
+                tool_use_id=msg.get("tool_use_id"),
             ))
         return turns
 

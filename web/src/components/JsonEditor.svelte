@@ -13,7 +13,7 @@
     try { JSON.parse(value); return true } catch { return false }
   })
 
-  let highlighted = $derived(value ? highlight(value, 'json') : '')
+  let highlighted = $derived(value ? highlight(value, 'json', { collapseLongStrings: false }) : '')
 
   function onScroll(e) {
     scrollTop = e.target.scrollTop
