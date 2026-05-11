@@ -579,7 +579,7 @@
     onOpenTemplatePanel={openTemplatePanel}
     {isStreaming}
     bind:text={inputText}
-    onNewSession={() => { messages = []; errorMsg = ''; sessionId = null }}
+    onNewSession={() => { messages = []; errorMsg = ''; sessionId = null; currentSession.sessionId = null }}
     hasMessages={messages.length > 0}
   />
 </div>
