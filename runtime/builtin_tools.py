@@ -7,19 +7,24 @@ execute commands described in SKILL.md.
 These tools use only Python standard library modules.
 """
 
+import gzip
+import hashlib
 import json
 import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import datetime
 import urllib.request
 import urllib.error
 import uuid
+from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger("runtime.builtin_tools")
@@ -37,30 +42,27 @@ from runtime.registry import ToolRegistry
 _thread_local = threading.local()
 
 
-def _get_snapshot_manager(workspace: str) -> '_SnapshotManager':
-    """Get or create a _SnapshotManager instance from thread_local.
-
-    Args:
-        workspace: The workspace root directory.
-
-    Returns:
-        A _SnapshotManager instance associated with the current thread.
-    """
+def _get_file_journal_manager(workspace: str) -> '_FileJournalManager':
     session_id = getattr(_thread_local, "session_id", None)
     user_message_timestamp = getattr(_thread_local, "user_message_timestamp", None)
-    
-    # Check if there's already a snapshot manager in thread_local
-    snapshot_manager = getattr(_thread_local, "snapshot_manager", None)
-    
-    if snapshot_manager is None:
-        snapshot_manager = _SnapshotManager(workspace, session_id, user_message_timestamp)
-        _thread_local.snapshot_manager = snapshot_manager
-    elif snapshot_manager.workspace != workspace:
-        # Workspace changed, create a new instance
-        snapshot_manager = _SnapshotManager(workspace, session_id, user_message_timestamp)
-        _thread_local.snapshot_manager = snapshot_manager
-    
-    return snapshot_manager
+    session_dir = getattr(_thread_local, "session_dir", None)
+
+    journal_manager = getattr(_thread_local, "file_journal_manager", None)
+    if (
+        journal_manager is None
+        or journal_manager.workspace != workspace
+        or journal_manager.session_id != session_id
+        or journal_manager.session_dir != session_dir
+        or journal_manager.user_message_timestamp != user_message_timestamp
+    ):
+        journal_manager = _FileJournalManager(
+            workspace,
+            session_id=session_id,
+            user_message_timestamp=user_message_timestamp,
+            session_dir=session_dir,
+        )
+        _thread_local.file_journal_manager = journal_manager
+    return journal_manager
 
 
 def _bash_execute(command: str, cwd: str = "") -> str:
@@ -384,10 +386,17 @@ def _make_delegate_fn(runtime, thread_local):
             # 保存旧值，切换到子 session 上下文
             old_depth = current_depth
             old_session_id = session_id
+            old_session_dir = getattr(thread_local, "session_dir", None)
+            old_file_journal_manager = getattr(thread_local, "file_journal_manager", None)
             old_user_message_timestamp = getattr(thread_local, "user_message_timestamp", None)
             thread_local.depth = current_depth + 1
             if sub_session_id is not None:
                 thread_local.session_id = sub_session_id
+                if old_session_dir is not None and session_id and sub_session_id.startswith(f"{session_id}-"):
+                    thread_local.session_dir = os.path.join(old_session_dir, sub_session_id[len(session_id) + 1:])
+                else:
+                    thread_local.session_dir = None
+                thread_local.file_journal_manager = None
 
             chunks = []
             collected_msgs = []
@@ -411,9 +420,11 @@ def _make_delegate_fn(runtime, thread_local):
                             except Exception:
                                 pass  # SSE 写入失败不中断推理
             finally:
-                # 恢复 depth、tool_scope、session_id 和用户消息时间戳
+                # 恢复 depth、tool_scope、session_id、session_dir 和用户消息时间戳
                 thread_local.depth = old_depth
                 thread_local.session_id = old_session_id
+                thread_local.session_dir = old_session_dir
+                thread_local.file_journal_manager = old_file_journal_manager
                 thread_local.user_message_timestamp = old_user_message_timestamp
                 if sub_session_id is not None:
                     thread_local.last_session_id = sub_session_id
@@ -544,255 +555,346 @@ def _validate_path(workspace: str, raw_path: str) -> str:
         return joined
 
 
-class _SnapshotManager:
-    """Manage Git snapshots for write/edit operations.
+def _utc_now_iso() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
-    Parameters
-    ----------
-    workspace:
-        The workspace root directory (must be a git repository).
-    session_id:
-        Optional session ID to associate with this snapshot via git commit messages.
-    user_message_timestamp:
-        Optional timestamp of the user message that triggered this snapshot.
-        Used together with ``session_id`` to restore file state when a user
-        message is revoked.
-    """
 
+def _parse_journal_timestamp(value: Optional[str]) -> Optional[datetime.datetime]:
+    if not value:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is not None:
+        return dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _journal_turn_key(value: Optional[str]) -> tuple[str, str, bool]:
+    dt = _parse_journal_timestamp(value)
+    if dt is None:
+        dt = datetime.datetime.utcnow()
+        timestamp = dt.replace(microsecond=0).isoformat()
+        return dt.strftime("%y%m%d_%H%M%S"), timestamp, True
+    return dt.strftime("%y%m%d_%H%M%S"), value or dt.isoformat(), False
+
+
+def _sha256_bytes(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _safe_rel_path(rel_path: str) -> str:
+    rel_path = rel_path.replace(os.sep, "/")
+    if os.path.isabs(rel_path) or rel_path == ".." or rel_path.startswith("../") or "/../" in f"/{rel_path}/":
+        raise ValueError(f"Unsafe journal path: {rel_path}")
+    return rel_path
+
+
+def _flatten_journal_path(rel_path: str, role: str) -> str:
+    safe_rel = _safe_rel_path(rel_path)
+    flat = re.sub(r"[\\/]+", "-", safe_rel)
+    flat = re.sub(r"[^A-Za-z0-9._-]", "_", flat) or "file"
+    short_hash = hashlib.sha256(safe_rel.encode("utf-8")).hexdigest()[:8]
+    return f"{flat}.{short_hash}.{role}.gz"
+
+
+def _file_mode(path: str) -> str:
+    mode = os.lstat(path).st_mode
+    return "100755" if mode & stat.S_IXUSR else "100644"
+
+
+def _capture_file_state(path: str) -> dict:
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return {"exists": False}
+    is_symlink = stat.S_ISLNK(st.st_mode)
+    if is_symlink:
+        data = os.readlink(path).encode("utf-8", errors="surrogateescape")
+    else:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    return {
+        "exists": True,
+        "data": data,
+        "mode": "100755" if st.st_mode & stat.S_IXUSR else "100644",
+        "is_symlink": is_symlink,
+    }
+
+
+def _restore_file_state(path: str, state: dict) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    if not state.get("exists"):
+        return
+    data = state.get("data", b"")
+    if state.get("is_symlink"):
+        target = data.decode("utf-8", errors="surrogateescape")
+        os.symlink(target, path)
+        return
+    fd, tmp_path = tempfile.mkstemp(dir=parent or None)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp_path, path)
+        tmp_path = None
+        os.chmod(path, 0o755 if state.get("mode") == "100755" else 0o644)
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
+
+
+def _blob_ref_from_state(state: dict, journal_dir: str, rel_path: str, role: str) -> dict:
+    if not state.get("exists"):
+        return {"exists": False}
+    data = state.get("data", b"")
+    blob_name = _flatten_journal_path(rel_path, role)
+    blob_rel = os.path.join("files", blob_name)
+    blob_path = os.path.join(journal_dir, blob_rel)
+    _write_gzip_blob(blob_path, data)
+    return {
+        "exists": True,
+        "store": "sidecar",
+        "file": blob_rel.replace(os.sep, "/"),
+        "sha256": _sha256_bytes(data),
+        "size": len(data),
+        "compression": "gzip",
+        "mode": state.get("mode", "100644"),
+        "is_symlink": bool(state.get("is_symlink")),
+    }
+
+
+def _write_gzip_blob(path: str, raw: bytes) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    compressed = gzip.compress(raw, compresslevel=6)
+    fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(compressed)
+        os.replace(tmp_path, path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
+
+
+def _read_gzip_blob(path: str, expected_sha256: Optional[str] = None) -> bytes:
+    with open(path, "rb") as fh:
+        raw = gzip.decompress(fh.read())
+    if expected_sha256 and _sha256_bytes(raw) != expected_sha256:
+        raise ValueError("Sidecar blob sha256 mismatch")
+    return raw
+
+
+def _atomic_write_json(path: str, data: dict) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    text = json.dumps(data, ensure_ascii=False, indent=2)
+    fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path), text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.write("\n")
+        os.replace(tmp_path, path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
+
+
+class _ManifestLock:
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._fh = None
+
+    def __enter__(self):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        self._fh = open(self.path, "w")
+        if sys.platform != "win32":
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._fh is not None:
+            if sys.platform != "win32":
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+            self._fh.close()
+
+
+class _FileJournalManager:
     def __init__(
         self,
         workspace: str,
         session_id: Optional[str] = None,
         user_message_timestamp: Optional[str] = None,
+        session_dir: Optional[str] = None,
     ) -> None:
-        self.workspace = workspace
+        self.workspace = os.path.realpath(workspace)
         self.session_id = session_id
         self.user_message_timestamp = user_message_timestamp
-        self._previous_staged = None  # Store previously staged changes
-        self._modified_files = []  # Track files modified during this session
-        # Check if git operations are disabled
-        self._disabled = os.environ.get("DISABLE_GIT_OPERATION", "true").lower() == "true"
-
-    def _run_git(self, args: list[str]) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            ["git"] + args,
-            cwd=self.workspace,
-            capture_output=True,
-            text=True,
-        )
-
-    def snapshot(self, tool_name: str, file_path: Optional[str] = None) -> str | dict:
-        """Stage changes for specific file(s) and create a pre-action commit.
-
-        Always creates a commit to track the edit operation, even if the file
-        has no pre-existing changes. This ensures complete traceability of all
-        agent operations within a session.
-
-        Args:
-            tool_name: Name of the tool creating this snapshot.
-            file_path: Optional path to the specific file being modified.
-                If provided, only this file will be staged and committed.
-                If None, all changes will be staged (backward compatible).
-
-        Returns:
-            The commit SHA string on success, or a dict with
-            ``{"error": ..., "message": ...}`` on failure, or
-            ``{"skipped": True}`` if git operations are disabled.
-        """
-        # Skip all git operations if disabled
-        if self._disabled:
-            return {"skipped": True}
-        
-        # Verify git repo exists
-        git_dir = os.path.join(self.workspace, ".git")
-        if not os.path.exists(git_dir):
-            return {
-                "error": "GitNotInitialized",
-                "message": "Workspace is not a Git repository",
-            }
-
-        has_changes = False
-        
-        if file_path:
-            # Get relative path from workspace
-            rel_path = os.path.relpath(file_path, self.workspace) if os.path.isabs(file_path) else file_path
-            
-            # Check if file exists and has changes (including staged changes)
-            status_result = self._run_git(["status", "--porcelain", rel_path])
-            if status_result.stdout.strip():
-                # Stage only this specific file (overwrites any staged changes for this file)
-                add_result = self._run_git(["add", rel_path])
-                if add_result.returncode != 0:
-                    return {
-                        "error": "SnapshotFailed",
-                        "message": f"Failed to stage file: {rel_path}",
-                    }
-                has_changes = True
+        self.session_dir = session_dir
+        self.disabled = os.environ.get("DISABLE_FILE_JOURNAL", "false").lower() == "true"
+        self.turn_key, self.timestamp, self.timestamp_fallback_used = _journal_turn_key(user_message_timestamp)
+        self.journal_id = f"{session_id or 'stateless'}/{self.turn_key}"
+        if session_dir:
+            self.journal_dir = os.path.join(session_dir, "file_journals", self.turn_key)
+            self.manifest_path = os.path.join(self.journal_dir, "manifest.json")
+            self.lock_path = self.manifest_path + ".lock"
         else:
-            # Backward compatible: stage all changes
-            add_result = self._run_git(["add", "."])
-            if add_result.returncode != 0:
-                return {
-                    "error": "SnapshotFailed",
-                    "message": "Pre-action snapshot could not be created",
-                }
-            # Check if there's anything staged
-            diff_result = self._run_git(["diff", "--cached", "--exit-code"])
-            has_changes = diff_result.returncode != 0
+            self.journal_dir = None
+            self.manifest_path = None
+            self.lock_path = None
 
-        # Commit with --allow-empty to ensure we always create a marker commit
-        # This ensures complete traceability even when file has no pre-existing changes
-        session_suffix = f" [session: {self.session_id}]" if self.session_id else ""
-        timestamp_suffix = (
-            f" [timestamp: {self.user_message_timestamp}]"
-            if self.user_message_timestamp
-            else ""
-        )
-        commit_msg = f"Agent pre-action: {tool_name}{session_suffix}{timestamp_suffix}"
-        commit_args = ["commit", "-m", commit_msg]
-        if not has_changes:
-            commit_args.append("--allow-empty")
-        commit_result = self._run_git(commit_args)
-        if commit_result.returncode != 0:
-            return {
-                "error": "SnapshotFailed",
-                "message": "Pre-action snapshot could not be created",
-            }
+    def _skipped(self, reason: str) -> dict:
+        return {"skipped": True, "reason": reason, "turn_key": self.turn_key, "journal_id": self.journal_id}
 
-        # Extract the commit SHA
-        rev_result = self._run_git(["rev-parse", "HEAD"])
-        if rev_result.returncode != 0:
-            return {
-                "error": "SnapshotFailed",
-                "message": "Pre-action snapshot could not be created",
-            }
-        commit_sha = rev_result.stdout.strip()
+    def response_metadata(self) -> dict:
+        if self.disabled:
+            return self._skipped("disabled")
+        if not self.session_dir:
+            return self._skipped("no_session_dir")
+        return {"journal_id": self.journal_id, "turn_key": self.turn_key, "session_id": self.session_id}
 
-        return commit_sha
+    def ensure_baseline(self, tool_name: str, file_path: str) -> dict:
+        if self.disabled:
+            return self._skipped("disabled")
+        if not self.session_dir or not self.manifest_path or not self.journal_dir or not self.lock_path:
+            return self._skipped("no_session_dir")
+        try:
+            resolved_path = _validate_path(self.workspace, file_path)
+            rel_path = _safe_rel_path(os.path.relpath(resolved_path, self.workspace))
+            with _ManifestLock(self.lock_path):
+                manifest = self._load_manifest()
+                files = manifest.setdefault("files", {})
+                entry = files.get(rel_path)
+                if entry is None:
+                    entry = {"path": rel_path, "tools": []}
+                    files[rel_path] = entry
+                if tool_name not in entry.setdefault("tools", []):
+                    entry["tools"].append(tool_name)
+                if "baseline" not in entry:
+                    entry["baseline"] = self._baseline_ref(resolved_path, rel_path)
+                self._save_manifest(manifest)
+            return self.response_metadata()
+        except Exception as exc:
+            logger.warning("File journal baseline failed for %s: %s", file_path, exc)
+            return {"error": "JournalFailed", "message": "Could not save baseline before modifying file"}
 
-    def record_modified_file(self, file_path: str) -> None:
-        """Record a file that was modified during this session.
+    def record_after(self, tool_name: str, file_path: str) -> dict:
+        if self.disabled:
+            return self._skipped("disabled")
+        if not self.session_dir or not self.manifest_path or not self.journal_dir or not self.lock_path:
+            return self._skipped("no_session_dir")
+        try:
+            resolved_path = _validate_path(self.workspace, file_path)
+            rel_path = _safe_rel_path(os.path.relpath(resolved_path, self.workspace))
+            with _ManifestLock(self.lock_path):
+                manifest = self._load_manifest()
+                files = manifest.setdefault("files", {})
+                entry = files.setdefault(rel_path, {"path": rel_path, "tools": []})
+                if tool_name not in entry.setdefault("tools", []):
+                    entry["tools"].append(tool_name)
+                if "baseline" not in entry:
+                    entry["baseline"] = {"exists": False}
+                entry["after"] = _blob_ref_from_state(_capture_file_state(resolved_path), self.journal_dir, rel_path, "after")
+                self._save_manifest(manifest)
+            return self.response_metadata()
+        except Exception as exc:
+            logger.warning("File journal after snapshot failed for %s: %s", file_path, exc)
+            return {"error": "JournalFailed", "message": "Could not save after snapshot"}
 
-        Args:
-            file_path: Absolute path to the modified file.
-        """
-        rel_path = os.path.relpath(file_path, self.workspace) if os.path.isabs(file_path) else file_path
-        if rel_path not in self._modified_files:
-            self._modified_files.append(rel_path)
+    def flush(self) -> None:
+        return None
 
-    def post_action(self) -> str | dict:
-        """Create a post-action commit marking the end of the session.
-
-        Creates a commit with all modified files and adds session_id note.
-
-        Returns:
-            The commit SHA string on success, or a dict with
-            ``{"error": ..., "message": ...}`` on failure, or
-            ``{"skipped": True}`` if no files were modified or git operations are disabled.
-        """
-        if not self._modified_files:
-            return {"skipped": True}
-        
-        # Skip all git operations if disabled
-        if self._disabled:
-            return {"skipped": True}
-
-        # Verify git repo exists
-        git_dir = os.path.join(self.workspace, ".git")
-        if not os.path.exists(git_dir):
-            return {
-                "error": "GitNotInitialized",
-                "message": "Workspace is not a Git repository",
-            }
-
-        # Stage all modified files
-        for file_path in self._modified_files:
-            add_result = self._run_git(["add", file_path])
-            if add_result.returncode != 0:
-                return {
-                    "error": "SnapshotFailed",
-                    "message": f"Failed to stage file: {file_path}",
-                }
-
-        # Check if there's anything to commit
-        diff_result = self._run_git(["diff", "--cached", "--exit-code"])
-        if diff_result.returncode == 0:
-            return {"skipped": True}
-
-        # Commit
-        session_suffix = f" [session: {self.session_id}]" if self.session_id else ""
-        timestamp_suffix = (
-            f" [timestamp: {self.user_message_timestamp}]"
-            if self.user_message_timestamp
-            else ""
-        )
-        commit_msg = f"Agent post-action: session end{session_suffix}{timestamp_suffix}"
-        commit_result = self._run_git(["commit", "-m", commit_msg])
-        if commit_result.returncode != 0:
-            return {
-                "error": "SnapshotFailed",
-                "message": "Post-action snapshot could not be created",
-            }
-
-        # Extract the commit SHA
-        rev_result = self._run_git(["rev-parse", "HEAD"])
-        if rev_result.returncode != 0:
-            return {
-                "error": "SnapshotFailed",
-                "message": "Post-action snapshot could not be created",
-            }
-        commit_sha = rev_result.stdout.strip()
-
-        return commit_sha
-
-    def undo(self) -> dict:
-        """Revert the workspace to the previous Git commit.
-
-        Returns a dict with ``reverted_commit`` and ``restored_commit`` on
-        success, or ``{"error": ..., "message": ...}`` on failure.
-        """
-        # Skip all git operations if disabled
-        if self._disabled:
-            return {
-                "error": "GitDisabled",
-                "message": "Git operations are disabled via DISABLE_GIT_OPERATION environment variable",
-            }
-        
-        # Get current HEAD (the commit we are about to revert)
-        head_result = self._run_git(["rev-parse", "HEAD"])
-        if head_result.returncode != 0:
-            return {
-                "error": "UndoFailed",
-                "message": head_result.stderr.strip(),
-            }
-        reverted_commit = head_result.stdout.strip()
-
-        # Check that HEAD^ exists (i.e. there is a parent commit)
-        parent_result = self._run_git(["rev-parse", "HEAD^"])
-        if parent_result.returncode != 0:
-            return {
-                "error": "NoPreviousCommit",
-                "message": "No previous snapshot to revert to",
-            }
-
-        # Perform the reset
-        reset_result = self._run_git(["reset", "--hard", "HEAD^"])
-        if reset_result.returncode != 0:
-            return {
-                "error": "UndoFailed",
-                "message": reset_result.stderr.strip(),
-            }
-
-        # Remove untracked files and directories so the workspace matches the
-        # restored commit exactly (e.g. a file created by write_file that was
-        # never committed should disappear after undo).
-        self._run_git(["clean", "-fd"])
-
-        restored_commit = parent_result.stdout.strip()
+    def _load_manifest(self) -> dict:
+        if self.manifest_path and os.path.isfile(self.manifest_path):
+            with open(self.manifest_path, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        now = _utc_now_iso()
         return {
-            "reverted_commit": reverted_commit,
-            "restored_commit": restored_commit,
+            "version": 1,
+            "session_id": self.session_id,
+            "timestamp": self.timestamp,
+            "timestamp_fallback_used": self.timestamp_fallback_used,
+            "turn_key": self.turn_key,
+            "workspace": self.workspace,
+            "created_at": now,
+            "updated_at": now,
+            "files": {},
         }
+
+    def _save_manifest(self, manifest: dict) -> None:
+        manifest["updated_at"] = _utc_now_iso()
+        _atomic_write_json(self.manifest_path, manifest)  # type: ignore[arg-type]
+
+    def _baseline_ref(self, resolved_path: str, rel_path: str) -> dict:
+        state = _capture_file_state(resolved_path)
+        if not state.get("exists"):
+            return {"exists": False}
+        git_ref = self._git_baseline_ref(rel_path, state)
+        if git_ref is not None:
+            return git_ref
+        return _blob_ref_from_state(state, self.journal_dir or "", rel_path, "baseline")
+
+    def _git(self, args: list[str]) -> subprocess.CompletedProcess:
+        return subprocess.run(["git"] + args, cwd=self.workspace, capture_output=True, text=False)
+
+    def _git_text(self, args: list[str]) -> subprocess.CompletedProcess:
+        return subprocess.run(["git"] + args, cwd=self.workspace, capture_output=True, text=True)
+
+    def _git_baseline_ref(self, rel_path: str, state: dict) -> Optional[dict]:
+        if state.get("is_symlink") or not os.path.isdir(os.path.join(self.workspace, ".git")):
+            return None
+        status = self._git_text(["status", "--porcelain", "--", rel_path])
+        if status.returncode != 0 or status.stdout.strip():
+            return None
+        oid_result = self._git_text(["rev-parse", f"HEAD:{rel_path}"])
+        if oid_result.returncode != 0:
+            return None
+        commit_result = self._git_text(["rev-parse", "HEAD"])
+        cat_result = self._git(["cat-file", "-p", oid_result.stdout.strip()])
+        if commit_result.returncode != 0 or cat_result.returncode != 0:
+            return None
+        ls_result = self._git_text(["ls-tree", "HEAD", "--", rel_path])
+        mode = state.get("mode", "100644")
+        if ls_result.returncode == 0 and ls_result.stdout.strip():
+            mode = ls_result.stdout.split()[0]
+        raw = cat_result.stdout
+        return {
+            "exists": True,
+            "store": "git",
+            "oid": oid_result.stdout.strip(),
+            "git_object_format": "sha1",
+            "git_commit": commit_result.stdout.strip(),
+            "git_path": rel_path,
+            "sha256": _sha256_bytes(raw),
+            "size": len(raw),
+            "mode": mode,
+            "is_symlink": False,
+        }
+
+
+class _PathValidator:
+    def __init__(self, workspace: str) -> None:
+        self.workspace = os.path.realpath(workspace)
+
+    def validate(self, raw_path: str) -> str:
+        return _validate_path(self.workspace, raw_path)
+
 
 
 class _Linter:
@@ -882,7 +984,7 @@ def _read_file(path: str, start_line: Optional[int] = None, end_line: Optional[i
         end_line = total_lines
 
     if start_line is None and end_line is None:
-        threshold = int(os.environ.get("READ_TRUNCATION_LINES", 500))
+        threshold = int(os.environ.get("READ_TRUNCATION_LINES", 1000))
         start, end = 1, min(total_lines, threshold)
         truncated = total_lines > threshold
     else:
@@ -944,14 +1046,14 @@ BUILTIN_TOOLS.append((READ_FILE_TOOL_CONFIG, _read_file))
 # ---------------------------------------------------------------------------
 
 def _write_file(path: str, content: str) -> str:
-    """Write content to a file atomically with a pre-write Git snapshot.
+    """Write content to a file atomically with a pre-write file journal snapshot.
 
     Args:
         path: Path to the file (relative to AGENT_WORKSPACE or absolute within it).
         content: The content to write to the file (UTF-8 string).
 
     Returns:
-        JSON string with keys: file, bytes_written, commit_id on success.
+        JSON string with keys: file, bytes_written, journal on success.
         On error, returns JSON string with keys: error, message.
     """
     import tempfile
@@ -963,20 +1065,11 @@ def _write_file(path: str, content: str) -> str:
     except ValueError as exc:
         return json.dumps({"error": exc.error_code, "message": str(exc)})  # type: ignore[attr-defined]
 
-    # Get snapshot manager from thread_local (creates if not exists)
-    snapshot_manager = _get_snapshot_manager(workspace)
-
-    # Create pre-action snapshot
-    # Always creates a commit (even empty) for traceability
-    snapshot_result = snapshot_manager.snapshot("write_file", resolved_path)
-    
-    # Handle return cases
-    commit_id = None
-    if isinstance(snapshot_result, dict):
-        # snapshot returned an error
-        return json.dumps(snapshot_result)
-    else:
-        commit_id = snapshot_result
+    journal_manager = _get_file_journal_manager(workspace)
+    backup = _capture_file_state(resolved_path)
+    journal_result = journal_manager.ensure_baseline("write_file", resolved_path)
+    if isinstance(journal_result, dict) and journal_result.get("error"):
+        return json.dumps(journal_result)
 
     # Create parent directories if they don't exist
     parent_dir = os.path.dirname(resolved_path)
@@ -1006,9 +1099,20 @@ def _write_file(path: str, content: str) -> str:
 
         os.replace(tmp_path, resolved_path)
         tmp_path = None  # successfully replaced, no cleanup needed
-        
-        # Record the modified file for post-action commit
-        snapshot_manager.record_modified_file(resolved_path)
+
+        journal_result = journal_manager.record_after("write_file", resolved_path)
+        if isinstance(journal_result, dict) and journal_result.get("error"):
+            try:
+                _restore_file_state(resolved_path, backup)
+            except Exception:
+                return json.dumps({
+                    "error": "JournalFailed",
+                    "message": "Could not save after snapshot and failed to restore file",
+                })
+            return json.dumps({
+                "error": "JournalFailed",
+                "message": "Could not save after snapshot; file was restored to pre-call state",
+            })
     except OSError as exc:
         return json.dumps({"error": "WriteFailure", "message": str(exc)})
     except Exception as exc:
@@ -1024,10 +1128,12 @@ def _write_file(path: str, content: str) -> str:
     # Compute relative path from workspace root for the response
     rel_path = os.path.relpath(resolved_path, workspace)
 
+    journal_meta = journal_manager.response_metadata()
     return json.dumps({
         "file": rel_path,
         "bytes_written": bytes_written,
-        "commit_id": commit_id,
+        "journal_id": journal_meta.get("journal_id"),
+        "journal": journal_meta,
     })
 
 
@@ -1039,7 +1145,7 @@ WRITE_FILE_TOOL_CONFIG = ToolConfig(
     description=(
         "Write content to a file in the workspace atomically. "
         "Creates parent directories if they don't exist. "
-        "A Git snapshot is created before writing."
+        "A file journal snapshot is saved before writing so the change can be reviewed or reverted with the session."
     ),
     parameters={
         "type": "object",
@@ -1082,7 +1188,7 @@ def _edit_file(
         patch: (diff mode) A unified diff patch string to apply.
 
     Returns:
-        JSON string with keys: file, commit_id, lines_changed on success.
+        JSON string with keys: file, journal, lines_changed on success.
         On error, returns JSON string with keys: error, message.
     """
     workspace = os.path.realpath(os.environ.get("AGENT_WORKSPACE", ""))
@@ -1096,43 +1202,50 @@ def _edit_file(
     if not os.path.isfile(resolved_path):
         return json.dumps({"error": "FileNotFound", "message": f"The specified file `{resolved_path}` does not exist"})
 
-    # Get snapshot manager from thread_local (creates if not exists)
-    snapshot_manager = _get_snapshot_manager(workspace)
-
-    # Create pre-action snapshot
-    # Always creates a commit (even empty) for traceability
-    snapshot_result = snapshot_manager.snapshot("edit_file", resolved_path)
-    
-    # Handle return cases
-    commit_id = None
-    if isinstance(snapshot_result, dict):
-        # snapshot returned an error
-        return json.dumps(snapshot_result)
-    else:
-        commit_id = snapshot_result
+    journal_manager = _get_file_journal_manager(workspace)
+    backup = _capture_file_state(resolved_path)
+    journal_result = journal_manager.ensure_baseline("edit_file", resolved_path)
+    if isinstance(journal_result, dict) and journal_result.get("error"):
+        return json.dumps(journal_result)
 
     rel_path = os.path.relpath(resolved_path, workspace)
 
     result = None
     if mode == "search_replace":
         result = _edit_file_search_replace(
-            resolved_path, rel_path, workspace, old_str, new_str, commit_id
+            resolved_path, rel_path, workspace, old_str, new_str, backup
         )
     elif mode == "diff":
         result = _edit_file_diff(
-            resolved_path, rel_path, workspace, patch, commit_id
+            resolved_path, rel_path, workspace, patch, backup
         )
     else:
         return json.dumps({"error": "InvalidMode", "message": f"Unknown mode: {mode!r}. Use 'search_replace' or 'diff'."})
 
-    # Record the modified file for post-action commit (only if edit succeeded)
     if result and isinstance(result, str):
         try:
             result_data = json.loads(result)
-            if "error" not in result_data:
-                snapshot_manager.record_modified_file(resolved_path)
         except (json.JSONDecodeError, TypeError):
-            pass
+            return result
+        if "error" in result_data:
+            return result
+        journal_result = journal_manager.record_after("edit_file", resolved_path)
+        if isinstance(journal_result, dict) and journal_result.get("error"):
+            try:
+                _restore_file_state(resolved_path, backup)
+            except Exception:
+                return json.dumps({
+                    "error": "JournalFailed",
+                    "message": "Could not save after snapshot and failed to restore file",
+                })
+            return json.dumps({
+                "error": "JournalFailed",
+                "message": "Could not save after snapshot; file was restored to pre-call state",
+            })
+        journal_meta = journal_manager.response_metadata()
+        result_data["journal_id"] = journal_meta.get("journal_id")
+        result_data["journal"] = journal_meta
+        return json.dumps(result_data)
 
     return result
 
@@ -1171,7 +1284,7 @@ def _edit_file_search_replace(
     workspace: str,
     old_str: Optional[str],
     new_str: Optional[str],
-    commit_id: str,
+    backup: dict,
 ) -> str:
     """Perform search_replace edit on the file."""
     if old_str is None:
@@ -1235,12 +1348,7 @@ def _edit_file_search_replace(
     linter = _Linter()
     passed, lint_output = linter.check(resolved_path)
     if not passed:
-        # Revert the file
-        subprocess.run(
-            ["git", "checkout", "--", rel_path],
-            cwd=workspace,
-            capture_output=True,
-        )
+        _restore_file_state(resolved_path, backup)
         return json.dumps({"error": "LintFailed", "message": lint_output})
 
     # Calculate lines_changed
@@ -1249,7 +1357,6 @@ def _edit_file_search_replace(
 
     return json.dumps({
         "file": rel_path,
-        "commit_id": commit_id,
         "lines_changed": lines_changed,
     })
 
@@ -1307,12 +1414,8 @@ def _cleanup_patch_artifacts(resolved_path: str) -> None:
             logger.warning("Failed to remove patch artifact: %s", resolved_path + suffix)
 
 
-def _restore_patched_file(workspace: str, rel_path: str, resolved_path: str) -> None:
-    subprocess.run(
-        ["git", "checkout", "--", rel_path],
-        cwd=workspace,
-        capture_output=True,
-    )
+def _restore_patched_file(resolved_path: str, backup: dict) -> None:
+    _restore_file_state(resolved_path, backup)
     _cleanup_patch_artifacts(resolved_path)
 
 
@@ -1334,7 +1437,7 @@ def _edit_file_diff(
     rel_path: str,
     workspace: str,
     patch: Optional[str],
-    commit_id: str,
+    backup: dict,
 ) -> str:
     """Apply a unified diff patch to the file."""
     if patch is None:
@@ -1353,7 +1456,7 @@ def _edit_file_diff(
 
     result = _run_patch(workspace, normalized_patch, dry_run=False)
     if result.returncode != 0:
-        _restore_patched_file(workspace, rel_path, resolved_path)
+        _restore_patched_file(resolved_path, backup)
         return json.dumps({"error": "PatchFailed", "message": _patch_process_output(result)})
 
     _cleanup_patch_artifacts(resolved_path)
@@ -1361,7 +1464,7 @@ def _edit_file_diff(
     linter = _Linter()
     passed, lint_output = linter.check(resolved_path)
     if not passed:
-        _restore_patched_file(workspace, rel_path, resolved_path)
+        _restore_patched_file(resolved_path, backup)
         return json.dumps({"error": "LintFailed", "message": lint_output})
 
     lines_changed = 0
@@ -1372,7 +1475,6 @@ def _edit_file_diff(
 
     return json.dumps({
         "file": rel_path,
-        "commit_id": commit_id,
         "lines_changed": lines_changed,
     })
 
@@ -1386,8 +1488,8 @@ EDIT_FILE_TOOL_CONFIG = ToolConfig(
         "Edit a file in the workspace using search_replace or diff mode. "
         "In search_replace mode, finds the first occurrence of old_str and replaces it with new_str. "
         "In diff mode, applies a unified diff patch. "
-        "A Git snapshot is created before editing. "
-        "Syntax is checked after editing; if it fails the edit is reverted."
+        "A file journal snapshot is saved before editing. "
+        "Syntax is checked after editing; if it fails the edit is reverted to its pre-call state."
     ),
     parameters={
         "type": "object",
@@ -1456,7 +1558,7 @@ def _search_code(query: str, include: Optional[str] = None, exclude: Optional[st
     # Get workspace
     workspace = os.path.realpath(os.environ.get("AGENT_WORKSPACE", ""))
 
-    max_results = int(os.environ.get("SEARCH_MAX_RESULTS", 20))
+    max_results = int(os.environ.get("SEARCH_MAX_RESULTS", 100))
 
     # Default excludes
     default_excludes = [".git", "node_modules", "dist"]
@@ -1758,15 +1860,25 @@ BUILTIN_TOOLS.append((EXECUTE_COMMAND_TOOL_CONFIG, _execute_command))
 # ---------------------------------------------------------------------------
 
 def _undo() -> str:
-    """Undo the most recent write or edit operation by reverting to the previous Git commit.
+    """Undo the latest file-journal turn for the current session without changing conversation history.
 
     Returns:
-        JSON string with keys: reverted_commit, restored_commit on success.
+        JSON string with keys: turn_key, restored_files on success.
         On error, returns JSON string with keys: error, message.
     """
     workspace = os.path.realpath(os.environ.get("AGENT_WORKSPACE", ""))
-    snapshot_manager = _SnapshotManager(workspace)
-    result = snapshot_manager.undo()
+    session_dir = getattr(_thread_local, "session_dir", None)
+    session_id = getattr(_thread_local, "session_id", None)
+    if not session_dir:
+        return json.dumps({
+            "error": "NoSessionJournal",
+            "message": "No current session directory is available for file journal undo",
+        })
+    try:
+        from runtime.context_manager import undo_latest_file_journal_turn
+        result = undo_latest_file_journal_turn(workspace, session_dir, session_id=session_id)
+    except Exception as exc:
+        result = {"error": "UndoFailed", "message": str(exc)}
     return json.dumps(result)
 
 
@@ -1776,9 +1888,8 @@ UNDO_TOOL_CONFIG = ToolConfig(
     tool_type="function",
     name="undo",
     description=(
-        "Undo the most recent write or edit operation by reverting the workspace "
-        "to the previous Git commit (git reset --hard HEAD^). "
-        "Returns the reverted commit ID and the restored commit ID."
+        "Undo the latest file journal turn in the current session without changing conversation history. "
+        "Restores files to that turn's baseline and marks the turn as undone."
     ),
     parameters={
         "type": "object",

@@ -313,12 +313,15 @@ class OpenAIProtocol(BaseProtocol):
             for tc in msg.tool_calls:
                 call_id = tc.get("id") or tc.get("tool_use_id") or "call_" + uuid.uuid4().hex[:8]
                 fn_name = tc.get("name", "unknown")
+                arguments = tc.get("arguments", "{}")
+                if not isinstance(arguments, str):
+                    arguments = json.dumps(arguments, ensure_ascii=False)
                 result["tool_calls"].append({
                     "id": call_id,
                     "type": "function",
                     "function": {
                         "name": fn_name,
-                        "arguments": tc.get("arguments", "{}"),
+                        "arguments": arguments,
                     },
                 })
             return result
@@ -1018,14 +1021,17 @@ class AnthropicProtocol(BaseProtocol):
             "anthropic-version": self.ANTHROPIC_VERSION,
         }
 
-        # Extract system prompt and filter it from messages
-        system = ""
+        # Anthropic accepts one top-level system field; preserve system order.
+        system_parts = []
         filtered_messages = []
         for msg in messages:
             if msg.role == "system":
-                system = msg.content or ""
+                if msg.content:
+                    system_parts.append(msg.content)
             else:
                 filtered_messages.append(msg)
+
+        system = "\n\n".join(system_parts)
 
         body = {
             "model": config.model_name,

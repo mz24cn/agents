@@ -102,6 +102,13 @@ function readFollowingIndentAfterComma(code, index) {
   return next === '"' || next === '}' || next === ']' ? '\n' : ''
 }
 
+function readFollowingIndentBeforeArrayClose(code, index) {
+  if (!code.startsWith('\n', index)) return ''
+  let i = index + 1
+  while (code[i] === ' ' || code[i] === '\t') i++
+  return code[i] === ']' ? code.slice(index, i) : ''
+}
+
 function getLinePrefixLength(code, index) {
   const lineStart = code.lastIndexOf('\n', index - 1) + 1
   return index - lineStart
@@ -129,7 +136,7 @@ function renderJsonStringValue(rawToken, collapseLongStrings, trailingComma = ''
   const fullHtml = escapeHtml(value)
   const trailingCommaHtml = escapeHtml(trailingComma)
 
-  return `<details class="hl-json-expand"><summary title="展开/收起完整文本" aria-label="展开/收起完整文本"><span class="hl-json-expand-icon"><span class="hl-json-expand-open">▸</span><span class="hl-json-expand-close">▾</span></span><span class="hl-string hl-json-string-preview" data-raw-json-preview="${rawContentHtml}">&quot;${previewHtml}…&quot;</span>${trailingCommaHtml}</summary><pre>${fullHtml}</pre></details>`
+  return `<details class="hl-json-expand"><summary title="展开/收起完整文本" aria-label="展开/收起完整文本"><span class="hl-json-expand-icon"><span class="hl-json-expand-open">▸</span><span class="hl-json-expand-close">▾</span></span><span class="hl-string hl-json-string-preview" data-raw-json-preview="${rawContentHtml}">&quot;${previewHtml}…&quot;</span>${trailingCommaHtml}</summary><span class="hl-json-expand-full">${fullHtml}</span></details>`
 }
 
 function renderHighlighted(code, matches) {
@@ -171,18 +178,21 @@ function highlightJson(code, options = {}) {
       const start = m.index
       const end = start + rawToken.length
       const isKey = findNextNonWhitespaceChar(code, end) === ':'
-      const isObjectPropertyStringValue = findPreviousNonWhitespaceChar(code, start) === ':'
+      const previousNonWhitespaceChar = findPreviousNonWhitespaceChar(code, start)
+      const isJsonStringValue = !isKey && (previousNonWhitespaceChar === ':' || previousNonWhitespaceChar === '[' || previousNonWhitespaceChar === ',')
       const className = isKey ? 'hl-key' : 'hl-string'
-      const trailingComma = isObjectPropertyStringValue ? readInlineTrailingComma(code, end) : ''
+      const trailingComma = isJsonStringValue ? readInlineTrailingComma(code, end) : ''
       const linePrefixLength = getLinePrefixLength(code, start)
       const previewLimit = previewColumns == null
         ? JSON_LONG_STRING_FALLBACK_LIMIT
         : Math.max(JSON_PREVIEW_MIN_CHARS, Math.floor(previewColumns - linePrefixLength - JSON_PREVIEW_RESERVED_CHARS))
-      const html = isObjectPropertyStringValue
+      const html = isJsonStringValue
         ? renderJsonStringValue(rawToken, collapseLongStrings, trailingComma, previewLimit)
         : null
       const afterComma = end + trailingComma.length
-      const followingIndent = html && trailingComma ? readFollowingIndentAfterComma(code, afterComma) : ''
+      const followingIndent = html
+        ? (trailingComma ? readFollowingIndentAfterComma(code, afterComma) : readFollowingIndentBeforeArrayClose(code, end))
+        : ''
       const matchEnd = html ? afterComma + followingIndent.length : end
 
       matches.push({ start, end: matchEnd, text: code.slice(start, matchEnd), className, html })

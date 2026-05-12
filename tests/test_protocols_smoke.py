@@ -247,6 +247,46 @@ def test_stream_flag_in_body():
     assert body["stream"] is True
 
 
+def test_openai_tool_call_arguments_are_json_strings():
+    proto = OpenAIProtocol()
+    config = ModelConfig(
+        model_id="test", api_base="http://localhost:11434",
+        model_name="gpt-test", api_protocol="openai"
+    )
+    msgs = [
+        Message(
+            role="assistant",
+            content="",
+            tool_calls=[{"id": "call_1", "name": "read_file", "arguments": {"path": "a.py"}}],
+        )
+    ]
+
+    _, _, body_bytes = proto.build_request(config, msgs)
+    body = json.loads(body_bytes)
+    arguments = body["messages"][0]["tool_calls"][0]["function"]["arguments"]
+
+    assert arguments == '{"path": "a.py"}'
+
+
+def test_anthropic_build_request_combines_system_messages():
+    proto = AnthropicProtocol()
+    config = ModelConfig(
+        model_id="test", api_base="http://localhost:11434",
+        model_name="claude-test", api_protocol="anthropic"
+    )
+    msgs = [
+        Message(role="system", content="base prompt"),
+        Message(role="system", content="memory prompt"),
+        Message(role="user", content="Hi"),
+    ]
+
+    _, _, body_bytes = proto.build_request(config, msgs)
+    body = json.loads(body_bytes)
+
+    assert body["system"] == "base prompt\n\nmemory prompt"
+    assert body["messages"] == [{"role": "user", "content": "Hi"}]
+
+
 def test_anthropic_parse_stream_uses_latest_nonzero_usage():
     proto = AnthropicProtocol()
     lines = [

@@ -36,8 +36,9 @@
 
   function renderToolResult(content) {
     const { type, lang } = detectToolResultType(content)
+    let displayContent = content
+
     if (type === 'json' || type === 'script') {
-      let displayContent = content
       // Pretty-print JSON to match tool call argument display
       if (type === 'json') {
         try {
@@ -46,9 +47,9 @@
           // Invalid JSON — fall back to raw content
         }
       }
-      return { html: highlight(displayContent, lang), lang }
+      return { html: highlight(displayContent, lang), lang, displayContent }
     }
-    return { html: null, lang: null }
+    return { html: null, lang: null, displayContent }
   }
 
   // 获取智能体信息
@@ -72,10 +73,17 @@
     return lines.join('\n')
   }
 
-  // 工具结果：超过5行默认收缩，否则默认展开
-  const toolResultLines = (msg.content ?? '').split('\n').length
-  const toolResultOverLimit = msg.role === 'tool' && toolResultLines > 5
-  let toolResultExpanded = $state(!toolResultOverLimit)
+  // 工具结果：按实际显示内容计算行数，超过5行默认收缩，否则默认展开。
+  // JSON 会先 pretty-print，因此即使原始 JSON 是单行，也能按格式化后的行数收缩。
+  const toolResultRender = $derived(msg.role === 'tool' && msg.content ? renderToolResult(msg.content) : { html: null, lang: null, displayContent: msg.content ?? '' })
+  const toolResultPreviewContent = $derived((toolResultRender.displayContent ?? '').split('\n').slice(0, 5).join('\n'))
+  const toolResultPreviewHtml = $derived(toolResultRender.html ? highlight(toolResultPreviewContent, toolResultRender.lang) : null)
+  const toolResultLines = $derived((toolResultRender.displayContent ?? '').split('\n').length)
+  const toolResultOverLimit = $derived(msg.role === 'tool' && toolResultLines > 5)
+  let toolResultExpanded = $state(true)
+  $effect(() => {
+    toolResultExpanded = !toolResultOverLimit
+  })
 
   // 思考过程：有正文或工具调用时自动收起；用户手动操作后不再自动跟随
   let thinkingUserToggled = $state(false)
@@ -154,24 +162,23 @@
     {#if msg.role === 'assistant'}
       <MarkdownRenderer content={msg.content} />
     {:else if msg.role === 'tool'}
-      {@const detected = renderToolResult(msg.content)}
       <div class="tool-result-block" ondblclick={() => toolResultExpanded = !toolResultExpanded}>
-        {#if detected.html}
+        {#if toolResultRender.html}
           {#if toolResultExpanded}
             <div class="code-block tool-result-code">
-              {#if detected.lang}<span class="code-lang">{detected.lang.toUpperCase()}</span>{/if}
-              <pre><code class="language-{detected.lang}">{@html detected.html}</code></pre>
+              {#if toolResultRender.lang}<span class="code-lang">{toolResultRender.lang.toUpperCase()}</span>{/if}
+              <pre><code class="language-{toolResultRender.lang}">{@html toolResultRender.html}</code></pre>
             </div>
           {:else}
             <div class="code-block tool-result-code">
-              {#if detected.lang}<span class="code-lang">{detected.lang.toUpperCase()}</span>{/if}
-              <pre class="preview"><code class="language-{detected.lang}">{@html detected.html.split('\n').slice(0, 5).join('\n')}</code></pre>
+              {#if toolResultRender.lang}<span class="code-lang">{toolResultRender.lang.toUpperCase()}</span>{/if}
+              <pre class="preview"><code class="language-{toolResultRender.lang}">{@html toolResultPreviewHtml}</code></pre>
             </div>
           {/if}
         {:else if toolResultExpanded}
-          <div class="tool-result-markdown"><MarkdownRenderer content={msg.content} /></div>
+          <div class="tool-result-markdown"><MarkdownRenderer content={toolResultRender.displayContent} /></div>
         {:else}
-          <div class="tool-result-markdown preview-fade"><MarkdownRenderer content={msg.content.split('\n').slice(0, 5).join('\n')} /></div>
+          <div class="tool-result-markdown preview-fade"><MarkdownRenderer content={toolResultPreviewContent} /></div>
         {/if}
       </div>
     {:else}

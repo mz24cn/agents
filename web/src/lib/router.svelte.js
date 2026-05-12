@@ -24,7 +24,16 @@ window.addEventListener('hashchange', () => {
  * @param {string} hash  e.g. "#/models" or "#/setup?tab=models"
  */
 export function navigate(hash) {
-  window.location.hash = hash
+  // Keep the reactive router state and the browser URL in sync.
+  // Assigning the same hash to window.location.hash does not fire `hashchange`,
+  // so update router.current explicitly as well. This also protects against
+  // callers that previously changed router.current without changing the URL.
+  if (router.current !== hash) {
+    router.current = hash
+  }
+  if (window.location.hash !== hash) {
+    window.location.hash = hash
+  }
 }
 
 /**

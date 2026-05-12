@@ -1,5 +1,5 @@
 <script>
-  import { router } from '../lib/router.svelte.js'
+  import { router, navigate } from '../lib/router.svelte.js'
   import ThemeToggle from './ThemeToggle.svelte'
   import { t, i18n, setLang } from '../lib/i18n.svelte.js'
   import { sessions } from '../lib/api.js'
@@ -58,8 +58,8 @@
       // 直接展开所有字段，保持与后端数据一致
       const msgs = (data.messages ?? []).map(m => ({ ...m }))
       sessionRestore.pending = { sessionId, messages: msgs }
-      // 恢复会话后跳转到对话页
-      router.current = '#/chat'
+      // 恢复会话后跳转到对话页，同时同步浏览器 hash
+      navigate('#/chat')
     } catch (err) {
       restoreError = err.message || t('restoreSessionFailed')
       // 后端在 session not found 时会删除该记录，前端同步移除
@@ -182,6 +182,19 @@
     // 如果刚刚发生了拖动，不触发收缩切换
     if (isDragging) return
     toggleSidebarCollapsed()
+  }
+
+  function handleSetupClick(e) {
+    // 不只依赖 <a href> 的默认 hash 跳转：
+    // 1. 移动端侧边栏是 fixed 浮层，跳转后如果不收起，页面已切换但仍被侧边栏挡住，容易被感知为“点击无反应”；
+    // 2. 当前已在 Setup 页时再次点击不会触发 hashchange，主动通知 SetupPage 回到默认入口。
+    e.preventDefault()
+    closeMenu()
+    if (window.innerWidth < 1024) {
+      collapseSidebar()
+    }
+    navigate('#/setup')
+    window.dispatchEvent(new CustomEvent('setup:reset'))
   }
 
   $effect(() => { loadSessions() })
@@ -345,7 +358,8 @@
     <a
       href="#/setup"
       class="env-btn"
-      class:active={router.current === '#/setup'}
+      class:active={router.current.split('?')[0] === '#/setup'}
+      onclick={handleSetupClick}
       title={t('nav_setup')}
     >⚙️</a>
   </div>

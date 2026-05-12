@@ -7,6 +7,9 @@ Covers:
 
 from __future__ import annotations
 
+import gzip
+import hashlib
+import json
 import os
 import re
 import tempfile
@@ -18,6 +21,8 @@ from hypothesis import strategies as st
 from runtime.context_manager import (
     ContextManager,
     ConversationTurn,
+    revoke_session_file_changes,
+    undo_latest_file_journal_turn,
 )
 
 
@@ -80,10 +85,149 @@ def test_tool_call_file_naming(turn_index: int, tool_name: str) -> None:
         )
 
 
+def _blob_ref(session_dir: str, turn_key: str, rel_path: str, role: str, raw: bytes) -> dict:
+    digest = hashlib.sha256(raw).hexdigest()
+    blob_rel = f"files/{rel_path.replace('/', '-')}.{role}.gz"
+    blob_path = os.path.join(session_dir, "file_journals", turn_key, blob_rel)
+    os.makedirs(os.path.dirname(blob_path), exist_ok=True)
+    with open(blob_path, "wb") as fh:
+        fh.write(gzip.compress(raw))
+    return {
+        "exists": True,
+        "store": "sidecar",
+        "file": blob_rel,
+        "sha256": digest,
+        "size": len(raw),
+        "compression": "gzip",
+        "mode": "100644",
+        "is_symlink": False,
+    }
+
+
+def _write_manifest(session_dir: str, workspace: str, session_id: str, turn_key: str, timestamp: str, files: dict) -> str:
+    manifest_dir = os.path.join(session_dir, "file_journals", turn_key)
+    os.makedirs(manifest_dir, exist_ok=True)
+    manifest_path = os.path.join(manifest_dir, "manifest.json")
+    manifest = {
+        "version": 1,
+        "session_id": session_id,
+        "timestamp": timestamp,
+        "turn_key": turn_key,
+        "workspace": workspace,
+        "created_at": timestamp,
+        "updated_at": timestamp,
+        "files": files,
+    }
+    with open(manifest_path, "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh)
+    return manifest_path
+
+
+def test_undo_latest_file_journal_turn_moves_files_to_undone_files(tmp_path):
+    workspace = str(tmp_path / "workspace")
+    session_dir = str(tmp_path / "chat_data" / "session1")
+    os.makedirs(workspace)
+    os.makedirs(session_dir)
+    target = os.path.join(workspace, "foo.txt")
+    with open(target, "w", encoding="utf-8") as fh:
+        fh.write("after\n")
+    files = {
+        "foo.txt": {
+            "path": "foo.txt",
+            "tools": ["edit_file"],
+            "baseline": _blob_ref(session_dir, "260511_102030", "foo.txt", "baseline", b"before\n"),
+            "after": _blob_ref(session_dir, "260511_102030", "foo.txt", "after", b"after\n"),
+        }
+    }
+    manifest_path = _write_manifest(session_dir, workspace, "session1", "260511_102030", "2026-05-11T10:20:30", files)
+
+    result = undo_latest_file_journal_turn(workspace, session_dir, "session1")
+
+    assert "error" not in result
+    assert result["turn_key"] == "260511_102030"
+    assert open(target, encoding="utf-8").read() == "before\n"
+    manifest = json.load(open(manifest_path, encoding="utf-8"))
+    assert "files" not in manifest
+    assert "foo.txt" in manifest["undone_files"]
+
+
+def test_revoke_session_file_changes_restores_sidecar_baseline(tmp_path):
+    workspace = str(tmp_path / "workspace")
+    session_dir = str(tmp_path / "chat_data" / "session1")
+    os.makedirs(workspace)
+    os.makedirs(session_dir)
+    target = os.path.join(workspace, "foo.txt")
+    with open(target, "w", encoding="utf-8") as fh:
+        fh.write("after\n")
+    files = {
+        "foo.txt": {
+            "path": "foo.txt",
+            "tools": ["edit_file"],
+            "baseline": _blob_ref(session_dir, "260511_102030", "foo.txt", "baseline", b"before\n"),
+            "after": _blob_ref(session_dir, "260511_102030", "foo.txt", "after", b"after\n"),
+        }
+    }
+    manifest_path = _write_manifest(session_dir, workspace, "session1", "260511_102030", "2026-05-11T10:20:30", files)
+
+    result = revoke_session_file_changes(workspace, session_dir, "session1", "2026-05-11T10:20:30")
+
+    assert "error" not in result
+    assert open(target, encoding="utf-8").read() == "before\n"
+    manifest = json.load(open(manifest_path, encoding="utf-8"))
+    assert manifest["revoked"] is True
+
+
+def test_revoke_session_file_changes_deletes_created_file(tmp_path):
+    workspace = str(tmp_path / "workspace")
+    session_dir = str(tmp_path / "chat_data" / "session1")
+    os.makedirs(workspace)
+    os.makedirs(session_dir)
+    target = os.path.join(workspace, "created.txt")
+    with open(target, "w", encoding="utf-8") as fh:
+        fh.write("created\n")
+    files = {
+        "created.txt": {
+            "path": "created.txt",
+            "tools": ["write_file"],
+            "baseline": {"exists": False},
+            "after": _blob_ref(session_dir, "260511_102030", "created.txt", "after", b"created\n"),
+        }
+    }
+    _write_manifest(session_dir, workspace, "session1", "260511_102030", "2026-05-11T10:20:30", files)
+
+    result = revoke_session_file_changes(workspace, session_dir, "session1", "2026-05-11T10:20:30")
+
+    assert "error" not in result
+    assert not os.path.exists(target)
+
+
+def test_revoke_session_file_changes_detects_conflict_before_restoring(tmp_path):
+    workspace = str(tmp_path / "workspace")
+    session_dir = str(tmp_path / "chat_data" / "session1")
+    os.makedirs(workspace)
+    os.makedirs(session_dir)
+    target = os.path.join(workspace, "foo.txt")
+    with open(target, "w", encoding="utf-8") as fh:
+        fh.write("user change\n")
+    files = {
+        "foo.txt": {
+            "path": "foo.txt",
+            "tools": ["edit_file"],
+            "baseline": _blob_ref(session_dir, "260511_102030", "foo.txt", "baseline", b"before\n"),
+            "after": _blob_ref(session_dir, "260511_102030", "foo.txt", "after", b"after\n"),
+        }
+    }
+    _write_manifest(session_dir, workspace, "session1", "260511_102030", "2026-05-11T10:20:30", files)
+
+    result = revoke_session_file_changes(workspace, session_dir, "session1", "2026-05-11T10:20:30")
+
+    assert result["error"] == "JournalConflict"
+    assert open(target, encoding="utf-8").read() == "user change\n"
+
+
 # ---------------------------------------------------------------------------
 # Unit tests — session management (Task 2.2)
 # ---------------------------------------------------------------------------
-
 
 def test_create_session_creates_directory():
     """create_session must create the session directory under chats_dir."""
@@ -98,14 +242,14 @@ def test_create_session_creates_directory():
 
 
 def test_create_session_timestamp_format():
-    """create_session must return a session_id matching YYYY-MM-DD_HH-MM-SS."""
+    """create_session must return a session_id matching YYMMDD_HHMMSS."""
     with tempfile.TemporaryDirectory() as tmp_dir:
         cm = _make_cm(tmp_dir)
         session_id = cm.create_session()
 
-        pattern = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$")
+        pattern = re.compile(r"^\d{6}_\d{6}$")
         assert pattern.match(session_id), (
-            f"session_id '{session_id}' does not match YYYY-MM-DD_HH-MM-SS"
+            f"session_id '{session_id}' does not match YYMMDD_HHMMSS"
         )
 
 

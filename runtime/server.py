@@ -682,12 +682,16 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             messages=assembled_messages,
             text=body.get("text"),
             stream=True,
-            max_tool_rounds=body.get("max_tool_rounds") or int(os.environ.get("MAX_TOOL_ROUNDS", 20)),
+            max_tool_rounds=body.get("max_tool_rounds") or int(os.environ.get("MAX_TOOL_ROUNDS", 100)),
         )
 
         from runtime.builtin_tools import _thread_local
+        session_dir = None
+        if use_session and session_id is not None:
+            session_dir = os.path.dirname(context_manager._conversation_path(session_id))
         _thread_local.sse_callback = None
         _thread_local.session_id = session_id
+        _thread_local.session_dir = session_dir
         _thread_local.user_message_timestamp = user_message_timestamp
         _thread_local.depth = 0
         _thread_local.tool_scope = tool_scope
@@ -703,23 +707,19 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         import logging
         logger = logging.getLogger("runtime.server")
 
-        # Create post-action commit if there are modified files
-        snapshot_manager = getattr(_thread_local, "snapshot_manager", None)
-        if snapshot_manager is not None:
+        file_journal_manager = getattr(_thread_local, "file_journal_manager", None)
+        if file_journal_manager is not None:
             try:
-                post_result = snapshot_manager.post_action()
-                if isinstance(post_result, dict) and post_result.get("error"):
-                    logger.warning("Failed to create post-action commit: %s", post_result.get("message"))
-                elif isinstance(post_result, str):
-                    logger.debug("Created post-action commit: %s", post_result)
-            except Exception as post_err:
-                logger.warning("Error creating post-action commit: %s", post_err)
+                file_journal_manager.flush()
+            except Exception as flush_err:
+                logger.warning("Error flushing file journal: %s", flush_err)
             finally:
-                _thread_local.snapshot_manager = None
+                _thread_local.file_journal_manager = None
 
         _thread_local.sse_callback = None
         _thread_local.cancel_event = None
         _thread_local.session_id = None
+        _thread_local.session_dir = None
         _thread_local.user_message_timestamp = None
         _thread_local.depth = 0
         _thread_local.tool_scope = []
@@ -1651,6 +1651,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 "session_id": session_id,
                 "removed_count": revoke_result.get("removed_count", 0),
                 "git": revoke_result.get("git", {}),
+                "journal": revoke_result.get("journal", {}),
             })
         except FileNotFoundError:
             self._send_json_error(404, f"Session not found: {session_id}")

@@ -50,6 +50,19 @@
     }
   })
 
+  function resetToDefaultTab() {
+    activeTab = 'agents'
+    editingModel = null
+    editingTool = null
+    editingPrompt = null
+    editingAgent = null
+  }
+
+  $effect(() => {
+    window.addEventListener('setup:reset', resetToDefaultTab)
+    return () => window.removeEventListener('setup:reset', resetToDefaultTab)
+  })
+
   const tabGroups = $derived.by(() => [
     {
       items: [

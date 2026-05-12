@@ -173,25 +173,32 @@ describe('highlight() unit tests — JSON', () => {
   })
 
   it('collapses long object string values with an expandable pre containing decoded text', () => {
-    const longText = `0123456789`.repeat(8) + 'line1\nline2 "quoted"'
+    const longText = `0123456789`.repeat(11) + 'line1\nline2 "quoted"'
     const result = highlight(JSON.stringify({ text: longText }, null, 2), 'json')
     expect(result).toContain('hl-json-string-preview')
     expect(result).toContain('<details class="hl-json-expand"><summary')
     expect(result.indexOf('hl-json-expand-icon')).toBeLessThan(result.indexOf('hl-json-string-preview'))
-    expect(result).toContain('&quot;01234567890123456789012345678901234567890123456789012345678901234567890123456789…&quot;')
-    expect(result).toContain('<pre>0123456789')
-    expect(result).toContain('line1\nline2 &quot;quoted&quot;</pre>')
+    expect(result).toContain('&quot;'.concat('0123456789'.repeat(10), '…&quot;'))
+    expect(result).toContain('<span class="hl-json-expand-full">0123456789')
+    expect(result).toContain('line1\nline2 &quot;quoted&quot;</span>')
     expect(result).not.toContain('\\nline2')
     expect(result).not.toContain('\\&quot;quoted\\&quot;')
   })
 
   it('keeps an inline trailing comma inside the collapsible JSON string summary without an extra blank line', () => {
-    const result = highlight(JSON.stringify({ text: 'x'.repeat(81), next: true }, null, 2), 'json')
+    const result = highlight(JSON.stringify({ text: 'x'.repeat(101), next: true }, null, 2), 'json')
     const summaryEnd = result.indexOf('</summary>')
     const comma = result.indexOf(',', result.indexOf('hl-json-string-preview'))
     expect(comma).toBeGreaterThan(-1)
     expect(comma).toBeLessThan(summaryEnd)
     expect(result).toContain('</details>  <span class="hl-key">&quot;next&quot;</span>')
+  })
+
+  it('collapses long string elements in JSON arrays', () => {
+    const result = highlight(JSON.stringify(['x'.repeat(101), 'y'.repeat(101)], null, 2), 'json')
+    expect((result.match(/<details class="hl-json-expand">/g) || []).length).toBe(2)
+    expect(result).toContain('<span class="hl-json-expand-full">'.concat('x'.repeat(101), '</span>'))
+    expect(result).toContain('<span class="hl-json-expand-full">'.concat('y'.repeat(101), '</span>'))
   })
 
   it('uses jsonPreviewColumns to adapt the collapsed preview length', () => {

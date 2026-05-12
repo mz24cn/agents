@@ -356,7 +356,70 @@ def test_assemble_context_ordering_unit():
         assert result[-1] == new_msgs[0]
 
 
-def test_assemble_context_empty_session_returns_new_messages():
+def test_compressed_context_preserves_system_template_message():
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cm = _make_cm(tmp_dir, recent_turns_k=2)
+        session_id = cm.create_session()
+        turns = [
+            ConversationTurn(
+                role="system",
+                content="",
+                timestamp="2026-01-01T00:00:00",
+                prompt_template="ExcelIn",
+                arguments={"ExcelIn": "python、svelte"},
+            ),
+            _make_turn("user", "turn 1"),
+            _make_turn("assistant", "turn 2"),
+        ]
+        cm.save_conversation(session_id, turns)
+        _write_summary(cm, session_id, "Summary text.", summarized_up_to_turn=1)
+
+        result = cm.assemble_context(session_id, [{"role": "user", "content": "next"}])
+
+        assert result[0]["role"] == "system"
+        assert result[0]["prompt_template"] == "ExcelIn"
+        assert result[0]["arguments"] == {"ExcelIn": "python、svelte"}
+        assert result[1]["content"].startswith("## Summary")
+
+
+def test_compressed_context_does_not_start_recent_window_with_tool_result():
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cm = _make_cm(tmp_dir, recent_turns_k=3)
+        session_id = cm.create_session()
+        turns = [
+            _make_turn("user", "old request"),
+            ConversationTurn(
+                role="assistant",
+                content="",
+                timestamp="2026-01-01T00:00:00",
+                tool_calls=[{"id": "call_1", "name": "read_file", "arguments": {}}],
+            ),
+            ConversationTurn(
+                role="tool",
+                content="old result",
+                timestamp="2026-01-01T00:00:00",
+                tool_use_id="call_1",
+            ),
+            ConversationTurn(
+                role="assistant",
+                content="done",
+                timestamp="2026-01-01T00:00:00",
+            ),
+        ]
+        cm.save_conversation(session_id, turns)
+        _write_summary(cm, session_id, "Summary text.", summarized_up_to_turn=1)
+
+        result = cm.assemble_context(session_id, [{"role": "user", "content": "next"}])
+        non_system = [msg for msg in result if msg["role"] != "system"]
+
+        assert non_system[0]["role"] == "user"
+        assert non_system[0]["content"] == "old request"
+        assert non_system[1]["role"] == "assistant"
+        assert non_system[1]["tool_calls"][0]["id"] == "call_1"
+        assert non_system[2]["role"] == "tool"
+        assert non_system[2]["tool_use_id"] == "call_1"
+
+
     """assemble_context with empty session_id must return new_messages as-is."""
     with tempfile.TemporaryDirectory() as tmp_dir:
         cm = _make_cm(tmp_dir)

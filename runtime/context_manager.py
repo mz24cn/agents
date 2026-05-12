@@ -7,8 +7,13 @@ library — zero third-party dependencies.
 
 from __future__ import annotations
 
+import difflib
+import gzip
+import hashlib
 import re
+import stat
 from dataclasses import dataclass, field, asdict
+from pathlib import Path
 from typing import Optional
 
 
@@ -578,130 +583,370 @@ import tempfile
 from typing import Callable, Optional
 
 
-def _run_git_for_revoke(workspace: str, args: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git"] + args,
+
+def _journal_parse_ts(value: Optional[str]) -> Optional[datetime.datetime]:
+    if not value:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is not None:
+        return dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _journal_now_iso() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _journal_sha256(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _journal_safe_rel_path(rel_path: str) -> str:
+    rel_path = rel_path.replace(os.sep, "/")
+    if os.path.isabs(rel_path) or rel_path == ".." or rel_path.startswith("../") or "/../" in f"/{rel_path}/":
+        raise ValueError(f"Unsafe journal path: {rel_path}")
+    return rel_path
+
+
+def _journal_resolve_workspace_path(workspace: str, rel_path: str) -> str:
+    safe_rel = _journal_safe_rel_path(rel_path)
+    root = os.path.realpath(workspace)
+    resolved = os.path.realpath(os.path.join(root, safe_rel))
+    if not (resolved == root or resolved.startswith(root + os.sep)):
+        raise ValueError(f"Journal path escapes workspace: {rel_path}")
+    return resolved
+
+
+def _journal_atomic_write_json(path: str, data: dict) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path), text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+        os.replace(tmp_path, path)
+        tmp_path = ""
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
+
+
+def _read_journal_sidecar(journal_dir: str, blob_ref: dict) -> bytes:
+    rel_file = _journal_safe_rel_path(blob_ref.get("file", ""))
+    blob_path = os.path.realpath(os.path.join(journal_dir, rel_file))
+    root = os.path.realpath(journal_dir)
+    if not (blob_path == root or blob_path.startswith(root + os.sep)):
+        raise ValueError(f"Journal blob escapes journal directory: {rel_file}")
+    with open(blob_path, "rb") as fh:
+        raw = gzip.decompress(fh.read())
+    expected_sha = blob_ref.get("sha256")
+    if expected_sha and _journal_sha256(raw) != expected_sha:
+        raise ValueError("Journal sidecar sha256 mismatch")
+    return raw
+
+
+def _read_journal_git_blob(blob_ref: dict, workspace: str) -> bytes:
+    oid = blob_ref.get("oid")
+    if not oid:
+        raise ValueError("Git journal blob is missing oid")
+    result = subprocess.run(
+        ["git", "cat-file", "-p", oid],
         cwd=workspace,
         capture_output=True,
-        text=True,
+        text=False,
     )
+    if result.returncode != 0:
+        raise ValueError(result.stderr.decode("utf-8", errors="replace") or "Could not read git blob")
+    raw = result.stdout
+    expected_sha = blob_ref.get("sha256")
+    if expected_sha and _journal_sha256(raw) != expected_sha:
+        raise ValueError("Git journal blob sha256 mismatch")
+    return raw
 
 
-def revoke_session_git_changes(
-    workspace: str,
-    session_id: str,
-    timestamp: str,
-) -> dict:
-    """Remove git commits created for a session at/after a revoked user turn.
+def _read_journal_blob(blob_ref: dict, workspace: str, journal_dir: str) -> bytes:
+    store = blob_ref.get("store")
+    if store == "sidecar":
+        return _read_journal_sidecar(journal_dir, blob_ref)
+    if store == "git":
+        return _read_journal_git_blob(blob_ref, workspace)
+    raise ValueError(f"Unsupported journal blob store: {store}")
 
-    Built-in write/edit tools create git commits whose messages include both
-    ``[session: <session_id>]`` and ``[timestamp: <user_message_timestamp>]``.
-    When a user message is revoked, these commits should disappear as well so
-    the workspace files return to the state before that message was handled.
 
-    The implementation intentionally rewrites the current branch instead of
-    creating additional "revert" commits. It finds all commits in the current
-    branch whose messages belong to the session, filters them by the user-turn
-    timestamp, and then removes the selected commits with ``git rebase --onto``
-    from newest to oldest. Processing newest first preserves older commit ids
-    long enough to target them reliably.
-    """
-    if os.environ.get("DISABLE_GIT_OPERATION", "true").lower() == "true":
-        return {"skipped": True, "reason": "git_disabled", "removed_commits": []}
+def materialize_blob(blob_ref: dict, target_path: str, workspace: str, journal_dir: str) -> None:
+    parent = os.path.dirname(target_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    try:
+        os.unlink(target_path)
+    except FileNotFoundError:
+        pass
+    if not blob_ref.get("exists"):
+        return
+    raw = _read_journal_blob(blob_ref, workspace, journal_dir)
+    if blob_ref.get("is_symlink"):
+        os.symlink(raw.decode("utf-8", errors="surrogateescape"), target_path)
+        return
+    fd, tmp_path = tempfile.mkstemp(dir=parent or None)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(raw)
+        os.replace(tmp_path, target_path)
+        tmp_path = ""
+        os.chmod(target_path, 0o755 if blob_ref.get("mode") == "100755" else 0o644)
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
 
-    workspace = os.path.realpath(workspace)
-    if not workspace or not os.path.isdir(os.path.join(workspace, ".git")):
-        return {"skipped": True, "reason": "git_not_initialized", "removed_commits": []}
 
-    def _parse_ts(value: str) -> Optional[datetime.datetime]:
-        if not value:
-            return None
+def _current_file_matches(path: str, expected: dict) -> bool:
+    if not expected.get("exists"):
+        return not os.path.exists(path) and not os.path.islink(path)
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    if bool(expected.get("is_symlink")) != stat.S_ISLNK(st.st_mode):
+        return False
+    if expected.get("is_symlink"):
         try:
-            # Accept both the app's ``YYYY-mm-ddTHH:MM:SS`` timestamps and
-            # ISO strings with timezone / trailing Z if clients provide them.
-            dt = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
-            if dt.tzinfo is not None:
-                dt = dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
-            return dt
-        except ValueError:
-            return None
+            raw = os.readlink(path).encode("utf-8", errors="surrogateescape")
+        except OSError:
+            return False
+    else:
+        try:
+            with open(path, "rb") as fh:
+                raw = fh.read()
+        except OSError:
+            return False
+    expected_sha = expected.get("sha256")
+    return not expected_sha or _journal_sha256(raw) == expected_sha
 
-    threshold_dt = _parse_ts(timestamp)
-    if threshold_dt is None:
-        return {"error": "InvalidTimestamp", "message": f"Invalid timestamp: {timestamp}"}
 
-    status_result = _run_git_for_revoke(workspace, ["status", "--porcelain"])
-    if status_result.returncode != 0:
-        return {"error": "GitStatusFailed", "message": status_result.stderr.strip()}
-    if status_result.stdout.strip():
+def _restore_journal_baseline(path: str, baseline: dict, workspace: str, journal_dir: str) -> None:
+    if not baseline.get("exists"):
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        return
+    materialize_blob(baseline, path, workspace, journal_dir)
+
+
+def _journal_manifest_sort_key(item: tuple[str, dict]) -> datetime.datetime:
+    manifest = item[1]
+    parsed = _journal_parse_ts(manifest.get("timestamp"))
+    if parsed is not None:
+        return parsed
+    turn_key = str(manifest.get("turn_key", ""))
+    try:
+        return datetime.datetime.strptime(turn_key, "%y%m%d_%H%M%S")
+    except ValueError:
+        return datetime.datetime.min
+
+
+def _iter_journal_manifests(session_dir: str) -> list[tuple[str, dict]]:
+    root = Path(session_dir)
+    if not root.exists():
+        return []
+    manifests: list[tuple[str, dict]] = []
+    for path in root.glob("**/file_journals/*/manifest.json"):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                manifest = json.load(fh)
+            manifests.append((str(path), manifest))
+        except (OSError, ValueError):
+            continue
+    manifests.sort(key=_journal_manifest_sort_key)
+    return manifests
+
+
+def _manifest_belongs_to_session(manifest: dict, session_id: Optional[str]) -> bool:
+    if not session_id:
+        return True
+    manifest_session = str(manifest.get("session_id") or "")
+    return manifest_session == session_id or manifest_session.startswith(f"{session_id}-sub_")
+
+
+def _manifest_has_file_changes(manifest: dict) -> bool:
+    files = manifest.get("files")
+    if not isinstance(files, dict):
+        return False
+    return any(isinstance(entry, dict) and "baseline" in entry and "after" in entry for entry in files.values())
+
+
+def _restore_file_plan(workspace: str, restore_plan: dict[str, dict], force: bool = False) -> dict:
+    conflicts: list[str] = []
+    for rel_path, item in restore_plan.items():
+        target_path = _journal_resolve_workspace_path(workspace, rel_path)
+        if not _current_file_matches(target_path, item["expected_current"]):
+            conflicts.append(rel_path)
+    if conflicts and not force:
         return {
-            "error": "GitWorkingTreeDirty",
-            "message": "Cannot revoke git changes while the workspace has uncommitted changes",
+            "error": "JournalConflict",
+            "message": "Current files do not match journal after-state",
+            "files": conflicts,
         }
 
-    log_result = _run_git_for_revoke(workspace, ["log", "--format=%H%x00%B%x00%x1e"])
-    if log_result.returncode != 0:
-        return {"error": "GitLogFailed", "message": log_result.stderr.strip()}
+    restored_files: list[str] = []
+    for rel_path, item in restore_plan.items():
+        target_path = _journal_resolve_workspace_path(workspace, rel_path)
+        _restore_journal_baseline(target_path, item["baseline"], workspace, item["journal_dir"])
+        restored_files.append(rel_path)
+    return {"restored_files": restored_files}
 
-    session_pattern = re.compile(r"\[session:\s*([^\]]+)\]")
-    ts_pattern = re.compile(r"\[timestamp:\s*([^\]]+)\]")
-    commits_to_remove: list[dict[str, str]] = []
 
-    for raw_record in log_result.stdout.split("\x1e"):
-        record = raw_record.strip("\n\x00")
-        if not record:
-            continue
-        parts = record.split("\x00", 1)
-        if len(parts) != 2:
-            continue
-        sha, message = parts
-        session_match = session_pattern.search(message)
-        if not session_match:
-            continue
-        commit_session = session_match.group(1).strip()
-        if commit_session != session_id and not commit_session.startswith(f"{session_id}-sub_"):
-            continue
-        match = ts_pattern.search(message)
-        if not match:
-            # Old commits without timestamp cannot be attributed to a user turn
-            # safely; leave them in history.
-            continue
-        commit_ts = _parse_ts(match.group(1).strip())
-        if commit_ts is None:
-            continue
-        if commit_ts >= threshold_dt:
-            commits_to_remove.append({
-                "sha": sha,
-                "session_id": commit_session,
-                "timestamp": match.group(1).strip(),
-            })
+def undo_latest_file_journal_turn(
+    workspace: str,
+    session_dir: str,
+    session_id: Optional[str] = None,
+    force: bool = False,
+) -> dict:
+    manifests = [
+        item for item in _iter_journal_manifests(session_dir)
+        if _manifest_belongs_to_session(item[1], session_id)
+        and not item[1].get("revoked")
+        and not item[1].get("undone")
+        and _manifest_has_file_changes(item[1])
+    ]
+    if not manifests:
+        return {"error": "NoJournalToUndo", "message": "No file journal turn is available to undo"}
 
-    removed: list[dict[str, str]] = []
-    for item in commits_to_remove:  # git log is newest -> oldest; keep that order.
-        sha = item["sha"]
-        exists_result = _run_git_for_revoke(workspace, ["merge-base", "--is-ancestor", sha, "HEAD"])
-        if exists_result.returncode != 0:
+    manifest_path, manifest = manifests[-1]
+    journal_dir = os.path.dirname(manifest_path)
+    restore_plan: dict[str, dict] = {}
+    for rel_path, entry in manifest.get("files", {}).items():
+        if not isinstance(entry, dict) or "baseline" not in entry or "after" not in entry:
             continue
+        safe_rel = _journal_safe_rel_path(entry.get("path") or rel_path)
+        restore_plan[safe_rel] = {
+            "baseline": entry["baseline"],
+            "expected_current": entry["after"],
+            "journal_dir": journal_dir,
+        }
+    if not restore_plan:
+        return {"error": "NoJournalToUndo", "message": "No file changes were found in the latest journal turn"}
 
-        parent_result = _run_git_for_revoke(workspace, ["rev-parse", f"{sha}^"])
-        if parent_result.returncode != 0:
-            return {"error": "GitRewriteFailed", "message": f"Cannot remove root commit: {sha}"}
-        parent_sha = parent_result.stdout.strip()
+    result = _restore_file_plan(workspace, restore_plan, force=force)
+    if result.get("error"):
+        return result
 
-        rebase_result = _run_git_for_revoke(workspace, ["rebase", "--onto", parent_sha, sha, "HEAD"])
-        if rebase_result.returncode != 0:
-            abort_result = _run_git_for_revoke(workspace, ["rebase", "--abort"])
-            abort_msg = abort_result.stderr.strip() if abort_result.returncode != 0 else ""
-            message = rebase_result.stderr.strip() or rebase_result.stdout.strip()
-            if abort_msg:
-                message = f"{message}; rebase --abort failed: {abort_msg}"
-            return {"error": "GitRewriteFailed", "message": message}
-        removed.append(item)
+    now = _journal_now_iso()
+    manifest["undone"] = True
+    manifest["undone_at"] = now
+    manifest["undone_files"] = manifest.pop("files", {})
+    manifest["updated_at"] = now
+    _journal_atomic_write_json(manifest_path, manifest)
+    return {
+        "turn_key": manifest.get("turn_key"),
+        "restored_files": result["restored_files"],
+        "undone": True,
+    }
+
+
+def revoke_session_file_changes(
+    workspace: str,
+    session_dir: str,
+    session_id: str,
+    timestamp: str,
+    force: bool = False,
+) -> dict:
+    threshold = _journal_parse_ts(timestamp)
+    if threshold is None:
+        return {"error": "InvalidTimestamp", "message": f"Invalid revoke timestamp: {timestamp}"}
+
+    selected: list[tuple[str, dict]] = []
+    for manifest_path, manifest in _iter_journal_manifests(session_dir):
+        if manifest.get("revoked") or not _manifest_belongs_to_session(manifest, session_id):
+            continue
+        manifest_ts = _journal_parse_ts(manifest.get("timestamp"))
+        if manifest_ts is None:
+            continue
+        if manifest_ts >= threshold and _manifest_has_file_changes(manifest):
+            selected.append((manifest_path, manifest))
+
+    if not selected:
+        return {"skipped": True, "reason": "no_matching_file_journals", "restored_files": []}
+
+    restore_plan: dict[str, dict] = {}
+    for manifest_path, manifest in selected:
+        journal_dir = os.path.dirname(manifest_path)
+        for rel_path, entry in manifest.get("files", {}).items():
+            if not isinstance(entry, dict) or "baseline" not in entry or "after" not in entry:
+                continue
+            safe_rel = _journal_safe_rel_path(entry.get("path") or rel_path)
+            if safe_rel not in restore_plan:
+                restore_plan[safe_rel] = {
+                    "baseline": entry["baseline"],
+                    "expected_current": entry["after"],
+                    "journal_dir": journal_dir,
+                }
+            else:
+                restore_plan[safe_rel]["expected_current"] = entry["after"]
+
+    if not restore_plan:
+        return {"skipped": True, "reason": "no_file_changes", "restored_files": []}
+
+    result = _restore_file_plan(workspace, restore_plan, force=force)
+    if result.get("error"):
+        return result
+
+    now = _journal_now_iso()
+    revoked_turns: list[str] = []
+    for manifest_path, manifest in selected:
+        manifest["revoked"] = True
+        manifest["revoked_at"] = now
+        manifest["updated_at"] = now
+        _journal_atomic_write_json(manifest_path, manifest)
+        revoked_turns.append(str(manifest.get("turn_key")))
 
     return {
-        "removed_commits": removed,
-        "removed_count": len(removed),
+        "revoked": True,
+        "revoked_turns": revoked_turns,
+        "restored_files": result["restored_files"],
     }
+
+
+def _diff_bytes(before: bytes, after: bytes, before_name: str, after_name: str) -> str:
+    before_lines = before.decode("utf-8", errors="replace").splitlines(keepends=True)
+    after_lines = after.decode("utf-8", errors="replace").splitlines(keepends=True)
+    return "".join(difflib.unified_diff(before_lines, after_lines, fromfile=before_name, tofile=after_name))
+
+
+def diff_journal_turn(session_dir: str, turn_key: str) -> str:
+    manifest_path = os.path.join(session_dir, "file_journals", turn_key, "manifest.json")
+    if not os.path.isfile(manifest_path):
+        return ""
+    with open(manifest_path, "r", encoding="utf-8") as fh:
+        manifest = json.load(fh)
+    journal_dir = os.path.dirname(manifest_path)
+    workspace = manifest.get("workspace") or os.getcwd()
+    chunks: list[str] = []
+    for rel_path, entry in manifest.get("files", {}).items():
+        if not isinstance(entry, dict) or "baseline" not in entry or "after" not in entry:
+            continue
+        before = b"" if not entry["baseline"].get("exists") else _read_journal_blob(entry["baseline"], workspace, journal_dir)
+        after = b"" if not entry["after"].get("exists") else _read_journal_blob(entry["after"], workspace, journal_dir)
+        chunks.append(_diff_bytes(before, after, f"a/{rel_path}", f"b/{rel_path}"))
+    return "".join(chunks)
+
+
+def diff_journal_session(session_dir: str) -> str:
+    chunks: list[str] = []
+    for _manifest_path, manifest in _iter_journal_manifests(session_dir):
+        turn_key = manifest.get("turn_key")
+        if turn_key:
+            chunks.append(diff_journal_turn(session_dir, str(turn_key)))
+    return "".join(chunks)
 
 
 class ContextManager:
@@ -794,9 +1039,8 @@ class ContextManager:
     def create_session(self) -> str:
         """Create a new session directory and return the session_id.
 
-        The session_id is a timestamp string in ``YYYY-MM-DD_HH-MM-SS``
-        format.  The ``/chats`` base directory is created automatically if it
-        does not exist.
+        The session_id is a timestamp string in ``YYMMDD_HHMMSS`` format. The
+        ``/chats`` base directory is created automatically if it does not exist.
 
         Returns:
             The session_id string.
@@ -978,13 +1222,15 @@ class ContextManager:
         new_messages = messages[:revoke_index]
 
         workspace = os.environ.get("AGENT_WORKSPACE", "") or os.getcwd()
-        git_result = revoke_session_git_changes(workspace, session_id, timestamp)
-        if isinstance(git_result, dict) and git_result.get("error"):
-            raise RuntimeError(git_result.get("message") or git_result["error"])
+        session_dir = os.path.dirname(conv_path)
+        journal_result = revoke_session_file_changes(workspace, session_dir, session_id, timestamp)
+        if isinstance(journal_result, dict) and journal_result.get("error"):
+            raise RuntimeError(journal_result.get("message") or journal_result["error"])
+        git_result = {"skipped": True, "reason": "replaced_by_file_journal", "removed_commits": []}
 
-        # Update meta and save only after git validation/rewrite succeeds. This
-        # keeps conversation history and workspace files in sync if git refuses
-        # to rewrite (for example, because the working tree is dirty).
+        # Update meta and save only after journal validation/restore succeeds. This
+        # keeps conversation history and workspace files in sync if the journal
+        # refuses to restore because of conflicts.
         now = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
         meta = data.get("meta", {})
         meta["updated_at"] = now
@@ -997,6 +1243,7 @@ class ContextManager:
         return {
             "removed_count": removed_count,
             "git": git_result,
+            "journal": journal_result,
         }
 
     # ------------------------------------------------------------------
@@ -1530,7 +1777,13 @@ trivial or uncertain items.
                 # caller handle overflow.
             return assembled
 
-        # Compression is active — use summary + recent-K window.
+        # Compression is active — use summary + unsummarized recent context.
+
+        system_msgs: list[dict] = [
+            {k: v for k, v in asdict(t).items() if v is not None}
+            for t in turns
+            if t.role == "system" and (t.content or t.prompt_template)
+        ]
 
         # 2. Structured memory entries
         memory_entries = self.get_memory_entries(session_id)
@@ -1542,16 +1795,35 @@ trivial or uncertain items.
             for entry in memory_entries
         ]
 
-        # 3. Recent K turns
+        # 3. Recent/unsummarized turns.
         k = self._recent_turns_k
-        recent_turns = turns[-k:] if len(turns) > k else turns
+        summarized_up_to = summary_fm.get("summarized_up_to_turn", -1)
+        if not isinstance(summarized_up_to, int):
+            summarized_up_to = -1
+        recent_start = max(max(0, len(turns) - k), max(0, summarized_up_to + 1))
+        if 0 < recent_start < len(turns) and turns[recent_start].role == "tool":
+            cursor = recent_start - 1
+            while cursor >= 0 and turns[cursor].role == "tool":
+                cursor -= 1
+            if cursor >= 0 and turns[cursor].role == "assistant" and turns[cursor].tool_calls:
+                recent_start = cursor
+            else:
+                while recent_start < len(turns) and turns[recent_start].role == "tool":
+                    recent_start += 1
+        while recent_start > 0 and turns[recent_start].role not in ("user", "system"):
+            recent_start -= 1
+        if recent_start < len(turns) and turns[recent_start].role == "system":
+            recent_start += 1
+        recent_turns = turns[recent_start:]
         turn_msgs = [
             {k: v for k, v in asdict(t).items() if v is not None}
             for t in recent_turns
+            if t.role != "system"
         ]
 
         # Assemble full list
         assembled = []
+        assembled.extend(system_msgs)
         assembled.append(summary_msg)
         assembled.extend(memory_msgs)
         assembled.extend(turn_msgs)
@@ -1567,7 +1839,9 @@ trivial or uncertain items.
                     total_tokens -= estimate_tokens(str(removed))
 
                 # Rebuild assembled after memory truncation
-                assembled = [summary_msg]
+                assembled = []
+                assembled.extend(system_msgs)
+                assembled.append(summary_msg)
                 assembled.extend(memory_msgs)
                 assembled.extend(turn_msgs)
                 assembled.extend(new_messages)
