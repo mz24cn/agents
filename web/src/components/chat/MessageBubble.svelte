@@ -97,6 +97,23 @@
     thinkingUserToggled = true
     thinkingExpanded = !thinkingExpanded
   }
+
+  // 格式化时间戳为 MM/DD HH:mm:ss 格式
+  function formatTimestamp(timestamp) {
+    if (!timestamp) return ''
+    try {
+      const date = new Date(timestamp)
+      if (isNaN(date.getTime())) return ''
+      const month = String(date.getMonth() + 1).padStart(2, '0')
+      const day = String(date.getDate()).padStart(2, '0')
+      const hours = String(date.getHours()).padStart(2, '0')
+      const minutes = String(date.getMinutes()).padStart(2, '0')
+      const seconds = String(date.getSeconds()).padStart(2, '0')
+      return `${month}/${day} ${hours}:${minutes}:${seconds}`
+    } catch {
+      return ''
+    }
+  }
 </script>
 
 <div class="message {msg.role}">
@@ -104,6 +121,9 @@
     {#if msg.role === 'user'}
       <span>{t('roleUser')}</span>
       <div class="role-actions">
+        {#if msg.timestamp}
+          <span class="timestamp">{formatTimestamp(msg.timestamp)}</span>
+        {/if}
         {#if onRevoke && msg.timestamp}
           <button class="revoke-btn" onclick={() => onRevoke(msg.timestamp)}>
             {t('revoke')}
@@ -265,6 +285,12 @@
     display: flex;
     align-items: center;
     gap: 4px;
+  }
+  .timestamp {
+    font-size: 0.75rem;
+    color: rgba(255, 255, 255, 0.6);
+    white-space: nowrap;
+    margin-right: 4px;
   }
   .toggle-btn {
     padding: 2px 8px;

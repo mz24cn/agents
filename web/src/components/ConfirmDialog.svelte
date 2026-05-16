@@ -6,28 +6,45 @@
     message = '',
     confirmText = t('confirm'),
     cancelText = t('cancel'),
+    closeText = '',
     customText = '',
     onCustom = null,
     onConfirm,
     onCancel,
+    hideCancel = false,
   } = $props()
+
+  $effect(() => {
+    if (!open) return
+    const handler = (e) => {
+      if (e.key === 'Escape') onCancel()
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  })
 </script>
 
 {#if open}
   <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="overlay" onclick={onCancel} onkeydown={(e) => e.key === 'Escape' && onCancel()}>
+  <div class="overlay" onclick={onCancel}>
     <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div class="dialog" onclick={(e) => e.stopPropagation()} onkeydown={() => {}}>
+    <div class="dialog" onclick={(e) => e.stopPropagation()}>
       <h3 class="dialog-title">{title}</h3>
       {#if message}
         <p class="dialog-message">{message}</p>
       {/if}
       <div class="dialog-actions">
+        {#if !hideCancel}
         <button class="btn btn-cancel" onclick={onCancel}>{cancelText}</button>
+        {/if}
         {#if customText && onCustom}
           <button class="btn btn-custom" onclick={onCustom}>{customText}</button>
         {/if}
-        <button class="btn btn-confirm" onclick={onConfirm}>{confirmText}</button>
+        {#if closeText}
+          <button class="btn btn-close" onclick={onConfirm}>{closeText}</button>
+        {:else}
+          <button class="btn btn-confirm" onclick={onConfirm}>{confirmText}</button>
+        {/if}
       </div>
     </div>
   </div>
@@ -91,6 +108,14 @@
     border: 1px solid var(--border);
   }
   .btn-custom:hover {
+    opacity: 0.8;
+  }
+  .btn-close {
+    background: var(--bg-secondary);
+    color: var(--text);
+    border: 1px solid var(--border);
+  }
+  .btn-close:hover {
     opacity: 0.8;
   }
   .btn-confirm {

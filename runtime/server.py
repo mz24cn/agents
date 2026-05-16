@@ -17,6 +17,7 @@ import re
 import sys
 import threading
 import urllib.parse
+from dataclasses import asdict
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 from typing import Callable, Optional
 
@@ -235,8 +236,10 @@ def persist_conversation(
             last_total_tokens=last_total_tokens,
             extra_meta=merged_extra,
         )
-        context_manager.update_rolling_summary(session_id, new_turns, last_total_tokens=last_total_tokens)
-        context_manager.extract_memory(session_id, new_turns, last_total_tokens=last_total_tokens)
+        # Trigger context compression exactly once per persistence operation.
+        # Use the unified API directly to avoid accidental double-compression
+        # through compatibility wrappers.
+        context_manager.compress_context(session_id, new_turns, last_total_tokens=last_total_tokens)
         if session_manager is not None:
             session_manager.update_index(session_id, last_total_tokens=last_total_tokens)
     except Exception as exc:
@@ -578,6 +581,18 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self._send_json_error(400, "Missing required field: model_id")
             return None
 
+        model_override = None
+        if "model" in body:
+            model_data = body.get("model")
+            if not isinstance(model_data, dict):
+                self._send_json_error(400, "Field 'model' must be a JSON object")
+                return None
+            try:
+                model_override = ModelConfig.from_dict(model_data)
+            except Exception as exc:
+                self._send_json_error(400, f"Invalid model config: {exc}")
+                return None
+
         context_manager = self.server.context_manager  # type: ignore[attr-defined]
         raw_session_id: Optional[str] = body.get("session_id") or None
         session_id: Optional[str] = None
@@ -684,6 +699,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
 
         request = InferenceRequest(
             model_id=body["model_id"],
+            model_config_override=model_override,
             tool_ids=tool_ids,
             messages=assembled_messages,
             text=body.get("text"),
@@ -787,24 +803,38 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                     self._send_json_error(500, f"Failed to save conversation: {persist_exc}")
                     return
 
+            merged_turns, merged_last_stat = merge_stream_messages(collected_messages)
+            if agent_id:
+                for turn in merged_turns:
+                    if turn.role == "assistant":
+                        turn.assistant_id = agent_id
+                        if agent_nickname:
+                            turn.name = agent_nickname
+
+            merged_messages = [
+                {k: v for k, v in asdict(turn).items() if v is not None}
+                for turn in merged_turns
+            ]
+
             has_error = any(
                 m.role == "assistant" and m.content and m.content.startswith("Error:")
                 for m in collected_messages
             )
             success = not has_error
 
-            stat_dict = None
-            for m in reversed(collected_messages):
-                if m.role == "usage":
-                    try:
-                        stat_dict = json.loads(m.content)
-                    except (json.JSONDecodeError, ValueError, AttributeError):
-                        pass
-                    break
+            stat_dict = merged_last_stat
+            if stat_dict is None:
+                for m in reversed(collected_messages):
+                    if m.role == "usage":
+                        try:
+                            stat_dict = json.loads(m.content)
+                        except (json.JSONDecodeError, ValueError, AttributeError):
+                            pass
+                        break
 
             response_data: dict = {
                 "success": success,
-                "messages": [m.to_dict() for m in collected_messages],
+                "messages": merged_messages,
             }
             if session_id is not None:
                 response_data["session_id"] = session_id

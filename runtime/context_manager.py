@@ -1893,19 +1893,46 @@ trivial or uncertain items.
             summarized_up_to = min(summarized_up_to, len(turns) - 1)
         else:
             summarized_up_to = -1
-        recent_start = max(max(0, len(turns) - k), max(0, summarized_up_to + 1))
+        unsummarized_floor = max(0, summarized_up_to + 1)
+        recent_start = max(max(0, len(turns) - k), unsummarized_floor)
         recent_start = min(recent_start, len(turns))
+        allow_before_floor_for_tool_chain = False
+        if 0 < recent_start < len(turns) and turns[recent_start].role == "tool":
+            cursor = recent_start - 1
+            while cursor >= 0 and turns[cursor].role == "tool":
+                cursor -= 1
+            if cursor >= 0 and turns[cursor].role == "assistant" and turns[cursor].tool_calls:
+                # Protocol integrity first: if the window starts from a tool_result,
+                # include its matching assistant(tool_use) even if that assistant
+                # is in summarized area.
+                recent_start = cursor
+                allow_before_floor_for_tool_chain = recent_start < unsummarized_floor
+            else:
+                while recent_start < len(turns) and turns[recent_start].role == "tool":
+                    recent_start += 1
+        while (
+            unsummarized_floor < recent_start < len(turns)
+            and turns[recent_start].role not in ("user", "system")
+        ):
+            recent_start -= 1
+        # Second tool-chain integrity check: the backtrack loop above may have
+        # moved recent_start onto a tool message whose matching assistant is
+        # still outside the window (in the summarized area).  Without the
+        # matching assistant(tool_use), Claude API will reject the orphan
+        # tool_result with "No tool call found for function call output".
         if 0 < recent_start < len(turns) and turns[recent_start].role == "tool":
             cursor = recent_start - 1
             while cursor >= 0 and turns[cursor].role == "tool":
                 cursor -= 1
             if cursor >= 0 and turns[cursor].role == "assistant" and turns[cursor].tool_calls:
                 recent_start = cursor
+                allow_before_floor_for_tool_chain = True  # allow going before floor
             else:
+                # No matching assistant found — skip orphan tool results
                 while recent_start < len(turns) and turns[recent_start].role == "tool":
                     recent_start += 1
-        while 0 < recent_start < len(turns) and turns[recent_start].role not in ("user", "system"):
-            recent_start -= 1
+        if recent_start < unsummarized_floor and not allow_before_floor_for_tool_chain:
+            recent_start = unsummarized_floor
         if recent_start < len(turns) and turns[recent_start].role == "system":
             recent_start += 1
         recent_turns = turns[recent_start:]

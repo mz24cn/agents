@@ -126,7 +126,9 @@ class Runtime:
             An InferenceResult with the conversation history and status.
         """
         # 1. Get model config
-        model_config = self._model_registry.get(request.model_id)
+        model_config = request.model_config_override
+        if model_config is None:
+            model_config = self._model_registry.get(request.model_id)
         if model_config is None:
             return InferenceResult(
                 success=False,
@@ -735,7 +737,9 @@ class Runtime:
             """Return current wall-clock timestamp in ISO 8601 format."""
             return _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
-        model_config = self._model_registry.get(request.model_id)
+        model_config = request.model_config_override
+        if model_config is None:
+            model_config = self._model_registry.get(request.model_id)
         if model_config is None:
             yield Message(role="assistant", timestamp=_now_ts(),
                           content=f"Error: Model '{request.model_id}' not found")

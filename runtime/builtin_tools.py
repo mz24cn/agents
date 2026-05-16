@@ -962,11 +962,18 @@ def _read_file(path: str, start_line: Optional[int] = None, end_line: Optional[i
         return json.dumps({"error": code, "message": message})
 
     workspace = os.path.realpath(os.environ.get("AGENT_WORKSPACE", ""))
+    check_path_for_read = os.environ.get("CHECK_PATH_FOR_READ", "false").lower() == "true"
 
-    try:
-        resolved_path = _validate_path(workspace, path)
-    except ValueError as exc:
-        return error(exc.error_code, str(exc))  # type: ignore[attr-defined]
+    if check_path_for_read:
+        try:
+            resolved_path = _validate_path(workspace, path)
+        except ValueError as exc:
+            return error(exc.error_code, str(exc))  # type: ignore[attr-defined]
+    else:
+        if os.path.isabs(path):
+            resolved_path = os.path.realpath(path)
+        else:
+            resolved_path = os.path.realpath(os.path.join(workspace, path))
 
     if not os.path.isfile(resolved_path):
         return error("FileNotFound", f"The specified file `{resolved_path}` does not exist")
@@ -1373,8 +1380,138 @@ def _strip_diff_fence(patch: str) -> str:
     return patch
 
 
+def _convert_begin_patch_format(patch: str, rel_path: str) -> str:
+    """Convert *** Begin Patch format to standard unified diff format.
+    
+    Some LLMs generate patches in this format:
+    *** Begin Patch
+    *** Update File: path/to/file
+    @@
+    context line
+    +added line
+    -removed line
+    @@
+    more context
+    *** End Patch
+    
+    This function converts it to standard unified diff format.
+    """
+    lines = patch.splitlines()
+    result = []
+    current_file = None
+    hunk_lines = []
+    hunk_start_old = 1
+    hunk_start_new = 1
+    
+    for line in lines:
+        # Skip markers
+        if line.startswith("*** Begin Patch") or line.startswith("*** End Patch"):
+            continue
+        
+        # File markers
+        if line.startswith("*** Update File:"):
+            # Flush previous hunk if any
+            if hunk_lines and current_file:
+                result.extend(_build_hunk(hunk_lines, hunk_start_old, hunk_start_new))
+                hunk_lines = []
+            
+            current_file = line.split(":", 1)[1].strip()
+            result.append(f"--- {current_file}")
+            result.append(f"+++ {current_file}")
+            hunk_start_old = 1
+            hunk_start_new = 1
+            continue
+        
+        if line.startswith("*** Add File:"):
+            # Flush previous hunk if any
+            if hunk_lines and current_file:
+                result.extend(_build_hunk(hunk_lines, hunk_start_old, hunk_start_new))
+                hunk_lines = []
+            
+            current_file = line.split(":", 1)[1].strip()
+            result.append(f"--- /dev/null")
+            result.append(f"+++ {current_file}")
+            hunk_start_old = 1
+            hunk_start_new = 1
+            continue
+        
+        if line.startswith("*** Delete File:"):
+            # Flush previous hunk if any
+            if hunk_lines and current_file:
+                result.extend(_build_hunk(hunk_lines, hunk_start_old, hunk_start_new))
+                hunk_lines = []
+            
+            current_file = line.split(":", 1)[1].strip()
+            result.append(f"--- {current_file}")
+            result.append(f"+++ /dev/null")
+            hunk_start_old = 1
+            hunk_start_new = 1
+            continue
+        
+        # Hunk header (just @@ without line numbers)
+        if line.startswith("@@"):
+            # Flush previous hunk if any
+            if hunk_lines and current_file:
+                result.extend(_build_hunk(hunk_lines, hunk_start_old, hunk_start_new))
+                hunk_lines = []
+            
+            # Try to parse line numbers from @@
+            import re
+            match = re.match(r'@@ -(\d+),?(\d+)? \+(\d+),?(\d+)? @@', line)
+            if match:
+                hunk_start_old = int(match.group(1))
+                hunk_start_new = int(match.group(3))
+                result.append(line)
+            else:
+                # Just @@ without numbers - we'll generate numbers later
+                hunk_start_old = 1
+                hunk_start_new = 1
+            continue
+        
+        # Regular patch line
+        if current_file:
+            hunk_lines.append(line)
+    
+    # Flush last hunk
+    if hunk_lines and current_file:
+        result.extend(_build_hunk(hunk_lines, hunk_start_old, hunk_start_new))
+    
+    return "\n".join(result) + "\n" if result else ""
+
+
+def _build_hunk(lines: list, start_old: int, start_new: int) -> list:
+    """Build a hunk with proper line numbers."""
+    import re
+    
+    # Count lines
+    old_count = 0
+    new_count = 0
+    for line in lines:
+        if line.startswith("+"):
+            new_count += 1
+        elif line.startswith("-"):
+            old_count += 1
+        else:
+            # Context line
+            old_count += 1
+            new_count += 1
+    
+    # If we have no changes, skip
+    if old_count == 0 and new_count == 0:
+        return []
+    
+    result = [f"@@ -{start_old},{old_count} +{start_new},{new_count} @@"]
+    result.extend(lines)
+    return result
+
+
 def _normalize_patch_for_path(patch: str, rel_path: str) -> str:
     patch = _strip_diff_fence(patch)
+    
+    # Handle "*** Begin Patch" format (used by some LLMs)
+    if "*** Begin Patch" in patch:
+        patch = _convert_begin_patch_format(patch, rel_path)
+    
     lines = patch.splitlines(keepends=True)
     first_text = next((line.lstrip() for line in lines if line.strip()), "")
     if first_text.startswith("@@ "):
@@ -1401,7 +1538,21 @@ def _patch_process_output(result: subprocess.CompletedProcess) -> str:
     output = "\n".join(
         part.strip() for part in (result.stdout, result.stderr) if part and part.strip()
     )
-    return output or "Patch did not apply cleanly"
+    
+    if not output:
+        return "Patch did not apply cleanly"
+    
+    # Add helpful context for common errors
+    if "Only garbage was found" in output:
+        return f"{output}\n\nHint: The patch format appears to be invalid. Make sure to use standard unified diff format with proper --- and +++ file headers."
+    
+    if "unexpectedly ends" in output:
+        return f"{output}\n\nHint: The patch appears to be incomplete. Make sure all hunks are properly terminated."
+    
+    if "patch: ****" in output:
+        return f"{output}\n\nHint: The patch format is invalid. Consider using search_replace mode instead."
+    
+    return output
 
 
 def _cleanup_patch_artifacts(resolved_path: str) -> None:
@@ -1501,7 +1652,7 @@ EDIT_FILE_TOOL_CONFIG = ToolConfig(
             "mode": {
                 "type": "string",
                 "enum": ["search_replace", "diff"],
-                "description": "Edit mode: 'search_replace' or 'diff'",
+                "description": "Edit mode: 'search_replace' (recommended) or 'diff'",
             },
             "old_str": {
                 "type": "string",

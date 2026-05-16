@@ -237,7 +237,10 @@
       let u = [...messages]
       const aIdx = aIdxRef.value
       if (!u[aIdx]) return
-      const newMsg = { ...u[aIdx], ...msg }
+      // 仅合并非内容元数据字段（role, timestamp 等），
+      // 避免 msg 中的 content:"" 覆盖已累积的内容（工具调用帧常携带 content:""）
+      const { content: _inc, thinking: _incT, tool_calls: _incTC, ...msgMeta } = msg
+      const newMsg = { ...u[aIdx], ...msgMeta }
       if (msg.content) newMsg.content = (u[aIdx].content || '') + msg.content
       if (msg.thinking) newMsg.thinking = (u[aIdx].thinking || '') + msg.thinking
       if (msg.tool_calls) newMsg.tool_calls = [...(u[aIdx].tool_calls || []), ...msg.tool_calls]

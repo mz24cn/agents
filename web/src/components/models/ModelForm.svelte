@@ -1,7 +1,8 @@
 <script>
   import { models } from '../../lib/api.js'
-  import { t } from '../../lib/i18n.svelte.js'
+  import { t, i18n } from '../../lib/i18n.svelte.js'
   import JsonEditor from '../JsonEditor.svelte'
+  import ConfirmDialog from '../ConfirmDialog.svelte'
 
   let { model = null, onSuccess, onCancel } = $props()
 
@@ -22,6 +23,10 @@
   let errors = $state({})
   let submitError = $state('')
   let submitting = $state(false)
+  let testing = $state(false)
+  let testDialogOpen = $state(false)
+  let testDialogTitle = $state('')
+  let testDialogMessage = $state('')
 
   let apiBasePlaceholder = $derived(
     api_protocol === 'anthropic'
@@ -72,6 +77,63 @@
     } finally {
       submitting = false
     }
+  }
+
+  async function handleTest() {
+    if (!validate()) return
+    testing = true
+    try {
+      const userMessage = i18n.lang === 'zh'
+        ? '你好！请简单介绍你自己。'
+        : 'Hello! Please simply introduce yourself.'
+
+      const body = {
+        model_id: model_id.trim(),
+        model: {
+          model_id: model_id.trim(),
+          api_base: api_base.trim(),
+          model_name: model_name.trim(),
+          api_key: api_key.trim(),
+          model_type,
+          api_protocol,
+          generate_params: generate_params_text.trim() ? JSON.parse(generate_params_text) : {},
+        },
+        messages: [{ role: 'user', content: userMessage }],
+        stream: false,
+      }
+
+      const res = await fetch('/v1/infer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+
+      const data = await res.json()
+
+      if (!res.ok || !data.success) {
+        const errorMsg = data.error || data.message || `Request failed: ${res.status}`
+        testDialogTitle = t('testFailedTitle')
+        testDialogMessage = errorMsg
+      } else {
+        // Extract assistant content from messages
+        const assistantMsg = data.messages?.find(m => m.role === 'assistant')
+        testDialogTitle = t('testSuccessTitle')
+        testDialogMessage = assistantMsg?.content || ''
+      }
+      testDialogOpen = true
+    } catch (err) {
+      testDialogTitle = t('testFailedTitle')
+      testDialogMessage = err.message || 'Network error'
+      testDialogOpen = true
+    } finally {
+      testing = false
+    }
+  }
+
+  function closeTestDialog() {
+    testDialogOpen = false
+    testDialogTitle = ''
+    testDialogMessage = ''
   }
 </script>
 
@@ -138,11 +200,22 @@
   </div>
 
   <div class="form-actions">
+    <button type="button" class="btn btn-test" onclick={handleTest} disabled={testing}>{testing ? t('submitting') : t('testModel')}</button>
     <button type="button" class="btn btn-cancel" onclick={onCancel} disabled={submitting}>{t('cancel')}</button>
     <button type="submit" class="btn btn-primary" disabled={submitting}>
       {submitting ? t('submitting') : (isEdit ? t('save') : t('register'))}
     </button>
   </div>
+
+  <ConfirmDialog
+    open={testDialogOpen}
+    title={testDialogTitle}
+    message={testDialogMessage}
+    closeText={t('testClose')}
+    hideCancel={true}
+    onConfirm={closeTestDialog}
+    onCancel={closeTestDialog}
+  />
 </form>
 
 <style>
@@ -166,7 +239,9 @@
   .form-actions { display: flex; justify-content: flex-end; gap: 12px; margin-top: 16px; }
   .btn { padding: 8px 20px; border-radius: 6px; border: none; cursor: pointer; font-size: 0.9rem; }
   .btn:disabled { opacity: 0.6; cursor: not-allowed; }
-  .btn-cancel { background: var(--bg-secondary); color: var(--text); border: 1px solid var(--border); }
-  .btn-primary { background: var(--primary); color: #fff; }
-  .btn-primary:hover:not(:disabled) { background: var(--primary-hover); }
+   .btn-cancel { background: var(--bg-secondary); color: var(--text); border: 1px solid var(--border); }
+   .btn-test { background: #e67e22; color: #fff; }
+   .btn-test:hover:not(:disabled) { background: #d35400; }
+   .btn-primary { background: var(--primary); color: #fff; }
+   .btn-primary:hover:not(:disabled) { background: var(--primary-hover); }
 </style>

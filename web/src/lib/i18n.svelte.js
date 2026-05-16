@@ -187,6 +187,11 @@ const translations = {
     // ModelForm
     editModel: '编辑模型',
     registerModel: '注册模型',
+    testModel: '测试模型',
+    testTitle: '模型测试结果',
+    testSuccessTitle: '测试成功',
+    testFailedTitle: '测试失败',
+    testClose: '关闭',
     modelId: '模型 ID',
     modelName: '模型名称',
     apiBase: 'API 地址',
@@ -500,6 +505,11 @@ const translations = {
     // ModelForm
     editModel: 'Edit Model',
     registerModel: 'Register Model',
+    testModel: 'Test Model',
+    testTitle: 'Test Result',
+    testSuccessTitle: 'Test Successful',
+    testFailedTitle: 'Test Failed',
+    testClose: 'Close',
     modelId: 'Model ID',
     modelName: 'Model Name',
     apiBase: 'API Base URL',

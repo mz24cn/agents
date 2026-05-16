@@ -213,6 +213,9 @@ class InferenceRequest:
 
     Attributes:
         model_id: ID of the model to use (must exist in ModelRegistry).
+        model_config_override: Optional temporary model configuration used only
+            for this request. If provided, runtime should prefer this over
+            registry lookup.
         tool_ids: List of tool IDs to make available during inference.
         messages: Optional pre-built message list.
         text: Optional plain text input (convenience shortcut).
@@ -221,6 +224,7 @@ class InferenceRequest:
     """
 
     model_id: str
+    model_config_override: Optional[ModelConfig] = None
     tool_ids: list = field(default_factory=list)
     messages: Optional[list] = None
     text: Optional[str] = None
