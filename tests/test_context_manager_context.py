@@ -309,7 +309,7 @@ def test_introspect_consistency(state: dict) -> None:
 
 
 def test_assemble_context_ordering_unit():
-    """assemble_context must return summary → memory → turns → new_messages."""
+    """assemble_context must return summary → memory → recent unsummarized turns → new_messages."""
     with tempfile.TemporaryDirectory() as tmp_dir:
         cm = _make_cm(tmp_dir, recent_turns_k=5)
         session_id = cm.create_session()
@@ -322,7 +322,7 @@ def test_assemble_context_ordering_unit():
         ]
         cm.save_conversation(session_id, turns)
 
-        # Write a summary
+        # Write a summary that already covers turn 0
         _write_summary(cm, session_id, "This is the summary.", summarized_up_to_turn=0)
 
         # Add memory entries
@@ -344,13 +344,11 @@ def test_assemble_context_ordering_unit():
         assert result[2]["role"] == "system"
         assert result[2]["content"].startswith("## Memory")
 
-        # Then turns
-        assert result[3]["role"] == "user"
-        assert result[3]["content"] == "turn 0"
-        assert result[4]["role"] == "assistant"
-        assert result[4]["content"] == "turn 1"
-        assert result[5]["role"] == "user"
-        assert result[5]["content"] == "turn 2"
+        # Then unsummarized recent turns (turn 1, turn 2)
+        assert result[3]["role"] == "assistant"
+        assert result[3]["content"] == "turn 1"
+        assert result[4]["role"] == "user"
+        assert result[4]["content"] == "turn 2"
 
         # Last: new_messages
         assert result[-1] == new_msgs[0]
@@ -383,6 +381,7 @@ def test_compressed_context_preserves_system_template_message():
 
 
 def test_compressed_context_does_not_start_recent_window_with_tool_result():
+    """When recent window would start at a tool result, include matching assistant tool_call first."""
     with tempfile.TemporaryDirectory() as tmp_dir:
         cm = _make_cm(tmp_dir, recent_turns_k=3)
         session_id = cm.create_session()
@@ -412,14 +411,18 @@ def test_compressed_context_does_not_start_recent_window_with_tool_result():
         result = cm.assemble_context(session_id, [{"role": "user", "content": "next"}])
         non_system = [msg for msg in result if msg["role"] != "system"]
 
-        assert non_system[0]["role"] == "user"
-        assert non_system[0]["content"] == "old request"
-        assert non_system[1]["role"] == "assistant"
-        assert non_system[1]["tool_calls"][0]["id"] == "call_1"
-        assert non_system[2]["role"] == "tool"
-        assert non_system[2]["tool_use_id"] == "call_1"
+        # Tool-chain integrity: assistant(tool_calls) must precede tool result.
+        assert non_system[0]["role"] == "assistant"
+        assert non_system[0]["tool_calls"][0]["id"] == "call_1"
+        assert non_system[1]["role"] == "tool"
+        assert non_system[1]["tool_use_id"] == "call_1"
+        assert non_system[2]["role"] == "assistant"
+        assert non_system[2]["content"] == "done"
+        assert non_system[-1]["role"] == "user"
+        assert non_system[-1]["content"] == "next"
 
 
+def test_assemble_context_empty_session_returns_new_messages():
     """assemble_context with empty session_id must return new_messages as-is."""
     with tempfile.TemporaryDirectory() as tmp_dir:
         cm = _make_cm(tmp_dir)

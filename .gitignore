@@ -25,7 +25,6 @@ venv/
 coverage.xml
 htmlcov/
 *.lcov
-/tests
 
 # Type checking
 .mypy_cache/

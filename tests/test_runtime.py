@@ -11,6 +11,7 @@ from hypothesis import strategies as st
 
 from runtime.models import InferenceRequest, Message
 from runtime.runtime import Runtime
+from runtime.registry import ModelRegistry, ToolRegistry
 
 
 # --- Hypothesis strategies ---
@@ -42,8 +43,9 @@ messages_list_st = st.lists(message_st, min_size=1, max_size=10)
 def test_normalize_text_input_wraps_as_user_message(text: str) -> None:
     """For any plain text input, _normalize_messages should wrap it as
     [Message(role="user", content=text)]."""
+    runtime = Runtime(model_registry=ModelRegistry(), tool_registry=ToolRegistry())
     request = InferenceRequest(model_id="test-model", text=text)
-    result = Runtime._normalize_messages(request)
+    result = runtime._normalize_messages(request)
 
     assert isinstance(result, list)
     assert len(result) == 1
@@ -59,8 +61,9 @@ def test_normalize_messages_input_passes_through_unchanged(
 ) -> None:
     """For any pre-built messages list, _normalize_messages should return
     the same messages unchanged."""
+    runtime = Runtime(model_registry=ModelRegistry(), tool_registry=ToolRegistry())
     request = InferenceRequest(model_id="test-model", messages=messages)
-    result = Runtime._normalize_messages(request)
+    result = runtime._normalize_messages(request)
 
     assert isinstance(result, list)
     assert len(result) == len(messages)
@@ -76,10 +79,11 @@ def test_normalize_messages_takes_precedence_over_text(
 ) -> None:
     """When both text and messages are provided, messages should take
     precedence (as documented in _normalize_messages)."""
+    runtime = Runtime(model_registry=ModelRegistry(), tool_registry=ToolRegistry())
     request = InferenceRequest(
         model_id="test-model", text=text, messages=messages
     )
-    result = Runtime._normalize_messages(request)
+    result = runtime._normalize_messages(request)
 
     # messages takes precedence, so result should match messages, not text
     assert len(result) == len(messages)
@@ -95,16 +99,17 @@ def test_normalize_text_and_messages_produce_consistent_format(
 ) -> None:
     """Both text input and messages input should produce a list of Message
     objects — the normalized format is always list[Message]."""
+    runtime = Runtime(model_registry=ModelRegistry(), tool_registry=ToolRegistry())
     # Text input path
     text_request = InferenceRequest(model_id="test-model", text=text)
-    text_result = Runtime._normalize_messages(text_request)
+    text_result = runtime._normalize_messages(text_request)
 
     # Equivalent messages input path
     equivalent_messages = [Message(role="user", content=text)]
     msg_request = InferenceRequest(
         model_id="test-model", messages=equivalent_messages
     )
-    msg_result = Runtime._normalize_messages(msg_request)
+    msg_result = runtime._normalize_messages(msg_request)
 
     # Both should produce the same normalized output
     assert len(text_result) == len(msg_result)
@@ -114,8 +119,9 @@ def test_normalize_text_and_messages_produce_consistent_format(
 
 def test_normalize_empty_input_returns_empty_list() -> None:
     """When neither text nor messages is provided, should return empty list."""
+    runtime = Runtime(model_registry=ModelRegistry(), tool_registry=ToolRegistry())
     request = InferenceRequest(model_id="test-model")
-    result = Runtime._normalize_messages(request)
+    result = runtime._normalize_messages(request)
     assert result == []
 
 
@@ -393,9 +399,9 @@ def test_tool_call_loop_terminates_at_max_rounds(max_rounds: int) -> None:
     )
 
     # Conversation history should contain:
-    # 1 user message + N * (assistant + function) + 1 final assistant = 2N + 2
+    # 1 user message + N * (assistant + tool) + 1 final assistant + 1 injected tool error = 2N + 3
     assert result.messages is not None
-    expected_msg_count = 2 * max_rounds + 2
+    expected_msg_count = 2 * max_rounds + 3
     assert len(result.messages) == expected_msg_count, (
         f"Expected {expected_msg_count} messages, got {len(result.messages)}"
     )
@@ -404,10 +410,11 @@ def test_tool_call_loop_terminates_at_max_rounds(max_rounds: int) -> None:
     assert result.messages[0].role == "user"
     assert result.messages[0].content == "hello"
 
-    # Last message should be an assistant message (the one that triggered the break)
-    assert result.messages[-1].role == "assistant"
+    # Last message should be injected tool error (max rounds reached)
+    assert result.messages[-1].role == "tool"
+    assert "maximum tool-call rounds" in (result.messages[-1].content or "")
 
-    # Verify the pattern: user, (assistant, function) * N, assistant
+    # Verify the pattern: user, (assistant, tool) * N, assistant, tool(error)
     for i in range(max_rounds):
         assistant_idx = 1 + 2 * i
         function_idx = 2 + 2 * i
