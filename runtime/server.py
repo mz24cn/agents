@@ -43,7 +43,7 @@ from runtime.prompt_template_manager import PromptTemplateManager
 from runtime.agent_manager import AgentManager
 from runtime.registry import ModelRegistry, ToolRegistry
 from runtime.runtime import Runtime
-from runtime.context_manager import ContextManager, ConversationTurn
+from runtime.context_manager import ContextManager, ConversationTurn, JournalConflictError
 
 
 def merge_stream_messages(stream_messages: list) -> tuple[list, Optional[dict]]:
@@ -159,6 +159,7 @@ def persist_conversation(
     extra_meta: Optional[dict] = None,
     agent_id: Optional[str] = None,
     agent_nickname: Optional[str] = None,
+    model_id: Optional[str] = None,
 ) -> Optional[Exception]:
     """将一次推理的消息持久化到会话存储。
 
@@ -177,6 +178,7 @@ def persist_conversation(
             一并通过 save_conversation 的 extra_meta 参数一次写入。
         agent_id: 可选的 agent ID，用于标记 role=assistant 的消息的 assistant_id。
         agent_nickname: 可选的 agent nickname，用于标记 role=assistant 的消息的 name 字段。
+        model_id: 可选的模型 ID，记录到会话 meta 中，便于恢复会话设置。
 
     Returns:
         成功时返回 None；失败时返回捕获的异常（OSError 或其他）。
@@ -218,10 +220,14 @@ def persist_conversation(
             if last_stat else None
         ) or None
         merged_extra: Optional[dict] = None
-        if tool_ids is not None or extra_meta:
+        if tool_ids is not None or extra_meta or model_id or agent_id:
             merged_extra = {}
             if tool_ids is not None:
                 merged_extra["tool_ids"] = tool_ids
+            if model_id is not None:
+                merged_extra["model_id"] = model_id
+            if agent_id is not None:
+                merged_extra["agent_id"] = agent_id
             if extra_meta:
                 merged_extra.update(extra_meta)
         context_manager.save_conversation(
@@ -699,7 +705,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         _thread_local.session_manager = self.server.session_manager  # type: ignore[attr-defined]
 
         agent_nickname = agent.get("nickname") if agent else None
-        return body, request, session_id, use_session, original_messages, context_manager, agent_id, agent_nickname
+        return body, request, session_id, use_session, original_messages, context_manager, agent_id, agent_nickname, body["model_id"], tool_ids
 
     def _cleanup_thread_local(self):
         from runtime.builtin_tools import _thread_local
@@ -726,7 +732,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         _thread_local.context_manager = None
         _thread_local.session_manager = None
 
-    def _persist_conversation(self, context_manager, session_id, original_messages, collected_messages, agent_id=None, agent_nickname=None):
+    def _persist_conversation(self, context_manager, session_id, original_messages, collected_messages, agent_id=None, agent_nickname=None, model_id=None, tool_ids=None):
         if session_id is None:
             return None
         exc = persist_conversation(
@@ -737,6 +743,8 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             session_manager=self.server.session_manager,  # type: ignore[attr-defined]
             agent_id=agent_id,
             agent_nickname=agent_nickname,
+            model_id=model_id,
+            tool_ids=tool_ids,
         )
         return exc
 
@@ -751,7 +759,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         result = self._prepare_infer_request()
         if result is None:
             return
-        _body, request, session_id, use_session, original_messages, context_manager, agent_id, agent_nickname = result
+        _body, request, session_id, use_session, original_messages, context_manager, agent_id, agent_nickname, model_id, tool_ids = result
 
         try:
             runtime = self._get_runtime()
@@ -774,7 +782,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                             msg.name = agent_nickname
 
             if use_session:
-                persist_exc = self._persist_conversation(context_manager, session_id, original_messages, collected_messages, agent_id, agent_nickname)
+                persist_exc = self._persist_conversation(context_manager, session_id, original_messages, collected_messages, agent_id, agent_nickname, model_id, tool_ids)
                 if persist_exc is not None:
                     self._send_json_error(500, f"Failed to save conversation: {persist_exc}")
                     return
@@ -823,7 +831,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         result = self._prepare_infer_request()
         if result is None:
             return
-        _body, request, session_id, use_session, original_messages, context_manager, agent_id, agent_nickname = result
+        _body, request, session_id, use_session, original_messages, context_manager, agent_id, agent_nickname, model_id, tool_ids = result
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -924,7 +932,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self.wfile.flush()
 
             if use_session:
-                persist_exc = self._persist_conversation(context_manager, session_id, original_messages, collected_messages, agent_id, agent_nickname)
+                persist_exc = self._persist_conversation(context_manager, session_id, original_messages, collected_messages, agent_id, agent_nickname, model_id, tool_ids)
                 if persist_exc is not None:
                     logger.error("infer_stream: failed to save conversation for session %s: %s", session_id, persist_exc)
         except (BrokenPipeError, ConnectionResetError):
@@ -932,14 +940,14 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             if use_session:
                 import datetime as _dt
                 collected_messages.append(Message(role="assistant", timestamp=_dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"), content="\n\nError: user interrupted."))
-                persist_exc = self._persist_conversation(context_manager, session_id, original_messages, collected_messages, agent_id, agent_nickname)
+                persist_exc = self._persist_conversation(context_manager, session_id, original_messages, collected_messages, agent_id, agent_nickname, model_id, tool_ids)
                 if persist_exc is not None:
                     logger.error("infer_stream: failed to save aborted conversation for session %s: %s", session_id, persist_exc)
         except Exception as exc:
             if use_session:
                 import datetime as _dt
                 collected_messages.append(Message(role="assistant", timestamp=_dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"), content=f"\n\nError: system aborted. ({exc})"))
-                persist_exc = self._persist_conversation(context_manager, session_id, original_messages, collected_messages, agent_id, agent_nickname)
+                persist_exc = self._persist_conversation(context_manager, session_id, original_messages, collected_messages, agent_id, agent_nickname, model_id, tool_ids)
                 if persist_exc is not None:
                     logger.error("infer_stream: failed to save aborted conversation for session %s: %s", session_id, persist_exc)
             try:
@@ -1642,9 +1650,17 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self._send_json_error(400, "Missing required field: timestamp")
             return
 
+        forced = bool(body.get("forced", False))
+        keep_files = bool(body.get("keep_files", False))
+
         context_manager = self.server.context_manager  # type: ignore[attr-defined]
         try:
-            revoke_result = context_manager.revoke_conversation(session_id, timestamp)
+            revoke_result = context_manager.revoke_conversation(
+                session_id,
+                timestamp,
+                force=forced,
+                keep_files=keep_files,
+            )
 
             self._send_json_response(200, {
                 "status": "success",
@@ -1653,6 +1669,9 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 "git": revoke_result.get("git", {}),
                 "journal": revoke_result.get("journal", {}),
             })
+        except JournalConflictError as exc:
+            self._send_json_response(409, exc.to_dict())
+            return
         except FileNotFoundError:
             self._send_json_error(404, f"Session not found: {session_id}")
             return
@@ -1702,6 +1721,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             system_prompt=body.get("system_prompt", ""),
             myself_view=body.get("myself_view", ""),
             description=body.get("description", ""),
+            group=body.get("group", ""),
             avatar=body.get("avatar", ""),
         )
         self._send_json_response(201, {"status": "created", "agent_id": agent_id})

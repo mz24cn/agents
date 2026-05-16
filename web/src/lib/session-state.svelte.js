@@ -2,7 +2,7 @@
 // Sidebar 设置 pending，ChatPage 监听并消费
 
 export const sessionRestore = $state({ pending: null })
-// pending: { sessionId: string, messages: Array<{role, content}> } | null
+// pending: { sessionId: string, messages: Array<{role, content}>, meta?: object } | null
 
 // 当前活跃的会话 ID（用于侧边栏高亮）
 export const currentSession = $state({ sessionId: null })

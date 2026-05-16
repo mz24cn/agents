@@ -308,7 +308,9 @@ class OpenAIProtocol(BaseProtocol):
 
         # Handle assistant messages with tool_calls
         if msg.tool_calls is not None:
-            result["content"] = msg.content if msg.content else None
+            # Only include content if non-empty to avoid content: null (some providers reject it)
+            if msg.content:
+                result["content"] = msg.content
             result["tool_calls"] = []
             for tc in msg.tool_calls:
                 call_id = tc.get("id") or tc.get("tool_use_id") or "call_" + uuid.uuid4().hex[:8]
@@ -324,6 +326,9 @@ class OpenAIProtocol(BaseProtocol):
                         "arguments": arguments,
                     },
                 })
+            # Pass back reasoning_content for thinking-mode models (required by API)
+            if msg.thinking is not None:
+                result["reasoning_content"] = msg.thinking
             return result
 
         # Handle tool role messages (legacy, shouldn't reach here)
@@ -343,6 +348,10 @@ class OpenAIProtocol(BaseProtocol):
             result["content"] = content_parts
         else:
             result["content"] = msg.content
+
+        # Pass back reasoning_content for thinking-mode models (required by API)
+        if msg.thinking is not None:
+            result["reasoning_content"] = msg.thinking
 
         return result
 

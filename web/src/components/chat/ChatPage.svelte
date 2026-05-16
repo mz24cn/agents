@@ -7,6 +7,7 @@
   import MarkdownRenderer from './MarkdownRenderer.svelte'
   import MessageList from './MessageList.svelte'
   import ChatInput from './ChatInput.svelte'
+  import ConfirmDialog from '../ConfirmDialog.svelte'
   import { extractPlaceholders } from '../../lib/placeholder.js'
   import { t } from '../../lib/i18n.svelte.js'
   import { sessionRestore, newSessionCreated, sessionDeleted, currentSession } from '../../lib/session-state.svelte.js'
@@ -22,6 +23,7 @@
   let inputText = $state('')
   let abortStream = $state(null)
   let sessionId = $state(null)   // maintained for the lifetime of this chat session
+  let revokeConflict = $state(null)
 
   // 提示词模板面板状态
   let templatePanelOpen = $state(false)
@@ -238,6 +240,7 @@
       const newMsg = { ...u[aIdx], ...msg }
       if (msg.content) newMsg.content = (u[aIdx].content || '') + msg.content
       if (msg.thinking) newMsg.thinking = (u[aIdx].thinking || '') + msg.thinking
+      if (msg.tool_calls) newMsg.tool_calls = [...(u[aIdx].tool_calls || []), ...msg.tool_calls]
       u[aIdx] = newMsg
       messages = u
     } else if (msg.role === 'tool') {
@@ -323,43 +326,111 @@
     errorMsg = err?.message || t('streamError')
   }
 
+  function applyRevokeSuccess(timestamp) {
+    const revokeIndex = messages.findIndex(m => m.timestamp === timestamp)
+    const revokedMessage = revokeIndex >= 0 ? messages[revokeIndex] : null
+    if (revokeIndex >= 0) {
+      messages = messages.slice(0, revokeIndex)
+    }
+    if (revokedMessage?.content) {
+      inputText = revokedMessage.content
+    }
+  }
+
+  function formatRevokeConflictMessage(files = []) {
+    const fileList = files.length ? `\n\n${t('revokeConflictFiles')}\n${files.map(f => `- ${f}`).join('\n')}` : ''
+    return `${t('revokeConflictMessage')}${fileList}`
+  }
+
   async function handleRevoke(timestamp) {
     if (!sessionId) return
-    // 弹出确认对话框
     if (!confirm(t('confirmRevoke'))) {
       return
     }
-    // 查找被撤回的用户消息内容
-    const revokeIndex = messages.findIndex(m => m.timestamp === timestamp)
-    const revokedMessage = revokeIndex >= 0 ? messages[revokeIndex] : null
-    // 向后端发送撤回请求
+    errorMsg = ''
     try {
       await sessionsApi.revoke(sessionId, timestamp)
-      // 后端操作成功后，才从前端移除消息并填入输入框
-      if (revokeIndex >= 0) {
-        messages = messages.slice(0, revokeIndex)
-      }
-      if (revokedMessage?.content) {
-        inputText = revokedMessage.content
-      }
+      applyRevokeSuccess(timestamp)
     } catch (err) {
-      console.error('Failed to revoke message:', err)
+      if (err?.status === 409 && err?.code === 'JournalConflict') {
+        revokeConflict = {
+          timestamp,
+          files: err.data?.files ?? [],
+        }
+        return
+      }
+      errorMsg = err?.message || t('revokeFailed')
     }
+  }
+
+  async function confirmForceRevoke() {
+    if (!sessionId || !revokeConflict) return
+    const timestamp = revokeConflict.timestamp
+    revokeConflict = null
+    errorMsg = ''
+    try {
+      await sessionsApi.revoke(sessionId, timestamp, { forced: true })
+      applyRevokeSuccess(timestamp)
+    } catch (err) {
+      errorMsg = err?.message || t('revokeFailed')
+    }
+  }
+
+  async function keepFilesAndRevoke() {
+    if (!sessionId || !revokeConflict) return
+    const timestamp = revokeConflict.timestamp
+    revokeConflict = null
+    errorMsg = ''
+    try {
+      await sessionsApi.revoke(sessionId, timestamp, { keepFiles: true })
+      applyRevokeSuccess(timestamp)
+    } catch (err) {
+      errorMsg = err?.message || t('revokeFailed')
+    }
+  }
+
+  function cancelForceRevoke() {
+    revokeConflict = null
   }
 
   $effect(() => {
     if (sessionRestore.pending) {
-      const { sessionId: sid, messages: msgs } = sessionRestore.pending
+      const { sessionId: sid, messages: msgs, meta } = sessionRestore.pending
       sessionRestore.pending = null
       messages = msgs
       sessionId = sid
       currentSession.sessionId = sid
       errorMsg = ''
-      // 检查最后一条assistant消息的assistant_id，设置智能体选择框
-      const lastAssistantMsg = [...msgs].reverse().find(m => m.role === 'assistant')
-      if (lastAssistantMsg?.assistant_id) {
-        selectedAgentId = lastAssistantMsg.assistant_id
-        localStorage.setItem('chat_selected_agent', lastAssistantMsg.assistant_id)
+      
+      // 优先使用 meta 中的设置（向下兼容：旧会话可能没有 meta）
+      if (meta) {
+        // 恢复智能体选择
+        if (meta.agent_id) {
+          selectedAgentId = meta.agent_id
+          localStorage.setItem('chat_selected_agent', meta.agent_id)
+        } else {
+          // meta 中没有 agent_id，清除选择
+          selectedAgentId = ''
+          localStorage.removeItem('chat_selected_agent')
+        }
+        // 恢复模型选择
+        if (meta.model_id) {
+          selectedModelId = meta.model_id
+          localStorage.setItem(STORAGE_MODEL_KEY, meta.model_id)
+        }
+        // 恢复工具选择
+        if (meta.tool_ids) {
+          selectedToolIds = meta.tool_ids
+          localStorage.setItem(STORAGE_TOOLS_KEY, JSON.stringify(meta.tool_ids))
+        }
+      } else {
+        // 向下兼容：从最后一条 assistant 消息恢复 assistant_id
+        const lastAssistantMsg = [...msgs].reverse().find(m => m.role === 'assistant')
+        if (lastAssistantMsg?.assistant_id) {
+          selectedAgentId = lastAssistantMsg.assistant_id
+          localStorage.setItem('chat_selected_agent', lastAssistantMsg.assistant_id)
+        }
+        // 模型和工具选中状态维持不变（使用 localStorage 中的值）
       }
     }
   })
@@ -435,6 +506,7 @@
         nickname: addAgentNickname.trim(),
         myself_view: '',
         description: `Model: ${selectedModelId}, Tools: ${toolNames.join(', ') || 'none'}`,
+        group: '',
       }
       await agentsApi.create(payload)
       addAgentMode = false
@@ -513,6 +585,16 @@
   {#if errorMsg}
     <div class="error-bar">{errorMsg}</div>
   {/if}
+
+  <ConfirmDialog
+    open={!!revokeConflict}
+    title={t('revokeConflictTitle')}
+    message={formatRevokeConflictMessage(revokeConflict?.files ?? [])}
+    customText={t('revokeKeepFiles')}
+    onCustom={keepFilesAndRevoke}
+    onConfirm={confirmForceRevoke}
+    onCancel={cancelForceRevoke}
+  />
 
   <div class="message-area">
     <MessageList {messages} {agentList} onRevoke={handleRevoke} />

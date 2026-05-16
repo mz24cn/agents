@@ -78,7 +78,12 @@
             <div class="agent-info">
               <div class="agent-name-row">
                 <span class="agent-name">{agent.nickname}</span>
-                <span class="agent-meta">{agent.model_id} · {agent.tool_ids?.length || 0} tools{agent.template_id ? ' · ' + agent.template_id : ''}</span>
+                <span class="agent-title-side">
+                  <span class="agent-meta">{agent.model_id} · {agent.tool_ids?.length || 0} tools{agent.template_id ? ' · ' + agent.template_id : ''}</span>
+                  {#if agent.group}
+                    <span class="agent-group">{agent.group}</span>
+                  {/if}
+                </span>
               </div>
               {#if agent.myself_view}
                 <div class="agent-myself">{agent.myself_view}</div>
@@ -133,8 +138,10 @@
   .avatar-emoji { font-size: 2rem; line-height: 1; }
   .agent-info { flex: 1; min-width: 0; display: flex; flex-direction: column; justify-content: center; }
   .agent-name-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; gap: 8px; }
-  .agent-name { font-weight: 600; color: var(--text); font-size: 0.95rem; }
+  .agent-name { font-weight: 600; color: var(--text); font-size: 0.95rem; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .agent-title-side { margin-left: auto; display: flex; align-items: center; justify-content: flex-end; gap: 8px; min-width: 0; white-space: nowrap; }
   .agent-meta { font-size: 0.8rem; color: var(--text-secondary); white-space: nowrap; }
+  .agent-group { color: var(--primary); font-size: 0.8rem; white-space: nowrap; }
   .agent-myself { color: var(--primary); font-size: 0.85rem; margin-bottom: 2px; }
   .agent-description { color: var(--text-secondary); font-size: 0.82rem; white-space: pre-wrap; word-break: break-word; margin-bottom: 4px; }
   .agent-timestamp { font-size: 0.75rem; color: var(--text-secondary); opacity: 0.7; }

@@ -25,10 +25,15 @@ async function request(method, path, body = null) {
   const data = await res.json()
   if (!res.ok) {
     // Support both single "error" string and "errors" array
-    const msg = data.error
+    const msg = data.message
+      || data.error
       || (Array.isArray(data.errors) ? data.errors.join('\n') : null)
       || `Request failed: ${res.status}`
-    throw new Error(msg)
+    const err = new Error(msg)
+    err.status = res.status
+    err.data = data
+    err.code = data.error
+    throw err
   }
   return data
 }
@@ -187,7 +192,7 @@ export const sessions = {
   get:           (sessionId)     => request('GET',    `/v1/sessions/${encodeURIComponent(sessionId)}`),
   delete:        (sessionId)     => request('DELETE', `/v1/sessions/${encodeURIComponent(sessionId)}`),
   generateTitle: (sessionId)     => request('POST',   `/v1/sessions/${encodeURIComponent(sessionId)}/generate-title`),
-  revoke:        (sessionId, timestamp) => request('POST', `/v1/sessions/${encodeURIComponent(sessionId)}/revoke`, { session_id: sessionId, timestamp }),
+  revoke:        (sessionId, timestamp, { forced = false, keepFiles = false } = {}) => request('POST', `/v1/sessions/${encodeURIComponent(sessionId)}/revoke`, { session_id: sessionId, timestamp, forced, keep_files: keepFiles }),
 }
 
 /** 智能体 API */

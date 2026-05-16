@@ -57,7 +57,8 @@
       const data = await sessions.get(sessionId)
       // 直接展开所有字段，保持与后端数据一致
       const msgs = (data.messages ?? []).map(m => ({ ...m }))
-      sessionRestore.pending = { sessionId, messages: msgs }
+      const meta = data.meta ?? null
+      sessionRestore.pending = { sessionId, messages: msgs, meta }
       // 恢复会话后跳转到对话页，同时同步浏览器 hash
       navigate('#/chat')
     } catch (err) {

@@ -17,6 +17,20 @@ from pathlib import Path
 from typing import Optional
 
 
+class JournalConflictError(RuntimeError):
+    def __init__(self, message: str, files: list[str]):
+        super().__init__(message)
+        self.files = files
+
+    def to_dict(self) -> dict:
+        return {
+            "error": "JournalConflict",
+            "message": str(self),
+            "files": self.files,
+            "can_force": True,
+        }
+
+
 # ---------------------------------------------------------------------------
 # Data models
 # ---------------------------------------------------------------------------
@@ -859,6 +873,7 @@ def revoke_session_file_changes(
     session_id: str,
     timestamp: str,
     force: bool = False,
+    keep_files: bool = False,
 ) -> dict:
     threshold = _journal_parse_ts(timestamp)
     if threshold is None:
@@ -895,6 +910,23 @@ def revoke_session_file_changes(
 
     if not restore_plan:
         return {"skipped": True, "reason": "no_file_changes", "restored_files": []}
+
+    if keep_files:
+        now = _journal_now_iso()
+        revoked_turns: list[str] = []
+        for manifest_path, manifest in selected:
+            manifest["revoked"] = True
+            manifest["revoked_at"] = now
+            manifest["kept_files"] = True
+            manifest["updated_at"] = now
+            _journal_atomic_write_json(manifest_path, manifest)
+            revoked_turns.append(str(manifest.get("turn_key")))
+        return {
+            "revoked": True,
+            "revoked_turns": revoked_turns,
+            "restored_files": [],
+            "kept_files": True,
+        }
 
     result = _restore_file_plan(workspace, restore_plan, force=force)
     if result.get("error"):
@@ -1177,10 +1209,52 @@ class ContextManager:
             ))
         return turns
 
+    def _remove_session_file(self, path: str) -> None:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+    def _reconcile_compression_after_revoke(
+        self,
+        session_id: str,
+        revoke_index: int,
+        new_turn_count: int,
+    ) -> None:
+        summary_text, summary_fm = self.get_summary(session_id)
+        summarized_up_to = summary_fm.get("summarized_up_to_turn", -1)
+        if not isinstance(summarized_up_to, int):
+            summarized_up_to = -1
+
+        cuts_summarized_history = bool(summary_text.strip()) and revoke_index <= summarized_up_to
+        if cuts_summarized_history:
+            self._remove_session_file(self._summary_path(session_id))
+            self._remove_session_file(self._memory_path(session_id))
+            self._memory_store.pop(session_id, None)
+            return
+
+        if summary_text.strip() and summarized_up_to >= new_turn_count:
+            summary_fm["summarized_up_to_turn"] = max(-1, new_turn_count - 1)
+            summary_fm["updated_at"] = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            if summary_fm["summarized_up_to_turn"] < 0:
+                self._remove_session_file(self._summary_path(session_id))
+            else:
+                self._atomic_write(self._summary_path(session_id), serialize_summary(summary_fm, summary_text))
+
+        entries = [entry for entry in self.load_memory(session_id) if entry.source_turn_index < new_turn_count]
+        if entries:
+            self.save_memory(session_id, entries)
+            self._memory_store[session_id] = entries
+        else:
+            self._remove_session_file(self._memory_path(session_id))
+            self._memory_store.pop(session_id, None)
+
     def revoke_conversation(
         self,
         session_id: str,
         timestamp: str,
+        force: bool = False,
+        keep_files: bool = False,
     ) -> dict:
         """Revoke messages from the conversation starting from the message with the given timestamp.
 
@@ -1223,10 +1297,25 @@ class ContextManager:
 
         workspace = os.environ.get("AGENT_WORKSPACE", "") or os.getcwd()
         session_dir = os.path.dirname(conv_path)
-        journal_result = revoke_session_file_changes(workspace, session_dir, session_id, timestamp)
+        journal_result = revoke_session_file_changes(
+            workspace,
+            session_dir,
+            session_id,
+            timestamp,
+            force=force,
+            keep_files=keep_files,
+        )
         if isinstance(journal_result, dict) and journal_result.get("error"):
+            if journal_result.get("error") == "JournalConflict":
+                raise JournalConflictError(
+                    journal_result.get("message") or "Current files do not match journal after-state",
+                    list(journal_result.get("files") or []),
+                )
+            if journal_result.get("error") == "InvalidTimestamp":
+                raise ValueError(journal_result.get("message") or journal_result["error"])
             raise RuntimeError(journal_result.get("message") or journal_result["error"])
         git_result = {"skipped": True, "reason": "replaced_by_file_journal", "removed_commits": []}
+        self._reconcile_compression_after_revoke(session_id, revoke_index, len(new_messages))
 
         # Update meta and save only after journal validation/restore succeeds. This
         # keeps conversation history and workspace files in sync if the journal
@@ -1800,7 +1889,12 @@ trivial or uncertain items.
         summarized_up_to = summary_fm.get("summarized_up_to_turn", -1)
         if not isinstance(summarized_up_to, int):
             summarized_up_to = -1
+        if turns:
+            summarized_up_to = min(summarized_up_to, len(turns) - 1)
+        else:
+            summarized_up_to = -1
         recent_start = max(max(0, len(turns) - k), max(0, summarized_up_to + 1))
+        recent_start = min(recent_start, len(turns))
         if 0 < recent_start < len(turns) and turns[recent_start].role == "tool":
             cursor = recent_start - 1
             while cursor >= 0 and turns[cursor].role == "tool":
@@ -1810,7 +1904,7 @@ trivial or uncertain items.
             else:
                 while recent_start < len(turns) and turns[recent_start].role == "tool":
                     recent_start += 1
-        while recent_start > 0 and turns[recent_start].role not in ("user", "system"):
+        while 0 < recent_start < len(turns) and turns[recent_start].role not in ("user", "system"):
             recent_start -= 1
         if recent_start < len(turns) and turns[recent_start].role == "system":
             recent_start += 1

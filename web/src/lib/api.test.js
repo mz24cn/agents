@@ -237,3 +237,74 @@ describe('sessions.get', () => {
     await expect(sessions.get('some-id')).rejects.toThrow('Invalid conversation format')
   })
 })
+
+// ---------------------------------------------------------------------------
+// sessions.revoke — POST /v1/sessions/{sessionId}/revoke
+// ---------------------------------------------------------------------------
+
+describe('sessions.revoke', () => {
+  it('sends revoke request with forced false by default', async () => {
+    vi.stubGlobal('fetch', mockFetch({ status: 'success' }))
+
+    await sessions.revoke('session-1', '2026-05-13T10:00:00')
+
+    expect(fetch).toHaveBeenCalledOnce()
+    const [url, opts] = fetch.mock.calls[0]
+    expect(url).toBe('/v1/sessions/session-1/revoke')
+    expect(opts.method).toBe('POST')
+    expect(JSON.parse(opts.body)).toEqual({
+      session_id: 'session-1',
+      timestamp: '2026-05-13T10:00:00',
+      forced: false,
+      keep_files: false,
+    })
+  })
+
+  it('sends revoke request with forced true', async () => {
+    vi.stubGlobal('fetch', mockFetch({ status: 'success' }))
+
+    await sessions.revoke('session-1', '2026-05-13T10:00:00', { forced: true })
+
+    const [, opts] = fetch.mock.calls[0]
+    expect(JSON.parse(opts.body)).toEqual({
+      session_id: 'session-1',
+      timestamp: '2026-05-13T10:00:00',
+      forced: true,
+      keep_files: false,
+    })
+  })
+
+  it('sends revoke request with keep_files true', async () => {
+    vi.stubGlobal('fetch', mockFetch({ status: 'success' }))
+
+    await sessions.revoke('session-1', '2026-05-13T10:00:00', { keepFiles: true })
+
+    const [, opts] = fetch.mock.calls[0]
+    expect(JSON.parse(opts.body)).toEqual({
+      session_id: 'session-1',
+      timestamp: '2026-05-13T10:00:00',
+      forced: false,
+      keep_files: true,
+    })
+  })
+
+  it('preserves structured error metadata', async () => {
+    const errorData = {
+      error: 'JournalConflict',
+      message: 'Current files do not match journal after-state',
+      files: ['runtime/server.py'],
+      can_force: true,
+    }
+    vi.stubGlobal('fetch', mockFetch(errorData, 409))
+
+    try {
+      await sessions.revoke('session-1', '2026-05-13T10:00:00')
+      throw new Error('Expected revoke to fail')
+    } catch (err) {
+      expect(err.message).toBe('Current files do not match journal after-state')
+      expect(err.status).toBe(409)
+      expect(err.code).toBe('JournalConflict')
+      expect(err.data).toEqual(errorData)
+    }
+  })
+})

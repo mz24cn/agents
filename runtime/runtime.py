@@ -453,14 +453,22 @@ class Runtime:
     def _ensure_builtin_tools(self, tools: list) -> None:
         """Ensure built-in tools (bash, fetch) are registered and in the tools list.
 
+        Only bash and fetch are auto-enabled during skill progressive disclosure.
+        Other built-in tools (read_file, edit_file, etc.) are NOT added here;
+        they must be explicitly requested in tool_ids by the client.
+
         Lazily registers callables if missing, and appends ToolConfigs to the
         provided tools list if not already present. Does not overwrite existing
         tools that share the same tool_id (e.g. a user-registered fetch tool).
         """
-        from runtime.builtin_tools import BUILTIN_TOOLS, register_builtin_tools
-        if self._tool_registry.get_callable("bash") is None:
-            register_builtin_tools(self._tool_registry)
-        for bt_config, bt_fn in BUILTIN_TOOLS:
+        from runtime.builtin_tools import (
+            BASH_TOOL_CONFIG, FETCH_TOOL_CONFIG, _bash_execute, _fetch_url,
+        )
+        skill_builtin_tools = [
+            (BASH_TOOL_CONFIG, _bash_execute),
+            (FETCH_TOOL_CONFIG, _fetch_url),
+        ]
+        for bt_config, bt_fn in skill_builtin_tools:
             # Only register if no callable exists yet for this tool_id
             if self._tool_registry.get_callable(bt_config.tool_id) is None:
                 self._tool_registry.register(bt_config, callable_fn=bt_fn)

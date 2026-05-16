@@ -1,6 +1,16 @@
 <script>
   import { t } from '../lib/i18n.svelte.js'
-  let { open, title, onConfirm, onCancel } = $props()
+  let {
+    open,
+    title,
+    message = '',
+    confirmText = t('confirm'),
+    cancelText = t('cancel'),
+    customText = '',
+    onCustom = null,
+    onConfirm,
+    onCancel,
+  } = $props()
 </script>
 
 {#if open}
@@ -9,9 +19,15 @@
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div class="dialog" onclick={(e) => e.stopPropagation()} onkeydown={() => {}}>
       <h3 class="dialog-title">{title}</h3>
+      {#if message}
+        <p class="dialog-message">{message}</p>
+      {/if}
       <div class="dialog-actions">
-        <button class="btn btn-cancel" onclick={onCancel}>{t('cancel')}</button>
-        <button class="btn btn-confirm" onclick={onConfirm}>{t('confirm')}</button>
+        <button class="btn btn-cancel" onclick={onCancel}>{cancelText}</button>
+        {#if customText && onCustom}
+          <button class="btn btn-custom" onclick={onCustom}>{customText}</button>
+        {/if}
+        <button class="btn btn-confirm" onclick={onConfirm}>{confirmText}</button>
       </div>
     </div>
   </div>
@@ -43,6 +59,12 @@
     font-size: 1.1rem;
     color: var(--text);
   }
+  .dialog-message {
+    margin: -8px 0 20px 0;
+    color: var(--text-secondary);
+    line-height: 1.5;
+    white-space: pre-wrap;
+  }
   .dialog-actions {
     display: flex;
     justify-content: flex-end;
@@ -61,6 +83,14 @@
     border: 1px solid var(--border);
   }
   .btn-cancel:hover {
+    opacity: 0.8;
+  }
+  .btn-custom {
+    background: var(--bg-secondary);
+    color: var(--text);
+    border: 1px solid var(--border);
+  }
+  .btn-custom:hover {
     opacity: 0.8;
   }
   .btn-confirm {

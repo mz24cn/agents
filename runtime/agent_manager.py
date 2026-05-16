@@ -46,6 +46,7 @@ class AgentManager:
         system_prompt: str = "",
         myself_view: str = "",
         description: str = "",
+        group: str = "",
         avatar: str = "",
     ) -> dict:
         """Create a new agent."""
@@ -59,6 +60,7 @@ class AgentManager:
             "nickname": nickname,
             "myself_view": myself_view,
             "description": description,
+            "group": str(group or ""),
             "last_modified": datetime.datetime.now().isoformat(),
             "avatar": avatar,
         }
@@ -80,9 +82,12 @@ class AgentManager:
             return None
         agent = self._agents[agent_id]
         for key in ("model_id", "tool_ids", "template_id", "template_arguments",
-                     "system_prompt", "nickname", "myself_view", "description", "avatar"):
+                     "system_prompt", "nickname", "myself_view", "description", "group", "avatar"):
             if key in updates:
-                agent[key] = updates[key]
+                if key == "group":
+                    agent[key] = str(updates[key] or "")
+                else:
+                    agent[key] = updates[key]
         agent["last_modified"] = datetime.datetime.now().isoformat()
         self._save_to_disk(agent_id, agent)
         return agent
@@ -127,6 +132,7 @@ class AgentManager:
                         agent = json.load(f)
                         agent_id = agent.get("agent_id")
                         if agent_id:
+                            agent.setdefault("group", "")
                             self._agents[agent_id] = agent
                 except (json.JSONDecodeError, OSError):
                     pass
