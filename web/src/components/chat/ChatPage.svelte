@@ -15,15 +15,52 @@
   const STORAGE_MODEL_KEY = 'chat_selected_model'
   const STORAGE_TOOLS_KEY = 'chat_selected_tools'
 
-  let messages = $state([])
   let selectedModelId = $state(localStorage.getItem(STORAGE_MODEL_KEY) ?? '')
   let selectedToolIds = $state(JSON.parse(localStorage.getItem(STORAGE_TOOLS_KEY) ?? '[]'))
-  let isStreaming = $state(false)
   let errorMsg = $state('')
   let inputText = $state('')
-  let abortStream = $state(null)
-  let sessionId = $state(null)   // maintained for the lifetime of this chat session
+  let sessionId = $state(null)   // currently displayed session ID
+
+  // Per-session state store: each session's messages & streaming state live independently.
+  // Key = session ID (or '__new__' before backend assigns one).
+  // Stream callbacks write to their own key; switching sessions just changes which key is displayed.
+  let sessionStore = $state({})
+  let abortFunctions = {}  // sessionKey -> abort function (not reactive)
+  function storeKey(sid) { return sid || '__new__' }
+  let messages = $derived(sessionStore[storeKey(sessionId)]?.messages ?? [])
+  let isStreaming = $derived(sessionStore[storeKey(sessionId)]?.isStreaming ?? false)
+
   let revokeConflict = $state(null)
+
+  // Track whether the message list is scrolled to the bottom (used for mark-read logic)
+  let isAtBottom = $state(true)
+  // Set when a stream ends while user is NOT at the bottom; cleared once read
+  let needsRead = $state(false)
+  // Set when sessionRestore loads a session; triggers mark-read once auto-scroll reaches bottom
+  let sessionRestored = $state(false)
+
+  function handleScrollAtBottom(atBottom) {
+    isAtBottom = atBottom
+    // When user scrolls to the bottom and the session needs reading, mark it read
+    if (atBottom && needsRead) {
+      needsRead = false
+      markSessionRead(sessionId)
+    }
+  }
+
+  // When a session is restored and auto-scroll reaches bottom, mark it as read
+  $effect(() => {
+    if (sessionRestored && isAtBottom && sessionId) {
+      sessionRestored = false
+      markSessionRead(sessionId)
+    }
+  })
+
+  /** Mark the given session as read on the backend (fire-and-forget). */
+  function markSessionRead(sid) {
+    if (!sid) return
+    sessionsApi.markRead(sid).catch(() => {})
+  }
 
   // 提示词模板面板状态
   let templatePanelOpen = $state(false)
@@ -148,7 +185,15 @@
   }
 
   function _doSend(apiMessages, pendingUserMsg) {
-    isStreaming = true
+    // Each stream writes to its own sessionStore entry via keyRef.
+    // keyRef.key may change from '__new__' to the real session ID once the
+    // backend assigns one (onInit / first onStreamMsg with session_id).
+    const keyRef = { key: storeKey(sessionId) }
+    if (!sessionStore[keyRef.key]) {
+      sessionStore[keyRef.key] = { messages: [], isStreaming: false }
+    }
+    sessionStore[keyRef.key].isStreaming = true
+
     let aIdxRef = { value: -1 }
     const reqBody = { model_id: selectedModelId, tool_ids: selectedToolIds, messages: apiMessages, stream: true }
     if (selectedAgentId) {
@@ -160,10 +205,20 @@
       ? (apiMessages.find(m => m.role === 'user')?.content || null)
       : null
 
+    // 当后端分配了真正的 session_id 时，将 store 数据从临时 key 迁移过去
+    function migrateKey(newKey) {
+      if (keyRef.key !== newKey && sessionStore[keyRef.key]) {
+        sessionStore[newKey] = sessionStore[keyRef.key]
+        delete sessionStore[keyRef.key]
+        keyRef.key = newKey
+      }
+    }
+
     // 收到 init 事件后，才创建用户消息和助手占位消息
     const onInit = (initData) => {
       // 同步 sessionId
       if (initData.session_id) {
+        migrateKey(initData.session_id)
         sessionId = initData.session_id
         currentSession.sessionId = initData.session_id
       }
@@ -175,66 +230,80 @@
           newSessionCreated.title = initData.title
         }
       }
+      const store = sessionStore[keyRef.key]
+      if (!store) return
       // 创建用户消息（带服务端返回的时间戳）
       if (initData.user_message_timestamp) {
         const userMsg = { ...pendingUserMsg }
         userMsg.timestamp = initData.user_message_timestamp
-        messages = [...messages, userMsg]
+        store.messages = [...store.messages, userMsg]
       }
       // 创建空助手消息占位
       const assistantMsg = { role: 'assistant', content: '', thinking: null }
       if (selectedAgentId) {
         assistantMsg.assistant_id = selectedAgentId
       }
-      messages = [...messages, assistantMsg]
-      aIdxRef.value = messages.length - 1
+      store.messages = [...store.messages, assistantMsg]
+      aIdxRef.value = store.messages.length - 1
       // 继承 agent_nickname
-      const prevAgent = [...messages].reverse().find(m => m.role === 'assistant' && m.agent_nickname)
+      const prevAgent = [...store.messages].reverse().find(m => m.role === 'assistant' && m.agent_nickname)
       if (prevAgent) {
-        messages[aIdxRef.value].agent_nickname = prevAgent.agent_nickname
+        store.messages[aIdxRef.value] = { ...store.messages[aIdxRef.value], agent_nickname: prevAgent.agent_nickname }
+        store.messages = [...store.messages]  // trigger reactivity
       }
     }
 
-    abortStream = inferStream(
+    abortFunctions[keyRef.key] = inferStream(
       reqBody,
-      (msg) => onStreamMsg(msg, aIdxRef, pendingFirstUserMsg),
-      () => onStreamDone(),
-      (err) => onStreamErr(err),
+      (msg) => onStreamMsg(msg, aIdxRef, pendingFirstUserMsg, keyRef),
+      () => onStreamDone(keyRef),
+      (err) => onStreamErr(err, keyRef),
       onInit,
     )
   }
 
   function handleStop() {
-    if (abortStream) {
-      // 通知后端 set cancel_event，后端会发送中止消息并关闭连接
+    const key = storeKey(sessionId)
+    if (abortFunctions[key]) {
+      // 通知后端 set cancel_event，后端会发送终止消息并关闭连接
       if (sessionId) abortInferStream(sessionId)
-      // 不再主动中止前端连接，等待后端发送中止消息后自然关闭
-      abortStream = null
+      // 不再主动终止前端连接，等待后端发送终止消息后自然关闭
+      abortFunctions[key] = null
     }
   }
 
-  function onStreamMsg(msg, aIdxRef, pendingFirstUserMsg) {
+  function onStreamMsg(msg, aIdxRef, pendingFirstUserMsg, keyRef) {
     if (msg.session_id && !msg.role) {
+      // Migrate store key if backend assigns a new session ID mid-stream
+      if (keyRef.key !== msg.session_id && sessionStore[keyRef.key]) {
+        sessionStore[msg.session_id] = sessionStore[keyRef.key]
+        delete sessionStore[keyRef.key]
+        keyRef.key = msg.session_id
+      }
       sessionId = msg.session_id
       currentSession.sessionId = msg.session_id
-      // 通知 Sidebar 有新会话创建（仅当之前没有 sessionId 时才是新会话）
+      // 通知 Sidebar 有新会话创建（仅当之前没有 sessionId 时才视为新会话）
       if (!newSessionCreated.sessionId) {
         newSessionCreated.sessionId = msg.session_id
         newSessionCreated.firstUserMessage = pendingFirstUserMsg ?? null
       }
       return
     }
+    const store = sessionStore[keyRef.key]
+    if (!store) return  // session store was cleaned up
+    const msgs = store.messages
+
     if (msg.role === 'assistant') {
       if (aIdxRef.value === -1) {
-        aIdxRef.value = messages.length
+        aIdxRef.value = msgs.length
         // Inherit agent_nickname from the previous assistant message (if any)
-        const prevAgent = [...messages].reverse().find(m => m.role === 'assistant' && m.agent_nickname)
+        const prevAgent = [...msgs].reverse().find(m => m.role === 'assistant' && m.agent_nickname)
         // 首次帧：直接展开 msg 的所有字段（含 content/thinking/tool_calls 等），无需增量拼接
-        messages = [...messages, { role: 'assistant', content: '', thinking: null, agent_nickname: prevAgent?.agent_nickname, ...msg }]
+        store.messages = [...msgs, { role: 'assistant', content: '', thinking: null, agent_nickname: prevAgent?.agent_nickname, ...msg }]
         return  // 首次创建已完成所有字段的设置，跳过后续合并逻辑
       }
       // 后续帧：增量追加 content 和 thinking
-      let u = [...messages]
+      let u = [...msgs]
       const aIdx = aIdxRef.value
       if (!u[aIdx]) return
       // 仅合并非内容元数据字段（role, timestamp 等），
@@ -245,24 +314,24 @@
       if (msg.thinking) newMsg.thinking = (u[aIdx].thinking || '') + msg.thinking
       if (msg.tool_calls) newMsg.tool_calls = [...(u[aIdx].tool_calls || []), ...msg.tool_calls]
       u[aIdx] = newMsg
-      messages = u
+      store.messages = u
     } else if (msg.role === 'tool') {
       if (msg.streaming === true) {
         // delegate 流式增量帧：找到对应 tool_call_id 的已有工具消息，追加 delta
         const delta = msg.delta || ''
         const tcId = msg.tool_call_id
         const existingIdx = tcId
-          ? messages.findLastIndex(m => m.role === 'tool' && m.tool_call_id === tcId)
+          ? msgs.findLastIndex(m => m.role === 'tool' && m.tool_call_id === tcId)
           : -1
         if (existingIdx >= 0) {
-          const arr = [...messages]
+          const arr = [...msgs]
           const newMsg = { ...arr[existingIdx], ...msg }
           newMsg.content = (arr[existingIdx].content || '') + delta
           arr[existingIdx] = newMsg
-          messages = arr
+          store.messages = arr
         } else {
           // 第一帧：创建新的工具消息占位
-          messages = [...messages, {
+          store.messages = [...msgs, {
             role: 'tool',
             name: msg.name || '',
             content: delta,
@@ -276,25 +345,25 @@
         // delegate 结束帧：标记流式消息框已完成
         const tcId = msg.tool_call_id
         const existingIdx = tcId
-          ? messages.findLastIndex(m => m.role === 'tool' && m.tool_call_id === tcId)
+          ? msgs.findLastIndex(m => m.role === 'tool' && m.tool_call_id === tcId)
           : -1
         if (existingIdx >= 0) {
-          const arr = [...messages]
-          // 只更新 streaming 状态，不覆盖 content（内容已通过流式增量帧完整推送）
+          const arr = [...msgs]
+          // 只更新 streaming 状态，不覆盖内容（内容已通过流式增量帧完整推送）
           const newMsg = { ...arr[existingIdx], ...msg, streaming: false }
           // 如果结束帧携带了 content（非空），才更新
           if (msg.content) {
             newMsg.content = msg.content
           }
           arr[existingIdx] = newMsg
-          messages = arr
+          store.messages = arr
         } else if (msg.content) {
-          messages = [...messages, { role: 'tool', ...msg }]
+          store.messages = [...msgs, { role: 'tool', ...msg }]
         }
         aIdxRef.value = -1
       } else {
         // 普通工具结果帧（bash、fetch 等）
-        messages = [...messages, { role: 'tool', ...msg }]
+        store.messages = [...msgs, { role: 'tool', ...msg }]
         aIdxRef.value = -1
       }
     } else if (msg.role === 'system') {
@@ -302,38 +371,65 @@
     } else if (msg.role === 'usage') {
       try {
         const s = JSON.parse(msg.content || '{}')
-        const lastAIdx = messages.map((m, i) => m.role === 'assistant' ? i : -1).filter(i => i >= 0).pop()
+        const lastAIdx = msgs.map((m, i) => m.role === 'assistant' ? i : -1).filter(i => i >= 0).pop()
         if (lastAIdx !== undefined) {
-          const arr = [...messages]
+          const arr = [...msgs]
           arr[lastAIdx] = { ...arr[lastAIdx], stat: s }
-          messages = arr
+          store.messages = arr
         }
       } catch (_) {}
     }
   }
 
-  function onStreamDone() {
-    isStreaming = false
-    abortStream = null
-    if (messages.length > 0) {
-      const last = messages[messages.length - 1]
-      if (last.role === 'assistant' && !last.content && !last.thinking && !last.tool_calls) {
-        messages = messages.slice(0, -1)
+  function onStreamDone(keyRef) {
+    const store = sessionStore[keyRef.key]
+    if (store) {
+      store.isStreaming = false
+      if (store.messages.length > 0) {
+        const last = store.messages[store.messages.length - 1]
+        if (last.role === 'assistant' && !last.content && !last.thinking && !last.tool_calls) {
+          store.messages = store.messages.slice(0, -1)
+        }
+      }
+    }
+    abortFunctions[keyRef.key] = null
+    // If the stream that just finished belongs to the currently viewed session:
+    // - at bottom → mark read immediately
+    // - not at bottom → set needsRead so it gets marked when user scrolls down
+    if (keyRef.key === sessionId) {
+      if (isAtBottom) {
+        markSessionRead(sessionId)
+      } else {
+        needsRead = true
       }
     }
   }
 
-  function onStreamErr(err) {
-    isStreaming = false
-    abortStream = null
+  function onStreamErr(err, keyRef) {
+    const store = sessionStore[keyRef.key]
+    if (store) store.isStreaming = false
+    abortFunctions[keyRef.key] = null
     errorMsg = err?.message || t('streamError')
+    // If the errored stream belongs to the currently viewed session:
+    // - at bottom → mark read immediately
+    // - not at bottom → set needsRead so it gets marked when user scrolls down
+    if (keyRef.key === sessionId) {
+      if (isAtBottom) {
+        markSessionRead(sessionId)
+      } else {
+        needsRead = true
+      }
+    }
   }
 
   function applyRevokeSuccess(timestamp) {
-    const revokeIndex = messages.findIndex(m => m.timestamp === timestamp)
-    const revokedMessage = revokeIndex >= 0 ? messages[revokeIndex] : null
+    const key = storeKey(sessionId)
+    const store = sessionStore[key]
+    if (!store) return
+    const revokeIndex = store.messages.findIndex(m => m.timestamp === timestamp)
+    const revokedMessage = revokeIndex >= 0 ? store.messages[revokeIndex] : null
     if (revokeIndex >= 0) {
-      messages = messages.slice(0, revokeIndex)
+      store.messages = store.messages.slice(0, revokeIndex)
     }
     if (revokedMessage?.content) {
       inputText = revokedMessage.content
@@ -400,10 +496,16 @@
     if (sessionRestore.pending) {
       const { sessionId: sid, messages: msgs, meta } = sessionRestore.pending
       sessionRestore.pending = null
-      messages = msgs
+      // If the target session is not currently streaming, use fresh backend data.
+      // If it IS streaming, keep the live data — don't overwrite with stale backend data.
+      if (!sessionStore[sid]?.isStreaming) {
+        sessionStore[sid] = { messages: msgs, isStreaming: false }
+      }
       sessionId = sid
       currentSession.sessionId = sid
       errorMsg = ''
+      needsRead = false
+      sessionRestored = true
       
       // 优先使用 meta 中的设置（向下兼容：旧会话可能没有 meta）
       if (meta) {
@@ -443,7 +545,11 @@
     const deletedSid = sessionDeleted.sessionId
     if (deletedSid) {
       sessionDeleted.sessionId = null
-      messages = []
+      // Abort any active stream for the deleted session
+      if (abortFunctions[deletedSid]) {
+        abortFunctions[deletedSid] = null
+      }
+      delete sessionStore[deletedSid]
       errorMsg = ''
       sessionId = null
     }
@@ -600,7 +706,7 @@
   />
 
   <div class="message-area">
-    <MessageList {messages} {agentList} onRevoke={handleRevoke} />
+    <MessageList {messages} {agentList} onRevoke={handleRevoke} onScrollAtBottom={handleScrollAtBottom} />
 
     {#if templatePanelOpen}
       <div class="template-panel">
@@ -664,7 +770,7 @@
     onOpenTemplatePanel={openTemplatePanel}
     {isStreaming}
     bind:text={inputText}
-    onNewSession={() => { messages = []; errorMsg = ''; sessionId = null; currentSession.sessionId = null }}
+    onNewSession={() => { delete sessionStore['__new__']; errorMsg = ''; sessionId = null; currentSession.sessionId = null }}
     hasMessages={messages.length > 0}
   />
 </div>

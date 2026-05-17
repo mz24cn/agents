@@ -1,8 +1,9 @@
 <script>
+  import { onMount, onDestroy } from 'svelte'
   import { router, navigate } from '../lib/router.svelte.js'
   import ThemeToggle from './ThemeToggle.svelte'
   import { t, i18n, setLang } from '../lib/i18n.svelte.js'
-  import { sessions } from '../lib/api.js'
+  import { sessions, subscribeSessionEvents } from '../lib/api.js'
   import { sessionRestore, newSessionCreated, sessionDeleted, currentSession } from '../lib/session-state.svelte.js'
   import { sidebarWidth, setSidebarWidth, toggleSidebarCollapsed, collapseSidebar, SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH } from '../lib/sidebar-width.svelte.js'
 
@@ -27,6 +28,66 @@
   // footer 高度，用于对齐 fixed 按钮
   let footerEl = $state(null)
   let footerHeight = $derived(footerEl ? footerEl.offsetHeight : 49)
+
+  // --- Session Status Stream ---
+  // Maps session_id -> status string from SSE events
+  let sessionStatuses = $state({})
+
+  function _applyStatusToSessionList(sid, status) {
+    sessionStatuses[sid] = status
+    // Also update status field in sessionList so template reactivity works
+    sessionList = sessionList.map(s =>
+      s.session_id === sid ? { ...s, _status: status } : s
+    )
+  }
+
+  let _unsubscribeSessionEvents = null
+
+  onMount(() => {
+    _unsubscribeSessionEvents = subscribeSessionEvents(
+      (data) => {
+        if (data.event === 'init') {
+          // Merge all statuses from init snapshot
+          const sids = data.sessions || {}
+          for (const [sid, status] of Object.entries(sids)) {
+            _applyStatusToSessionList(sid, status)
+          }
+        } else if (data.event === 'message') {
+          _applyStatusToSessionList(data.session_id, data.status)
+        } else if (data.event === 'title_update') {
+          const sid = data.session_id
+          const newTitle = data.title
+          if (sid && newTitle) {
+            sessionList = sessionList.map(s =>
+              s.session_id === sid ? { ...s, title: newTitle } : s
+            )
+          }
+        }
+      },
+      (_err) => {
+        // SSE error — silently ignore; no automatic reconnect per spec
+      },
+    )
+  })
+
+  onDestroy(() => {
+    if (_unsubscribeSessionEvents) {
+      _unsubscribeSessionEvents()
+      _unsubscribeSessionEvents = null
+    }
+  })
+
+  /**
+   * Derive a CSS class string for a session row based on its status.
+   * Combines status with active state.
+   */
+  function getSessionStatusClass(entry) {
+    const status = entry._status || sessionStatuses[entry.session_id] || ''
+    if (status === 'streaming') return 'status-streaming'
+    if (status === 'done_success_unread') return 'status-done-success-unread'
+    if (status === 'done_error_unread') return 'status-done-error-unread'
+    return ''
+  }
 
   async function loadSessions() {
     sessionLoading = true
@@ -326,7 +387,7 @@
             ontouchend={(e) => handleRowTouchEnd(e, entry.session_id)}
           >
             <button
-              class="session-item"
+              class="session-item {getSessionStatusClass(entry)}"
               class:active={entry.session_id === currentSession.sessionId}
               onclick={() => handleSessionClick(entry.session_id)}
               ontouchend={(e) => { e.preventDefault(); handleSessionClick(entry.session_id) }}
@@ -567,6 +628,19 @@
   }
   .session-item.active {
     font-weight: 700;
+  }
+  /* Session Status Stream indicator styles */
+  .session-item.status-streaming {
+    color: var(--warning);
+    font-style: italic;
+  }
+  .session-item.status-done-success-unread {
+    color: var(--success);
+    font-weight: 600;
+  }
+  .session-item.status-done-error-unread {
+    color: var(--danger, #e53e3e);
+    font-weight: 600;
   }
   .session-menu-btn {
     position: absolute;

@@ -10,6 +10,7 @@
   --danger: #e53e3e;
   --danger-hover: #c53030;
   --success: #38a169;
+  --warning: #e67e22;
 }
 
 :root[data-theme="dark"] {
@@ -23,6 +24,7 @@
   --danger: #fc8181;
   --danger-hover: #feb2b2;
   --success: #68d391;
+  --warning: #f0a050;
 }
 
 /* ===== Base Styles ===== */

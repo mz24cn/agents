@@ -2,7 +2,7 @@
   import MessageBubble from './MessageBubble.svelte'
   import { t } from '../../lib/i18n.svelte.js'
 
-  let { messages = [], agentList = [], onRevoke } = $props()
+  let { messages = [], agentList = [], onRevoke, onScrollAtBottom } = $props()
   let listEl = $state(null)
   let isAtBottom = $state(true)
 
@@ -10,6 +10,7 @@
     if (!listEl) return
     const threshold = 100
     isAtBottom = listEl.scrollHeight - listEl.scrollTop - listEl.clientHeight < threshold
+    if (onScrollAtBottom) onScrollAtBottom(isAtBottom)
   }
 
   $effect(() => {

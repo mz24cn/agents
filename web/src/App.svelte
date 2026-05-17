@@ -10,24 +10,27 @@
   import SetupPage from './components/setup/SetupPage.svelte'
 
   let currentPath = $derived(parseRoute().path)
+  let isChatActive = $derived(currentPath === '#/chat' || !['#/models', '#/tools', '#/prompts', '#/agents', '#/env', '#/setup'].includes(currentPath))
 </script>
 
 <Layout>
-  {#if currentPath === '#/chat'}
+  <!-- ChatPage 始终挂载，通过 CSS 显隐，确保页面切换不影响流式推理 -->
+  <div style="display: {isChatActive ? 'contents' : 'none'}">
     <ChatPage />
-  {:else if currentPath === '#/models'}
-    <ModelsPage />
-  {:else if currentPath === '#/tools'}
-    <ToolsPage />
-  {:else if currentPath === '#/prompts'}
-    <PromptsPage />
-  {:else if currentPath === '#/agents'}
-    <AgentsPage />
-  {:else if currentPath === '#/env'}
-    <EnvPage />
-  {:else if currentPath === '#/setup'}
-    <SetupPage />
-  {:else}
-    <ChatPage />
+  </div>
+  {#if !isChatActive}
+    {#if currentPath === '#/models'}
+      <ModelsPage />
+    {:else if currentPath === '#/tools'}
+      <ToolsPage />
+    {:else if currentPath === '#/prompts'}
+      <PromptsPage />
+    {:else if currentPath === '#/agents'}
+      <AgentsPage />
+    {:else if currentPath === '#/env'}
+      <EnvPage />
+    {:else if currentPath === '#/setup'}
+      <SetupPage />
+    {/if}
   {/if}
 </Layout>

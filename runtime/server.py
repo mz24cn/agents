@@ -279,6 +279,66 @@ _PROMPT_TEMPLATES_PATH = os.path.join(_DATA_DIR, "prompt_templates.json")
 _ENV_PATH = os.path.join(_DATA_DIR, "env.json")
 _AGENTS_DIR = os.path.join(_DATA_DIR, "agents")
 
+# ---------------------------------------------------------------------------
+# Session Status Stream – in-memory state
+# ---------------------------------------------------------------------------
+# Set of session_ids that are currently streaming (registered/cancelled per request).
+# Maps session_id -> status string: "streaming" | "done_success_unread" | "done_error_unread"
+# "idle" state means session is neither active nor unread (i.e. viewed or just completed-and-read).
+_session_statuses: dict[str, str] = {}
+# Set of session_ids that have completed but whose result has not been "viewed" yet.
+# Entries are status strings: "done_success_unread" or "done_error_unread".
+_unread_sessions: dict[str, str] = {}
+# List of subscriber callbacks for session-event SSE connections.
+# Each entry is a callable(data: dict) -> bool; returns False if write failed (caller removes).
+_session_event_subscribers: list = []
+# Lock protecting all the above shared state.
+_session_state_lock = threading.Lock()
+
+
+def _broadcast_session_status(session_id: str, status: str) -> None:
+    """Broadcast a session status change to all SSE subscribers.
+
+    Called with _session_state_lock held (or outside if safe).  Here we
+    iterate a *snapshot* of the subscriber list so we can safely remove
+    dead entries without holding the lock during I/O.
+    """
+    _broadcast_session_event(session_id, "message", {"status": status})
+
+
+def _broadcast_session_event(session_id: str, event_type: str, data: dict) -> None:
+    """Broadcast an arbitrary session event to all SSE subscribers.
+
+    Args:
+        session_id: The session this event belongs to.
+        event_type: Event type string (e.g. 'message', 'title_update').
+        data: Extra key-value pairs merged into the event payload.
+    """
+    payload = {"event": event_type, "session_id": session_id, **data}
+    event_payload = json.dumps(payload, ensure_ascii=False)
+    frame = f"data: {event_payload}\n\n"
+
+    # Take snapshot of subscriber list under lock
+    with _session_state_lock:
+        subscribers_snapshot = list(_session_event_subscribers)
+
+    dead: list = []
+    for send_fn in subscribers_snapshot:
+        try:
+            ok = send_fn(frame)
+            if ok is False:
+                dead.append(send_fn)
+        except Exception:
+            dead.append(send_fn)
+
+    if dead:
+        with _session_state_lock:
+            for fn in dead:
+                try:
+                    _session_event_subscribers.remove(fn)
+                except ValueError:
+                    pass
+
 
 class _RuntimeRequestHandler(BaseHTTPRequestHandler):
     """HTTP request handler that routes requests to the Runtime instance.
@@ -364,6 +424,8 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self._handle_get_env()
         elif path == "/v1/sessions":
             self._handle_list_sessions()
+        elif path == "/v1/sessions/events":
+            self._handle_sessions_events()
         elif re.match(r"^/v1/sessions/[^/]+$", path):
             session_id = path[len("/v1/sessions/"):]
             self._handle_get_session(session_id)
@@ -448,6 +510,10 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             # POST /v1/sessions/{session_id}/generate-title
             session_id = path[len("/v1/sessions/"):-len("/generate-title")]
             self._handle_generate_session_title(urllib.parse.unquote(session_id))
+        elif re.match(r"^/v1/sessions/[^/]+/read$", path):
+            # POST /v1/sessions/{session_id}/read
+            session_id = path[len("/v1/sessions/"):-len("/read")]
+            self._handle_mark_session_read(urllib.parse.unquote(session_id))
         elif re.match(r"^/v1/sessions/[^/]+/revoke$", path):
             # POST /v1/sessions/{session_id}/revoke
             session_id = path[len("/v1/sessions/"):-len("/revoke")]
@@ -940,6 +1006,22 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         if active_streams is not None and session_id is not None:
             active_streams[session_id] = cancel_event
 
+        # --- Session Status Stream: broadcast "streaming" ---
+        if session_id is not None:
+            with _session_state_lock:
+                _session_statuses[session_id] = "streaming"
+                _unread_sessions.pop(session_id, None)
+            _broadcast_session_status(session_id, "streaming")
+
+        # --- Pre-inference persistence: save user message so conversation.json exists ---
+        if use_session:
+            pre_exc = self._persist_conversation(
+                context_manager, session_id, original_messages, [],
+                agent_id, agent_nickname, model_id, tool_ids,
+            )
+            if pre_exc is not None:
+                logger.error("infer_stream: failed to pre-persist conversation for session %s: %s", session_id, pre_exc)
+
         try:
             for msg in runtime.infer_stream(request, cancel_event=cancel_event):
                 collected_messages.append(msg)
@@ -962,22 +1044,38 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self.wfile.flush()
 
             if use_session:
-                persist_exc = self._persist_conversation(context_manager, session_id, original_messages, collected_messages, agent_id, agent_nickname, model_id, tool_ids)
+                # original_messages already saved in pre-inference step, pass [] to avoid duplication
+                persist_exc = self._persist_conversation(context_manager, session_id, [], collected_messages, agent_id, agent_nickname, model_id, tool_ids)
                 if persist_exc is not None:
                     logger.error("infer_stream: failed to save conversation for session %s: %s", session_id, persist_exc)
+
+            # --- Session Status Stream: broadcast "done_success_unread" ---
+            if session_id is not None:
+                with _session_state_lock:
+                    _session_statuses[session_id] = "done_success_unread"
+                    _unread_sessions[session_id] = "done_success_unread"
+                _broadcast_session_status(session_id, "done_success_unread")
         except (BrokenPipeError, ConnectionResetError):
             cancel_event.set()
             if use_session:
                 import datetime as _dt
                 collected_messages.append(Message(role="assistant", timestamp=_dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"), content="\n\nError: user interrupted."))
-                persist_exc = self._persist_conversation(context_manager, session_id, original_messages, collected_messages, agent_id, agent_nickname, model_id, tool_ids)
+                # original_messages already saved in pre-inference step, pass [] to avoid duplication
+                persist_exc = self._persist_conversation(context_manager, session_id, [], collected_messages, agent_id, agent_nickname, model_id, tool_ids)
                 if persist_exc is not None:
                     logger.error("infer_stream: failed to save aborted conversation for session %s: %s", session_id, persist_exc)
+            # --- Session Status Stream: broadcast "done_error_unread" ---
+            if session_id is not None:
+                with _session_state_lock:
+                    _session_statuses[session_id] = "done_error_unread"
+                    _unread_sessions[session_id] = "done_error_unread"
+                _broadcast_session_status(session_id, "done_error_unread")
         except Exception as exc:
             if use_session:
                 import datetime as _dt
                 collected_messages.append(Message(role="assistant", timestamp=_dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"), content=f"\n\nError: system aborted. ({exc})"))
-                persist_exc = self._persist_conversation(context_manager, session_id, original_messages, collected_messages, agent_id, agent_nickname, model_id, tool_ids)
+                # original_messages already saved in pre-inference step, pass [] to avoid duplication
+                persist_exc = self._persist_conversation(context_manager, session_id, [], collected_messages, agent_id, agent_nickname, model_id, tool_ids)
                 if persist_exc is not None:
                     logger.error("infer_stream: failed to save aborted conversation for session %s: %s", session_id, persist_exc)
             try:
@@ -986,6 +1084,12 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             except Exception:
                 pass
+            # --- Session Status Stream: broadcast "done_error_unread" ---
+            if session_id is not None:
+                with _session_state_lock:
+                    _session_statuses[session_id] = "done_error_unread"
+                    _unread_sessions[session_id] = "done_error_unread"
+                _broadcast_session_status(session_id, "done_error_unread")
         finally:
             # 注销 active_streams 中的 cancel_event
             if active_streams is not None and session_id is not None:
@@ -1618,6 +1722,78 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
     # Session handlers
     # ------------------------------------------------------------------
 
+    def _handle_sessions_events(self) -> None:
+        """GET /v1/sessions/events — SSE endpoint for session status changes.
+
+        On connect:
+          1. Send an `init` event containing the current snapshot of all
+             active (streaming) sessions and all unread sessions combined.
+          2. Subsequently send `message` events for every status change.
+
+        No heartbeat. Write failure removes the subscriber.
+        """
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        # Build snapshot under lock
+        with _session_state_lock:
+            snapshot: dict[str, str] = {}
+            # Active / streaming sessions
+            for sid, st in _session_statuses.items():
+                snapshot[sid] = st
+            # Unread sessions (may overlap with active – prefer active)
+            for sid, st in _unread_sessions.items():
+                if sid not in snapshot:
+                    snapshot[sid] = st
+
+        # Send init event
+        init_payload = json.dumps({
+            "event": "init",
+            "sessions": snapshot,
+        }, ensure_ascii=False)
+        try:
+            self.wfile.write(f"data: {init_payload}\n\n".encode("utf-8"))
+            self.wfile.flush()
+        except Exception:
+            return
+
+        # Register this connection's write function
+        import queue as _queue
+        event_q: _queue.Queue = _queue.Queue()
+
+        def _send(frame: str) -> bool:
+            """Enqueue a frame. Returns False only if the queue is full (shouldn't happen)."""
+            try:
+                event_q.put_nowait(frame)
+                return True
+            except _queue.Full:
+                return False
+
+        with _session_state_lock:
+            _session_event_subscribers.append(_send)
+
+        try:
+            while True:
+                try:
+                    frame = event_q.get(timeout=30)  # block up to 30s
+                except _queue.Empty:
+                    # No events for 30s — just loop; no heartbeat per spec
+                    continue
+                try:
+                    self.wfile.write(frame.encode("utf-8") if isinstance(frame, str) else frame)
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    break
+        finally:
+            with _session_state_lock:
+                try:
+                    _session_event_subscribers.remove(_send)
+                except ValueError:
+                    pass
+
     def _handle_list_sessions(self) -> None:
         """GET /v1/sessions — 返回所有历史会话列表。"""
         session_manager = self.server.session_manager  # type: ignore[attr-defined]
@@ -1625,7 +1801,11 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         self._send_json_response(200, {"sessions": sessions})
 
     def _handle_get_session(self, session_id: str) -> None:
-        """GET /v1/sessions/{session_id} — 返回指定会话的完整消息记录。"""
+        """GET /v1/sessions/{session_id} — 返回指定会话的完整消息记录。
+
+        成功返回后实现"查看即已读"：如果该 session 处于 unread 状态，
+        清除 unread 并广播 idle。
+        """
         session_manager = self.server.session_manager  # type: ignore[attr-defined]
         try:
             data = session_manager.get_session(session_id)
@@ -1638,6 +1818,18 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self._send_json_error(400, f"Invalid conversation format: {exc}")
             return
         self._send_json_response(200, data)
+
+    def _handle_mark_session_read(self, session_id: str) -> None:
+        """POST /v1/sessions/{session_id}/read — 将指定会话标记为已读。"""
+        was_unread = False
+        with _session_state_lock:
+            if session_id in _unread_sessions:
+                del _unread_sessions[session_id]
+                _session_statuses[session_id] = "idle"
+                was_unread = True
+        if was_unread:
+            _broadcast_session_status(session_id, "idle")
+        self._send_json_response(200, {"ok": True})
 
     def _handle_delete_session(self, session_id: str) -> None:
         """DELETE /v1/sessions/{session_id} — 删除指定会话目录。"""
@@ -1889,6 +2081,7 @@ class RuntimeHTTPServer:
         self._session_manager = SessionManager(
             chats_dir=chats_dir if chats_dir is not None else os.path.join(_DATA_DIR, "chat_data"),
             infer_fn=self._runtime.infer,
+            broadcast_fn=_broadcast_session_event,
         )
         # Log Phase 2 configuration status
         _summary_model = os.environ.get("SUMMARY_MODEL_ID", "")

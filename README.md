@@ -28,6 +28,7 @@ A minimal, zero-dependency composable agent runtime engine built with pure Pytho
 - **Web UI management console** — Svelte 5 SPA for managing models, tools, prompt templates, agents, and chat
 - **HTTP API server** — lightweight REST API built on `http.server`, no FastAPI/uvicorn needed
 - **Multimodal** — supports image (base64) and audio inputs for VLM models
+- **Multi-task concurrent conversations with real-time status tracking** — support multiple simultaneous chat sessions with independent streaming states; real-time session status updates via SSE (streaming, success, error, unread); automatic read status management based on user scroll position; session title broadcasting
 
 ### Architecture
 
@@ -276,8 +277,10 @@ python app.py 0.0.0.0:9000 # custom host and port
 | POST | `/v1/env/detect` | Auto-detect environment variables |
 | DELETE | `/v1/env/{key}` | Delete environment variable |
 | GET | `/v1/sessions` | List all sessions |
+| GET | `/v1/sessions/events` | SSE endpoint for real-time session status updates |
 | GET | `/v1/sessions/{session_id}` | Get session details |
 | DELETE | `/v1/sessions/{session_id}` | Delete session |
+| POST | `/v1/sessions/{session_id}/read` | Mark session as read |
 | GET | `/v1/agents` | List all agents |
 | GET | `/v1/agents/{agent_id}` | Get a single agent |
 | POST | `/v1/agents` | Create an agent |
@@ -318,6 +321,9 @@ The built files in `web/dist/` are automatically served by the HTTP server at th
 
 Features:
 - Chat with model selection, tool selection, prompt template support, and agent selection
+- Multi-task concurrent conversations — each session maintains independent streaming state; switching sessions doesn't interrupt active streams
+- Real-time session status indicators in sidebar (streaming, success-unread, error-unread) via SSE
+- Automatic read status management — marks session as read when user scrolls to bottom
 - Model management (CRUD) — copy an existing model config to quickly create a new one
 - Tool management (CRUD)
 - Prompt template management with `{{placeholder}}` variable support
@@ -419,6 +425,7 @@ MIT License — see [LICENSE](LICENSE)
 - **Web UI 管理控制台** — Svelte 5 SPA，支持模型、工具、提示词模板、智能体管理和对话
 - **HTTP API 服务** — 基于 `http.server` 的轻量 REST API，无需 FastAPI/uvicorn
 - **多模态** — 支持图片（base64）和音频输入，适配 VLM 模型
+- **多任务并发对话及实时状态跟踪** — 支持多个聊天会话同时进行，每个会话独立管理流式状态；通过SSE实时更新会话状态（流式中、成功、错误、未读）；基于用户滚动位置自动管理已读状态；会话标题实时广播更新
 
 ### 架构
 
@@ -665,8 +672,10 @@ python app.py 0.0.0.0:9000 # 自定义主机和端口
 | POST | `/v1/env/detect` | 自动检测环境变量 |
 | DELETE | `/v1/env/{key}` | 删除环境变量 |
 | GET | `/v1/sessions` | 列出所有会话 |
+| GET | `/v1/sessions/events` | SSE端点，实时推送会话状态更新 |
 | GET | `/v1/sessions/{session_id}` | 获取会话详情 |
 | DELETE | `/v1/sessions/{session_id}` | 删除会话 |
+| POST | `/v1/sessions/{session_id}/read` | 标记会话为已读 |
 | GET | `/v1/agents` | 列出所有智能体 |
 | GET | `/v1/agents/{agent_id}` | 获取单个智能体 |
 | POST | `/v1/agents` | 创建智能体 |
@@ -707,6 +716,9 @@ npm run build
 
 功能包括：
 - 对话页面：模型选择、工具选择、提示词模板（支持 `{{占位符}}` 变量）、智能体选择
+- 多任务并发对话 — 每个会话独立维护流式状态，切换会话不影响正在进行的推理
+- 侧边栏实时会话状态指示（流式中、成功未读、错误未读），通过SSE推送
+- 自动已读状态管理 — 用户滚动到底部时自动标记会话为已读
 - 模型管理（增删改查）— 支持复制现有模型配置，快速创建新模型
 - 工具管理（增删改查）
 - 提示词模板管理

@@ -1079,7 +1079,9 @@ class ContextManager:
         """
         session_id = datetime.datetime.now().strftime("%y%m%d_%H%M%S")
         session_dir = os.path.join(self._chats_dir, session_id)
-        os.makedirs(session_dir, exist_ok=True)
+        if os.path.exists(session_dir):
+            raise OSError(f"Session directory already exists: {session_dir}")
+        os.makedirs(session_dir)
         return session_id
 
     def session_exists(self, session_id: str) -> bool:

@@ -24,9 +24,11 @@ class SessionManager:
         infer_fn: 可选的推理函数，用于生成会话标题。
     """
 
-    def __init__(self, chats_dir: str, infer_fn: Optional[Callable] = None) -> None:
+    def __init__(self, chats_dir: str, infer_fn: Optional[Callable] = None,
+                 broadcast_fn: Optional[Callable] = None) -> None:
         self._chats_dir = chats_dir
         self._infer_fn = infer_fn
+        self._broadcast_fn = broadcast_fn
 
     # ------------------------------------------------------------------
     # 内部属性
@@ -263,6 +265,9 @@ class SessionManager:
                 index[session_id]["title"] = title
                 self._write_index(index)
                 logger.info("generate_title: 成功生成标题 (session=%s): %s", session_id, title)
+                # 广播标题更新事件
+                if self._broadcast_fn:
+                    self._broadcast_fn(session_id, "title_update", {"title": title})
                 return title
             return None
         except Exception as exc:

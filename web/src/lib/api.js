@@ -193,6 +193,71 @@ export const sessions = {
   delete:        (sessionId)     => request('DELETE', `/v1/sessions/${encodeURIComponent(sessionId)}`),
   generateTitle: (sessionId)     => request('POST',   `/v1/sessions/${encodeURIComponent(sessionId)}/generate-title`),
   revoke:        (sessionId, timestamp, { forced = false, keepFiles = false } = {}) => request('POST', `/v1/sessions/${encodeURIComponent(sessionId)}/revoke`, { session_id: sessionId, timestamp, forced, keep_files: keepFiles }),
+  markRead:      (sessionId)     => request('POST',   `/v1/sessions/${encodeURIComponent(sessionId)}/read`),
+}
+
+/**
+ * Subscribe to session status events via SSE (GET /v1/sessions/events).
+ *
+ * @param {function} onEvent  Called with each parsed event object:
+ *   - init:         { event: 'init', sessions: { <sid>: <status>, ... } }
+ *   - message:      { event: 'message', session_id: '<sid>', status: '<status>' }
+ *   - title_update: { event: 'title_update', session_id: '<sid>', title: '<title>' }
+ * @param {function} onError  Called on fetch or stream errors (except AbortError).
+ * @returns {function}        Call to close/abort the SSE connection.
+ */
+export function subscribeSessionEvents(onEvent, onError) {
+  const controller = new AbortController()
+
+  fetch('/v1/sessions/events', {
+    signal: controller.signal,
+  })
+    .then((res) => {
+      if (!res.ok) {
+        throw new Error(`Session events request failed: ${res.status}`)
+      }
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      function pump() {
+        reader.read().then(({ done, value }) => {
+          if (done) {
+            // Stream closed cleanly — reconnect is left to the caller
+            return
+          }
+          buffer += decoder.decode(value, { stream: true })
+          const lines = buffer.split('\n')
+          buffer = lines.pop() || ''
+          for (const line of lines) {
+            const trimmed = line.trim()
+            if (trimmed.startsWith('data: ')) {
+              const payload = trimmed.slice(6).trim()
+              try {
+                const data = JSON.parse(payload)
+                onEvent(data)
+              } catch {
+                // skip malformed JSON
+              }
+            }
+          }
+          pump()
+        }).catch((err) => {
+          if (err.name !== 'AbortError') {
+            onError(err)
+          }
+        })
+      }
+
+      pump()
+    })
+    .catch((err) => {
+      if (err.name !== 'AbortError') {
+        onError(err)
+      }
+    })
+
+  return () => controller.abort()
 }
 
 /** 智能体 API */
