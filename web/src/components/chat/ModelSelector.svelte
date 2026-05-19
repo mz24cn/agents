@@ -1,36 +1,27 @@
 <script>
-  import { models } from '../../lib/api.js'
+  import { catalog, loadModels } from '../../lib/catalog-state.svelte.js'
   import { t } from '../../lib/i18n.svelte.js'
 
   let { selectedModelId = $bindable(''), onchange, disabled = false } = $props()
 
-  let modelList = $state([])
-  let loading = $state(true)
-  let error = $state('')
-
-  async function fetchModels() {
-    loading = true
-    error = ''
-    try {
-      const data = await models.list()
-      modelList = data.models ?? []
-      // 如果已保存的模型 ID 不在列表中，则清空选择
-      if (selectedModelId && !modelList.some(m => m.model_id === selectedModelId)) {
-        selectedModelId = ''
-      }
-    } catch (err) {
-      error = err.message || t('fetchModelsFailed')
-    } finally {
-      loading = false
-    }
-  }
+  let modelList = $derived(catalog.models.items)
+  let loading = $derived(catalog.models.loading && !catalog.models.loaded)
+  let error = $derived(catalog.models.error)
 
   function handleChange(e) {
     selectedModelId = e.target.value
     onchange?.(selectedModelId)
   }
 
-  $effect(() => { fetchModels() })
+  $effect(() => { loadModels().catch(() => {}) })
+
+  // 如果已保存/恢复的模型 ID 不在共享列表中，则清空选择。
+  $effect(() => {
+    if (catalog.models.loaded && selectedModelId && !modelList.some(m => m.model_id === selectedModelId)) {
+      selectedModelId = ''
+      onchange?.(selectedModelId)
+    }
+  })
 </script>
 
 <div class="model-selector">

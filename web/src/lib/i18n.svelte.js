@@ -242,8 +242,8 @@ const translations = {
     copyPrompt: '复制',
 
     // SessionPanel
-    sessionPanelTitle: '📚 历史会话',
-    noSessions: '暂无历史会话',
+    sessionPanelTitle: '📚 最近会话',
+    noSessions: '暂无最近会话',
     fetchSessionsFailed: '获取会话列表失败',
     restoreSessionFailed: '恢复会话失败',
     deleteSession: '删除会话',
@@ -251,6 +251,8 @@ const translations = {
     confirmDeleteSession: '确定要删除会话「{id}」吗？',
     generateTitle: '生成标题',
     generateTitleFailed: '生成标题失败',
+    searchSessions: '搜索最近会话，回车执行；空白回车取消',
+    searchSessionsTooltip: '搜索最近会话\n空格=AND，|=OR\n例: error timeout（同时包含）\n    error|timeout（包含任一）',
 
     // Sidebar
     collapseSidebar: '收起侧边栏',
@@ -560,8 +562,8 @@ const translations = {
     copyPrompt: 'Copy',
 
     // SessionPanel
-    sessionPanelTitle: '📚 History',
-    noSessions: 'No sessions yet',
+    sessionPanelTitle: '📚 Recent Sessions',
+    noSessions: 'No recent sessions yet',
     fetchSessionsFailed: 'Failed to fetch sessions',
     restoreSessionFailed: 'Failed to restore session',
     deleteSession: 'Delete session',
@@ -569,6 +571,8 @@ const translations = {
     confirmDeleteSession: 'Delete session "{id}"?',
     generateTitle: 'Generate Title',
     generateTitleFailed: 'Failed to generate title',
+    searchSessions: 'Search recent sessions; Enter to run, blank to reset',
+    searchSessionsTooltip: 'Search recent sessions\nSpace=AND, |=OR\nEg: error timeout (both)\n    error|timeout (either)',
 
     // Sidebar
     collapseSidebar: 'Collapse sidebar',

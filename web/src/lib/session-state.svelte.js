@@ -13,6 +13,10 @@ export const newSessionCreated = $state({ sessionId: null, firstUserMessage: nul
 // sessionId: string | null — 新创建的会话 ID
 // title: string | null — 后端生成的会话标题
 
+// 新建会话请求：Sidebar 触发，ChatPage 消费
+export const newSessionRequest = $state({ token: 0 })
+// token: number — 每点击一次新建会话递增，确保连续点击也能被响应
+
 // 会话删除通知：Sidebar 通知 ChatPage 同步清空右侧面板
 export const sessionDeleted = $state({ sessionId: null })
 // sessionId: string | null — 被删除的会话 ID

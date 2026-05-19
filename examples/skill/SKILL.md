@@ -72,10 +72,13 @@ api_json() { method="$1"; path="$2"; data="$3"; curl -fsS -X "$method" "$SERVER_
 | `POST` | `/v1/infer/stream` | SSE 流式推理 |
 | `POST` | `/v1/infer/abort` | 中止指定 session 的流式推理 |
 | `GET` | `/v1/sessions` | 列出历史会话 |
+| `GET` | `/v1/sessions/search?q=...` | 搜索会话（按标题/内容关键词） |
 | `GET` | `/v1/sessions/{session_id}` | 获取会话完整记录 |
 | `DELETE` | `/v1/sessions/{session_id}` | 删除会话 |
 | `POST` | `/v1/sessions/{session_id}/generate-title` | 强制生成会话标题 |
+| `POST` | `/v1/sessions/{session_id}/read` | 将指定会话标记为已读 |
 | `POST` | `/v1/sessions/{session_id}/revoke` | 按用户消息 timestamp 撤回该消息及之后消息 |
+| `GET` | `/v1/sessions/events` | SSE 端点，实时推送会话状态变更 |
 | `GET` | `/v1/agents` | 列出 Agent |
 | `GET` | `/v1/agents/{agent_id}` | 获取单个 Agent |
 | `POST` | `/v1/agents` | 创建 Agent |
@@ -435,6 +438,38 @@ curl -fsS -X POST "$SERVER_URL/v1/sessions/<session_id>/revoke" \
   -d '{"timestamp":"2026-01-01T12:00:00"}' \
   | python -m json.tool
 ```
+
+### 搜索会话
+
+按关键词搜索会话标题和内容，返回匹配的会话列表。
+
+```bash
+curl -fsS "$SERVER_URL/v1/sessions/search?q=关键词" | python -m json.tool
+```
+
+参数说明：
+- `q` (query string): 搜索关键词，匹配会话标题和内容
+
+### 标记会话为已读
+
+将指定会话标记为已读状态，清除 unread 标记。
+
+```bash
+curl -fsS -X POST "$SERVER_URL/v1/sessions/<session_id>/read" | python -m json.tool
+```
+
+### 订阅会话状态变更（SSE）
+
+SSE 端点，用于实时推送会话状态变更。使用 `curl -N` 保持流式输出。
+
+```bash
+curl -N "$SERVER_URL/v1/sessions/events"
+```
+
+支持的事件类型：
+- `streaming`：会话正在流式推理中
+- `done_success_unread`：推理完成，有未读消息
+- `deleted`：会话已删除
 
 ## 12. Agent 管理
 

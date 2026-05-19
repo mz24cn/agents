@@ -1063,3 +1063,44 @@ class TestSessionAPI:
         assert status == 200
         session_ids = [s["session_id"] for s in body["sessions"]]
         assert session_id in session_ids
+
+    def test_get_sessions_respects_search_max_results_env(self, server_with_env, monkeypatch):
+        """GET /v1/sessions 按运行时 SEARCH_MAX_RESULTS 截断已排序结果。"""
+        monkeypatch.setenv("SEARCH_MAX_RESULTS", "2")
+        for i in range(5):
+            sid = f"260101_00000{i}"
+            server_with_env._session_manager.on_session_created(sid)
+            server_with_env._session_manager.update_index(sid)
+
+        status, body = _get(server_with_env, "/v1/sessions")
+
+        assert status == 200
+        assert len(body["sessions"]) == 2
+        assert [s["session_id"] for s in body["sessions"]] == [
+            "260101_000000",
+            "260101_000001",
+        ]
+
+    def test_search_sessions_respects_search_max_results_after_full_search(self, server_with_env, monkeypatch):
+        """GET /v1/sessions/search 在全量搜索命中后再按 SEARCH_MAX_RESULTS 截断。"""
+        import json as _json
+
+        monkeypatch.setenv("SEARCH_MAX_RESULTS", "2")
+        chats_dir = server_with_env._context_manager._chats_dir
+        for i in range(5):
+            sid = f"260101_00000{i}"
+            session_dir = os.path.join(chats_dir, sid)
+            os.makedirs(session_dir, exist_ok=True)
+            with open(os.path.join(session_dir, "conversation.json"), "w", encoding="utf-8") as f:
+                _json.dump({"meta": {}, "messages": [{"role": "user", "content": "needle"}]}, f)
+            server_with_env._session_manager.on_session_created(sid)
+            server_with_env._session_manager.update_index(sid)
+
+        status, body = _get(server_with_env, "/v1/sessions/search?q=needle")
+
+        assert status == 200
+        assert len(body["sessions"]) == 2
+        assert [s["session_id"] for s in body["sessions"]] == [
+            "260101_000000",
+            "260101_000001",
+        ]

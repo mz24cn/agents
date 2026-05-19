@@ -1,7 +1,7 @@
 <script>
   import { router, getQueryParam } from '../../lib/router.svelte.js'
   import { t } from '../../lib/i18n.svelte.js'
-  import { promptTemplates } from '../../lib/api.js'
+  import { catalog, loadPromptTemplates } from '../../lib/catalog-state.svelte.js'
   import ModelsPage from '../models/ModelsPage.svelte'
   import ToolsPage from '../tools/ToolsPage.svelte'
   import PromptsPage from '../prompts/PromptsPage.svelte'
@@ -42,8 +42,8 @@
       const params = new URLSearchParams(hash.split('?')[1] || '')
       const templateId = params.get('templateId') || ''
       if (templateId) {
-        promptTemplates.list().then(data => {
-          const found = data.templates?.find(t => t.template_id === templateId)
+        loadPromptTemplates().then(() => {
+          const found = catalog.promptTemplates.items.find(t => t.template_id === templateId)
           if (found) editingPrompt = found
         })
       }
@@ -67,31 +67,31 @@
     {
       items: [
         { id: 'models', label: t('models'), icon: '📦' },
-        { id: 'model-add', label: '➕', icon: '➕' },
+        { id: 'model-add', label: '✚', icon: '✚' },
       ]
     },
     {
       items: [
         { id: 'tools', label: t('tools'), icon: '🔧' },
-        { id: 'tool-add', label: '➕', icon: '➕' },
+        { id: 'tool-add', label: '✚', icon: '✚' },
       ]
     },
     {
       items: [
         { id: 'prompts', label: t('prompts'), icon: '📝' },
-        { id: 'prompt-add', label: '➕', icon: '➕' },
+        { id: 'prompt-add', label: '✚', icon: '✚' },
       ]
     },
     {
       items: [
         { id: 'agents', label: t('agents'), icon: '🤖' },
-        { id: 'agent-add', label: '➕', icon: '➕' },
+        { id: 'agent-add', label: '✚', icon: '✚' },
       ]
     },
     {
       items: [
         { id: 'env', label: t('nav_env'), icon: '🔑' },
-        { id: 'env-add', label: '➕', icon: '➕' },
+        { id: 'env-add', label: '✚', icon: '✚' },
         { id: 'env-detect', label: '📡', icon: '📡', action: 'detect' },
       ]
     },

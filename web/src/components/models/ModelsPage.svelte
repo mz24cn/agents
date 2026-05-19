@@ -1,25 +1,22 @@
 <script>
   import { models } from '../../lib/api.js'
+  import { catalog, loadModels, refreshModels } from '../../lib/catalog-state.svelte.js'
   import ConfirmDialog from '../ConfirmDialog.svelte'
   import { t } from '../../lib/i18n.svelte.js'
 
   let { onEdit = null, onCopy = null } = $props()
 
-  let modelList = $state([])
-  let loading = $state(true)
-  let error = $state('')
+  let modelList = $derived(catalog.models.items)
+  let loading = $derived(catalog.models.loading && !catalog.models.loaded)
+  let error = $derived(catalog.models.error)
   let deleteTarget = $state(null)
 
-  async function fetchModels() {
-    loading = true
-    error = ''
+  async function fetchModels({ force = false } = {}) {
     try {
-      const data = await models.list()
-      modelList = data.models ?? []
-    } catch (err) {
-      error = err.message || t('fetchModelListFailed')
-    } finally {
-      loading = false
+      if (force) await refreshModels()
+      else await loadModels()
+    } catch {
+      catalog.models.error = catalog.models.error || t('fetchModelListFailed')
     }
   }
 
@@ -39,9 +36,9 @@
     deleteTarget = null
     try {
       await models.delete(id)
-      fetchModels()
+      await fetchModels({ force: true })
     } catch (err) {
-      error = err.message || t('deleteModelFailed')
+      catalog.models.error = err.message || t('deleteModelFailed')
     }
   }
 

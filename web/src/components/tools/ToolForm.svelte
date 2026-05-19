@@ -1,5 +1,6 @@
 <script>
   import { tools, mcpServers } from '../../lib/api.js'
+  import { refreshTools } from '../../lib/catalog-state.svelte.js'
   import { t } from '../../lib/i18n.svelte.js'
   import JsonEditor from '../JsonEditor.svelte'
 
@@ -88,6 +89,7 @@
         if (isEdit) await tools.update(_init.tool_id, config)
         else await tools.create(config)
       }
+      await refreshTools()
       onSuccess()
     } catch (err) {
       submitError = err.message || t('operationFailed')

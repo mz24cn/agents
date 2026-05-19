@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
+import subprocess
 from typing import Callable, Optional
 
 logger = logging.getLogger("runtime.session_manager")
@@ -291,19 +293,141 @@ class SessionManager:
         except Exception as exc:
             logger.warning("remove_from_index: 更新 index.json 失败 (session=%s): %s", session_id, exc)
 
-    def list_sessions(self) -> list[dict]:        
+    def list_sessions(self, session_ids: Optional[set[str]] = None) -> list[dict]:
         """读取 index.json，返回所有 SessionIndexEntry 列表，按 last_inference_at 降序排列。
+
+        Args:
+            session_ids: 可选的父 session_id 集合。传入时只返回该集合命中的会话，
+                用于历史会话全文搜索过滤。
 
         Returns:
             SessionIndexEntry 字典列表（降序排列）。index.json 不存在时返回空列表。
         """
         index = self._read_index()
         entries = list(index.values())
+        if session_ids is not None:
+            entries = [e for e in entries if e.get("session_id") in session_ids]
         entries.sort(
             key=lambda e: e.get("last_inference_at") or "",
             reverse=True,
         )
         return entries
+
+    @staticmethod
+    def _parse_search_query(query: str):
+        """解析搜索查询，支持多关键词 AND/OR 模式。
+
+        规则：
+        - 包含 "|" → OR 模式：按 "|" 拆分为关键词列表
+        - 不包含 "|" → AND 模式：按空格拆分为关键词列表
+        每段关键词去除首尾空白后丢弃空串。
+
+        Args:
+            query: 原始搜索字符串
+
+        Returns:
+            tuple(str, list[str]): (mode, keywords)
+                mode 为 "or" 或 "and"
+        """
+        stripped = query.strip()
+        if "|" in stripped:
+            keywords = [kw.strip() for kw in stripped.split("|") if kw.strip()]
+            return ("or", keywords)
+        else:
+            keywords = [kw.strip() for kw in stripped.split() if kw.strip()]
+            return ("and", keywords)
+
+    def search_sessions(self, query: str) -> list[dict]:
+        """全文搜索 chats_dir 下所有 conversation.json，并返回命中的父会话列表。
+
+        优先使用 ripgrep (rg)，不存在时 fallback 到 grep。搜索范围包含子目录，
+        因此会命中子 session 的 conversation.json；命中路径最终会归并到父
+        session_id（即 chats_dir 下的第一层目录名），再从 index.json 中取回会话
+        元数据并按 list_sessions 的排序规则返回。
+
+        搜索语法：
+        - 空格分隔 = AND（同时包含所有关键词）
+        - | 分隔 = OR（包含任一关键词）
+        不支持混合使用。
+        """
+        if not query:
+            return self.list_sessions()
+
+        mode, keywords = self._parse_search_query(query)
+        if not keywords:
+            return self.list_sessions()
+
+        root = os.path.realpath(self._chats_dir)
+        if not os.path.isdir(root):
+            return []
+
+        rg = shutil.which("rg") or shutil.which("ripgrep")
+        grep = shutil.which("grep") if not rg else None
+
+        if not rg and not grep:
+            logger.warning("search_sessions: neither rg nor grep is available")
+            return []
+
+        tool = rg or grep
+        try:
+            if mode == "or":
+                # OR: 搜索包含任一关键词的文件
+                if rg:
+                    import re as _re
+                    escaped = [_re.escape(kw) for kw in keywords]
+                    pattern = "|".join(escaped)
+                    cmd = [tool, "--files-with-matches", "--glob", "**/conversation.json", pattern, root]
+                else:
+                    pattern = "|".join(keywords)
+                    cmd = [tool, "-R", "-l", "-E", "--include=conversation.json", pattern, root]
+                proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+                matched_files = set(proc.stdout.splitlines()) if proc.returncode == 0 else set()
+            else:
+                # AND: 必须同时包含所有关键词 → 逐轮过滤
+                # 第一轮：获取所有 conversation.json 文件
+                if rg:
+                    cmd = [tool, "--files-with-matches", "--glob", "**/conversation.json", "--fixed-strings", "-e", keywords[0], root]
+                else:
+                    cmd = [tool, "-R", "-l", "-F", "--include=conversation.json", "-e", keywords[0], root]
+                proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+                matched_files = set(proc.stdout.splitlines()) if proc.returncode == 0 else set()
+
+                # 后续轮次：在已匹配文件中继续过滤
+                for kw in keywords[1:]:
+                    if not matched_files:
+                        break
+                    if rg:
+                        cmd = [tool, "--files-with-matches", "--fixed-strings", "-e", kw] + list(matched_files)
+                    else:
+                        cmd = [tool, "-l", "-F", "-e", kw] + list(matched_files)
+                    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+                    matched_files = set(proc.stdout.splitlines()) if proc.returncode == 0 else set()
+        except subprocess.TimeoutExpired:
+            logger.warning("search_sessions: search timed out")
+            return []
+        except Exception as exc:
+            logger.warning("search_sessions: search failed: %s", exc)
+            return []
+
+        if not matched_files:
+            return []
+
+        session_ids: set[str] = set()
+        for path in matched_files:
+            path = path.strip()
+            if not path:
+                continue
+            real_path = os.path.realpath(path)
+            try:
+                rel = os.path.relpath(real_path, root)
+            except ValueError:
+                continue
+            parts = rel.split(os.sep)
+            if len(parts) >= 2 and parts[-1] == "conversation.json" and parts[0] not in ("", ".", ".."):
+                # 子 session 路径形如 <parent>/sub_xxx/conversation.json，仍归并为 <parent>。
+                session_ids.add(parts[0])
+
+        return self.list_sessions(session_ids)
 
     def delete_session(self, session_id: str) -> None:
         """删除指定会话目录及其所有内容，并从 index.json 中移除对应条目。

@@ -1,7 +1,7 @@
 <script>
   import { t } from '../../lib/i18n.svelte.js'
 
-  let { disabled = false, onSend, onStop, onNewSession, onOpenTemplatePanel, text = $bindable(''), hasMessages = false, isStreaming = false } = $props()
+  let { disabled = false, onSend, onStop, onOpenTemplatePanel, text = $bindable(''), isStreaming = false } = $props()
 
   // 输入框为空且不在流式状态时，显示"?"按钮（提示词模板入口）
   let showTemplateBtn = $derived(!isStreaming && !text.trim())
@@ -52,14 +52,6 @@
       {#if isStreaming}⏹{:else}↑{/if}
     </button>
   {/if}
-  <button
-    class="new-session-btn"
-    onclick={() => onNewSession?.()}
-    title={t('newSession')}
-    disabled={isStreaming}
-  >
-    +
-  </button>
 </div>
 
 <style>
@@ -117,23 +109,4 @@
     color: #fff;
     border-color: var(--primary);
   }
-  .new-session-btn {
-    width: 32px;
-    height: 32px;
-    border-radius: 8px;
-    border: 1px solid var(--border);
-    background: var(--bg-secondary);
-    color: var(--text-secondary);
-    font-size: 1.3rem;
-    font-weight: 300;
-    cursor: pointer;
-    flex-shrink: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    line-height: 1;
-    transition: background-color 0.15s, color 0.15s;
-  }
-  .new-session-btn:hover:not(:disabled) { background: var(--primary); color: #fff; border-color: var(--primary); }
-  .new-session-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 </style>

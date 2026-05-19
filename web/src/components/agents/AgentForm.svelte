@@ -1,5 +1,6 @@
 <script>
-  import { agents, promptTemplates } from '../../lib/api.js'
+  import { agents } from '../../lib/api.js'
+  import { catalog, loadPromptTemplates, refreshAgents } from '../../lib/catalog-state.svelte.js'
   import { t } from '../../lib/i18n.svelte.js'
   import JsonEditor from '../JsonEditor.svelte'
   import ToolSelector from '../chat/ToolSelector.svelte'
@@ -24,26 +25,14 @@
 
   const isTemplateSelected = $derived(templateId.trim() !== '')
 
-  let templateList = $state([])
-  let loadingMeta = $state(true)
+  let templateList = $derived(catalog.promptTemplates.items)
+  let loadingMeta = $derived(catalog.promptTemplates.loading && !catalog.promptTemplates.loaded)
 
   let errors = $state({})
   let submitError = $state('')
   let submitting = $state(false)
 
-  async function fetchMeta() {
-    loadingMeta = true
-    try {
-      const tplData = await promptTemplates.list()
-      templateList = tplData.templates ?? []
-    } catch {
-      // fallback: empty list
-    } finally {
-      loadingMeta = false
-    }
-  }
-
-  $effect(() => { fetchMeta() })
+  $effect(() => { loadPromptTemplates().catch(() => {}) })
 
   function validate() {
     const e = {}
@@ -83,6 +72,7 @@
     try {
       if (isEdit) await agents.update(originalAgentId, payload)
       else await agents.create(payload)
+      await refreshAgents()
       onSuccess()
     } catch (err) {
       submitError = err.message || t('operationFailed')

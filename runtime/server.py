@@ -411,7 +411,8 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         """Handle GET requests."""
-        path = self.path.rstrip("/")
+        # Strip query string before routing so GET endpoints can accept query params.
+        path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
         if path == "/v1/models":
             self._handle_list_models()
         elif path == "/v1/tools":
@@ -424,6 +425,8 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self._handle_get_env()
         elif path == "/v1/sessions":
             self._handle_list_sessions()
+        elif path == "/v1/sessions/search":
+            self._handle_search_sessions()
         elif path == "/v1/sessions/events":
             self._handle_sessions_events()
         elif re.match(r"^/v1/sessions/[^/]+$", path):
@@ -1794,10 +1797,42 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 except ValueError:
                     pass
 
+    def _session_search_max_results(self) -> Optional[int]:
+        """Read SEARCH_MAX_RESULTS at request time for session list/search limits.
+
+        Empty, missing, invalid, or non-positive values mean "no limit". The value
+        is intentionally read on every request so changes made through env.json / UI
+        take effect without restarting the server.
+        """
+        raw = os.environ.get("SEARCH_MAX_RESULTS", "").strip()
+        if not raw:
+            return None
+        try:
+            limit = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return limit if limit > 0 else None
+
+    def _limit_session_results(self, sessions: list[dict]) -> list[dict]:
+        """Apply SEARCH_MAX_RESULTS to an already ordered session result list."""
+        limit = self._session_search_max_results()
+        if limit is None:
+            return sessions
+        return sessions[:limit]
+
     def _handle_list_sessions(self) -> None:
-        """GET /v1/sessions — 返回所有历史会话列表。"""
+        """GET /v1/sessions — 返回最近会话列表，按 SEARCH_MAX_RESULTS 限制最大条目数。"""
         session_manager = self.server.session_manager  # type: ignore[attr-defined]
-        sessions = session_manager.list_sessions()
+        sessions = self._limit_session_results(session_manager.list_sessions())
+        self._send_json_response(200, {"sessions": sessions})
+
+    def _handle_search_sessions(self) -> None:
+        """GET /v1/sessions/search?q=... — 全量搜索后按 SEARCH_MAX_RESULTS 限制最大条目数。"""
+        parsed = urllib.parse.urlparse(self.path)
+        params = urllib.parse.parse_qs(parsed.query)
+        query = (params.get("q") or [""])[0]
+        session_manager = self.server.session_manager  # type: ignore[attr-defined]
+        sessions = self._limit_session_results(session_manager.search_sessions(query))
         self._send_json_response(200, {"sessions": sessions})
 
     def _handle_get_session(self, session_id: str) -> None:

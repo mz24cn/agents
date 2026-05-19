@@ -1,25 +1,22 @@
 <script>
   import { agents } from '../../lib/api.js'
+  import { catalog, loadAgents, refreshAgents } from '../../lib/catalog-state.svelte.js'
   import ConfirmDialog from '../ConfirmDialog.svelte'
   import { t } from '../../lib/i18n.svelte.js'
 
   let { onEdit = null, onCopy = null } = $props()
 
-  let agentList = $state([])
-  let loading = $state(true)
-  let error = $state('')
+  let agentList = $derived(catalog.agents.items)
+  let loading = $derived(catalog.agents.loading && !catalog.agents.loaded)
+  let error = $derived(catalog.agents.error)
   let deleteTarget = $state(null)
 
-  async function fetchAgents() {
-    loading = true
-    error = ''
+  async function fetchAgents({ force = false } = {}) {
     try {
-      const data = await agents.list()
-      agentList = data.agents ?? []
-    } catch (err) {
-      error = err.message || t('fetchAgentsFailed')
-    } finally {
-      loading = false
+      if (force) await refreshAgents()
+      else await loadAgents()
+    } catch {
+      catalog.agents.error = catalog.agents.error || t('fetchAgentsFailed')
     }
   }
 
@@ -39,9 +36,9 @@
     deleteTarget = null
     try {
       await agents.delete(id)
-      fetchAgents()
+      await fetchAgents({ force: true })
     } catch (err) {
-      error = err.message || t('deleteAgentFailed')
+      catalog.agents.error = err.message || t('deleteAgentFailed')
     }
   }
 

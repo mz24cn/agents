@@ -1,5 +1,5 @@
 <script>
-  import { promptTemplates } from '../../lib/api.js'
+  import { catalog, loadPromptTemplates } from '../../lib/catalog-state.svelte.js'
   import { extractPlaceholders } from '../../lib/placeholder.js'
   import { t } from '../../lib/i18n.svelte.js'
 
@@ -10,22 +10,9 @@
    */
   let { selectedTemplateId = $bindable(null), onSelect } = $props()
 
-  let templateList = $state([])
-  let loading = $state(true)
-  let error = $state('')
-
-  async function fetchTemplates() {
-    loading = true
-    error = ''
-    try {
-      const data = await promptTemplates.list()
-      templateList = data.templates ?? []
-    } catch (err) {
-      error = err.message || t('fetchTemplatesFailed')
-    } finally {
-      loading = false
-    }
-  }
+  let templateList = $derived(catalog.promptTemplates.items)
+  let loading = $derived(catalog.promptTemplates.loading && !catalog.promptTemplates.loaded)
+  let error = $derived(catalog.promptTemplates.error)
 
   function handleSelect(tpl) {
     selectedTemplateId = tpl.template_id
@@ -37,9 +24,7 @@
     }
   }
 
-  $effect(() => {
-    fetchTemplates()
-  })
+  $effect(() => { loadPromptTemplates().catch(() => {}) })
 
   // 当模板列表加载完成后，如果有已选中的模板，自动触发选中
   $effect(() => {

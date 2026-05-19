@@ -1,26 +1,23 @@
 <script>
   import { promptTemplates } from '../../lib/api.js'
+  import { catalog, loadPromptTemplates, refreshPromptTemplates } from '../../lib/catalog-state.svelte.js'
   import ConfirmDialog from '../ConfirmDialog.svelte'
   import { extractPlaceholders } from '../../lib/placeholder.js'
   import { t } from '../../lib/i18n.svelte.js'
 
   let { onEdit = null, onCopy = null } = $props()
 
-  let templateList = $state([])
-  let loading = $state(true)
-  let error = $state('')
+  let templateList = $derived(catalog.promptTemplates.items)
+  let loading = $derived(catalog.promptTemplates.loading && !catalog.promptTemplates.loaded)
+  let error = $derived(catalog.promptTemplates.error)
   let deleteTarget = $state(null)
 
-  async function fetchTemplates() {
-    loading = true
-    error = ''
+  async function fetchTemplates({ force = false } = {}) {
     try {
-      const data = await promptTemplates.list()
-      templateList = data.templates ?? []
-    } catch (err) {
-      error = err.message || t('fetchTemplateListFailed')
-    } finally {
-      loading = false
+      if (force) await refreshPromptTemplates()
+      else await loadPromptTemplates()
+    } catch {
+      catalog.promptTemplates.error = catalog.promptTemplates.error || t('fetchTemplateListFailed')
     }
   }
 
@@ -40,9 +37,9 @@
     deleteTarget = null
     try {
       await promptTemplates.delete(id)
-      fetchTemplates()
+      await fetchTemplates({ force: true })
     } catch (err) {
-      error = err.message || t('deleteTemplateFailed')
+      catalog.promptTemplates.error = err.message || t('deleteTemplateFailed')
     }
   }
 

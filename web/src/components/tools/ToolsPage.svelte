@@ -1,28 +1,25 @@
 <script>
   import { tools, mcpServers } from '../../lib/api.js'
+  import { catalog, loadTools, refreshTools } from '../../lib/catalog-state.svelte.js'
   import ToolDetail from './ToolDetail.svelte'
   import ConfirmDialog from '../ConfirmDialog.svelte'
   import { t } from '../../lib/i18n.svelte.js'
 
   let { onEdit = null } = $props()
 
-  let toolList = $state([])
-  let loading = $state(true)
-  let error = $state('')
+  let toolList = $derived(catalog.tools.items)
+  let loading = $derived(catalog.tools.loading && !catalog.tools.loaded)
+  let error = $derived(catalog.tools.error)
   let deleteTarget = $state(null)
   let detailTool = $state(null)
   let expandedGroups = $state(new Set())
 
-  async function fetchTools() {
-    loading = true
-    error = ''
+  async function fetchTools({ force = false } = {}) {
     try {
-      const data = await tools.list()
-      toolList = data.tools ?? []
-    } catch (err) {
-      error = err.message || t('fetchToolListFailed')
-    } finally {
-      loading = false
+      if (force) await refreshTools()
+      else await loadTools()
+    } catch {
+      catalog.tools.error = catalog.tools.error || t('fetchToolListFailed')
     }
   }
 
@@ -71,9 +68,9 @@
     try {
       if (target.type === 'single') await tools.delete(target.tool.tool_id)
       else await mcpServers.delete(target.serverName)
-      fetchTools()
+      await fetchTools({ force: true })
     } catch (err) {
-      error = err.message || t('deleteToolFailed')
+      catalog.tools.error = err.message || t('deleteToolFailed')
     }
   }
 

@@ -1,5 +1,6 @@
 <script>
   import { models } from '../../lib/api.js'
+  import { refreshModels } from '../../lib/catalog-state.svelte.js'
   import { t, i18n } from '../../lib/i18n.svelte.js'
   import JsonEditor from '../JsonEditor.svelte'
   import ConfirmDialog from '../ConfirmDialog.svelte'
@@ -71,6 +72,7 @@
     try {
       if (isEdit) await models.update(originalModelId, config)
       else await models.create(config)
+      await refreshModels()
       onSuccess()
     } catch (err) {
       submitError = err.message || t('operationFailed')

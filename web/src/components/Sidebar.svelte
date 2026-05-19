@@ -1,21 +1,21 @@
 <script>
-  import { onMount, onDestroy } from 'svelte'
+  import { onMount, onDestroy, tick } from 'svelte'
   import { router, navigate } from '../lib/router.svelte.js'
   import ThemeToggle from './ThemeToggle.svelte'
   import { t, i18n, setLang } from '../lib/i18n.svelte.js'
   import { sessions, subscribeSessionEvents } from '../lib/api.js'
-  import { sessionRestore, newSessionCreated, sessionDeleted, currentSession } from '../lib/session-state.svelte.js'
+  import { sessionRestore, newSessionCreated, sessionDeleted, currentSession, newSessionRequest } from '../lib/session-state.svelte.js'
   import { sidebarWidth, setSidebarWidth, toggleSidebarCollapsed, collapseSidebar, SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH } from '../lib/sidebar-width.svelte.js'
-
-  const navItems = [
-    { hash: '#/chat', key: 'nav_chat' },
-  ]
 
   let sessionList = $state([])
   let sessionError = $state('')
   let sessionLoading = $state(false)
   let restoreError = $state('')
   let lastClickTime = $state(0)
+  let searchOpen = $state(false)
+  let searchText = $state('')
+  let activeSearchQuery = $state('')
+  let searchInput
 
   // 弹出菜单状态
   let menuOpenId = $state(null)   // 当前展开菜单的 session id
@@ -35,15 +35,25 @@
 
   function _applyStatusToSessionList(sid, status) {
     sessionStatuses[sid] = status
-    // Also update status field in sessionList so template reactivity works
-    sessionList = sessionList.map(s =>
-      s.session_id === sid ? { ...s, _status: status } : s
-    )
+    const idx = sessionList.findIndex(s => s.session_id === sid)
+    if (idx >= 0) {
+      // Update existing entry's status
+      sessionList = sessionList.map(s =>
+        s.session_id === sid ? { ...s, _status: status } : s
+      )
+    } else if (status === 'streaming') {
+      // New session detected via SSE before newSessionCreated fires —
+      // add it immediately so the user sees it during inference.
+      // Title is a placeholder (session_id); it will be updated by
+      // the newSessionCreated effect or a title_update SSE event.
+      sessionList = [{ session_id: sid, title: sid, _status: status }, ...sessionList]
+    }
   }
 
   let _unsubscribeSessionEvents = null
 
   onMount(() => {
+    loadSessions()
     _unsubscribeSessionEvents = subscribeSessionEvents(
       (data) => {
         if (data.event === 'init') {
@@ -93,13 +103,45 @@
     sessionLoading = true
     sessionError = ''
     try {
-      const data = await sessions.list()
+      const data = activeSearchQuery
+        ? await sessions.search(activeSearchQuery)
+        : await sessions.list()
       sessionList = data.sessions ?? []
     } catch (err) {
       sessionError = err.message || t('fetchSessionsFailed')
     } finally {
       sessionLoading = false
     }
+  }
+
+  function handleNewSession(e) {
+    e.preventDefault()
+    e.stopPropagation()
+    closeMenu()
+    newSessionRequest.token += 1
+    navigate('#/chat')
+    if (window.innerWidth < 1024) {
+      collapseSidebar()
+    }
+  }
+
+  function toggleSearch(e) {
+    e.preventDefault()
+    e.stopPropagation()
+    searchOpen = !searchOpen
+    if (searchOpen) {
+      // 等待 DOM 更新（{#if} 渲染 input）后再聚焦
+      tick().then(() => {
+        if (searchInput) searchInput.focus()
+      })
+    }
+  }
+
+  async function handleSearchKeydown(e) {
+    if (e.key !== 'Enter') return
+    e.preventDefault()
+    activeSearchQuery = searchText.trim()
+    await loadSessions()
   }
 
   async function handleSessionClick(sessionId) {
@@ -259,7 +301,6 @@
     window.dispatchEvent(new CustomEvent('setup:reset'))
   }
 
-  $effect(() => { loadSessions() })
 
   /**
    * 将 session_id（YYMMDD_HHmmss）解析为 "MM/DD HH:mm:ss" 格式的时间字符串。
@@ -298,15 +339,23 @@
   $effect(() => {
     const sid = newSessionCreated.sessionId
     if (sid) {
-      // 检查是否已存在
+      const firstMsg = newSessionCreated.firstUserMessage
+      const title = newSessionCreated.title
+          || (firstMsg && firstMsg.trim() ? firstMsg.trim() : sid)
       const exists = sessionList.some(s => s.session_id === sid)
       if (!exists) {
-        // 优先使用后端生成的标题，回退到第一条用户消息，再回退到 session_id
-        const firstMsg = newSessionCreated.firstUserMessage
-        const title = newSessionCreated.title
-            || (firstMsg && firstMsg.trim() ? firstMsg.trim() : sid)
-        // 动态添加新会话条目到列表顶部
-        sessionList = [{ session_id: sid, title }, ...sessionList]
+        // 动态添加新会话条目到列表顶部。搜索过滤状态下仅当标题/首条消息命中时显示，
+        // 避免破坏当前过滤结果；清空搜索后会正常显示所有会话。
+        const searchable = `${title} ${firstMsg || ''} ${sid}`.toLowerCase()
+        if (!activeSearchQuery || searchable.includes(activeSearchQuery.toLowerCase())) {
+          sessionList = [{ session_id: sid, title }, ...sessionList]
+        }
+      } else {
+        // Session already in list (added by SSE streaming event with placeholder
+        // title). Update the title with the proper one from onInit.
+        sessionList = sessionList.map(s =>
+          s.session_id === sid ? { ...s, title } : s
+        )
       }
       // 重置状态，避免重复处理
       newSessionCreated.sessionId = null
@@ -358,17 +407,38 @@
 
 <aside class="sidebar" class:collapsed={sidebarWidth.collapsed} style="width: {sidebarWidth.collapsed ? 0 : sidebarWidth.current}px">
   <nav class="nav">
-    {#each navItems as item}
-      <a
-        href={item.hash}
-        class="nav-item"
-        class:active={router.current === item.hash}
+    <div class="nav-row">
+      <button
+        class="nav-action-btn new-session-top-btn"
+        class:active={router.current === '#/chat' && !currentSession.sessionId}
+        onclick={handleNewSession}
+        title={t('newSession')}
+        aria-label={t('newSession')}
       >
-        {t(item.key)}
-      </a>
-    {/each}
+        <span>{t('nav_chat')}</span>
+        <span class="plus-mark">✚</span>
+      </button>
+      <button
+        class="nav-action-btn search-toggle-btn"
+        class:active={searchOpen}
+        onclick={toggleSearch}
+        title={t('searchSessionsTooltip')}
+        aria-label={t('searchSessions')}
+      >🔍</button>
+    </div>
+    {#if searchOpen}
+      <input
+        class="session-search-input"
+        type="text"
+        bind:this={searchInput}
+        bind:value={searchText}
+        onkeydown={handleSearchKeydown}
+        placeholder={t('searchSessions')}
+        title={t('searchSessionsTooltip')}
+      />
+    {/if}
   </nav>
-  <!-- 历史会话面板 -->
+  <!-- 最近会话面板 -->
   <div class="session-panel">
     <div class="session-panel-title">{t('sessionPanelTitle')}</div>
     <div class="session-list">
@@ -467,26 +537,66 @@
   .nav {
     display: flex;
     flex-direction: column;
-    padding: 16px 0;
+    padding: 12px 10px 8px 10px;
     flex-shrink: 0;
   }
-  .nav-item {
-    display: block;
-    padding: 12px 0 12px 10px;
-    color: var(--text-secondary);
-    text-decoration: none;
-    font-size: 0.95rem;
-    transition: background-color 0.15s, color 0.15s;
+  .nav-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
   }
-  .nav-item:hover {
-    background-color: var(--border);
+  .nav-action-btn {
+    min-width: 32px;
+    height: 32px;
+    padding: 0 9px;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-secondary);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    line-height: 1;
+    font-size: 0.9rem;
+    font-weight: 600;
+    white-space: nowrap;
+    transition: border-color 0.15s, color 0.15s;
+  }
+  .nav-action-btn:hover {
+    background: transparent;
     color: var(--text);
   }
-  .nav-item.active {
-    color: var(--primary);
-    background-color: var(--bg);
-    font-weight: 600;
-    border-right: 3px solid var(--primary);
+  .nav-action-btn.active {
+    background: transparent;
+    border-color: rgba(59, 130, 246, 0.45);
+    color: var(--text);
+  }
+  .new-session-top-btn {
+    flex: 0 0 auto;
+  }
+  .plus-mark {
+    font-size: 1rem;
+  }
+  .search-toggle-btn {
+    margin-left: auto;
+    font-size: 0.95rem;
+  }
+  .session-search-input {
+    width: 100%;
+    box-sizing: border-box;
+    margin: 8px 0 0 0;
+    padding: 7px 9px;
+    border-radius: 7px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+    font-size: 0.85rem;
+  }
+  .session-search-input:focus {
+    outline: none;
+    border-color: var(--primary);
   }
   .sidebar-footer {
     padding: 12px 12px;
@@ -589,6 +699,7 @@
     font-size: 0.78rem;
     font-weight: 600;
     color: var(--text-secondary);
+    opacity: 0.45;
     text-transform: uppercase;
     letter-spacing: 0.05em;
     flex-shrink: 0;

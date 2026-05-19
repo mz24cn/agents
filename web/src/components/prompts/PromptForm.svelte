@@ -1,5 +1,6 @@
 <script>
   import { promptTemplates } from '../../lib/api.js'
+  import { refreshPromptTemplates } from '../../lib/catalog-state.svelte.js'
   import { extractPlaceholders } from '../../lib/placeholder.js'
   import { t } from '../../lib/i18n.svelte.js'
 
@@ -39,6 +40,7 @@
     try {
       if (isEdit) await promptTemplates.update(originalTemplateId, payload)
       else await promptTemplates.create(payload)
+      await refreshPromptTemplates()
       onSuccess()
     } catch (err) {
       submitError = err.message || t('operationFailed')

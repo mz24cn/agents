@@ -1,30 +1,14 @@
 <script>
-  import { tools } from '../../lib/api.js'
+  import { catalog, loadTools } from '../../lib/catalog-state.svelte.js'
   import { t } from '../../lib/i18n.svelte.js'
 
   let { selectedToolIds = $bindable([]), onchange, disabled = false } = $props()
 
-  let toolList = $state([])
-  let loading = $state(true)
-  let error = $state('')
+  let toolList = $derived(catalog.tools.items)
+  let loading = $derived(catalog.tools.loading && !catalog.tools.loaded)
+  let error = $derived(catalog.tools.error)
   let expanded = $state(false)
   let expandedGroups = $state(new Set())
-
-  async function fetchTools() {
-    loading = true
-    error = ''
-    try {
-      const data = await tools.list()
-      toolList = data.tools ?? []
-      // 过滤掉已不存在的工具 ID，避免选中了已删除的工具
-      const validIds = new Set(toolList.map(t => t.tool_id))
-      selectedToolIds = selectedToolIds.filter(id => validIds.has(id))
-    } catch (err) {
-      error = err.message || t('fetchToolsFailed')
-    } finally {
-      loading = false
-    }
-  }
 
   let groups = $derived.by(() => {
     const map = new Map()
@@ -83,7 +67,18 @@
     expandedGroups = next
   }
 
-  $effect(() => { fetchTools() })
+  $effect(() => { loadTools().catch(() => {}) })
+
+  // 过滤掉已不存在的工具 ID，避免选中已删除的工具；共享列表刷新后即时生效。
+  $effect(() => {
+    if (!catalog.tools.loaded) return
+    const validIds = new Set(toolList.map(t => t.tool_id))
+    const filtered = selectedToolIds.filter(id => validIds.has(id))
+    if (filtered.length !== selectedToolIds.length) {
+      selectedToolIds = filtered
+      onchange?.(selectedToolIds)
+    }
+  })
 </script>
 
 <div class="tool-selector">

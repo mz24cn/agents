@@ -1,5 +1,6 @@
 <script>
-  import { inferStream, abortInferStream, agents as agentsApi, tools as toolsApi, sessions as sessionsApi } from '../../lib/api.js'
+  import { inferStream, abortInferStream, agents as agentsApi, sessions as sessionsApi } from '../../lib/api.js'
+  import { catalog, loadAgents, loadTools, refreshAgents } from '../../lib/catalog-state.svelte.js'
   import ModelSelector from './ModelSelector.svelte'
   import ToolSelector from './ToolSelector.svelte'
   import PromptTemplateSelector from './PromptTemplateSelector.svelte'
@@ -10,7 +11,7 @@
   import ConfirmDialog from '../ConfirmDialog.svelte'
   import { extractPlaceholders } from '../../lib/placeholder.js'
   import { t } from '../../lib/i18n.svelte.js'
-  import { sessionRestore, newSessionCreated, sessionDeleted, currentSession } from '../../lib/session-state.svelte.js'
+  import { sessionRestore, newSessionCreated, sessionDeleted, currentSession, newSessionRequest } from '../../lib/session-state.svelte.js'
 
   const STORAGE_MODEL_KEY = 'chat_selected_model'
   const STORAGE_TOOLS_KEY = 'chat_selected_tools'
@@ -80,9 +81,9 @@
   let addAgentSaving = $state(false)
 
   // 智能体选择器状态
-  let agentList = $state([])
-  let selectedAgentId = $state('')
-  let loadingAgents = $state(true)
+  let agentList = $derived(catalog.agents.items)
+  let selectedAgentId = $state(localStorage.getItem('chat_selected_agent') ?? '')
+  let loadingAgents = $derived(catalog.agents.loading && !catalog.agents.loaded)
 
   function openTemplatePanel() {
     templatePanelOpen = true
@@ -272,6 +273,49 @@
     }
   }
 
+  function mergeToolCallDeltas(existing = [], incoming = []) {
+    const merged = existing.map(tc => ({ ...tc }))
+
+    for (const inc of incoming) {
+      const incIndex = inc._index
+      const incId = inc.id || inc.tool_use_id
+      let pos = -1
+
+      // OpenAI-compatible streaming tool calls are deltas. Prefer the explicit
+      // delta index, then fall back to id/tool_use_id; otherwise append as a
+      // complete/non-streaming tool call.
+      if (incIndex !== undefined && incIndex !== null) {
+        pos = merged.findIndex(tc => (tc._index ?? 0) === incIndex)
+      }
+      if (pos < 0 && incId) {
+        pos = merged.findIndex(tc => tc.id === incId || tc.tool_use_id === incId)
+      }
+      if (pos < 0) {
+        merged.push({ ...inc })
+        continue
+      }
+
+      const cur = { ...merged[pos] }
+      if (incIndex !== undefined && incIndex !== null) cur._index = incIndex
+      if (inc.id) cur.id = inc.id
+      if (inc.tool_use_id) cur.tool_use_id = inc.tool_use_id
+
+      // name/arguments may arrive as multiple delta fragments.
+      if (inc.name) cur.name = (cur.name || '') + inc.name
+      if (inc.arguments !== undefined && inc.arguments !== null) {
+        if (typeof inc.arguments === 'string') {
+          cur.arguments = (cur.arguments || '') + inc.arguments
+        } else {
+          cur.arguments = inc.arguments
+        }
+      }
+
+      merged[pos] = cur
+    }
+
+    return merged
+  }
+
   function onStreamMsg(msg, aIdxRef, pendingFirstUserMsg, keyRef) {
     if (msg.session_id && !msg.role) {
       // Migrate store key if backend assigns a new session ID mid-stream
@@ -299,7 +343,9 @@
         // Inherit agent_nickname from the previous assistant message (if any)
         const prevAgent = [...msgs].reverse().find(m => m.role === 'assistant' && m.agent_nickname)
         // 首次帧：直接展开 msg 的所有字段（含 content/thinking/tool_calls 等），无需增量拼接
-        store.messages = [...msgs, { role: 'assistant', content: '', thinking: null, agent_nickname: prevAgent?.agent_nickname, ...msg }]
+        const initialMsg = { role: 'assistant', content: '', thinking: null, agent_nickname: prevAgent?.agent_nickname, ...msg }
+        if (msg.tool_calls) initialMsg.tool_calls = mergeToolCallDeltas([], msg.tool_calls)
+        store.messages = [...msgs, initialMsg]
         return  // 首次创建已完成所有字段的设置，跳过后续合并逻辑
       }
       // 后续帧：增量追加 content 和 thinking
@@ -312,7 +358,7 @@
       const newMsg = { ...u[aIdx], ...msgMeta }
       if (msg.content) newMsg.content = (u[aIdx].content || '') + msg.content
       if (msg.thinking) newMsg.thinking = (u[aIdx].thinking || '') + msg.thinking
-      if (msg.tool_calls) newMsg.tool_calls = [...(u[aIdx].tool_calls || []), ...msg.tool_calls]
+      if (msg.tool_calls) newMsg.tool_calls = mergeToolCallDeltas(u[aIdx].tool_calls || [], msg.tool_calls)
       u[aIdx] = newMsg
       store.messages = u
     } else if (msg.role === 'tool') {
@@ -540,6 +586,24 @@
     }
   })
 
+  function startNewSession() {
+    delete sessionStore['__new__']
+    errorMsg = ''
+    sessionId = null
+    currentSession.sessionId = null
+  }
+
+  // 监听 Sidebar 顶部的新建会话按钮。即使当前会话正在推理，也允许切换到新会话，
+  // 已有流式回调仍会写入各自 sessionStore，不会被中断。
+  let lastNewSessionToken = 0
+  $effect(() => {
+    const token = newSessionRequest.token
+    if (token && token !== lastNewSessionToken) {
+      lastNewSessionToken = token
+      startNewSession()
+    }
+  })
+
   // 监听会话删除事件：同步清空右侧面板（效果等同新建会话）
   $effect(() => {
     const deletedSid = sessionDeleted.sessionId
@@ -555,25 +619,31 @@
     }
   })
 
-  // 加载智能体列表
-  async function fetchAgents() {
-    loadingAgents = true
+  // 加载智能体列表（共享数据源：设置页变更后会即时反映到这里）
+  async function fetchAgents({ force = false } = {}) {
     try {
-      const data = await agentsApi.list()
-      agentList = data.agents ?? []
+      if (force) await refreshAgents()
+      else await loadAgents()
     } catch {
-      agentList = []
-    } finally {
-      loadingAgents = false
+      catalog.agents.error = catalog.agents.error || t('fetchAgentsFailed')
     }
   }
 
   $effect(() => { fetchAgents() })
 
+  $effect(() => {
+    if (catalog.agents.loaded && selectedAgentId && !agentList.some(a => a.agent_id === selectedAgentId)) {
+      selectedAgentId = ''
+      localStorage.removeItem('chat_selected_agent')
+    }
+  })
+
   function handleAgentChange(e) {
     selectedAgentId = e.target.value
     if (selectedAgentId) {
       localStorage.setItem('chat_selected_agent', selectedAgentId)
+    } else {
+      localStorage.removeItem('chat_selected_agent')
     }
   }
 
@@ -600,9 +670,9 @@
     if (!addAgentNickname.trim() || addAgentSaving) return
     addAgentSaving = true
     try {
-      // 获取选中工具的详细信息用于描述
-      const toolsData = await toolsApi.list()
-      const toolNames = (toolsData.tools ?? [])
+      // 获取选中工具的详细信息用于描述；复用工具选择器/列表页的共享数据源
+      await loadTools().catch(() => {})
+      const toolNames = catalog.tools.items
         .filter(t => selectedToolIds.includes(t.tool_id))
         .map(t => t.name)
 
@@ -620,8 +690,7 @@
       await agentsApi.create(payload)
       addAgentMode = false
       addAgentNickname = ''
-      // 重新加载智能体列表
-      fetchAgents()
+      await fetchAgents({ force: true })
     } catch (err) {
       errorMsg = err.message || t('addAsAgentFailed')
     } finally {
@@ -764,14 +833,12 @@
   </div>
 
   <ChatInput
-    disabled={isStreaming || (!selectedModelId && !selectedAgentId)}
+    disabled={!selectedModelId && !selectedAgentId}
     onSend={handleSend}
     onStop={handleStop}
     onOpenTemplatePanel={openTemplatePanel}
     {isStreaming}
     bind:text={inputText}
-    onNewSession={() => { delete sessionStore['__new__']; errorMsg = ''; sessionId = null; currentSession.sessionId = null }}
-    hasMessages={messages.length > 0}
   />
 </div>
 
