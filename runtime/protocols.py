@@ -79,8 +79,8 @@ class BaseProtocol(ABC):
         For example, session_id "260501_143022-sub_260501_143025" maps to
         "<chats_dir>/260501_143022/sub_260501_143025/".
 
-        Falls back to <chats_dir>/request_<timestamp>.json when no session is
-        active, and silently skips the dump if chats_dir is also unavailable.
+        Silently skips the dump when no session is active or chats_dir is
+        unavailable.
         """
         if os.environ.get("DEBUG_INFER_REQUEST", "").lower() != "true":
             return
@@ -99,11 +99,10 @@ class BaseProtocol(ABC):
         date_time = now.strftime("%y%m%d_%H%M%S")
         millisec = now.microsecond // 1000
         filename = f"request_{date_time}_{millisec:03d}.json"
-        if session_id:
-            # Replace '-' with os.sep to convert session hierarchy into a path
-            out_dir = os.path.join(chats_dir, session_id.replace("-", os.sep))
-        else:
-            out_dir = chats_dir
+        if not session_id:
+            return
+        # Replace '-' with os.sep to convert session hierarchy into a path
+        out_dir = os.path.join(chats_dir, session_id.replace("-", os.sep))
         os.makedirs(out_dir, exist_ok=True)
         filepath = os.path.join(out_dir, filename)
         with open(filepath, "w", encoding="utf-8") as f:

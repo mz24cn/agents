@@ -72,7 +72,7 @@
     },
     {
       items: [
-        { id: 'tools', label: t('tools'), icon: '🔧' },
+        { id: 'tools', label: t('tools'), icon: '🛠️' },
         { id: 'tool-add', label: '✚', icon: '✚' },
       ]
     },

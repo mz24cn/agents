@@ -120,7 +120,7 @@ const translations = {
     roleUser: '👤 用户',
     roleAssistant: '🤖 助手',
     roleSystem: '📜 系统',
-    roleFunction: '🔧 工具结果',
+    roleFunction: '🛠️ 工具结果',
     collapseResult: '▾ 收起结果',
     expandResult: '▸ 展开结果',
     revoke: '撤回',
@@ -172,7 +172,7 @@ const translations = {
     thinkingProcess: '思考过程',
 
     // ToolCallCard
-    callingTool: '🔧 调用工具: {name}',
+    callingTool: '🛠️ 调用工具: {name}',
     unknownTool: '未知',
 
     // ToolSelector
@@ -440,7 +440,7 @@ const translations = {
     roleUser: '👤 User',
     roleAssistant: '🤖 Assistant',
     roleSystem: '📜 System',
-    roleFunction: '🔧 Tool result',
+    roleFunction: '🛠️ Tool result',
     collapseResult: '▾ Collapse',
     expandResult: '▸ Expand',
     revoke: 'Revoke',
@@ -492,7 +492,7 @@ const translations = {
     thinkingProcess: 'thinking',
 
     // ToolCallCard
-    callingTool: '🔧 Tool call: {name}',
+    callingTool: '🛠️ Tool call: {name}',
     unknownTool: 'unknown',
 
     // ToolSelector

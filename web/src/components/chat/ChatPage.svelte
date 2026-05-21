@@ -39,6 +39,8 @@
   let needsRead = $state(false)
   // Set when sessionRestore loads a session; triggers mark-read once auto-scroll reaches bottom
   let sessionRestored = $state(false)
+  // Set when user sends a message; forces scroll to bottom even if not currently at bottom
+  let shouldScrollToBottom = $state(false)
 
   function handleScrollAtBottom(atBottom) {
     isAtBottom = atBottom
@@ -46,6 +48,10 @@
     if (atBottom && needsRead) {
       needsRead = false
       markSessionRead(sessionId)
+    }
+    // Reset shouldScrollToBottom when we reach the bottom
+    if (atBottom) {
+      shouldScrollToBottom = false
     }
   }
 
@@ -194,6 +200,8 @@
       sessionStore[keyRef.key] = { messages: [], isStreaming: false }
     }
     sessionStore[keyRef.key].isStreaming = true
+    // Force scroll to bottom when user sends a new message
+    shouldScrollToBottom = true
 
     let aIdxRef = { value: -1 }
     const reqBody = { model_id: selectedModelId, tool_ids: selectedToolIds, messages: apiMessages, stream: true }
@@ -552,6 +560,7 @@
       errorMsg = ''
       needsRead = false
       sessionRestored = true
+      shouldScrollToBottom = false
       
       // 优先使用 meta 中的设置（向下兼容：旧会话可能没有 meta）
       if (meta) {
@@ -591,6 +600,7 @@
     errorMsg = ''
     sessionId = null
     currentSession.sessionId = null
+    shouldScrollToBottom = false
   }
 
   // 监听 Sidebar 顶部的新建会话按钮。即使当前会话正在推理，也允许切换到新会话，
@@ -616,6 +626,7 @@
       delete sessionStore[deletedSid]
       errorMsg = ''
       sessionId = null
+      shouldScrollToBottom = false
     }
   })
 
@@ -711,7 +722,7 @@
       <ModelSelector bind:selectedModelId onchange={(id) => localStorage.setItem(STORAGE_MODEL_KEY, id)} disabled={!!selectedAgentId} />
     </div>
     <div class="selector-wrapper" class:disabled={!!selectedAgentId}>
-      🔧<a href="#/setup?tab=tools" class="nav-link">{t('tools')}</a>
+      🛠️<a href="#/setup?tab=tools" class="nav-link">{t('tools')}</a>
       <ToolSelector bind:selectedToolIds onchange={(ids) => localStorage.setItem(STORAGE_TOOLS_KEY, JSON.stringify(ids))} disabled={!!selectedAgentId} />
     </div>
     <div class="agent-selector-spacer"></div>
@@ -775,7 +786,7 @@
   />
 
   <div class="message-area">
-    <MessageList {messages} {agentList} onRevoke={handleRevoke} onScrollAtBottom={handleScrollAtBottom} />
+    <MessageList {messages} {agentList} onRevoke={handleRevoke} onScrollAtBottom={handleScrollAtBottom} {shouldScrollToBottom} />
 
     {#if templatePanelOpen}
       <div class="template-panel">

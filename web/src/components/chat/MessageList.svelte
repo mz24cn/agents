@@ -2,7 +2,7 @@
   import MessageBubble from './MessageBubble.svelte'
   import { t } from '../../lib/i18n.svelte.js'
 
-  let { messages = [], agentList = [], onRevoke, onScrollAtBottom } = $props()
+  let { messages = [], agentList = [], onRevoke, onScrollAtBottom, shouldScrollToBottom = false } = $props()
   let listEl = $state(null)
   let isAtBottom = $state(true)
 
@@ -13,10 +13,18 @@
     if (onScrollAtBottom) onScrollAtBottom(isAtBottom)
   }
 
+  function scrollToBottom() {
+    if (listEl) {
+      listEl.scrollTop = listEl.scrollHeight
+    }
+  }
+
   $effect(() => {
     // 追踪整个 messages 内容变化（包括流式追加）
     JSON.stringify(messages)
-    if (listEl && isAtBottom) listEl.scrollTop = listEl.scrollHeight
+    if (listEl && (isAtBottom || shouldScrollToBottom)) {
+      scrollToBottom()
+    }
   })
 </script>
 

@@ -160,7 +160,7 @@
     {:else if msg.role === 'system'}
       {t('roleSystem')}
     {:else if msg.role === 'tool'}
-      <span>{t('roleFunction')}</span>
+      <span>{t('roleFunction')}{#if msg.name}: {msg.name}{/if}</span>
       <div class="role-actions">
         {#if toolResultOverLimit}
           <button class="toggle-btn" onclick={() => toolResultExpanded = !toolResultExpanded}>
