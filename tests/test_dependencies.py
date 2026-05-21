@@ -1,4 +1,4 @@
-# Feature: composable-agent-runtime, Property 17: 零第三方依赖
+# Feature: agent-service, Property 17: 零第三方依赖
 """
 Property 17: Zero Third-Party Dependencies
 

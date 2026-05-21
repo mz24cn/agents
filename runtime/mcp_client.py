@@ -1,4 +1,4 @@
-"""MCP Client Manager for the Composable Agent Runtime.
+"""MCP Client Manager for the Agent Service.
 
 Provides MCPClientManager, a singleton that manages connections to MCP servers
 via stdio (subprocess) or Streamable HTTP (MCP 2025-03-26). Communicates using

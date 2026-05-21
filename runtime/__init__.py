@@ -1,4 +1,4 @@
-"""Composable Agent Runtime - a minimal, zero-dependency agent runtime engine."""
+"""Agent Service - a minimal, zero-dependency agent service engine."""
 
 from runtime.models import (
     InferenceRequest,

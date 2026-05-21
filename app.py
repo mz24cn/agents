@@ -1,4 +1,4 @@
-"""Entry point for the Composable Agent Runtime server.
+"""Entry point for the Agent Service server.
 
 Usage:
     python app.py              # default host/port

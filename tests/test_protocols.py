@@ -1,4 +1,4 @@
-# Feature: composable-agent-runtime, Property 3: OpenAI 协议多模态请求构造
+# Feature: agent-service, Property 3: OpenAI 协议多模态请求构造
 """Property-based tests for protocol adapters."""
 
 import json
@@ -97,7 +97,7 @@ def test_openai_multimodal_content_is_array_with_image_url(
                 )
 
 
-# Feature: composable-agent-runtime, Property 4: Ollama 协议多模态请求构造
+# Feature: agent-service, Property 4: Ollama 协议多模态请求构造
 
 from runtime.protocols import OllamaProtocol
 
@@ -166,7 +166,7 @@ def test_ollama_multimodal_images_at_same_level_as_content(
                 )
 
 
-# Feature: composable-agent-runtime, Property 6: 协议响应解析
+# Feature: agent-service, Property 6: 协议响应解析
 
 # --- Hypothesis strategies for response data ---
 

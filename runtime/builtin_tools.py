@@ -1,4 +1,4 @@
-"""Built-in tools for the Composable Agent Runtime.
+"""Built-in tools for the Agent Service.
 
 Provides basic tools (bash, fetch) that are always available to the LLM,
 especially after Skill progressive disclosure when the LLM needs to

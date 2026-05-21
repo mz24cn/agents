@@ -1,4 +1,4 @@
-# Feature: composable-agent-runtime, Property 1: ModelConfig 序列化往返一致性
+# Feature: agent-service, Property 1: ModelConfig 序列化往返一致性
 """Property-based tests for data model serialization round-trip consistency."""
 
 from hypothesis import given, settings
@@ -54,7 +54,7 @@ def test_model_config_round_trip(config: ModelConfig) -> None:
     assert deserialized.api_protocol == config.api_protocol
     assert deserialized.generate_params == config.generate_params
 
-# Feature: composable-agent-runtime, Property 2: ToolConfig 序列化往返一致性（所有工具类型）
+# Feature: agent-service, Property 2: ToolConfig 序列化往返一致性（所有工具类型）
 
 from runtime.models import ToolConfig
 

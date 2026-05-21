@@ -1,4 +1,4 @@
-"""Protocol adapters for the Composable Agent Runtime.
+"""Protocol adapters for the Agent Service.
 
 Provides BaseProtocol abstract base class and concrete protocol implementations
 for constructing API requests and parsing responses from different LLM backends.

@@ -1,4 +1,4 @@
-# Feature: composable-agent-runtime, Property 5: 输入格式归一化
+# Feature: agent-service, Property 5: 输入格式归一化
 """Property-based tests for Runtime input format normalization.
 
 Verifies that Runtime._normalize_messages() produces a consistent message
@@ -125,7 +125,7 @@ def test_normalize_empty_input_returns_empty_list() -> None:
     assert result == []
 
 
-# Feature: composable-agent-runtime, Property 12: 选择性工具启用
+# Feature: agent-service, Property 12: 选择性工具启用
 """Property-based test for selective tool enabling.
 
 Verifies that when a subset of tool_ids is requested, only those tools
@@ -274,7 +274,7 @@ def test_selective_tool_enabling_ignores_unknown_ids(
     assert len(gathered) == len(valid_subset)
 
 
-# Feature: composable-agent-runtime, Property 15: 工具调用循环与最大轮次限制
+# Feature: agent-service, Property 15: 工具调用循环与最大轮次限制
 """Property-based test for tool call loop and max rounds limit.
 
 Verifies that when the model continuously returns function_call responses,
@@ -424,7 +424,7 @@ def test_tool_call_loop_terminates_at_max_rounds(max_rounds: int) -> None:
         assert result.messages[function_idx].name == "dummy_tool"
 
 
-# Feature: composable-agent-runtime, Property 8: 工具分发与执行
+# Feature: agent-service, Property 8: 工具分发与执行
 """Property-based test for tool dispatch and execution.
 
 Verifies that after registering a function tool, when the model returns a
@@ -605,7 +605,7 @@ def test_tool_dispatch_and_execution(tool_name: str, arg_value: str) -> None:
     assert result.messages[3].tool_calls is None
 
 
-# Feature: composable-agent-runtime, Property 9: 工具错误处理
+# Feature: agent-service, Property 9: 工具错误处理
 """Property-based test for tool error handling.
 
 Verifies three error scenarios:
@@ -808,7 +808,7 @@ def test_tool_error_http_failure(http_code: int) -> None:
     assert result.error is not None, "Expected error message to be set"
 
 
-# Feature: composable-agent-runtime, Property 16: 工具实例复用
+# Feature: agent-service, Property 16: 工具实例复用
 """Property-based test for tool instance reuse.
 
 Verifies that for any tool_id, calling ToolRegistry.get_callable() multiple

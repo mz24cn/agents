@@ -1,4 +1,4 @@
-"""Runtime Engine for the Composable Agent Runtime.
+"""Runtime Engine for the Agent Service.
 
 Provides the Runtime class which orchestrates model inference and tool execution.
 Supports dynamic composition of models and tools at runtime, with automatic

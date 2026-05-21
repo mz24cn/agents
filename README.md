@@ -1,4 +1,4 @@
-# Composable Agent Runtime
+# Agent Service
 
 [English](#english) | [中文](#中文)
 
@@ -12,11 +12,12 @@
 
 ## English
 
-A minimal, zero-dependency composable agent runtime engine built with pure Python standard library. Dynamically compose any LLM with any combination of tools (Function, MCP, Skill) at runtime — no static agent definitions needed.
+A minimal, zero-dependency Agent Service built with the pure Python standard library. It bootstraps coding agents from project context and dynamically connects LLMs, tools, prompt templates, and subagents at runtime — no static agent definitions required.
 
 ### Features
 
 - **Zero third-party dependencies** — core runtime uses only Python standard library
+- **Self-bootstrapping agents** — bootstrap runnable coding agents from project context, model/tool configuration, prompts, skills, and session state
 - **Multi-protocol support** — OpenAI-compatible API, Ollama native `/api/chat`, and Anthropic Messages API
 - **Three tool types** — in-process Function tools, MCP (Model Context Protocol) tools, and Skills
 - **Direct MCP/function tool invocation** — bypass the LLM and call MCP/function tools directly, 100% reliability; optionally return parsed JSON with `format: "json"`
@@ -203,7 +204,7 @@ result = runtime.infer(InferenceRequest(
 print(result.messages[-1].content)
 ```
 
-The template content is fetched and all `{variable}` placeholders are substituted before the message is sent to the model. Templates can be created, updated, and deleted at runtime via the HTTP API or Web UI — making prompt iteration fast without touching code.
+The template content is fetched and all `{{variable}}` placeholders are substituted before the message is sent to the model. Templates can be created, updated, and deleted at runtime via the HTTP API or Web UI — making prompt iteration fast without touching code.
 
 **5. Multi-Agent Collaboration (Delegate Tool)**
 
@@ -384,7 +385,7 @@ All configuration is persisted to `~/.agents_runtime/`:
 
 ### Background & Motivation
 
-This project was born out of frustrations encountered while using [Qwen-Agent](https://github.com/QwenLM/Qwen-Agent). Several pain points drove the decision to build a new runtime from scratch:
+This project was born out of frustrations encountered while using [Qwen-Agent](https://github.com/QwenLM/Qwen-Agent). Several pain points drove the decision to build a new Agent Service from scratch:
 
 - MCP tools are registered per-agent, so different agents each spin up their own local MCP process instances — unnecessary overhead since most MCP servers can be shared as stateless services.
 - The combinatorial explosion of models × tools makes static pre-definitions impractical.
@@ -395,7 +396,7 @@ This project was born out of frustrations encountered while using [Qwen-Agent](h
 - The Web UI and a clean HTTP server API cannot run in the same process simultaneously.
 - Models, tools, and prompt templates need to be added, updated, and removed at runtime — especially prompt templates, which require frequent iteration. The author added CRUD support to the official Qwen-Agent GUI ([fork here](https://github.com/mz24cn/Qwen-Agent)), but the Gradio-based UI is sluggish and the experience is poor.
 
-These issues made rebuilding the agent runtime worthwhile. Leveraging the power of modern AI-assisted development, this project was built from scratch to address all of the above. It intentionally avoids introducing third-party dependencies so it can be embedded into any existing project — usable as either an SDK or a standalone HTTP service.
+These issues made building a dedicated Agent Service worthwhile. Leveraging the power of modern AI-assisted development, this project was built from scratch to address all of the above. It intentionally avoids introducing third-party dependencies so it can be embedded into any existing project — usable as either an SDK or a standalone HTTP service.
 
 The project is under active development. Next steps include enhancing the multi-agent collaboration framework with more orchestration patterns and the closely related topic of secure user data management.
 
@@ -409,11 +410,12 @@ MIT License — see [LICENSE](LICENSE)
 
 ## 中文
 
-一个极简、零第三方依赖的可组合 Agent 运行时引擎，完全基于 Python 标准库构建。运行期自由组合任意大模型与任意工具（Function、MCP、Skill），无需预定义静态 Agent。
+一个极简、零第三方依赖的 Agent Service，完全基于 Python 标准库构建。它可基于项目上下文自举编码 Agent，并在运行期动态连接大模型、工具、提示词模板与 Subagent，无需预定义静态 Agent。
 
 ### 特性
 
 - **零第三方依赖** — 核心运行时仅使用 Python 标准库
+- **自举式 Agent** — 基于项目上下文、模型/工具配置、提示词、Skill 和会话状态自举可运行的编码 Agent
 - **多协议支持** — OpenAI 兼容 API、Ollama 原生 `/api/chat` 和 Anthropic Messages API
 - **三种工具类型** — 进程内 Function 工具、MCP（模型上下文协议）工具、Skill 技能
 - **MCP/function工具直接调用** — 可绕过大模型直接调用MCP/function工具，可靠性100%；支持通过 `format: "json"` 返回解析后的 JSON
@@ -779,7 +781,7 @@ npm run build
 
 ### 背景与动机
 
-本项目源于在使用 [Qwen-Agent](https://github.com/QwenLM/Qwen-Agent) 过程中遇到的一系列痛点，促使作者决定从零重新构建一个 Agent 运行时：
+本项目源于在使用 [Qwen-Agent](https://github.com/QwenLM/Qwen-Agent) 过程中遇到的一系列痛点，促使作者决定从零构建一个 Agent Service：
 
 - MCP 工具注册在 Agent 内部，不同 Agent 会重复启动各自的 MCP 本地进程实例，而大多数 MCP 服务完全可以作为无状态服务共享使用，这种重复启动是不必要的开销。
 - 模型与工具的组合数量庞大，预先静态定义远远不够用。
@@ -790,7 +792,7 @@ npm run build
 - Web GUI 与简洁的 HTTP Server 接口无法在同一进程中同时提供服务。
 - 模型、工具和提示词模板需要在运行期间增删改查，尤其是提示词模板需要反复调整。作者曾为官方 GUI 增加了相关 CRUD 功能（[fork 地址](https://github.com/mz24cn/Qwen-Agent)），但 Gradio 制作的 GUI 响应迟缓，体验较差。
 
-基于以上问题，重新构建 Agent Runtime 就有了必要性。借助现代 AI 辅助开发的强大能力，本项目从零开始开发，解决了上述所有问题。它有意避免引入第三方依赖，以便嵌入到任何现有项目中使用——既可作为 SDK 引入，也可作为独立 HTTP 服务运行。
+基于以上问题，构建一个专门的 Agent Service 就有了必要性。借助现代 AI 辅助开发的强大能力，本项目从零开始开发，解决了上述所有问题。它有意避免引入第三方依赖，以便嵌入到任何现有项目中使用——既可作为 SDK 引入，也可作为独立 HTTP 服务运行。
 
 此项目仍在积极迭代中。下一步计划完善多 Agent 协同工作框架（增加更多编排模式），以及与之密切相关的用户数据安全管理机制。
 

@@ -1,4 +1,4 @@
-"""Data models for the Composable Agent Runtime.
+"""Data models for the Agent Service.
 
 Defines Message, ModelConfig, ToolConfig, InferenceRequest, and InferenceResult
 as dataclasses with JSON serialization/deserialization support.

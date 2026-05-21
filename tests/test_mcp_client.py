@@ -248,7 +248,7 @@ class TestSSEParsing:
 # Property-based tests
 # ------------------------------------------------------------------
 
-# Feature: composable-agent-runtime, Property 10: MCP Client 单例
+# Feature: agent-service, Property 10: MCP Client 单例
 class TestSingletonProperty:
     """Property-based test verifying MCPClientManager singleton pattern.
 
@@ -260,7 +260,7 @@ class TestSingletonProperty:
     def test_multiple_instantiations_return_same_object(self, n):
         """For any number of instantiations, all MCPClientManager instances
         must be the exact same object (same id())."""
-        # Feature: composable-agent-runtime, Property 10: MCP Client 单例
+        # Feature: agent-service, Property 10: MCP Client 单例
         # Reset singleton before each Hypothesis example to ensure clean state
         MCPClientManager._reset()
         instances = [MCPClientManager() for _ in range(n)]
@@ -312,7 +312,7 @@ _raw_tools_list = st.lists(_raw_tool, min_size=1, max_size=10)
 _server_name = st.from_regex(r"[a-z][a-z0-9\-]{0,19}", fullmatch=True)
 
 
-# Feature: composable-agent-runtime, Property 11: MCP 工具发现与 Schema 生成
+# Feature: agent-service, Property 11: MCP 工具发现与 Schema 生成
 class TestMCPToolDiscoveryProperty:
     """Property-based test verifying MCP tool discovery and Schema generation.
 
@@ -325,7 +325,7 @@ class TestMCPToolDiscoveryProperty:
         """For any MCP server tool list, _convert_tools should produce
         ToolConfig objects with correct tool_type, mcp_server_name,
         matching tool_name, and valid parameters Schema."""
-        # Feature: composable-agent-runtime, Property 11: MCP 工具发现与 Schema 生成
+        # Feature: agent-service, Property 11: MCP 工具发现与 Schema 生成
         MCPClientManager._reset()
         mgr = MCPClientManager()
 

@@ -261,7 +261,7 @@ import hypothesis.strategies as st
 
 from runtime.tools import _extract_tool_config, _python_type_to_json_schema
 
-# Feature: composable-agent-runtime, Property 7: 函数工具 Schema 自动生成
+# Feature: agent-service, Property 7: 函数工具 Schema 自动生成
 
 # Valid JSON Schema types that _python_type_to_json_schema can produce
 _VALID_JSON_SCHEMA_TYPES = {"string", "integer", "number", "boolean", "array", "object"}

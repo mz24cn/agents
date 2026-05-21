@@ -1,4 +1,4 @@
-"""HTTP API Server for the Composable Agent Runtime.
+"""HTTP API Server for the Agent Service.
 
 Provides RuntimeHTTPServer, a lightweight HTTP server built on Python's
 standard library http.server module. Exposes REST endpoints for inference,

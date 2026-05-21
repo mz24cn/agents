@@ -1,11 +1,11 @@
 ---
 name: agent-runtime-server
-description: 通过本地 Composable Agent Runtime HTTP server 管理模型、工具、MCP、Skill、提示模板、环境变量、会话、Agent，并发起/中止推理；使用 bash + curl 调用 server API，server 地址和端口可由环境变量配置。
+description: 通过本地 Agent Service HTTP server 管理模型、工具、MCP、Skill、提示模板、环境变量、会话、Agent，并发起/中止推理；使用 bash + curl 调用 server API，server 地址和端口可由环境变量配置。
 ---
 
 # Agent Runtime Server 操作技能
 
-本 Skill 用于通过 HTTP API 操作当前 Composable Agent Runtime server。需要执行实际操作时，优先使用 `bash` 工具调用 `curl`。所有请求都应面向运行中的 server；如果 server 未启动，先提示用户启动（通常为 `python app.py` 或 `python app.py 127.0.0.1:8080`）。
+本 Skill 用于通过 HTTP API 操作当前 Agent Service server。需要执行实际操作时，优先使用 `bash` 工具调用 `curl`。所有请求都应面向运行中的 server；如果 server 未启动，先提示用户启动（通常为 `python app.py` 或 `python app.py 127.0.0.1:8080`）。
 
 ## 1. Server 地址配置
 
