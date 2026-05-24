@@ -27,7 +27,10 @@
     }
   }, null, 2)
 
-  let mcp_config_text = $state(isMcpEdit ? JSON.stringify(mcpServer?.config ?? _init.mcpServerConfig ?? {}, null, 2) : '')
+  // For edit mode, show the full mcpServers wrapper to match registration format
+  const _mcpServerName = mcpServer?.serverName ?? _init.mcpServerName ?? 'myServer'
+  const _mcpServerConfig = mcpServer?.config ?? _init.mcpServerConfig ?? {}
+  let mcp_config_text = $state(isMcpEdit ? JSON.stringify({ mcpServers: { [_mcpServerName]: _mcpServerConfig } }, null, 2) : '')
 
   let errors = $state({})
   let submitError = $state('')
@@ -73,8 +76,20 @@
       if (tool_type === 'mcp') {
         const config = JSON.parse(mcp_config_text)
         const serverName = mcpServer?.serverName ?? _init.mcpServerName
-        if (isMcpEdit && serverName) await mcpServers.delete(serverName)
-        await tools.createMcp(config)
+        if (isMcpEdit && serverName) {
+          // Edit: delete old first, rollback if create fails
+          const oldConfig = _mcpServerConfig
+          await mcpServers.delete(serverName)
+          try {
+            await tools.createMcp(config)
+          } catch (createErr) {
+            // Rollback: restore old config so the server isn't lost
+            try { await mcpServers.restore(serverName, oldConfig) } catch { /* best-effort */ }
+            throw createErr
+          }
+        } else {
+          await tools.createMcp(config)
+        }
       } else if (tool_type === 'skill') {
         await tools.createSkill(skill_dir.trim())
       } else {

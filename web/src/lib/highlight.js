@@ -102,11 +102,11 @@ function readFollowingIndentAfterComma(code, index) {
   return next === '"' || next === '}' || next === ']' ? '\n' : ''
 }
 
-function readFollowingIndentBeforeArrayClose(code, index) {
+function readFollowingIndentBeforeClose(code, index) {
   if (!code.startsWith('\n', index)) return ''
   let i = index + 1
   while (code[i] === ' ' || code[i] === '\t') i++
-  return code[i] === ']' ? code.slice(index, i) : ''
+  return code[i] === ']' || code[i] === '}' ? code.slice(index, i) : ''
 }
 
 function getLinePrefixLength(code, index) {
@@ -191,7 +191,7 @@ function highlightJson(code, options = {}) {
         : null
       const afterComma = end + trailingComma.length
       const followingIndent = html
-        ? (trailingComma ? readFollowingIndentAfterComma(code, afterComma) : readFollowingIndentBeforeArrayClose(code, end))
+        ? (trailingComma ? readFollowingIndentAfterComma(code, afterComma) : readFollowingIndentBeforeClose(code, end))
         : ''
       const matchEnd = html ? afterComma + followingIndent.length : end
 

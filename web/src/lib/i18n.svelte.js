@@ -60,6 +60,7 @@ const translations = {
 
     // ChatInput
     inputPlaceholder: '输入消息...',
+    stopBtnTooltip: '单击=中止 | 双击=强制终止（杀掉卡住的工具进程）',
     clearChat: '清除对话',
     newSession: '新建会话',
 
@@ -380,6 +381,7 @@ const translations = {
 
     // ChatInput
     inputPlaceholder: 'Type a message...',
+    stopBtnTooltip: 'Click = abort | Double-click = force kill (terminate stuck tool processes)',
     clearChat: 'Clear chat',
     newSession: 'New session',
 

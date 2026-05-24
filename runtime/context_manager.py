@@ -819,6 +819,67 @@ def _restore_file_plan(workspace: str, restore_plan: dict[str, dict], force: boo
     return {"restored_files": restored_files}
 
 
+def _move_journal_files_dir_to_undone(journal_dir: str) -> None:
+    """Move a turn journal's sidecar blobs from files/ to undone_files/.
+
+    The blobs are intentionally kept for inspection, but moving the directory
+    makes it explicit that the corresponding workspace changes have already
+    been reverted.
+    """
+    src_dir = os.path.join(journal_dir, "files")
+    dst_dir = os.path.join(journal_dir, "undone_files")
+    if not os.path.isdir(src_dir):
+        return
+
+    if not os.path.exists(dst_dir):
+        os.replace(src_dir, dst_dir)
+        return
+
+    os.makedirs(dst_dir, exist_ok=True)
+    for root, dirs, files in os.walk(src_dir, topdown=False):
+        rel_root = os.path.relpath(root, src_dir)
+        target_root = dst_dir if rel_root == "." else os.path.join(dst_dir, rel_root)
+        os.makedirs(target_root, exist_ok=True)
+        for name in files:
+            os.replace(os.path.join(root, name), os.path.join(target_root, name))
+        for name in dirs:
+            try:
+                os.rmdir(os.path.join(root, name))
+            except OSError:
+                pass
+    try:
+        os.rmdir(src_dir)
+    except OSError:
+        pass
+
+
+def _rewrite_blob_refs_to_undone_files(value):
+    if isinstance(value, dict):
+        if value.get("store") == "sidecar" and isinstance(value.get("file"), str):
+            file_ref = value["file"]
+            if file_ref == "files" or file_ref.startswith("files/"):
+                value["file"] = "undone_files" + file_ref[len("files"):]
+        for child in value.values():
+            _rewrite_blob_refs_to_undone_files(child)
+    elif isinstance(value, list):
+        for child in value:
+            _rewrite_blob_refs_to_undone_files(child)
+
+
+def _mark_manifest_file_changes_undone(manifest_path: str, manifest: dict) -> None:
+    """Move active file-change records/blobs to undone markers.
+
+    This is used after a journaled change is actually restored, whether via the
+    explicit undo tool or via revoking a user message. keep_files revokes do not
+    call this helper because no file restoration took place.
+    """
+    files = manifest.pop("files", None)
+    if isinstance(files, dict):
+        _rewrite_blob_refs_to_undone_files(files)
+        manifest["undone_files"] = files
+    _move_journal_files_dir_to_undone(os.path.dirname(manifest_path))
+
+
 def undo_latest_file_journal_turn(
     workspace: str,
     session_dir: str,
@@ -857,7 +918,7 @@ def undo_latest_file_journal_turn(
     now = _journal_now_iso()
     manifest["undone"] = True
     manifest["undone_at"] = now
-    manifest["undone_files"] = manifest.pop("files", {})
+    _mark_manifest_file_changes_undone(manifest_path, manifest)
     manifest["updated_at"] = now
     _journal_atomic_write_json(manifest_path, manifest)
     return {
@@ -937,6 +998,7 @@ def revoke_session_file_changes(
     for manifest_path, manifest in selected:
         manifest["revoked"] = True
         manifest["revoked_at"] = now
+        _mark_manifest_file_changes_undone(manifest_path, manifest)
         manifest["updated_at"] = now
         _journal_atomic_write_json(manifest_path, manifest)
         revoked_turns.append(str(manifest.get("turn_key")))

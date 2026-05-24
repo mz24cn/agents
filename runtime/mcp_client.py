@@ -436,6 +436,31 @@ class MCPClientManager:
         for server_name in list(self._connections.keys()):
             self.disconnect(server_name)
 
+    def abort_all(self) -> None:
+        """Kill all stdio MCP server processes immediately.
+
+        Called from the abort handler (different thread) to unblock any
+        pending ``call_tool()`` that is waiting on a server response.
+        The servers will be transparently restarted on the next use.
+        """
+        for server_name, conn in self._connections.items():
+            if conn.get("type") != "stdio":
+                continue
+            process = conn.get("process")
+            if process is None or process.returncode is not None:
+                continue
+            try:
+                pid = process.pid
+                try:
+                    os.killpg(os.getpgid(pid), signal.SIGTERM)
+                except (ProcessLookupError, OSError):
+                    process.terminate()
+            except (ProcessLookupError, OSError):
+                pass
+            # Mark as disconnected so _ensure_connected will reconnect later.
+            conn["connected"] = False
+            conn["tools_cache"] = None
+
     def is_connected(self, server_name: str) -> bool:
         conn = self._connections.get(server_name)
         if conn is None:

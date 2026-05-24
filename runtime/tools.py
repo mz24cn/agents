@@ -11,8 +11,11 @@ import re
 import base64
 import os
 import time
+import logging
 
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from runtime.models import ToolConfig
 from runtime.registry import ToolRegistry
@@ -176,6 +179,122 @@ def register_function_tool(registry: ToolRegistry, name: str = None, description
         registry.register(tool_config, callable_fn=fn)
         return fn
     return decorator
+
+
+def is_likely_base64(value: str, threshold: int = 256) -> bool:
+    """判断字符串是否看起来像 base64 编码内容。
+
+    检测逻辑：
+    1. 长度必须大于阈值（默认256字符）
+    2. 只包含 base64 合法字符（A-Z, a-z, 0-9, +, /, =）
+    3. 末尾可能有 0-2 个 '=' 填充符
+
+    Args:
+        value: 要检测的字符串
+        threshold: 长度阈值，低于此值认为不是 base64（可能是文件路径）
+
+    Returns:
+        True 如果看起来像 base64，False 否则
+    """
+    if not isinstance(value, str):
+        return False
+    
+    # 长度检查：base64 编码的文件内容通常很长
+    if len(value) < threshold:
+        return False
+    
+    # 字符合法性检查：只包含 base64 字符集
+    # 移除末尾的 '=' 填充符后检查
+    content = value.rstrip('=')
+    if not content:
+        return False
+    
+    # base64 字符集：A-Z, a-z, 0-9, +, /
+    import string
+    valid_chars = set(string.ascii_letters + string.digits + '+/')
+    return all(c in valid_chars for c in content)
+
+
+def convert_file_path_to_base64(value: str) -> tuple[str, bool]:
+    """尝试将文件路径转换为 base64 编码内容。
+
+    如果输入看起来不是 base64（长度较短），则尝试将其作为文件路径打开，
+    成功则返回 base64 编码内容。
+
+    Args:
+        value: 可能是文件路径的字符串
+
+    Returns:
+        tuple: (结果字符串, 是否进行了转换)
+        - 如果转换成功：(base64_content, True)
+        - 如果无需转换或失败：(original_value, False)
+    """
+    # 如果已经是 base64，直接返回
+    if is_likely_base64(value):
+        return value, False
+    
+    # 尝试作为文件路径打开
+    try:
+        # 处理路径：支持正斜杠和反斜杠
+        file_path = value.replace('/', os.sep).replace('\\', os.sep)
+        
+        # 检查文件是否存在
+        if not os.path.exists(file_path):
+            return value, False
+        
+        # 检查是否是文件（不是目录）
+        if not os.path.isfile(file_path):
+            return value, False
+        
+        # 读取文件并转换为 base64
+        with open(file_path, 'rb') as f:
+            file_content = f.read()
+        
+        # 转换为 base64 字符串
+        base64_content = base64.b64encode(file_content).decode('utf-8')
+        return base64_content, True
+        
+    except (OSError, IOError, PermissionError):
+        # 文件读取失败，返回原值
+        return value, False
+    except Exception:
+        # 其他异常，返回原值
+        return value, False
+
+
+def process_tool_arguments_for_base64(arguments: dict) -> dict:
+    """处理工具调用参数，自动将文件路径转换为 base64。
+
+    检测参数中名为 'base64_content' 的字段，如果其值看起来不是 base64
+    （长度小于阈值），则尝试将其作为文件路径打开并转换。
+
+    Args:
+        arguments: 工具调用参数字典
+
+    Returns:
+        处理后的参数字典
+    """
+    # 需要检测的参数名列表
+    base64_param_names = ['base64_content', 'base64_data', 'image_base64']
+    
+    for param_name in base64_param_names:
+        if param_name in arguments:
+            original_value = arguments[param_name]
+            
+            # 只处理字符串类型
+            if isinstance(original_value, str):
+                converted_value, was_converted = convert_file_path_to_base64(original_value)
+                
+                if was_converted:
+                    arguments[param_name] = converted_value
+                    # 添加元数据，便于调试
+                    arguments['_original_path'] = original_value
+                    arguments['_converted_to_base64'] = True
+                    logger.info(f"自动转换文件路径到 base64: {param_name} = {original_value} -> (已转换, 长度 {len(converted_value)})")
+                else:
+                    logger.debug(f"参数 {param_name} 无需转换 (长度 {len(original_value)}, 看起来像 base64: {is_likely_base64(original_value)})")
+    
+    return arguments
 
 
 def save_and_replace_base64(text: str, output_dir: str ="/tmp"):

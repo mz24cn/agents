@@ -1,10 +1,29 @@
 <script>
   import { t } from '../../lib/i18n.svelte.js'
 
-  let { disabled = false, onSend, onStop, onOpenTemplatePanel, text = $bindable(''), isStreaming = false } = $props()
+  let { disabled = false, onSend, onStop, onStopForce, onOpenTemplatePanel, text = $bindable(''), isStreaming = false } = $props()
 
   // 输入框为空且不在流式状态时，显示"?"按钮（提示词模板入口）
   let showTemplateBtn = $derived(!isStreaming && !text.trim())
+
+  // Double-click detection for forced abort.
+  // Single click → normal abort; double-click → forced abort (kills tool processes).
+  let _stopClickTimer = null
+
+  function handleStopClick() {
+    if (_stopClickTimer) {
+      // Second click within 300ms → forced abort
+      clearTimeout(_stopClickTimer)
+      _stopClickTimer = null
+      onStopForce?.()
+    } else {
+      // First click → start timer, fire normal abort on expiry
+      _stopClickTimer = setTimeout(() => {
+        _stopClickTimer = null
+        onStop?.()
+      }, 300)
+    }
+  }
 
   function handleSend() {
     const trimmed = text.trim()
@@ -46,8 +65,9 @@
     <button
       class="send-btn"
       class:stop={isStreaming}
-      onclick={isStreaming ? () => onStop?.() : handleSend}
+      onclick={isStreaming ? handleStopClick : handleSend}
       disabled={isStreaming ? false : (disabled || !text.trim())}
+      title={isStreaming ? t('stopBtnTooltip') : ''}
     >
       {#if isStreaming}⏹{:else}↑{/if}
     </button>

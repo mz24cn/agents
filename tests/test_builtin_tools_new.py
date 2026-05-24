@@ -631,6 +631,54 @@ class TestEditFileUnit:
         assert "error" not in result, f"Unexpected error: {result}"
         assert test_file.read_text(encoding="utf-8") == "a\nB\nc\n"
 
+    def test_diff_mode_rewrites_bad_hunk_counts(self, workspace):
+        """diff mode fixes stale unified diff hunk counts before invoking patch."""
+        test_file = workspace / "bad_counts.txt"
+        test_file.write_text("a\nb\nc\n", encoding="utf-8")
+        patch = (
+            "--- a/bad_counts.txt\n"
+            "+++ b/bad_counts.txt\n"
+            "@@ -1,99 +1,99 @@\n"
+            " a\n"
+            "-b\n"
+            "+B\n"
+            " c\n"
+        )
+
+        result = _json.loads(_edit_file("bad_counts.txt", "diff", patch=patch))
+
+        assert "error" not in result, f"Unexpected error: {result}"
+        assert test_file.read_text(encoding="utf-8") == "a\nB\nc\n"
+
+    def test_diff_mode_applies_begin_patch_with_bare_anchor_sections(self, workspace):
+        """Begin Patch bare @@ anchor sections are located but not emitted as hunks."""
+        test_file = workspace / "begin_patch.py"
+        test_file.write_text("def f():\n    value = 1\n    return value\n", encoding="utf-8")
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: begin_patch.py\n"
+            "@@\n"
+            "def f():\n"
+            "@@\n"
+            "    return value\n"
+            "+\n"
+            "+def g():\n"
+            "+    return 2\n"
+            "*** End Patch\n"
+        )
+
+        result = _json.loads(_edit_file("begin_patch.py", "diff", patch=patch))
+
+        assert "error" not in result, f"Unexpected error: {result}"
+        assert test_file.read_text(encoding="utf-8") == (
+            "def f():\n"
+            "    value = 1\n"
+            "    return value\n"
+            "\n"
+            "def g():\n"
+            "    return 2\n"
+        )
+
     def test_diff_mode_returns_patch_diagnostics(self, workspace):
         """PatchFailed includes patch output so callers can diagnose failures."""
         test_file = workspace / "diagnostic.txt"

@@ -6,12 +6,21 @@ tool call loop handling. Only uses Python standard library modules.
 """
 
 import json
+import logging
 import os
+import socket
 import time
 import urllib.request
 import urllib.error
 import datetime as _dt
 from typing import Iterator, Optional
+
+_logger = logging.getLogger("runtime.runtime")
+
+# Socket timeout (seconds) for model API calls (connect + read).
+# Covers the entire lifecycle: TCP handshake, TLS negotiation, waiting for
+# first response bytes, and each subsequent read on streaming responses.
+_MODEL_API_TIMEOUT = int(os.environ.get("MODEL_API_TIMEOUT", "600"))
 
 from runtime.models import (
     InferenceRequest,
@@ -178,7 +187,7 @@ class Runtime:
                 http_req = urllib.request.Request(
                     url, data=body_bytes, headers=headers, method="POST"
                 )
-                with urllib.request.urlopen(http_req) as http_resp:
+                with urllib.request.urlopen(http_req, timeout=_MODEL_API_TIMEOUT) as http_resp:
                     response_data = http_resp.read()
             except urllib.error.HTTPError as exc:
                 error_body = ""
@@ -186,8 +195,6 @@ class Runtime:
                     error_body = exc.read().decode("utf-8", errors="replace")
                 except Exception:
                     pass
-                import logging
-                _logger = logging.getLogger("runtime.runtime")
                 _logger.error(
                     "infer HTTP error | url=%s code=%s reason=%s body=%s",
                     url, exc.code, exc.reason, error_body[:2000],
@@ -199,6 +206,16 @@ class Runtime:
                     error_code=str(exc.code),
                 )
             except urllib.error.URLError as exc:
+                reason = getattr(exc, "reason", exc)
+                is_timeout = isinstance(reason, socket.timeout) or "timed out" in str(reason).lower()
+                if is_timeout:
+                    _logger.error("infer timeout | url=%s timeout=%ds", url, _MODEL_API_TIMEOUT)
+                    return InferenceResult(
+                        success=False,
+                        messages=messages,
+                        error=f"Model API request timed out after {_MODEL_API_TIMEOUT}s",
+                        error_code="TIMEOUT",
+                    )
                 return InferenceResult(
                     success=False,
                     messages=messages,
@@ -402,6 +419,12 @@ class Runtime:
         if tool_config.tool_type == "function":
             return self._execute_function_tool(tool_config, arguments), tool_config
         elif tool_config.tool_type == "mcp":
+            # --- Base64 file path auto-conversion (for file transfer MCP) ---
+            # 检测参数中的 base64_content 等字段，如果值看起来是文件路径（非 base64），
+            # 则自动读取文件并转换为 base64，避免大模型处理长 base64 字符串。
+            from runtime.tools import process_tool_arguments_for_base64
+            arguments = process_tool_arguments_for_base64(arguments)
+            
             result_str = self._execute_mcp_tool(tool_config, arguments)
 
             # --- Base64 image interception (inference loop only) ---
@@ -767,6 +790,12 @@ class Runtime:
         total_completion = 0
         overall_start = time.monotonic()
         while True:
+            # Check cancel_event before each round (including before model API call)
+            # so we don't block for MODEL_API_TIMEOUT seconds after a forced abort.
+            if cancel_event is not None and cancel_event.is_set():
+                yield Message(role="assistant", timestamp=_now_ts(), content="Error: user interrupted.")
+                return
+
             url, headers, body_bytes = protocol.build_request(
                 config=model_config, messages=messages,
                 tools=tools if tools else None, stream=True,
@@ -776,15 +805,13 @@ class Runtime:
             try:
                 http_req = urllib.request.Request(
                     url, data=body_bytes, headers=headers, method="POST")
-                http_resp = urllib.request.urlopen(http_req)
+                http_resp = urllib.request.urlopen(http_req, timeout=_MODEL_API_TIMEOUT)
             except urllib.error.HTTPError as exc:
                 error_body = ""
                 try:
                     error_body = exc.read().decode("utf-8", errors="replace")
                 except Exception:
                     pass
-                import logging
-                _logger = logging.getLogger("runtime.runtime")
                 _logger.error(
                     "infer_stream HTTP error | url=%s code=%s reason=%s body=%s",
                     url, exc.code, exc.reason, error_body[:2000],
@@ -793,6 +820,18 @@ class Runtime:
                 if error_body:
                     detail += f" | body: {error_body[:500]}"
                 yield Message(role="assistant", timestamp=_now_ts(), content=f"Error: {detail}")
+                return
+            except (socket.timeout, urllib.error.URLError) as exc:
+                # URLError wraps socket.timeout when the underlying socket times out.
+                reason = getattr(exc, "reason", exc)
+                is_timeout = isinstance(reason, socket.timeout) or "timed out" in str(reason).lower()
+                if is_timeout:
+                    _logger.error("infer_stream timeout | url=%s timeout=%ds", url, _MODEL_API_TIMEOUT)
+                    yield Message(role="assistant", timestamp=_now_ts(),
+                                  content=f"Error: model API request timed out after {_MODEL_API_TIMEOUT}s")
+                else:
+                    _logger.error("infer_stream connection error | url=%s err=%s", url, reason)
+                    yield Message(role="assistant", timestamp=_now_ts(), content=f"Error: {exc}")
                 return
             except Exception as exc:
                 yield Message(role="assistant", timestamp=_now_ts(), content=f"Error: {exc}")

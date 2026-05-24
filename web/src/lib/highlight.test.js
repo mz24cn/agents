@@ -178,7 +178,7 @@ describe('highlight() unit tests — JSON', () => {
     expect(result).toContain('hl-json-string-preview')
     expect(result).toContain('<details class="hl-json-expand"><summary')
     expect(result.indexOf('hl-json-expand-icon')).toBeLessThan(result.indexOf('hl-json-string-preview'))
-    expect(result).toContain('&quot;'.concat('0123456789'.repeat(10), '…&quot;'))
+    expect(result).toContain('&quot;'.concat('0123456789'.repeat(9), '…&quot;'))
     expect(result).toContain('<span class="hl-json-expand-full">0123456789')
     expect(result).toContain('line1\nline2 &quot;quoted&quot;</span>')
     expect(result).not.toContain('\\nline2')
@@ -192,6 +192,12 @@ describe('highlight() unit tests — JSON', () => {
     expect(comma).toBeGreaterThan(-1)
     expect(comma).toBeLessThan(summaryEnd)
     expect(result).toContain('</details>  <span class="hl-key">&quot;next&quot;</span>')
+  })
+
+  it('does not leave an extra newline before an object close after a collapsed final string value', () => {
+    const result = highlight(JSON.stringify({ text: 'x'.repeat(101) }, null, 2), 'json')
+    expect(result).toContain('</details>}')
+    expect(result).not.toContain('</details>\n}')
   })
 
   it('collapses long string elements in JSON arrays', () => {

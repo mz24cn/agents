@@ -537,6 +537,10 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         if m:
             self._handle_update_tool(m.group(1))
             return
+        m = re.match(r"^/v1/mcp-servers/([^/]+)$", path)
+        if m:
+            self._handle_restore_mcp_server_config(urllib.parse.unquote(m.group(1)))
+            return
         m = re.match(r"^/v1/prompt-templates/([^/]+)$", path)
         if m:
             self._handle_update_prompt_template(m.group(1))
@@ -1102,8 +1106,11 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
     def _handle_infer_abort(self) -> None:
         """POST /v1/infer/abort — 主动中止指定会话的流式推理。
 
-        请求体: {"session_id": "<session_id>"}
+        请求体: {"session_id": "<session_id>", "forced": true|false}
         找到对应的 cancel_event 并 set()，使推理线程在下一个检查点退出。
+
+        当 forced=true 时，还会主动杀死正在执行的工具进程（bash、MCP），
+        并强制将会话状态标记为 done_error_unread，适用于工具调用卡死的场景。
         """
         body = self._read_json_body()
         if body is None:
@@ -1112,13 +1119,44 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         if not session_id:
             self._send_json_error(400, "Missing required field: session_id")
             return
+        forced = body.get("forced", False) is True
+
         active_streams = getattr(self.server, "active_streams", None)
         if active_streams is not None and session_id in active_streams:
             active_streams[session_id].set()
+
+        if forced:
+            self._force_abort(session_id)
+            self._send_json_response(200, {"ok": True, "forced": True})
+        elif active_streams is not None and session_id in active_streams:
             self._send_json_response(200, {"ok": True})
         else:
             # 会话不存在或已结束，视为成功（幂等）
             self._send_json_response(200, {"ok": True, "note": "session not found or already done"})
+
+    def _force_abort(self, session_id: str) -> None:
+        """Kill running tool processes and force session status to done."""
+        # 1. Kill any running bash process for this session.
+        try:
+            from runtime.builtin_tools import kill_active_process
+            kill_active_process(session_id)
+        except Exception as exc:
+            logger.error("force_abort: kill_active_process failed for %s: %s", session_id, exc)
+
+        # 2. Kill all MCP stdio server processes so pending call_tool() unblocks.
+        try:
+            runtime = self._get_runtime()
+            mcp_manager = getattr(runtime, "_mcp_manager", None)
+            if mcp_manager is not None:
+                mcp_manager.abort_all()
+        except Exception as exc:
+            logger.error("force_abort: mcp abort_all failed for %s: %s", session_id, exc)
+
+        # 3. Force session status to done so the frontend can stop waiting.
+        with _session_state_lock:
+            _session_statuses[session_id] = "done_error_unread"
+            _unread_sessions[session_id] = "done_error_unread"
+        _broadcast_session_status(session_id, "done_error_unread")
 
     @staticmethod
     def _extract_json(text: str) -> Optional[dict | list]:
@@ -1602,6 +1640,28 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         else:
             data = {"mcpServers": {}}
         self._send_json_response(200, data)
+
+    def _handle_restore_mcp_server_config(self, server_name: str) -> None:
+        """PUT /v1/mcp-servers/{server_name} — restore/update a single MCP server config.
+
+        Only persists the config to mcp_servers.json without connecting or
+        discovering tools.  Used for rollback when a create step fails after
+        the old server was already deleted.
+        """
+        body = self._read_json_body()
+        if body is None:
+            return
+
+        saved: dict = {}
+        if os.path.isfile(_MCP_SERVERS_PATH):
+            with open(_MCP_SERVERS_PATH, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+        saved_servers = saved.setdefault("mcpServers", {})
+        saved_servers[server_name] = body
+        os.makedirs(_DATA_DIR, exist_ok=True)
+        with open(_MCP_SERVERS_PATH, "w", encoding="utf-8") as f:
+            json.dump(saved, f, ensure_ascii=False, indent=2)
+        self._send_json_response(200, {"status": "restored", "server_name": server_name})
 
     def _handle_delete_mcp_server(self, server_name: str) -> None:
         """DELETE /v1/mcp-servers/{server_name} — remove an MCP server and all its tools."""

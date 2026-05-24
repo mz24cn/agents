@@ -59,8 +59,9 @@ export const tools = {
 
 /** MCP server helpers. */
 export const mcpServers = {
-  list:   ()              => request('GET',    '/v1/mcp-servers'),
-  delete: (serverName)    => request('DELETE', `/v1/mcp-servers/${encodeURIComponent(serverName)}`),
+  list:    ()                          => request('GET',    '/v1/mcp-servers'),
+  delete:  (serverName)                => request('DELETE', `/v1/mcp-servers/${encodeURIComponent(serverName)}`),
+  restore: (serverName, config)        => request('PUT',    `/v1/mcp-servers/${encodeURIComponent(serverName)}`, config),
 }
 
 /** Prompt template CRUD helpers. */
@@ -164,14 +165,17 @@ export function inferStream(body, onMessage, onDone, onError, onInit = null) {
  * even while a delegate sub-agent is running (no SSE writes happening).
  *
  * @param {string} sessionId
+ * @param {boolean} [forced=false]  When true, kills running tool processes
+ *        (bash, MCP) and forces session status to done.  Use when the
+ *        session is stuck in a tool call that won't respond to a normal abort.
  * @returns {Promise<void>}
  */
-export async function abortInferStream(sessionId) {
+export async function abortInferStream(sessionId, forced = false) {
   try {
     await fetch('/v1/infer/abort', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_id: sessionId }),
+      body: JSON.stringify({ session_id: sessionId, forced }),
     })
   } catch {
     // best-effort — ignore network errors

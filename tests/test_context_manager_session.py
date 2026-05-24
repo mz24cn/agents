@@ -146,9 +146,15 @@ def test_undo_latest_file_journal_turn_moves_files_to_undone_files(tmp_path):
     assert "error" not in result
     assert result["turn_key"] == "260511_102030"
     assert open(target, encoding="utf-8").read() == "before\n"
+    journal_dir = os.path.dirname(manifest_path)
+    assert not os.path.exists(os.path.join(journal_dir, "files"))
+    assert os.path.exists(os.path.join(journal_dir, "undone_files", "foo.txt.baseline.gz"))
+    assert os.path.exists(os.path.join(journal_dir, "undone_files", "foo.txt.after.gz"))
     manifest = json.load(open(manifest_path, encoding="utf-8"))
     assert "files" not in manifest
     assert "foo.txt" in manifest["undone_files"]
+    assert manifest["undone_files"]["foo.txt"]["baseline"]["file"] == "undone_files/foo.txt.baseline.gz"
+    assert manifest["undone_files"]["foo.txt"]["after"]["file"] == "undone_files/foo.txt.after.gz"
 
 
 def test_revoke_session_file_changes_restores_sidecar_baseline(tmp_path):
@@ -173,8 +179,16 @@ def test_revoke_session_file_changes_restores_sidecar_baseline(tmp_path):
 
     assert "error" not in result
     assert open(target, encoding="utf-8").read() == "before\n"
+    journal_dir = os.path.dirname(manifest_path)
+    assert not os.path.exists(os.path.join(journal_dir, "files"))
+    assert os.path.exists(os.path.join(journal_dir, "undone_files", "foo.txt.baseline.gz"))
+    assert os.path.exists(os.path.join(journal_dir, "undone_files", "foo.txt.after.gz"))
     manifest = json.load(open(manifest_path, encoding="utf-8"))
     assert manifest["revoked"] is True
+    assert "files" not in manifest
+    assert "foo.txt" in manifest["undone_files"]
+    assert manifest["undone_files"]["foo.txt"]["baseline"]["file"] == "undone_files/foo.txt.baseline.gz"
+    assert manifest["undone_files"]["foo.txt"]["after"]["file"] == "undone_files/foo.txt.after.gz"
 
 
 def test_revoke_session_file_changes_deletes_created_file(tmp_path):
@@ -193,12 +207,49 @@ def test_revoke_session_file_changes_deletes_created_file(tmp_path):
             "after": _blob_ref(session_dir, "260511_102030", "created.txt", "after", b"created\n"),
         }
     }
-    _write_manifest(session_dir, workspace, "session1", "260511_102030", "2026-05-11T10:20:30", files)
+    manifest_path = _write_manifest(session_dir, workspace, "session1", "260511_102030", "2026-05-11T10:20:30", files)
 
     result = revoke_session_file_changes(workspace, session_dir, "session1", "2026-05-11T10:20:30")
 
     assert "error" not in result
     assert not os.path.exists(target)
+    journal_dir = os.path.dirname(manifest_path)
+    assert not os.path.exists(os.path.join(journal_dir, "files"))
+    assert os.path.exists(os.path.join(journal_dir, "undone_files", "created.txt.after.gz"))
+    manifest = json.load(open(manifest_path, encoding="utf-8"))
+    assert manifest["undone_files"]["created.txt"]["after"]["file"] == "undone_files/created.txt.after.gz"
+
+
+def test_revoke_session_file_changes_keep_files_keeps_active_files_dir(tmp_path):
+    workspace = str(tmp_path / "workspace")
+    session_dir = str(tmp_path / "chat_data" / "session1")
+    os.makedirs(workspace)
+    os.makedirs(session_dir)
+    target = os.path.join(workspace, "foo.txt")
+    with open(target, "w", encoding="utf-8") as fh:
+        fh.write("after\n")
+    files = {
+        "foo.txt": {
+            "path": "foo.txt",
+            "tools": ["edit_file"],
+            "baseline": _blob_ref(session_dir, "260511_102030", "foo.txt", "baseline", b"before\n"),
+            "after": _blob_ref(session_dir, "260511_102030", "foo.txt", "after", b"after\n"),
+        }
+    }
+    manifest_path = _write_manifest(session_dir, workspace, "session1", "260511_102030", "2026-05-11T10:20:30", files)
+
+    result = revoke_session_file_changes(workspace, session_dir, "session1", "2026-05-11T10:20:30", keep_files=True)
+
+    assert "error" not in result
+    assert open(target, encoding="utf-8").read() == "after\n"
+    journal_dir = os.path.dirname(manifest_path)
+    assert os.path.exists(os.path.join(journal_dir, "files", "foo.txt.baseline.gz"))
+    assert not os.path.exists(os.path.join(journal_dir, "undone_files"))
+    manifest = json.load(open(manifest_path, encoding="utf-8"))
+    assert manifest["revoked"] is True
+    assert manifest["kept_files"] is True
+    assert "files" in manifest
+    assert "undone_files" not in manifest
 
 
 def test_revoke_session_file_changes_detects_conflict_before_restoring(tmp_path):

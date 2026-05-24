@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import signal
 import shutil
 import stat
 import subprocess
@@ -40,6 +41,40 @@ from runtime.models import InferenceRequest, Message, ToolConfig
 from runtime.registry import ToolRegistry
 
 _thread_local = threading.local()
+
+# Shared registry mapping session_id → subprocess.Popen for the currently
+# executing bash command.  Populated by _execute_command so that the abort
+# handler (which runs in the HTTPServer thread) can kill the process.
+_active_processes: dict[str, subprocess.Popen] = {}
+_active_processes_lock = threading.Lock()
+
+
+def kill_active_process(session_id: str) -> bool:
+    """Kill the bash process associated with *session_id*.
+
+    Called from the abort handler in a different thread.  Returns True if a
+    process was found and killed, False otherwise.
+    """
+    with _active_processes_lock:
+        proc = _active_processes.pop(session_id, None)
+    if proc is None:
+        return False
+    try:
+        # Kill the entire process group so child processes are also terminated.
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                proc.kill()
+        return True
+    except (ProcessLookupError, OSError):
+        return False
 
 
 def _get_file_journal_manager(workspace: str) -> '_FileJournalManager':
@@ -1380,142 +1415,200 @@ def _strip_diff_fence(patch: str) -> str:
     return patch
 
 
-def _convert_begin_patch_format(patch: str, rel_path: str) -> str:
-    """Convert *** Begin Patch format to standard unified diff format.
-    
-    Some LLMs generate patches in this format:
-    *** Begin Patch
-    *** Update File: path/to/file
-    @@
-    context line
-    +added line
-    -removed line
-    @@
-    more context
-    *** End Patch
-    
-    This function converts it to standard unified diff format.
-    """
-    lines = patch.splitlines()
-    result = []
-    current_file = None
-    hunk_lines = []
-    hunk_start_old = 1
-    hunk_start_new = 1
-    
-    for line in lines:
-        # Skip markers
-        if line.startswith("*** Begin Patch") or line.startswith("*** End Patch"):
-            continue
-        
-        # File markers
-        if line.startswith("*** Update File:"):
-            # Flush previous hunk if any
-            if hunk_lines and current_file:
-                result.extend(_build_hunk(hunk_lines, hunk_start_old, hunk_start_new))
-                hunk_lines = []
-            
-            current_file = line.split(":", 1)[1].strip()
-            result.append(f"--- {current_file}")
-            result.append(f"+++ {current_file}")
-            hunk_start_old = 1
-            hunk_start_new = 1
-            continue
-        
-        if line.startswith("*** Add File:"):
-            # Flush previous hunk if any
-            if hunk_lines and current_file:
-                result.extend(_build_hunk(hunk_lines, hunk_start_old, hunk_start_new))
-                hunk_lines = []
-            
-            current_file = line.split(":", 1)[1].strip()
-            result.append(f"--- /dev/null")
-            result.append(f"+++ {current_file}")
-            hunk_start_old = 1
-            hunk_start_new = 1
-            continue
-        
-        if line.startswith("*** Delete File:"):
-            # Flush previous hunk if any
-            if hunk_lines and current_file:
-                result.extend(_build_hunk(hunk_lines, hunk_start_old, hunk_start_new))
-                hunk_lines = []
-            
-            current_file = line.split(":", 1)[1].strip()
-            result.append(f"--- {current_file}")
-            result.append(f"+++ /dev/null")
-            hunk_start_old = 1
-            hunk_start_new = 1
-            continue
-        
-        # Hunk header (just @@ without line numbers)
-        if line.startswith("@@"):
-            # Flush previous hunk if any
-            if hunk_lines and current_file:
-                result.extend(_build_hunk(hunk_lines, hunk_start_old, hunk_start_new))
-                hunk_lines = []
-            
-            # Try to parse line numbers from @@
-            import re
-            match = re.match(r'@@ -(\d+),?(\d+)? \+(\d+),?(\d+)? @@', line)
-            if match:
-                hunk_start_old = int(match.group(1))
-                hunk_start_new = int(match.group(3))
-                result.append(line)
-            else:
-                # Just @@ without numbers - we'll generate numbers later
-                hunk_start_old = 1
-                hunk_start_new = 1
-            continue
-        
-        # Regular patch line
-        if current_file:
-            hunk_lines.append(line)
-    
-    # Flush last hunk
-    if hunk_lines and current_file:
-        result.extend(_build_hunk(hunk_lines, hunk_start_old, hunk_start_new))
-    
-    return "\n".join(result) + "\n" if result else ""
+def _find_line_block(file_lines: list[str], block: list[str], start: int = 0) -> Optional[int]:
+    """Find a block of logical lines in file_lines using whitespace-tolerant matching."""
+    if not block:
+        return start
+    stripped_file = [line.rstrip("\n").strip() for line in file_lines]
+    stripped_block = [line.strip() for line in block]
+    n = len(stripped_block)
+    for i in range(max(start, 0), len(stripped_file) - n + 1):
+        if stripped_file[i:i + n] == stripped_block:
+            return i
+    return None
 
 
-def _build_hunk(lines: list, start_old: int, start_new: int) -> list:
-    """Build a hunk with proper line numbers."""
-    import re
-    
-    # Count lines
+def _format_hunk_header(old_start: int, old_count: int, new_start: int, new_count: int) -> str:
+    old_range = str(old_start) if old_count == 1 else f"{old_start},{old_count}"
+    new_range = str(new_start) if new_count == 1 else f"{new_start},{new_count}"
+    return f"@@ -{old_range} +{new_range} @@"
+
+
+def _is_added_line(line: str) -> bool:
+    return line.startswith("+")
+
+
+def _is_removed_line(line: str) -> bool:
+    return line.startswith("-")
+
+
+def _count_hunk_lines(hunk_lines: list[str]) -> tuple[int, int]:
     old_count = 0
     new_count = 0
-    for line in lines:
-        if line.startswith("+"):
+    for line in hunk_lines:
+        if _is_added_line(line):
             new_count += 1
-        elif line.startswith("-"):
+        elif _is_removed_line(line):
             old_count += 1
+        elif line.startswith("\\"):
+            continue
         else:
-            # Context line
             old_count += 1
             new_count += 1
-    
-    # If we have no changes, skip
-    if old_count == 0 and new_count == 0:
-        return []
-    
-    result = [f"@@ -{start_old},{old_count} +{start_new},{new_count} @@"]
-    result.extend(lines)
-    return result
+    return old_count, new_count
 
 
-def _normalize_patch_for_path(patch: str, rel_path: str) -> str:
+def _rewrite_unified_hunk_counts(patch: str) -> str:
+    """Rewrite hunk line counts to match the hunk body.
+
+    LLMs often produce otherwise-valid unified diffs with stale @@ -a,b +c,d @@
+    counts.  The external patch command treats those as malformed, so normalize
+    the counts before invoking it.
+    """
+    lines = patch.splitlines()
+    out: list[str] = []
+    i = 0
+    hunk_re = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)$")
+    while i < len(lines):
+        line = lines[i]
+        match = hunk_re.match(line)
+        if not match:
+            out.append(line)
+            i += 1
+            continue
+
+        body: list[str] = []
+        i += 1
+        while i < len(lines):
+            next_line = lines[i]
+            if next_line.startswith("@@ ") or next_line.startswith("--- "):
+                break
+            if not next_line.startswith((" ", "+", "-", "\\")):
+                # Some generated diffs omit the required leading space on
+                # context lines.  Add it so the hunk is syntactically valid.
+                next_line = f" {next_line}"
+            body.append(next_line)
+            i += 1
+
+        old_count, new_count = _count_hunk_lines(body)
+        old_start = int(match.group(1))
+        new_start = int(match.group(2))
+        suffix = match.group(3) or ""
+        out.append(_format_hunk_header(old_start, old_count, new_start, new_count) + suffix)
+        out.extend(body)
+
+    return "\n".join(out) + ("\n" if patch.endswith("\n") or out else "")
+
+
+def _build_located_hunk(file_lines: list[str], patch_lines: list[str], search_start: int = 0) -> tuple[Optional[list[str]], int]:
+    old_block = [line[1:] if _is_removed_line(line) else line[1:] if line.startswith(" ") else line for line in patch_lines if not _is_added_line(line)]
+    if not old_block:
+        # Pure insertion with no context is ambiguous; let patch report a useful
+        # diagnostic instead of inventing a location.
+        return None, search_start
+
+    match_start = _find_line_block(file_lines, old_block, search_start)
+    if match_start is None:
+        return None, search_start
+
+    old_count, new_count = _count_hunk_lines(patch_lines)
+    hunk = [_format_hunk_header(match_start + 1, old_count, match_start + 1, new_count)]
+    for line in patch_lines:
+        if _is_added_line(line) or _is_removed_line(line) or line.startswith("\\"):
+            hunk.append(line)
+        else:
+            hunk.append(f" {line[1:] if line.startswith(' ') else line}")
+    return hunk, match_start + max(old_count, 1)
+
+
+def _convert_begin_patch_format(patch: str, rel_path: str, resolved_path: Optional[str] = None) -> str:
+    """Convert common *** Begin Patch update hunks to unified diff.
+
+    The Begin Patch DSL frequently uses bare @@ markers as anchors, e.g. one
+    anchor for the containing function and another anchor for the insertion
+    point.  Treat anchor-only sections as location hints and emit only hunks that
+    actually contain +/- changes, with line numbers located from the target file.
+    """
+    file_lines: list[str] = []
+    if resolved_path:
+        try:
+            with open(resolved_path, "r", encoding="utf-8", errors="replace") as f:
+                file_lines = f.readlines()
+        except OSError:
+            file_lines = []
+
+    lines = patch.splitlines()
+    result: list[str] = []
+    current_file = rel_path
+    section: list[str] = []
+    search_start = 0
+    in_file = False
+
+    def flush_section() -> None:
+        nonlocal section, search_start
+        if not section:
+            return
+        has_change = any(_is_added_line(line) or _is_removed_line(line) for line in section)
+        if has_change:
+            hunk, next_start = _build_located_hunk(file_lines, section, search_start)
+            if hunk is None:
+                # Fall back to a syntactically valid hunk; patch will diagnose
+                # any context mismatch.
+                old_count, new_count = _count_hunk_lines(section)
+                hunk = [_format_hunk_header(1, old_count, 1, new_count), *section]
+            else:
+                search_start = next_start
+            result.extend(hunk)
+        else:
+            found = _find_line_block(file_lines, section, search_start)
+            if found is not None:
+                search_start = found + len(section)
+        section = []
+
+    for line in lines:
+        if line.startswith("*** Begin Patch") or line.startswith("*** End Patch"):
+            continue
+        if line.startswith("*** Update File:"):
+            flush_section()
+            current_file = line.split(":", 1)[1].strip() or rel_path
+            result = [f"--- {current_file}", f"+++ {current_file}"]
+            in_file = True
+            continue
+        if line.startswith("*** Add File:") or line.startswith("*** Delete File:"):
+            # Keep unsupported operations syntactically simple. edit_file already
+            # targets an existing single file, so update hunks are the useful case.
+            flush_section()
+            current_file = line.split(":", 1)[1].strip() or rel_path
+            result = [f"--- {current_file}", f"+++ {current_file}"]
+            in_file = True
+            continue
+        if line.startswith("@@"):
+            # Bare @@ markers are anchors in Begin Patch DSL.  Numbered @@
+            # headers are also treated as section boundaries; we recalculate the
+            # final location/counts from the target file below.
+            flush_section()
+            continue
+        if in_file:
+            section.append(line)
+
+    flush_section()
+    if not result:
+        return ""
+    return _rewrite_unified_hunk_counts("\n".join(result) + "\n")
+
+
+def _normalize_patch_for_path(patch: str, rel_path: str, resolved_path: Optional[str] = None) -> str:
     patch = _strip_diff_fence(patch)
-    
+
     # Handle "*** Begin Patch" format (used by some LLMs)
     if "*** Begin Patch" in patch:
-        patch = _convert_begin_patch_format(patch, rel_path)
-    
+        patch = _convert_begin_patch_format(patch, rel_path, resolved_path)
+
     lines = patch.splitlines(keepends=True)
     first_text = next((line.lstrip() for line in lines if line.strip()), "")
     if first_text.startswith("@@ "):
-        return f"--- {rel_path}\n+++ {rel_path}\n" + patch
+        patch = f"--- {rel_path}\n+++ {rel_path}\n" + patch
+        return _rewrite_unified_hunk_counts(patch)
 
     normalized = []
     before_first_hunk = True
@@ -1531,7 +1624,7 @@ def _normalize_patch_for_path(patch: str, rel_path: str) -> str:
         if line.startswith("@@ "):
             before_first_hunk = False
         normalized.append(line)
-    return "".join(normalized)
+    return _rewrite_unified_hunk_counts("".join(normalized))
 
 
 def _patch_process_output(result: subprocess.CompletedProcess) -> str:
@@ -1594,7 +1687,7 @@ def _edit_file_diff(
     if patch is None:
         return json.dumps({"error": "PatchFailed", "message": "patch parameter is required for diff mode"})
 
-    normalized_patch = _normalize_patch_for_path(patch, rel_path)
+    normalized_patch = _normalize_patch_for_path(patch, rel_path, resolved_path)
 
     try:
         dry_run = _run_patch(workspace, normalized_patch, dry_run=True)
@@ -1920,25 +2013,63 @@ def _execute_command(command: str, timeout: Optional[int] = None) -> str:
     env = os.environ.copy()
     env["TERM"] = "dumb"
 
+    # Use Popen with start_new_session=True so the abort handler can kill
+    # the entire process group via kill_active_process().
+    session_id = getattr(_thread_local, "session_id", None)
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             command,
             shell=True,
             cwd=workspace,
             env=env,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout_val,
+            start_new_session=True,  # own process group for clean kill
         )
-    except subprocess.TimeoutExpired:
-        return json.dumps({
-            "error": "Timeout",
-            "message": f"Command exceeded timeout of {timeout_val} seconds",
-            "exit_code": None,
-        })
+    except Exception as exc:
+        return json.dumps({"error": "SpawnFailed", "message": str(exc)})
 
-    stdout = result.stdout
-    stderr = result.stderr
+    # Register so the abort handler can kill it from another thread.
+    if session_id:
+        with _active_processes_lock:
+            _active_processes[session_id] = proc
+
+    try:
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout_val)
+        except subprocess.TimeoutExpired:
+            # Timeout — kill the process group.
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                proc.terminate()
+            try:
+                stdout, stderr = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    proc.kill()
+                stdout, stderr = proc.communicate()
+            return json.dumps({
+                "error": "Timeout",
+                "message": f"Command exceeded timeout of {timeout_val} seconds",
+                "exit_code": None,
+            })
+    finally:
+        # Unregister.
+        if session_id:
+            with _active_processes_lock:
+                _active_processes.pop(session_id, None)
+
+    # Check if the process was killed externally (abort handler).
+    if proc.returncode in (-signal.SIGTERM, -signal.SIGKILL):
+        return json.dumps({
+            "error": "Aborted",
+            "message": "Command was aborted by user",
+            "exit_code": proc.returncode,
+        })
 
     # Truncate combined output to output_line_limit lines
     stdout_lines = stdout.splitlines(keepends=True)
@@ -1964,7 +2095,7 @@ def _execute_command(command: str, timeout: Optional[int] = None) -> str:
         stdout += f"\n[...output truncated: {omitted_lines} lines omitted...]"
 
     response: dict = {
-        "exit_code": result.returncode,
+        "exit_code": proc.returncode,
         "stdout": stdout,
         "stderr": stderr,
         "truncated": truncated,

@@ -1,5 +1,6 @@
 <script>
-  import { inferStream, abortInferStream, agents as agentsApi, sessions as sessionsApi } from '../../lib/api.js'
+  import { onMount, onDestroy } from 'svelte'
+  import { inferStream, abortInferStream, subscribeSessionEvents, agents as agentsApi, sessions as sessionsApi } from '../../lib/api.js'
   import { catalog, loadAgents, loadTools, refreshAgents } from '../../lib/catalog-state.svelte.js'
   import ModelSelector from './ModelSelector.svelte'
   import ToolSelector from './ToolSelector.svelte'
@@ -279,6 +280,18 @@
       // 不再主动终止前端连接，等待后端发送终止消息后自然关闭
       abortFunctions[key] = null
     }
+  }
+
+  // Double-click stop = forced abort: kills running tool processes (bash, MCP)
+  // and forces session status to done.  Use when the session is stuck in a
+  // tool call that won't respond to a normal abort.
+  function handleStopForce() {
+    const key = storeKey(sessionId)
+    if (sessionId) abortInferStream(sessionId, true)
+    abortFunctions[key] = null
+    // Immediately mark local state as not streaming so the UI unblocks.
+    const store = sessionStore[key]
+    if (store) store.isStreaming = false
   }
 
   function mergeToolCallDeltas(existing = [], incoming = []) {
@@ -713,6 +726,31 @@
     // 当用户点击输入框时，选中全部文本，方便编辑
     e.target.select()
   }
+
+  // Listen for session events so the UI can recover from force-abort.
+  // When the backend force-aborts a session, it sets status to
+  // "done_error_unread".  We detect this and clear the local isStreaming
+  // flag, which lets the user continue interacting.
+  let _unsubscribeSessionEvents = null
+  onMount(() => {
+    _unsubscribeSessionEvents = subscribeSessionEvents(
+      (data) => {
+        if (data.event === 'message' && data.session_id && data.status) {
+          const s = sessionStore[storeKey(data.session_id)]
+          if (s && s.isStreaming && data.status.startsWith('done_')) {
+            s.isStreaming = false
+          }
+        }
+      },
+      () => { /* silently ignore SSE errors */ },
+    )
+  })
+  onDestroy(() => {
+    if (_unsubscribeSessionEvents) {
+      _unsubscribeSessionEvents()
+      _unsubscribeSessionEvents = null
+    }
+  })
 </script>
 
 <div class="chat-page">
@@ -847,6 +885,7 @@
     disabled={!selectedModelId && !selectedAgentId}
     onSend={handleSend}
     onStop={handleStop}
+    onStopForce={handleStopForce}
     onOpenTemplatePanel={openTemplatePanel}
     {isStreaming}
     bind:text={inputText}
