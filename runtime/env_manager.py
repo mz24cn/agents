@@ -12,7 +12,6 @@ import json
 import logging
 import os
 import re
-import tempfile
 
 logger = logging.getLogger("runtime.env_manager")
 
@@ -144,20 +143,9 @@ class EnvManager:
         Raises:
             OSError: 写入或替换失败时抛出。
         """
-        dir_path = os.path.dirname(path)
-        if dir_path:
-            os.makedirs(dir_path, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(dir=dir_path or ".")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(content)
-            os.replace(tmp_path, path)
-        except Exception:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
+        from runtime.common import atomic_write_text
+
+        atomic_write_text(path, content)
 
     def _sync_to_environ(self, env_map: dict[str, str]) -> None:
         """将 env_map 中所有键值对写入 os.environ。

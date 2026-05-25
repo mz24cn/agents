@@ -142,6 +142,8 @@ const translations = {
     statNet: '净推理时间:',
     statRound: '本轮总时间:',
     statOverall: '全程总时间:',
+    statFirstTokenTime: '首 token 时间:',
+    statCompletedTime: '推理完成时间:',
 
     // MessageList
     startChat: '开始对话吧 💬',
@@ -463,6 +465,8 @@ const translations = {
     statNet: 'net:',
     statRound: 'round:',
     statOverall: 'overall:',
+    statFirstTokenTime: 'first token time:',
+    statCompletedTime: 'completed time:',
 
     // MessageList
     startChat: 'Start a conversation 💬',

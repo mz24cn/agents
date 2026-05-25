@@ -64,7 +64,7 @@ def merge_stream_messages(stream_messages: list) -> tuple[list, Optional[dict]]:
         - turns: ConversationTurn 列表，可直接追加到会话历史
         - last_stat: 最后一条 usage 消息解析出的 stat dict，若无则为 None
     """
-    import datetime as _dt
+    from runtime.common import now_iso
     import json as _json
 
     turns: list = []
@@ -77,7 +77,9 @@ def merge_stream_messages(stream_messages: list) -> tuple[list, Optional[dict]]:
         nonlocal assistant_text_buf, assistant_thinking_buf, pending_tool_calls, first_assistant_ts
         if assistant_text_buf or pending_tool_calls or assistant_thinking_buf:
             # 优先使用第一条 assistant delta 的时间戳作为本轮时间戳
-            ts = first_assistant_ts if first_assistant_ts else _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            ts = first_assistant_ts if first_assistant_ts else now_iso()
+            # 推理完成时间 = 当前时间
+            completed_ts = now_iso()
             turns.append(ConversationTurn(
                 role="assistant",
                 content=assistant_text_buf,
@@ -85,6 +87,7 @@ def merge_stream_messages(stream_messages: list) -> tuple[list, Optional[dict]]:
                 tool_calls=pending_tool_calls if pending_tool_calls else None,
                 thinking=assistant_thinking_buf or None,
                 stat=stat,
+                completed_at=completed_ts,
             ))
             assistant_text_buf = ""
             assistant_thinking_buf = ""
@@ -133,7 +136,7 @@ def merge_stream_messages(stream_messages: list) -> tuple[list, Optional[dict]]:
             # tool result 到来时先 flush assistant turn（含 tool_calls）
             _flush_assistant()
             # 复用 Message 自带的时间戳，无则 fallback
-            ts = m.timestamp if m.timestamp else _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            ts = m.timestamp if m.timestamp else now_iso()
             turns.append(ConversationTurn(
                 role="tool",
                 content=m.content or "",
@@ -184,7 +187,7 @@ def persist_conversation(
     Returns:
         成功时返回 None；失败时返回捕获的异常（OSError 或其他）。
     """
-    import datetime as _dt
+    from runtime.common import now_iso
 
     try:
         try:
@@ -194,7 +197,7 @@ def persist_conversation(
         new_turns = list(existing_turns)
         for m in (original_messages or []):
             # 复用 Message 自带的时间戳，无则 fallback 为当前时间
-            ts = m.timestamp if m.timestamp else _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            ts = m.timestamp if m.timestamp else now_iso()
             new_turns.append(ConversationTurn(
                 role=m.role,
                 content=m.content or "",
@@ -247,7 +250,7 @@ def persist_conversation(
     return None
 
 
-_DATA_DIR = os.path.join(os.path.expanduser("~"), ".agents_runtime")
+from runtime.common import DATA_DIR as _DATA_DIR, set_request_context, get_request_context, clear_request_context, now_iso as _now_iso, session_timestamp
 
 
 def _load_function_from_file(file_path: str, func_name: str) -> Callable:
@@ -704,8 +707,8 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         original_messages = None
         user_message_timestamp = None
         if "messages" in body:
-            import datetime as _dt
-            now_ts = _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            from runtime.common import now_iso
+            now_ts = now_iso()
             original_messages = []
             for m in body["messages"]:
                 msg = Message.from_dict(m)
@@ -780,46 +783,42 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             max_tool_rounds=body.get("max_tool_rounds") or int(os.environ.get("MAX_TOOL_ROUNDS", 100)),
         )
 
-        from runtime.builtin_tools import _thread_local
         session_dir = None
         if use_session and session_id is not None:
             session_dir = os.path.dirname(context_manager._conversation_path(session_id))
-        _thread_local.sse_callback = None
-        _thread_local.session_id = session_id
-        _thread_local.session_dir = session_dir
-        _thread_local.user_message_timestamp = user_message_timestamp
-        _thread_local.depth = 0
-        _thread_local.tool_scope = tool_scope
-        _thread_local.context_manager = context_manager
-        _thread_local.session_manager = self.server.session_manager  # type: ignore[attr-defined]
+        set_request_context(
+            sse_callback=None,
+            session_id=session_id,
+            session_dir=session_dir,
+            user_message_timestamp=user_message_timestamp,
+            depth=0,
+            tool_scope=tool_scope,
+            context_manager=context_manager,
+            session_manager=self.server.session_manager,  # type: ignore[attr-defined]
+        )
 
         agent_nickname = agent.get("nickname") if agent else None
         return body, request, session_id, use_session, original_messages, context_manager, agent_id, agent_nickname, body["model_id"], tool_ids
 
     def _cleanup_thread_local(self):
-        from runtime.builtin_tools import _thread_local
         from runtime.models import Message
         import logging
         logger = logging.getLogger("runtime.server")
 
-        file_journal_manager = getattr(_thread_local, "file_journal_manager", None)
+        file_journal_manager = get_request_context("file_journal_manager")
         if file_journal_manager is not None:
             try:
                 file_journal_manager.flush()
             except Exception as flush_err:
                 logger.warning("Error flushing file journal: %s", flush_err)
             finally:
-                _thread_local.file_journal_manager = None
+                set_request_context(file_journal_manager=None)
 
-        _thread_local.sse_callback = None
-        _thread_local.cancel_event = None
-        _thread_local.session_id = None
-        _thread_local.session_dir = None
-        _thread_local.user_message_timestamp = None
-        _thread_local.depth = 0
-        _thread_local.tool_scope = []
-        _thread_local.context_manager = None
-        _thread_local.session_manager = None
+        clear_request_context([
+            "sse_callback", "cancel_event", "session_id", "session_dir",
+            "user_message_timestamp", "depth", "tool_scope",
+            "context_manager", "session_manager",
+        ])
 
     def _persist_conversation(self, context_manager, session_id, original_messages, collected_messages, agent_id=None, agent_nickname=None, model_id=None, tool_ids=None):
         if session_id is None:
@@ -995,8 +994,6 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         runtime = self._get_runtime()
         collected_messages: list[Message] = []
 
-        from runtime.builtin_tools import _thread_local
-
         def _sse_write(frame: dict) -> None:
             try:
                 event_data = json.dumps(frame, ensure_ascii=False)
@@ -1005,8 +1002,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-        _thread_local.sse_callback = _sse_write
-        _thread_local.cancel_event = cancel_event
+        set_request_context(sse_callback=_sse_write, cancel_event=cancel_event)
 
         # 注册到 active_streams，使 /v1/infer/abort 可以主动触发中止
         active_streams = getattr(self.server, "active_streams", None)
@@ -1065,8 +1061,8 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             cancel_event.set()
             if use_session:
-                import datetime as _dt
-                collected_messages.append(Message(role="assistant", timestamp=_dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"), content="\n\nError: user interrupted."))
+                from runtime.common import now_iso
+                collected_messages.append(Message(role="assistant", timestamp=now_iso(), content="\n\nError: user interrupted."))
                 # original_messages already saved in pre-inference step, pass [] to avoid duplication
                 persist_exc = self._persist_conversation(context_manager, session_id, [], collected_messages, agent_id, agent_nickname, model_id, tool_ids)
                 if persist_exc is not None:
@@ -1079,8 +1075,8 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 _broadcast_session_status(session_id, "done_error_unread")
         except Exception as exc:
             if use_session:
-                import datetime as _dt
-                collected_messages.append(Message(role="assistant", timestamp=_dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"), content=f"\n\nError: system aborted. ({exc})"))
+                from runtime.common import now_iso
+                collected_messages.append(Message(role="assistant", timestamp=now_iso(), content=f"\n\nError: system aborted. ({exc})"))
                 # original_messages already saved in pre-inference step, pass [] to avoid duplication
                 persist_exc = self._persist_conversation(context_manager, session_id, [], collected_messages, agent_id, agent_nickname, model_id, tool_ids)
                 if persist_exc is not None:
@@ -2027,7 +2023,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             if field not in body:
                 self._send_json_error(400, f"Missing required field: {field}")
                 return
-        agent_id = datetime.datetime.now().strftime("%y%m%d_%H%M%S")
+        agent_id = session_timestamp()
         self.server.agent_manager.create(  # type: ignore[attr-defined]
             agent_id=agent_id,
             model_id=body["model_id"],

@@ -39,8 +39,19 @@ if sys.platform != "win32":
 
 from runtime.models import InferenceRequest, Message, ToolConfig
 from runtime.registry import ToolRegistry
-
-_thread_local = threading.local()
+from runtime.common import (
+    _thread_local,
+    set_request_context,
+    get_request_context,
+    clear_request_context,
+    get_workspace,
+    utc_now_iso as _utc_now_iso,
+    parse_iso_timestamp as _parse_journal_timestamp,
+    sha256_bytes as _sha256_bytes,
+    safe_rel_path as _safe_rel_path,
+    atomic_write_json as _atomic_write_json,
+    session_timestamp,
+)
 
 # Shared registry mapping session_id → subprocess.Popen for the currently
 # executing bash command.  Populated by _execute_command so that the abort
@@ -78,11 +89,11 @@ def kill_active_process(session_id: str) -> bool:
 
 
 def _get_file_journal_manager(workspace: str) -> '_FileJournalManager':
-    session_id = getattr(_thread_local, "session_id", None)
-    user_message_timestamp = getattr(_thread_local, "user_message_timestamp", None)
-    session_dir = getattr(_thread_local, "session_dir", None)
+    session_id = get_request_context("session_id")
+    user_message_timestamp = get_request_context("user_message_timestamp")
+    session_dir = get_request_context("session_dir")
 
-    journal_manager = getattr(_thread_local, "file_journal_manager", None)
+    journal_manager = get_request_context("file_journal_manager")
     if (
         journal_manager is None
         or journal_manager.workspace != workspace
@@ -96,7 +107,7 @@ def _get_file_journal_manager(workspace: str) -> '_FileJournalManager':
             user_message_timestamp=user_message_timestamp,
             session_dir=session_dir,
         )
-        _thread_local.file_journal_manager = journal_manager
+        set_request_context(file_journal_manager=journal_manager)
     return journal_manager
 
 
@@ -405,7 +416,7 @@ def _make_delegate_fn(runtime, thread_local):
                     except Exception as load_err:
                         logger.warning("delegate: 恢复 SubAgent 会话历史失败: %s", load_err)
             elif session_id is not None:
-                sub_ts = datetime.datetime.now().strftime("%y%m%d_%H%M%S")
+                sub_ts = session_timestamp()
                 sub_session_id = f"{session_id}-sub_{sub_ts}"
                 if context:
                     messages.append(Message(role="system", content=context))
@@ -590,22 +601,6 @@ def _validate_path(workspace: str, raw_path: str) -> str:
         return joined
 
 
-def _utc_now_iso() -> str:
-    return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def _parse_journal_timestamp(value: Optional[str]) -> Optional[datetime.datetime]:
-    if not value:
-        return None
-    try:
-        dt = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if dt.tzinfo is not None:
-        return dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
-    return dt
-
-
 def _journal_turn_key(value: Optional[str]) -> tuple[str, str, bool]:
     dt = _parse_journal_timestamp(value)
     if dt is None:
@@ -613,17 +608,6 @@ def _journal_turn_key(value: Optional[str]) -> tuple[str, str, bool]:
         timestamp = dt.replace(microsecond=0).isoformat()
         return dt.strftime("%y%m%d_%H%M%S"), timestamp, True
     return dt.strftime("%y%m%d_%H%M%S"), value or dt.isoformat(), False
-
-
-def _sha256_bytes(raw: bytes) -> str:
-    return hashlib.sha256(raw).hexdigest()
-
-
-def _safe_rel_path(rel_path: str) -> str:
-    rel_path = rel_path.replace(os.sep, "/")
-    if os.path.isabs(rel_path) or rel_path == ".." or rel_path.startswith("../") or "/../" in f"/{rel_path}/":
-        raise ValueError(f"Unsafe journal path: {rel_path}")
-    return rel_path
 
 
 def _flatten_journal_path(rel_path: str, role: str) -> str:
@@ -731,24 +715,6 @@ def _read_gzip_blob(path: str, expected_sha256: Optional[str] = None) -> bytes:
     if expected_sha256 and _sha256_bytes(raw) != expected_sha256:
         raise ValueError("Sidecar blob sha256 mismatch")
     return raw
-
-
-def _atomic_write_json(path: str, data: dict) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    text = json.dumps(data, ensure_ascii=False, indent=2)
-    fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path), text=True)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(text)
-            fh.write("\n")
-        os.replace(tmp_path, path)
-        tmp_path = None
-    finally:
-        if tmp_path is not None:
-            try:
-                os.unlink(tmp_path)
-            except FileNotFoundError:
-                pass
 
 
 class _ManifestLock:
@@ -996,7 +962,7 @@ def _read_file(path: str, start_line: Optional[int] = None, end_line: Optional[i
     def error(code: str, message: str) -> str:
         return json.dumps({"error": code, "message": message})
 
-    workspace = os.path.realpath(os.environ.get("AGENT_WORKSPACE", ""))
+    workspace = get_workspace()
     check_path_for_read = os.environ.get("CHECK_PATH_FOR_READ", "false").lower() == "true"
 
     if check_path_for_read:
@@ -1064,7 +1030,7 @@ READ_FILE_TOOL_CONFIG = ToolConfig(
         "properties": {
             "path": {
                 "type": "string",
-                "description": "Path to the file (relative to AGENT_WORKSPACE)",
+                "description": "Path to the file (relative to workspace)",
             },
             "start_line": {
                 "type": "integer",
@@ -1091,7 +1057,7 @@ def _write_file(path: str, content: str) -> str:
     """Write content to a file atomically with a pre-write file journal snapshot.
 
     Args:
-        path: Path to the file (relative to AGENT_WORKSPACE or absolute within it).
+        path: Path to the file (relative to workspace or absolute within it).
         content: The content to write to the file (UTF-8 string).
 
     Returns:
@@ -1100,7 +1066,7 @@ def _write_file(path: str, content: str) -> str:
     """
     import tempfile
 
-    workspace = os.path.realpath(os.environ.get("AGENT_WORKSPACE", ""))
+    workspace = get_workspace()
 
     try:
         resolved_path = _validate_path(workspace, path)
@@ -1194,7 +1160,7 @@ WRITE_FILE_TOOL_CONFIG = ToolConfig(
         "properties": {
             "path": {
                 "type": "string",
-                "description": "Path to the file (relative to AGENT_WORKSPACE)",
+                "description": "Path to the file (relative to workspace)",
             },
             "content": {
                 "type": "string",
@@ -1223,17 +1189,17 @@ def _edit_file(
     """Edit a file using search_replace or diff mode.
 
     Args:
-        path: Path to the file (relative to AGENT_WORKSPACE or absolute within it).
+        path: Path to the file (relative to workspace or absolute within it).
         mode: Either 'search_replace' or 'diff'.
         old_str: (search_replace mode) The text block to find and replace.
         new_str: (search_replace mode) The replacement text block.
         patch: (diff mode) A unified diff patch string to apply.
 
     Returns:
-        JSON string with keys: file, journal, lines_changed on success.
+        JSON string with keys: file, lines_added, lines_removed, file_modified on success.
         On error, returns JSON string with keys: error, message.
     """
-    workspace = os.path.realpath(os.environ.get("AGENT_WORKSPACE", ""))
+    workspace = get_workspace()
 
     try:
         resolved_path = _validate_path(workspace, path)
@@ -1393,13 +1359,26 @@ def _edit_file_search_replace(
         _restore_file_state(resolved_path, backup)
         return json.dumps({"error": "LintFailed", "message": lint_output})
 
-    # Calculate lines_changed
+    # Calculate lines added/removed
     new_line_count = len(new_str.splitlines()) if new_str else 0
-    lines_changed = abs(new_line_count - old_line_count)
+    lines_removed = old_line_count
+    lines_added = new_line_count
+
+    # Detect if file content actually changed
+    old_content = backup.get("data", b"")
+    try:
+        with open(resolved_path, "rb") as f:
+            new_content = f.read()
+    except FileNotFoundError:
+        # File was deleted during edit (unlikely but handle gracefully)
+        new_content = b""
+    file_modified = (old_content != new_content)
 
     return json.dumps({
         "file": rel_path,
-        "lines_changed": lines_changed,
+        "lines_added": lines_added,
+        "lines_removed": lines_removed,
+        "file_modified": file_modified,
     })
 
 
@@ -1711,15 +1690,29 @@ def _edit_file_diff(
         _restore_patched_file(resolved_path, backup)
         return json.dumps({"error": "LintFailed", "message": lint_output})
 
-    lines_changed = 0
+    lines_added = 0
+    lines_removed = 0
     for line in normalized_patch.splitlines():
-        if (line.startswith("+") and not line.startswith("+++")) or \
-           (line.startswith("-") and not line.startswith("---")):
-            lines_changed += 1
+        if line.startswith("+") and not line.startswith("+++"):
+            lines_added += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            lines_removed += 1
+
+    # Detect if file content actually changed
+    old_content = backup.get("data", b"")
+    try:
+        with open(resolved_path, "rb") as f:
+            new_content = f.read()
+    except FileNotFoundError:
+        # File was deleted during edit (unlikely but handle gracefully)
+        new_content = b""
+    file_modified = (old_content != new_content)
 
     return json.dumps({
         "file": rel_path,
-        "lines_changed": lines_changed,
+        "lines_added": lines_added,
+        "lines_removed": lines_removed,
+        "file_modified": file_modified,
     })
 
 
@@ -1740,7 +1733,7 @@ EDIT_FILE_TOOL_CONFIG = ToolConfig(
         "properties": {
             "path": {
                 "type": "string",
-                "description": "Path to the file (relative to AGENT_WORKSPACE)",
+                "description": "Path to the file (relative to workspace)",
             },
             "mode": {
                 "type": "string",
@@ -1800,7 +1793,7 @@ def _search_code(query: str, include: Optional[str] = None, exclude: Optional[st
         return json.dumps({"error": "InvalidQuery", "message": str(exc)})
 
     # Get workspace
-    workspace = os.path.realpath(os.environ.get("AGENT_WORKSPACE", ""))
+    workspace = get_workspace()
 
     max_results = int(os.environ.get("SEARCH_MAX_RESULTS", 100))
 
@@ -2007,7 +2000,7 @@ def _execute_command(command: str, timeout: Optional[int] = None) -> str:
         timeout_val = int(timeout)
 
     # Get workspace
-    workspace = os.path.realpath(os.environ.get("AGENT_WORKSPACE", ""))
+    workspace = get_workspace()
 
     # Build environment: inherit current env, override TERM=dumb
     env = os.environ.copy()
@@ -2015,7 +2008,7 @@ def _execute_command(command: str, timeout: Optional[int] = None) -> str:
 
     # Use Popen with start_new_session=True so the abort handler can kill
     # the entire process group via kill_active_process().
-    session_id = getattr(_thread_local, "session_id", None)
+    session_id = get_request_context("session_id")
     try:
         proc = subprocess.Popen(
             command,
@@ -2148,9 +2141,9 @@ def _undo() -> str:
         JSON string with keys: turn_key, restored_files on success.
         On error, returns JSON string with keys: error, message.
     """
-    workspace = os.path.realpath(os.environ.get("AGENT_WORKSPACE", ""))
-    session_dir = getattr(_thread_local, "session_dir", None)
-    session_id = getattr(_thread_local, "session_id", None)
+    workspace = get_workspace()
+    session_dir = get_request_context("session_dir")
+    session_id = get_request_context("session_id")
     if not session_dir:
         return json.dumps({
             "error": "NoSessionJournal",

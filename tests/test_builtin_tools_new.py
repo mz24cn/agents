@@ -711,7 +711,9 @@ class TestEditFileUnit:
         assert result["file"] == "success_edit.py"
         assert "commit_id" not in result
         assert result["journal"]["turn_key"] == "260511_102030"
-        assert "lines_changed" in result
+        assert "lines_added" in result
+        assert "lines_removed" in result
+        assert "file_modified" in result
 
     def test_search_replace_modifies_file_content(self, workspace):
         """search_replace actually modifies the file on disk."""

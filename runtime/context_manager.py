@@ -1,4 +1,4 @@
-"""Context Manager for Agent Runtime.
+"""Context Manager for Agent Service.
 
 Manages multi-turn conversation context, session persistence, rolling summaries,
 structured memory extraction, and context assembly. Uses only the Python standard
@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import difflib
 import gzip
-import hashlib
 import re
 import stat
 from dataclasses import dataclass, field, asdict
@@ -55,6 +54,7 @@ class ConversationTurn:
         assistant_id: Optional agent_id for assistant-role turns, identifying which agent sent this message.
         tool_id: Optional tool_id for tool-role turns, identifying which tool produced this result.
         tool_use_id: Optional protocol-level tool call ID linking a tool result to its assistant tool call.
+        completed_at: Optional ISO 8601 timestamp when inference completed (for assistant-role turns).
     """
 
     role: str
@@ -71,6 +71,7 @@ class ConversationTurn:
     assistant_id: Optional[str] = None
     tool_id: Optional[str] = None
     tool_use_id: Optional[str] = None
+    completed_at: Optional[str] = None
 
 
 @dataclass
@@ -120,265 +121,23 @@ class IntrospectionSnapshot:
 
 
 # ---------------------------------------------------------------------------
-# Token estimation
+# Token estimation & shared utilities (re-exported from common)
 # ---------------------------------------------------------------------------
 
-
-def estimate_tokens(text: str) -> int:
-    """Rough token count estimate: characters / 4.
-
-    This is intentionally approximate and used only for budget control.
-    """
-    return len(text) // 4
+from runtime.common import estimate_tokens  # noqa: F401 — re-export
 
 
 # ---------------------------------------------------------------------------
-# Lightweight YAML front-matter parser
+# Lightweight YAML front-matter parser (delegated to common)
 # ---------------------------------------------------------------------------
 
-
-def _parse_yaml_value(raw: str) -> object:
-    """Parse a single scalar YAML value (string or integer)."""
-    raw = raw.strip()
-    # Quoted string
-    if (raw.startswith('"') and raw.endswith('"')) or (
-        raw.startswith("'") and raw.endswith("'")
-    ):
-        return raw[1:-1]
-    # Integer
-    if re.fullmatch(r"-?\d+", raw):
-        return int(raw)
-    # Unquoted string (including empty)
-    return raw
-
-
-def parse_front_matter(text: str) -> tuple[dict, str]:
-    """Parse a front-matter + body document.
-
-    The document must start with ``---`` on its own line, followed by YAML
-    key-value pairs, and closed by another ``---`` line.  Everything after
-    the closing ``---`` is returned as *body_text*.
-
-    Supported YAML subset:
-    - String values (quoted or unquoted)
-    - Integer values
-    - Lists (``- item`` format, one item per line)
-    - Nested dicts (indented ``key: value`` pairs)
-
-    Args:
-        text: Raw document text.
-
-    Returns:
-        A ``(yaml_dict, body_text)`` tuple.
-
-    Raises:
-        ValueError: When the front-matter is missing, malformed, or the
-            closing ``---`` delimiter is absent.
-    """
-    if not text.startswith("---"):
-        raise ValueError(
-            "Invalid front-matter: document must start with '---' delimiter"
-        )
-
-    # Find the closing ---
-    # The opening --- is at position 0; search for the next --- after it.
-    rest = text[3:]  # skip opening ---
-    # Allow optional newline right after opening ---
-    if rest.startswith("\r\n"):
-        rest = rest[2:]
-    elif rest.startswith("\n"):
-        rest = rest[1:]
-    else:
-        raise ValueError(
-            "Invalid front-matter: '---' must be followed by a newline"
-        )
-
-    close_match = re.search(r"^---[ \t]*$", rest, re.MULTILINE)
-    if close_match is None:
-        raise ValueError(
-            "Invalid front-matter: missing closing '---' delimiter"
-        )
-
-    yaml_block = rest[: close_match.start()]
-    body_text = rest[close_match.end():]
-    # Strip leading newline from body
-    if body_text.startswith("\r\n"):
-        body_text = body_text[2:]
-    elif body_text.startswith("\n"):
-        body_text = body_text[1:]
-
-    result = _parse_yaml_block(yaml_block, indent=0)
-    return result, body_text
-
-
-def _parse_yaml_block(block: str, indent: int) -> dict:
-    """Recursively parse an indented YAML block into a dict."""
-    result: dict = {}
-    lines = block.splitlines()
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        # Skip blank lines
-        if not line.strip():
-            i += 1
-            continue
-
-        # Determine current line's indentation
-        stripped = line.lstrip(" ")
-        current_indent = len(line) - len(stripped)
-
-        if current_indent != indent:
-            # This line belongs to a different (outer) scope — stop
-            break
-
-        # List item at this indent level (shouldn't normally happen at top
-        # level, but handle gracefully)
-        if stripped.startswith("- "):
-            raise ValueError(
-                f"Invalid front-matter: unexpected list item at indent {indent}: {line!r}"
-            )
-
-        # Key: value pair
-        if ":" not in stripped:
-            raise ValueError(
-                f"Invalid front-matter: expected 'key: value' but got: {line!r}"
-            )
-
-        colon_pos = stripped.index(":")
-        key = stripped[:colon_pos].strip()
-        value_part = stripped[colon_pos + 1:]
-
-        if not key:
-            raise ValueError(
-                f"Invalid front-matter: empty key in line: {line!r}"
-            )
-
-        # Peek ahead to determine value type
-        # Case 1: value on same line (scalar, or inline [] / {})
-        if value_part.strip():
-            inline = value_part.strip()
-            if inline == "[]":
-                result[key] = []
-            elif inline == "{}":
-                result[key] = {}
-            else:
-                result[key] = _parse_yaml_value(value_part)
-            i += 1
-            continue
-
-        # Case 2: value is empty — look ahead for list items or nested dict
-        # Collect continuation lines (deeper indent)
-        j = i + 1
-        child_lines = []
-        while j < len(lines):
-            next_line = lines[j]
-            if not next_line.strip():
-                j += 1
-                continue
-            next_stripped = next_line.lstrip(" ")
-            next_indent = len(next_line) - len(next_stripped)
-            if next_indent <= indent:
-                break
-            child_lines.append(next_line)
-            j += 1
-
-        if not child_lines:
-            # Empty value
-            result[key] = ""
-            i += 1
-            continue
-
-        # Determine if child is a list or nested dict
-        first_child = child_lines[0].lstrip(" ")
-        child_indent = len(child_lines[0]) - len(child_lines[0].lstrip(" "))
-
-        if first_child.startswith("- "):
-            # List
-            items = []
-            for cl in child_lines:
-                cl_stripped = cl.lstrip(" ")
-                cl_indent = len(cl) - len(cl_stripped)
-                if cl_indent == child_indent and cl_stripped.startswith("- "):
-                    items.append(_parse_yaml_value(cl_stripped[2:]))
-                elif cl_indent > child_indent:
-                    raise ValueError(
-                        f"Invalid front-matter: unexpected indentation in list under key '{key}': {cl!r}"
-                    )
-                else:
-                    raise ValueError(
-                        f"Invalid front-matter: inconsistent list indentation under key '{key}': {cl!r}"
-                    )
-            result[key] = items
-        else:
-            # Nested dict
-            child_block = "\n".join(child_lines)
-            result[key] = _parse_yaml_block(child_block, indent=child_indent)
-
-        i = j
-
-    return result
-
-
-def _serialize_yaml_value(value: object, indent: int = 0) -> str:
-    """Serialize a Python value to a YAML front-matter string fragment.
-
-    Returns the serialized text.  For dicts and non-empty lists the returned
-    string is multi-line and already includes the *indent* prefix on every
-    line.  For scalars and empty collections it returns a single-line string
-    (no leading indent).
-    """
-    prefix = " " * indent
-    if isinstance(value, dict):
-        if not value:
-            return "{}"
-        lines = []
-        for k, v in value.items():
-            if isinstance(v, (dict, list)) and v:
-                child = _serialize_yaml_value(v, indent=indent + 2)
-                lines.append(f"{prefix}{k}:\n{child}")
-            else:
-                lines.append(f"{prefix}{k}: {_serialize_yaml_value(v)}")
-        return "\n".join(lines)
-    if isinstance(value, list):
-        if not value:
-            return "[]"
-        lines = []
-        for item in value:
-            lines.append(f"{prefix}- {_serialize_yaml_value(item)}")
-        return "\n".join(lines)
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, float):
-        return str(value)
-    # String — quote if it contains special characters or is empty
-    s = str(value)
-    if not s or any(c in s for c in (':', '#', '"', "'", '\n', '\r')):
-        escaped = s.replace('"', '\\"')
-        return f'"{escaped}"'
-    return s
-
-
-def _build_front_matter(front_matter: dict) -> str:
-    """Render a dict as a YAML front-matter block (between --- delimiters)."""
-    lines = ["---"]
-    for key, value in front_matter.items():
-        if isinstance(value, list) and value:
-            # Non-empty list: key on its own line, items indented below
-            serialized = _serialize_yaml_value(value, indent=2)
-            lines.append(f"{key}:")
-            lines.append(serialized)
-        elif isinstance(value, dict) and value:
-            # Non-empty dict: key on its own line, children indented below
-            serialized = _serialize_yaml_value(value, indent=2)
-            lines.append(f"{key}:")
-            lines.append(serialized)
-        else:
-            # Scalar, empty list "[]", empty dict "{}"
-            lines.append(f"{key}: {_serialize_yaml_value(value)}")
-    lines.append("---")
-    return "\n".join(lines)
+from runtime.common import (  # noqa: F401 — re-export for backward compat
+    _parse_yaml_value,
+    _parse_yaml_block,
+    parse_front_matter,
+    serialize_yaml_value as _serialize_yaml_value,
+    build_front_matter as _build_front_matter,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -594,35 +353,20 @@ import logging
 import os
 import subprocess
 import tempfile
+
+from runtime.common import now_iso
 from typing import Callable, Optional
 
-
-
-def _journal_parse_ts(value: Optional[str]) -> Optional[datetime.datetime]:
-    if not value:
-        return None
-    try:
-        dt = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if dt.tzinfo is not None:
-        return dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
-    return dt
-
-
-def _journal_now_iso() -> str:
-    return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def _journal_sha256(raw: bytes) -> str:
-    return hashlib.sha256(raw).hexdigest()
-
-
-def _journal_safe_rel_path(rel_path: str) -> str:
-    rel_path = rel_path.replace(os.sep, "/")
-    if os.path.isabs(rel_path) or rel_path == ".." or rel_path.startswith("../") or "/../" in f"/{rel_path}/":
-        raise ValueError(f"Unsafe journal path: {rel_path}")
-    return rel_path
+from runtime.common import (
+    get_workspace,
+    parse_iso_timestamp as _journal_parse_ts,
+    utc_now_iso as _journal_now_iso,
+    sha256_bytes as _journal_sha256,
+    safe_rel_path as _journal_safe_rel_path,
+    atomic_write_json as _journal_atomic_write_json,
+    atomic_write_text,
+    session_timestamp,
+)
 
 
 def _journal_resolve_workspace_path(workspace: str, rel_path: str) -> str:
@@ -632,23 +376,6 @@ def _journal_resolve_workspace_path(workspace: str, rel_path: str) -> str:
     if not (resolved == root or resolved.startswith(root + os.sep)):
         raise ValueError(f"Journal path escapes workspace: {rel_path}")
     return resolved
-
-
-def _journal_atomic_write_json(path: str, data: dict) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path), text=True)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, ensure_ascii=False, indent=2)
-            fh.write("\n")
-        os.replace(tmp_path, path)
-        tmp_path = ""
-    finally:
-        if tmp_path:
-            try:
-                os.unlink(tmp_path)
-            except FileNotFoundError:
-                pass
 
 
 def _read_journal_sidecar(journal_dir: str, blob_ref: dict) -> bytes:
@@ -1139,7 +866,7 @@ class ContextManager:
         Returns:
             The session_id string.
         """
-        session_id = datetime.datetime.now().strftime("%y%m%d_%H%M%S")
+        session_id = session_timestamp()
         session_dir = os.path.join(self._chats_dir, session_id)
         if os.path.exists(session_dir):
             raise OSError(f"Session directory already exists: {session_dir}")
@@ -1219,7 +946,7 @@ class ContextManager:
             except (ValueError, OSError, KeyError):
                 pass
 
-        now = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        now = now_iso()
         meta: dict = {
             "session_id": session_id,
             "created_at": existing_created_at or now,
@@ -1270,6 +997,7 @@ class ContextManager:
                 assistant_id=msg.get("assistant_id"),
                 tool_id=msg.get("tool_id"),
                 tool_use_id=msg.get("tool_use_id"),
+                completed_at=msg.get("completed_at"),
             ))
         return turns
 
@@ -1299,7 +1027,7 @@ class ContextManager:
 
         if summary_text.strip() and summarized_up_to >= new_turn_count:
             summary_fm["summarized_up_to_turn"] = max(-1, new_turn_count - 1)
-            summary_fm["updated_at"] = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            summary_fm["updated_at"] = now_iso()
             if summary_fm["summarized_up_to_turn"] < 0:
                 self._remove_session_file(self._summary_path(session_id))
             else:
@@ -1359,7 +1087,7 @@ class ContextManager:
         removed_count = len(messages) - revoke_index
         new_messages = messages[:revoke_index]
 
-        workspace = os.environ.get("AGENT_WORKSPACE", "") or os.getcwd()
+        workspace = get_workspace()
         session_dir = os.path.dirname(conv_path)
         journal_result = revoke_session_file_changes(
             workspace,
@@ -1384,7 +1112,7 @@ class ContextManager:
         # Update meta and save only after journal validation/restore succeeds. This
         # keeps conversation history and workspace files in sync if the journal
         # refuses to restore because of conflicts.
-        now = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        now = now_iso()
         meta = data.get("meta", {})
         meta["updated_at"] = now
         meta["turn_count"] = len(new_messages)
@@ -1466,7 +1194,7 @@ class ContextManager:
             session_id: Target session.
             entries: List of :class:`MemoryEntry` objects to persist.
         """
-        now = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        now = now_iso()
         front_matter: dict = {
             "session_id": session_id,
             "entry_count": len(entries),
@@ -1595,7 +1323,7 @@ class ContextManager:
         else:
             history_section = f"## Conversation turns\n{turns_text}"
 
-        now_iso = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        current_ts = now_iso()
         prompt = f"""\
 You are a conversation analysis assistant. Read the conversation history below \
 and complete TWO tasks. Output ONLY the two tagged blocks — no other text.
@@ -1631,7 +1359,7 @@ trivial or uncertain items.
     "content": "concise description",
     "source_turn_index": 0,
     "confidence": 0.9,
-    "created_at": "{now_iso}"
+    "created_at": "{current_ts}"
   }}
 ]
 </memory>
@@ -1678,7 +1406,7 @@ trivial or uncertain items.
             )
 
         # Persist summary
-        now = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        now = now_iso()
         summary_fm: dict = {
             "session_id": session_id,
             "summary_version": existing_version + 1,
@@ -1825,19 +1553,7 @@ trivial or uncertain items.
     @staticmethod
     def _atomic_write(path: str, text: str) -> None:
         """Write *text* to *path* atomically (temp file + os.replace)."""
-        dir_path = os.path.dirname(path)
-        os.makedirs(dir_path, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(dir=dir_path)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(text)
-            os.replace(tmp_path, path)
-        except Exception:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
+        atomic_write_text(path, text)
 
     def _add_reference(self, session_id: str, ref: str) -> None:
         """No-op — references were part of the old Markdown format.

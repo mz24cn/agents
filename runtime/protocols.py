@@ -10,8 +10,6 @@ import uuid
 from abc import ABC, abstractmethod
 from typing import Optional, Iterator
 import os
-import base64
-import urllib.request
 import datetime
 
 from runtime.models import Message, ModelConfig, TokenStat, ToolConfig
@@ -85,9 +83,9 @@ class BaseProtocol(ABC):
         if os.environ.get("DEBUG_INFER_REQUEST", "").lower() != "true":
             return
         try:
-            from runtime.builtin_tools import _thread_local
-            context_manager = getattr(_thread_local, "context_manager", None)
-            session_id = getattr(_thread_local, "session_id", None)
+            from runtime.common import get_request_context
+            context_manager = get_request_context("context_manager")
+            session_id = get_request_context("session_id")
         except Exception:
             return
         if not context_manager:
@@ -111,22 +109,8 @@ class BaseProtocol(ABC):
     @staticmethod
     def _convert_image_to_base64(img_data: str) -> str:
         """Convert an image source (URL, local path, or data URI) to a raw base64 string."""
-        if img_data.startswith("data:"):
-            return img_data.split(",", 1)[1]
-        
-        if img_data.startswith("http://") or img_data.startswith("https://"):
-            try:
-                with urllib.request.urlopen(img_data) as response:
-                    return base64.b64encode(response.read()).decode("utf-8")
-            except Exception as e:
-                raise ValueError(f"Failed to download image: {e}")
-        
-        expanded_path = os.path.expanduser(img_data)
-        try:
-            with open(expanded_path, "rb") as f:
-                return base64.b64encode(f.read()).decode("utf-8")
-        except (FileNotFoundError, PermissionError, IsADirectoryError) as e:
-            raise ValueError(f"Failed to read image: {e}")
+        from runtime.common import convert_image_to_base64
+        return convert_image_to_base64(img_data)
 
 
 class OpenAIProtocol(BaseProtocol):

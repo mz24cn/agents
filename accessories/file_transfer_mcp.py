@@ -112,7 +112,7 @@ def create_mcp_server(host: str = "0.0.0.0", port: int = 8000) -> FastMCP:
     @server.tool()
     def save_file_to_phone_gallery(base64_content: str, filename: str) -> str:
         """
-        将 base64 编码的图片保存到手机相册（通过 ADB 推送）。
+        将 base64 编码的图片保存到手机相册。
         
         Args:
             base64_content: base64 编码的图片内容。提供本地文件路径即可，底层会自动读取并编码。

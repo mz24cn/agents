@@ -134,6 +134,10 @@
       tick().then(() => {
         if (searchInput) searchInput.focus()
       })
+    } else {
+      // 收起搜索框 = 取消搜索，恢复默认列表
+      activeSearchQuery = ''
+      loadSessions()
     }
   }
 

@@ -6,21 +6,23 @@
 
   let { template = null, onSuccess, onCancel } = $props()
 
-  const _init = template ?? {}
-  const originalTemplateId = _init.template_id ?? ''  // 保存原始ID用于API调用
-  let isEdit = $derived(originalTemplateId !== '')  // 有原始ID才是编辑模式，复制时template_id为空算创建
+  let originalTemplateId = $state('')
+  let isEdit = $derived(originalTemplateId !== '')
 
-  let templateId = $state(_init.template_id ?? '')
-  let content = $state(_init.content ?? '')
-
-  $effect(() => {
-    templateId = _init.template_id ?? ''
-    content = _init.content ?? ''
-  })
-
+  let templateId = $state('')
+  let content = $state('')
   let errors = $state({})
   let submitError = $state('')
   let submitting = $state(false)
+
+  $effect(() => {
+    const init = template ?? {}
+    originalTemplateId = init.template_id ?? ''
+    templateId = init.template_id ?? ''
+    content = init.content ?? ''
+    errors = {}
+    submitError = ''
+  })
 
   let placeholders = $derived(extractPlaceholders(content))
 

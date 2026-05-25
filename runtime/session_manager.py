@@ -72,12 +72,10 @@ class SessionManager:
         Raises:
             OSError: 写入失败时抛出。
         """
+        from runtime.common import atomic_write_json
+
         os.makedirs(self._chats_dir, exist_ok=True)
-        tmp_path = self._index_path + ".tmp"
-        content = json.dumps(index, ensure_ascii=False, indent=2)
-        with open(tmp_path, "w", encoding="utf-8") as fh:
-            fh.write(content)
-        os.replace(tmp_path, self._index_path)
+        atomic_write_json(self._index_path, index)
 
     # ------------------------------------------------------------------
     # 公共方法
@@ -90,8 +88,8 @@ class SessionManager:
             session_id: 新创建的会话 ID。
             first_user_message: 用户的第一条消息文本，用作初始标题（可选）。
         """
-        import datetime as _dt
-        now = _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        from runtime.common import now_iso
+        now = now_iso()
         # 用第一条用户消息作为初始标题，超过 30 字符则截断
         if first_user_message and first_user_message.strip():
             initial_title = first_user_message.strip()
@@ -123,8 +121,8 @@ class SessionManager:
             session_id: 会话 ID。
             last_total_tokens: 本次推理的总 token 数（可选）。
         """
-        import datetime as _dt
-        now = _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        from runtime.common import now_iso
+        now = now_iso()
         try:
             index = self._read_index()
             entry = index.get(session_id, {

@@ -12,8 +12,9 @@ import socket
 import time
 import urllib.request
 import urllib.error
-import datetime as _dt
 from typing import Iterator, Optional
+
+from runtime.common import now_iso as _now_iso
 
 _logger = logging.getLogger("runtime.runtime")
 
@@ -92,8 +93,7 @@ class Runtime:
             messages = list(request.messages)
             for msg in messages:
                 if msg.timestamp is None:
-                    import datetime as _dt
-                    msg.timestamp = _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+                    msg.timestamp = _now_iso()
                 if (
                     not msg.content
                     and msg.prompt_template is not None
@@ -108,8 +108,7 @@ class Runtime:
                         msg.content = content
             return messages
         if request.text is not None:
-            import datetime as _dt
-            return [Message(role="user", content=request.text, timestamp=_dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"))]
+            return [Message(role="user", content=request.text, timestamp=_now_iso())]
         return []
 
     # ------------------------------------------------------------------
@@ -756,15 +755,11 @@ class Runtime:
             Message objects incrementally.
         """
         # 1. Setup (same as infer)
-        def _now_ts() -> str:
-            """Return current wall-clock timestamp in ISO 8601 format."""
-            return _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-
         model_config = request.model_config_override
         if model_config is None:
             model_config = self._model_registry.get(request.model_id)
         if model_config is None:
-            yield Message(role="assistant", timestamp=_now_ts(),
+            yield Message(role="assistant", timestamp=_now_iso(),
                           content=f"Error: Model '{request.model_id}' not found")
             return
 
@@ -777,7 +772,7 @@ class Runtime:
         protocol_name = model_config.api_protocol
         protocol_cls = PROTOCOL_MAP.get(protocol_name)
         if protocol_cls is None:
-            yield Message(role="assistant", timestamp=_now_ts(),
+            yield Message(role="assistant", timestamp=_now_iso(),
                           content=f"Error: Unsupported protocol '{protocol_name}'")
             return
         protocol = protocol_cls()
@@ -793,7 +788,7 @@ class Runtime:
             # Check cancel_event before each round (including before model API call)
             # so we don't block for MODEL_API_TIMEOUT seconds after a forced abort.
             if cancel_event is not None and cancel_event.is_set():
-                yield Message(role="assistant", timestamp=_now_ts(), content="Error: user interrupted.")
+                yield Message(role="assistant", timestamp=_now_iso(), content="Error: user interrupted.")
                 return
 
             url, headers, body_bytes = protocol.build_request(
@@ -819,7 +814,7 @@ class Runtime:
                 detail = f"HTTP {exc.code}: {exc.reason}"
                 if error_body:
                     detail += f" | body: {error_body[:500]}"
-                yield Message(role="assistant", timestamp=_now_ts(), content=f"Error: {detail}")
+                yield Message(role="assistant", timestamp=_now_iso(), content=f"Error: {detail}")
                 return
             except (socket.timeout, urllib.error.URLError) as exc:
                 # URLError wraps socket.timeout when the underlying socket times out.
@@ -827,14 +822,14 @@ class Runtime:
                 is_timeout = isinstance(reason, socket.timeout) or "timed out" in str(reason).lower()
                 if is_timeout:
                     _logger.error("infer_stream timeout | url=%s timeout=%ds", url, _MODEL_API_TIMEOUT)
-                    yield Message(role="assistant", timestamp=_now_ts(),
+                    yield Message(role="assistant", timestamp=_now_iso(),
                                   content=f"Error: model API request timed out after {_MODEL_API_TIMEOUT}s")
                 else:
                     _logger.error("infer_stream connection error | url=%s err=%s", url, reason)
-                    yield Message(role="assistant", timestamp=_now_ts(), content=f"Error: {exc}")
+                    yield Message(role="assistant", timestamp=_now_iso(), content=f"Error: {exc}")
                 return
             except Exception as exc:
-                yield Message(role="assistant", timestamp=_now_ts(), content=f"Error: {exc}")
+                yield Message(role="assistant", timestamp=_now_iso(), content=f"Error: {exc}")
                 return
 
             # Stream this round and collect the full assistant message
@@ -854,7 +849,7 @@ class Runtime:
                     # Check for cancellation before yielding
                     if cancel_event is not None and cancel_event.is_set():
                         http_resp.close()
-                        yield Message(role="assistant", timestamp=_now_ts(), content="Error: user interrupted.")
+                        yield Message(role="assistant", timestamp=_now_iso(), content="Error: user interrupted.")
                         return
 
                     # Intercept usage messages — accumulate, don't yield raw
@@ -876,11 +871,11 @@ class Runtime:
                         if msg.tool_calls:
                             # For tool calls, record the first timestamp
                             if tool_calls_first_ts is None:
-                                tool_calls_first_ts = _now_ts()
+                                tool_calls_first_ts = _now_iso()
                             msg.timestamp = tool_calls_first_ts
                         else:
                             # For regular content/thinking, use current time
-                            msg.timestamp = _now_ts()
+                            msg.timestamp = _now_iso()
 
                     # Yield each chunk to the caller for real-time display
                     yield msg
@@ -913,7 +908,7 @@ class Runtime:
                                 else:
                                     accumulated_tool_calls[idx]["arguments"] += tc["arguments"]
             except Exception as exc:
-                yield Message(role="assistant", timestamp=_now_ts(), content=f"Error: stream parse: {exc}")
+                yield Message(role="assistant", timestamp=_now_iso(), content=f"Error: stream parse: {exc}")
                 return
             finally:
                 stream_end_time = time.monotonic()
@@ -931,7 +926,7 @@ class Runtime:
                 all_tool_calls = [accumulated_tool_calls[idx] for idx in sorted(accumulated_tool_calls.keys())]
 
             # Build the complete assistant message for conversation history
-            assistant_ts = tool_calls_first_ts if tool_calls_first_ts else _now_ts()
+            assistant_ts = tool_calls_first_ts if tool_calls_first_ts else _now_iso()
             assistant_msg = Message(
                 role="assistant",
                 content=full_content,
@@ -959,7 +954,7 @@ class Runtime:
                 }
                 if ttft_ms is not None:
                     stat_dict["ttft_ms"] = round(ttft_ms, 1)
-                yield Message(role="usage", timestamp=_now_ts(), name="round", content=json.dumps(stat_dict))
+                yield Message(role="usage", timestamp=_now_iso(), name="round", content=json.dumps(stat_dict))
                 return
 
             # Max rounds check
@@ -972,7 +967,7 @@ class Runtime:
                     pending_name = fn_call.get("name", "unknown_tool")
                     yield Message(
                         role="tool",
-                        timestamp=_now_ts(),
+                        timestamp=_now_iso(),
                         name=pending_name,
                         tool_use_id=fn_call.get("id") or fn_call.get("tool_use_id"),
                         content=(
@@ -993,7 +988,7 @@ class Runtime:
                 }
                 if ttft_ms is not None:
                     stat_dict["ttft_ms"] = round(ttft_ms, 1)
-                yield Message(role="usage", timestamp=_now_ts(), name="round", content=json.dumps(stat_dict))
+                yield Message(role="usage", timestamp=_now_iso(), name="round", content=json.dumps(stat_dict))
                 return
 
             # Execute all tool calls sequentially in this round
@@ -1015,7 +1010,7 @@ class Runtime:
                         cwd_hint = f"\n\n技能工作目录: {skill_dir}" if skill_dir else ""
                         fn_msg = Message(
                             role="tool",
-                            timestamp=_now_ts(),
+                            timestamp=_now_iso(),
                             name=tool_name,
                             tool_use_id=fn_call.get("id") or fn_call.get("tool_use_id"),
                             content=(
@@ -1043,7 +1038,7 @@ class Runtime:
 
                 tool_msg = Message(
                     role="tool",
-                    timestamp=_now_ts(),
+                    timestamp=_now_iso(),
                     content=tool_result,
                     name=tool_name,
                     tool_id=tool_config.tool_id if tool_config else None,

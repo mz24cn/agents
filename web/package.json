@@ -1,5 +1,5 @@
 {
-  "name": "agents-runtime-console",
+  "name": "agent-service-web",
   "private": true,
   "version": "0.1.0",
   "type": "module",

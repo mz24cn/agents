@@ -104,6 +104,10 @@
     panelSelectedResult = result
   }
 
+  function getPromptEditHref(templateId) {
+    return `#/setup?tab=prompt-edit&templateId=${encodeURIComponent(templateId ?? '')}`
+  }
+
   /**
    * 顶栏"作为"按钮统一入口
    */
@@ -840,7 +844,7 @@
           <!-- 撑满中间空间，右对齐区域 -->
           <div class="header-apply-row">
             {#if panelSelectedResult}
-              <a href="#/setup?tab=prompt-edit&templateId={panelSelectedResult.template?.template_id}" class="nav-link">{panelSelectedResult.template?.template_id ?? ''}</a>
+              <a href={getPromptEditHref(panelSelectedResult.template?.template_id)} class="nav-link">{panelSelectedResult.template?.template_id ?? ''}</a>
               <span class="apply-as-label">{t('applyAs')}</span>
               <button class="btn btn-secondary" onclick={() => handleHeaderApply('system')}>{t('applyAsSystem')}</button>
               <button class="btn btn-primary" onclick={() => handleHeaderApply('user')}>{t('applyAsUserSend')}</button>
