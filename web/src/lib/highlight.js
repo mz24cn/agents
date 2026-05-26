@@ -8,11 +8,13 @@ const PYTHON_RULES = [
   { pattern: /"""[\s\S]*?"""|'''[\s\S]*?'''/g, className: 'hl-string' },
   // Single-line strings
   { pattern: /"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, className: 'hl-string' },
+  // Decorators
+  { pattern: /@\w+/g, className: 'hl-decorator' },
   // Comments
   { pattern: /#[^\n]*/g, className: 'hl-comment' },
   // Keywords
   {
-    pattern: /\b(def|class|if|else|elif|for|while|return|import|from|with|as|try|except|finally|pass|break|continue|True|False|None)\b/g,
+    pattern: /\b(def|class|if|else|elif|for|while|return|import|from|with|as|try|except|finally|pass|break|continue|True|False|None|yield|lambda|async|await|not|and|or|is|in|del|raise|global|nonlocal|assert)\b/g,
     className: 'hl-keyword',
   },
   // Numbers
@@ -41,18 +43,272 @@ const BASH_RULES = [
   { pattern: /#[^\n]*/g, className: 'hl-comment' },
   // Keywords
   {
-    pattern: /\b(if|then|fi|else|elif|for|while|do|done|case|esac|function|return|export|local)\b/g,
+    pattern: /\b(if|then|fi|else|elif|for|while|do|done|case|esac|function|return|export|local|source|alias|unset|shift|exit|echo|printf|read|test|true|false)\b/g,
     className: 'hl-keyword',
   },
   // Variable references: ${var} and $var
-  { pattern: /\$\{[^}]+\}|\$[A-Za-z_][A-Za-z0-9_]*/g, className: 'hl-variable' },
+  { pattern: /\$\{[^}]+}|\$[A-Za-z_][A-Za-z0-9_]*/g, className: 'hl-variable' },
+]
+
+const JS_RULES = [
+  // Template literals
+  { pattern: /`(?:[^`\\]|\\.)*`/g, className: 'hl-string' },
+  // Strings
+  { pattern: /"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, className: 'hl-string' },
+  // Comments (line and block)
+  { pattern: /\/\/[^\n]*/g, className: 'hl-comment' },
+  { pattern: /\/\*[\s\S]*?\*\//g, className: 'hl-comment' },
+  // Keywords
+  {
+    pattern: /\b(const|let|var|function|return|if|else|for|while|do|switch|case|break|continue|new|this|class|extends|super|import|from|export|default|typeof|instanceof|void|delete|throw|try|catch|finally|async|await|yield|of|in)\b/g,
+    className: 'hl-keyword',
+  },
+  // Built-in values
+  { pattern: /\b(true|false|null|undefined|NaN|Infinity)\b/g, className: 'hl-boolean' },
+  // Numbers
+  { pattern: /\b\d+(\.\d+)?([eE][+-]?\d+)?\b/g, className: 'hl-number' },
+  // Arrow functions
+  { pattern: /=>/g, className: 'hl-keyword' },
+]
+
+const TS_RULES = [
+  // Template literals
+  { pattern: /`(?:[^`\\]|\\.)*`/g, className: 'hl-string' },
+  // Strings
+  { pattern: /"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, className: 'hl-string' },
+  // Comments
+  { pattern: /\/\/[^\n]*/g, className: 'hl-comment' },
+  { pattern: /\/\*[\s\S]*?\*\//g, className: 'hl-comment' },
+  // Keywords
+  {
+    pattern: /\b(const|let|var|function|return|if|else|for|while|do|switch|case|break|continue|new|this|class|extends|super|import|from|export|default|typeof|instanceof|void|delete|throw|try|catch|finally|async|await|yield|of|in|type|interface|enum|namespace|declare|abstract|implements|readonly|as|is|keyof|infer)\b/g,
+    className: 'hl-keyword',
+  },
+  // Built-in values
+  { pattern: /\b(true|false|null|undefined|NaN|Infinity)\b/g, className: 'hl-boolean' },
+  // Numbers
+  { pattern: /\b\d+(\.\d+)?([eE][+-]?\d+)?\b/g, className: 'hl-number' },
+  { pattern: /=>/g, className: 'hl-keyword' },
+]
+
+const HTML_RULES = [
+  // Comments
+  { pattern: /<!--[\s\S]*?-->/g, className: 'hl-comment' },
+  // Strings in attributes
+  { pattern: /"[^"]*"|'[^']*'/g, className: 'hl-string' },
+  // Tags
+  { pattern: /<\/?[\w-]+/g, className: 'hl-tag' },
+  // Attributes
+  { pattern: /\s[\w-]+(?==)/g, className: 'hl-attribute' },
+  // Entities
+  { pattern: /&\w+;|&#\d+;|&#x[\da-fA-F]+;/g, className: 'hl-variable' },
+]
+
+const CSS_RULES = [
+  // Comments
+  { pattern: /\/\*[\s\S]*?\*\//g, className: 'hl-comment' },
+  // Strings
+  { pattern: /"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, className: 'hl-string' },
+  // @rules
+  { pattern: /@[\w-]+/g, className: 'hl-decorator' },
+  // Properties (word before colon)
+  { pattern: /[\w-]+(?=\s*:)/g, className: 'hl-key' },
+  // Hex colors
+  { pattern: /#[0-9a-fA-F]{3,8}\b/g, className: 'hl-number' },
+  // Values with units
+  { pattern: /\b\d+(\.\d+)?(px|em|rem|%|vh|vw|vmin|vmax|ch|ex|deg|rad|turn|s|ms|fr)\b/g, className: 'hl-number' },
+  // Plain numbers
+  { pattern: /\b\d+(\.\d+)?\b/g, className: 'hl-number' },
+  // Selectors (simplified: .class, #id)
+  { pattern: /[.#][\w-]+/g, className: 'hl-keyword' },
+]
+
+const JAVA_RULES = [
+  // Strings
+  { pattern: /"(?:[^"\\]|\\.)*"/g, className: 'hl-string' },
+  // Char literals
+  { pattern: /'(?:[^'\\]|\\.)*'/g, className: 'hl-string' },
+  // Comments
+  { pattern: /\/\/[^\n]*/g, className: 'hl-comment' },
+  { pattern: /\/\*[\s\S]*?\*\//g, className: 'hl-comment' },
+  // Annotations
+  { pattern: /@\w+/g, className: 'hl-decorator' },
+  // Keywords
+  {
+    pattern: /\b(abstract|assert|boolean|break|byte|case|catch|char|class|const|continue|default|do|double|else|enum|extends|final|finally|float|for|goto|if|implements|import|instanceof|int|interface|long|native|new|package|private|protected|public|return|short|static|strictfp|super|switch|synchronized|this|throw|throws|transient|try|void|volatile|while|var|record|sealed|permits|yield)\b/g,
+    className: 'hl-keyword',
+  },
+  // Built-in values
+  { pattern: /\b(true|false|null)\b/g, className: 'hl-boolean' },
+  // Numbers
+  { pattern: /\b\d+(\.\d+)?[fFdDlL]?\b/g, className: 'hl-number' },
+]
+
+const GO_RULES = [
+  // Strings
+  { pattern: /"(?:[^"\\]|\\.)*"|`[^`]*`/g, className: 'hl-string' },
+  // Char literals
+  { pattern: /'(?:[^'\\]|\\.)*'/g, className: 'hl-string' },
+  // Comments
+  { pattern: /\/\/[^\n]*/g, className: 'hl-comment' },
+  { pattern: /\/\*[\s\S]*?\*\//g, className: 'hl-comment' },
+  // Keywords
+  {
+    pattern: /\b(break|case|chan|const|continue|default|defer|else|fallthrough|for|func|go|goto|if|import|interface|map|package|range|return|select|struct|switch|type|var)\b/g,
+    className: 'hl-keyword',
+  },
+  // Built-in values
+  { pattern: /\b(true|false|nil|iota)\b/g, className: 'hl-boolean' },
+  // Built-in types
+  { pattern: /\b(bool|byte|complex(64|128)|error|float(32|64)|int(8|16|32|64)?|rune|string|uint(8|16|32|64)?|uintptr|any|comparable)\b/g, className: 'hl-type' },
+  // Numbers
+  { pattern: /\b\d+(\.\d+)?([eE][+-]?\d+)?\b/g, className: 'hl-number' },
+]
+
+const RUST_RULES = [
+  // Strings
+  { pattern: /"(?:[^"\\]|\\.)*"/g, className: 'hl-string' },
+  // Raw strings
+  { pattern: /r#*"[^"]*?"#*/g, className: 'hl-string' },
+  // Char literals
+  { pattern: /'(?:[^'\\]|\\.)*'/g, className: 'hl-string' },
+  // Comments
+  { pattern: /\/\/[^\n]*/g, className: 'hl-comment' },
+  { pattern: /\/\*[\s\S]*?\*\//g, className: 'hl-comment' },
+  // Attributes
+  { pattern: /#\[[^\]]*\]/g, className: 'hl-decorator' },
+  // Macros (word!)
+  { pattern: /\b\w+!/g, className: 'hl-decorator' },
+  // Keywords
+  {
+    pattern: /\b(as|async|await|break|const|continue|crate|dyn|else|enum|extern|fn|for|if|impl|in|let|loop|match|mod|move|mut|pub|ref|return|self|Self|static|struct|super|trait|type|unsafe|use|where|while|yield)\b/g,
+    className: 'hl-keyword',
+  },
+  // Built-in values
+  { pattern: /\b(true|false|Some|None|Ok|Err)\b/g, className: 'hl-boolean' },
+  // Types
+  { pattern: /\b(bool|char|f32|f64|i8|i16|i32|i64|i128|isize|str|u8|u16|u32|u64|u128|usize|String|Vec|Box|Rc|Arc|Option|Result|HashMap|HashSet)\b/g, className: 'hl-type' },
+  // Numbers
+  { pattern: /\b\d+(\.\d+)?([eE][+-]?\d+)?(_\d+)*\b/g, className: 'hl-number' },
+]
+
+const C_RULES = [
+  // Strings
+  { pattern: /"(?:[^"\\]|\\.)*"/g, className: 'hl-string' },
+  // Char literals
+  { pattern: /'(?:[^'\\]|\\.)*'/g, className: 'hl-string' },
+  // Preprocessor
+  { pattern: /^\s*#\s*\w+[^\n]*/gm, className: 'hl-decorator' },
+  // Comments
+  { pattern: /\/\/[^\n]*/g, className: 'hl-comment' },
+  { pattern: /\/\*[\s\S]*?\*\//g, className: 'hl-comment' },
+  // Keywords
+  {
+    pattern: /\b(auto|break|case|char|const|continue|default|do|double|else|enum|extern|float|for|goto|if|inline|int|long|register|restrict|return|short|signed|sizeof|static|struct|switch|typedef|union|unsigned|void|volatile|while|_Bool|_Complex|_Imaginary)\b/g,
+    className: 'hl-keyword',
+  },
+  // Common types
+  { pattern: /\b(int8_t|int16_t|int32_t|int64_t|uint8_t|uint16_t|uint32_t|uint64_t|size_t|ssize_t|ptrdiff_t|intptr_t|uintptr_t|bool|NULL|EOF|stdin|stdout|stderr)\b/g, className: 'hl-type' },
+  // Numbers
+  { pattern: /\b\d+(\.\d+)?([eE][+-]?\d+)?[fFlLuU]*\b/g, className: 'hl-number' },
+]
+
+const SQL_RULES = [
+  // Strings
+  { pattern: /'(?:[^'\\]|\\.)*'/g, className: 'hl-string' },
+  // Comments
+  { pattern: /--[^\n]*/g, className: 'hl-comment' },
+  { pattern: /\/\*[\s\S]*?\*\//g, className: 'hl-comment' },
+  // Keywords
+  {
+    pattern: /\b(SELECT|FROM|WHERE|INSERT|INTO|VALUES|UPDATE|SET|DELETE|CREATE|TABLE|ALTER|DROP|INDEX|VIEW|AND|OR|NOT|IN|IS|NULL|LIKE|BETWEEN|EXISTS|HAVING|GROUP|BY|ORDER|ASC|DESC|LIMIT|OFFSET|JOIN|INNER|LEFT|RIGHT|OUTER|FULL|CROSS|ON|AS|UNION|ALL|DISTINCT|CASE|WHEN|THEN|ELSE|END|BEGIN|COMMIT|ROLLBACK|GRANT|REVOKE|PRIMARY|KEY|FOREIGN|REFERENCES|DEFAULT|CHECK|CONSTRAINT|UNIQUE|CASCADE|TRIGGER|FUNCTION|PROCEDURE|RETURNS|DECLARE|CURSOR|FETCH|OPEN|CLOSE|IF|WHILE|LOOP|EXIT|EXECUTE|EXPLAIN|ANALYZE|VACUUM)\b/gi,
+    className: 'hl-keyword',
+  },
+  // Numbers
+  { pattern: /\b\d+(\.\d+)?\b/g, className: 'hl-number' },
+]
+
+const YAML_RULES = [
+  // Comments
+  { pattern: /#[^\n]*/g, className: 'hl-comment' },
+  // Strings
+  { pattern: /"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, className: 'hl-string' },
+  // Keys
+  { pattern: /^[\t ]*[\w][\w .-]*(?=\s*:)/gm, className: 'hl-key' },
+  // Booleans & null
+  { pattern: /\b(true|false|yes|no|on|off|null)\b/gi, className: 'hl-boolean' },
+  // Anchors & aliases
+  { pattern: /[&*][\w-]+/g, className: 'hl-variable' },
+  // Numbers
+  { pattern: /\b\d+(\.\d+)?([eE][+-]?\d+)?\b/g, className: 'hl-number' },
+]
+
+const TOML_RULES = [
+  // Comments
+  { pattern: /#[^\n]*/g, className: 'hl-comment' },
+  // Strings
+  { pattern: /"""[\s\S]*?"""|'''[\s\S]*?'''/g, className: 'hl-string' },
+  { pattern: /"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, className: 'hl-string' },
+  // Section headers
+  { pattern: /^\s*\[[\w.-]+\]/gm, className: 'hl-decorator' },
+  { pattern: /^\s*\[\[[\w.-]+\]\]/gm, className: 'hl-decorator' },
+  // Keys
+  { pattern: /^[\t ]*[\w][\w -]*(?=\s*=)/gm, className: 'hl-key' },
+  // Booleans
+  { pattern: /\b(true|false)\b/g, className: 'hl-boolean' },
+  // Numbers
+  { pattern: /\b\d+(\.\d+)?\b/g, className: 'hl-number' },
+  // Dates
+  { pattern: /\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}/g, className: 'hl-number' },
 ]
 
 const RULES = {
   python: PYTHON_RULES,
+  py: PYTHON_RULES,
   json: JSON_RULES,
   bash: BASH_RULES,
   sh: BASH_RULES,
+  zsh: BASH_RULES,
+  javascript: JS_RULES,
+  js: JS_RULES,
+  jsx: JS_RULES,
+  mjs: JS_RULES,
+  cjs: JS_RULES,
+  typescript: TS_RULES,
+  ts: TS_RULES,
+  tsx: TS_RULES,
+  html: HTML_RULES,
+  htm: HTML_RULES,
+  xml: HTML_RULES,
+  svg: HTML_RULES,
+  vue: HTML_RULES,
+  svelte: HTML_RULES,
+  css: CSS_RULES,
+  scss: CSS_RULES,
+  less: CSS_RULES,
+  java: JAVA_RULES,
+  kt: JAVA_RULES,
+  kotlin: JAVA_RULES,
+  go: GO_RULES,
+  rust: RUST_RULES,
+  rs: RUST_RULES,
+  c: C_RULES,
+  h: C_RULES,
+  cpp: C_RULES,
+  cxx: C_RULES,
+  cc: C_RULES,
+  hpp: C_RULES,
+  sql: SQL_RULES,
+  yaml: YAML_RULES,
+  yml: YAML_RULES,
+  toml: TOML_RULES,
+  dockerfile: BASH_RULES,
+  makefile: BASH_RULES,
+  mk: BASH_RULES,
+  ini: TOML_RULES,
+  cfg: TOML_RULES,
+  conf: TOML_RULES,
+  env: BASH_RULES,
 }
 
 const JSON_LONG_STRING_FALLBACK_LIMIT = 90
@@ -97,8 +353,6 @@ function readFollowingIndentAfterComma(code, index) {
   let i = index + 1
   while (code[i] === ' ' || code[i] === '\t') i++
   const next = code[i]
-  // Swallow only the newline that would otherwise become an extra visual row after
-  // the inline <details>. Keep the original indentation spaces for the next key.
   return next === '"' || next === '}' || next === ']' ? '\n' : ''
 }
 
@@ -245,4 +499,27 @@ export function highlight(code, lang, options = {}) {
   } catch {
     return escaped
   }
+}
+
+/**
+ * Get the language identifier from a file extension.
+ * @param {string} filename
+ * @returns {string} Language identifier or empty string
+ */
+export function getFileLang(filename) {
+  if (!filename) return ''
+  const ext = filename.split('.').pop()?.toLowerCase() || ''
+  if (ext === 'md' || ext === 'markdown' || ext === 'mdx') return ''
+  return RULES[ext] ? ext : ''
+}
+
+/**
+ * Check if a file is a markdown file.
+ * @param {string} filename
+ * @returns {boolean}
+ */
+export function isMarkdownFile(filename) {
+  if (!filename) return false
+  const ext = filename.split('.').pop()?.toLowerCase() || ''
+  return ext === 'md' || ext === 'markdown' || ext === 'mdx'
 }

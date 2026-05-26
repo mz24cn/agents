@@ -11,9 +11,9 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shutil
-import subprocess
 from typing import Callable, Optional
+
+from runtime.common import parse_search_query, search_files
 
 logger = logging.getLogger("runtime.session_manager")
 
@@ -313,27 +313,8 @@ class SessionManager:
 
     @staticmethod
     def _parse_search_query(query: str):
-        """解析搜索查询，支持多关键词 AND/OR 模式。
-
-        规则：
-        - 包含 "|" → OR 模式：按 "|" 拆分为关键词列表
-        - 不包含 "|" → AND 模式：按空格拆分为关键词列表
-        每段关键词去除首尾空白后丢弃空串。
-
-        Args:
-            query: 原始搜索字符串
-
-        Returns:
-            tuple(str, list[str]): (mode, keywords)
-                mode 为 "or" 或 "and"
-        """
-        stripped = query.strip()
-        if "|" in stripped:
-            keywords = [kw.strip() for kw in stripped.split("|") if kw.strip()]
-            return ("or", keywords)
-        else:
-            keywords = [kw.strip() for kw in stripped.split() if kw.strip()]
-            return ("and", keywords)
+        """Parse a search query — delegates to :func:`runtime.common.parse_search_query`."""
+        return parse_search_query(query)
 
     def search_sessions(self, query: str) -> list[dict]:
         """全文搜索 chats_dir 下所有 conversation.json，并返回命中的父会话列表。
@@ -351,7 +332,7 @@ class SessionManager:
         if not query:
             return self.list_sessions()
 
-        mode, keywords = self._parse_search_query(query)
+        _, keywords = parse_search_query(query)
         if not keywords:
             return self.list_sessions()
 
@@ -359,53 +340,11 @@ class SessionManager:
         if not os.path.isdir(root):
             return []
 
-        rg = shutil.which("rg") or shutil.which("ripgrep")
-        grep = shutil.which("grep") if not rg else None
-
-        if not rg and not grep:
-            logger.warning("search_sessions: neither rg nor grep is available")
-            return []
-
-        tool = rg or grep
-        try:
-            if mode == "or":
-                # OR: 搜索包含任一关键词的文件
-                if rg:
-                    import re as _re
-                    escaped = [_re.escape(kw) for kw in keywords]
-                    pattern = "|".join(escaped)
-                    cmd = [tool, "--files-with-matches", "--glob", "**/conversation.json", pattern, root]
-                else:
-                    pattern = "|".join(keywords)
-                    cmd = [tool, "-R", "-l", "-E", "--include=conversation.json", pattern, root]
-                proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
-                matched_files = set(proc.stdout.splitlines()) if proc.returncode == 0 else set()
-            else:
-                # AND: 必须同时包含所有关键词 → 逐轮过滤
-                # 第一轮：获取所有 conversation.json 文件
-                if rg:
-                    cmd = [tool, "--files-with-matches", "--glob", "**/conversation.json", "--fixed-strings", "-e", keywords[0], root]
-                else:
-                    cmd = [tool, "-R", "-l", "-F", "--include=conversation.json", "-e", keywords[0], root]
-                proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
-                matched_files = set(proc.stdout.splitlines()) if proc.returncode == 0 else set()
-
-                # 后续轮次：在已匹配文件中继续过滤
-                for kw in keywords[1:]:
-                    if not matched_files:
-                        break
-                    if rg:
-                        cmd = [tool, "--files-with-matches", "--fixed-strings", "-e", kw] + list(matched_files)
-                    else:
-                        cmd = [tool, "-l", "-F", "-e", kw] + list(matched_files)
-                    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
-                    matched_files = set(proc.stdout.splitlines()) if proc.returncode == 0 else set()
-        except subprocess.TimeoutExpired:
-            logger.warning("search_sessions: search timed out")
-            return []
-        except Exception as exc:
-            logger.warning("search_sessions: search failed: %s", exc)
-            return []
+        matched_files = search_files(
+            root,
+            query,
+            include="**/conversation.json",
+        )
 
         if not matched_files:
             return []

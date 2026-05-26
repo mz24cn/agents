@@ -462,3 +462,173 @@ def get_workspace() -> str:
     if not raw:
         raw = os.getcwd()
     return os.path.realpath(raw)
+
+
+# ---------------------------------------------------------------------------
+# Generic file search
+# ---------------------------------------------------------------------------
+
+import shutil
+import subprocess as _subprocess
+
+
+def parse_search_query(query: str) -> tuple[str, list[str]]:
+    """Parse a search query into mode and keyword list.
+
+    Rules:
+    - Contains ``|`` → OR mode: split on ``|``
+    - Otherwise      → AND mode: split on whitespace
+
+    Empty segments are discarded.  Each keyword is stripped of leading/trailing
+    whitespace.
+
+    Returns:
+        ``(mode, keywords)`` where *mode* is ``"or"`` or ``"and"``.
+    """
+    stripped = query.strip()
+    if "|" in stripped:
+        keywords = [kw.strip() for kw in stripped.split("|") if kw.strip()]
+        return ("or", keywords)
+    else:
+        keywords = [kw.strip() for kw in stripped.split() if kw.strip()]
+        return ("and", keywords)
+
+
+def search_files(
+    root: str,
+    query: str,
+    *,
+    include: str = "**/*",
+    exclude_dirs: Optional[list[str]] = None,
+    fixed_strings: bool = True,
+    timeout: int = 30,
+) -> set[str]:
+    """Search *root* for files matching *query* keywords.
+
+    Uses ripgrep (``rg``) when available, falls back to ``grep``.
+
+    Args:
+        root: Directory to search (must be an existing directory).
+        query: User query string — parsed via :func:`parse_search_query`
+            into AND/OR keywords.
+        include: Glob pattern(s) for files to search.
+            Multiple patterns separated by ``|`` (e.g. ``"*.py|*.js"``).
+            Default ``"**/*"`` (all files).
+        exclude_dirs: Directory names to skip.
+            Defaults to ``[".git", "node_modules", "dist"]``.
+        fixed_strings: If *True* (default), treat keywords as literal strings
+            (``--fixed-strings`` / ``-F``).  If *False*, treat as regex.
+        timeout: Per-subprocess timeout in seconds.
+
+    Returns:
+        Set of absolute file paths that match.
+    """
+    root = os.path.realpath(root)
+    if not os.path.isdir(root):
+        return set()
+
+    mode, keywords = parse_search_query(query)
+    if not keywords:
+        return set()
+
+    if exclude_dirs is None:
+        exclude_dirs = [".git", "node_modules", "dist"]
+
+    rg = shutil.which("rg") or shutil.which("ripgrep")
+    grep = shutil.which("grep") if not rg else None
+
+    if not rg and not grep:
+        return set()
+
+    tool = rg or grep
+
+    # ---- helpers ----------------------------------------------------------
+    def _split_glob(patterns: str) -> list[str]:
+        return [p.strip() for p in patterns.split("|") if p.strip()]
+
+    def _run(cmd: list[str]) -> set[str]:
+        proc = _subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
+        if proc.returncode not in (0, 1):          # 1 = no matches
+            return set()
+        return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+
+    # ---- build common flags ----------------------------------------------
+    globs = _split_glob(include)
+    result: set[str] = set()
+
+    try:
+        if mode == "or":
+            # OR: single command, regex alternation pattern
+            if rg:
+                escaped = [re.escape(kw) if fixed_strings else kw for kw in keywords]
+                pattern = "|".join(escaped)
+                cmd = [tool, "--files-with-matches"]
+                for g in globs:
+                    cmd += ["--glob", g]
+                for d in exclude_dirs:
+                    cmd += ["--glob", f"!{d}"]
+                cmd += [pattern, root]
+            else:
+                pattern = "|".join(
+                    re.escape(kw) if fixed_strings else kw for kw in keywords
+                )
+                cmd = [tool, "-R", "-l", "-E"]
+                for g in globs:
+                    cmd += [f"--include={g}"]
+                for d in exclude_dirs:
+                    cmd += [f"--exclude-dir={d}"]
+                cmd += [pattern, root]
+            result = _run(cmd)
+
+        else:
+            # AND: iterative narrowing — first keyword narrows scope,
+            # subsequent keywords refine the already-matched set.
+            for i, kw in enumerate(keywords):
+                if i == 0:
+                    if rg:
+                        cmd = [tool, "--files-with-matches"]
+                        for g in globs:
+                            cmd += ["--glob", g]
+                        for d in exclude_dirs:
+                            cmd += ["--glob", f"!{d}"]
+                        if fixed_strings:
+                            cmd += ["--fixed-strings"]
+                        cmd += ["-e", kw, root]
+                    else:
+                        cmd = [tool, "-R", "-l"]
+                        if fixed_strings:
+                            cmd += ["-F"]
+                        for g in globs:
+                            cmd += [f"--include={g}"]
+                        for d in exclude_dirs:
+                            cmd += [f"--exclude-dir={d}"]
+                        cmd += ["-e", kw, root]
+                    result = _run(cmd)
+                else:
+                    if not result:
+                        break
+                    if rg:
+                        cmd = [tool, "--files-with-matches"]
+                        if fixed_strings:
+                            cmd += ["--fixed-strings"]
+                        cmd += ["-e", kw] + sorted(result)
+                    else:
+                        cmd = [tool, "-l"]
+                        if fixed_strings:
+                            cmd += ["-F"]
+                        cmd += ["-e", kw] + sorted(result)
+                    result = _run(cmd)
+
+    except _subprocess.TimeoutExpired:
+        return set()
+    except Exception:
+        return set()
+
+    return result

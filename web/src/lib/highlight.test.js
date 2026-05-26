@@ -87,8 +87,8 @@ describe('P5: unsupported languages produce no <span> tags', () => {
   // Validates: Requirements 3.4
   it('unsupported lang returns plain escaped text without <span>', () => {
     const unsupportedLangs = fc.oneof(
-      fc.constantFrom('ruby', 'go', 'rust', 'java', 'cpp', 'typescript', 'unknown', ''),
-      fc.string().filter(s => !['python', 'json', 'bash', 'sh'].includes(s.toLowerCase()))
+      fc.constantFrom('ruby', 'perl', 'swift', 'kotlin_script', 'elixir', 'unknown', ''),
+      fc.string().filter(s => !['python', 'json', 'bash', 'sh', 'zsh', 'javascript', 'js', 'jsx', 'typescript', 'ts', 'tsx', 'html', 'htm', 'xml', 'svg', 'vue', 'svelte', 'css', 'scss', 'less', 'java', 'kt', 'go', 'rust', 'rs', 'c', 'h', 'cpp', 'cxx', 'cc', 'hpp', 'sql', 'yaml', 'yml', 'toml', 'dockerfile', 'makefile', 'mk', 'ini', 'cfg', 'conf', 'env', 'mjs', 'cjs'].includes(s.toLowerCase()))
     )
     fc.assert(
       fc.property(unsupportedLangs, fc.string(), (lang, code) => {

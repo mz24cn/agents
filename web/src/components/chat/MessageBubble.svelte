@@ -52,6 +52,21 @@
     return { html: null, lang: null, displayContent }
   }
 
+  function renderContentParts(content) {
+    const source = String(content ?? '')
+    const re = /<file>\s*([^<]+?)\s*<\/file>/g
+    const parts = []
+    let index = 0
+    let match
+    while ((match = re.exec(source)) !== null) {
+      if (match.index > index) parts.push({ type: 'text', value: source.slice(index, match.index) })
+      parts.push({ type: 'file', value: match[1].trim() })
+      index = re.lastIndex
+    }
+    if (index < source.length) parts.push({ type: 'text', value: source.slice(index) })
+    return parts
+  }
+
   // 获取智能体信息
   const matchedAgent = $derived(msg.assistant_id ? agentList.find(a => a.agent_id === msg.assistant_id) : null)
   const agentNickname = $derived(matchedAgent?.nickname)
@@ -207,7 +222,15 @@
         {/if}
       </div>
     {:else}
-      <div class="content">{msg.content}</div>
+      <div class="content">
+        {#each renderContentParts(msg.content) as part}
+          {#if part.type === 'file'}
+            <span class="file-ref-chip">{part.value}</span>
+          {:else}
+            {part.value}
+          {/if}
+        {/each}
+      </div>
     {/if}
   {:else if msg.prompt_template}
     <div class="content template-ref">
@@ -325,6 +348,36 @@
     white-space: pre-wrap;
     line-height: 1.5;
     font-size: 0.9rem;
+  }
+  .file-ref-chip {
+    display: inline-flex;
+    align-items: center;
+    vertical-align: baseline;
+    max-width: min(520px, 100%);
+    margin: 0 2px;
+    padding: 1px 7px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.18);
+    border: 1px solid rgba(255, 255, 255, 0.35);
+    color: inherit;
+    font-size: 0.78rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    line-height: 1.6;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .file-ref-chip::before {
+    content: '📎';
+    margin-right: 4px;
+    font-family: system-ui, sans-serif;
+  }
+  .message.assistant .file-ref-chip,
+  .message.system .file-ref-chip,
+  .message.tool .file-ref-chip {
+    background: color-mix(in srgb, var(--primary) 14%, var(--bg-secondary));
+    border-color: color-mix(in srgb, var(--primary) 35%, var(--border));
+    color: var(--primary);
   }
   .template-ref { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 6px; white-space: normal; }
   .template-ref-id { font-family: monospace; font-weight: 600; font-size: 0.9rem; }

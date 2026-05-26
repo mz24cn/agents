@@ -164,6 +164,7 @@ def persist_conversation(
     agent_id: Optional[str] = None,
     agent_nickname: Optional[str] = None,
     model_id: Optional[str] = None,
+    workspace: Optional[str] = None,
 ) -> Optional[Exception]:
     """将一次推理的消息持久化到会话存储。
 
@@ -224,7 +225,7 @@ def persist_conversation(
             if last_stat else None
         ) or None
         merged_extra: Optional[dict] = None
-        if tool_ids is not None or extra_meta or model_id or agent_id:
+        if tool_ids is not None or extra_meta or model_id or agent_id or workspace:
             merged_extra = {}
             if tool_ids is not None:
                 merged_extra["tool_ids"] = tool_ids
@@ -232,6 +233,8 @@ def persist_conversation(
                 merged_extra["model_id"] = model_id
             if agent_id is not None:
                 merged_extra["agent_id"] = agent_id
+            if workspace:
+                merged_extra["workspace"] = workspace
             if extra_meta:
                 merged_extra.update(extra_meta)
         context_manager.save_conversation(
@@ -367,7 +370,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         """Handle CORS preflight requests."""
         self.send_response(200)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Upload-Offset, X-Upload-Size, X-File-Size")
         self.end_headers()
 
     # ------------------------------------------------------------------
@@ -440,6 +443,20 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         elif re.match(r"^/v1/agents/[^/]+$", path):
             agent_id = path[len("/v1/agents/"):]
             self._handle_get_agent(agent_id)
+        elif path == "/v1/workspace/list":
+            self._handle_workspace_list()
+        elif path == "/v1/workspace/tree":
+            self._handle_workspace_tree()
+        elif path == "/v1/workspace/children":
+            self._handle_workspace_children()
+        elif path == "/v1/workspace/search":
+            self._handle_workspace_search()
+        elif path == "/v1/workspace/content":
+            self._handle_workspace_content()
+        elif path == "/v1/workspace/download":
+            self._handle_workspace_download()
+        elif path == "/v1/workspace/thumbnail":
+            self._handle_workspace_thumbnail()
         elif path.startswith("/v1/"):
             self._send_json_error(404, f"Not found: {self.path}")
         else:
@@ -489,7 +506,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         """Handle POST requests."""
-        path = self.path.rstrip("/")
+        path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
         if path == "/v1/infer":
             self._handle_infer()
         elif path == "/v1/infer/stream":
@@ -526,12 +543,21 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self._handle_revoke_session(urllib.parse.unquote(session_id))
         elif path == "/v1/agents":
             self._handle_create_agent()
+        elif path == "/v1/workspace/rename":
+            self._handle_workspace_rename()
+        elif path == "/v1/workspace/duplicate":
+            self._handle_workspace_duplicate()
+        elif path == "/v1/workspace/upload/init":
+            self._handle_workspace_upload_init()
+        elif re.match(r"^/v1/workspace/upload/[^/]+/complete$", path):
+            upload_id = path[len("/v1/workspace/upload/"):-len("/complete")]
+            self._handle_workspace_upload_complete(urllib.parse.unquote(upload_id))
         else:
             self._send_json_error(404, f"Not found: {self.path}")
 
     def do_PUT(self) -> None:
         """Handle PUT requests."""
-        path = self.path.rstrip("/")
+        path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
         m = re.match(r"^/v1/models/([^/]+)$", path)
         if m:
             self._handle_update_model(m.group(1))
@@ -552,11 +578,15 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         if m:
             self._handle_update_agent(m.group(1))
             return
+        m = re.match(r"^/v1/workspace/upload/([^/]+)/chunk/(\d+)$", path)
+        if m:
+            self._handle_workspace_upload_chunk(urllib.parse.unquote(m.group(1)), int(m.group(2)))
+            return
         self._send_json_error(404, f"Not found: {self.path}")
 
     def do_DELETE(self) -> None:
         """Handle DELETE requests."""
-        path = self.path.rstrip("/")
+        path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
         m = re.match(r"^/v1/models/([^/]+)$", path)
         if m:
             self._handle_delete_model(m.group(1))
@@ -588,6 +618,13 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         if m:
             self._handle_delete_agent(m.group(1))
             return
+        if path == "/v1/workspace/delete":
+            self._handle_workspace_delete()
+            return
+        m = re.match(r"^/v1/workspace/upload/([^/]+)$", path)
+        if m:
+            self._handle_workspace_upload_cancel(urllib.parse.unquote(m.group(1)))
+            return
         self._send_json_error(404, f"Not found: {self.path}")
 
     # ------------------------------------------------------------------
@@ -614,6 +651,161 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         templates = mgr.list_all()
         data = [t.to_dict() for t in templates]
         self._send_json_response(200, {"templates": data})
+
+    def _handle_workspace_list(self) -> None:
+        """GET /v1/workspace/list — list files in workspace directory."""
+        try:
+            parsed = urllib.parse.urlparse(self.path)
+            params = urllib.parse.parse_qs(parsed.query)
+            
+            path = params.get('path', [''])[0]
+            page = int(params.get('page', ['1'])[0])
+            page_size = int(params.get('page_size', ['50'])[0])
+            restrict = params.get('restrict', ['1'])[0] != '0'
+            
+            if not path:
+                self._send_json_error(400, "Missing 'path' parameter")
+                return
+            
+            workspace_mgr = self._get_workspace_manager()
+            result = workspace_mgr.list_files(path, page, page_size, restrict_workspace=restrict)
+            self._send_json_response(200, result)
+        except ValueError as e:
+            self._send_json_error(400, str(e))
+        except Exception as e:
+            logger.error(f"Workspace list error: {e}")
+            self._send_json_error(500, "Internal server error")
+
+    def _handle_workspace_tree(self) -> None:
+        """GET /v1/workspace/tree — get directory tree structure."""
+        try:
+            parsed = urllib.parse.urlparse(self.path)
+            params = urllib.parse.parse_qs(parsed.query)
+            
+            path = params.get('path', [''])[0]
+            
+            if not path:
+                self._send_json_error(400, "Missing 'path' parameter")
+                return
+            
+            workspace_mgr = self._get_workspace_manager()
+            tree = workspace_mgr.get_directory_tree(path)
+            self._send_json_response(200, tree)
+        except ValueError as e:
+            self._send_json_error(400, str(e))
+        except Exception as e:
+            logger.error(f"Workspace tree error: {e}")
+            self._send_json_error(500, "Internal server error")
+
+    def _handle_workspace_children(self) -> None:
+        """GET /v1/workspace/children — list child directories of any path (no workspace restriction)."""
+        try:
+            parsed = urllib.parse.urlparse(self.path)
+            params = urllib.parse.parse_qs(parsed.query)
+            path = params.get('path', [''])[0]
+            
+            workspace_mgr = self._get_workspace_manager()
+            children = workspace_mgr.list_children(path)
+            self._send_json_response(200, children)
+        except ValueError as e:
+            self._send_json_error(400, str(e))
+        except Exception as e:
+            logger.error(f"Workspace children error: {e}")
+            self._send_json_error(500, "Internal server error")
+
+    def _handle_workspace_search(self) -> None:
+        """GET /v1/workspace/search — search files in workspace."""
+        try:
+            parsed = urllib.parse.urlparse(self.path)
+            params = urllib.parse.parse_qs(parsed.query)
+            
+            path = params.get('path', [''])[0]
+            query = params.get('query', [''])[0]
+            
+            if not path:
+                self._send_json_error(400, "Missing 'path' parameter")
+                return
+            
+            if not query:
+                self._send_json_error(400, "Missing 'query' parameter")
+                return
+            
+            workspace_mgr = self._get_workspace_manager()
+            results = workspace_mgr.search_files(path, query, restrict_workspace=False)
+            self._send_json_response(200, results)
+        except ValueError as e:
+            self._send_json_error(400, str(e))
+        except Exception as e:
+            logger.error(f"Workspace search error: {e}")
+            self._send_json_error(500, "Internal server error")
+
+    def _handle_workspace_content(self) -> None:
+        """GET /v1/workspace/content — get file content for preview."""
+        try:
+            parsed = urllib.parse.urlparse(self.path)
+            params = urllib.parse.parse_qs(parsed.query)
+            
+            path = params.get('path', [''])[0]
+            restrict = params.get('restrict', ['1'])[0] != '0'
+            
+            if not path:
+                self._send_json_error(400, "Missing 'path' parameter")
+                return
+            
+            workspace_mgr = self._get_workspace_manager()
+            content = workspace_mgr.get_file_content(path, restrict_workspace=restrict)
+            file_info = workspace_mgr.get_file_info(path, restrict_workspace=restrict)
+            
+            content_type = file_info.get('mime_type') or 'application/octet-stream'
+            
+            self.send_response(200)
+            self.send_header('Content-Type', content_type)
+            self.send_header('Content-Length', str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+        except ValueError as e:
+            self._send_json_error(400, str(e))
+        except Exception as e:
+            logger.error(f"Workspace content error: {e}")
+            self._send_json_error(500, "Internal server error")
+
+    def _handle_workspace_download(self) -> None:
+        """GET /v1/workspace/download — download file."""
+        try:
+            parsed = urllib.parse.urlparse(self.path)
+            params = urllib.parse.parse_qs(parsed.query)
+            
+            path = params.get('path', [''])[0]
+            restrict = params.get('restrict', ['1'])[0] != '0'
+            
+            if not path:
+                self._send_json_error(400, "Missing 'path' parameter")
+                return
+            
+            workspace_mgr = self._get_workspace_manager()
+            content = workspace_mgr.get_file_content(path, restrict_workspace=restrict)
+            file_info = workspace_mgr.get_file_info(path, restrict_workspace=restrict)
+            
+            content_type = file_info.get('mime_type') or 'application/octet-stream'
+            file_name = file_info.get('name', 'download')
+            
+            self.send_response(200)
+            self.send_header('Content-Type', content_type)
+            self.send_header('Content-Disposition', f'attachment; filename="{file_name}"')
+            self.send_header('Content-Length', str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+        except ValueError as e:
+            self._send_json_error(400, str(e))
+        except Exception as e:
+            logger.error(f"Workspace download error: {e}")
+            self._send_json_error(500, "Internal server error")
+
+    def _handle_workspace_thumbnail(self) -> None:
+        """GET /v1/workspace/thumbnail — get image thumbnail."""
+        # For now, just serve the original image
+        # TODO: Implement actual thumbnail generation
+        self._handle_workspace_content()
 
     # ------------------------------------------------------------------
     # POST handlers
@@ -670,6 +862,14 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 return None
 
         context_manager = self.server.context_manager  # type: ignore[attr-defined]
+
+        # Extract workspace from body early and set on thread_local before
+        # parsing messages, so <file>...</file> references resolve against the
+        # request workspace rather than a stale/default context.
+        workspace = body.get("workspace") or None
+        if workspace:
+            set_request_context(workspace=workspace)
+
         raw_session_id: Optional[str] = body.get("session_id") or None
         session_id: Optional[str] = None
         use_session: bool = False
@@ -708,6 +908,8 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         user_message_timestamp = None
         if "messages" in body:
             from runtime.common import now_iso
+            from runtime.workspace_manager import expand_workspace_file_refs
+            from runtime.common import get_workspace as _get_ws
             now_ts = now_iso()
             original_messages = []
             for m in body["messages"]:
@@ -718,6 +920,11 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 if user_message_timestamp is None and msg.role == "user":
                     user_message_timestamp = msg.timestamp
                 original_messages.append(msg)
+            try:
+                original_messages = expand_workspace_file_refs(original_messages, _get_ws())
+            except ValueError as exc:
+                self._send_json_error(400, str(exc))
+                return None
 
         assembled_messages = original_messages
         if use_session and session_id is not None:
@@ -798,7 +1005,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         )
 
         agent_nickname = agent.get("nickname") if agent else None
-        return body, request, session_id, use_session, original_messages, context_manager, agent_id, agent_nickname, body["model_id"], tool_ids
+        return body, request, session_id, use_session, original_messages, context_manager, agent_id, agent_nickname, body["model_id"], tool_ids, workspace
 
     def _cleanup_thread_local(self):
         from runtime.models import Message
@@ -817,10 +1024,10 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         clear_request_context([
             "sse_callback", "cancel_event", "session_id", "session_dir",
             "user_message_timestamp", "depth", "tool_scope",
-            "context_manager", "session_manager",
+            "context_manager", "session_manager", "workspace",
         ])
 
-    def _persist_conversation(self, context_manager, session_id, original_messages, collected_messages, agent_id=None, agent_nickname=None, model_id=None, tool_ids=None):
+    def _persist_conversation(self, context_manager, session_id, original_messages, collected_messages, agent_id=None, agent_nickname=None, model_id=None, tool_ids=None, workspace=None):
         if session_id is None:
             return None
         exc = persist_conversation(
@@ -833,6 +1040,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             agent_nickname=agent_nickname,
             model_id=model_id,
             tool_ids=tool_ids,
+            workspace=workspace,
         )
         return exc
 
@@ -847,7 +1055,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         result = self._prepare_infer_request()
         if result is None:
             return
-        _body, request, session_id, use_session, original_messages, context_manager, agent_id, agent_nickname, model_id, tool_ids = result
+        _body, request, session_id, use_session, original_messages, context_manager, agent_id, agent_nickname, model_id, tool_ids, workspace = result
 
         try:
             runtime = self._get_runtime()
@@ -870,7 +1078,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                             msg.name = agent_nickname
 
             if use_session:
-                persist_exc = self._persist_conversation(context_manager, session_id, original_messages, collected_messages, agent_id, agent_nickname, model_id, tool_ids)
+                persist_exc = self._persist_conversation(context_manager, session_id, original_messages, collected_messages, agent_id, agent_nickname, model_id, tool_ids, workspace)
                 if persist_exc is not None:
                     self._send_json_error(500, f"Failed to save conversation: {persist_exc}")
                     return
@@ -933,7 +1141,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         result = self._prepare_infer_request()
         if result is None:
             return
-        _body, request, session_id, use_session, original_messages, context_manager, agent_id, agent_nickname, model_id, tool_ids = result
+        _body, request, session_id, use_session, original_messages, context_manager, agent_id, agent_nickname, model_id, tool_ids, workspace = result
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -1020,7 +1228,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         if use_session:
             pre_exc = self._persist_conversation(
                 context_manager, session_id, original_messages, [],
-                agent_id, agent_nickname, model_id, tool_ids,
+                agent_id, agent_nickname, model_id, tool_ids, workspace,
             )
             if pre_exc is not None:
                 logger.error("infer_stream: failed to pre-persist conversation for session %s: %s", session_id, pre_exc)
@@ -1048,7 +1256,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
 
             if use_session:
                 # original_messages already saved in pre-inference step, pass [] to avoid duplication
-                persist_exc = self._persist_conversation(context_manager, session_id, [], collected_messages, agent_id, agent_nickname, model_id, tool_ids)
+                persist_exc = self._persist_conversation(context_manager, session_id, [], collected_messages, agent_id, agent_nickname, model_id, tool_ids, workspace)
                 if persist_exc is not None:
                     logger.error("infer_stream: failed to save conversation for session %s: %s", session_id, persist_exc)
 
@@ -1064,7 +1272,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 from runtime.common import now_iso
                 collected_messages.append(Message(role="assistant", timestamp=now_iso(), content="\n\nError: user interrupted."))
                 # original_messages already saved in pre-inference step, pass [] to avoid duplication
-                persist_exc = self._persist_conversation(context_manager, session_id, [], collected_messages, agent_id, agent_nickname, model_id, tool_ids)
+                persist_exc = self._persist_conversation(context_manager, session_id, [], collected_messages, agent_id, agent_nickname, model_id, tool_ids, workspace)
                 if persist_exc is not None:
                     logger.error("infer_stream: failed to save aborted conversation for session %s: %s", session_id, persist_exc)
             # --- Session Status Stream: broadcast "done_error_unread" ---
@@ -1078,7 +1286,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 from runtime.common import now_iso
                 collected_messages.append(Message(role="assistant", timestamp=now_iso(), content=f"\n\nError: system aborted. ({exc})"))
                 # original_messages already saved in pre-inference step, pass [] to avoid duplication
-                persist_exc = self._persist_conversation(context_manager, session_id, [], collected_messages, agent_id, agent_nickname, model_id, tool_ids)
+                persist_exc = self._persist_conversation(context_manager, session_id, [], collected_messages, agent_id, agent_nickname, model_id, tool_ids, workspace)
                 if persist_exc is not None:
                     logger.error("infer_stream: failed to save aborted conversation for session %s: %s", session_id, persist_exc)
             try:
@@ -2058,6 +2266,283 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             return
         self._send_json_response(200, {"status": "deleted", "agent_id": agent_id})
 
+    def _handle_workspace_rename(self) -> None:
+        """POST /v1/workspace/rename — rename a file or directory."""
+        try:
+            body = self._read_json_body()
+            if body is None:
+                return
+            
+            path = body.get('path')
+            new_name = body.get('new_name')
+            
+            if not path:
+                self._send_json_error(400, "Missing 'path' field")
+                return
+            
+            if not new_name:
+                self._send_json_error(400, "Missing 'new_name' field")
+                return
+            
+            workspace_mgr = self._get_workspace_manager()
+            result = workspace_mgr.rename_file(path, new_name, restrict_workspace=False)
+            self._send_json_response(200, result)
+        except ValueError as e:
+            self._send_json_error(400, str(e))
+        except Exception as e:
+            logger.error(f"Workspace rename error: {e}")
+            self._send_json_error(500, "Internal server error")
+
+    def _handle_workspace_duplicate(self) -> None:
+        """POST /v1/workspace/duplicate — create a duplicate of a file."""
+        try:
+            body = self._read_json_body()
+            if body is None:
+                return
+            
+            path = body.get('path')
+            
+            if not path:
+                self._send_json_error(400, "Missing 'path' field")
+                return
+            
+            workspace_mgr = self._get_workspace_manager()
+            result = workspace_mgr.duplicate_file(path, restrict_workspace=False)
+            self._send_json_response(200, result)
+        except ValueError as e:
+            self._send_json_error(400, str(e))
+        except Exception as e:
+            logger.error(f"Workspace duplicate error: {e}")
+            self._send_json_error(500, "Internal server error")
+
+    def _handle_workspace_delete(self) -> None:
+        """DELETE /v1/workspace/delete — delete a file or directory."""
+        try:
+            body = self._read_json_body()
+            if body is None:
+                return
+            
+            path = body.get('path')
+            
+            if not path:
+                self._send_json_error(400, "Missing 'path' field")
+                return
+            
+            workspace_mgr = self._get_workspace_manager()
+            workspace_mgr.delete_file(path, restrict_workspace=False)
+            self._send_json_response(200, {"status": "deleted", "path": path})
+        except ValueError as e:
+            self._send_json_error(400, str(e))
+        except Exception as e:
+            logger.error(f"Workspace delete error: {e}")
+            self._send_json_error(500, "Internal server error")
+
+    def _upload_error_status(self, message: str) -> int:
+        if message.startswith("UPLOAD_NOT_FOUND") or message.startswith("CHUNK_NOT_FOUND"):
+            return 404
+        if message.startswith("UPLOAD_NOT_READY") or message.startswith("UPLOAD_CANCELLED"):
+            return 409
+        return 400
+
+    def _get_workspace_upload_state(self):
+        if not hasattr(self.server, 'workspace_uploads'):
+            self.server.workspace_uploads = {}
+        if not hasattr(self.server, 'workspace_uploads_lock'):
+            self.server.workspace_uploads_lock = threading.Lock()
+        return self.server.workspace_uploads, self.server.workspace_uploads_lock
+
+    def _upload_header_int(self, name: str) -> Optional[int]:
+        value = self.headers.get(name)
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except ValueError:
+            raise ValueError(f"CHUNK_SIZE_MISMATCH: invalid {name}")
+
+    def _handle_workspace_upload_init(self) -> None:
+        try:
+            body = self._read_json_body()
+            if body is None:
+                return
+            for field in ('workspace_id', 'file_name', 'file_size', 'target_path'):
+                if field not in body:
+                    self._send_json_error(400, f"INVALID_REQUEST: missing field {field}")
+                    return
+
+            from runtime.workspace_manager import parse_upload_size, parse_upload_max_threads
+
+            parallel_size = parse_upload_size(os.environ.get('UPLOAD_PARALLEL_SIZE'))
+            parallel_max_threads = parse_upload_max_threads(os.environ.get('UPLOAD_PARALLEL_MAX_THREADS'))
+            workspace_mgr = self._get_workspace_manager()
+            task = workspace_mgr.create_upload_task(
+                body.get('file_name'),
+                body.get('file_size'),
+                body.get('target_path'),
+                parallel_size,
+                parallel_max_threads,
+            )
+            task['workspace_id'] = body.get('workspace_id')
+
+            uploads, lock = self._get_workspace_upload_state()
+            with lock:
+                uploads[task['upload_id']] = task
+
+            self._send_json_response(200, {
+                "upload_id": task['upload_id'],
+                "parallel_size": task['parallel_size'],
+                "parallel_max_threads": task['parallel_max_threads'],
+                "chunk_count": task['chunk_count'],
+                "chunks": [{
+                    "parallel_id": chunk['parallel_id'],
+                    "offset": chunk['offset'],
+                    "size": chunk['size'],
+                } for chunk in task['chunks']],
+            })
+        except ValueError as e:
+            self._send_json_error(self._upload_error_status(str(e)), str(e))
+        except Exception as e:
+            logger.error(f"Workspace upload init error: {e}")
+            self._send_json_error(500, "SERVER_ERROR: internal server error")
+
+    def _handle_workspace_upload_chunk(self, upload_id: str, parallel_id: int) -> None:
+        uploads, lock = self._get_workspace_upload_state()
+        workspace_mgr = self._get_workspace_manager()
+        try:
+            content_length = int(self.headers.get('Content-Length', '0'))
+        except ValueError:
+            self._send_json_error(400, "CHUNK_SIZE_MISMATCH: invalid Content-Length")
+            return
+
+        with lock:
+            task = uploads.get(upload_id)
+            if task is None:
+                self._send_json_error(404, "UPLOAD_NOT_FOUND: upload_id not found")
+                return
+            if task.get('status') == 'cancelled':
+                self._send_json_error(409, "UPLOAD_CANCELLED: upload has been cancelled")
+                return
+            if task.get('status') in {'completing', 'completed'}:
+                self._send_json_error(409, "UPLOAD_NOT_READY: upload is not accepting chunks")
+                return
+            chunks = {chunk['parallel_id']: chunk for chunk in task['chunks']}
+            chunk = chunks.get(parallel_id)
+            if chunk is None:
+                self._send_json_error(404, "CHUNK_NOT_FOUND: parallel_id not found")
+                return
+            if content_length != chunk['size']:
+                self._send_json_error(400, "CHUNK_SIZE_MISMATCH: Content-Length does not match expected size")
+                return
+            try:
+                upload_offset = self._upload_header_int('X-Upload-Offset')
+                upload_size = self._upload_header_int('X-Upload-Size')
+                file_size = self._upload_header_int('X-File-Size')
+            except ValueError as e:
+                self._send_json_error(400, str(e))
+                return
+            if upload_offset is not None and upload_offset != chunk['offset']:
+                self._send_json_error(400, "CHUNK_SIZE_MISMATCH: X-Upload-Offset mismatch")
+                return
+            if upload_size is not None and upload_size != chunk['size']:
+                self._send_json_error(400, "CHUNK_SIZE_MISMATCH: X-Upload-Size mismatch")
+                return
+            if file_size is not None and file_size != task['file_size']:
+                self._send_json_error(400, "CHUNK_SIZE_MISMATCH: X-File-Size mismatch")
+                return
+            chunk['status'] = 'uploading'
+            task['status'] = 'uploading'
+
+        try:
+            received = workspace_mgr.write_upload_chunk(upload_id, parallel_id, self.rfile, content_length)
+            with lock:
+                task = uploads.get(upload_id)
+                if task is None or task.get('status') == 'cancelled':
+                    workspace_mgr.cleanup_upload_temp(upload_id, {"chunks": [{"parallel_id": parallel_id}], "target_path": ""})
+                    self._send_json_error(409, "UPLOAD_CANCELLED: upload has been cancelled")
+                    return
+                for chunk in task['chunks']:
+                    if chunk['parallel_id'] == parallel_id:
+                        chunk['status'] = 'uploaded'
+                        break
+            self._send_json_response(200, {
+                "upload_id": upload_id,
+                "parallel_id": parallel_id,
+                "received": received,
+                "status": "uploaded",
+            })
+        except (ConnectionError, ValueError) as e:
+            with lock:
+                task = uploads.get(upload_id)
+                if task:
+                    for chunk in task['chunks']:
+                        if chunk['parallel_id'] == parallel_id:
+                            chunk['status'] = 'pending'
+                            break
+            self._send_json_error(self._upload_error_status(str(e)), str(e))
+        except Exception as e:
+            logger.error(f"Workspace upload chunk error: {e}")
+            self._send_json_error(500, "SERVER_ERROR: internal server error")
+
+    def _handle_workspace_upload_complete(self, upload_id: str) -> None:
+        uploads, lock = self._get_workspace_upload_state()
+        workspace_mgr = self._get_workspace_manager()
+        with lock:
+            task = uploads.get(upload_id)
+            if task is None:
+                self._send_json_error(404, "UPLOAD_NOT_FOUND: upload_id not found")
+                return
+            if task.get('status') == 'cancelled':
+                self._send_json_error(409, "UPLOAD_CANCELLED: upload has been cancelled")
+                return
+            if any(chunk.get('status') == 'uploading' for chunk in task['chunks']):
+                self._send_json_error(409, "UPLOAD_NOT_READY: some chunks are still uploading")
+                return
+            if any(chunk.get('status') != 'uploaded' for chunk in task['chunks']):
+                self._send_json_error(409, "UPLOAD_NOT_READY: some chunks are missing")
+                return
+            task['status'] = 'completing'
+
+        try:
+            result = workspace_mgr.complete_upload_task(task)
+            with lock:
+                uploads.pop(upload_id, None)
+            self._send_json_response(200, result)
+        except ValueError as e:
+            with lock:
+                task = uploads.get(upload_id)
+                if task:
+                    task['status'] = 'failed'
+            self._send_json_error(self._upload_error_status(str(e)), str(e))
+        except Exception as e:
+            with lock:
+                task = uploads.get(upload_id)
+                if task:
+                    task['status'] = 'failed'
+            logger.error(f"Workspace upload complete error: {e}")
+            self._send_json_error(500, "SERVER_ERROR: internal server error")
+
+    def _handle_workspace_upload_cancel(self, upload_id: str) -> None:
+        uploads, lock = self._get_workspace_upload_state()
+        workspace_mgr = self._get_workspace_manager()
+        with lock:
+            task = uploads.pop(upload_id, None)
+            if task is not None:
+                task['status'] = 'cancelled'
+        if task is None:
+            self._send_json_error(404, "UPLOAD_NOT_FOUND: upload_id not found")
+            return
+        workspace_mgr.cleanup_upload_temp(upload_id, task)
+        self._send_json_response(200, {"upload_id": upload_id, "status": "cancelled"})
+
+    def _get_workspace_manager(self):
+        """Get or create workspace manager instance."""
+        if not hasattr(self.server, '_workspace_manager'):
+            from runtime.common import get_workspace
+            workspace_path = get_workspace()
+            from runtime.workspace_manager import WorkspaceManager
+            self.server._workspace_manager = WorkspaceManager(workspace_path)
+        return self.server._workspace_manager
+
     # ------------------------------------------------------------------
     # RuntimeHTTPServer
     # ------------------------------------------------------------------
@@ -2207,6 +2692,8 @@ class RuntimeHTTPServer:
         self._server.env_manager = self._env_manager  # type: ignore[attr-defined]
         self._server.session_manager = self._session_manager  # type: ignore[attr-defined]
         self._server.active_streams = self._active_streams  # type: ignore[attr-defined]
+        self._server.workspace_uploads = {}  # type: ignore[attr-defined]
+        self._server.workspace_uploads_lock = threading.Lock()  # type: ignore[attr-defined]
         self._server.serve_forever()
 
     def start_background(self) -> None:
@@ -2224,6 +2711,8 @@ class RuntimeHTTPServer:
         self._server.env_manager = self._env_manager  # type: ignore[attr-defined]
         self._server.session_manager = self._session_manager  # type: ignore[attr-defined]
         self._server.active_streams = self._active_streams  # type: ignore[attr-defined]
+        self._server.workspace_uploads = {}  # type: ignore[attr-defined]
+        self._server.workspace_uploads_lock = threading.Lock()  # type: ignore[attr-defined]
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
 

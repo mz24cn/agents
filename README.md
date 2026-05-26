@@ -30,6 +30,8 @@ A minimal, zero-dependency Agent Service built with the pure Python standard lib
 - **HTTP API server** — lightweight REST API built on `http.server`, no FastAPI/uvicorn needed
 - **Multimodal** — supports image (base64) and audio inputs for VLM models
 - **Multi-task concurrent conversations with real-time status tracking** — support multiple simultaneous chat sessions with independent streaming states; real-time session status updates via SSE (streaming, success, error, unread); automatic read status management based on user scroll position; session title broadcasting
+- **Workspace file management** — full-featured workspace file manager with directory tree navigation, file listing (list/grid views), search (AND/OR modes via ripgrep/grep), rename, duplicate, delete, download, and chunked/parallel upload with pause/resume/retry support; workspace file references (`<file>path</file>`) in chat prompts are auto-expanded to inline content or attached images at inference time
+- **Enhanced code syntax highlighting** — extended language support for JavaScript, TypeScript, HTML, CSS, Java, Go, Rust, and more; improved keyword and decorator coverage for Python and Bash
 
 ### Architecture
 
@@ -48,6 +50,7 @@ runtime/
 ├── context_manager.py       # Context manager: session management, rolling summary, memory extraction
 ├── env_manager.py           # Environment variable manager
 ├── session_manager.py       # Session index manager
+├── workspace_manager.py     # Workspace file manager: listing, search, upload, file refs
 └── server.py                # HTTP API server
 
 web/                         # Svelte 5 management console SPA
@@ -287,6 +290,20 @@ python app.py 0.0.0.0:9000 # custom host and port
 | POST | `/v1/agents` | Create an agent |
 | PUT | `/v1/agents/{agent_id}` | Update an agent |
 | DELETE | `/v1/agents/{agent_id}` | Delete an agent |
+| GET | `/v1/workspace/list` | List files in a workspace directory (paginated) |
+| GET | `/v1/workspace/tree` | Get workspace directory tree structure |
+| GET | `/v1/workspace/children` | List child directories of any path (no workspace restriction) |
+| GET | `/v1/workspace/search` | Search files in workspace (AND/OR modes) |
+| GET | `/v1/workspace/content` | Get file content for preview |
+| GET | `/v1/workspace/download` | Download a file |
+| GET | `/v1/workspace/thumbnail` | Get image thumbnail |
+| POST | `/v1/workspace/rename` | Rename a file or directory |
+| POST | `/v1/workspace/duplicate` | Duplicate a file |
+| DELETE | `/v1/workspace/delete` | Delete a file or directory |
+| POST | `/v1/workspace/upload/init` | Initialize a chunked file upload |
+| PUT | `/v1/workspace/upload/{upload_id}/chunk/{chunk_id}` | Upload a file chunk |
+| POST | `/v1/workspace/upload/{upload_id}/complete` | Complete a chunked upload |
+| DELETE | `/v1/workspace/upload/{upload_id}` | Cancel an upload |
 
 **Streaming inference request:**
 
@@ -331,6 +348,8 @@ Features:
 - Agent management — save current configuration as a reusable agent; switch agents in the chat interface
 - Markdown rendering with syntax highlighting
 - Expandable long JSON string previews that auto-fit the available code block width
+- Workspace file manager — directory tree navigation, list/grid views, file search, rename/duplicate/delete, chunked upload with progress tracking, and clipboard paste upload
+- Rich text chat input with workspace file reference chips (`<file>path</file>`)
 - Multimodal: image upload and microphone recording
 - Dark/light theme, responsive layout
 - Resizable sidebar with collapse/expand toggle; width persisted to localStorage
@@ -428,6 +447,8 @@ MIT License — see [LICENSE](LICENSE)
 - **HTTP API 服务** — 基于 `http.server` 的轻量 REST API，无需 FastAPI/uvicorn
 - **多模态** — 支持图片（base64）和音频输入，适配 VLM 模型
 - **多任务并发对话及实时状态跟踪** — 支持多个聊天会话同时进行，每个会话独立管理流式状态；通过SSE实时更新会话状态（流式中、成功、错误、未读）；基于用户滚动位置自动管理已读状态；会话标题实时广播更新
+- **工作区文件管理** — 完整的工作区文件管理器，支持目录树导航、文件列表（列表/网格视图）、搜索（AND/OR模式，基于ripgrep/grep）、重命名、复制、删除、下载及分块/并行上传（支持暂停/恢复/重试）；对话中的工作区文件引用（`<file>路径</file>`）在推理时自动展开为内联内容或附加图片
+- **增强代码语法高亮** — 扩展支持 JavaScript、TypeScript、HTML、CSS、Java、Go、Rust 等语言；改进 Python 和 Bash 的关键字及装饰器覆盖
 
 ### 架构
 
@@ -446,6 +467,7 @@ runtime/
 ├── context_manager.py       # 上下文管理器：会话管理、滚动摘要、记忆提取
 ├── env_manager.py           # 环境变量管理器
 ├── session_manager.py       # 会话索引管理器
+├── workspace_manager.py     # 工作区文件管理器：文件列表、搜索、上传、文件引用展开
 └── server.py                # HTTP API 服务器
 
 web/                         # Svelte 5 管理控制台 SPA
@@ -683,6 +705,20 @@ python app.py 0.0.0.0:9000 # 自定义主机和端口
 | POST | `/v1/agents` | 创建智能体 |
 | PUT | `/v1/agents/{agent_id}` | 更新智能体 |
 | DELETE | `/v1/agents/{agent_id}` | 删除智能体 |
+| GET | `/v1/workspace/list` | 列出工作区目录中的文件（分页） |
+| GET | `/v1/workspace/tree` | 获取工作区目录树结构 |
+| GET | `/v1/workspace/children` | 列出任意路径的子目录（不限工作区） |
+| GET | `/v1/workspace/search` | 搜索工作区文件（AND/OR模式） |
+| GET | `/v1/workspace/content` | 获取文件内容用于预览 |
+| GET | `/v1/workspace/download` | 下载文件 |
+| GET | `/v1/workspace/thumbnail` | 获取图片缩略图 |
+| POST | `/v1/workspace/rename` | 重命名文件或目录 |
+| POST | `/v1/workspace/duplicate` | 复制文件 |
+| DELETE | `/v1/workspace/delete` | 删除文件或目录 |
+| POST | `/v1/workspace/upload/init` | 初始化分块文件上传 |
+| PUT | `/v1/workspace/upload/{upload_id}/chunk/{chunk_id}` | 上传文件分块 |
+| POST | `/v1/workspace/upload/{upload_id}/complete` | 完成分块上传 |
+| DELETE | `/v1/workspace/upload/{upload_id}` | 取消上传 |
 
 **流式推理请求示例：**
 
@@ -727,6 +763,8 @@ npm run build
 - 智能体管理 — 将当前配置保存为可复用的智能体；在对话中快速切换智能体
 - Markdown 渲染与语法高亮
 - JSON 长字符串可折叠预览，并自动适配代码块可用宽度
+- 工作区文件管理器 — 目录树导航、列表/网格视图、文件搜索、重命名/复制/删除、分块上传及进度跟踪、剪贴板粘贴上传
+- 富文本聊天输入框，支持工作区文件引用标签（`<file>路径</file>`）
 - 多模态：图片上传与麦克风录音
 - 深色/浅色主题，响应式布局
 - 侧边栏支持拖拽调整宽度与折叠/展开，宽度自动持久化到 localStorage

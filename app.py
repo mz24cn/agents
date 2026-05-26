@@ -23,6 +23,14 @@ if len(sys.argv) > 1:
         port = int(parts[1])
 
 if __name__ == "__main__":
+    workspace_dir = os.environ.get("AGENT_WORKSPACE", "")
+    if not workspace_dir or not os.path.exists(workspace_dir):
+        workspace_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workspace")
+        if not os.path.exists(workspace_dir):
+            workspace_dir = os.path.dirname(os.path.abspath(__file__))
+        os.environ["AGENT_WORKSPACE"] = workspace_dir
+    os.chdir(workspace_dir)
+
     server = RuntimeHTTPServer(host=host, port=port)
 
     try:

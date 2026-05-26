@@ -1,6 +1,6 @@
 <script>
   import { onMount, onDestroy } from 'svelte'
-  import { inferStream, abortInferStream, subscribeSessionEvents, agents as agentsApi, sessions as sessionsApi } from '../../lib/api.js'
+  import { inferStream, abortInferStream, subscribeSessionEvents, agents as agentsApi, sessions as sessionsApi, env as envApi } from '../../lib/api.js'
   import { catalog, loadAgents, loadTools, refreshAgents } from '../../lib/catalog-state.svelte.js'
   import ModelSelector from './ModelSelector.svelte'
   import ToolSelector from './ToolSelector.svelte'
@@ -9,6 +9,7 @@
   import MarkdownRenderer from './MarkdownRenderer.svelte'
   import MessageList from './MessageList.svelte'
   import ChatInput from './ChatInput.svelte'
+  import WorkspaceFileManager from './WorkspaceFileManager.svelte'
   import ConfirmDialog from '../ConfirmDialog.svelte'
   import { extractPlaceholders } from '../../lib/placeholder.js'
   import { t } from '../../lib/i18n.svelte.js'
@@ -82,6 +83,16 @@
   let systemPromptText = $state('')          // 纯文本形式
   let systemPromptTemplate = $state(null)    // { template_id, arguments } 形式，非 null 时优先使用
 
+  // 工作区文件管理器面板状态
+  let workspacePanelOpen = $state(false)
+  // 当前工作区路径（从环境变量获取）
+  let workspacePath = $state('')
+  let defaultWorkspacePath = $state('')
+  // 选中的文件列表（用于输入框）
+  let selectedWorkspaceFiles = $state([])
+  // 工作区是否为自定义路径（不等于默认路径，且默认路径已知）
+  let isWorkspaceCustom = $derived(workspacePath && defaultWorkspacePath && workspacePath !== defaultWorkspacePath)
+
   // 添加为智能体状态
   let addAgentMode = $state(false)
   let addAgentNickname = $state('')
@@ -98,6 +109,44 @@
 
   function closeTemplatePanel() {
     templatePanelOpen = false
+  }
+
+  // 工作区文件管理器相关函数
+  function openWorkspacePanel() {
+    workspacePanelOpen = true
+    // 从环境变量获取工作区路径
+    if (!workspacePath) {
+      fetchWorkspacePath()
+    }
+  }
+
+  function closeWorkspacePanel() {
+    workspacePanelOpen = false
+  }
+
+  async function fetchWorkspacePath() {
+    try {
+      const resp = await envApi.list()
+      const envMap = resp.env || {}
+      if (envMap.AGENT_WORKSPACE) {
+        defaultWorkspacePath = envMap.AGENT_WORKSPACE
+        workspacePath = envMap.AGENT_WORKSPACE
+      }
+    } catch (err) {
+      console.error('Failed to fetch workspace path:', err)
+    }
+  }
+
+  function handleWorkspaceChange(path) {
+    workspacePath = path
+  }
+
+  function handleSelectFiles(files) {
+    selectedWorkspaceFiles = files
+    // 将文件路径添加到输入框，使用 <file> 标签避免和前后文本粘连，后端会解析该标签
+    const fileRefs = files.map(f => `<file>${f.relative_path || f.path}</file>`).join(' ')
+    inputText = inputText ? `${inputText} ${fileRefs}` : fileRefs
+    closeWorkspacePanel()
   }
 
   function handleTemplatePanelSelect(result) {
@@ -212,6 +261,9 @@
     const reqBody = { model_id: selectedModelId, tool_ids: selectedToolIds, messages: apiMessages, stream: true }
     if (selectedAgentId) {
       reqBody.agent_id = selectedAgentId
+    }
+    if (workspacePath) {
+      reqBody.workspace = workspacePath
     }
     reqBody.session_id = sessionId ?? 'new'
     // 记录本次发送的第一条用户消息，用于新会话的临时标题
@@ -600,7 +652,11 @@
           selectedToolIds = meta.tool_ids
           localStorage.setItem(STORAGE_TOOLS_KEY, JSON.stringify(meta.tool_ids))
         }
+        // 恢复工作区路径
+        workspacePath = meta.workspace || defaultWorkspacePath
       } else {
+        // 无 meta 的旧会话，工作区回退到默认值
+        workspacePath = defaultWorkspacePath
         // 向下兼容：从最后一条 assistant 消息恢复 assistant_id
         const lastAssistantMsg = [...msgs].reverse().find(m => m.role === 'assistant')
         if (lastAssistantMsg?.assistant_id) {
@@ -618,6 +674,7 @@
     sessionId = null
     currentSession.sessionId = null
     shouldScrollToBottom = false
+    workspacePath = defaultWorkspacePath
   }
 
   // 监听 Sidebar 顶部的新建会话按钮。即使当前会话正在推理，也允许切换到新会话，
@@ -737,6 +794,7 @@
   // flag, which lets the user continue interacting.
   let _unsubscribeSessionEvents = null
   onMount(() => {
+    fetchWorkspacePath()
     _unsubscribeSessionEvents = subscribeSessionEvents(
       (data) => {
         if (data.event === 'message' && data.session_id && data.status) {
@@ -767,6 +825,12 @@
       🛠️<a href="#/setup?tab=tools" class="nav-link">{t('tools')}</a>
       <ToolSelector bind:selectedToolIds onchange={(ids) => localStorage.setItem(STORAGE_TOOLS_KEY, JSON.stringify(ids))} disabled={!!selectedAgentId} />
     </div>
+    {#if isWorkspaceCustom}
+      <div class="workspace-indicator" title={workspacePath} onclick={openWorkspacePanel}>
+        <span class="workspace-icon">📁</span>
+        <span class="workspace-path">{workspacePath}</span>
+      </div>
+    {/if}
     <div class="agent-selector-spacer"></div>
     <div class="agent-selector">
       🤖<a href="#/setup?tab=agents" class="nav-link">{t('agentSelector')}</a>
@@ -830,6 +894,16 @@
   <div class="message-area">
     <MessageList {messages} {agentList} onRevoke={handleRevoke} onScrollAtBottom={handleScrollAtBottom} {shouldScrollToBottom} />
 
+    {#if workspacePanelOpen}
+      <WorkspaceFileManager
+        bind:open={workspacePanelOpen}
+        bind:workspacePath={workspacePath}
+        onWorkspaceChange={handleWorkspaceChange}
+        onSelectFiles={handleSelectFiles}
+        onClose={closeWorkspacePanel}
+      />
+    {/if}
+
     {#if templatePanelOpen}
       <div class="template-panel">
         <div class="panel-header">
@@ -891,6 +965,7 @@
     onStop={handleStop}
     onStopForce={handleStopForce}
     onOpenTemplatePanel={openTemplatePanel}
+    onOpenWorkspacePanel={openWorkspacePanel}
     {isStreaming}
     bind:text={inputText}
   />
@@ -936,6 +1011,32 @@
     text-decoration: underline;
   }
   .agent-selector-spacer { flex: 1; }
+  .workspace-indicator {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 8px;
+    background: var(--bg-secondary);
+    border-radius: 4px;
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    cursor: pointer;
+    max-width: 300px;
+    overflow: hidden;
+  }
+  .workspace-indicator:hover {
+    background: var(--border);
+  }
+  .workspace-icon {
+    flex-shrink: 0;
+  }
+  .workspace-path {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    direction: rtl;
+    text-align: left;
+  }
   .agent-selector { display: flex; align-items: center; gap: 8px; }
   .agent-selector select {
     padding: 6px 10px;
@@ -1006,7 +1107,7 @@
     bottom: 0;
     left: 0;
     right: 0;
-    height: 75%;
+    height: calc(100% - 40px); /* 减去系统提示词行高 */
     background: var(--bg);
     border-top: 1px solid var(--border);
     display: flex;
@@ -1018,12 +1119,14 @@
   .panel-header {
     display: flex;
     align-items: center;
+    justify-content: space-between;
     gap: 8px;
     padding: 8px 16px;
     border-bottom: 1px solid var(--border);
     flex-shrink: 0;
     flex-wrap: nowrap;
     overflow: hidden;
+    background: var(--bg-secondary);
   }
   .header-placeholder-tag {
     display: inline-block;

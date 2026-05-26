@@ -273,3 +273,76 @@ export const agents = {
   update: (agentId, data) => request('PUT',    `/v1/agents/${encodeURIComponent(agentId)}`, data),
   delete: (agentId)       => request('DELETE', `/v1/agents/${encodeURIComponent(agentId)}`),
 }
+
+function uploadChunkWithProgress(uploadId, chunk, blob, onProgress) {
+  let xhr
+  let rejectPromise
+
+  const promise = new Promise((resolve, reject) => {
+    rejectPromise = reject
+    xhr = new XMLHttpRequest()
+    xhr.open('PUT', `/v1/workspace/upload/${encodeURIComponent(uploadId)}/chunk/${chunk.parallel_id}`)
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream')
+    xhr.setRequestHeader('X-Upload-Offset', String(chunk.offset))
+    xhr.setRequestHeader('X-Upload-Size', String(chunk.size))
+    xhr.setRequestHeader('X-File-Size', String(chunk.file_size))
+
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable && onProgress) {
+        onProgress(event.loaded)
+      }
+    }
+
+    xhr.onload = () => {
+      let data = null
+      try {
+        data = xhr.responseText ? JSON.parse(xhr.responseText) : null
+      } catch {
+        data = xhr.responseText
+      }
+
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(data)
+      } else {
+        const message = data?.message || data?.error || xhr.responseText || `Request failed: ${xhr.status}`
+        const err = new Error(message)
+        err.status = xhr.status
+        err.data = data
+        reject(err)
+      }
+    }
+
+    xhr.onerror = () => reject(new Error('Upload network error'))
+    xhr.onabort = () => {
+      const err = new DOMException('Upload aborted', 'AbortError')
+      reject(err)
+    }
+    xhr.send(blob)
+  })
+
+  return {
+    promise,
+    abort: () => {
+      if (xhr) xhr.abort()
+      else if (rejectPromise) rejectPromise(new DOMException('Upload aborted', 'AbortError'))
+    },
+  }
+}
+
+/** 工作区文件管理 API */
+export const workspace = {
+  list:     (path, page = 1, pageSize = 50, restrict = true) => request('GET', `/v1/workspace/list?path=${encodeURIComponent(path)}&page=${page}&page_size=${pageSize}&restrict=${restrict ? 1 : 0}`),
+  tree:     (path) => request('GET', `/v1/workspace/tree?path=${encodeURIComponent(path)}`),
+  children: (path) => request('GET', `/v1/workspace/children?path=${encodeURIComponent(path)}`),
+  search:   (path, query) => request('GET', `/v1/workspace/search?path=${encodeURIComponent(path)}&query=${encodeURIComponent(query)}`),
+  content:  (path, restrict = true) => `/v1/workspace/content?path=${encodeURIComponent(path)}&restrict=${restrict ? 1 : 0}`,
+  download: (path, restrict = true) => `/v1/workspace/download?path=${encodeURIComponent(path)}&restrict=${restrict ? 1 : 0}`,
+  thumbnail:(path, restrict = true) => `/v1/workspace/thumbnail?path=${encodeURIComponent(path)}&restrict=${restrict ? 1 : 0}`,
+  rename:   (path, newName) => request('POST', '/v1/workspace/rename', { path, new_name: newName }),
+  duplicate:(path) => request('POST', '/v1/workspace/duplicate', { path }),
+  delete:   (path) => request('DELETE', '/v1/workspace/delete', { path }),
+  uploadInit: (data) => request('POST', '/v1/workspace/upload/init', data),
+  uploadChunk: (uploadId, chunk, blob, onProgress) => uploadChunkWithProgress(uploadId, chunk, blob, onProgress),
+  uploadComplete: (uploadId) => request('POST', `/v1/workspace/upload/${encodeURIComponent(uploadId)}/complete`, {}),
+  uploadCancel: (uploadId) => request('DELETE', `/v1/workspace/upload/${encodeURIComponent(uploadId)}`),
+}
