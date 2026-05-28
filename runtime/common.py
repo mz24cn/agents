@@ -411,7 +411,10 @@ def convert_image_to_base64(img_data: str) -> str:
 # Data directory
 # ---------------------------------------------------------------------------
 
-DATA_DIR: str = os.path.join(os.path.expanduser("~"), ".agents_runtime")
+DATA_DIR: str = os.environ.get(
+    "AGENTS_RUNTIME_DIR",
+    os.path.join(os.path.expanduser("~"), ".agents_runtime"),
+)
 
 
 # ---------------------------------------------------------------------------

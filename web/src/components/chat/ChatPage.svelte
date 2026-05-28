@@ -91,6 +91,17 @@
   // 选中的文件列表（用于输入框）
   let selectedWorkspaceFiles = $state([])
   // 工作区是否为自定义路径（不等于默认路径，且默认路径已知）
+  // Ensure trailing slash for display. With CSS direction:rtl the trailing
+  // slash anchors the end, making paths like "/root" render as "/root/"
+  // instead of the confusing "root/". Also keeps D:\ displayable on Windows.
+  let displayWorkspacePath = $derived.by(() => {
+    let p = workspacePath || ''
+    if (!p) return ''
+    // Normalise Windows backslashes for display
+    p = p.replace(/\\/g, '/')
+    if (!p.endsWith('/')) p += '/'
+    return p
+  })
   let isWorkspaceCustom = $derived(workspacePath && defaultWorkspacePath && workspacePath !== defaultWorkspacePath)
 
   // 添加为智能体状态
@@ -828,7 +839,7 @@
     {#if isWorkspaceCustom}
       <div class="workspace-indicator" title={workspacePath} onclick={openWorkspacePanel}>
         <span class="workspace-icon">📁</span>
-        <span class="workspace-path">{workspacePath}</span>
+        <span class="workspace-path">{displayWorkspacePath}</span>
       </div>
     {/if}
     <div class="agent-selector-spacer"></div>

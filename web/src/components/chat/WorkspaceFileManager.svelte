@@ -119,6 +119,13 @@
     }
   }
 
+  // 构造子路径：parentPath + name
+  function childPath(parentPath, name) {
+    if (parentPath === '/') return `/${name}`
+    const sep = parentPath.includes('\\') ? '\\' : '/'
+    return `${parentPath}${sep}${name}`
+  }
+
   // 初始化目录树：从根节点逐级展开到工作区路径
   async function initTree(wsPath) {
     treeNodes = []
@@ -132,9 +139,9 @@
     }
     if (!roots || roots.length === 0) return
 
-    // 插入根节点（展开状态）
-    const rootPath = roots[0].path
-    treeNodes = [{ path: rootPath, name: roots[0].name, depth: 0, expanded: true, loading: false, isWorkspace: rootPath === wsPath }]
+    // 插入根节点（展开状态）- 根节点的 name 就是路径
+    const rootPath = roots[0].name
+    treeNodes = [{ path: rootPath, name: rootPath, depth: 0, expanded: true, loading: false, isWorkspace: rootPath === wsPath }]
 
     // 加载根的子目录
     let children
@@ -154,8 +161,7 @@
     let parentPath = rootPath
     for (let i = 0; i < segments.length; i++) {
       const seg = segments[i]
-      const sep = parentPath === '/' ? '' : (parentPath.includes('\\') ? '\\' : '/')
-      const segPath = parentPath === '/' ? `/${seg}` : `${parentPath}${sep}${seg}`
+      const segPath = childPath(parentPath, seg)
 
       // 确保该段在树中并展开
       const nodeIdx = treeNodes.findIndex(n => n.path === segPath)
@@ -189,14 +195,18 @@
   function insertChildren(parentIdx, parentPath, children, wsPath) {
     const parentNode = treeNodes[parentIdx]
     const depth = parentNode.depth + 1
-    const childNodes = children.map(c => ({
-      path: c.path,
-      name: c.name,
-      depth,
-      expanded: false,
-      loading: false,
-      isWorkspace: c.path === wsPath,
-    }))
+    const childNodes = children.map(c => {
+      const path = childPath(parentPath, c.name)
+      return {
+        path,
+        name: c.name,
+        depth,
+        expanded: false,
+        loading: false,
+        isWorkspace: path === wsPath,
+        ...(c.symlink_target ? { symlink_target: c.symlink_target } : {}),
+      }
+    })
     // 移除该父节点旧的子节点（如果有）
     let removeCount = 0
     for (let i = parentIdx + 1; i < treeNodes.length; i++) {

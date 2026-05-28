@@ -33,7 +33,7 @@ import urllib.error
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 SERVER_HOST = "127.0.0.1"
-SERVER_PORT = 8080
+SERVER_PORT = 7988
 
 # ANSI colors
 DIM = "\033[2m"

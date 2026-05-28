@@ -23,7 +23,7 @@
   const MCP_PLACEHOLDER = JSON.stringify({
     mcpServers: {
       time: { command: 'uvx', args: ['mcp-server-time', '--local-timezone=Asia/Shanghai'] },
-      myHttpServer: { url: 'http://localhost:8080/mcp', headers: { Authorization: 'Bearer <token>' } },
+      myHttpServer: { url: 'http://localhost:8000/mcp', headers: { Authorization: 'Bearer <token>' } },
     }
   }, null, 2)
 

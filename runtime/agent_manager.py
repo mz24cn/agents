@@ -21,9 +21,11 @@ class AgentManager:
 
     def __init__(self, agents_dir: Optional[str] = None) -> None:
         self._agents: dict[str, dict] = {}
-        self._agents_dir = agents_dir or os.path.join(
-            os.path.expanduser("~"), ".agents_runtime", "agents"
+        self._agents_dir = agents_dir or os.environ.get(
+            "AGENTS_RUNTIME_DIR",
+            os.path.join(os.path.expanduser("~"), ".agents_runtime"),
         )
+        self._agents_dir = os.path.join(self._agents_dir, "agents")
 
     def list_all(self) -> list[dict]:
         """Return a list of all agents sorted by last_modified descending."""

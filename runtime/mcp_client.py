@@ -501,7 +501,7 @@ class MCPClientManager:
             {
                 "mcpServers": {
                     "time": {"command": "uvx", "args": [...], "env": {}},
-                    "fetch": {"url": "http://localhost:8080/mcp"}
+                    "fetch": {"url": "http://localhost:8000/mcp"}
                 }
             }
         """

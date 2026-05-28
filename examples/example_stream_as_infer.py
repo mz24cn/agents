@@ -31,7 +31,7 @@ import urllib.error
 from typing import Optional
 
 # ── 配置 ──────────────────────────────────────────────────────────────────────
-SERVER_URL = "http://localhost:8080"
+SERVER_URL = "http://localhost:7988"
 MODEL_ID   = "qwen3"          # 替换为你在 server 中注册的 model_id
 TOOL_IDS   = []                  # 需要的工具 ID 列表，不需要则留空
 USER_TEXT  = "你好，请简单介绍一下你自己。"

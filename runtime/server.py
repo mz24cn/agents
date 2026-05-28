@@ -429,6 +429,8 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self._handle_list_prompt_templates()
         elif path == "/v1/env":
             self._handle_get_env()
+        elif path == "/v1/setup":
+            self._handle_setup_script()
         elif path == "/v1/sessions":
             self._handle_list_sessions()
         elif path == "/v1/sessions/search":
@@ -445,8 +447,6 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self._handle_get_agent(agent_id)
         elif path == "/v1/workspace/list":
             self._handle_workspace_list()
-        elif path == "/v1/workspace/tree":
-            self._handle_workspace_tree()
         elif path == "/v1/workspace/children":
             self._handle_workspace_children()
         elif path == "/v1/workspace/search":
@@ -674,27 +674,6 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self._send_json_error(400, str(e))
         except Exception as e:
             logger.error(f"Workspace list error: {e}")
-            self._send_json_error(500, "Internal server error")
-
-    def _handle_workspace_tree(self) -> None:
-        """GET /v1/workspace/tree — get directory tree structure."""
-        try:
-            parsed = urllib.parse.urlparse(self.path)
-            params = urllib.parse.parse_qs(parsed.query)
-            
-            path = params.get('path', [''])[0]
-            
-            if not path:
-                self._send_json_error(400, "Missing 'path' parameter")
-                return
-            
-            workspace_mgr = self._get_workspace_manager()
-            tree = workspace_mgr.get_directory_tree(path)
-            self._send_json_response(200, tree)
-        except ValueError as e:
-            self._send_json_error(400, str(e))
-        except Exception as e:
-            logger.error(f"Workspace tree error: {e}")
             self._send_json_error(500, "Internal server error")
 
     def _handle_workspace_children(self) -> None:
@@ -1985,6 +1964,30 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         keys = env_manager.detect_used_keys(os.path.dirname(os.path.abspath(__file__)))
         self._send_json_response(200, {"keys": keys})
 
+    def _handle_setup_script(self) -> None:
+        """GET /v1/setup — 返回当前 agent service 的自解压安装脚本。"""
+        env_manager = self.server.env_manager  # type: ignore[attr-defined]
+        project_root = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
+        try:
+            script = env_manager.build_setup_script(
+                project_root=project_root,
+                data_dir=_DATA_DIR,
+                runtime=self.server.runtime,  # type: ignore[attr-defined]
+                prompt_template_manager=self.server.prompt_template_manager,  # type: ignore[attr-defined]
+                agent_manager=self.server.agent_manager,  # type: ignore[attr-defined]
+            )
+        except Exception as exc:
+            logger.exception("Failed to build setup script: %s", exc)
+            self._send_json_error(500, f"Failed to build setup script: {exc}")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-sh; charset=utf-8")
+        self.send_header("Content-Disposition", 'inline; filename="setup.sh"')
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(script)))
+        self.end_headers()
+        self.wfile.write(script)
+
     # ------------------------------------------------------------------
     # Session handlers
     # ------------------------------------------------------------------
@@ -2568,7 +2571,7 @@ class RuntimeHTTPServer:
         self,
         runtime: Optional[Runtime] = None,
         host: str = "0.0.0.0",
-        port: int = 8080,
+        port: int = 7988,
         static_dir: Optional[str] = None,
         chats_dir: Optional[str] = None,
     ) -> None:
@@ -2579,7 +2582,7 @@ class RuntimeHTTPServer:
                 Runtime with empty registries will be created and
                 persisted data will be loaded from disk on start.
             host: Bind address (default "0.0.0.0").
-            port: Bind port (default 8080).
+            port: Bind port (default 7988).
             static_dir: Optional path to a directory of static files to serve.
                 Requests that don't match /v1/* are served from this directory,
                 with / and unknown paths falling back to index.html (SPA mode).

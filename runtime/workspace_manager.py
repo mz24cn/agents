@@ -142,15 +142,17 @@ class WorkspaceManager:
         Returns:
             Dictionary with 'files' list and 'has_more' boolean
         """
-        # Resolve path
+        # Resolve path (use abspath to preserve symlinks)
         if os.path.isabs(path):
-            dir_path = os.path.realpath(path)
+            dir_path = os.path.abspath(path)
         else:
-            dir_path = os.path.realpath(os.path.join(self.workspace_path, path))
+            dir_path = os.path.abspath(os.path.join(self.workspace_path, path))
         
-        # Security check: ensure path is within workspace (if restricted)
-        if restrict_workspace and not dir_path.startswith(self.workspace_path):
-            raise ValueError("Access denied: path is outside workspace")
+        # Security check: use realpath to verify actual location (if restricted)
+        if restrict_workspace:
+            real_dir = os.path.realpath(dir_path)
+            if not real_dir.startswith(self.workspace_path):
+                raise ValueError("Access denied: path is outside workspace")
         
         if not os.path.isdir(dir_path):
             raise ValueError(f"Directory does not exist: {dir_path}")
@@ -169,14 +171,17 @@ class WorkspaceManager:
                         'is_text': False, 'is_image': False, 'is_audio': False, 'is_video': False
                     }
                     
-                    items.append({
+                    entry = {
                         'name': item_name,
                         'path': item_path,
                         'is_dir': is_dir,
                         'size': stat.st_size if not is_dir else 0,
                         'modified': int(stat.st_mtime * 1000),
                         **flags,
-                    })
+                    }
+                    if os.path.islink(item_path):
+                        entry['symlink_target'] = os.readlink(item_path)
+                    items.append(entry)
                 except (OSError, PermissionError):
                     # Skip items we can't access
                     continue
@@ -198,49 +203,6 @@ class WorkspaceManager:
         except PermissionError:
             raise ValueError(f"Permission denied: {dir_path}")
     
-    def get_directory_tree(self, root_path: str) -> List[Dict[str, Any]]:
-        """Get directory tree structure for navigation.
-        
-        Args:
-            root_path: Root path to start building tree from
-            
-        Returns:
-            List of tree nodes with path, name, is_root, and children
-        """
-        if os.path.isabs(root_path):
-            root = os.path.realpath(root_path)
-        else:
-            root = os.path.realpath(os.path.join(self.workspace_path, root_path))
-        
-        # Security check
-        if not root.startswith(self.workspace_path):
-            raise ValueError("Access denied: path is outside workspace")
-        
-        tree = []
-        
-        # Add workspace root
-        tree.append({
-            'name': os.path.basename(self.workspace_path) or 'Workspace',
-            'path': self.workspace_path,
-            'is_root': True,
-            'children': []
-        })
-        
-        # Add immediate children of workspace
-        try:
-            for item_name in os.listdir(self.workspace_path):
-                item_path = os.path.join(self.workspace_path, item_name)
-                if os.path.isdir(item_path):
-                    tree[0]['children'].append({
-                        'name': item_name,
-                        'path': item_path,
-                        'is_root': False
-                    })
-        except PermissionError:
-            pass
-        
-        return tree
-
     def list_children(self, path: str = '') -> List[Dict[str, Any]]:
         """List child directories of any path. No workspace restriction.
         
@@ -252,7 +214,7 @@ class WorkspaceManager:
             path: Directory path to list children of (empty = roots)
             
         Returns:
-            List of dicts with 'name' and 'path' keys
+            List of dicts with 'name' key, and optional 'symlink_target' for symlinks
         """
         if not path:
             # Return root directories
@@ -265,11 +227,10 @@ class WorkspaceManager:
                     if os.path.isdir(drive_path):
                         roots.append({
                             'name': drive_path,
-                            'path': drive_path,
                         })
                 return roots
             else:
-                return [{'name': '/', 'path': '/'}]
+                return [{'name': '/'}]
         
         real_path = os.path.realpath(path)
         if not os.path.isdir(real_path):
@@ -280,10 +241,12 @@ class WorkspaceManager:
             for item_name in sorted(os.listdir(real_path)):
                 item_path = os.path.join(real_path, item_name)
                 if os.path.isdir(item_path) and not item_name.startswith('.'):
-                    children.append({
+                    entry = {
                         'name': item_name,
-                        'path': os.path.realpath(item_path),
-                    })
+                    }
+                    if os.path.islink(item_path):
+                        entry['symlink_target'] = os.readlink(item_path)
+                    children.append(entry)
         except PermissionError:
             pass
         
@@ -292,11 +255,14 @@ class WorkspaceManager:
     def search_files(self, path: str, query: str, restrict_workspace: bool = True) -> List[Dict[str, Any]]:
         """Search for files matching the query."""
         if os.path.isabs(path):
-            search_path = os.path.realpath(path)
+            search_path = os.path.abspath(path)
         else:
-            search_path = os.path.realpath(os.path.join(self.workspace_path, path))
-        if restrict_workspace and not search_path.startswith(self.workspace_path):
-            raise ValueError("Access denied: path is outside workspace")
+            search_path = os.path.abspath(os.path.join(self.workspace_path, path))
+        # Security check: use realpath to verify actual location
+        if restrict_workspace:
+            real_search = os.path.realpath(search_path)
+            if not real_search.startswith(self.workspace_path):
+                raise ValueError("Access denied: path is outside workspace")
         
         # Use common.py search function
         from runtime.common import search_files
@@ -314,14 +280,17 @@ class WorkspaceManager:
                         'is_text': False, 'is_image': False, 'is_audio': False, 'is_video': False
                     }
                     
-                    results.append({
+                    entry = {
                         'name': os.path.basename(file_path),
                         'path': file_path,
                         'is_dir': is_dir,
                         'size': stat.st_size if not is_dir else 0,
                         'modified': int(stat.st_mtime * 1000),
                         **flags,
-                    })
+                    }
+                    if os.path.islink(file_path):
+                        entry['symlink_target'] = os.readlink(file_path)
+                    results.append(entry)
                 except (OSError, PermissionError):
                     continue
             
@@ -333,11 +302,14 @@ class WorkspaceManager:
     def get_file_content(self, path: str, restrict_workspace: bool = True) -> bytes:
         """Get file content for preview or download."""
         if os.path.isabs(path):
-            file_path = os.path.realpath(path)
+            file_path = os.path.abspath(path)
         else:
-            file_path = os.path.realpath(os.path.join(self.workspace_path, path))
-        if restrict_workspace and not file_path.startswith(self.workspace_path):
-            raise ValueError("Access denied: path is outside workspace")
+            file_path = os.path.abspath(os.path.join(self.workspace_path, path))
+        # Security check: use realpath to verify actual location
+        if restrict_workspace:
+            real_path = os.path.realpath(file_path)
+            if not real_path.startswith(self.workspace_path):
+                raise ValueError("Access denied: path is outside workspace")
         if not os.path.isfile(file_path):
             raise ValueError(f"File does not exist: {file_path}")
         try:
@@ -349,11 +321,14 @@ class WorkspaceManager:
     def get_file_info(self, path: str, restrict_workspace: bool = True) -> Dict[str, Any]:
         """Get file information."""
         if os.path.isabs(path):
-            file_path = os.path.realpath(path)
+            file_path = os.path.abspath(path)
         else:
-            file_path = os.path.realpath(os.path.join(self.workspace_path, path))
-        if restrict_workspace and not file_path.startswith(self.workspace_path):
-            raise ValueError("Access denied: path is outside workspace")
+            file_path = os.path.abspath(os.path.join(self.workspace_path, path))
+        # Security check: use realpath to verify actual location
+        if restrict_workspace:
+            real_path = os.path.realpath(file_path)
+            if not real_path.startswith(self.workspace_path):
+                raise ValueError("Access denied: path is outside workspace")
         if not os.path.exists(file_path):
             raise ValueError(f"Path does not exist: {file_path}")
         try:
@@ -363,7 +338,7 @@ class WorkspaceManager:
             mime_type = None
             if not is_dir:
                 mime_type, _ = mimetypes.guess_type(file_path)
-            return {
+            entry = {
                 'name': name,
                 'path': file_path,
                 'is_dir': is_dir,
@@ -371,6 +346,9 @@ class WorkspaceManager:
                 'modified': int(stat.st_mtime * 1000),
                 'mime_type': mime_type
             }
+            if os.path.islink(file_path):
+                entry['symlink_target'] = os.readlink(file_path)
+            return entry
         except PermissionError:
             raise ValueError(f"Permission denied: {file_path}")
     

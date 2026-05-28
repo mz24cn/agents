@@ -244,8 +244,8 @@ Key features:
 **6. Start the HTTP Server**
 
 ```bash
-python app.py              # default: 0.0.0.0:8080
-python app.py 8080         # custom port
+python app.py              # default: 0.0.0.0:7988
+python app.py 7988         # custom port
 python app.py 0.0.0.0:9000 # custom host and port
 ```
 
@@ -659,8 +659,8 @@ result = runtime.infer(InferenceRequest(
 **6. 启动 HTTP 服务**
 
 ```bash
-python app.py              # 默认：0.0.0.0:8080
-python app.py 8080         # 自定义端口
+python app.py              # 默认：0.0.0.0:7988
+python app.py 7988         # 自定义端口
 python app.py 0.0.0.0:9000 # 自定义主机和端口
 ```
 
