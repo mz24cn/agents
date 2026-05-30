@@ -86,8 +86,8 @@
     if (s.total_ms != null) lines.push(`${t('statRound')} ${fmtMs(s.total_ms)}`)
     if (s.overall_ms != null) lines.push(`${t('statOverall')} ${fmtMs(s.overall_ms)}`)
     // Add first token time and completed time if available
-    const firstTokenTime = formatTimestamp(msg.timestamp)
-    const completedTime = formatTimestamp(msg.completed_at)
+    const firstTokenTime = formatTimestamp(s.first_token_timestamp)
+    const completedTime = formatTimestamp(msg.timestamp)
     if (firstTokenTime) lines.push(`${t('statFirstTokenTime')} ${firstTokenTime}`)
     if (completedTime) lines.push(`${t('statCompletedTime')} ${completedTime}`)
     return lines.join('\n')

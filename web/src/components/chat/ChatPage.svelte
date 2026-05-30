@@ -508,7 +508,8 @@
         const lastAIdx = msgs.map((m, i) => m.role === 'assistant' ? i : -1).filter(i => i >= 0).pop()
         if (lastAIdx !== undefined) {
           const arr = [...msgs]
-          arr[lastAIdx] = { ...arr[lastAIdx], stat: s }
+          const update = { ...arr[lastAIdx], stat: s }
+          arr[lastAIdx] = update
           store.messages = arr
         }
       } catch (_) {}

@@ -31,7 +31,7 @@ A minimal, zero-dependency Agent Service built with the pure Python standard lib
 - **Multimodal** — supports image (base64) and audio inputs for VLM models
 - **Multi-task concurrent conversations with real-time status tracking** — support multiple simultaneous chat sessions with independent streaming states; real-time session status updates via SSE (streaming, success, error, unread); automatic read status management based on user scroll position; session title broadcasting
 - **Workspace file management** — full-featured workspace file manager with directory tree navigation, file listing (list/grid views), search (AND/OR modes via ripgrep/grep), rename, duplicate, delete, download, and chunked/parallel upload with pause/resume/retry support; workspace file references (`<file>path</file>`) in chat prompts are auto-expanded to inline content or attached images at inference time
-- **Self-install setup script** — export the current Agent Service code and runtime configuration as a self-extracting installer via `/v1/setup`; install on another machine with `curl -s http://{host}:7988/v1/setup | sh`
+- **Self-install setup script** — export the current Agent Service code, built Web UI (`web/dist`), and runtime configuration as a self-extracting installer via `/v1/setup`; install on another machine with `curl -s http://{host}:7988/v1/setup | sh`.
 
 ### Architecture
 
@@ -448,7 +448,7 @@ MIT License — see [LICENSE](LICENSE)
 - **多模态** — 支持图片（base64）和音频输入，适配 VLM 模型
 - **多任务并发对话及实时状态跟踪** — 支持多个聊天会话同时进行，每个会话独立管理流式状态；通过SSE实时更新会话状态（流式中、成功、错误、未读）；基于用户滚动位置自动管理已读状态；会话标题实时广播更新
 - **工作区文件管理** — 完整的工作区文件管理器，支持目录树导航、文件列表（列表/网格视图）、搜索（AND/OR模式，基于ripgrep/grep）、重命名、复制、删除、下载及分块/并行上传（支持暂停/恢复/重试）；对话中的工作区文件引用（`<file>路径</file>`）在推理时自动展开为内联内容或附加图片
-- **自安装脚本** — 通过 `/v1/setup` 将当前 Agent Service 代码和运行时配置导出为自解压安装脚本；可在另一台机器上使用 `curl -s http://{host}:7988/v1/setup | sh` 安装
+- **自安装脚本** — 通过 `/v1/setup` 将当前 Agent Service 源码、已编译 Web UI（`web/dist`）和运行时配置导出为自解压安装脚本；可在另一台机器上使用 `curl -s http://{host}:7988/v1/setup | sh` 安装。
 
 ### 架构
 

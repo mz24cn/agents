@@ -74,12 +74,13 @@ def merge_stream_messages(stream_messages: list) -> tuple[list, Optional[dict]]:
     last_stat: Optional[dict] = None
 
     def _flush_assistant(stat=None):
-        nonlocal assistant_text_buf, assistant_thinking_buf, pending_tool_calls, first_assistant_ts
+        nonlocal assistant_text_buf, assistant_thinking_buf, pending_tool_calls
         if assistant_text_buf or pending_tool_calls or assistant_thinking_buf:
-            # 优先使用第一条 assistant delta 的时间戳作为本轮时间戳
-            ts = first_assistant_ts if first_assistant_ts else now_iso()
-            # 推理完成时间 = 当前时间
-            completed_ts = now_iso()
+            # timestamp should be the inference completion time from stat
+            # Fall back to now_iso() if stat doesn't have it
+            ts = stat.get("completed_at") if stat else None
+            if not ts:
+                ts = now_iso()
             turns.append(ConversationTurn(
                 role="assistant",
                 content=assistant_text_buf,
@@ -87,26 +88,26 @@ def merge_stream_messages(stream_messages: list) -> tuple[list, Optional[dict]]:
                 tool_calls=pending_tool_calls if pending_tool_calls else None,
                 thinking=assistant_thinking_buf or None,
                 stat=stat,
-                completed_at=completed_ts,
             ))
             assistant_text_buf = ""
             assistant_thinking_buf = ""
             pending_tool_calls = []
-            first_assistant_ts = None  # Reset for next round
 
-    first_assistant_ts: Optional[str] = None
+    current_stat: Optional[dict] = None
 
     for m in stream_messages:
         if m.role == "usage":
             try:
-                last_stat = _json.loads(m.content)
+                current_stat = _json.loads(m.content)
+                last_stat = current_stat
             except (ValueError, AttributeError):
                 pass
+            # stat arrives BEFORE tool messages in infer_stream,
+            # flush the assistant turn now so it has stat attached
+            _flush_assistant(stat=current_stat)
+            current_stat = None
             continue
         if m.role == "assistant":
-            # 记录第一条 assistant delta 的时间戳
-            if first_assistant_ts is None and m.timestamp:
-                first_assistant_ts = m.timestamp
             if m.tool_calls:
                 # tool_calls 到来时，合并到当前 assistant turn（不单独 flush）
                 for tc in m.tool_calls:
@@ -133,9 +134,7 @@ def merge_stream_messages(stream_messages: list) -> tuple[list, Optional[dict]]:
             if m.thinking:
                 assistant_thinking_buf += m.thinking
         elif m.role == "tool":
-            # tool result 到来时先 flush assistant turn（含 tool_calls）
-            _flush_assistant()
-            # 复用 Message 自带的时间戳，无则 fallback
+            # tool result 到来时，直接 append（assistant 已经在 stat 到来时 flush 了）
             ts = m.timestamp if m.timestamp else now_iso()
             turns.append(ConversationTurn(
                 role="tool",
@@ -147,8 +146,8 @@ def merge_stream_messages(stream_messages: list) -> tuple[list, Optional[dict]]:
             ))
         # skip system deltas
 
-    # Flush 剩余 assistant 内容，附上 stat
-    _flush_assistant(stat=last_stat)
+    # Flush 剩余 assistant 内容（最后一条，无 tool calls）
+    _flush_assistant(stat=current_stat or last_stat)
 
     return turns, last_stat
 

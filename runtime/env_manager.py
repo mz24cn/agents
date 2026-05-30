@@ -289,8 +289,7 @@ class EnvManager:
             if os.path.isdir(src_agents):
                 import shutil
                 shutil.copytree(src_agents, agents_dir, dirs_exist_ok=True)
-        copied: dict[str, str] = {}
-        project_root_real = os.path.realpath(project_root)
+        package_root_real = os.path.realpath(os.path.dirname(os.path.dirname(__file__)))
         for tool in tools if isinstance(tools, list) else []:
             if not isinstance(tool, dict):
                 continue
@@ -300,31 +299,15 @@ class EnvManager:
                     continue
                 real = os.path.realpath(pth)
                 try:
-                    common = os.path.commonpath([project_root_real, real])
+                    common = os.path.commonpath([package_root_real, real])
                 except ValueError:
                     common = ""
-                if common != project_root_real:
+                if common != package_root_real:
                     logger.info(
-                        "工具资源不在项目目录下，跳过打包但保留工具注册信息: tool_id=%s, %s=%s。"
-                        "安装后相关工具或智能体可能无法正常工作。",
+                        "工具资源不在 env_manager.py 所在目录的父目录下，跳过打包但保留工具注册信息不变: "
+                        "tool_id=%s, %s=%s。安装后相关工具或智能体可能无法正常工作。",
                         tool.get("tool_id", ""), key, pth,
                     )
-                    continue
-                if real in copied:
-                    tool[key] = copied[real]; continue
-                rel = os.path.join("resources", key, str(len(copied)))
-                target = os.path.join(cfg_dir, rel)
-                import shutil
-                try:
-                    if os.path.isdir(real):
-                        shutil.copytree(real, target)
-                    else:
-                        os.makedirs(os.path.dirname(target), exist_ok=True)
-                        shutil.copy2(real, target)
-                    copied[real] = "${AGENTS_RUNTIME_DIR}/" + rel
-                    tool[key] = copied[real]
-                except OSError as exc:
-                    logger.warning("打包工具资源失败 %s: %s", real, exc)
         self._dump_json(os.path.join(cfg_dir, "tools.json"), tools)
 
     def _read_json_file(self, path: str, default):
@@ -348,7 +331,7 @@ set -eu
 : "${AGENT_SERVICE_HOME:=$PWD/agents}"
 : "${AGENTS_RUNTIME_DIR:=$HOME/.agents_runtime}"
 : "${AGENT_SERVICE_PORT:=7988}"
-: "${START_AGENT_SERVICE:=true}"
+: "${START_AGENT_SERVICE:=background}"
 
 TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/agent-service-setup.XXXXXX")
 cleanup() { rm -rf "$TMPDIR"; }
@@ -365,41 +348,66 @@ mkdir -p "$AGENT_SERVICE_HOME" "$AGENTS_RUNTIME_DIR"
 [ ! -d "$TMPDIR/payload/app" ] || tar -C "$TMPDIR/payload/app" -cf - . | tar -C "$AGENT_SERVICE_HOME" -xf -
 [ ! -d "$TMPDIR/payload/agents_runtime" ] || tar -C "$TMPDIR/payload/agents_runtime" -cf - . | tar -C "$AGENTS_RUNTIME_DIR" -xf -
 
-if [ -f "$AGENTS_RUNTIME_DIR/tools.json" ]; then
-  AGENTS_RUNTIME_DIR="$AGENTS_RUNTIME_DIR" python3 - <<'PY' || true
-import json, os
-p = os.path.join(os.environ['AGENTS_RUNTIME_DIR'], 'tools.json')
-with open(p, 'r', encoding='utf-8') as f:
-    data = json.load(f)
-prefix = '${AGENTS_RUNTIME_DIR}'
-for item in data if isinstance(data, list) else []:
-    for k in ('function_file_path', 'skill_dir'):
-        v = item.get(k)
-        if isinstance(v, str) and v.startswith(prefix):
-            item[k] = os.environ['AGENTS_RUNTIME_DIR'] + v[len(prefix):]
-with open(p, 'w', encoding='utf-8') as f:
-    json.dump(data, f, ensure_ascii=False, indent=2)
-PY
-fi
-
 cat > "$AGENT_SERVICE_HOME/start-agent-service.sh" <<'SH'
 #!/bin/sh
 set -eu
 : "${AGENT_SERVICE_PORT:=7988}"
 : "${AGENTS_RUNTIME_DIR:=$HOME/.agents_runtime}"
-export AGENTS_RUNTIME_DIR
+: "${AGENT_SERVICE_LOG:=$AGENTS_RUNTIME_DIR/server.log}"
+: "${START_AGENT_SERVICE:=background}"
+export AGENTS_RUNTIME_DIR AGENT_SERVICE_LOG
+mkdir -p "$AGENTS_RUNTIME_DIR"
 cd "$(dirname "$0")"
-exec python3 app.py "0.0.0.0:${AGENT_SERVICE_PORT}"
+
+case "$START_AGENT_SERVICE" in
+  background)
+    nohup python3 app.py "0.0.0.0:${AGENT_SERVICE_PORT}" >> "$AGENT_SERVICE_LOG" 2>&1 &
+    echo $!
+    ;;
+  foreground)
+    exec python3 app.py "0.0.0.0:${AGENT_SERVICE_PORT}" 2>&1 | tee -a "$AGENT_SERVICE_LOG"
+    ;;
+  none)
+    exit 0
+    ;;
+  *)
+    echo "Invalid START_AGENT_SERVICE=$START_AGENT_SERVICE. Expected: background, foreground, none" >&2
+    exit 2
+    ;;
+esac
 SH
 chmod +x "$AGENT_SERVICE_HOME/start-agent-service.sh"
+
+case "$START_AGENT_SERVICE" in
+  background|foreground|none) ;;
+  true) START_AGENT_SERVICE=background ;;
+  false) START_AGENT_SERVICE=none ;;
+  *)
+    echo "Invalid START_AGENT_SERVICE=$START_AGENT_SERVICE. Expected: background, foreground, none" >&2
+    exit 2
+    ;;
+esac
+
+AGENT_SERVICE_LOG="$AGENTS_RUNTIME_DIR/server.log"
+export AGENT_SERVICE_LOG
 
 echo "Agent service installed:" >&2
 echo "  app:    $AGENT_SERVICE_HOME" >&2
 echo "  config: $AGENTS_RUNTIME_DIR" >&2
-echo "Start with: AGENT_SERVICE_PORT=$AGENT_SERVICE_PORT $AGENT_SERVICE_HOME/start-agent-service.sh" >&2
+echo "  log:    $AGENT_SERVICE_LOG" >&2
 
-if [ "$START_AGENT_SERVICE" = "true" ]; then
-  "$AGENT_SERVICE_HOME/start-agent-service.sh"
-fi
+case "$START_AGENT_SERVICE" in
+  background)
+    pid=$("$AGENT_SERVICE_HOME/start-agent-service.sh")
+    echo "Agent service started in background, pid: $pid" >&2
+    echo "Log: $AGENT_SERVICE_LOG" >&2
+    ;;
+  foreground)
+    "$AGENT_SERVICE_HOME/start-agent-service.sh"
+    ;;
+  none)
+    echo "Agent service not started because START_AGENT_SERVICE=none" >&2
+    ;;
+esac
 exit 0
 """

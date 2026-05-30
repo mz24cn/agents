@@ -61,7 +61,17 @@
   function serializeEditor() {
     if (!editorEl) return text
     let out = ''
-    for (const child of editorEl.childNodes) out += serializeNode(child)
+    for (const child of editorEl.childNodes) {
+      // When a <div>/<p> follows a text node (e.g. first line is bare text,
+      // subsequent lines wrapped in <div> by the browser), insert a newline
+      // before the <div> to prevent lines from merging.
+      if (out && !out.endsWith('\n') &&
+        child.nodeType === Node.ELEMENT_NODE &&
+        (child.tagName === 'DIV' || child.tagName === 'P')) {
+        out += '\n'
+      }
+      out += serializeNode(child)
+    }
     return out.replace(/\n$/g, '')
   }
 

@@ -294,6 +294,7 @@ class Runtime:
 
             # Execute all tool calls sequentially in this round
             skill_triggered = False
+            _logger.info("infer_stream: executing %d tool calls in round %d", len(tool_calls_to_execute), tool_round)
             for fn_call in tool_calls_to_execute:
                 tool_name = fn_call.get("name", "")
                 arguments_str = fn_call.get("arguments", "{}")
@@ -351,7 +352,11 @@ class Runtime:
                 )
 
             if skill_triggered:
-                continue
+                _logger.info("infer_stream: skill triggered, continuing to next round")
+            else:
+                _logger.info("infer_stream: normal tool call done, continuing to next round")
+            # Continue to next round of inference (both skill and normal tools)
+            continue
 
         # Attach overall_ms to the last round's stat
         if last_stat is not None:
@@ -840,6 +845,7 @@ class Runtime:
             round_prompt = 0
             round_completion = 0
             first_token_time: Optional[float] = None
+            first_token_timestamp: Optional[str] = None  # ISO timestamp of first token
             tool_calls_first_ts: Optional[str] = None  # Reset for each round
 
             try:
@@ -865,6 +871,7 @@ class Runtime:
                     # Record first-token time
                     if first_token_time is None and (msg.content or msg.thinking):
                         first_token_time = time.monotonic()
+                        first_token_timestamp = _now_iso()
 
                     # Set timestamp before yielding
                     if msg.role == "assistant":
@@ -926,7 +933,8 @@ class Runtime:
                 all_tool_calls = [accumulated_tool_calls[idx] for idx in sorted(accumulated_tool_calls.keys())]
 
             # Build the complete assistant message for conversation history
-            assistant_ts = tool_calls_first_ts if tool_calls_first_ts else _now_iso()
+            # timestamp should be the inference completion time (now)
+            assistant_ts = _now_iso()
             assistant_msg = Message(
                 role="assistant",
                 content=full_content,
@@ -951,7 +959,10 @@ class Runtime:
                     "net_ms": round(net_ms, 1),
                     "total_ms": round(net_ms, 1),  # no tool calls, total == net
                     "overall_ms": round((time.monotonic() - overall_start) * 1000, 1),
+                    "completed_at": _now_iso(),
                 }
+                if first_token_timestamp:
+                    stat_dict["first_token_timestamp"] = first_token_timestamp
                 if ttft_ms is not None:
                     stat_dict["ttft_ms"] = round(ttft_ms, 1)
                 yield Message(role="usage", timestamp=_now_iso(), name="round", content=json.dumps(stat_dict))
@@ -985,11 +996,33 @@ class Runtime:
                     "net_ms": round(net_ms, 1),
                     "total_ms": round(net_ms, 1),
                     "overall_ms": round((time.monotonic() - overall_start) * 1000, 1),
+                    "completed_at": _now_iso(),
                 }
+                if first_token_timestamp:
+                    stat_dict["first_token_timestamp"] = first_token_timestamp
                 if ttft_ms is not None:
                     stat_dict["ttft_ms"] = round(ttft_ms, 1)
                 yield Message(role="usage", timestamp=_now_iso(), name="round", content=json.dumps(stat_dict))
                 return
+
+            # Yield stat BEFORE tool execution — usage info is already available
+            # from the LLM response (round_prompt/round_completion), no need to wait
+            stat_dict = {
+                "prompt_tokens": round_prompt,
+                "completion_tokens": round_completion,
+                "total_tokens": round_prompt + round_completion,
+                "total_prompt_tokens": total_prompt,
+                "total_completion_tokens": total_completion,
+                "total_all_tokens": total_prompt + total_completion,
+                "net_ms": round(net_ms, 1),
+                "total_ms": round(net_ms, 1),  # inference-only for tool-call rounds
+                "completed_at": _now_iso(),
+            }
+            if first_token_timestamp:
+                stat_dict["first_token_timestamp"] = first_token_timestamp
+            if ttft_ms is not None:
+                stat_dict["ttft_ms"] = round(ttft_ms, 1)
+            yield Message(role="usage", name="round", content=json.dumps(stat_dict))
 
             # Execute all tool calls sequentially in this round
             skill_triggered = False
@@ -1046,23 +1079,6 @@ class Runtime:
                 )
                 messages.append(tool_msg)
                 yield tool_msg
-
-            # total_ms includes tool execution time; yield stat after tools are done
-            if not skill_triggered:
-                round_total_ms = (time.monotonic() - round_start) * 1000
-                stat_dict = {
-                    "prompt_tokens": round_prompt,
-                    "completion_tokens": round_completion,
-                    "total_tokens": round_prompt + round_completion,
-                    "total_prompt_tokens": total_prompt,
-                    "total_completion_tokens": total_completion,
-                    "total_all_tokens": total_prompt + total_completion,
-                    "net_ms": round(net_ms, 1),
-                    "total_ms": round(round_total_ms, 1),
-                }
-                if ttft_ms is not None:
-                    stat_dict["ttft_ms"] = round(ttft_ms, 1)
-                yield Message(role="usage", name="round", content=json.dumps(stat_dict))
 
             if skill_triggered:
                 continue

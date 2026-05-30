@@ -1796,6 +1796,7 @@ def _search_code(query: str, include: Optional[str] = None, exclude: Optional[st
     workspace = get_workspace()
 
     max_results = int(os.environ.get("SEARCH_MAX_RESULTS", 100))
+    max_context_length = int(os.environ.get("EXEC_OUTPUT_COLUMN_LIMIT", 1000))
 
     # Default excludes
     default_excludes = [".git", "node_modules", "dist"]
@@ -1851,6 +1852,32 @@ def _search_code(query: str, include: Optional[str] = None, exclude: Optional[st
                 submatches = data.get("submatches", [])
                 column = submatches[0].get("start", 0) if submatches else 0
                 context = data.get("lines", {}).get("text", "").rstrip("\n").rstrip("\r\n")
+                # Smart truncation: ensure search keywords are preserved
+                if len(context) > max_context_length and submatches:
+                    # Use submatches to determine where to truncate
+                    match_start = submatches[0].get("start", 0)
+                    match_end = submatches[0].get("end", 0)
+                    
+                    # Calculate truncation range around the match
+                    context_half = max_context_length // 2
+                    start = max(0, match_start - context_half)
+                    end = min(len(context), match_end + context_half)
+                    
+                    # Ensure we don't exceed max_context_length
+                    if end - start > max_context_length:
+                        # Adjust to fit within limit while keeping match
+                        start = max(0, end - max_context_length)
+                    
+                    context = context[start:end]
+                    
+                    # Add truncation markers
+                    if start > 0:
+                        context = "..." + context
+                    if end < len(data.get("lines", {}).get("text", "").rstrip("\n").rstrip("\r\n")):
+                        context = context + "..."
+                elif len(context) > max_context_length:
+                    # Fallback: simple truncation if no submatches
+                    context = context[:max_context_length] + "..."
                 results.append({
                     "file": file_path,
                     "line": line_number,
@@ -1913,6 +1940,35 @@ def _search_code(query: str, include: Optional[str] = None, exclude: Optional[st
 
             total_found += 1
             if len(results) < max_results:
+                # Smart truncation for grep (no submatches info available)
+                if len(context) > max_context_length:
+                    # Try to find the query pattern in context for smart truncation
+                    try:
+                        # Find the first match of the query in context
+                        match = re.search(query, context)
+                        if match:
+                            # Smart truncation around the match
+                            context_half = max_context_length // 2
+                            start = max(0, match.start() - context_half)
+                            end = min(len(context), match.end() + context_half)
+                            
+                            # Ensure we don't exceed max_context_length
+                            if end - start > max_context_length:
+                                start = max(0, end - max_context_length)
+                            
+                            context = context[start:end]
+                            
+                            # Add truncation markers
+                            if start > 0:
+                                context = "..." + context
+                            if end < len(parts[2]):
+                                context = context + "..."
+                        else:
+                            # Fallback: simple truncation
+                            context = context[:max_context_length] + "..."
+                    except re.error:
+                        # If regex is invalid, use simple truncation
+                        context = context[:max_context_length] + "..."
                 results.append({
                     "file": file_path,
                     "line": line_number,
@@ -1994,6 +2050,7 @@ def _execute_command(command: str, timeout: Optional[int] = None) -> str:
 
     # Read configuration
     output_line_limit = int(os.environ.get("EXEC_OUTPUT_LINE_LIMIT", 1000))
+    max_line_length = int(os.environ.get("EXEC_OUTPUT_COLUMN_LIMIT", 1000))
     if timeout is None:
         timeout_val = int(os.environ.get("EXEC_DEFAULT_TIMEOUT", 30))
     else:
@@ -2067,6 +2124,21 @@ def _execute_command(command: str, timeout: Optional[int] = None) -> str:
     # Truncate combined output to output_line_limit lines
     stdout_lines = stdout.splitlines(keepends=True)
     stderr_lines = stderr.splitlines(keepends=True)
+    
+    # Limit line length for each line
+    def truncate_line(line):
+        """Truncate a line if it exceeds max_line_length."""
+        if len(line) > max_line_length:
+            # Keep the newline character if present
+            if line.endswith('\n'):
+                return line[:max_line_length - 3] + "...\n"
+            else:
+                return line[:max_line_length - 3] + "..."
+        return line
+    
+    stdout_lines = [truncate_line(line) for line in stdout_lines]
+    stderr_lines = [truncate_line(line) for line in stderr_lines]
+    
     total_lines = len(stdout_lines) + len(stderr_lines)
 
     truncated = False

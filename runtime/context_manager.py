@@ -54,7 +54,9 @@ class ConversationTurn:
         assistant_id: Optional agent_id for assistant-role turns, identifying which agent sent this message.
         tool_id: Optional tool_id for tool-role turns, identifying which tool produced this result.
         tool_use_id: Optional protocol-level tool call ID linking a tool result to its assistant tool call.
-        completed_at: Optional ISO 8601 timestamp when inference completed (for assistant-role turns).
+        completed_at: Kept for backward compatibility with old sessions.
+            For new sessions, msg.timestamp is the inference completion time,
+            and stat.first_token_timestamp is the first token time.
     """
 
     role: str

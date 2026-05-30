@@ -117,11 +117,17 @@ def test_infer_stream_openai_yields_messages() -> None:
     ):
         messages = list(runtime.infer_stream(request))
 
-    assert len(messages) == 3
-    for msg, expected_content in zip(messages, chunks):
+    assert len(messages) == 4
+    # First 3 are content chunks
+    for msg, expected_content in zip(messages[:3], chunks):
         assert isinstance(msg, Message)
         assert msg.role == "assistant"
         assert msg.content == expected_content
+    # 4th is the usage stat message
+    assert messages[3].role == "usage"
+    # usage stat should contain first_token_timestamp
+    stat = json.loads(messages[3].content)
+    assert "first_token_timestamp" in stat
 
 
 def test_infer_stream_openai_empty_stream() -> None:
@@ -141,7 +147,12 @@ def test_infer_stream_openai_empty_stream() -> None:
     ):
         messages = list(runtime.infer_stream(request))
 
-    assert len(messages) == 0
+    assert len(messages) == 1
+    # usage stat message
+    assert messages[0].role == "usage"
+    stat = json.loads(messages[0].content)
+    # Empty stream has no first token, so first_token_timestamp should not be present
+    assert "first_token_timestamp" not in stat
 
 
 # ---------------------------------------------------------------------------
@@ -170,11 +181,16 @@ def test_infer_stream_ollama_yields_messages() -> None:
     ):
         messages = list(runtime.infer_stream(request))
 
-    assert len(messages) == 3
-    for msg, expected_content in zip(messages, chunks):
+    assert len(messages) == 4
+    # First 3 are content chunks
+    for msg, expected_content in zip(messages[:3], chunks):
         assert isinstance(msg, Message)
         assert msg.role == "assistant"
         assert msg.content == expected_content
+    # 4th is the usage stat message
+    assert messages[3].role == "usage"
+    stat = json.loads(messages[3].content)
+    assert "first_token_timestamp" in stat
 
 
 # ---------------------------------------------------------------------------
