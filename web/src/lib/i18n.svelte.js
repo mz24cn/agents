@@ -188,6 +188,7 @@ const translations = {
     deselect: '取消选择',
     rename: '重命名',
     duplicate: '创建副本',
+    copyPath: '复制绝对路径',
     delete: '删除',
     enterNewName: '请输入新名称',
     confirmDeleteFile: '确定要删除这个文件吗？',
@@ -210,6 +211,10 @@ const translations = {
     collapseThinking: '收起思考过程',
     expandThinking: '展开思考过程',
     thinkingProcess: '思考过程',
+
+    // 执行过程折叠
+    collapseExecution: '收起执行过程',
+    expandExecution: '展开执行过程',
 
     // ToolCallCard
     callingTool: '🛠️ 调用工具: {name}',
@@ -548,6 +553,7 @@ const translations = {
     deselect: 'Deselect',
     rename: 'Rename',
     duplicate: 'Duplicate',
+    copyPath: 'Copy Absolute Path',
     delete: 'Delete',
     enterNewName: 'Enter new name',
     confirmDeleteFile: 'Are you sure you want to delete this file?',
@@ -570,6 +576,10 @@ const translations = {
     collapseThinking: 'Collapse ',
     expandThinking: 'Expand ',
     thinkingProcess: 'thinking',
+
+    // Execution group collapse
+    collapseExecution: 'Collapse execution',
+    expandExecution: 'Expand execution',
 
     // ToolCallCard
     callingTool: '🛠️ Tool call: {name}',

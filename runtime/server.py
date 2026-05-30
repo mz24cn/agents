@@ -1232,7 +1232,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
 
-            if use_session:
+            if use_session and self._is_active_stream(session_id, cancel_event):
                 # original_messages already saved in pre-inference step, pass [] to avoid duplication
                 persist_exc = self._persist_conversation(context_manager, session_id, [], collected_messages, agent_id, agent_nickname, model_id, tool_ids, workspace)
                 if persist_exc is not None:
@@ -1246,13 +1246,15 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 _broadcast_session_status(session_id, "done_success_unread")
         except (BrokenPipeError, ConnectionResetError):
             cancel_event.set()
-            if use_session:
+            if use_session and self._is_active_stream(session_id, cancel_event):
                 from runtime.common import now_iso
                 collected_messages.append(Message(role="assistant", timestamp=now_iso(), content="\n\nError: user interrupted."))
                 # original_messages already saved in pre-inference step, pass [] to avoid duplication
                 persist_exc = self._persist_conversation(context_manager, session_id, [], collected_messages, agent_id, agent_nickname, model_id, tool_ids, workspace)
                 if persist_exc is not None:
                     logger.error("infer_stream: failed to save aborted conversation for session %s: %s", session_id, persist_exc)
+            elif use_session:
+                logger.info("infer_stream: skipped stale persist for session %s (BrokenPipe)", session_id)
             # --- Session Status Stream: broadcast "done_error_unread" ---
             if session_id is not None:
                 with _session_state_lock:
@@ -1260,13 +1262,15 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                     _unread_sessions[session_id] = "done_error_unread"
                 _broadcast_session_status(session_id, "done_error_unread")
         except Exception as exc:
-            if use_session:
+            if use_session and self._is_active_stream(session_id, cancel_event):
                 from runtime.common import now_iso
                 collected_messages.append(Message(role="assistant", timestamp=now_iso(), content=f"\n\nError: system aborted. ({exc})"))
                 # original_messages already saved in pre-inference step, pass [] to avoid duplication
                 persist_exc = self._persist_conversation(context_manager, session_id, [], collected_messages, agent_id, agent_nickname, model_id, tool_ids, workspace)
                 if persist_exc is not None:
                     logger.error("infer_stream: failed to save aborted conversation for session %s: %s", session_id, persist_exc)
+            elif use_session:
+                logger.info("infer_stream: skipped stale persist for session %s (Exception)", session_id)
             try:
                 error_data = json.dumps({"error": str(exc)}, ensure_ascii=False)
                 self.wfile.write(f"data: {error_data}\n\n".encode("utf-8"))
@@ -1280,10 +1284,29 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                     _unread_sessions[session_id] = "done_error_unread"
                 _broadcast_session_status(session_id, "done_error_unread")
         finally:
-            # 注销 active_streams 中的 cancel_event
+            # Only unregister from active_streams if we are still the active stream
+            # for this session. A newer inference may have replaced our cancel_event.
             if active_streams is not None and session_id is not None:
-                active_streams.pop(session_id, None)
+                if active_streams.get(session_id) is cancel_event:
+                    active_streams.pop(session_id, None)
             self._cleanup_thread_local()
+
+    def _is_active_stream(self, session_id: Optional[str], cancel_event: threading.Event) -> bool:
+        """Check whether *cancel_event* is still the active stream for *session_id*.
+
+        When a user force-aborts and immediately starts a new inference on the
+        same session, the old thread's ``cancel_event`` gets replaced in
+        ``active_streams`` by the new thread's event.  Calling this method
+        before persisting lets the stale thread detect that it has been
+        superseded and skip the write — preventing a lost-update race on
+        ``conversation.json``.
+        """
+        if session_id is None:
+            return True
+        active_streams = getattr(self.server, "active_streams", None)
+        if active_streams is None:
+            return True
+        return active_streams.get(session_id) is cancel_event
 
     def _handle_infer_abort(self) -> None:
         """POST /v1/infer/abort — 主动中止指定会话的流式推理。

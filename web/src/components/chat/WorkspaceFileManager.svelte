@@ -1,4 +1,5 @@
 <script>
+  import { tick } from 'svelte'
   import { t } from '../../lib/i18n.svelte.js'
   import { workspace as workspaceApi } from '../../lib/api.js'
   import { marked } from 'marked'
@@ -407,7 +408,30 @@
   // 右键菜单操作
   function showContextMenu(e, file) {
     e.preventDefault()
-    contextMenu = { visible: true, x: e.clientX, y: e.clientY, file }
+    const menuHeight = 250 // estimated before render; refined after tick
+    let x = e.clientX
+    let y = e.clientY
+    // Pre-clamp: if click is in the bottom region, start higher
+    if (y + menuHeight > window.innerHeight) {
+      y = Math.max(0, window.innerHeight - menuHeight - 8)
+    }
+    contextMenu = { visible: true, x, y, file }
+    // After DOM update, measure real height and fine-tune
+    tick().then(() => {
+      const el = document.querySelector('.context-menu')
+      if (!el) return
+      const rect = el.getBoundingClientRect()
+      let newY = y
+      if (rect.bottom > window.innerHeight) {
+        newY = Math.max(0, window.innerHeight - rect.height - 8)
+      }
+      if (rect.right > window.innerWidth) {
+        const newX = Math.max(0, window.innerWidth - rect.width - 8)
+        contextMenu = { ...contextMenu, x: newX, y: newY }
+      } else if (newY !== y) {
+        contextMenu = { ...contextMenu, y: newY }
+      }
+    })
   }
 
   function hideContextMenu() {
@@ -1038,6 +1062,9 @@
     {/if}
     <button onmousedown={() => { downloadFile(menuFile); hideContextMenu() }}>
       {t('download')}
+    </button>
+    <button onmousedown={() => { navigator.clipboard.writeText(menuFile?.path || ''); hideContextMenu() }}>
+      {t('copyPath')}
     </button>
     {#if menuFile && !menuFile.is_dir}
       <button onmousedown={() => { toggleFileSelection(menuFile); hideContextMenu() }}>

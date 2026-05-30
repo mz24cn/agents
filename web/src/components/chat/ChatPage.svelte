@@ -32,6 +32,7 @@
   function storeKey(sid) { return sid || '__new__' }
   let messages = $derived(sessionStore[storeKey(sessionId)]?.messages ?? [])
   let isStreaming = $derived(sessionStore[storeKey(sessionId)]?.isStreaming ?? false)
+  let collapsedGroups = $derived(sessionStore[storeKey(sessionId)]?.collapsedGroups ?? new Set())
 
   let revokeConflict = $state(null)
 
@@ -262,7 +263,7 @@
     // backend assigns one (onInit / first onStreamMsg with session_id).
     const keyRef = { key: storeKey(sessionId) }
     if (!sessionStore[keyRef.key]) {
-      sessionStore[keyRef.key] = { messages: [], isStreaming: false }
+      sessionStore[keyRef.key] = { messages: [], isStreaming: false, collapsedGroups: new Set() }
     }
     sessionStore[keyRef.key].isStreaming = true
     // Force scroll to bottom when user sends a new message
@@ -526,6 +527,8 @@
           store.messages = store.messages.slice(0, -1)
         }
       }
+      // 2 秒后自动收起本轮工具调用消息
+      autoCollapseLastGroup(keyRef.key)
     }
     abortFunctions[keyRef.key] = null
     // If the stream that just finished belongs to the currently viewed session:
@@ -538,6 +541,55 @@
         needsRead = true
       }
     }
+  }
+
+  function toggleCollapse(startIndex) {
+    const key = storeKey(sessionId)
+    const store = sessionStore[key]
+    if (!store) return
+    const old = store.collapsedGroups ?? new Set()
+    const next = new Set(old)
+    if (next.has(startIndex)) {
+      next.delete(startIndex)
+    } else {
+      next.add(startIndex)
+    }
+    sessionStore[key] = { ...store, collapsedGroups: next }
+  }
+
+  // 记录已安排的自动收起定时器，避免重复
+  let collapseTimers = {}
+  function autoCollapseLastGroup(key) {
+    const store = sessionStore[key]
+    if (!store) return
+    const msgs = store.messages
+    if (msgs.length === 0) return
+    // 找到最后一个 user 消息的索引
+    let lastUserIdx = -1
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i].role === 'user') { lastUserIdx = i; break }
+    }
+    if (lastUserIdx < 0) return
+    // 确认 user 消息后有 tool 消息（即有工具调用过程），才自动收起
+    let hasToolMessages = false
+    for (let i = lastUserIdx + 1; i < msgs.length; i++) {
+      if (msgs[i].role === 'tool') { hasToolMessages = true; break }
+    }
+    if (!hasToolMessages) return
+    // 清除该 key 的旧定时器
+    if (collapseTimers[key]) clearTimeout(collapseTimers[key])
+    const capturedIdx = lastUserIdx
+    collapseTimers[key] = setTimeout(() => {
+      const s = sessionStore[key]
+      if (!s) { delete collapseTimers[key]; return }
+      const old = s.collapsedGroups ?? new Set()
+      if (!old.has(capturedIdx)) {
+        const next = new Set(old)
+        next.add(capturedIdx)
+        sessionStore[key] = { ...s, collapsedGroups: next }
+      }
+      delete collapseTimers[key]
+    }, 2000)
   }
 
   function onStreamErr(err, keyRef) {
@@ -634,7 +686,14 @@
       // If the target session is not currently streaming, use fresh backend data.
       // If it IS streaming, keep the live data — don't overwrite with stale backend data.
       if (!sessionStore[sid]?.isStreaming) {
-        sessionStore[sid] = { messages: msgs, isStreaming: false }
+        // 计算所有 user 消息的索引，用于默认折叠
+        const userIndices = new Set()
+        for (let i = 0; i < msgs.length; i++) {
+          if (msgs[i].role === 'user') {
+            userIndices.add(i)
+          }
+        }
+        sessionStore[sid] = { messages: msgs, isStreaming: false, collapsedGroups: userIndices }
       }
       sessionId = sid
       currentSession.sessionId = sid
@@ -904,7 +963,7 @@
   />
 
   <div class="message-area">
-    <MessageList {messages} {agentList} onRevoke={handleRevoke} onScrollAtBottom={handleScrollAtBottom} {shouldScrollToBottom} />
+    <MessageList {messages} {agentList} onRevoke={handleRevoke} onScrollAtBottom={handleScrollAtBottom} {shouldScrollToBottom} {collapsedGroups} onToggleCollapse={toggleCollapse} />
 
     {#if workspacePanelOpen}
       <WorkspaceFileManager

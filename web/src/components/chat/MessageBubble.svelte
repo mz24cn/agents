@@ -8,7 +8,7 @@
   import { t } from '../../lib/i18n.svelte.js'
   import { highlight } from '../../lib/highlight.js'
 
-  let { msg, agentList = [], onRevoke } = $props()
+  let { msg, agentList = [], onRevoke, collapseButton = null, onCollapse } = $props()
 
   /**
    * Detect the content type of a tool result.
@@ -149,6 +149,11 @@
             {t('revoke')}
           </button>
         {/if}
+        {#if collapseButton === 'expand'}
+          <button class="toggle-btn" onclick={onCollapse}>
+            {t('expandExecution')}
+          </button>
+        {/if}
         <CopyButton getText={() => msg.content ?? ''} />
       </div>
     {:else if msg.role === 'assistant'}
@@ -170,7 +175,12 @@
             {msg.stat.prompt_tokens >= 10000 ? `${(msg.stat.prompt_tokens/1000).toFixed(1)}k` : msg.stat.prompt_tokens}/{msg.stat.completion_tokens >= 10000 ? `${(msg.stat.completion_tokens/1000).toFixed(1)}k` : msg.stat.completion_tokens} tokens
           </span>
         {/if}
-        {#if msg.thinking}
+        {#if collapseButton === 'collapse' || collapseButton === 'expand'}
+          <button class="toggle-btn" onclick={onCollapse}>
+            {collapseButton === 'collapse' ? t('collapseExecution') : t('expandExecution')}
+          </button>
+        {/if}
+        {#if msg.thinking && typeof msg.thinking === 'string' && msg.thinking.trim().length > 0}
           <button class="toggle-btn" onclick={toggleThinking}>
             {thinkingExpanded ? t('collapseThinking') : t('expandThinking')}
           </button>
@@ -194,7 +204,7 @@
     {/if}
   </div>
 
-  {#if msg.thinking}
+  {#if msg.thinking && typeof msg.thinking === 'string' && msg.thinking.trim().length > 0}
     <ThinkingBlock thinking={msg.thinking} expanded={thinkingExpanded} />
   {/if}
 
