@@ -7,6 +7,9 @@
   let listEl = $state(null)
   let isAtBottom = $state(true)
 
+  // 展开/收起动画时长（ms），setTimeout 需要与此保持一致
+  const SLIDE_DURATION = 600
+
   function onScroll() {
     if (!listEl) return
     const threshold = 100
@@ -80,7 +83,7 @@
     if (onToggleCollapse) onToggleCollapse(startIndex)
 
     if (isCurrentlyCollapsed) {
-      // 展开：slide 动画持续 200ms，等动画结束后再修正滚动位置
+      // 展开：slide 动画结束后再修正滚动位置
       setTimeout(() => {
         if (wasAtBottom) {
           // 展开前在底部 → 动画结束后继续滚到底，anchor 保持在底部
@@ -95,7 +98,7 @@
             listEl.scrollTop += delta
           }
         }
-      }, 220)
+      }, SLIDE_DURATION + 20)
     }
     // 折叠时 anchor 本身不动，无需调整
   }
@@ -136,7 +139,7 @@
               </div>
             {:else if !group.isCollapsed}
               <!-- 中间消息（tool/assistant）：展开时用 slide 动画显示，折叠时隐藏 -->
-              <div transition:slide={{ duration: 200 }} data-intermediate={group.startIndex}>
+              <div transition:slide={{ duration: SLIDE_DURATION }} data-intermediate={group.startIndex}>
                 <MessageBubble 
                   {msg} 
                   {agentList} 

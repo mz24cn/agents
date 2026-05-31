@@ -1,7 +1,7 @@
 """
 File Transfer MCP Server
 
-用于在 Agent Service 宿主机和远程机器之间传输文件。
+用于在 Agent Service 宿主机和远程机器及远程机器上的安卓设备之间传输文件。
 运行在远程机器上，接收 base64 编码的文件内容并保存到本地。
 
 前置条件：
@@ -9,7 +9,9 @@ pip install fastmcp
 
 功能：
 1. save_file_from_base64 - 将 base64 内容保存为文件。对大模型来说，提供本地文件路径即可，底层会自动读取并编码。
-2. save_file_to_phone_gallery - 将 base64 图片保存到手机相册
+2. read_file_to_base64 - 读取文件并以 base64 返回。对大模型来说，最终拿到的是本地文件路径（Agent Service 底层会将 base64 替换为本地路径）。
+3. save_file_to_phone_gallery - 将 base64 图片保存到手机相册
+4. check_adb_connection - 检查 ADB 连接状态
 
 使用方法：
     # HTTP 方式运行（默认）
@@ -62,42 +64,42 @@ def create_mcp_server(host: str = "0.0.0.0", port: int = 8000) -> FastMCP:
     """创建 MCP server 实例并注册工具"""
     server = FastMCP(
         "file-transfer",
-        instructions="文件传输服务：支持 base64 文件保存和手机相册推送",
+        instructions="文件传输服务：支持 base64 文件保存/读取和手机相册推送",
         host=host,
         port=port,
     )
     
     @server.tool()
-    def save_file_from_base64(base64_content: str, target_path: str) -> str:
+    def save_file_from_base64(base64_content: str, remote_path: str) -> str:
         """
         将 base64 编码的内容保存到指定文件路径。
         
         Args:
             base64_content: base64 编码的文件内容。提供本地文件路径即可，底层会自动读取并编码。
-            target_path: 目标文件完整路径（Windows 格式，如 C:\\temp\\image.png）
+            remote_path: 目标文件完整路径（Windows 格式，如 C:\\temp\\image.png）
         
         Returns:
             JSON 格式的操作结果
         """
         try:
             # 确保目标目录存在
-            target_dir = os.path.dirname(target_path)
+            target_dir = os.path.dirname(remote_path)
             if target_dir and not os.path.exists(target_dir):
                 os.makedirs(target_dir, exist_ok=True)
                 logger.info(f"创建目录: {target_dir}")
             
             # 解码并保存
             file_data = base64.b64decode(base64_content)
-            with open(target_path, 'wb') as f:
+            with open(remote_path, 'wb') as f:
                 f.write(file_data)
             
             result = {
                 "success": True,
-                "message": f"文件已保存到: {target_path}",
-                "file_path": target_path,
+                "message": f"文件已保存到: {remote_path}",
+                "remote_path": remote_path,
                 "file_size": len(file_data)
             }
-            logger.info(f"文件保存成功: {target_path} ({len(file_data)} bytes)")
+            logger.info(f"文件保存成功: {remote_path} ({len(file_data)} bytes)")
             return json.dumps(result, ensure_ascii=False)
             
         except base64.binascii.Error as e:
@@ -106,6 +108,58 @@ def create_mcp_server(host: str = "0.0.0.0", port: int = 8000) -> FastMCP:
             return json.dumps({"success": False, "message": error_msg}, ensure_ascii=False)
         except Exception as e:
             error_msg = f"保存文件失败: {str(e)}"
+            logger.error(error_msg)
+            return json.dumps({"success": False, "message": error_msg}, ensure_ascii=False)
+
+    @server.tool()
+    def read_file_to_base64(remote_path: str) -> str:
+        """
+        读取指定文件并以 base64 编码返回。与 save_file_from_base64 对称。
+
+        在 MCP Server 侧（远程机器），读取本地文件并返回 base64 编码内容。
+        Agent Service 底层会拦截返回值，将 base64 替换为本地文件路径，大模型最终拿到的是本地路径。
+
+        Args:
+            remote_path: 要读取的文件完整路径（远程机器上的路径，如 C:\\temp\\image.png）
+
+        Returns:
+            JSON 格式的结果，包含 base64 编码的文件内容
+        """
+        try:
+            if not os.path.exists(remote_path):
+                return json.dumps({
+                    "success": False,
+                    "message": f"文件不存在: {remote_path}"
+                }, ensure_ascii=False)
+
+            if not os.path.isfile(remote_path):
+                return json.dumps({
+                    "success": False,
+                    "message": f"路径不是文件: {remote_path}"
+                }, ensure_ascii=False)
+
+            # 读取文件并编码为 base64
+            with open(remote_path, 'rb') as f:
+                file_data = f.read()
+
+            base64_content = base64.b64encode(file_data).decode('utf-8')
+
+            result = {
+                "success": True,
+                "message": f"文件读取成功: {remote_path}",
+                "remote_path": remote_path,
+                "file_size": len(file_data),
+                "base64_content": base64_content
+            }
+            logger.info(f"文件读取成功: {remote_path} ({len(file_data)} bytes)")
+            return json.dumps(result, ensure_ascii=False)
+
+        except PermissionError as e:
+            error_msg = f"无权限读取文件: {str(e)}"
+            logger.error(error_msg)
+            return json.dumps({"success": False, "message": error_msg}, ensure_ascii=False)
+        except Exception as e:
+            error_msg = f"读取文件失败: {str(e)}"
             logger.error(error_msg)
             return json.dumps({"success": False, "message": error_msg}, ensure_ascii=False)
 

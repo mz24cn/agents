@@ -37,7 +37,7 @@ from runtime import (
     Message,
 )
 
-SEARXNG_URL = "http://pi:8080"
+SEARXNG_URL = os.environ.get("SEARXNG_URL", "http://pi:8080")
 
 
 def searxng_search(query: str, num_results: int = 5) -> str:

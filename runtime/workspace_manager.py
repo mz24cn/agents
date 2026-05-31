@@ -621,11 +621,19 @@ def expand_workspace_file_refs_in_message(message: Message, workspace: str) -> M
     images = list(message.images or [])
 
     def replace(match: re.Match) -> str:
-        ref = match.group(1).strip()
-        file_path = _resolve_workspace_file(ref, workspace)
+        file_path = match.group(1).strip()
+
+        if os.path.isabs(file_path):
+            file_path = os.path.realpath(file_path)
+        else:
+            file_path = os.path.realpath(os.path.join(workspace, file_path.lstrip("/\\")))
+
+        if not os.path.isfile(file_path):
+            raise ValueError(f"Referenced file does not exist: {ref_path}")
+
         if is_image_file(file_path):
             images.append(file_path)
-            return f"[Image file attached: {ref}]"
+            return f"[Image file attached: {file_path}]"
         if is_text_file(file_path):
             content = _read_text_file(file_path)
             return f"```\n{content}\n```"

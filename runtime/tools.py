@@ -265,7 +265,7 @@ def convert_file_path_to_base64(value: str) -> tuple[str, bool]:
 def process_tool_arguments_for_base64(arguments: dict) -> dict:
     """处理工具调用参数，自动将文件路径转换为 base64。
 
-    检测参数中名为 'base64_content' 的字段，如果其值看起来不是 base64
+    检测参数名包含 'base64' 的字段，如果其值看起来不是 base64
     （长度小于阈值），则尝试将其作为文件路径打开并转换。
 
     Args:
@@ -274,26 +274,23 @@ def process_tool_arguments_for_base64(arguments: dict) -> dict:
     Returns:
         处理后的参数字典
     """
-    # 需要检测的参数名列表
-    base64_param_names = ['base64_content', 'base64_data', 'image_base64']
-    
-    for param_name in base64_param_names:
-        if param_name in arguments:
-            original_value = arguments[param_name]
-            
-            # 只处理字符串类型
-            if isinstance(original_value, str):
-                converted_value, was_converted = convert_file_path_to_base64(original_value)
-                
-                if was_converted:
-                    arguments[param_name] = converted_value
-                    # 添加元数据，便于调试
-                    arguments['_original_path'] = original_value
-                    arguments['_converted_to_base64'] = True
-                    logger.info(f"自动转换文件路径到 base64: {param_name} = {original_value} -> (已转换, 长度 {len(converted_value)})")
-                else:
-                    logger.debug(f"参数 {param_name} 无需转换 (长度 {len(original_value)}, 看起来像 base64: {is_likely_base64(original_value)})")
-    
+    for param_name, original_value in list(arguments.items()):
+        if 'base64' not in param_name.lower():
+            continue
+
+        # 只处理字符串类型
+        if isinstance(original_value, str):
+            converted_value, was_converted = convert_file_path_to_base64(original_value)
+
+            if was_converted:
+                arguments[param_name] = converted_value
+                # 添加元数据，便于调试
+                arguments['_original_path'] = original_value
+                arguments['_converted_to_base64'] = True
+                logger.info(f"自动转换文件路径到 base64: {param_name} = {original_value} -> (已转换, 长度 {len(converted_value)})")
+            else:
+                logger.debug(f"参数 {param_name} 无需转换 (长度 {len(original_value)}, 看起来像 base64: {is_likely_base64(original_value)})")
+
     return arguments
 
 
@@ -303,9 +300,9 @@ def save_and_replace_base64(text: str, output_dir: str ="/tmp"):
         os.makedirs(output_dir)
 
     # 2. 正则表达式：匹配 "key": "base64内容"
-    # 这里的 key 涵盖了 windows-mcp 和 chrome-devtools 常用的字段名
-    # {1000,} 确保只抓取长字符串，避免误伤普通的 JSON 字段
-    pattern = r'"(screenshot|data|image|base64)":\s*"([A-Za-z0-9+/]{100,}={0,2})"'
+    # 这里的 key 涵盖了 windows-mcp、chrome-devtools 和 file-transfer-mcp 常用的字段名
+    # {100,} 确保只抓取长字符串，避免误伤普通的 JSON 字段
+    pattern = r'"(screenshot|data|image|base64|base64_content|base64_data|image_base64)":\s*"([A-Za-z0-9+/]{100,}={0,2})"'
 
     def replace_logic(match):
         # match.group(1) 是原来的 key，group(2) 是 base64 内容

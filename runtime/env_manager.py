@@ -59,7 +59,13 @@ class EnvManager:
             raise ValueError(
                 f"env.json 内容必须是 JSON 对象，实际类型: {type(data).__name__}"
             )
-        return {str(k): str(v) for k, v in data.items()}
+        result = {str(k): str(v) for k, v in data.items()}
+        # 如果 env.json 中没有 AGENT_WORKSPACE，从 os.environ 中补充（app.py 启动时已保证 environ 中有值）
+        if "AGENT_WORKSPACE" not in result:
+            workspace = os.environ.get("AGENT_WORKSPACE", "")
+            if workspace:
+                result["AGENT_WORKSPACE"] = workspace
+        return result
 
     def set(self, key: str, value: str) -> dict[str, str]:
         """新增或更新一个键值对，原子写入 env.json，并同步到 os.environ。
