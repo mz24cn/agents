@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import signal
 import shutil
 import stat
@@ -51,6 +52,7 @@ from runtime.common import (
     safe_rel_path as _safe_rel_path,
     atomic_write_json as _atomic_write_json,
     session_timestamp,
+    kill_process_group,
 )
 
 # Shared registry mapping session_id → subprocess.Popen for the currently
@@ -58,6 +60,14 @@ from runtime.common import (
 # handler (which runs in the HTTPServer thread) can kill the process.
 _active_processes: dict[str, subprocess.Popen] = {}
 _active_processes_lock = threading.Lock()
+
+
+def _was_terminated_by_signal(proc: subprocess.Popen) -> bool:
+    signal_returncodes = {-signal.SIGTERM}
+    sigkill = getattr(signal, "SIGKILL", None)
+    if sigkill is not None:
+        signal_returncodes.add(-sigkill)
+    return proc.returncode in signal_returncodes
 
 
 def kill_active_process(session_id: str) -> bool:
@@ -72,17 +82,7 @@ def kill_active_process(session_id: str) -> bool:
         return False
     try:
         # Kill the entire process group so child processes are also terminated.
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        except (ProcessLookupError, OSError):
-            proc.terminate()
-        try:
-            proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, OSError):
-                proc.kill()
+        kill_process_group(proc)
         return True
     except (ProcessLookupError, OSError):
         return False
@@ -2032,12 +2032,13 @@ BUILTIN_TOOLS.append((SEARCH_CODE_TOOL_CONFIG, _search_code))
 # Task 10.1 — _execute_command implementation
 # ---------------------------------------------------------------------------
 
-def _execute_command(command: str, timeout: Optional[int] = None) -> str:
+def _execute_command(command: str, timeout: Optional[int] = None, background: bool = False) -> str:
     """Execute a shell command in the workspace with output limits.
 
     Args:
         command: The shell command to execute.
         timeout: Optional timeout in seconds. If None, uses EXEC_DEFAULT_TIMEOUT.
+        background: If True and platform is Windows, run command in background using Start-Process.
 
     Returns:
         JSON string with keys: exit_code, stdout, stderr, truncated on success.
@@ -2047,6 +2048,39 @@ def _execute_command(command: str, timeout: Optional[int] = None) -> str:
     # Reject empty command
     if not command or not command.strip():
         return json.dumps({"error": "EmptyCommand", "message": "Command must not be empty"})
+
+    # Handle background execution on Windows
+    if sys.platform == "win32":
+        start_prefix = "start /B "
+        start_index = command.find(start_prefix)
+        if start_index != -1:
+            command = command[start_index + len(start_prefix):]
+            background = True
+
+        if background:
+            try:
+                parts = shlex.split(command)
+                if not parts:
+                    return json.dumps({"error": "EmptyCommand", "message": "Command must not be empty"})
+
+                program = parts[0]
+                arguments = parts[1:] if len(parts) > 1 else []
+
+                # Escape single quotes for PowerShell (double them)
+                def escape_ps(s):
+                    return s.replace("'", "''")
+
+                # Build Start-Process command via PowerShell
+                if arguments:
+                    arg_str = " ".join(arguments)
+                    ps_command = f"Start-Process -WindowStyle Hidden '{escape_ps(program)}' -ArgumentList '{escape_ps(arg_str)}'"
+                else:
+                    ps_command = f"Start-Process -WindowStyle Hidden '{escape_ps(program)}'"
+
+                # Wrap in powershell.exe -Command
+                command = f"powershell.exe -Command \"{ps_command}\""
+            except ValueError as e:
+                return json.dumps({"error": "CommandParseError", "message": f"Failed to parse command: {e}"})
 
     # Read configuration
     output_line_limit = int(os.environ.get("EXEC_OUTPUT_LINE_LIMIT", 1000))
@@ -2066,6 +2100,7 @@ def _execute_command(command: str, timeout: Optional[int] = None) -> str:
     # Use Popen with start_new_session=True so the abort handler can kill
     # the entire process group via kill_active_process().
     session_id = get_request_context("session_id")
+    creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
     try:
         proc = subprocess.Popen(
             command,
@@ -2075,7 +2110,8 @@ def _execute_command(command: str, timeout: Optional[int] = None) -> str:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            start_new_session=True,  # own process group for clean kill
+            start_new_session=sys.platform != "win32",
+            creationflags=creationflags,
         )
     except Exception as exc:
         return json.dumps({"error": "SpawnFailed", "message": str(exc)})
@@ -2090,18 +2126,8 @@ def _execute_command(command: str, timeout: Optional[int] = None) -> str:
             stdout, stderr = proc.communicate(timeout=timeout_val)
         except subprocess.TimeoutExpired:
             # Timeout — kill the process group.
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                proc.terminate()
-            try:
-                stdout, stderr = proc.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                except (ProcessLookupError, OSError):
-                    proc.kill()
-                stdout, stderr = proc.communicate()
+            kill_process_group(proc)
+            stdout, stderr = proc.communicate()
             return json.dumps({
                 "error": "Timeout",
                 "message": f"Command exceeded timeout of {timeout_val} seconds",
@@ -2114,7 +2140,7 @@ def _execute_command(command: str, timeout: Optional[int] = None) -> str:
                 _active_processes.pop(session_id, None)
 
     # Check if the process was killed externally (abort handler).
-    if proc.returncode in (-signal.SIGTERM, -signal.SIGKILL):
+    if _was_terminated_by_signal(proc):
         return json.dumps({
             "error": "Aborted",
             "message": "Command was aborted by user",
@@ -2179,8 +2205,6 @@ EXECUTE_COMMAND_TOOL_CONFIG = ToolConfig(
     description=(
         "Execute a shell command in the workspace directory. "
         "Runs in non-interactive mode (TERM=dumb). "
-        "Output is truncated to EXEC_OUTPUT_LINE_LIMIT lines. "
-        "A default timeout of EXEC_DEFAULT_TIMEOUT seconds is applied."
     ),
     parameters={
         "type": "object",
@@ -2198,6 +2222,14 @@ EXECUTE_COMMAND_TOOL_CONFIG = ToolConfig(
     },
     builtin=True,
 )
+
+# Add background parameter only on Windows
+if sys.platform == "win32":
+    EXECUTE_COMMAND_TOOL_CONFIG.parameters["properties"]["background"] = {
+        "type": "boolean",
+        "description": "Run command in background mode.",
+        "default": False,
+    }
 
 BUILTIN_TOOLS.append((EXECUTE_COMMAND_TOOL_CONFIG, _execute_command))
 

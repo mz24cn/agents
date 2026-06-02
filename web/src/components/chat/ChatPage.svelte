@@ -28,8 +28,17 @@
   // Key = session ID (or '__new__' before backend assigns one).
   // Stream callbacks write to their own key; switching sessions just changes which key is displayed.
   let sessionStore = $state({})
-  let abortFunctions = {}  // sessionKey -> abort function (not reactive)
   function storeKey(sid) { return sid || '__new__' }
+
+  function migrateSessionStoreKey(oldKey, newKey) {
+    if (!newKey || oldKey === newKey) return oldKey
+    if (sessionStore[oldKey]) {
+      sessionStore[newKey] = sessionStore[oldKey]
+      delete sessionStore[oldKey]
+    }
+    return newKey
+  }
+
   let messages = $derived(sessionStore[storeKey(sessionId)]?.messages ?? [])
   let isStreaming = $derived(sessionStore[storeKey(sessionId)]?.isStreaming ?? false)
   let collapsedGroups = $derived(sessionStore[storeKey(sessionId)]?.collapsedGroups ?? new Set())
@@ -285,11 +294,7 @@
 
     // 当后端分配了真正的 session_id 时，将 store 数据从临时 key 迁移过去
     function migrateKey(newKey) {
-      if (keyRef.key !== newKey && sessionStore[keyRef.key]) {
-        sessionStore[newKey] = sessionStore[keyRef.key]
-        delete sessionStore[keyRef.key]
-        keyRef.key = newKey
-      }
+      keyRef.key = migrateSessionStoreKey(keyRef.key, newKey)
     }
 
     // 收到 init 事件后，才创建用户消息和助手占位消息
@@ -331,7 +336,7 @@
       }
     }
 
-    abortFunctions[keyRef.key] = inferStream(
+    inferStream(
       reqBody,
       (msg) => onStreamMsg(msg, aIdxRef, pendingFirstUserMsg, keyRef),
       () => onStreamDone(keyRef),
@@ -342,12 +347,12 @@
 
   function handleStop() {
     const key = storeKey(sessionId)
-    if (abortFunctions[key]) {
-      // 通知后端 set cancel_event，后端会发送终止消息并关闭连接
-      if (sessionId) abortInferStream(sessionId)
-      // 不再主动终止前端连接，等待后端发送终止消息后自然关闭
-      abortFunctions[key] = null
-    }
+    const store = sessionStore[key]
+    if (!sessionId || !store?.isStreaming) return
+
+    // 通知后端 set cancel_event，后端会发送终止消息并关闭连接。
+    // 不再主动终止前端连接，等待后端发送终止消息后自然关闭。
+    abortInferStream(sessionId)
   }
 
   // Double-click stop = forced abort: kills running tool processes (bash, MCP)
@@ -356,7 +361,6 @@
   function handleStopForce() {
     const key = storeKey(sessionId)
     if (sessionId) abortInferStream(sessionId, true)
-    abortFunctions[key] = null
     // Immediately mark local state as not streaming so the UI unblocks.
     const store = sessionStore[key]
     if (store) store.isStreaming = false
@@ -408,11 +412,7 @@
   function onStreamMsg(msg, aIdxRef, pendingFirstUserMsg, keyRef) {
     if (msg.session_id && !msg.role) {
       // Migrate store key if backend assigns a new session ID mid-stream
-      if (keyRef.key !== msg.session_id && sessionStore[keyRef.key]) {
-        sessionStore[msg.session_id] = sessionStore[keyRef.key]
-        delete sessionStore[keyRef.key]
-        keyRef.key = msg.session_id
-      }
+      keyRef.key = migrateSessionStoreKey(keyRef.key, msg.session_id)
       sessionId = msg.session_id
       currentSession.sessionId = msg.session_id
       // 通知 Sidebar 有新会话创建（仅当之前没有 sessionId 时才视为新会话）
@@ -530,7 +530,6 @@
       // 2 秒后自动收起本轮工具调用消息
       autoCollapseLastGroup(keyRef.key)
     }
-    abortFunctions[keyRef.key] = null
     // If the stream that just finished belongs to the currently viewed session:
     // - at bottom → mark read immediately
     // - not at bottom → set needsRead so it gets marked when user scrolls down
@@ -595,7 +594,6 @@
   function onStreamErr(err, keyRef) {
     const store = sessionStore[keyRef.key]
     if (store) store.isStreaming = false
-    abortFunctions[keyRef.key] = null
     errorMsg = err?.message || t('streamError')
     // If the errored stream belongs to the currently viewed session:
     // - at bottom → mark read immediately
@@ -764,10 +762,6 @@
     const deletedSid = sessionDeleted.sessionId
     if (deletedSid) {
       sessionDeleted.sessionId = null
-      // Abort any active stream for the deleted session
-      if (abortFunctions[deletedSid]) {
-        abortFunctions[deletedSid] = null
-      }
       delete sessionStore[deletedSid]
       errorMsg = ''
       sessionId = null

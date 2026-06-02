@@ -1439,12 +1439,17 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         elif fmt == "json":
             parsed = self._extract_json(result)
             if parsed is not None:
-                self._send_json_response(200, {"result": parsed})
+                self._send_json_response(200, parsed)
             else:
-                self._send_json_error(400, "Result is not valid JSON and no embedded JSON could be extracted")
+                self._send_json_error(400, {"error": "Result is not valid JSON and no embedded JSON could be extracted"})
                 return
         else:
-            self._send_json_response(200, {"result": result})
+            body = result.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
     def _handle_register_model(self) -> None:
         """POST /v1/models — register a new model configuration.
@@ -1990,6 +1995,10 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         """GET /v1/setup — 返回当前 agent service 的自解压安装脚本。"""
         env_manager = self.server.env_manager  # type: ignore[attr-defined]
         project_root = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
+        user_agent = self.headers.get("User-Agent", "")
+        ua_lower = user_agent.lower()
+        is_windows = "powershell" in ua_lower or "windows" in ua_lower or "pwsh" in ua_lower
+        script_format = "ps1" if is_windows else "sh"
         try:
             script = env_manager.build_setup_script(
                 project_root=project_root,
@@ -1997,14 +2006,19 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 runtime=self.server.runtime,  # type: ignore[attr-defined]
                 prompt_template_manager=self.server.prompt_template_manager,  # type: ignore[attr-defined]
                 agent_manager=self.server.agent_manager,  # type: ignore[attr-defined]
+                script_format=script_format,
             )
         except Exception as exc:
             logger.exception("Failed to build setup script: %s", exc)
             self._send_json_error(500, f"Failed to build setup script: {exc}")
             return
         self.send_response(200)
-        self.send_header("Content-Type", "application/x-sh; charset=utf-8")
-        self.send_header("Content-Disposition", 'inline; filename="setup.sh"')
+        if script_format == "ps1":
+            self.send_header("Content-Type", "application/x-powershell; charset=utf-8")
+            self.send_header("Content-Disposition", 'inline; filename="setup.ps1"')
+        else:
+            self.send_header("Content-Type", "application/x-sh; charset=utf-8")
+            self.send_header("Content-Disposition", 'inline; filename="setup.sh"')
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(script)))
         self.end_headers()

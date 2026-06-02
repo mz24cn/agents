@@ -150,8 +150,9 @@ class EnvManager:
         prompt_template_manager: object | None = None,
         agent_manager: object | None = None,
         include_project: bool = True,
+        script_format: str = "sh",
     ) -> bytes:
-        """生成可通过 ``curl ... | sh`` 执行的自解压安装脚本。
+        """生成可通过 ``curl ... | sh`` 或 ``irm ... | iex`` 执行的自解压安装脚本。
 
         脚本内嵌一个 tar.gz 载荷，包含当前 agent service 代码以及服务端
         已注册的模型、工具、MCP server、提示词模板、智能体配置和 env.json。
@@ -165,7 +166,12 @@ class EnvManager:
             include_project=include_project,
         )
         encoded = "\n".join(textwrap.wrap(base64.b64encode(payload).decode("ascii"), 76))
-        return self._render_setup_script(encoded).encode("utf-8")
+        fmt = script_format.lower().strip()
+        if fmt in {"ps1", "powershell", "windows"}:
+            return self._render_setup_script_ps1(encoded).encode("utf-8")
+        if fmt not in {"sh", "shell", "posix", "unix"}:
+            raise ValueError(f"Unsupported setup script format: {script_format}")
+        return self._render_setup_script_sh(encoded).encode("utf-8")
 
     # ------------------------------------------------------------------
     # 私有方法
@@ -220,8 +226,16 @@ class EnvManager:
             })
             bio = BytesIO()
             with tarfile.open(fileobj=bio, mode="w:gz") as tar:
-                tar.add(payload_root, arcname=".")
+                tar.add(payload_root, arcname=".", filter=self._setup_tar_filter)
             return bio.getvalue()
+
+    def _setup_tar_filter(self, tarinfo: tarfile.TarInfo) -> tarfile.TarInfo | None:
+        """过滤 setup payload 中不应包含的 tar 条目。"""
+        if tarinfo.issym() or tarinfo.islnk():
+            target = getattr(tarinfo, "linkname", "")
+            logger.warning("打包 setup payload 时跳过链接 %s -> %s", tarinfo.name, target)
+            return None
+        return tarinfo
 
     def _copy_project(self, src: str, dst: str) -> None:
         import shutil
@@ -232,27 +246,44 @@ class EnvManager:
         web_dist_real = os.path.join(src_real, "web", "dist")
 
         def should_exclude_dir(parent_dir: str, name: str) -> bool:
-            path_real = os.path.realpath(os.path.join(parent_dir, name))
+            path = os.path.join(parent_dir, name)
+            path_real = os.path.realpath(path)
             # web/dist 是前端编译产物，部署后用于提供 Web UI，必须随源码一起打包。
             if path_real == web_dist_real:
                 return False
+            # Agent Service 部署目录下不应包含任何点号开头的目录（例如 .vscode、.git、.hypothesis）。
+            # 注意：运行时配置目录 payload/agents_runtime 会安装到 AGENTS_RUNTIME_DIR，不在部署目录下，不能因此排除。
+            if name.startswith(".") and os.path.isdir(path):
+                return True
             return name in exclude_dirs
 
         def ignore(dirpath: str, names: list[str]) -> set[str]:
-            return {
-                name for name in names
-                if name in exclude_files or should_exclude_dir(dirpath, name)
-            }
+            ignored: set[str] = set()
+            for name in names:
+                path = os.path.join(dirpath, name)
+                if name in exclude_files or should_exclude_dir(dirpath, name):
+                    ignored.add(name)
+                    continue
+                # Windows 自带 tar.exe 对 Linux/Unix 符号链接，尤其是指向绝对路径的链接，
+                # 经常会解压失败（例如项目根目录 chat_data -> /root/.agents_runtime/chat_data）。
+                # setup payload 需要跨平台可解压，因此项目源码打包时跳过符号链接。
+                if os.path.islink(path):
+                    logger.warning("打包时跳过符号链接 %s -> %s", path, os.readlink(path))
+                    ignored.add(name)
+            return ignored
 
         for name in os.listdir(src):
             if name in exclude_files or should_exclude_dir(src, name):
                 continue
             s = os.path.join(src, name); d = os.path.join(dst, name)
             try:
-                if os.path.isdir(s) and not os.path.islink(s):
-                    shutil.copytree(s, d, symlinks=True, ignore=ignore)
+                if os.path.islink(s):
+                    logger.warning("打包时跳过符号链接 %s -> %s", s, os.readlink(s))
+                    continue
+                if os.path.isdir(s):
+                    shutil.copytree(s, d, symlinks=False, ignore=ignore)
                 else:
-                    shutil.copy2(s, d, follow_symlinks=False)
+                    shutil.copy2(s, d, follow_symlinks=True)
             except OSError as exc:
                 logger.warning("打包时跳过 %s: %s", s, exc)
 
@@ -294,7 +325,17 @@ class EnvManager:
             src_agents = os.path.join(data_dir, "agents")
             if os.path.isdir(src_agents):
                 import shutil
-                shutil.copytree(src_agents, agents_dir, dirs_exist_ok=True)
+
+                def ignore_links(dirpath: str, names: list[str]) -> set[str]:
+                    ignored: set[str] = set()
+                    for name in names:
+                        path = os.path.join(dirpath, name)
+                        if os.path.islink(path):
+                            logger.warning("打包 agents 配置时跳过符号链接 %s -> %s", path, os.readlink(path))
+                            ignored.add(name)
+                    return ignored
+
+                shutil.copytree(src_agents, agents_dir, dirs_exist_ok=True, symlinks=False, ignore=ignore_links)
         package_root_real = os.path.realpath(os.path.dirname(os.path.dirname(__file__)))
         for tool in tools if isinstance(tools, list) else []:
             if not isinstance(tool, dict):
@@ -330,7 +371,7 @@ class EnvManager:
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(data, fh, ensure_ascii=False, indent=2)
 
-    def _render_setup_script(self, encoded_payload: str) -> str:
+    def _render_setup_script_sh(self, encoded_payload: str) -> str:
         return """#!/bin/sh
 set -eu
 
@@ -349,6 +390,9 @@ base64 -d > "$TMPDIR/payload.tar.gz" <<'__AGENT_SERVICE_TAR_GZ_BASE64__'
 __AGENT_SERVICE_TAR_GZ_BASE64__
 mkdir -p "$TMPDIR/payload"
 tar -xzf "$TMPDIR/payload.tar.gz" -C "$TMPDIR/payload"
+# setup 包不应包含符号链接。即使历史版本 payload 中误带链接，也在 shell 侧二次清理，
+# 避免 Linux/Windows tar 行为差异或无效链接影响安装。
+find "$TMPDIR/payload" -type l -exec rm -f {} \\;
 
 mkdir -p "$AGENT_SERVICE_HOME" "$AGENTS_RUNTIME_DIR"
 [ ! -d "$TMPDIR/payload/app" ] || tar -C "$TMPDIR/payload/app" -cf - . | tar -C "$AGENT_SERVICE_HOME" -xf -
@@ -416,4 +460,182 @@ case "$START_AGENT_SERVICE" in
     ;;
 esac
 exit 0
+"""
+
+    def _render_setup_script_ps1(self, encoded_payload: str) -> str:
+        return """$ErrorActionPreference = 'Stop'
+
+if (-not $env:AGENT_SERVICE_HOME) { $env:AGENT_SERVICE_HOME = Join-Path (Get-Location) 'agents' }
+if (-not $env:AGENTS_RUNTIME_DIR) { $env:AGENTS_RUNTIME_DIR = Join-Path $HOME '.agents_runtime' }
+if (-not $env:AGENT_SERVICE_PORT) { $env:AGENT_SERVICE_PORT = '7988' }
+if (-not $env:START_AGENT_SERVICE) { $env:START_AGENT_SERVICE = 'background' }
+
+$tmpRoot = if ($env:TEMP) { $env:TEMP } else { [System.IO.Path]::GetTempPath() }
+$tmpDir = Join-Path $tmpRoot ("agent-service-setup." + [System.Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
+try {
+    Write-Host "Extracting agent service package..."
+    $payloadPath = Join-Path $tmpDir 'payload.tar.gz'
+    $base64Payload = @'
+""" + encoded_payload + """
+'@
+    [System.IO.File]::WriteAllBytes($payloadPath, [System.Convert]::FromBase64String(($base64Payload -replace '\\s', '')))
+
+    $payloadDir = Join-Path $tmpDir 'payload'
+    New-Item -ItemType Directory -Force -Path $payloadDir | Out-Null
+    tar -xzf $payloadPath -C $payloadDir
+    if ($LASTEXITCODE -ne 0) { throw "tar extraction failed with exit code $LASTEXITCODE" }
+
+    New-Item -ItemType Directory -Force -Path $env:AGENT_SERVICE_HOME | Out-Null
+    New-Item -ItemType Directory -Force -Path $env:AGENTS_RUNTIME_DIR | Out-Null
+
+    $appPayload = Join-Path $payloadDir 'app'
+    if (Test-Path -LiteralPath $appPayload -PathType Container) {
+        Get-ChildItem -LiteralPath $appPayload -Force | Copy-Item -Destination $env:AGENT_SERVICE_HOME -Recurse -Force
+    }
+    $runtimePayload = Join-Path $payloadDir 'agents_runtime'
+    if (Test-Path -LiteralPath $runtimePayload -PathType Container) {
+        Get-ChildItem -LiteralPath $runtimePayload -Force | Copy-Item -Destination $env:AGENTS_RUNTIME_DIR -Recurse -Force
+    }
+
+    $startScript = Join-Path $env:AGENT_SERVICE_HOME 'start-agent-service.ps1'
+    @'
+$ErrorActionPreference = 'Stop'
+if (-not $env:AGENT_SERVICE_PORT) { $env:AGENT_SERVICE_PORT = '7988' }
+if (-not $env:AGENTS_RUNTIME_DIR) { $env:AGENTS_RUNTIME_DIR = Join-Path $HOME '.agents_runtime' }
+if (-not $env:AGENT_SERVICE_LOG) { $env:AGENT_SERVICE_LOG = Join-Path $env:AGENTS_RUNTIME_DIR 'server.log' }
+if (-not $env:START_AGENT_SERVICE) { $env:START_AGENT_SERVICE = 'background' }
+New-Item -ItemType Directory -Force -Path $env:AGENTS_RUNTIME_DIR | Out-Null
+Set-Location -LiteralPath $PSScriptRoot
+
+switch ($env:START_AGENT_SERVICE) {
+    'background' {
+        $errLog = Join-Path (Split-Path -Parent $env:AGENT_SERVICE_LOG) 'server.err.log'
+        $pidPath = Join-Path $env:AGENTS_RUNTIME_DIR 'server.pid'
+        Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue
+        $appDir = $PSScriptRoot.Replace("'", "''")
+        $outLog = $env:AGENT_SERVICE_LOG.Replace("'", "''")
+        $errorLog = $errLog.Replace("'", "''")
+        $runner = @"
+`$ErrorActionPreference = 'Continue'
+try {
+    ('[{0}] Launching agent service from $appDir on port $($env:AGENT_SERVICE_PORT)' -f (Get-Date -Format o)) | Add-Content -LiteralPath '$outLog'
+    `$pythonCmd = Get-Command python -ErrorAction SilentlyContinue
+    `$pythonArgs = @('app.py', '0.0.0.0:$($env:AGENT_SERVICE_PORT)')
+    if (-not `$pythonCmd) {
+        `$pythonCmd = Get-Command py -ErrorAction SilentlyContinue
+        `$pythonArgs = @('-3', 'app.py', '0.0.0.0:$($env:AGENT_SERVICE_PORT)')
+    }
+    if (-not `$pythonCmd) { throw 'Neither python nor py was found in PATH' }
+    `$pythonExe = if (`$pythonCmd.Source) { `$pythonCmd.Source } else { `$pythonCmd.Name }
+    ('[{0}] Python command: {1} {2}' -f (Get-Date -Format o), `$pythonExe, (`$pythonArgs -join ' ')) | Add-Content -LiteralPath '$outLog'
+    Set-Location -LiteralPath '$appDir'
+    & `$pythonExe @pythonArgs >> '$outLog' 2>> '$errorLog'
+    `$exitCode = if (`$null -ne `$LASTEXITCODE) { `$LASTEXITCODE } else { 0 }
+    ('[{0}] Agent service exited with code {1}' -f (Get-Date -Format o), `$exitCode) | Add-Content -LiteralPath '$errorLog'
+    exit `$exitCode
+} catch {
+    ('[{0}] Failed to launch agent service:' -f (Get-Date -Format o)) | Add-Content -LiteralPath '$errorLog'
+    (`$_ | Out-String) | Add-Content -LiteralPath '$errorLog'
+    exit 1
+}
+"@
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($runner))
+        $p = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded) -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -PassThru
+        Start-Sleep -Seconds 2
+        $p.Refresh()
+        if ($p.HasExited) {
+            $tail = if (Test-Path -LiteralPath $errLog) { (Get-Content -LiteralPath $errLog -Tail 80 -ErrorAction SilentlyContinue | Out-String) } else { '' }
+            throw "Agent service exited immediately with code $($p.ExitCode). Error log: $errLog`n$tail"
+        }
+        Set-Content -LiteralPath $pidPath -Value $p.Id -Encoding ASCII
+        Write-Output $p.Id
+    }
+    'foreground' {
+        & python app.py "0.0.0.0:$($env:AGENT_SERVICE_PORT)" 2>&1 | Tee-Object -FilePath $env:AGENT_SERVICE_LOG -Append
+    }
+    'none' { return }
+    default { throw "Invalid START_AGENT_SERVICE=$($env:START_AGENT_SERVICE). Expected: background, foreground, none" }
+}
+'@ | Set-Content -LiteralPath $startScript -Encoding UTF8
+
+    $stopScript = Join-Path $env:AGENT_SERVICE_HOME 'stop-agent-service.ps1'
+    @'
+$ErrorActionPreference = 'Stop'
+if (-not $env:AGENTS_RUNTIME_DIR) { $env:AGENTS_RUNTIME_DIR = Join-Path $HOME '.agents_runtime' }
+$pidPath = Join-Path $env:AGENTS_RUNTIME_DIR 'server.pid'
+if (-not (Test-Path -LiteralPath $pidPath)) {
+    Write-Host "No pid file found: $pidPath"
+    exit 0
+}
+$servicePidText = (Get-Content -LiteralPath $pidPath -Raw).Trim()
+$servicePid = 0
+if (-not [int]::TryParse($servicePidText, [ref]$servicePid)) {
+    throw "Invalid pid file content: $pidPath"
+}
+function Stop-AgentProcessTree {
+    param([int]$RootPid)
+    $children = Get-CimInstance Win32_Process -Filter "ParentProcessId=$RootPid" -ErrorAction SilentlyContinue
+    foreach ($child in $children) {
+        Stop-AgentProcessTree -RootPid ([int]$child.ProcessId)
+    }
+    $proc = Get-Process -Id $RootPid -ErrorAction SilentlyContinue
+    if ($proc) {
+        Stop-Process -Id $RootPid -Force -ErrorAction SilentlyContinue
+        Write-Host "Stopped pid: $RootPid"
+    }
+}
+Stop-AgentProcessTree -RootPid $servicePid
+Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue
+'@ | Set-Content -LiteralPath $stopScript -Encoding UTF8
+
+    switch ($env:START_AGENT_SERVICE) {
+        'background' { }
+        'foreground' { }
+        'none' { }
+        'true' { $env:START_AGENT_SERVICE = 'background' }
+        'false' { $env:START_AGENT_SERVICE = 'none' }
+        default { throw "Invalid START_AGENT_SERVICE=$($env:START_AGENT_SERVICE). Expected: background, foreground, none" }
+    }
+
+    $env:AGENT_SERVICE_LOG = Join-Path $env:AGENTS_RUNTIME_DIR 'server.log'
+    $agentServiceErrLog = Join-Path $env:AGENTS_RUNTIME_DIR 'server.err.log'
+
+    Write-Host "Agent service installed:"
+    Write-Host "  app:    $($env:AGENT_SERVICE_HOME)"
+    Write-Host "  config: $($env:AGENTS_RUNTIME_DIR)"
+    Write-Host "  log:    $($env:AGENT_SERVICE_LOG)"
+    Write-Host "  errlog: $agentServiceErrLog"
+
+    switch ($env:START_AGENT_SERVICE) {
+        'background' {
+            try {
+                $pidText = powershell.exe -NoProfile -ExecutionPolicy Bypass -File $startScript
+                Write-Host "Agent service started in background, pid: $pidText"
+                Write-Host "Log: $($env:AGENT_SERVICE_LOG)"
+                Write-Host "Error log: $agentServiceErrLog"
+                Write-Host "Stop: powershell.exe -NoProfile -ExecutionPolicy Bypass -File '$stopScript'"
+            }
+            catch {
+                Write-Warning "Agent service was installed, but automatic start failed: $($_.Exception.Message)"
+                Write-Warning "You can start it manually: cd '$($env:AGENT_SERVICE_HOME)'; python app.py '0.0.0.0:$($env:AGENT_SERVICE_PORT)'"
+                Write-Warning "Or run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File '$startScript'"
+            }
+        }
+        'foreground' {
+            try {
+                powershell.exe -NoProfile -ExecutionPolicy Bypass -File $startScript
+            }
+            catch {
+                Write-Warning "Agent service was installed, but automatic start failed: $($_.Exception.Message)"
+                Write-Warning "You can start it manually: cd '$($env:AGENT_SERVICE_HOME)'; python app.py '0.0.0.0:$($env:AGENT_SERVICE_PORT)'"
+                Write-Warning "Or run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File '$startScript'"
+            }
+        }
+        'none' { Write-Host "Agent service not started because START_AGENT_SERVICE=none" }
+    }
+}
+finally {
+    Remove-Item -LiteralPath $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
+}
 """

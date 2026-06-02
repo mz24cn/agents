@@ -1,4 +1,4 @@
-import { models as modelsApi, tools as toolsApi, promptTemplates as promptTemplatesApi, agents as agentsApi } from './api.js'
+import { models as modelsApi, tools as toolsApi, promptTemplates as promptTemplatesApi, agents as agentsApi, env as envApi } from './api.js'
 
 // Shared SPA-side catalog state for resources that are selected/edited from
 // multiple pages. ChatPage stays mounted while setup pages are shown, so local
@@ -9,10 +9,11 @@ export const catalog = $state({
   tools: { items: [], loading: false, error: '', loaded: false, version: 0 },
   promptTemplates: { items: [], loading: false, error: '', loaded: false, version: 0 },
   agents: { items: [], loading: false, error: '', loaded: false, version: 0 },
+  envVars: { items: [], loading: false, error: '', loaded: false, version: 0 },
 })
 
 const pending = {}
-const sequence = { models: 0, tools: 0, promptTemplates: 0, agents: 0 }
+const sequence = { models: 0, tools: 0, promptTemplates: 0, agents: 0, envVars: 0 }
 
 async function loadResource(key, request, pickItems, { force = false } = {}) {
   const state = catalog[key]
@@ -84,4 +85,15 @@ export function loadAgents(options) {
 
 export function refreshAgents() {
   return loadAgents({ force: true })
+}
+
+export function loadEnvVars(options) {
+  return loadResource('envVars', envApi.list, (data) => {
+    const map = data.env ?? data
+    return Object.entries(map).map(([key, value]) => ({ key, value }))
+  }, options)
+}
+
+export function refreshEnvVars() {
+  return loadEnvVars({ force: true })
 }

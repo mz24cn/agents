@@ -1,5 +1,5 @@
 <script>
-  import { tick } from 'svelte'
+  import { onDestroy, tick } from 'svelte'
   import { t } from '../../lib/i18n.svelte.js'
 
   let { disabled = false, onSend, onStop, onStopForce, onOpenTemplatePanel, onOpenWorkspacePanel, text = $bindable(''), isStreaming = false } = $props()
@@ -112,23 +112,30 @@
   })
 
   // Double-click detection for forced abort.
-  // Single click → normal abort; double-click → forced abort (kills tool processes).
+  // Wait 300ms to decide whether this is a single click or a double click, then
+  // send exactly one abort request: single → normal abort, double → forced abort.
   let _stopClickTimer = null
+  let _stopClickCount = 0
 
   function handleStopClick() {
-    if (_stopClickTimer) {
-      // Second click within 300ms → forced abort
-      clearTimeout(_stopClickTimer)
+    _stopClickCount += 1
+    if (_stopClickTimer) return
+
+    _stopClickTimer = setTimeout(() => {
+      const clickCount = _stopClickCount
       _stopClickTimer = null
-      onStopForce?.()
-    } else {
-      // First click → start timer, fire normal abort on expiry
-      _stopClickTimer = setTimeout(() => {
-        _stopClickTimer = null
+      _stopClickCount = 0
+      if (clickCount >= 2) {
+        onStopForce?.()
+      } else {
         onStop?.()
-      }, 300)
-    }
+      }
+    }, 300)
   }
+
+  onDestroy(() => {
+    if (_stopClickTimer) clearTimeout(_stopClickTimer)
+  })
 
   function handleSend() {
     syncTextFromEditor()

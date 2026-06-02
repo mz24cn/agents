@@ -1,5 +1,6 @@
 <script>
   import { env } from '../../lib/api.js'
+  import { catalog, loadEnvVars, refreshEnvVars } from '../../lib/catalog-state.svelte.js'
   import ConfirmDialog from '../ConfirmDialog.svelte'
   import { t } from '../../lib/i18n.svelte.js'
 
@@ -8,9 +9,9 @@
     showAddForm = false,
   } = $props()
 
-  let envVars = $state([])       // [{ key, value }]
-  let loading = $state(true)
-  let error = $state('')
+  let envVars = $derived(catalog.envVars.items)
+  let loading = $derived(catalog.envVars.loading && !catalog.envVars.loaded)
+  let error = $derived(catalog.envVars.error)
 
   // --- 新增表单 ---
   let newKey = $state('')
@@ -32,24 +33,15 @@
   let detectError = $state('')
   let unsetKeys = $state([])     // 检测到但尚未配置的 key 列表
 
-  // --- 数据就绪标记 ---
-  let loaded = $state(false)
-
   // ============================
   // 加载
   // ============================
-  async function fetchEnvVars() {
-    loading = true
-    error = ''
+  async function fetchEnvVars({ force = false } = {}) {
     try {
-      const data = await env.list()
-      const map = data.env ?? data
-      envVars = Object.entries(map).map(([key, value]) => ({ key, value }))
-    } catch (err) {
-      error = err.message || t('fetchEnvFailed')
-    } finally {
-      loading = false
-      loaded = true
+      if (force) await refreshEnvVars()
+      else await loadEnvVars()
+    } catch {
+      catalog.envVars.error = catalog.envVars.error || t('fetchEnvFailed')
     }
   }
 
@@ -67,7 +59,7 @@
       await env.set(newKey.trim(), newValue)
       newKey = ''
       newValue = ''
-      await fetchEnvVars()
+      await fetchEnvVars({ force: true })
     } catch (err) {
       saveError = err.message || t('saveEnvFailed')
     } finally {
@@ -88,9 +80,9 @@
     deleteTarget = null
     try {
       await env.delete(key)
-      await fetchEnvVars()
+      await fetchEnvVars({ force: true })
     } catch (err) {
-      error = err.message || t('deleteEnvFailed')
+      catalog.envVars.error = err.message || t('deleteEnvFailed')
     }
   }
 
@@ -114,7 +106,7 @@
     try {
       await env.set(editing.key, editValue)
       editing = null
-      await fetchEnvVars()
+      await fetchEnvVars({ force: true })
     } catch (err) {
       editError = err.message || t('saveEnvFailed')
     } finally {
@@ -132,7 +124,7 @@
   // ============================
   async function handleDetect() {
     // 确保环境变量列表已加载后再执行检测过滤
-    if (!loaded) {
+    if (!catalog.envVars.loaded) {
       await fetchEnvVars()
     }
     detecting = true
@@ -171,7 +163,7 @@
     // showAddForm 变化时重置表单状态（由 SetupPage 驱动）
   })
 
-  // 初始加载
+  // 初始加载（共享状态已加载则跳过）
   $effect(() => {
     fetchEnvVars()
   })

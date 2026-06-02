@@ -115,6 +115,73 @@ class Runtime:
     # Core inference
     # ------------------------------------------------------------------
 
+    def _maybe_throttle_inference_loop(
+        self,
+        loop_start: float,
+        infer_round: int,
+        cancel_event: Optional[object] = None,
+    ) -> bool:
+        """Throttle fast multi-round inference loops based on MAX_INFER_PER_MINUTE.
+
+        The limit is intentionally scoped to one inference loop.  It is checked
+        dynamically before every model API call, so changing the environment
+        variable affects an already-running loop on its next round.
+
+        ``infer_round`` follows the same unit as ``max_tool_rounds``: the number
+        of completed tool-call rounds so far.  To avoid slowing down normal
+        short conversations, throttling starts only after 10 rounds.
+
+        Returns:
+            True if inference should continue, False if ``cancel_event`` was set
+            while sleeping.
+        """
+        if infer_round < 10:
+            return True
+
+        raw_limit = os.environ.get("MAX_INFER_PER_MINUTE", "").strip()
+        if not raw_limit:
+            return True
+
+        try:
+            max_infer_per_minute = float(raw_limit)
+        except (TypeError, ValueError):
+            _logger.warning("invalid MAX_INFER_PER_MINUTE=%r; throttling disabled", raw_limit)
+            return True
+
+        if max_infer_per_minute <= 0:
+            return True
+
+        min_avg_interval = 60.0 / max_infer_per_minute
+        now = time.monotonic()
+        elapsed = max(0.0, now - loop_start)
+        current_avg_interval = elapsed / infer_round
+        if current_avg_interval >= min_avg_interval:
+            return True
+
+        target_elapsed = min_avg_interval * infer_round
+        sleep_seconds = target_elapsed - elapsed
+        if sleep_seconds <= 0:
+            return True
+
+        _logger.info(
+            "throttling inference loop | round=%d max_per_minute=%s "
+            "avg_interval=%.3fs min_interval=%.3fs sleep=%.3fs",
+            infer_round,
+            raw_limit,
+            current_avg_interval,
+            min_avg_interval,
+            sleep_seconds,
+        )
+
+        sleep_until = time.monotonic() + sleep_seconds
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                return False
+            remaining = sleep_until - time.monotonic()
+            if remaining <= 0:
+                return True
+            time.sleep(min(remaining, 0.5))
+
     def infer(self, request: InferenceRequest) -> InferenceResult:
         """Execute a model inference with optional tool call loop.
 
@@ -172,6 +239,10 @@ class Runtime:
         overall_start = time.monotonic()
         last_stat: Optional[TokenStat] = None
         while True:
+            # Dynamically throttle very long/fast tool-call loops before the
+            # next model API request, if MAX_INFER_PER_MINUTE is configured.
+            self._maybe_throttle_inference_loop(overall_start, tool_round)
+
             # Build HTTP request
             url, headers, body_bytes = protocol.build_request(
                 config=model_config,
@@ -793,6 +864,12 @@ class Runtime:
             # Check cancel_event before each round (including before model API call)
             # so we don't block for MODEL_API_TIMEOUT seconds after a forced abort.
             if cancel_event is not None and cancel_event.is_set():
+                yield Message(role="assistant", timestamp=_now_iso(), content="Error: user interrupted.")
+                return
+
+            # Dynamically throttle very long/fast tool-call loops before the
+            # next model API request, if MAX_INFER_PER_MINUTE is configured.
+            if not self._maybe_throttle_inference_loop(overall_start, tool_round, cancel_event):
                 yield Message(role="assistant", timestamp=_now_iso(), content="Error: user interrupted.")
                 return
 

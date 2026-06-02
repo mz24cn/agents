@@ -17,6 +17,7 @@ import asyncio
 import json
 import os
 import signal
+import subprocess
 import threading
 import time
 import urllib.request
@@ -24,6 +25,7 @@ import urllib.error
 from typing import Optional
 
 from runtime.models import ToolConfig
+from runtime.common import kill_process_group
 
 # Default idle timeout in seconds before a stdio process is reaped.
 _DEFAULT_IDLE_TIMEOUT = 300
@@ -163,6 +165,9 @@ class MCPClientManager:
 
         Also captures the ``mcp-session-id`` header from the response and
         stores it on *conn* so subsequent requests include it automatically.
+
+        When the server returns 404 (session not found / expired), the stale
+        session is cleared and the request is retried after re-initialization.
         """
         url = conn["url"]
         headers = dict(conn.get("headers") or {})
@@ -185,6 +190,64 @@ class MCPClientManager:
                     return self._read_sse_stream(resp)
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
+            # 404 with stale session_id means the server restarted or the
+            # session expired.  Clear the stale session and re-initialize,
+            # then retry the original request exactly once.
+            if exc.code == 404 and session_id:
+                import logging
+                logger = logging.getLogger("runtime.mcp_client")
+                logger.info(
+                    "MCP session %s expired (404), re-initializing %s",
+                    session_id[:12], conn.get("server_name", url),
+                )
+                # Use a per-connection lock to prevent multiple threads from
+                # re-initializing simultaneously when they all see 404.
+                reinit_lock = conn.setdefault("_reinit_lock", threading.Lock())
+                with reinit_lock:
+                    # If another thread already re-initialized, session_id will
+                    # have changed — just retry with the new session.
+                    if conn.get("session_id") != session_id:
+                        headers2 = dict(conn.get("headers") or {})
+                        headers2.setdefault("Content-Type", "application/json")
+                        headers2.setdefault("Accept", "application/json, text/event-stream")
+                        new_sid = conn.get("session_id")
+                        if new_sid:
+                            headers2["mcp-session-id"] = new_sid
+                        req2 = urllib.request.Request(url, data=body, headers=headers2, method="POST")
+                        with urllib.request.urlopen(req2, timeout=30) as resp2:
+                            new_session_id2 = resp2.headers.get("mcp-session-id")
+                            if new_session_id2:
+                                conn["session_id"] = new_session_id2
+                            ct2 = resp2.headers.get("Content-Type", "")
+                            if "text/event-stream" in ct2:
+                                return self._read_sse_stream(resp2)
+                            return json.loads(resp2.read().decode("utf-8"))
+                    # We are the first thread to discover the stale session.
+                    conn["session_id"] = None
+                    conn["tools_cache"] = None
+                    try:
+                        self._http_initialize(conn)
+                        # Retry the original request with the fresh session
+                        headers2 = dict(conn.get("headers") or {})
+                        headers2.setdefault("Content-Type", "application/json")
+                        headers2.setdefault("Accept", "application/json, text/event-stream")
+                        new_sid = conn.get("session_id")
+                        if new_sid:
+                            headers2["mcp-session-id"] = new_sid
+                        req2 = urllib.request.Request(url, data=body, headers=headers2, method="POST")
+                        with urllib.request.urlopen(req2, timeout=30) as resp2:
+                            new_session_id2 = resp2.headers.get("mcp-session-id")
+                            if new_session_id2:
+                                conn["session_id"] = new_session_id2
+                            ct2 = resp2.headers.get("Content-Type", "")
+                            if "text/event-stream" in ct2:
+                                return self._read_sse_stream(resp2)
+                            return json.loads(resp2.read().decode("utf-8"))
+                    except Exception as retry_exc:
+                        conn["connected"] = False
+                        raise RuntimeError(
+                            f"MCP re-initialize after 404 failed: {retry_exc}"
+                        ) from retry_exc
             raise RuntimeError(f"MCP HTTP error {exc.code}: {exc.reason}") from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"MCP connection error: {exc.reason}") from exc
@@ -605,21 +668,7 @@ class MCPClientManager:
                 # Kill the entire process group so child processes spawned by
                 # the MCP server (e.g. chrome-devtools-mcp forked by npm exec)
                 # are also terminated and don't become orphans.
-                pid = process.pid
-                try:
-                    os.killpg(os.getpgid(pid), signal.SIGTERM)
-                except (ProcessLookupError, OSError):
-                    process.terminate()
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    try:
-                        os.killpg(os.getpgid(pid), signal.SIGKILL)
-                    except (ProcessLookupError, OSError):
-                        try:
-                            process.kill()
-                        except ProcessLookupError:
-                            pass
+                kill_process_group(process)
             except (ProcessLookupError, OSError):
                 pass
 

@@ -130,7 +130,7 @@
   // 初始化目录树：从根节点逐级展开到工作区路径
   async function initTree(wsPath) {
     treeNodes = []
-    // 1. 加载根节点
+    // 1. 加载根节点（Windows 下可能是多个盘符，Unix 下是 ['/']）
     let roots
     try {
       roots = await workspaceApi.children('')
@@ -140,26 +140,64 @@
     }
     if (!roots || roots.length === 0) return
 
-    // 插入根节点（展开状态）- 根节点的 name 就是路径
-    const rootPath = roots[0].name
-    treeNodes = [{ path: rootPath, name: rootPath, depth: 0, expanded: true, loading: false, isWorkspace: rootPath === wsPath }]
+    // 为所有根节点创建树节点（depth=0）
+    const normalizedWs = wsPath.replace(/\\/g, '/').toLowerCase()
+    for (const root of roots) {
+      const rootPath = root.name
+      const normalizedRoot = rootPath.replace(/\\/g, '/').toLowerCase().replace(/\/$/, '')
+      // 判断工作区是否在该根节点下
+      const isUnderThisRoot = normalizedWs === normalizedRoot || normalizedWs.startsWith(normalizedRoot + '/')
+      treeNodes.push({
+        path: rootPath,
+        name: rootPath,
+        depth: 0,
+        expanded: false,  // 先折叠，后面再展开需要的
+        loading: false,
+        isWorkspace: rootPath === wsPath
+      })
+    }
+
+    // 2. 找到包含工作区路径的根节点，逐级展开
+    const wsRootIdx = treeNodes.findIndex(n => {
+      const normalizedRoot = n.path.replace(/\\/g, '/').toLowerCase().replace(/\/$/, '')
+      return normalizedWs === normalizedRoot || normalizedWs.startsWith(normalizedRoot + '/')
+    })
+
+    if (wsRootIdx === -1) {
+      // 工作区不在任何根下，展开第一个根
+      const firstRoot = treeNodes[0]
+      firstRoot.expanded = true
+      try {
+        const children = await workspaceApi.children(firstRoot.path)
+        insertChildren(0, firstRoot.path, children, wsPath)
+      } catch {}
+      treeNodes = [...treeNodes]
+      return
+    }
+
+    // 展开工作区所在的根节点
+    const wsRoot = treeNodes[wsRootIdx]
+    wsRoot.expanded = true
 
     // 加载根的子目录
     let children
     try {
-      children = await workspaceApi.children(rootPath)
+      children = await workspaceApi.children(wsRoot.path)
     } catch {
+      treeNodes = [...treeNodes]
       return
     }
-    insertChildren(0, rootPath, children, wsPath)
+    insertChildren(wsRootIdx, wsRoot.path, children, wsPath)
 
-    // 2. 从根到工作区的路径段，逐级展开
-    const normalizedWs = wsPath.replace(/\\/g, '/')
-    const normalizedRoot = rootPath.replace(/\\/g, '/').replace(/\/$/, '')
-    const relative = normalizedWs.startsWith(normalizedRoot) ? normalizedWs.slice(normalizedRoot.length) : normalizedWs
+    // 从根到工作区的路径段，逐级展开
+    const normalizedRootPath = wsRoot.path.replace(/\\/g, '/').replace(/\/$/, '')
+    const relative = normalizedWs.startsWith(normalizedRootPath.toLowerCase())
+      ? wsPath.replace(/\\/g, '/').slice(normalizedRootPath.length)
+      : wsPath.replace(/\\/g, '/')
     const segments = relative.split('/').filter(Boolean)
 
-    let parentPath = rootPath
+    let parentPath = wsRoot.path
+    let parentIdx = wsRootIdx
     for (let i = 0; i < segments.length; i++) {
       const seg = segments[i]
       const segPath = childPath(parentPath, seg)
@@ -179,6 +217,7 @@
         break
       }
       parentPath = segPath
+      parentIdx = nodeIdx
     }
 
     treeNodes = [...treeNodes] // 触发响应式

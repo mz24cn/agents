@@ -16,6 +16,9 @@ import hashlib
 import json
 import os
 import re
+import signal
+import subprocess
+import sys
 import tempfile
 import threading
 import urllib.request
@@ -635,3 +638,41 @@ def search_files(
         return set()
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Process management utilities
+# ---------------------------------------------------------------------------
+
+
+def kill_process_group(proc: subprocess.Popen) -> None:
+    """Kill entire process group/tree.
+    
+    On Unix: sends SIGKILL to the process group.
+    On Windows: uses taskkill /T /F to kill the process tree.
+    Falls back to proc.kill() if group kill fails.
+    
+    Args:
+        proc: The subprocess.Popen object to kill.
+    """
+    if sys.platform == "win32":
+        # Windows: use taskkill to kill process tree
+        try:
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            return
+        except (subprocess.SubprocessError, OSError):
+            pass
+    else:
+        # Unix: send SIGKILL to process group
+        if hasattr(signal, "SIGKILL"):
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                return
+            except (ProcessLookupError, OSError):
+                pass
+    proc.kill()

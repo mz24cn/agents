@@ -1,7 +1,7 @@
 <script>
   import { router, getQueryParam } from '../../lib/router.svelte.js'
   import { t } from '../../lib/i18n.svelte.js'
-  import { catalog, loadPromptTemplates } from '../../lib/catalog-state.svelte.js'
+  import { catalog, loadPromptTemplates, refreshModels, refreshTools, refreshPromptTemplates, refreshAgents, refreshEnvVars } from '../../lib/catalog-state.svelte.js'
   import ModelsPage from '../models/ModelsPage.svelte'
   import ToolsPage from '../tools/ToolsPage.svelte'
   import PromptsPage from '../prompts/PromptsPage.svelte'
@@ -17,6 +17,7 @@
   const initialTab = validTabs.includes(getQueryParam('tab')) ? getQueryParam('tab') : 'agents'
   let activeTab = $state(initialTab)
   let envDetectTrigger = $state(0)
+  let refreshing = $state(false)
 
   let editingModel = $state(null)
   let editingTool = $state(null)
@@ -99,6 +100,29 @@
 
   function handleTabClick(id) {
     activeTab = id
+  }
+
+  function getBaseCategory(tab) {
+    if (tab.startsWith('model')) return 'models'
+    if (tab.startsWith('tool')) return 'tools'
+    if (tab.startsWith('prompt')) return 'prompts'
+    if (tab.startsWith('agent')) return 'agents'
+    if (tab.startsWith('env')) return 'env'
+    return tab
+  }
+
+  async function handleRefresh() {
+    if (refreshing) return
+    refreshing = true
+    const category = getBaseCategory(activeTab)
+    try {
+      if (category === 'models') await refreshModels()
+      else if (category === 'tools') await refreshTools()
+      else if (category === 'prompts') await refreshPromptTemplates()
+      else if (category === 'agents') await refreshAgents()
+      else if (category === 'env') await refreshEnvVars()
+    } catch { /* errors are shown in each page */ }
+    refreshing = false
   }
 
   function handleModelFormSuccess() {
@@ -204,6 +228,14 @@
           {/each}
         </div>
       {/each}
+      <button
+        class="refresh-btn"
+        onclick={handleRefresh}
+        disabled={refreshing}
+        title={t('refreshCurrentTab')}
+      >
+        {refreshing ? '⏳' : '🔄'}
+      </button>
     </div>
   </div>
 
@@ -310,6 +342,29 @@
   .tab-btn.active {
     background: var(--primary);
     color: #fff;
+  }
+  .refresh-btn {
+    margin-left: auto;
+    padding: 8px 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    font-size: 1rem;
+    cursor: pointer;
+    transition: all 0.15s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .refresh-btn:hover:not(:disabled) {
+    background: var(--primary);
+    color: #fff;
+    border-color: var(--primary);
+  }
+  .refresh-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
   .tab-group:has(.tab-btn.active) {
     border-color: var(--primary);

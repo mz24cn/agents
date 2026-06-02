@@ -195,7 +195,7 @@ JSON
 ```bash
 curl -fsS -X POST "$SERVER_URL/v1/tools/call" \
   -H 'Content-Type: application/json' \
-  -d '{"tool_id":"function-echo","arguments":{"text":"hello"}}' \
+  -d '{"tool_id":"function-echo","arguments":{"text":"hello","format":"json"}}' \
   | python -m json.tool
 ```
 

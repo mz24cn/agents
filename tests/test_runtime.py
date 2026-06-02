@@ -319,6 +319,40 @@ def _make_openai_function_call_response(tool_name: str, arguments: str = "{}") -
     }).encode("utf-8")
 
 
+def test_max_infer_per_minute_throttle_sleeps_after_ten_rounds() -> None:
+    """MAX_INFER_PER_MINUTE is enforced dynamically once 10 tool rounds complete."""
+    runtime = Runtime(model_registry=ModelRegistry(), tool_registry=ToolRegistry())
+    current_time = [101.0]
+    sleep_calls: list[float] = []
+
+    def fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        current_time[0] += seconds
+
+    with patch.dict("os.environ", {"MAX_INFER_PER_MINUTE": "120"}, clear=False), \
+         patch("runtime.runtime.time.monotonic", side_effect=lambda: current_time[0]), \
+         patch("runtime.runtime.time.sleep", side_effect=fake_sleep):
+        should_continue = runtime._maybe_throttle_inference_loop(loop_start=100.0, infer_round=10)
+
+    assert should_continue is True
+    assert sleep_calls
+    # 120/minute => at least 0.5s average. At round 10 target elapsed is 5s;
+    # with only 1s elapsed initially, the helper should sleep about 4s total.
+    assert abs(sum(sleep_calls) - 4.0) < 1e-6
+
+
+def test_max_infer_per_minute_throttle_ignored_before_ten_rounds() -> None:
+    """The rate limiter must not affect short inference loops (< 10 rounds)."""
+    runtime = Runtime(model_registry=ModelRegistry(), tool_registry=ToolRegistry())
+
+    with patch.dict("os.environ", {"MAX_INFER_PER_MINUTE": "1"}, clear=False), \
+         patch("runtime.runtime.time.sleep") as sleep_mock:
+        should_continue = runtime._maybe_throttle_inference_loop(loop_start=100.0, infer_round=9)
+
+    assert should_continue is True
+    sleep_mock.assert_not_called()
+
+
 @given(max_rounds=st.integers(min_value=1, max_value=10))
 @settings(max_examples=100)
 def test_tool_call_loop_terminates_at_max_rounds(max_rounds: int) -> None:

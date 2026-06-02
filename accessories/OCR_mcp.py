@@ -361,7 +361,7 @@ def create_mcp_server(host: str = "0.0.0.0", port: int = 8000) -> FastMCP:
             return json.dumps({"success": False, "message": error_msg}, ensure_ascii=False)
 
     @server.tool()
-    def find(base64_big_img: str, base64_small_img: str) -> str:
+    def find_image(base64_big_img: str, base64_small_img: str) -> str:
         """
         在大图中查找小图的位置，使用模板匹配算法。
 
@@ -370,7 +370,7 @@ def create_mcp_server(host: str = "0.0.0.0", port: int = 8000) -> FastMCP:
             base64_small_img: base64 编码的要查找的小图内容。可提供本地文件路径，底层会自动读取并编码。
 
         Returns:
-            JSON 格式的结果，包含小图位置 [x, y, w, h] 和匹配置信度 score
+            JSON 格式的结果，包含小图坐标区间 x_range, y_range 和匹配置信度 score
         """
         try:
             big_binary = base64.b64decode(base64_big_img)
