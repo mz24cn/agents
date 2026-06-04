@@ -2148,6 +2148,9 @@ def _execute_command(command: str, timeout: Optional[int] = None, background: bo
         })
 
     # Truncate combined output to output_line_limit lines
+    # Handle case where communicate() returns None (e.g., on Windows after taskkill)
+    stdout = stdout or ""
+    stderr = stderr or ""
     stdout_lines = stdout.splitlines(keepends=True)
     stderr_lines = stderr.splitlines(keepends=True)
     
@@ -2184,6 +2187,10 @@ def _execute_command(command: str, timeout: Optional[int] = None, background: bo
         stderr = "".join(stderr_lines)
         # Append truncation notice to stdout
         stdout += f"\n[...output truncated: {omitted_lines} lines omitted...]"
+    else:
+        # Reassemble lines even when not truncated, so line-length truncation takes effect
+        stdout = "".join(stdout_lines)
+        stderr = "".join(stderr_lines)
 
     response: dict = {
         "exit_code": proc.returncode,

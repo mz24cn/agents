@@ -331,7 +331,17 @@ function uploadChunkWithProgress(uploadId, chunk, blob, onProgress) {
 
 /** 工作区文件管理 API */
 export const workspace = {
-  list:     (path, page = 1, pageSize = 50, restrict = true) => request('GET', `/v1/workspace/list?path=${encodeURIComponent(path)}&page=${page}&page_size=${pageSize}&restrict=${restrict ? 1 : 0}`),
+  list:     (path, page = 1, pageSize = 50, restrict = true, { sort = 'name', nameFilter = '' } = {}) => {
+    const params = new URLSearchParams({
+      path,
+      page: String(page),
+      page_size: String(pageSize),
+      restrict: restrict ? '1' : '0',
+      sort,
+    })
+    if (nameFilter) params.set('name_filter', nameFilter)
+    return request('GET', `/v1/workspace/list?${params.toString()}`)
+  },
   tree:     (path) => request('GET', `/v1/workspace/tree?path=${encodeURIComponent(path)}`),
   children: (path) => request('GET', `/v1/workspace/children?path=${encodeURIComponent(path)}`),
   search:   (path, query) => request('GET', `/v1/workspace/search?path=${encodeURIComponent(path)}&query=${encodeURIComponent(query)}`),

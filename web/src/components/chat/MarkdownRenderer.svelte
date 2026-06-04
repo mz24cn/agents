@@ -114,6 +114,7 @@
     void html
     if (!markdownContainer) return
     Promise.resolve().then(() => {
+      if (!markdownContainer) return
       const buttons = markdownContainer.querySelectorAll('[data-copy-btn]')
       buttons.forEach((btn) => {
         if (btn.dataset.copyBound) return

@@ -661,13 +661,22 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             page = int(params.get('page', ['1'])[0])
             page_size = int(params.get('page_size', ['50'])[0])
             restrict = params.get('restrict', ['1'])[0] != '0'
+            sort = params.get('sort', ['name'])[0]
+            name_filter = params.get('name_filter', [''])[0]
             
             if not path:
                 self._send_json_error(400, "Missing 'path' parameter")
                 return
             
             workspace_mgr = self._get_workspace_manager()
-            result = workspace_mgr.list_files(path, page, page_size, restrict_workspace=restrict)
+            result = workspace_mgr.list_files(
+                path,
+                page,
+                page_size,
+                restrict_workspace=restrict,
+                sort=sort,
+                name_filter=name_filter,
+            )
             self._send_json_response(200, result)
         except ValueError as e:
             self._send_json_error(400, str(e))
@@ -1441,7 +1450,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             if parsed is not None:
                 self._send_json_response(200, parsed)
             else:
-                self._send_json_error(400, {"error": "Result is not valid JSON and no embedded JSON could be extracted"})
+                self._send_json_error(400, f"Result is not valid JSON: {result}")
                 return
         else:
             body = result.encode("utf-8")

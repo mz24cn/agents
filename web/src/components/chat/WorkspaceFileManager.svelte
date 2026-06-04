@@ -23,6 +23,26 @@
     onClose
   } = $props()
 
+  const SORT_TIME_DESC_STORAGE_KEY = 'workspace_file_manager_sort_time_desc'
+  const NAME_FILTER_STORAGE_KEY = 'workspace_file_manager_name_filter'
+
+  function readLocalStorage(key, fallback = '') {
+    try {
+      if (typeof localStorage === 'undefined') return fallback
+      return localStorage.getItem(key) ?? fallback
+    } catch {
+      return fallback
+    }
+  }
+
+  function writeLocalStorage(key, value) {
+    try {
+      if (typeof localStorage !== 'undefined') {
+        localStorage.setItem(key, value)
+      }
+    } catch {}
+  }
+
   // 视图模式：list（列表）/ grid（网格大图）/ preview（满幅预览）
   let viewMode = $state('list')
   // 当前目录路径
@@ -41,9 +61,13 @@
   let searchQuery = $state('')
   let searchResults = $state([])
   let searchInputEl = $state(null)
+  let nameFilterQuery = $state(readLocalStorage(NAME_FILTER_STORAGE_KEY, ''))
+  let sortByTimeDesc = $state(readLocalStorage(SORT_TIME_DESC_STORAGE_KEY, '0') === '1')
+  let nameFilterTimer = null
   // 预览相关
   let previewFile = $state(null)
   let previewContent = $state('')
+  let previewReturnView = $state('list')
   // 选中的文件
   let selectedFiles = $state(new Set())
   // 右键菜单
@@ -79,6 +103,52 @@
     return !!file && !file.is_dir && isInsideWorkspacePath(file.path)
   }
 
+  function getSortMode() {
+    return sortByTimeDesc ? 'recent' : 'name'
+  }
+
+  function topLevelNameUnderCurrentPath(filePath, fallbackName = '') {
+    const normalizedFilePath = normalizePathForCompare(filePath)
+    const normalizedCurrentPath = normalizePathForCompare(currentPath)
+    if (normalizedCurrentPath && normalizedFilePath.startsWith(normalizedCurrentPath + '/')) {
+      return normalizedFilePath.slice(normalizedCurrentPath.length + 1).split('/')[0] || fallbackName
+    }
+    if (!normalizedCurrentPath && normalizedFilePath.startsWith('/')) {
+      return normalizedFilePath.slice(1).split('/')[0] || fallbackName
+    }
+    return fallbackName
+  }
+
+  function matchesNameFilter(file, isSearchList) {
+    const filterText = nameFilterQuery.trim().toLowerCase()
+    if (!filterText) return true
+    const nameToCheck = isSearchList
+      ? topLevelNameUnderCurrentPath(file.path, file.name)
+      : file.name
+    return (nameToCheck || '').toLowerCase().includes(filterText)
+  }
+
+  function filterAndSortFiles(fileList, isSearchList = false) {
+    let result = Array.isArray(fileList) ? [...fileList] : []
+    result = result.filter((file) => matchesNameFilter(file, isSearchList))
+
+    if (sortByTimeDesc) {
+      result.sort((a, b) => {
+        const timeDiff = (b.modified || 0) - (a.modified || 0)
+        if (timeDiff !== 0) return timeDiff
+        return (a.name || '').localeCompare(b.name || '', undefined, { sensitivity: 'base' })
+      })
+    } else {
+      result.sort((a, b) => {
+        if (!!a.is_dir !== !!b.is_dir) return a.is_dir ? -1 : 1
+        return (a.name || '').localeCompare(b.name || '', undefined, { sensitivity: 'base' })
+      })
+    }
+    return result
+  }
+
+  let displayedFiles = $derived(filterAndSortFiles(searchMode ? searchResults : files, searchMode))
+
   // 当前目录是否在工作区内
   let isCurrentPathInWorkspace = $derived(isInsideWorkspacePath(currentPath))
 
@@ -105,7 +175,10 @@
     loading = true
     error = ''
     try {
-      const data = await workspaceApi.list(dirPath, page, pageSize, false)
+      const data = await workspaceApi.list(dirPath, page, pageSize, false, {
+        sort: getSortMode(),
+        nameFilter: nameFilterQuery.trim(),
+      })
       
       if (append) {
         files = [...files, ...data.files]
@@ -308,6 +381,40 @@
     treeNodes = []
   }
 
+  function reloadCurrentDirectory() {
+    if (!currentPath) return
+    page = 1
+    hasMore = true
+    loadFiles(currentPath)
+  }
+
+  function handleNameFilterInput(e) {
+    nameFilterQuery = e.currentTarget.value
+    writeLocalStorage(NAME_FILTER_STORAGE_KEY, nameFilterQuery)
+    if (nameFilterTimer) clearTimeout(nameFilterTimer)
+    nameFilterTimer = setTimeout(() => {
+      reloadCurrentDirectory()
+    }, 200)
+  }
+
+  function handleNameFilterKeydown(e) {
+    if (e.key === 'Enter') {
+      if (nameFilterTimer) clearTimeout(nameFilterTimer)
+      reloadCurrentDirectory()
+    } else if (e.key === 'Escape') {
+      nameFilterQuery = ''
+      writeLocalStorage(NAME_FILTER_STORAGE_KEY, '')
+      if (nameFilterTimer) clearTimeout(nameFilterTimer)
+      reloadCurrentDirectory()
+    }
+  }
+
+  function toggleTimeSort() {
+    sortByTimeDesc = !sortByTimeDesc
+    writeLocalStorage(SORT_TIME_DESC_STORAGE_KEY, sortByTimeDesc ? '1' : '0')
+    reloadCurrentDirectory()
+  }
+
   // 搜索文件
   async function handleSearch() {
     if (!searchQuery.trim()) {
@@ -354,6 +461,7 @@
 
   // 进入目录
   function enterDirectory(dirPath) {
+    closePreview()
     currentPath = dirPath
     page = 1
     hasMore = true
@@ -373,8 +481,10 @@
       return // 不支持预览的文件类型
     }
     
+    previewReturnView = viewMode
     previewFile = file
     viewMode = 'preview'
+    previewContent = ''
     
     if (file.is_text) {
       try {
@@ -385,6 +495,12 @@
         error = err.message
       }
     }
+  }
+
+  function closePreview() {
+    viewMode = previewReturnView
+    previewFile = null
+    previewContent = ''
   }
 
   // 渲染预览 HTML
@@ -435,7 +551,7 @@
 
   // 确认选择文件到输入框
   function confirmSelectFiles() {
-    const selected = (searchMode ? searchResults : files)
+    const selected = displayedFiles
       .filter(f => selectedFiles.has(f.path) && isSelectableFile(f))
       .map(f => ({ ...f, relative_path: relativeWorkspacePath(f.path) }))
     if (selected.length === 0) return
@@ -798,7 +914,7 @@
   // 滚动到底部加载更多
   function handleScroll(e) {
     const { scrollTop, scrollHeight, clientHeight } = e.target
-    if (scrollHeight - scrollTop - clientHeight < 50 && hasMore && !loading) {
+    if (!searchMode && scrollHeight - scrollTop - clientHeight < 50 && hasMore && !loading) {
       page++
       loadFiles(currentPath, true)
     }
@@ -864,7 +980,16 @@
       </div>
       
       <div class="header-actions">
-        <!-- 搜索（内联输入框 + 按钮，类似 Sidebar） -->
+        <!-- 文件名过滤器 + 内容搜索 -->
+        <input
+          class="inline-search-input filename-filter-input"
+          type="text"
+          bind:value={nameFilterQuery}
+          oninput={handleNameFilterInput}
+          onkeydown={handleNameFilterKeydown}
+          placeholder={t('filterFileNames')}
+          title={t('filterFileNames')}
+        />
         {#if searchOpen}
           <input
             class="inline-search-input"
@@ -877,6 +1002,9 @@
         {/if}
         <button class="header-btn" class:active={searchOpen} onclick={toggleSearch} title={t('search')}>
           🔍
+        </button>
+        <button class="header-btn" class:active={sortByTimeDesc} onclick={toggleTimeSort} title={t('sortByTimeDesc')}>
+          🕒
         </button>
         
         <!-- 视图切换 -->
@@ -972,7 +1100,7 @@
 
             <!-- 文件列表视图 -->
             {#if viewMode === 'list'}
-              {#each (searchMode ? searchResults : files) as file (file.path)}
+              {#each displayedFiles as file (file.path)}
                 <button 
                   class="file-item"
                   class:selected={selectedFiles.has(file.path)}
@@ -990,9 +1118,9 @@
               {/each}
             
             <!-- 网格视图 -->
-            {:else}
+            {:else if viewMode === 'grid' && !previewFile}
               <div class="grid-container">
-                {#each (searchMode ? searchResults : files) as file (file.path)}
+                {#each displayedFiles as file (file.path)}
                   <button 
                     class="grid-item"
                     class:selected={selectedFiles.has(file.path)}
@@ -1063,11 +1191,11 @@
     </div>
 
     <!-- 预览模式 -->
-    {#if viewMode === 'preview' && previewFile}
+    {#if previewFile}
       <div class="preview-overlay">
         <div class="preview-header">
           <span>{previewFile.name}</span>
-          <button onclick={() => { viewMode = 'list'; previewFile = null }}>✕</button>
+          <button onclick={() => closePreview()}>✕</button>
         </div>
         <div class="preview-content">
         {#if previewFile.is_image}
@@ -1151,6 +1279,7 @@
     display: flex;
     align-items: center;
     gap: 8px;
+    min-width: 0;
   }
 
   .header-icon {
@@ -1166,12 +1295,16 @@
     font-size: 0.8rem;
     color: var(--text-secondary);
     font-family: monospace;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .header-actions {
     display: flex;
     align-items: center;
     gap: 4px;
+    flex-shrink: 0;
   }
 
   .header-btn {
@@ -1257,6 +1390,10 @@
 
   .inline-search-input:focus {
     border-color: var(--primary);
+  }
+
+  .filename-filter-input {
+    width: 150px;
   }
 
   .upload-queue {

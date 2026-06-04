@@ -742,7 +742,8 @@
     color: var(--text);
   }
   .session-item.active {
-    font-weight: 700;
+    text-decoration: underline;
+    text-underline-offset: 3px;
   }
   /* Session Status Stream indicator styles */
   .session-item.status-streaming {

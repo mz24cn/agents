@@ -130,7 +130,15 @@ class WorkspaceManager:
         if not os.path.isdir(self.workspace_path):
             raise ValueError(f"Workspace path does not exist: {workspace_path}")
     
-    def list_files(self, path: str, page: int = 1, page_size: int = 50, restrict_workspace: bool = True) -> Dict[str, Any]:
+    def list_files(
+        self,
+        path: str,
+        page: int = 1,
+        page_size: int = 50,
+        restrict_workspace: bool = True,
+        sort: str = "name",
+        name_filter: str = "",
+    ) -> Dict[str, Any]:
         """List files and directories in the given path.
         
         Args:
@@ -138,6 +146,10 @@ class WorkspaceManager:
             page: Page number (1-based)
             page_size: Number of items per page
             restrict_workspace: If True, restrict to workspace path
+            sort: Sort mode. ``"name"`` sorts alphabetically (directories first),
+                ``"recent"`` sorts by modification time descending.
+            name_filter: Case-insensitive substring filter applied to item names in
+                this directory before pagination.
             
         Returns:
             Dictionary with 'files' list and 'has_more' boolean
@@ -186,8 +198,16 @@ class WorkspaceManager:
                     # Skip items we can't access
                     continue
             
-            # Sort: directories first, then by name
-            items.sort(key=lambda x: (not x['is_dir'], x['name'].lower()))
+            filter_text = (name_filter or '').strip().lower()
+            if filter_text:
+                items = [item for item in items if filter_text in item['name'].lower()]
+
+            if sort == 'recent':
+                # Newest first across files and directories; use name as a stable tie-breaker.
+                items.sort(key=lambda x: (-(x.get('modified') or 0), x['name'].lower()))
+            else:
+                # Default: directories first, then alphabetical by name.
+                items.sort(key=lambda x: (not x['is_dir'], x['name'].lower()))
             
             # Apply pagination
             start_idx = (page - 1) * page_size

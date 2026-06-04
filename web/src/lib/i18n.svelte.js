@@ -172,7 +172,9 @@ const translations = {
     // WorkspaceFileManager
     workspaceFileManager: '工作区文件管理器',
     search: '搜索',
-    searchFiles: '搜索文件...',
+    searchFiles: '搜索文件内容...',
+    filterFileNames: '过滤文件名...',
+    sortByTimeDesc: '按时间倒序',
     listView: '列表视图',
     gridView: '网格视图',
     uploadFile: '上传文件',
@@ -538,7 +540,9 @@ const translations = {
     // WorkspaceFileManager
     workspaceFileManager: 'Workspace File Manager',
     search: 'Search',
-    searchFiles: 'Search files...',
+    searchFiles: 'Search file contents...',
+    filterFileNames: 'Filter file names...',
+    sortByTimeDesc: 'Sort by time descending',
     listView: 'List View',
     gridView: 'Grid View',
     uploadFile: 'Upload File',

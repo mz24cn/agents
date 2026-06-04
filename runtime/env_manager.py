@@ -375,7 +375,7 @@ class EnvManager:
         return """#!/bin/sh
 set -eu
 
-: "${AGENT_SERVICE_HOME:=$PWD/agents}"
+AGENT_SERVICE_HOME="$PWD/agents"
 : "${AGENTS_RUNTIME_DIR:=$HOME/.agents_runtime}"
 : "${AGENT_SERVICE_PORT:=7988}"
 : "${START_AGENT_SERVICE:=background}"
@@ -438,8 +438,9 @@ case "$START_AGENT_SERVICE" in
     ;;
 esac
 
+AGENT_SERVICE_HOME="$(cd "$(dirname "$0")" && pwd)"
 AGENT_SERVICE_LOG="$AGENTS_RUNTIME_DIR/server.log"
-export AGENT_SERVICE_LOG
+export AGENT_SERVICE_HOME AGENT_SERVICE_LOG
 
 echo "Agent service installed:" >&2
 echo "  app:    $AGENT_SERVICE_HOME" >&2
@@ -465,7 +466,7 @@ exit 0
     def _render_setup_script_ps1(self, encoded_payload: str) -> str:
         return """$ErrorActionPreference = 'Stop'
 
-if (-not $env:AGENT_SERVICE_HOME) { $env:AGENT_SERVICE_HOME = Join-Path (Get-Location) 'agents' }
+$env:AGENT_SERVICE_HOME = Join-Path $PWD 'agents'
 if (-not $env:AGENTS_RUNTIME_DIR) { $env:AGENTS_RUNTIME_DIR = Join-Path $HOME '.agents_runtime' }
 if (-not $env:AGENT_SERVICE_PORT) { $env:AGENT_SERVICE_PORT = '7988' }
 if (-not $env:START_AGENT_SERVICE) { $env:START_AGENT_SERVICE = 'background' }
@@ -506,14 +507,15 @@ if (-not $env:AGENTS_RUNTIME_DIR) { $env:AGENTS_RUNTIME_DIR = Join-Path $HOME '.
 if (-not $env:AGENT_SERVICE_LOG) { $env:AGENT_SERVICE_LOG = Join-Path $env:AGENTS_RUNTIME_DIR 'server.log' }
 if (-not $env:START_AGENT_SERVICE) { $env:START_AGENT_SERVICE = 'background' }
 New-Item -ItemType Directory -Force -Path $env:AGENTS_RUNTIME_DIR | Out-Null
-Set-Location -LiteralPath $PSScriptRoot
+$currentDir = if ($PSScriptRoot) { $PSScriptRoot } else { $env:AGENT_SERVICE_HOME }
+Set-Location -LiteralPath $currentDir
 
 switch ($env:START_AGENT_SERVICE) {
     'background' {
         $errLog = Join-Path (Split-Path -Parent $env:AGENT_SERVICE_LOG) 'server.err.log'
         $pidPath = Join-Path $env:AGENTS_RUNTIME_DIR 'server.pid'
         Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue
-        $appDir = $PSScriptRoot.Replace("'", "''")
+        $appDir = $currentDir.Replace("'", "''")
         $outLog = $env:AGENT_SERVICE_LOG.Replace("'", "''")
         $errorLog = $errLog.Replace("'", "''")
         $runner = @"
@@ -541,7 +543,7 @@ try {
 }
 "@
         $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($runner))
-        $p = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded) -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -PassThru
+        $p = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded) -WorkingDirectory $currentDir -WindowStyle Hidden -PassThru
         Start-Sleep -Seconds 2
         $p.Refresh()
         if ($p.HasExited) {
@@ -602,7 +604,7 @@ Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue
     $agentServiceErrLog = Join-Path $env:AGENTS_RUNTIME_DIR 'server.err.log'
 
     Write-Host "Agent service installed:"
-    Write-Host "  app:    $($env:AGENT_SERVICE_HOME)"
+    Write-Host "  app:    $(Join-Path $PWD 'agents')"
     Write-Host "  config: $($env:AGENTS_RUNTIME_DIR)"
     Write-Host "  log:    $($env:AGENT_SERVICE_LOG)"
     Write-Host "  errlog: $agentServiceErrLog"
@@ -618,7 +620,7 @@ Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue
             }
             catch {
                 Write-Warning "Agent service was installed, but automatic start failed: $($_.Exception.Message)"
-                Write-Warning "You can start it manually: cd '$($env:AGENT_SERVICE_HOME)'; python app.py '0.0.0.0:$($env:AGENT_SERVICE_PORT)'"
+                Write-Warning "You can start it manually: cd '$(Join-Path $PWD 'agents')'; python app.py '0.0.0.0:$($env:AGENT_SERVICE_PORT)'"
                 Write-Warning "Or run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File '$startScript'"
             }
         }
@@ -628,7 +630,7 @@ Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue
             }
             catch {
                 Write-Warning "Agent service was installed, but automatic start failed: $($_.Exception.Message)"
-                Write-Warning "You can start it manually: cd '$($env:AGENT_SERVICE_HOME)'; python app.py '0.0.0.0:$($env:AGENT_SERVICE_PORT)'"
+                Write-Warning "You can start it manually: cd '$(Join-Path $PWD 'agents')'; python app.py '0.0.0.0:$($env:AGENT_SERVICE_PORT)'"
                 Write-Warning "Or run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File '$startScript'"
             }
         }
