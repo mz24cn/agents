@@ -1,6 +1,7 @@
 <script>
   import { router, getQueryParam } from '../../lib/router.svelte.js'
-  import { t } from '../../lib/i18n.svelte.js'
+  import ThemeToggle from '../ThemeToggle.svelte'
+  import { t, i18n, setLang } from '../../lib/i18n.svelte.js'
   import { catalog, loadPromptTemplates, refreshModels, refreshTools, refreshPromptTemplates, refreshAgents, refreshEnvVars } from '../../lib/catalog-state.svelte.js'
   import ModelsPage from '../models/ModelsPage.svelte'
   import ToolsPage from '../tools/ToolsPage.svelte'
@@ -206,36 +207,48 @@
 
 <div class="setup-page">
   <div class="setup-header">
-    <div class="tabs">
-      {#each tabGroups as group}
-        <div class="tab-group">
-          {#each group.items as tab}
-            <button
-              class="tab-btn"
-              class:active={activeTab === tab.id}
-              onclick={() => {
-                if (tab.action === 'detect') {
-                  activeTab = 'env'
-                  envDetectTrigger += 1
-                } else {
-                  handleTabClick(tab.id)
-                }
-              }}
-              title={tab.id.includes('-add') ? t('addNew') : (tab.action === 'detect' ? t('detectEnvVars') : tab.label)}
-            >
-              {tab.action === 'detect' ? tab.label : (tab.id.includes('-add') ? tab.label : tab.icon + ' ' + tab.label)}
-            </button>
-          {/each}
+    <div class="setup-header-row">
+      <div class="tabs">
+        {#each tabGroups as group}
+          <div class="tab-group">
+            {#each group.items as tab}
+              <button
+                class="tab-btn"
+                class:active={activeTab === tab.id}
+                onclick={() => {
+                  if (tab.action === 'detect') {
+                    activeTab = 'env'
+                    envDetectTrigger += 1
+                  } else {
+                    handleTabClick(tab.id)
+                  }
+                }}
+                title={tab.id.includes('-add') ? t('addNew') : (tab.action === 'detect' ? t('detectEnvVars') : tab.label)}
+              >
+                {tab.action === 'detect' ? tab.label : (tab.id.includes('-add') ? tab.label : tab.icon + ' ' + tab.label)}
+              </button>
+            {/each}
+          </div>
+        {/each}
+      </div>
+      <div class="setup-header-actions">
+        <div class="setup-theme-wrap">
+          <ThemeToggle />
         </div>
-      {/each}
-      <button
-        class="refresh-btn"
-        onclick={handleRefresh}
-        disabled={refreshing}
-        title={t('refreshCurrentTab')}
-      >
-        {refreshing ? '⏳' : '🔄'}
-      </button>
+        <button
+          class="setup-lang-btn"
+          onclick={() => setLang(i18n.lang === 'zh' ? 'en' : 'zh')}
+          title={i18n.lang === 'zh' ? 'Switch to English' : '切换为中文'}
+        >{i18n.lang === 'zh' ? '中' : 'En'}</button>
+        <button
+          class="refresh-btn"
+          onclick={handleRefresh}
+          disabled={refreshing}
+          title={t('refreshCurrentTab')}
+        >
+          {refreshing ? '⏳' : '🔄'}
+        </button>
+      </div>
     </div>
   </div>
 
@@ -303,10 +316,61 @@
     padding: 12px 16px;
     flex-shrink: 0;
   }
+  .setup-header-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+  }
   .tabs {
     display: flex;
     flex-wrap: wrap;
     gap: 8px;
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .setup-header-actions {
+    margin-left: auto;
+    display: flex;
+    align-items: stretch;
+    justify-content: flex-end;
+    gap: 8px;
+    flex: 0 0 auto;
+  }
+  .setup-theme-wrap {
+    width: 38px;
+    height: 36px;
+    display: flex;
+  }
+  .setup-theme-wrap :global(.theme-toggle) {
+    flex: 1;
+    width: 100%;
+    height: 100%;
+    padding: 0;
+    box-sizing: border-box;
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+  }
+  .setup-theme-wrap :global(.theme-toggle:hover) {
+    background: var(--border);
+    color: var(--text);
+  }
+  .setup-lang-btn {
+    width: 38px;
+    height: 36px;
+    padding: 0;
+    box-sizing: border-box;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    font-size: 0.88rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .setup-lang-btn:hover {
+    background: var(--border);
+    color: var(--text);
   }
   .tab-group {
     display: flex;
@@ -344,8 +408,10 @@
     color: #fff;
   }
   .refresh-btn {
-    margin-left: auto;
-    padding: 8px 12px;
+    width: 38px;
+    height: 36px;
+    padding: 0;
+    box-sizing: border-box;
     border: 1px solid var(--border);
     border-radius: 6px;
     background: var(--bg-secondary);

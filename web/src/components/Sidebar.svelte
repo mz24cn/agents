@@ -1,21 +1,25 @@
 <script>
   import { onMount, onDestroy, tick } from 'svelte'
   import { router, navigate } from '../lib/router.svelte.js'
-  import ThemeToggle from './ThemeToggle.svelte'
-  import { t, i18n, setLang } from '../lib/i18n.svelte.js'
+  import { t } from '../lib/i18n.svelte.js'
   import { sessions, subscribeSessionEvents } from '../lib/api.js'
   import { sessionRestore, newSessionCreated, sessionDeleted, currentSession, newSessionRequest } from '../lib/session-state.svelte.js'
   import { sidebarWidth, setSidebarWidth, toggleSidebarCollapsed, collapseSidebar, SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH } from '../lib/sidebar-width.svelte.js'
 
+  const SESSION_PAGE_SIZE = 100
+
   let sessionList = $state([])
   let sessionError = $state('')
   let sessionLoading = $state(false)
+  let sessionLoadingMore = $state(false)
+  let sessionPage = $state(1)
+  let sessionHasMore = $state(true)
   let restoreError = $state('')
   let lastClickTime = $state(0)
   let searchOpen = $state(false)
   let searchText = $state('')
   let activeSearchQuery = $state('')
-  let searchInput
+  let searchInput = $state(null)
 
   // 弹出菜单状态
   let menuOpenId = $state(null)   // 当前展开菜单的 session id
@@ -25,9 +29,6 @@
   let isDragging = $state(false)
   let dragStartX = 0        // mousedown 时的 clientX
   let dragStartWidth = 0    // mousedown 时的侧边栏宽度
-  // footer 高度，用于对齐 fixed 按钮
-  let footerEl = $state(null)
-  let footerHeight = $derived(footerEl ? footerEl.offsetHeight : 49)
 
   // --- Session Status Stream ---
   // Maps session_id -> status string from SSE events
@@ -99,18 +100,52 @@
     return ''
   }
 
-  async function loadSessions() {
-    sessionLoading = true
+  function mergeSessionLists(existing, incoming) {
+    const seen = new Set(existing.map(s => s.session_id))
+    const appended = incoming.filter(s => {
+      if (!s?.session_id || seen.has(s.session_id)) return false
+      seen.add(s.session_id)
+      return true
+    })
+    return [...existing, ...appended]
+  }
+
+  async function loadSessions(append = false) {
+    if (append && (!sessionHasMore || sessionLoading || sessionLoadingMore)) return
+
+    const nextPage = append ? sessionPage + 1 : 1
+    if (append) {
+      sessionLoadingMore = true
+    } else {
+      sessionLoading = true
+      sessionPage = 1
+      sessionHasMore = true
+      sessionList = []
+    }
     sessionError = ''
     try {
       const data = activeSearchQuery
-        ? await sessions.search(activeSearchQuery)
-        : await sessions.list()
-      sessionList = data.sessions ?? []
+        ? await sessions.search(activeSearchQuery, nextPage, SESSION_PAGE_SIZE)
+        : await sessions.list(nextPage, SESSION_PAGE_SIZE)
+      const incoming = data.sessions ?? []
+      sessionList = append ? mergeSessionLists(sessionList, incoming) : incoming
+      sessionPage = data.page ?? nextPage
+      sessionHasMore = Boolean(data.has_more)
     } catch (err) {
       sessionError = err.message || t('fetchSessionsFailed')
     } finally {
-      sessionLoading = false
+      if (append) {
+        sessionLoadingMore = false
+      } else {
+        sessionLoading = false
+      }
+    }
+  }
+
+  function handleSessionScroll(e) {
+    const { scrollTop, scrollHeight, clientHeight } = e.target
+    if (scrollHeight - scrollTop - clientHeight < 50) {
+      loadSessions(true)
     }
   }
 
@@ -429,6 +464,14 @@
         title={t('searchSessionsTooltip')}
         aria-label={t('searchSessions')}
       >🔍</button>
+      <a
+        href="#/setup"
+        class="nav-action-btn setup-top-btn"
+        class:active={router.current.split('?')[0] === '#/setup'}
+        onclick={handleSetupClick}
+        title={t('nav_setup')}
+        aria-label={t('nav_setup')}
+      >⚙️</a>
     </div>
     {#if searchOpen}
       <input
@@ -445,10 +488,10 @@
   <!-- 最近会话面板 -->
   <div class="session-panel">
     <div class="session-panel-title">{t('sessionPanelTitle')}</div>
-    <div class="session-list">
-      {#if sessionLoading}
+    <div class="session-list" onscroll={handleSessionScroll}>
+      {#if sessionLoading && sessionList.length === 0}
         <div class="session-loading">{t('loading')}</div>
-      {:else if sessionError}
+      {:else if sessionError && sessionList.length === 0}
         <div class="session-error">{sessionError}</div>
       {:else if sessionList.length === 0}
         <div class="session-empty">{t('noSessions')}</div>
@@ -476,35 +519,24 @@
             >···</button>
           </div>
         {/each}
+        {#if sessionLoadingMore}
+          <div class="session-loading session-loading-more">{t('loading')}</div>
+        {/if}
+        {#if sessionError}
+          <div class="session-error">{sessionError}</div>
+        {/if}
       {/if}
       {#if restoreError}
         <div class="session-error">{restoreError}</div>
       {/if}
     </div>
   </div>
-  <div class="sidebar-footer" bind:this={footerEl}>
-    <div class="footer-theme-wrap">
-      <ThemeToggle />
-    </div>
-    <button
-      class="lang-btn"
-      onclick={() => setLang(i18n.lang === 'zh' ? 'en' : 'zh')}
-      title={i18n.lang === 'zh' ? 'Switch to English' : '切换为中文'}
-    >{i18n.lang === 'zh' ? '中' : 'En'}</button>
-    <a
-      href="#/setup"
-      class="env-btn"
-      class:active={router.current.split('?')[0] === '#/setup'}
-      onclick={handleSetupClick}
-      title={t('nav_setup')}
-    >⚙️</a>
-  </div>
 </aside>
 
-<!-- 统一的收缩/展开按钮，固定在侧边栏右边缘底部 -->
+<!-- 统一的收缩/展开按钮，固定在侧边栏右边缘顶部，与主内容顶栏重叠 -->
 <button
   class="sidebar-toggle-btn"
-  style="left: {sidebarWidth.collapsed ? 0 : sidebarWidth.current}px; height: {footerHeight}px;"
+  style="left: {sidebarWidth.collapsed ? 0 : sidebarWidth.current}px;"
   onclick={handleToggleClick}
   onmousedown={handleDragStart}
   ontouchstart={handleDragStart}
@@ -587,6 +619,10 @@
     margin-left: auto;
     font-size: 0.95rem;
   }
+  .setup-top-btn {
+    text-decoration: none;
+    font-size: 0.95rem;
+  }
   .session-search-input {
     width: 100%;
     box-sizing: border-box;
@@ -602,21 +638,13 @@
     outline: none;
     border-color: var(--primary);
   }
-  .sidebar-footer {
-    padding: 12px 12px;
-    border-top: 1px solid var(--border);
-    display: flex;
-    flex-direction: row;
-    gap: 8px;
-    align-items: stretch;
-    flex-shrink: 0; /* 防止 footer 被挤压，确保始终可见 */
-  }
   .sidebar-toggle-btn {
     position: fixed;
-    bottom: 0;
-    /* left & height 由 style 属性动态设置 */
+    top: 12px;
+    /* left 由 style 属性动态设置 */
     width: fit-content;
     min-width: 0;
+    height: 32px;
     padding: 0 2px;
     background: var(--bg-secondary);
     border: 1px solid var(--border);
@@ -626,7 +654,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    z-index: 50;
+    z-index: 180;
     transition: background-color 0.15s, left 0.2s ease;
   }
   .sidebar-toggle-btn:hover {
@@ -638,59 +666,6 @@
     color: var(--text-secondary);
     display: block;
     pointer-events: none;
-  }
-  .footer-theme-wrap {
-    flex: 1;
-    display: flex;
-  }
-  .footer-theme-wrap :global(.theme-toggle) {
-    flex: 1;
-    width: 100%;
-    padding: 6px 0;
-    font-size: 1rem;
-  }
-  .lang-btn {
-    flex: 1;
-    padding: 6px 0;
-    border-radius: 6px;
-    border: 1px solid var(--border);
-    background: var(--bg);
-    color: var(--text-secondary);
-    font-size: 0.85rem;
-    font-weight: 600;
-    cursor: pointer;
-    transition: background 0.15s, color 0.15s;
-    text-align: center;
-  }
-  .lang-btn:hover {
-    background: var(--border);
-    color: var(--text);
-  }
-  .env-btn {
-    flex: 1;
-    padding: 6px 0;
-    border-radius: 6px;
-    border: 1px solid var(--border);
-    background: var(--bg);
-    color: var(--text-secondary);
-    font-size: 0.85rem;
-    font-weight: 600;
-    cursor: pointer;
-    transition: background 0.15s, color 0.15s;
-    text-align: center;
-    text-decoration: none;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-  .env-btn:hover {
-    background: var(--border);
-    color: var(--text);
-  }
-  .env-btn.active {
-    color: var(--primary);
-    background: var(--bg);
-    border-color: var(--primary);
   }
   .session-panel {
     flex: 1;

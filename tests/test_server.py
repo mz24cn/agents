@@ -1076,10 +1076,16 @@ class TestSessionAPI:
 
         assert status == 200
         assert len(body["sessions"]) == 2
-        assert [s["session_id"] for s in body["sessions"]] == [
-            "260101_000000",
-            "260101_000001",
-        ]
+        assert body["page"] == 1
+        assert body["page_size"] == 2
+        assert body["has_more"] is True
+        first_page_ids = [s["session_id"] for s in body["sessions"]]
+
+        status, body = _get(server_with_env, "/v1/sessions?page=2&page_size=2")
+        assert status == 200
+        second_page_ids = [s["session_id"] for s in body["sessions"]]
+        assert len(second_page_ids) == 2
+        assert set(first_page_ids).isdisjoint(second_page_ids)
 
     def test_search_sessions_respects_search_max_results_after_full_search(self, server_with_env, monkeypatch):
         """GET /v1/sessions/search 在全量搜索命中后再按 SEARCH_MAX_RESULTS 截断。"""
@@ -1100,7 +1106,13 @@ class TestSessionAPI:
 
         assert status == 200
         assert len(body["sessions"]) == 2
-        assert [s["session_id"] for s in body["sessions"]] == [
-            "260101_000000",
-            "260101_000001",
-        ]
+        assert body["page"] == 1
+        assert body["page_size"] == 2
+        assert body["has_more"] is True
+        first_page_ids = [s["session_id"] for s in body["sessions"]]
+
+        status, body = _get(server_with_env, "/v1/sessions/search?q=needle&page=2&page_size=2")
+        assert status == 200
+        second_page_ids = [s["session_id"] for s in body["sessions"]]
+        assert len(second_page_ids) == 2
+        assert set(first_page_ids).isdisjoint(second_page_ids)

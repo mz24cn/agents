@@ -438,7 +438,7 @@ case "$START_AGENT_SERVICE" in
     ;;
 esac
 
-AGENT_SERVICE_HOME="$(cd "$(dirname "$0")" && pwd)"
+
 AGENT_SERVICE_LOG="$AGENTS_RUNTIME_DIR/server.log"
 export AGENT_SERVICE_HOME AGENT_SERVICE_LOG
 

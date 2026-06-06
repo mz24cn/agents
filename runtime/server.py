@@ -2109,43 +2109,69 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 except ValueError:
                     pass
 
-    def _session_search_max_results(self) -> Optional[int]:
-        """Read SEARCH_MAX_RESULTS at request time for session list/search limits.
+    def _session_search_max_results(self) -> int:
+        """Read SEARCH_MAX_RESULTS at request time as the max session page size.
 
-        Empty, missing, invalid, or non-positive values mean "no limit". The value
+        Missing, empty, invalid, or non-positive values fall back to 100. The value
         is intentionally read on every request so changes made through env.json / UI
         take effect without restarting the server.
         """
         raw = os.environ.get("SEARCH_MAX_RESULTS", "").strip()
-        if not raw:
-            return None
         try:
-            limit = int(raw)
+            limit = int(raw) if raw else 100
         except (TypeError, ValueError):
-            return None
-        return limit if limit > 0 else None
+            limit = 100
+        return limit if limit > 0 else 100
 
-    def _limit_session_results(self, sessions: list[dict]) -> list[dict]:
-        """Apply SEARCH_MAX_RESULTS to an already ordered session result list."""
-        limit = self._session_search_max_results()
-        if limit is None:
-            return sessions
-        return sessions[:limit]
+    def _paginate_session_results(self, sessions: list[dict], params: dict) -> dict:
+        """Paginate an already ordered session result list.
+
+        Query parameters:
+          - page: 1-based page number, defaults to 1
+          - page_size: requested page size, capped by SEARCH_MAX_RESULTS
+        """
+        max_page_size = self._session_search_max_results()
+        try:
+            page = int((params.get("page") or ["1"])[0])
+        except (TypeError, ValueError):
+            page = 1
+        try:
+            page_size = int((params.get("page_size") or [str(max_page_size)])[0])
+        except (TypeError, ValueError):
+            page_size = max_page_size
+        page = max(1, page)
+        if page_size <= 0:
+            page_size = max_page_size
+        page_size = min(page_size, max_page_size)
+
+        total = len(sessions)
+        start = (page - 1) * page_size
+        end = start + page_size
+        page_sessions = sessions[start:end]
+        return {
+            "sessions": page_sessions,
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "has_more": end < total,
+        }
 
     def _handle_list_sessions(self) -> None:
-        """GET /v1/sessions — 返回最近会话列表，按 SEARCH_MAX_RESULTS 限制最大条目数。"""
+        """GET /v1/sessions — 分页返回最近会话列表，页大小受 SEARCH_MAX_RESULTS 限制。"""
+        parsed = urllib.parse.urlparse(self.path)
+        params = urllib.parse.parse_qs(parsed.query)
         session_manager = self.server.session_manager  # type: ignore[attr-defined]
-        sessions = self._limit_session_results(session_manager.list_sessions())
-        self._send_json_response(200, {"sessions": sessions})
+        result = self._paginate_session_results(session_manager.list_sessions(), params)
+        self._send_json_response(200, result)
 
     def _handle_search_sessions(self) -> None:
-        """GET /v1/sessions/search?q=... — 全量搜索后按 SEARCH_MAX_RESULTS 限制最大条目数。"""
+        """GET /v1/sessions/search?q=... — 全量搜索后分页返回，页大小受 SEARCH_MAX_RESULTS 限制。"""
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
         query = (params.get("q") or [""])[0]
         session_manager = self.server.session_manager  # type: ignore[attr-defined]
-        sessions = self._limit_session_results(session_manager.search_sessions(query))
-        self._send_json_response(200, {"sessions": sessions})
+        result = self._paginate_session_results(session_manager.search_sessions(query), params)
+        self._send_json_response(200, result)
 
     def _handle_get_session(self, session_id: str) -> None:
         """GET /v1/sessions/{session_id} — 返回指定会话的完整消息记录。

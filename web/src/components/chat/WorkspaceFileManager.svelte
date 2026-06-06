@@ -538,15 +538,44 @@
     link.click()
   }
 
-  // 选择文件
-  function toggleFileSelection(file) {
+  // 记录最后选中的文件，用于 Shift 范围选择
+  let lastSelectedFile = $state(null)
+
+  // 选择文件（符合 Windows 资源管理器习惯）
+  // - 单击：选中当前文件，取消其他
+  // - Ctrl+点击：切换选中状态（添加/移除）
+  // - Shift+点击：范围选择（从上次选中到当前）
+  function handleFileClick(file, event) {
     if (file.is_dir) return
-    if (selectedFiles.has(file.path)) {
-      selectedFiles.delete(file.path)
+    
+    if (event.shiftKey && lastSelectedFile) {
+      // Shift+点击：范围选择
+      const currentFiles = displayedFiles.filter(f => !f.is_dir)
+      const lastIdx = currentFiles.findIndex(f => f.path === lastSelectedFile.path)
+      const currentIdx = currentFiles.findIndex(f => f.path === file.path)
+      if (lastIdx !== -1 && currentIdx !== -1) {
+        const start = Math.min(lastIdx, currentIdx)
+        const end = Math.max(lastIdx, currentIdx)
+        // 保留已有的选中，添加范围内的
+        for (let i = start; i <= end; i++) {
+          selectedFiles.add(currentFiles[i].path)
+        }
+        selectedFiles = new Set(selectedFiles)
+      }
+    } else if (event.ctrlKey || event.metaKey) {
+      // Ctrl+点击（Mac: Cmd+点击）：切换选中状态
+      if (selectedFiles.has(file.path)) {
+        selectedFiles.delete(file.path)
+      } else {
+        selectedFiles.add(file.path)
+      }
+      selectedFiles = new Set(selectedFiles)
+      lastSelectedFile = file
     } else {
-      selectedFiles.add(file.path)
+      // 普通点击：单选
+      selectedFiles = new Set([file.path])
+      lastSelectedFile = file
     }
-    selectedFiles = new Set(selectedFiles) // 触发响应式更新
   }
 
   // 确认选择文件到输入框
@@ -558,6 +587,64 @@
     onSelectFiles?.(selected)
     selectedFiles.clear()
     selectedFiles = new Set(selectedFiles)
+  }
+
+  // 获取当前选中的文件对象列表
+  function getSelectedFiles() {
+    return displayedFiles.filter(f => selectedFiles.has(f.path))
+  }
+
+  // 判断是否有多选
+  function hasMultiSelection() {
+    return selectedFiles.size > 1
+  }
+
+  // 批量下载
+  function downloadSelectedFiles() {
+    const files = getSelectedFiles().filter(f => !f.is_dir)
+    for (const file of files) {
+      const link = document.createElement('a')
+      link.href = workspaceApi.download(file.path, false)
+      link.download = file.name
+      link.click()
+    }
+  }
+
+  // 批量复制绝对路径
+  function copySelectedPaths() {
+    const paths = getSelectedFiles().map(f => f.path)
+    if (paths.length > 0) {
+      navigator.clipboard.writeText(paths.join('\n'))
+    }
+  }
+
+  // 批量创建副本
+  async function duplicateSelectedFiles() {
+    const files = getSelectedFiles().filter(f => !f.is_dir)
+    for (const file of files) {
+      try {
+        await workspaceApi.duplicate(file.path)
+      } catch (err) {
+        error = err.message
+      }
+    }
+    loadFiles(currentPath)
+  }
+
+  // 批量删除
+  async function deleteSelectedFiles() {
+    const files = getSelectedFiles()
+    if (!confirm(t('confirmDeleteFile') + ` (${files.length} ${t('files')})`)) return
+    for (const file of files) {
+      try {
+        await workspaceApi.delete(file.path)
+      } catch (err) {
+        error = err.message
+      }
+    }
+    selectedFiles.clear()
+    selectedFiles = new Set(selectedFiles)
+    loadFiles(currentPath)
   }
 
   // 右键菜单操作
@@ -1106,7 +1193,7 @@
                   class:selected={selectedFiles.has(file.path)}
                   class:directory={file.is_dir}
                   class:outside-workspace={!file.is_dir && !isInsideWorkspacePath(file.path)}
-                  onclick={() => file.is_dir ? enterDirectory(file.path) : toggleFileSelection(file)}
+                  onclick={(e) => file.is_dir ? enterDirectory(file.path) : handleFileClick(file, e)}
                   ondblclick={() => handleDoubleClick(file)}
                   oncontextmenu={(e) => showContextMenu(e, file)}
                 >
@@ -1125,7 +1212,7 @@
                     class="grid-item"
                     class:selected={selectedFiles.has(file.path)}
                     class:outside-workspace={!file.is_dir && !isInsideWorkspacePath(file.path)}
-                    onclick={() => file.is_dir ? enterDirectory(file.path) : toggleFileSelection(file)}
+                    onclick={(e) => file.is_dir ? enterDirectory(file.path) : handleFileClick(file, e)}
                     ondblclick={() => handleDoubleClick(file)}
                     oncontextmenu={(e) => showContextMenu(e, file)}
                   >
@@ -1216,36 +1303,56 @@
 <!-- 右键菜单和背景层：放在组件根级别，避免被 panel 的层叠上下文限制 -->
 {#if contextMenu.visible}
   {@const menuFile = contextMenu.file}
+  {@const isMulti = selectedFiles.size > 1 && selectedFiles.has(menuFile?.path)}
   <div class="context-menu-backdrop" onmousedown={hideContextMenu}></div>
   <div
     class="context-menu"
     style="left: {contextMenu.x}px; top: {contextMenu.y}px"
     onmousedown={(e) => e.stopPropagation()}
   >
+    <!-- 预览：多选时置灰 -->
     {#if menuFile?.is_text || menuFile?.is_image || menuFile?.is_audio || menuFile?.is_video}
-      <button onmousedown={() => { previewFileContent(menuFile); hideContextMenu() }}>
+      <button 
+        disabled={isMulti}
+        onmousedown={() => { if (!isMulti) { previewFileContent(menuFile); hideContextMenu() } }}
+      >
         {t('preview')}
       </button>
     {/if}
-    <button onmousedown={() => { downloadFile(menuFile); hideContextMenu() }}>
-      {t('download')}
+    <!-- 下载：支持多选 -->
+    <button onmousedown={() => { 
+      if (isMulti) { downloadSelectedFiles() } else { downloadFile(menuFile) }
+      hideContextMenu() 
+    }}>
+      {t('download')}{isMulti ? ` (${selectedFiles.size})` : ''}
     </button>
-    <button onmousedown={() => { navigator.clipboard.writeText(menuFile?.path || ''); hideContextMenu() }}>
-      {t('copyPath')}
+    <!-- 复制路径：支持多选 -->
+    <button onmousedown={() => { 
+      if (isMulti) { copySelectedPaths() } else { navigator.clipboard.writeText(menuFile?.path || '') }
+      hideContextMenu() 
+    }}>
+      {t('copyPath')}{isMulti ? ` (${selectedFiles.size})` : ''}
     </button>
-    {#if menuFile && !menuFile.is_dir}
-      <button onmousedown={() => { toggleFileSelection(menuFile); hideContextMenu() }}>
-        {selectedFiles.has(menuFile?.path) ? t('deselect') : t('select')}
-      </button>
-    {/if}
-    <button onmousedown={() => { renameFile(menuFile) }}>
+    <!-- 重命名：多选时置灰 -->
+    <button 
+      disabled={isMulti}
+      onmousedown={() => { if (!isMulti) renameFile(menuFile) }}
+    >
       {t('rename')}
     </button>
-    <button onmousedown={() => { duplicateFile(menuFile) }}>
-      {t('duplicate')}
+    <!-- 创建副本：支持多选 -->
+    <button onmousedown={() => { 
+      if (isMulti) { duplicateSelectedFiles() } else { duplicateFile(menuFile) }
+      hideContextMenu() 
+    }}>
+      {t('duplicate')}{isMulti ? ` (${selectedFiles.size})` : ''}
     </button>
-    <button class="danger" onmousedown={() => { deleteFile(menuFile) }}>
-      {t('delete')}
+    <!-- 删除：支持多选 -->
+    <button class="danger" onmousedown={() => { 
+      if (isMulti) { deleteSelectedFiles() } else { deleteFile(menuFile) }
+      hideContextMenu() 
+    }}>
+      {t('delete')}{isMulti ? ` (${selectedFiles.size})` : ''}
     </button>
   </div>
 {/if}
@@ -1965,6 +2072,15 @@
   .context-menu button.danger:hover {
     background: var(--danger);
     color: #fff;
+  }
+
+  .context-menu button:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  .context-menu button:disabled:hover {
+    background: none;
   }
 
   .context-menu-backdrop {
