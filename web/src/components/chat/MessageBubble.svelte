@@ -185,7 +185,18 @@
             {thinkingExpanded ? t('collapseThinking') : t('expandThinking')}
           </button>
         {/if}
-        <CopyButton getText={() => msg.content ?? ''} />
+        <CopyButton getText={() => {
+          const parts = []
+          if (msg.content) parts.push(msg.content)
+          if (msg.tool_calls?.length) {
+            for (const tc of msg.tool_calls) {
+              const name = tc.name ?? t('unknownTool')
+              const args = typeof tc.arguments === 'string' ? tc.arguments : JSON.stringify(tc.arguments, null, 2)
+              parts.push(`[Tool Call: ${name}]\n${args}`)
+            }
+          }
+          return parts.join('\n\n') || ''
+        }} />
       </div>
     {:else if msg.role === 'system'}
       {t('roleSystem')}

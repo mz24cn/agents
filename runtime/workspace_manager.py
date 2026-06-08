@@ -634,11 +634,21 @@ def _read_text_file(path: str) -> str:
 
 
 def expand_workspace_file_refs_in_message(message: Message, workspace: str) -> Message:
-    """Expand <file> tags inside one user message in-place and return it."""
+    """Expand <file> tags inside one user message in-place and return it.
+
+    Deduplication logic:
+    - Path descriptions (e.g. [Text file attached: ...]) appear at every occurrence
+    - File content (code blocks for text, base64 for images) is only added once
+    - All content attachments are appended at the end of the message
+    """
     if message.role != "user" or not message.content or "<file>" not in message.content:
         return message
 
     images = list(message.images or [])
+    # Track processed files to avoid duplicating content
+    processed_files: set[str] = set()
+    # Collect content attachments (text file code blocks) to append at the end
+    attachments: list[str] = []
 
     def replace(match: re.Match) -> str:
         file_path = match.group(1).strip()
@@ -649,17 +659,31 @@ def expand_workspace_file_refs_in_message(message: Message, workspace: str) -> M
             file_path = os.path.realpath(os.path.join(workspace, file_path.lstrip("/\\")))
 
         if not os.path.isfile(file_path):
-            raise ValueError(f"Referenced file does not exist: {ref_path}")
+            raise ValueError(f"Referenced file does not exist: {file_path}")
 
         if is_image_file(file_path):
-            images.append(file_path)
+            # Image content (base64) only added once
+            if file_path not in processed_files:
+                images.append(file_path)
+                processed_files.add(file_path)
             return f"[Image file attached: {file_path}]"
         if is_text_file(file_path):
-            content = _read_text_file(file_path)
-            return f"```\n{content}\n```"
-        raise ValueError(f"Unsupported workspace file reference type: {ref}")
+            # Text content (code block) only added once
+            if file_path not in processed_files:
+                content = _read_text_file(file_path)
+                attachments.append(f"[Text file attached: {file_path}]\n```\n{content}\n```")
+                processed_files.add(file_path)
+            return f"[Text file attached: {file_path}]"
+        # Unsupported file type: return path reference instead of raising error
+        return f"[file attached: {file_path}]"
 
     message.content = _FILE_REF_RE.sub(replace, message.content)
+    
+    # Prepend text file content attachments at the beginning
+    # so user's text appears at the end for better inference
+    if attachments:
+        message.content = "\n\n".join(attachments) + "\n\n" + message.content.lstrip()
+    
     message.images = images or None
     return message
 

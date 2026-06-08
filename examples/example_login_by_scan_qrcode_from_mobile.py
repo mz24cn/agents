@@ -3,7 +3,7 @@
 
 【目标】
 在电脑浏览器上自动化登录微信视频号创作者平台（https://channels.weixin.qq.com/login.html）。
-该平台需要使用微信扫码登录，本脚本通过两个手机配合完成整个流程：
+该平台需要使用微信扫码登录，本脚本通过两个手机（微信登录扫码强制要求摄像头物理拍照）配合完成整个流程：
 - 手机A（显示二维码）：接收电脑截取的登录二维码并全屏显示
 - 手机B（扫码手机）：打开微信扫一扫，扫描手机A上的二维码完成登录
 
@@ -16,16 +16,21 @@
 
 【流程概览】
 1. 电脑浏览器打开视频号登录页面
-2. 从页面A11Y树中定位二维码iframe并截图
-3. 将二维码图片发送到手机A全屏显示（最大亮度）
-4. 在手机B上打开微信 → 点击"+" → 点击"扫一扫"
-5. 等待扫码完成，在浏览器中确认登录成功（检测到"登录"字样）
+2. （可选）如果页面有多种登录方式，点击切换到二维码扫码模式
+3. 对整页截图，微信扫一扫会自动放大识别二维码
+4. 将二维码图片发送到手机A全屏显示（最大亮度）
+5. 在手机B上打开微信 → 点击"+" → 点击"扫一扫"
+6. 等待扫码完成，点击"登录"。在浏览器中确认登录成功
 
 【API说明】
 本脚本通过 /v1/tools/call 接口调用 chrome-devtools-mcp 和 android_use_mcp 工具，全程无大模型参与。
 - tool_id 格式：mcp-{service}-{tool_name}
 - 浏览器工具：mcp-chrome-devtools-take_snapshot, mcp-chrome-devtools-take_screenshot, mcp-chrome-devtools-navigate_page
 - Android工具：mcp-android-show_image, mcp-android-run_adb_command, mcp-android-find_and_click
+
+【关于截图策略】
+直接对整页截图即可，无需截取特定 iframe。微信扫一扫会自动放大图片并识别出二维码。
+这种方式更简单可靠，适用于各种网页登录场景。
 """
 
 import re
@@ -128,30 +133,6 @@ def call_tool(tool_id: str, arguments: dict, format: str = "json") -> Any:
         return result
 
 
-def save_and_replace_base64(text: str, output_dir: str = "/tmp") -> str:
-    """
-    后处理：将返回结果中的 base64 图片保存为文件，并替换为 filePath。
-    与 runtime.py 中的逻辑一致。
-    """
-    # 确保输出目录存在
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-
-    # 正则表达式：匹配 "key": "base64内容"
-    pattern = r'"(screenshot|data|image|base64|base64_content|base64_data|image_base64)":\s*"([A-Za-z0-9+/]{100,}={0,2})"'
-
-    def replace_logic(match):
-        b64_content = match.group(2)
-        file_name = f"snap_{int(time.time()*1000)}.png"
-        file_path = os.path.abspath(os.path.join(output_dir, file_name))
-        with open(file_path, "wb") as f:
-            f.write(base64.b64decode(b64_content))
-        safe_path = file_path.replace("\\", "/")
-        return f'"filePath": "{safe_path}"'
-
-    return re.sub(pattern, replace_logic, text)
-
-
 # ============================================================
 # 浏览器操作
 # ============================================================
@@ -175,24 +156,59 @@ def browser_take_snapshot() -> dict:
     )
 
 
-def browser_take_screenshot(uid: str = None) -> dict:
-    """截取页面或指定元素的截图"""
-    args = {}
-    if uid:
-        args["uid"] = uid
-    result = call_tool(
+def browser_take_screenshot() -> dict:
+    """截取整页截图（无需指定元素，微信扫一扫会自动识别二维码）"""
+    return call_tool(
         "mcp-chrome-devtools-take_screenshot",
-        args,
+        {},
         format="text",
     )
-    return result
 
 
 def browser_find_and_click(keyword: str) -> dict:
-    """在页面上查找并点击包含指定文字的元素"""
+    """
+    在页面上查找并点击包含指定文字的元素。
+    
+    实现逻辑：
+    1. 截取页面截图
+    2. 调用 MCP-OCR 服务的 find_location 工具定位目标文字
+    3. 使用 mcp-chrome-devtools-click_at 点击对应坐标
+    """
+    import base64
+    
+    # 步骤 1: 截取页面截图
+    screenshot_result = browser_take_screenshot()
+    
+    # 提取 base64 图片数据
+    _m = re.search(r'"(?:data|screenshot|image)":\s*"([A-Za-z0-9+/=]+)"', str(screenshot_result))
+    if not _m:
+        return {"success": False, "message": "无法获取页面截图"}
+    
+    screenshot_base64 = _m.group(1)
+    
+    # 步骤 2: 调用 MCP-OCR find_location 定位目标
+    location_result = call_tool(
+        "mcp-OCR-find_location",
+        {
+            "base64_image_big": screenshot_base64,
+            "pattern": keyword
+        },
+        format="json",
+    )
+    
+    if not location_result.get("success"):
+        return {"success": False, "message": f"定位失败: {location_result.get('message', '未找到目标')}"}
+    
+    center_x = location_result.get("center_x")
+    center_y = location_result.get("center_y")
+    
+    if center_x is None or center_y is None:
+        return {"success": False, "message": "无法获取目标坐标"}
+    
+    # 步骤 3: 点击对应坐标
     return call_tool(
-        "mcp-chrome-devtools-find_and_click",
-        {"keyword": keyword},
+        "mcp-chrome-devtools-click_at",
+        {"x": center_x, "y": center_y},
         format="text",
     )
 
@@ -303,43 +319,6 @@ def android_find_and_click(keyword: str, device_id: str) -> dict:
 # ============================================================
 
 
-def find_qrcode_iframe_uid(snapshot_data) -> Optional[str]:
-    """
-    从页面快照中查找二维码 iframe 的 uid。
-
-    策略：在 A11Y 树中查找 Iframe 类型的节点，
-    其子节点通常包含"扫码"、"二维码"等关键词。
-
-    Args:
-        snapshot_data: take_snapshot 返回的数据
-
-    Returns:
-        iframe 的 uid，未找到返回 None
-    """
-    snapshot_text = snapshot_data.get("snapshot", "") if isinstance(snapshot_data, dict) else str(snapshot_data)
-
-    # 解析快照文本，查找 Iframe 节点
-    # 格式示例：uid=2_27 Iframe
-    lines = snapshot_text.split("\n")
-    for i, line in enumerate(lines):
-        if "Iframe" in line:
-            # 提取 uid
-            parts = line.strip().split()
-            for part in parts:
-                if part.startswith("uid="):
-                    uid = part.split("=")[1]
-                    # 检查后续几行是否包含二维码相关内容
-                    context = "\n".join(lines[i : min(i + 10, len(lines))])
-                    if any(
-                        kw in context
-                        for kw in ["扫码", "二维码", "QR", "scan", "登录"]
-                    ):
-                        return uid
-                    # 如果没有明确关键词，也返回第一个 Iframe（通常只有一个登录二维码）
-                    return uid
-    return None
-
-
 def wait_for_element_in_snapshot(
     keyword: str, timeout: int = 30, interval: int = 2
 ) -> bool:
@@ -400,11 +379,12 @@ def login_video_account_by_scan(
 
     完整流程：
     1. 电脑浏览器打开登录页面
-    2. 从页面中截取二维码图片
-    3. 将二维码发送到手机A全屏显示
-    4. 在手机B上打开微信扫一扫
-    5. 扫描手机A上的二维码
-    6. 等待登录成功
+    2. （可选）切换到二维码扫码模式
+    3. 对整页截图，微信扫一扫会自动放大识别二维码
+    4. 将二维码发送到手机A全屏显示
+    5. 在手机B上打开微信扫一扫
+    6. 扫描手机A上的二维码
+    7. 等待登录成功
 
     Args:
         display_phone: 显示二维码的手机型号（默认 MI5X）
@@ -435,31 +415,40 @@ def login_video_account_by_scan(
     time.sleep(3)  # 等待页面加载
 
     # --------------------------------------------------------
-    # 步骤2：获取页面快照，定位二维码 iframe
+    # 步骤2：（可选）切换到二维码扫码模式
     # --------------------------------------------------------
-    print("[步骤2/7] 定位二维码 iframe...")
-    snapshot_result = browser_take_snapshot()
-    iframe_uid = find_qrcode_iframe_uid(snapshot_result)
-
-    if not iframe_uid:
-        print("❌ 未找到二维码 iframe，登录流程终止")
-        return False
-
-    print(f"   ✅ 找到二维码 iframe: uid={iframe_uid}")
+    # 【说明】很多网页登录页面有多种登录方式（账号密码、手机验证码、扫码等），
+    # 需要点击切换到"扫码登录"模式，让二维码显示出来。
+    # 
+    # 示例：通过 chrome-devtools-mcp 执行点击操作，切换到扫码登录模式
+    # ```python
+    # # 获取页面快照，查看有哪些登录方式
+    # snapshot = browser_take_snapshot()
+    # # 点击"扫码登录"或"二维码登录"按钮
+    # browser_find_and_click("扫码登录")
+    # ```
+    # 
+    # 【注意】视频号登录页面默认就是扫码模式，无需此步骤。
+    # 但其他网站（如淘宝、京东等）可能需要先切换登录方式。
+    
+    print("[步骤2/7] 检查登录模式...")
+    print("   ℹ️  视频号登录页面默认为扫码模式，无需切换")
 
     # --------------------------------------------------------
-    # 步骤3：截取二维码图片
+    # 步骤3：截取整页截图（包含二维码）
     # --------------------------------------------------------
-    print("[步骤3/7] 截取二维码图片...")
-    screenshot_result = browser_take_screenshot(uid=iframe_uid)
-    _m = re.search(r'"data":\s*"([A-Za-z0-9+/=]+)"', str(screenshot_result))
+    print("[步骤3/7] 截取登录页面截图...")
+    screenshot_result = browser_take_screenshot()
+    
+    # 从返回结果中提取 base64 图片数据
+    _m = re.search(r'"(?:data|screenshot|image)":\s*"([A-Za-z0-9+/=]+)"', str(screenshot_result))
     qrcode_base64 = _m.group(1) if _m else ""
 
     if not qrcode_base64:
-        print("❌ 二维码截图失败")
+        print("❌ 截图失败，未获取到图片数据")
         return False
 
-    print(f"   ✅ 二维码已获取。")
+    print(f"   ✅ 页面截图已获取（微信扫一扫会自动放大识别二维码）")
 
     # --------------------------------------------------------
     # 步骤4：唤醒屏幕并显示二维码到手机A
@@ -469,11 +458,11 @@ def login_video_account_by_scan(
         print(f"❌ {display_phone} 屏幕解锁失败，请检查PIN码配置")
         return False
 
-    print(f"   将二维码发送到 {display_phone} 显示...")
+    print(f"   将截图发送到 {display_phone} 显示...")
     android_show_image(qrcode_base64, display_device_id)
     time.sleep(2)
 
-    print(f"   ✅ 二维码已在 {display_phone} 上全屏显示（最大亮度）")
+    print(f"   ✅ 登录页面截图已在 {display_phone} 上全屏显示（最大亮度）")
 
     # --------------------------------------------------------
     # 步骤5：唤醒手机B并打开微信
@@ -502,8 +491,8 @@ def login_video_account_by_scan(
     time.sleep(2)
 
     # 此时手机B的相机已经打开，对准手机A的屏幕
-    # 微信扫一扫会自动识别二维码，无需手动拍照
-    print("   ✅ 扫一扫已启动，等待自动识别二维码...")
+    # 微信扫一扫会自动放大图片并识别二维码，无需手动拍照
+    print("   ✅ 扫一扫已启动，对准手机A屏幕，等待自动识别二维码...")
 
     # --------------------------------------------------------
     # 步骤7：等待登录成功

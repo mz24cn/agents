@@ -13,6 +13,7 @@ pip install fastmcp
 3. run_adb_command - 执行任意 ADB 命令
 4. find_and_click - 查找并点击屏幕上的文字或图片。先截图，然后调用 OCR 工具定位目标，最后执行点击操作。
 5. show_image - 在手机上显示图片（打开图片查看器）。自动唤醒屏幕、解锁、查找默认图片查看器并打开图片，同时设置屏幕常亮和最大亮度。
+6. read_verification_code - 读取最近5分钟内的短信并提取4-6位验证码（优先匹配带"验证码"、"code"等前缀的数字，支持重试机制）
 
 使用方法：
     # HTTP 方式运行（默认）
@@ -47,6 +48,7 @@ import logging
 import argparse
 import subprocess
 import time
+import tempfile
 import urllib.request
 import urllib.error
 
@@ -291,22 +293,27 @@ def create_mcp_server(host: str = "0.0.0.0", port: int = 8000) -> FastMCP:
             logger.error(f"截屏失败: {str(e)}")
             return ""
     
-    def call_ocr_tool(tool_name: str, arguments: dict) -> dict:
+    def call_mcp_ocr_tool(tool_name: str, arguments: dict) -> dict:
         """
-        通过 /v1/tools/call 接口调用 OCR 工具。
+        调用 MCP-OCR 服务工具（如 find_location）。
+        
+        优先通过 MCP 协议调用，如果 MCP 服务不可用则回退到直接调用。
         
         Args:
-            tool_name: 工具名称，如 "mcp-OCR-locate" 或 "mcp-OCR-find_image"
+            tool_name: 工具名称，如 "find_location"
             arguments: 工具参数
             
         Returns:
             工具调用结果字典
         """
+        # 方式1: 通过 MCP 协议调用
         agent_service_url = os.getenv("AGENT_SERVICE_URL", "http://localhost:7988")
+        
+        # 尝试通过 Agent Service 的 MCP 代理调用
         url = f"{agent_service_url}/v1/tools/call"
         
         payload = {
-            "tool_id": tool_name,
+            "tool_id": f"mcp-OCR-{tool_name}",
             "arguments": arguments,
             "format": "json"
         }
@@ -322,11 +329,11 @@ def create_mcp_server(host: str = "0.0.0.0", port: int = 8000) -> FastMCP:
                 return result
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
-            error_msg = f"调用 OCR 工具失败: HTTP {e.code} - {body}"
+            error_msg = f"调用 MCP-OCR 工具失败: HTTP {e.code} - {body}"
             logger.error(error_msg)
             return {"success": False, "message": error_msg}
         except Exception as e:
-            error_msg = f"调用 OCR 工具失败: {str(e)}"
+            error_msg = f"调用 MCP-OCR 工具失败: {str(e)}"
             logger.error(error_msg)
             return {"success": False, "message": error_msg}
     
@@ -337,11 +344,11 @@ def create_mcp_server(host: str = "0.0.0.0", port: int = 8000) -> FastMCP:
         
         实现逻辑：
         1. 使用 ADB 截取手机屏幕
-        2. 调用 OCR 工具（locate 或 find_image）定位目标
+        2. 调用 MCP-OCR 服务的 find_location 工具定位目标
         3. 根据返回的坐标使用 ADB 点击
         
         Args:
-            keyword_or_image_file: 如果 is_image=True，则为小图片路径；否则为要查找的关键词。
+            keyword_or_image_file: 如果 is_image=True，则为小图片路径；否则为要查找的关键词（支持正则）。
             is_image: 是否为图片模式。True 表示图片模式，False 表示文字模式。
             device_id: 可选，指定设备 ID。
             
@@ -358,16 +365,15 @@ def create_mcp_server(host: str = "0.0.0.0", port: int = 8000) -> FastMCP:
                     "message": "截屏失败，无法获取屏幕内容"
                 }, ensure_ascii=False)
             
-            logger.info("截屏成功，正在调用 OCR 工具...")
+            logger.info("截屏成功，正在调用 MCP-OCR find_location 工具定位...")
             
-            # 步骤 2: 根据模式调用不同的 OCR 工具
-            ocr_tool_prefix = os.getenv("OCR_TOOL", "mcp-OCR")
+            # 步骤 2: 调用 MCP-OCR 服务的 find_location 工具
+            find_args = {
+                "base64_image_big": screenshot_base64
+            }
             
             if is_image:
-                # 图片模式：调用 find_image
-                tool_name = f"{ocr_tool_prefix}-find_image"
-                
-                # 读取小图片并转换为 base64
+                # 图片模式：读取小图片文件
                 if not os.path.exists(keyword_or_image_file):
                     return json.dumps({
                         "success": False,
@@ -376,86 +382,36 @@ def create_mcp_server(host: str = "0.0.0.0", port: int = 8000) -> FastMCP:
                 
                 with open(keyword_or_image_file, 'rb') as f:
                     small_img_bytes = f.read()
-                small_img_base64 = base64.b64encode(small_img_bytes).decode('utf-8')
-                
-                arguments = {
-                    "base64_big_img": screenshot_base64,
-                    "base64_small_img": small_img_base64
-                }
+                find_args["base64_image_small"] = base64.b64encode(small_img_bytes).decode('utf-8')
             else:
-                # 文字模式：调用 locate
-                tool_name = f"{ocr_tool_prefix}-locate"
-                arguments = {
-                    "base64_content": screenshot_base64
-                }
+                # 文字模式：使用 pattern 参数
+                find_args["pattern"] = keyword_or_image_file
             
-            # 调用 OCR 工具
-            ocr_result = call_ocr_tool(tool_name, arguments)
-            if not ocr_result.get("success"):
+            # 调用 MCP-OCR find_location 工具
+            location_result = call_mcp_ocr_tool("find_location", find_args)
+            
+            if not location_result.get("success"):
                 return json.dumps({
                     "success": False,
-                    "message": f"OCR 工具调用失败: {ocr_result.get('message', '未知错误')}"
+                    "message": f"定位失败: {location_result.get('message', '未找到目标')}"
                 }, ensure_ascii=False)
             
-            # 步骤 3: 解析坐标并执行点击
-            if is_image:
-                # 图片模式
-                if not ocr_result.get("success"):
-                    return json.dumps({
-                        "success": False,
-                        "message": f"图片查找失败: {ocr_result.get('message', '未找到匹配的图片')}"
-                    }, ensure_ascii=False)
-                
-                x_range = ocr_result.get("x_range", [])
-                y_range = ocr_result.get("y_range", [])
-                
-                if not x_range or not y_range:
-                    return json.dumps({
-                        "success": False,
-                        "message": "未找到匹配的图片"
-                    }, ensure_ascii=False)
-                
-                # 计算中心点坐标
-                center_x = (x_range[0] + x_range[1]) // 2
-                center_y = (y_range[0] + y_range[1]) // 2
-                score = ocr_result.get("score", 0)
-                
-                logger.info(f"找到图片，中心坐标: ({center_x}, {center_y})，置信度: {score:.2f}")
-                
+            # 步骤 3: 获取坐标并执行点击
+            center_x = location_result.get("center_x")
+            center_y = location_result.get("center_y")
+            score = location_result.get("score", 0)
+            text = location_result.get("text")
+            
+            if center_x is None or center_y is None:
+                return json.dumps({
+                    "success": False,
+                    "message": "无法获取目标坐标"
+                }, ensure_ascii=False)
+            
+            if text:
+                logger.info(f"找到文字 '{text}'，中心坐标: ({center_x}, {center_y})，置信度: {score:.2f}")
             else:
-                # 文字模式
-                locations = ocr_result.get("locations", [])
-                
-                # 查找包含关键词的文字
-                target_location = None
-                for loc in locations:
-                    text = loc.get("text", "")
-                    if re.search(keyword_or_image_file, text):
-                        target_location = loc
-                        break
-                
-                if not target_location:
-                    return json.dumps({
-                        "success": False,
-                        "message": f"未找到包含关键词 '{keyword_or_image_file}' 的文字",
-                        "found_texts": [loc.get("text", "") for loc in locations]
-                    }, ensure_ascii=False)
-                
-                x_range = target_location.get("x_range", [])
-                y_range = target_location.get("y_range", [])
-                
-                if not x_range or not y_range:
-                    return json.dumps({
-                        "success": False,
-                        "message": "无法获取文字坐标"
-                    }, ensure_ascii=False)
-                
-                # 计算中心点坐标
-                center_x = (x_range[0] + x_range[1]) // 2
-                center_y = (y_range[0] + y_range[1]) // 2
-                score = target_location.get("score", 0)
-                
-                logger.info(f"找到文字 '{target_location.get('text')}'，中心坐标: ({center_x}, {center_y})，置信度: {score:.2f}")
+                logger.info(f"找到图片，中心坐标: ({center_x}, {center_y})，置信度: {score:.2f}")
             
             # 步骤 4: 执行 ADB 点击
             click_command = f"shell input tap {center_x} {center_y}"
@@ -509,9 +465,8 @@ def create_mcp_server(host: str = "0.0.0.0", port: int = 8000) -> FastMCP:
         """
         try:
             # ========== 步骤 1: 保存到临时文件 ==========
-            temp_dir = r"C:\temp"
-            if not os.path.exists(temp_dir):
-                os.makedirs(temp_dir, exist_ok=True)
+            # 使用操作系统临时目录
+            temp_dir = tempfile.gettempdir()
             
             # 生成唯一文件名
             timestamp = int(time.time())
@@ -752,6 +707,160 @@ def create_mcp_server(host: str = "0.0.0.0", port: int = 8000) -> FastMCP:
             return json.dumps({
                 "success": False,
                 "message": error_msg
+            }, ensure_ascii=False)
+    
+    @server.tool()
+    def read_verification_code(device_id: str = None) -> str:
+        """
+        读取最近5分钟内的短信并提取验证码。
+        
+        实现逻辑：
+        1. 使用ADB命令获取最近5分钟内的短信内容（按时间倒序）
+        2. 如果未收到短信，会重试最多6次，每次间隔10秒
+        3. 提取第一条短信（最新的）
+        4. 使用正则表达式提取4-6位验证码
+        5. 优先提取带有"验证码"、"code"等前缀的数字
+        
+        Args:
+            device_id: 可选，指定设备 ID。仅有一个设备时无需指定。
+        
+        Returns:
+            JSON 格式的结果，包含验证码和原始短信内容
+            如果多次尝试后仍未收到短信，verification_code 返回空字符串
+        """
+        try:
+            # 重试机制：最多尝试6次，每次间隔10秒
+            max_retries = 6
+            retry_interval = 10  # 秒
+            
+            sms_output = None
+            for attempt in range(max_retries):
+                # 步骤1：获取最近5分钟内的短信
+                # 获取当前时间戳（秒）
+                current_timestamp = int(time.time())
+                # 5分钟前的时间戳（秒）
+                five_minutes_ago = current_timestamp - 300
+                # 转换为毫秒
+                five_minutes_ago_ms = five_minutes_ago * 1000
+                
+                command = f'shell content query --uri content://sms --projection address:date:body --sort "date DESC" --where "date > {five_minutes_ago_ms}"'
+                
+                result = run_adb_command(command, device_id)
+                result_data = json.loads(result)
+                
+                if not result_data.get("success"):
+                    logger.warning(f"尝试 {attempt + 1}/{max_retries}: 获取短信失败: {result_data.get('stderr', result_data.get('message', ''))}")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_interval)
+                    continue
+                
+                sms_output = result_data.get("stdout", "")
+                if not sms_output or sms_output.strip() == "No result found.":
+                    logger.info(f"尝试 {attempt + 1}/{max_retries}: 最近5分钟内没有收到短信")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_interval)
+                    continue
+                
+                # 成功获取到短信，跳出循环
+                break
+            
+            # 如果所有尝试都失败，返回空验证码
+            if not sms_output or sms_output.strip() == "No result found.":
+                return json.dumps({
+                    "success": False,
+                    "message": f"在{max_retries}次尝试后仍未收到短信",
+                    "verification_code": "",
+                    "sms_body": "",
+                    "raw_output": ""
+                }, ensure_ascii=False)
+            
+            # 步骤1.5：提取第一条短信（Row: 0）
+            # 输出可能包含多条短信，每条以"Row: X"开头
+            # 我们需要提取从"Row: 0"开始到"Row: 1"之前的内容
+            lines = sms_output.split('\n')
+            first_sms_lines = []
+            in_first_sms = False
+            for line in lines:
+                if line.startswith('Row: 0'):
+                    in_first_sms = True
+                    first_sms_lines.append(line)
+                elif in_first_sms and line.startswith('Row: 1'):
+                    # 遇到第二条短信，停止
+                    break
+                elif in_first_sms:
+                    first_sms_lines.append(line)
+            
+            if not first_sms_lines:
+                return json.dumps({
+                    "success": False,
+                    "message": "未找到第一条短信"
+                }, ensure_ascii=False)
+            
+            first_sms_output = '\n'.join(first_sms_lines)
+            
+            # 步骤2：解析短信内容
+            # 输出格式为：
+            # Row: 0 address=10086, date=1780639504356, body=...
+            # 我们需要提取body部分
+            lines = first_sms_output.strip().split('\n')
+            body_lines = []
+            in_body = False
+            for line in lines:
+                if line.startswith('body='):
+                    # 从这一行开始是body内容
+                    body_part = line[5:]  # 去掉"body="
+                    body_lines.append(body_part)
+                    in_body = True
+                elif in_body and not line.startswith('Row:'):
+                    # 继续body内容
+                    body_lines.append(line)
+                elif line.startswith('Row:'):
+                    # 遇到新的Row，停止
+                    break
+            
+            body = '\n'.join(body_lines).strip()
+            
+            # 步骤3：提取验证码
+            # 正则表达式：优先匹配带有前缀的4-6位数字
+            # 前缀：验证码、code、CODE、验证、verification、sms code、动态码、校验码
+            # 如果没找到带前缀的，则匹配独立的4-6位数字（但可能误匹配）
+            
+            # 首先尝试带前缀的匹配
+            pattern_with_prefix = r'(?:验证码|code|CODE|验证|verification|sms\s*code|动态码|校验码)[:\s]*(\d{4,6})'
+            match = re.search(pattern_with_prefix, body, re.IGNORECASE)
+            
+            if match:
+                verification_code = match.group(1)
+            else:
+                # 尝试匹配4-6位独立数字（前后不是数字）
+                pattern_standalone = r'(?<!\d)(\d{4,6})(?!\d)'
+                match = re.search(pattern_standalone, body)
+                if match:
+                    verification_code = match.group(1)
+                else:
+                    verification_code = None
+            
+            # 步骤4：返回结果
+            if verification_code:
+                return json.dumps({
+                    "success": True,
+                    "message": "成功提取验证码",
+                    "verification_code": verification_code,
+                    "sms_body": body,
+                    "raw_output": first_sms_output
+                }, ensure_ascii=False)
+            else:
+                return json.dumps({
+                    "success": False,
+                    "message": "未能从短信中提取验证码",
+                    "sms_body": body,
+                    "raw_output": first_sms_output
+                }, ensure_ascii=False)
+        
+        except Exception as e:
+            return json.dumps({
+                "success": False,
+                "message": f"读取验证码失败: {str(e)}"
             }, ensure_ascii=False)
     
     return server

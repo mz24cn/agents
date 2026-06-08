@@ -308,13 +308,20 @@ def save_and_replace_base64(text: str, output_dir: str ="/tmp"):
         # match.group(1) 是原来的 key，group(2) 是 base64 内容
         b64_content = match.group(2)
         
+        # 尝试解码 base64，失败则返回原始匹配
+        try:
+            decoded_bytes = base64.b64decode(b64_content)
+        except Exception:
+            # 解码失败，说明不是真正的 base64，返回原始匹配
+            return match.group(0)
+        
         # 生成唯一文件名
         file_name = f"snap_{int(time.time()*1000)}.png"
         file_path = os.path.abspath(os.path.join(output_dir, file_name))
         
-        # 解码并写入文件
+        # 写入文件
         with open(file_path, "wb") as f:
-            f.write(base64.b64decode(b64_content))
+            f.write(decoded_bytes)
         
         # 返回替换后的内容：将 key 换成 filePath，将内容换成路径
         # 注意：Windows 路径需要处理斜杠，这里统一用正斜杠
