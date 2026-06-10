@@ -13,6 +13,7 @@
 3. 手机B（扫码手机）已安装微信并登录
 4. 两台手机的屏幕已解锁
 5. Agent Service服务已启动
+6. 已安装Python Pillow库（用于图片旋转处理）
 
 【流程概览】
 1. 电脑浏览器打开视频号登录页面
@@ -28,9 +29,6 @@
 - 浏览器工具：mcp-chrome-devtools-take_snapshot, mcp-chrome-devtools-take_screenshot, mcp-chrome-devtools-navigate_page
 - Android工具：mcp-android-show_image, mcp-android-run_adb_command, mcp-android-find_and_click
 
-【关于截图策略】
-直接对整页截图即可，无需截取特定 iframe。微信扫一扫会自动放大图片并识别出二维码。
-这种方式更简单可靠，适用于各种网页登录场景。
 """
 
 import re
@@ -38,7 +36,10 @@ import json
 import urllib.request
 import urllib.error
 import time
+import base64
+import io
 from typing import Optional, Dict, Any, Tuple
+from PIL import Image
 
 # ============================================================
 # 配置区域
@@ -211,6 +212,58 @@ def browser_find_and_click(keyword: str) -> dict:
         {"x": center_x, "y": center_y},
         format="text",
     )
+
+
+# ============================================================
+# 图片处理工具
+# ============================================================
+
+
+def rotate_image_for_mobile_display(base64_image: str, angle: int = 90) -> str:
+    """
+    旋转图片以便在竖屏手机上全屏显示。
+    
+    电脑截屏通常是横屏图片，在竖屏手机上显示时会被缩小，导致二维码太小难以扫描。
+    旋转90度后变为竖屏图片，在竖屏手机上显示时会填满屏幕，显示更大更清晰。
+    
+    Args:
+        base64_image: base64编码的图片数据
+        angle: 旋转角度，90表示顺时针90度，-90表示逆时针90度
+        
+    Returns:
+        旋转后的base64编码图片数据
+    """
+    try:
+        # 解码base64图片
+        image_data = base64.b64decode(base64_image)
+        img = Image.open(io.BytesIO(image_data))
+        
+        original_size = img.size
+        print(f"   原始图片尺寸: {original_size[0]}x{original_size[1]}")
+        
+        # 旋转图片
+        if angle == 90:
+            rotated_img = img.transpose(Image.ROTATE_270)  # 顺时针90度
+        elif angle == -90 or angle == 270:
+            rotated_img = img.transpose(Image.ROTATE_90)   # 逆时针90度
+        elif angle == 180:
+            rotated_img = img.transpose(Image.ROTATE_180)
+        else:
+            rotated_img = img.rotate(angle, expand=True)
+        
+        new_size = rotated_img.size
+        print(f"   旋转后尺寸: {new_size[0]}x{new_size[1]}")
+        
+        # 转换回base64
+        buffer = io.BytesIO()
+        rotated_img.save(buffer, format='PNG')
+        rotated_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+        
+        return rotated_base64
+        
+    except Exception as e:
+        print(f"   ⚠️ 图片旋转失败: {e}，使用原图")
+        return base64_image
 
 
 # ============================================================
@@ -449,6 +502,12 @@ def login_video_account_by_scan(
         return False
 
     print(f"   ✅ 页面截图已获取（微信扫一扫会自动放大识别二维码）")
+    
+    # 旋转图片以便在竖屏手机上全屏显示
+    # 电脑截屏是横屏图片，在竖屏手机上显示时会缩小，二维码太小难以扫描
+    # 旋转90度后变为竖屏图片，在竖屏手机上会填满屏幕，显示更大更清晰
+    print("   旋转图片以便在竖屏手机上全屏显示...")
+    qrcode_base64 = rotate_image_for_mobile_display(qrcode_base64, angle=90)
 
     # --------------------------------------------------------
     # 步骤4：唤醒屏幕并显示二维码到手机A
@@ -459,7 +518,9 @@ def login_video_account_by_scan(
         return False
 
     print(f"   将截图发送到 {display_phone} 显示...")
-    android_show_image(qrcode_base64, display_device_id)
+    show_image_result = android_show_image(qrcode_base64, display_device_id)
+    # 保存返回的文件路径，用于后续清理
+    qrcode_phone_path = show_image_result.get("phone_path", "") if show_image_result else ""
     time.sleep(2)
 
     print(f"   ✅ 登录页面截图已在 {display_phone} 上全屏显示（最大亮度）")
@@ -500,12 +561,15 @@ def login_video_account_by_scan(
     print("[步骤7/7] 等待登录成功...")
 
     # 在手机B上确认扫码（如果有确认按钮的话）
-    time.sleep(3)
-    try:
-        android_find_and_click("^登录$", scan_device_id)
-        print("   ✅ 已在手机上确认登录")
-    except Exception:
-        print("   ℹ️  无需手机确认（可能已自动确认）")
+    time.sleep(5)
+    for attempt in range(3):
+        try:
+            android_find_and_click("^登录$", scan_device_id)
+            print("   ✅ 已在手机上确认登录")
+            break
+        except Exception as e:
+            time.sleep(5)
+            print(f"   ⏳ 重试第 {attempt + 1} 次: {e}")
 
     # 等待浏览器页面跳转（登录成功后会跳转到后台页面）
     print("   等待页面跳转...")
@@ -519,6 +583,15 @@ def login_video_account_by_scan(
     print("\n[清理] 将手机恢复到初始状态...")
 
     # 1. MI5X：关闭图片预览 APP，回到桌面
+    print(f"   {display_phone}：删除之前传输到相册的图片...")
+    # 删除传输到相册的图片（使用 show_image 返回的具体路径）
+    if qrcode_phone_path:
+        android_run_adb(f"shell rm -f {qrcode_phone_path}", display_device_id)
+        print(f"   ✅ 已删除图片: {qrcode_phone_path}")
+    else:
+        print(f"   ⚠️  未找到图片路径，跳过删除")
+    time.sleep(0.5)
+    
     print(f"   {display_phone}：关闭图片预览 APP...")
     # 关闭 MIUI 相册应用
     android_run_adb("shell am force-stop com.miui.gallery", display_device_id)

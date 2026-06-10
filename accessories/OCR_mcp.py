@@ -351,319 +351,331 @@ def _find_location_by_image(base64_big: str, base64_small: str) -> list[dict]:
     }]
 
 
+# ---------------------------------------------------------------------------
+# 全局 MCP Server 实例和工具函数
+# ---------------------------------------------------------------------------
 
-def create_mcp_server(host: str = "0.0.0.0", port: int = 8000) -> FastMCP:
-    """创建 MCP server 实例并注册工具"""
-    server = FastMCP(
-        "ocr",
-        instructions="OCR 服务：基于 PaddleOCR 的文字识别和定位，支持 base64 图片输入",
-        host=host,
-        port=port,
-    )
+# 创建全局 MCP server 实例
+server = FastMCP(
+    "ocr",
+    instructions="OCR 服务：基于 PaddleOCR 的文字识别和定位，支持 base64 图片输入",
+    host="0.0.0.0",
+    port=8000,
+)
 
-    @server.tool()
-    def detect_text_blocks(base64_content: str) -> str:
-        """
-        定位图片中的文字，返回所有文字块的位置范围。
 
-        Args:
-            base64_content: base64 编码的图片内容。可提供本地文件路径，底层会自动读取并编码。
+@server.tool()
+def detect_text_blocks(base64_content: str) -> str:
+    """
+    定位图片中的文字，返回所有文字块的位置范围。
 
-        Returns:
-            JSON 格式的定位结果，每个元素包含 text、x_range、y_range、score
-        """
-        try:
-            binary_data = base64.b64decode(base64_content)
-            img = decode_image(binary_data)
-            ocr_results = predict_ocr([img])
+    Args:
+        base64_content: base64 编码的图片内容。可提供本地文件路径，底层会自动读取并编码。
 
-            if not ocr_results:
-                return json.dumps({"success": True, "locations": []}, ensure_ascii=False)
+    Returns:
+        JSON 格式的定位结果，每个元素包含 text、x_range、y_range、score
+    """
+    try:
+        binary_data = base64.b64decode(base64_content)
+        img = decode_image(binary_data)
+        ocr_results = predict_ocr([img])
 
-            result = ocr_results[0]
-            locations = []
-            for i in range(len(result['texts'])):
-                box = result['boxes'][i]
-                x1, y1, x2, y2 = box
-                locations.append({
-                    "text": result['texts'][i],
-                    "x_range": [x1, x2],
-                    "y_range": [y1, y2],
-                    "score": result['scores'][i]
-                })
+        if not ocr_results:
+            return json.dumps({"success": True, "locations": []}, ensure_ascii=False)
 
-            return json.dumps({
-                "success": True,
-                "locations": locations
-            }, ensure_ascii=False)
+        result = ocr_results[0]
+        locations = []
+        for i in range(len(result['texts'])):
+            box = result['boxes'][i]
+            x1, y1, x2, y2 = box
+            locations.append({
+                "text": result['texts'][i],
+                "x_range": [x1, x2],
+                "y_range": [y1, y2],
+                "score": result['scores'][i]
+            })
 
-        except Exception as e:
-            error_msg = f"文字定位失败: {str(e)}"
-            logger.error(error_msg)
-            return json.dumps({"success": False, "message": error_msg}, ensure_ascii=False)
-    
-    @server.tool()
-    def ocr(base64_content: str, threshold_ratio: float = 0.3, add_spaces: bool = True) -> str:
-        """
-        对图片进行 OCR 识别，并将文本块按阅读顺序排序合并成字符串。
-
-        Args:
-            base64_content: base64 编码的图片内容。可提供本地文件路径，底层会自动读取并编码。
-            threshold_ratio: 行聚类阈值比例（0-1），越大越容易合并到同一行。建议值0.3
-            add_spaces: 是否为英文单词自动添加空格
-
-        Returns:
-            JSON 格式的结果，包含排序合并后的文本、行分组信息和原始定位数据
-        """
-        try:
-            binary_data = base64.b64decode(base64_content)
-            img = decode_image(binary_data)
-            ocr_results = predict_ocr([img])
-
-            if not ocr_results:
-                return json.dumps({
-                    "success": True,
-                    "full_text": "",
-                    "lines": [],
-                    "locations": []
-                }, ensure_ascii=False)
-
-            result = ocr_results[0]
-            locations = []
-            for i in range(len(result['texts'])):
-                box = result['boxes'][i]
-                x1, y1, x2, y2 = box
-                locations.append({
-                    "text": result['texts'][i],
-                    "x_range": [x1, x2],
-                    "y_range": [y1, y2],
-                    "score": result['scores'][i]
-                })
-
-            lines = cluster_text_blocks_into_lines(locations, threshold_ratio=threshold_ratio)
-
-            full_text = merge_text_lines(lines, add_spaces_for_english=add_spaces)
-
-            line_info = []
-            for line in lines:
-                line_texts = [block['text'] for block in line]
-                line_x_ranges = [[block['x1'], block['x2']] for block in line]
-                line_y_ranges = [[block['y1'], block['y2']] for block in line]
-                line_info.append({
-                    "texts": line_texts,
-                    "x_ranges": line_x_ranges,
-                    "y_ranges": line_y_ranges
-                })
-
-            return json.dumps({
-                "success": True,
-                "full_text": full_text,
-                "lines": line_info,
-                "locations": locations,
-                "width": result['width'],
-                "height": result['height']
-            }, ensure_ascii=False)
-
-        except Exception as e:
-            error_msg = f"OCR 识别失败: {str(e)}"
-            logger.error(error_msg)
-            return json.dumps({"success": False, "message": error_msg}, ensure_ascii=False)
-
-    @server.tool()
-    def find_image(base64_big_img: str, base64_small_img: str) -> str:
-        """
-        在大图中查找小图的位置。
-
-        Args:
-            base64_big_img: base64 编码的大图内容。可提供本地文件路径，底层会自动读取并编码。
-            base64_small_img: base64 编码的要查找的小图内容。可提供本地文件路径，底层会自动读取并编码。
-
-        Returns:
-            JSON 格式的结果，包含小图坐标区间 x_range, y_range 和匹配置信度 score
-        """
-        try:
-            big_binary = base64.b64decode(base64_big_img)
-            small_binary = base64.b64decode(base64_small_img)
-
-            big_img = decode_image(big_binary)
-            small_img = decode_image(small_binary)
-
-            big_gray = cv2.cvtColor(big_img, cv2.COLOR_BGR2GRAY)
-            small_gray = cv2.cvtColor(small_img, cv2.COLOR_BGR2GRAY)
-
-            small_gray = cv2.equalizeHist(small_gray)
-            big_gray = cv2.equalizeHist(big_gray)
-
-            result = cv2.matchTemplate(big_gray, small_gray, cv2.TM_CCOEFF_NORMED)
-
-            min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
-
-            top_left = max_loc
-            h, w = small_gray.shape[:2]
-
-            return json.dumps({
-                "success": True,
-                "x_range": [top_left[0], top_left[0] + w],
-                "y_range": [top_left[1], top_left[1] + h],
-                "score": float(max_val)
-            }, ensure_ascii=False)
-
-        except Exception as e:
-            error_msg = f"模板匹配失败: {str(e)}"
-            logger.error(error_msg)
-            return json.dumps({"success": False, "message": error_msg}, ensure_ascii=False)
-
-    @server.tool()
-    def find_location(
-        base64_image_big: str,
-        pattern: Optional[str] = None,
-        base64_image_small: Optional[str] = None,
-    ) -> str:
-        """
-        在大图中查找目标位置（支持文字模式匹配和/或小图匹配）。
-
-        至少提供 pattern 或 base64_image_small 之一。当两者都提供时，
-        优先返回文字匹配的位置，但会选择距离小图匹配最近的那个文字匹配。
-
-        Args:
-            base64_image_big: 大图（base64 编码或本地文件路径）
-            pattern: 可选，正则表达式模式（非特殊字符 = 关键词搜索）
-            base64_image_small: 可选，要查找的小图（base64 编码或本地文件路径）
-
-        Returns:
-            JSON 格式的结果，包含：
-            - success: 是否成功
-            - x_range: [min_x, max_x] 坐标范围
-            - y_range: [min_y, max_y] 坐标范围
-            - center_x, center_y: 中心点坐标
-            - score: 匹配置信度
-            - text: 匹配的文字（如果有）
-            - source: 匹配来源 (pattern/image/pattern+image)
-        """
-        # Validate inputs
-        if not pattern and not base64_image_small:
-            return json.dumps({
-                "success": False,
-                "message": "At least one of pattern or base64_image_small must be provided"
-            }, ensure_ascii=False)
-
-        # Read images (support both file paths and base64)
-        try:
-            big_image = read_image_as_base64(base64_image_big)
-            small_image = read_image_as_base64(base64_image_small) if base64_image_small else None
-        except FileNotFoundError as e:
-            return json.dumps({
-                "success": False,
-                "message": str(e)
-            }, ensure_ascii=False)
-        except ValueError as e:
-            return json.dumps({
-                "success": False,
-                "message": str(e)
-            }, ensure_ascii=False)
-        except Exception as e:
-            return json.dumps({
-                "success": False,
-                "message": f"Failed to read image: {str(e)}"
-            }, ensure_ascii=False)
-        
-        # Search by pattern (text)
-        pattern_matches = []
-        if pattern:
-            pattern_matches = _find_location_by_pattern(big_image, pattern)
-        
-        # Search by small image
-        image_matches = []
-        if small_image:
-            image_matches = _find_location_by_image(big_image, small_image)
-        
-        # Determine final result based on the algorithm:
-        # 1. If one returns empty, use the other (if non-empty)
-        # 2. If both return non-empty, use pattern position but select based on proximity to image match
-        
-        if not pattern_matches and not image_matches:
-            return json.dumps({
-                "success": False,
-                "message": "No match found"
-            }, ensure_ascii=False)
-        
-        if not pattern_matches:
-            # Only image matches found
-            best = image_matches[0]
-            x_range = best["x_range"]
-            y_range = best["y_range"]
-            return json.dumps({
-                "success": True,
-                "x_range": x_range,
-                "y_range": y_range,
-                "center_x": (x_range[0] + x_range[1]) // 2,
-                "center_y": (y_range[0] + y_range[1]) // 2,
-                "score": best.get("score", 0),
-                "text": None,
-                "source": "image"
-            }, ensure_ascii=False)
-        
-        if not image_matches:
-            # Only pattern matches found
-            best = pattern_matches[0]
-            x_range = best["x_range"]
-            y_range = best["y_range"]
-            return json.dumps({
-                "success": True,
-                "x_range": x_range,
-                "y_range": y_range,
-                "center_x": (x_range[0] + x_range[1]) // 2,
-                "center_y": (y_range[0] + y_range[1]) // 2,
-                "score": best.get("score", 0),
-                "text": best.get("text"),
-                "source": "pattern"
-            }, ensure_ascii=False)
-        
-        # Both have matches: find pattern match closest to any image match
-        def get_center(loc):
-            x_range = loc["x_range"]
-            y_range = loc["y_range"]
-            return ((x_range[0] + x_range[1]) / 2, (y_range[0] + y_range[1]) / 2)
-        
-        def distance(p1, p2):
-            return ((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2) ** 0.5
-        
-        # Get centers of all image matches
-        image_centers = [get_center(m) for m in image_matches]
-        
-        # Find pattern match closest to any image match
-        best_pattern = None
-        min_dist = float('inf')
-        
-        for p_match in pattern_matches:
-            p_center = get_center(p_match)
-            for i_center in image_centers:
-                dist = distance(p_center, i_center)
-                if dist < min_dist:
-                    min_dist = dist
-                    best_pattern = p_match
-        
-        if best_pattern:
-            x_range = best_pattern["x_range"]
-            y_range = best_pattern["y_range"]
-            return json.dumps({
-                "success": True,
-                "x_range": x_range,
-                "y_range": y_range,
-                "center_x": (x_range[0] + x_range[1]) // 2,
-                "center_y": (y_range[0] + y_range[1]) // 2,
-                "score": best_pattern.get("score", 0),
-                "text": best_pattern.get("text"),
-                "source": "pattern+image",
-                "distance_to_image": min_dist
-            }, ensure_ascii=False)
-        
-        # Fallback (should not reach here)
         return json.dumps({
-            "success": False,
-            "message": "Failed to determine best match"
+            "success": True,
+            "locations": locations
         }, ensure_ascii=False)
 
+    except Exception as e:
+        error_msg = f"文字定位失败: {str(e)}"
+        logger.error(error_msg)
+        return json.dumps({"success": False, "message": error_msg}, ensure_ascii=False)
+
+
+@server.tool()
+def ocr(base64_content: str, threshold_ratio: float = 0.3, add_spaces: bool = True) -> str:
+    """
+    对图片进行 OCR 识别，并将文本块按阅读顺序排序合并成字符串。
+
+    Args:
+        base64_content: base64 编码的图片内容。可提供本地文件路径，底层会自动读取并编码。
+        threshold_ratio: 行聚类阈值比例（0-1），越大越容易合并到同一行。建议值0.3
+        add_spaces: 是否为英文单词自动添加空格
+
+    Returns:
+        JSON 格式的结果，包含排序合并后的文本、行分组信息和原始定位数据
+    """
+    try:
+        binary_data = base64.b64decode(base64_content)
+        img = decode_image(binary_data)
+        ocr_results = predict_ocr([img])
+
+        if not ocr_results:
+            return json.dumps({
+                "success": True,
+                "full_text": "",
+                "lines": [],
+                "locations": []
+            }, ensure_ascii=False)
+
+        result = ocr_results[0]
+        locations = []
+        for i in range(len(result['texts'])):
+            box = result['boxes'][i]
+            x1, y1, x2, y2 = box
+            locations.append({
+                "text": result['texts'][i],
+                "x_range": [x1, x2],
+                "y_range": [y1, y2],
+                "score": result['scores'][i]
+            })
+
+        lines = cluster_text_blocks_into_lines(locations, threshold_ratio=threshold_ratio)
+
+        full_text = merge_text_lines(lines, add_spaces_for_english=add_spaces)
+
+        line_info = []
+        for line in lines:
+            line_texts = [block['text'] for block in line]
+            line_x_ranges = [[block['x1'], block['x2']] for block in line]
+            line_y_ranges = [[block['y1'], block['y2']] for block in line]
+            line_info.append({
+                "texts": line_texts,
+                "x_ranges": line_x_ranges,
+                "y_ranges": line_y_ranges
+            })
+
+        return json.dumps({
+            "success": True,
+            "full_text": full_text,
+            "lines": line_info,
+            "locations": locations,
+            "width": result['width'],
+            "height": result['height']
+        }, ensure_ascii=False)
+
+    except Exception as e:
+        error_msg = f"OCR 识别失败: {str(e)}"
+        logger.error(error_msg)
+        return json.dumps({"success": False, "message": error_msg}, ensure_ascii=False)
+
+
+@server.tool()
+def find_image(base64_big_img: str, base64_small_img: str) -> str:
+    """
+    在大图中查找小图的位置。
+
+    Args:
+        base64_big_img: base64 编码的大图内容。可提供本地文件路径，底层会自动读取并编码。
+        base64_small_img: base64 编码的要查找的小图内容。可提供本地文件路径，底层会自动读取并编码。
+
+    Returns:
+        JSON 格式的结果，包含小图坐标区间 x_range, y_range 和匹配置信度 score
+    """
+    try:
+        big_binary = base64.b64decode(base64_big_img)
+        small_binary = base64.b64decode(base64_small_img)
+
+        big_img = decode_image(big_binary)
+        small_img = decode_image(small_binary)
+
+        big_gray = cv2.cvtColor(big_img, cv2.COLOR_BGR2GRAY)
+        small_gray = cv2.cvtColor(small_img, cv2.COLOR_BGR2GRAY)
+
+        small_gray = cv2.equalizeHist(small_gray)
+        big_gray = cv2.equalizeHist(big_gray)
+
+        result = cv2.matchTemplate(big_gray, small_gray, cv2.TM_CCOEFF_NORMED)
+
+        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+
+        top_left = max_loc
+        h, w = small_gray.shape[:2]
+
+        return json.dumps({
+            "success": True,
+            "x_range": [top_left[0], top_left[0] + w],
+            "y_range": [top_left[1], top_left[1] + h],
+            "score": float(max_val)
+        }, ensure_ascii=False)
+
+    except Exception as e:
+        error_msg = f"模板匹配失败: {str(e)}"
+        logger.error(error_msg)
+        return json.dumps({"success": False, "message": error_msg}, ensure_ascii=False)
+
+
+@server.tool()
+def find_location(
+    base64_image_big: str,
+    pattern: Optional[str] = None,
+    base64_image_small: Optional[str] = None,
+) -> str:
+    """
+    在大图中查找目标位置（支持文字模式匹配和/或小图匹配）。
+
+    至少提供 pattern 或 base64_image_small 之一。当两者都提供时，
+    优先返回文字匹配的位置，但会选择距离小图匹配最近的那个文字匹配。
+
+    Args:
+        base64_image_big: 大图（base64 编码或本地文件路径）
+        pattern: 可选，正则表达式模式（非特殊字符 = 关键词搜索）
+        base64_image_small: 可选，要查找的小图（base64 编码或本地文件路径）
+
+    Returns:
+        JSON 格式的结果，包含：
+        - success: 是否成功
+        - x_range: [min_x, max_x] 坐标范围
+        - y_range: [min_y, max_y] 坐标范围
+        - center_x, center_y: 中心点坐标
+        - score: 匹配置信度
+        - text: 匹配的文字（如果有）
+        - source: 匹配来源 (pattern/image/pattern+image)
+    """
+    # Validate inputs
+    if not pattern and not base64_image_small:
+        return json.dumps({
+            "success": False,
+            "message": "At least one of pattern or base64_image_small must be provided"
+        }, ensure_ascii=False)
+
+    # Read images (support both file paths and base64)
+    try:
+        big_image = read_image_as_base64(base64_image_big)
+        small_image = read_image_as_base64(base64_image_small) if base64_image_small else None
+    except FileNotFoundError as e:
+        return json.dumps({
+            "success": False,
+            "message": str(e)
+        }, ensure_ascii=False)
+    except ValueError as e:
+        return json.dumps({
+            "success": False,
+            "message": str(e)
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "message": f"Failed to read image: {str(e)}"
+        }, ensure_ascii=False)
+    
+    # Search by pattern (text)
+    pattern_matches = []
+    if pattern:
+        pattern_matches = _find_location_by_pattern(big_image, pattern)
+    
+    # Search by small image
+    image_matches = []
+    if small_image:
+        image_matches = _find_location_by_image(big_image, small_image)
+    
+    # Determine final result based on the algorithm:
+    # 1. If one returns empty, use the other (if non-empty)
+    # 2. If both return non-empty, use pattern position but select based on proximity to image match
+    
+    if not pattern_matches and not image_matches:
+        return json.dumps({
+            "success": False,
+            "message": "No match found"
+        }, ensure_ascii=False)
+    
+    if not pattern_matches:
+        # Only image matches found
+        best = image_matches[0]
+        x_range = best["x_range"]
+        y_range = best["y_range"]
+        return json.dumps({
+            "success": True,
+            "x_range": x_range,
+            "y_range": y_range,
+            "center_x": (x_range[0] + x_range[1]) // 2,
+            "center_y": (y_range[0] + y_range[1]) // 2,
+            "score": best.get("score", 0),
+            "text": None,
+            "source": "image"
+        }, ensure_ascii=False)
+    
+    if not image_matches:
+        # Only pattern matches found
+        best = pattern_matches[0]
+        x_range = best["x_range"]
+        y_range = best["y_range"]
+        return json.dumps({
+            "success": True,
+            "x_range": x_range,
+            "y_range": y_range,
+            "center_x": (x_range[0] + x_range[1]) // 2,
+            "center_y": (y_range[0] + y_range[1]) // 2,
+            "score": best.get("score", 0),
+            "text": best.get("text"),
+            "source": "pattern"
+        }, ensure_ascii=False)
+    
+    # Both have matches: find pattern match closest to any image match
+    def get_center(loc):
+        x_range = loc["x_range"]
+        y_range = loc["y_range"]
+        return ((x_range[0] + x_range[1]) / 2, (y_range[0] + y_range[1]) / 2)
+    
+    def distance(p1, p2):
+        return ((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2) ** 0.5
+    
+    # Get centers of all image matches
+    image_centers = [get_center(m) for m in image_matches]
+    
+    # Find pattern match closest to any image match
+    best_pattern = None
+    min_dist = float('inf')
+    
+    for p_match in pattern_matches:
+        p_center = get_center(p_match)
+        for i_center in image_centers:
+            dist = distance(p_center, i_center)
+            if dist < min_dist:
+                min_dist = dist
+                best_pattern = p_match
+    
+    if best_pattern:
+        x_range = best_pattern["x_range"]
+        y_range = best_pattern["y_range"]
+        return json.dumps({
+            "success": True,
+            "x_range": x_range,
+            "y_range": y_range,
+            "center_x": (x_range[0] + x_range[1]) // 2,
+            "center_y": (y_range[0] + y_range[1]) // 2,
+            "score": best_pattern.get("score", 0),
+            "text": best_pattern.get("text"),
+            "source": "pattern+image",
+            "distance_to_image": min_dist
+        }, ensure_ascii=False)
+    
+    # Fallback (should not reach here)
+    return json.dumps({
+        "success": False,
+        "message": "Failed to determine best match"
+    }, ensure_ascii=False)
+
+
+def create_mcp_server(host: str = "0.0.0.0", port: int = 8000) -> FastMCP:
+    """创建或配置 MCP server 实例并返回"""
+    # 更新全局 server 的配置
+    server.settings.host = host
+    server.settings.port = port
     return server
 
 
@@ -711,7 +723,7 @@ def main():
         logger.info(f"挂载路径: {args.mount_path}")
         logger.info(f"访问地址: http://{args.host}:{args.port}{args.mount_path}")
 
-    # 创建 MCP server（传递 host 和 port）
+    # 配置 MCP server（设置 host 和 port）
     mcp = create_mcp_server(host=args.host, port=args.port)
 
     mcp.run(transport=args.transport)

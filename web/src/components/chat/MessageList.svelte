@@ -106,7 +106,10 @@
 
 <div class="message-list" bind:this={listEl} onscroll={onScroll}>
   {#if messages.length === 0}
-    <div class="empty">{t('startChat')}</div>
+    <div class="empty">
+      <img src="/logo.svg" alt="Linglong Agent Service" class="empty-logo" />
+      <div class="empty-text">{t('startChat')}</div>
+    </div>
   {:else}
     {#each groups() as group (group.startIndex)}
       {#if group.ungrouped}
@@ -164,9 +167,21 @@
     gap: 12px;
   }
   .empty {
-    text-align: center;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 24px;
     color: var(--text-secondary);
-    padding: 60px 0;
+    padding: 40px 0;
+  }
+  .empty-logo {
+    width: min(480px, 80vw);
+    height: auto;
+    opacity: 0.85;
+  }
+  .empty-text {
     font-size: 1rem;
   }
   .group {

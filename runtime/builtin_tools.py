@@ -995,23 +995,78 @@ def _read_file(path: str, start_line: Optional[int] = None, end_line: Optional[i
         threshold = int(os.environ.get("READ_TRUNCATION_LINES", 1000))
         start, end = 1, min(total_lines, threshold)
         truncated = total_lines > threshold
+        # If we're truncating by READ_TRUNCATION_LINES, track omitted lines
+        if truncated:
+            omitted_lines = total_lines - threshold
+        else:
+            omitted_lines = 0
     else:
         start, end = start_line or 1, end_line or total_lines
         truncated = False
+        omitted_lines = 0
 
     selected_lines = lines[start - 1:end]
-    content = "".join(
-        f"{line_number}: {line}"
-        for line_number, line in enumerate(selected_lines, start=start)
-    )
-
+    
+    # Apply output limits (EXEC_OUTPUT_LINE_LIMIT and EXEC_OUTPUT_COLUMN_LIMIT)
+    # similar to execute_command and search_code
+    output_line_limit = int(os.environ.get("EXEC_OUTPUT_LINE_LIMIT", 1000))
+    max_line_length = int(os.environ.get("EXEC_OUTPUT_COLUMN_LIMIT", 1000))
+    
+    # Track if any truncation occurs
+    line_truncated = False
+    column_truncated = False
+    
+    # Store the initial omitted_lines from READ_TRUNCATION_LINES
+    read_truncation_omitted = omitted_lines
+    
+    # Truncate lines if needed (EXEC_OUTPUT_LINE_LIMIT)
+    if len(selected_lines) > output_line_limit:
+        truncated = True
+        omitted_lines = total_lines - output_line_limit
+        selected_lines = selected_lines[:output_line_limit]
+        line_truncated = True
+    
+    # Build content with line numbers and apply column limit
+    content_parts = []
+    for line_number, line in enumerate(selected_lines, start=start):
+        # Remove trailing newline for consistent formatting
+        line_content = line.rstrip('\n').rstrip('\r\n')
+        
+        # Apply column limit to each line
+        if len(line_content) > max_line_length:
+            line_content = line_content[:max_line_length - 3] + "..."
+            column_truncated = True
+        
+        content_parts.append(f"{line_number}: {line_content}")
+    
+    # If column was truncated, mark as truncated
+    if column_truncated:
+        truncated = True
+    
+    content = "\n".join(content_parts)
+    
+    # Add truncation notice if output was truncated by line count
+    if line_truncated:
+        content += f"\n[...output truncated: {omitted_lines} lines omitted...]"
+    
+    # Calculate final omitted_lines for the result
+    if line_truncated:
+        # Use the EXEC_OUTPUT_LINE_LIMIT based omission
+        final_omitted_lines = omitted_lines
+    elif read_truncation_omitted > 0:
+        # Use the READ_TRUNCATION_LINES based omission
+        final_omitted_lines = read_truncation_omitted
+    else:
+        # If only column was truncated or no truncation, no lines were omitted
+        final_omitted_lines = 0
+    
     result: dict = {
         "content": content,
         "total_lines": total_lines,
         "truncated": truncated,
     }
     if truncated:
-        result["omitted_lines"] = total_lines - len(selected_lines)
+        result["omitted_lines"] = final_omitted_lines
 
     return json.dumps(result)
 

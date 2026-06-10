@@ -30,6 +30,11 @@ from runtime.common import kill_process_group
 # Default idle timeout in seconds before a stdio process is reaped.
 _DEFAULT_IDLE_TIMEOUT = 300
 
+# HTTP request timeout (seconds) for MCP tool calls.
+# Long-running tools (e.g. read_verification_code with retries) may need minutes.
+# Override via the MCP_EXEC_TIMEOUT environment variable.
+_MCP_EXEC_TIMEOUT = int(os.environ.get("MCP_EXEC_TIMEOUT", 300))
+
 
 class MCPClientManager:
     """Singleton MCP Client manager supporting stdio and Streamable HTTP transports."""
@@ -180,7 +185,7 @@ class MCPClientManager:
         body = json.dumps(request).encode("utf-8")
         req = urllib.request.Request(url, data=body, headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=_MCP_EXEC_TIMEOUT) as resp:
                 # Capture session ID from response headers (set during initialize)
                 new_session_id = resp.headers.get("mcp-session-id")
                 if new_session_id:
@@ -214,7 +219,7 @@ class MCPClientManager:
                         if new_sid:
                             headers2["mcp-session-id"] = new_sid
                         req2 = urllib.request.Request(url, data=body, headers=headers2, method="POST")
-                        with urllib.request.urlopen(req2, timeout=30) as resp2:
+                        with urllib.request.urlopen(req2, timeout=_MCP_EXEC_TIMEOUT) as resp2:
                             new_session_id2 = resp2.headers.get("mcp-session-id")
                             if new_session_id2:
                                 conn["session_id"] = new_session_id2
@@ -235,7 +240,7 @@ class MCPClientManager:
                         if new_sid:
                             headers2["mcp-session-id"] = new_sid
                         req2 = urllib.request.Request(url, data=body, headers=headers2, method="POST")
-                        with urllib.request.urlopen(req2, timeout=30) as resp2:
+                        with urllib.request.urlopen(req2, timeout=_MCP_EXEC_TIMEOUT) as resp2:
                             new_session_id2 = resp2.headers.get("mcp-session-id")
                             if new_session_id2:
                                 conn["session_id"] = new_session_id2

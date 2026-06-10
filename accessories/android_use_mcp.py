@@ -749,12 +749,29 @@ def create_mcp_server(host: str = "0.0.0.0", port: int = 8000) -> FastMCP:
                 result_data = json.loads(result)
                 
                 if not result_data.get("success"):
-                    logger.warning(f"尝试 {attempt + 1}/{max_retries}: 获取短信失败: {result_data.get('stderr', result_data.get('message', ''))}")
-                    if attempt < max_retries - 1:
-                        time.sleep(retry_interval)
-                    continue
+                    error_msg = result_data.get('stderr', result_data.get('message', '获取短信失败'))
+                    logger.error(f"获取短信失败: {error_msg}")
+                    return json.dumps({
+                        "success": False,
+                        "message": error_msg,
+                        "verification_code": "",
+                        "sms_body": "",
+                        "raw_output": ""
+                    }, ensure_ascii=False)
                 
                 sms_output = result_data.get("stdout", "")
+                # 检查 stderr 是否包含权限错误或其它致命错误（部分设备 returncode=0 但 stderr 有异常）
+                stderr_output = result_data.get("stderr", "")
+                if stderr_output and ("Error" in stderr_output or "Exception" in stderr_output or "Permission" in stderr_output):
+                    logger.error(f"ADB 命令执行出错: {stderr_output}")
+                    return json.dumps({
+                        "success": False,
+                        "message": f"ADB 命令执行出错: {stderr_output}",
+                        "verification_code": "",
+                        "sms_body": "",
+                        "raw_output": stderr_output
+                    }, ensure_ascii=False)
+
                 if not sms_output or sms_output.strip() == "No result found.":
                     logger.info(f"尝试 {attempt + 1}/{max_retries}: 最近5分钟内没有收到短信")
                     if attempt < max_retries - 1:
@@ -799,26 +816,40 @@ def create_mcp_server(host: str = "0.0.0.0", port: int = 8000) -> FastMCP:
             first_sms_output = '\n'.join(first_sms_lines)
             
             # 步骤2：解析短信内容
-            # 输出格式为：
-            # Row: 0 address=10086, date=1780639504356, body=...
-            # 我们需要提取body部分
-            lines = first_sms_output.strip().split('\n')
-            body_lines = []
-            in_body = False
-            for line in lines:
-                if line.startswith('body='):
-                    # 从这一行开始是body内容
-                    body_part = line[5:]  # 去掉"body="
-                    body_lines.append(body_part)
-                    in_body = True
-                elif in_body and not line.startswith('Row:'):
-                    # 继续body内容
-                    body_lines.append(line)
-                elif line.startswith('Row:'):
-                    # 遇到新的Row，停止
-                    break
+            # 输出格式可能为：
+            # 单行格式: Row: 0 address=10086, date=1780639504356, body=...
+            # 多行格式: Row: 0
+            #          address=10086
+            #          date=1780639504356
+            #          body=...
             
-            body = '\n'.join(body_lines).strip()
+            body = ""
+            # 先尝试单行解析（更常见的情况）
+            body_start = first_sms_output.find('body=')
+            if body_start != -1:
+                # 找到 body= 的位置，提取后面的内容
+                body_content = first_sms_output[body_start + 5:]  # 去掉 "body="
+                # 如果有逗号，说明后面还有其他字段，只取到逗号之前
+                comma_pos = body_content.find(',')
+                if comma_pos != -1:
+                    body = body_content[:comma_pos].strip()
+                else:
+                    body = body_content.strip()
+            else:
+                # 尝试多行解析（备用方案）
+                lines = first_sms_output.strip().split('\n')
+                body_lines = []
+                in_body = False
+                for line in lines:
+                    if line.startswith('body='):
+                        body_part = line[5:]
+                        body_lines.append(body_part)
+                        in_body = True
+                    elif in_body and not line.startswith('Row:'):
+                        body_lines.append(line)
+                    elif line.startswith('Row:'):
+                        break
+                body = '\n'.join(body_lines).strip()
             
             # 步骤3：提取验证码
             # 正则表达式：优先匹配带有前缀的4-6位数字
@@ -826,7 +857,7 @@ def create_mcp_server(host: str = "0.0.0.0", port: int = 8000) -> FastMCP:
             # 如果没找到带前缀的，则匹配独立的4-6位数字（但可能误匹配）
             
             # 首先尝试带前缀的匹配
-            pattern_with_prefix = r'(?:验证码|code|CODE|验证|verification|sms\s*code|动态码|校验码)[:\s]*(\d{4,6})'
+            pattern_with_prefix = r'(?:验证码|code|CODE|验证|verification|sms\s*code|动态码|校验码)[:：\s]*(\d{4,6})'
             match = re.search(pattern_with_prefix, body, re.IGNORECASE)
             
             if match:
