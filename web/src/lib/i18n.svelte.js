@@ -8,6 +8,9 @@ export const LANGS = [
 
 const translations = {
   zh: {
+    // App
+    appTitle: '玲珑',
+
     // Layout
     openMenu: '打开菜单',
 
@@ -377,6 +380,9 @@ const translations = {
   },
 
   en: {
+    // App
+    appTitle: 'Linglong Agent Service',
+
     // Layout
     openMenu: 'Open menu',
 

@@ -1247,12 +1247,18 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 if persist_exc is not None:
                     logger.error("infer_stream: failed to save conversation for session %s: %s", session_id, persist_exc)
 
-            # --- Session Status Stream: broadcast "done_success_unread" ---
+            # --- Session Status Stream: broadcast "done_success_unread" or "done_error_unread" ---
             if session_id is not None:
+                # Check if any collected message indicates an error
+                has_error = any(
+                    m.role == "assistant" and m.content and m.content.startswith("Error:")
+                    for m in collected_messages
+                )
+                status = "done_error_unread" if has_error else "done_success_unread"
                 with _session_state_lock:
-                    _session_statuses[session_id] = "done_success_unread"
-                    _unread_sessions[session_id] = "done_success_unread"
-                _broadcast_session_status(session_id, "done_success_unread")
+                    _session_statuses[session_id] = status
+                    _unread_sessions[session_id] = status
+                _broadcast_session_status(session_id, status)
         except (BrokenPipeError, ConnectionResetError):
             cancel_event.set()
             if use_session and self._is_active_stream(session_id, cancel_event):

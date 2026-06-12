@@ -7,6 +7,7 @@ execute commands described in SKILL.md.
 These tools use only Python standard library modules.
 """
 
+import fnmatch
 import gzip
 import hashlib
 import json
@@ -129,9 +130,9 @@ def _bash_execute(command: str, cwd: str = "") -> str:
                 command, shell=True, capture_output=True, text=True,
                 timeout=timeout, cwd=cwd if cwd else None,
             )
-            output = result.stdout.strip()
+            output = (result.stdout or "").strip()
             if result.returncode != 0:
-                err = result.stderr.strip()
+                err = (result.stderr or "").strip()
                 return f"Exit code {result.returncode}\nstderr: {err}\nstdout: {output}"
             return output if output else "(empty output)"
         except subprocess.TimeoutExpired:
@@ -426,7 +427,7 @@ def _make_delegate_fn(runtime, thread_local):
                 model_id=model_id,
                 tool_ids=resolved_ids,
                 messages=messages,
-                max_tool_rounds=int(os.environ.get("MAX_TOOL_ROUNDS", 20))
+                max_tool_rounds=int(os.environ.get("MAX_TOOL_ROUNDS", 100))
             )
 
             # 保存旧值，切换到子 session 上下文
@@ -861,26 +862,26 @@ class _FileJournalManager:
         if state.get("is_symlink") or not os.path.isdir(os.path.join(self.workspace, ".git")):
             return None
         status = self._git_text(["status", "--porcelain", "--", rel_path])
-        if status.returncode != 0 or status.stdout.strip():
+        if status.returncode != 0 or (status.stdout or "").strip():
             return None
         oid_result = self._git_text(["rev-parse", f"HEAD:{rel_path}"])
         if oid_result.returncode != 0:
             return None
         commit_result = self._git_text(["rev-parse", "HEAD"])
-        cat_result = self._git(["cat-file", "-p", oid_result.stdout.strip()])
+        cat_result = self._git(["cat-file", "-p", (oid_result.stdout or "").strip()])
         if commit_result.returncode != 0 or cat_result.returncode != 0:
             return None
         ls_result = self._git_text(["ls-tree", "HEAD", "--", rel_path])
         mode = state.get("mode", "100644")
-        if ls_result.returncode == 0 and ls_result.stdout.strip():
-            mode = ls_result.stdout.split()[0]
-        raw = cat_result.stdout
+        if ls_result.returncode == 0 and (ls_result.stdout or "").strip():
+            mode = (ls_result.stdout or "").split()[0]
+        raw = cat_result.stdout or ""
         return {
             "exists": True,
             "store": "git",
-            "oid": oid_result.stdout.strip(),
+            "oid": (oid_result.stdout or "").strip(),
             "git_object_format": "sha1",
-            "git_commit": commit_result.stdout.strip(),
+            "git_commit": (commit_result.stdout or "").strip(),
             "git_path": rel_path,
             "sha256": _sha256_bytes(raw),
             "size": len(raw),
@@ -943,8 +944,8 @@ class _Linter:
                 timeout=30,
             )
             if result.returncode == 0:
-                return (True, result.stdout + result.stderr)
-            return (False, (result.stdout + result.stderr).strip())
+                return (True, (result.stdout or "") + (result.stderr or ""))
+            return (False, ((result.stdout or "") + (result.stderr or "")).strip())
         except Exception as exc:
             # Never raise — treat unexpected errors as a pass so that the
             # linter doesn't block edits when the tool is unavailable.
@@ -1663,7 +1664,7 @@ def _normalize_patch_for_path(patch: str, rel_path: str, resolved_path: Optional
 
 def _patch_process_output(result: subprocess.CompletedProcess) -> str:
     output = "\n".join(
-        part.strip() for part in (result.stdout, result.stderr) if part and part.strip()
+        part.strip() for part in (result.stdout or "", result.stderr or "") if part and part.strip()
     )
     
     if not output:
@@ -1821,10 +1822,73 @@ BUILTIN_TOOLS.append((EDIT_FILE_TOOL_CONFIG, _edit_file))
 # ---------------------------------------------------------------------------
 
 def _split_patterns(pattern: str | None) -> list[str]:
-    """Split a pattern string by | into a list of non-empty patterns."""
+    """Split a pattern string by | into a list of non-empty normalized patterns."""
     if not pattern:
         return []
-    return [p.strip() for p in pattern.split("|") if p.strip()]
+    return [p.strip().replace("\\", "/") for p in pattern.split("|") if p.strip()]
+
+
+def _search_glob_matches(rel_path: str, pattern: str) -> bool:
+    """Best-effort path glob matching shared by rg and grep result filtering."""
+    normalized_path = rel_path.replace("\\", "/")
+    if normalized_path.startswith("./"):
+        normalized_path = normalized_path[2:]
+    normalized_pattern = pattern.strip().replace("\\", "/")
+    if normalized_pattern in {"*", "**", "**/*"}:
+        return True
+
+    basename = os.path.basename(normalized_path)
+    if fnmatch.fnmatch(normalized_path, normalized_pattern):
+        return True
+    if fnmatch.fnmatch(basename, normalized_pattern):
+        return True
+    if normalized_pattern.startswith("**/"):
+        suffix = normalized_pattern[3:]
+        return fnmatch.fnmatch(normalized_path, suffix) or fnmatch.fnmatch(basename, suffix)
+    return False
+
+
+def _search_path_allowed(rel_path: str, include_patterns: list[str], exclude_patterns: list[str]) -> bool:
+    """Apply user include/exclude globs after command execution.
+
+    This is required for grep because GNU grep applies ``--include`` and
+    ``--exclude`` to basenames only, while rg-style globs are path-aware.
+    """
+    normalized_path = rel_path.replace("\\", "/")
+    if normalized_path.startswith("./"):
+        normalized_path = normalized_path[2:]
+    if include_patterns and not any(_search_glob_matches(normalized_path, pat) for pat in include_patterns):
+        return False
+    if exclude_patterns and any(_search_glob_matches(normalized_path, pat) for pat in exclude_patterns):
+        return False
+    return True
+
+
+def _grep_include_args(patterns: list[str]) -> list[str]:
+    """Convert path-aware include globs into safe basename-only grep includes."""
+    args: list[str] = []
+    seen: set[str] = set()
+    for pattern in patterns:
+        basename_pattern = pattern.rsplit("/", 1)[-1]
+        if basename_pattern in {"", "*", "**"} or basename_pattern in seen:
+            continue
+        seen.add(basename_pattern)
+        args.append(f"--include={basename_pattern}")
+    return args
+
+
+def _grep_exclude_args(patterns: list[str]) -> list[str]:
+    """Return grep excludes only for basename globs to avoid over-exclusion."""
+    args: list[str] = []
+    seen: set[str] = set()
+    for pattern in patterns:
+        if "/" in pattern:
+            continue
+        if pattern in {"", "*", "**"} or pattern in seen:
+            continue
+        seen.add(pattern)
+        args.append(f"--exclude={pattern}")
+    return args
 
 
 def _search_code(query: str, include: Optional[str] = None, exclude: Optional[str] = None) -> str:
@@ -1855,21 +1919,24 @@ def _search_code(query: str, include: Optional[str] = None, exclude: Optional[st
 
     # Default excludes
     default_excludes = [".git", "node_modules", "dist"]
+    include_patterns = _split_patterns(include)
+    exclude_patterns = _split_patterns(exclude)
 
     # Try ripgrep first
     if shutil.which("rg") is not None:
-        cmd = ["rg", "--json", query]
+        cmd = ["rg", "--json"]
         # Add default excludes
         for excl in default_excludes:
             cmd += ["--glob", f"!{excl}"]
         # Add user-specified include patterns (support | as OR)
-        if include:
-            for pat in _split_patterns(include):
-                cmd += ["--glob", pat]
+        for pat in include_patterns:
+            cmd += ["--glob", pat]
         # Add user-specified exclude patterns (support | as OR)
-        if exclude:
-            for pat in _split_patterns(exclude):
-                cmd += ["--glob", f"!{pat}"]
+        for pat in exclude_patterns:
+            cmd += ["--glob", f"!{pat}"]
+        # Explicit path is required: when stdin is not a TTY, rg may otherwise
+        # read stdin instead of recursively searching the workspace.
+        cmd += ["-e", query, "."]
 
         try:
             result = subprocess.run(
@@ -1884,7 +1951,7 @@ def _search_code(query: str, include: Optional[str] = None, exclude: Optional[st
         results = []
         total_found = 0
 
-        for line in result.stdout.splitlines():
+        for line in (result.stdout or "").splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -1896,13 +1963,16 @@ def _search_code(query: str, include: Optional[str] = None, exclude: Optional[st
             if obj.get("type") != "match":
                 continue
 
+            data = obj.get("data", {})
+            file_path = data.get("path", {}).get("text", "")
+            # Make path relative to workspace
+            if os.path.isabs(file_path):
+                file_path = os.path.relpath(file_path, workspace)
+            if not _search_path_allowed(file_path, include_patterns, exclude_patterns):
+                continue
+
             total_found += 1
             if len(results) < max_results:
-                data = obj.get("data", {})
-                file_path = data.get("path", {}).get("text", "")
-                # Make path relative to workspace
-                if os.path.isabs(file_path):
-                    file_path = os.path.relpath(file_path, workspace)
                 line_number = data.get("line_number", 0)
                 submatches = data.get("submatches", [])
                 column = submatches[0].get("start", 0) if submatches else 0
@@ -1952,16 +2022,13 @@ def _search_code(query: str, include: Optional[str] = None, exclude: Optional[st
         cmd = ["grep", "-r", "-n"]
         for excl in default_excludes:
             cmd += [f"--exclude-dir={excl}"]
-        # Add user-specified include patterns (support | as OR)
-        if include:
-            for pat in _split_patterns(include):
-                cmd += [f"--include={pat}"]
-        # Add user-specified exclude patterns (support | as OR)
-        if exclude:
-            for pat in _split_patterns(exclude):
-                cmd += [f"--exclude={pat}"]
-        # Add the query and search path
-        cmd += ["-E", query, "."]
+        # GNU grep --include/--exclude only match basenames.  Use safe command
+        # narrowing and apply authoritative path-glob filtering in Python below.
+        cmd += _grep_include_args(include_patterns)
+        cmd += _grep_exclude_args(exclude_patterns)
+        # Add the query and search path. Use -e to prevent option injection when
+        # a user regex starts with '-' and -I to ignore binary files.
+        cmd += ["-I", "-E", "-e", query, "."]
 
         try:
             result = subprocess.run(
@@ -1976,7 +2043,7 @@ def _search_code(query: str, include: Optional[str] = None, exclude: Optional[st
         results = []
         total_found = 0
 
-        for line in result.stdout.splitlines():
+        for line in (result.stdout or "").splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -1988,6 +2055,8 @@ def _search_code(query: str, include: Optional[str] = None, exclude: Optional[st
             # Make path relative (grep may prefix with ./)
             if file_path.startswith("./"):
                 file_path = file_path[2:]
+            if not _search_path_allowed(file_path, include_patterns, exclude_patterns):
+                continue
             try:
                 line_number = int(line_num_str)
             except ValueError:

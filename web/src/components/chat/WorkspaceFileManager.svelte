@@ -85,17 +85,42 @@
     return String(path || '').replace(/\\/g, '/').replace(/\/$/, '')
   }
 
+  // Detect Windows-style paths (e.g. C:\, D:/) for case-insensitive comparison.
+  // Windows file systems are case-insensitive, so we must lowercase when
+  // comparing to avoid false negatives from os.environ vs os.listdir casing.
+  function isWindowsStylePath(p) {
+    return /^[A-Za-z]:[\\/]/.test(p)
+  }
+
+  function pathsEqual(a, b) {
+    const na = normalizePathForCompare(a)
+    const nb = normalizePathForCompare(b)
+    if (isWindowsStylePath(na) || isWindowsStylePath(nb)) {
+      return na.toLowerCase() === nb.toLowerCase()
+    }
+    return na === nb
+  }
+
+  function pathStartsWith(base, child) {
+    const nb = normalizePathForCompare(base)
+    const nc = normalizePathForCompare(child)
+    if (isWindowsStylePath(nb) || isWindowsStylePath(nc)) {
+      return nc.toLowerCase().startsWith(nb.toLowerCase() + '/')
+    }
+    return nc.startsWith(nb + '/')
+  }
+
   function isInsideWorkspacePath(path) {
-    const normalizedPath = normalizePathForCompare(path)
-    const normalizedWorkspace = normalizePathForCompare(workspacePath)
-    return normalizedPath === normalizedWorkspace || normalizedPath.startsWith(normalizedWorkspace + '/')
+    return pathsEqual(path, workspacePath) || pathStartsWith(workspacePath, path)
   }
 
   function relativeWorkspacePath(path) {
     const normalizedPath = normalizePathForCompare(path)
     const normalizedWorkspace = normalizePathForCompare(workspacePath)
-    if (normalizedPath === normalizedWorkspace) return ''
-    if (!normalizedPath.startsWith(normalizedWorkspace + '/')) return ''
+    // Use the same-case versions for slicing, but compare case-insensitively on Windows
+    const equal = pathsEqual(normalizedPath, normalizedWorkspace)
+    if (equal) return ''
+    if (!pathStartsWith(normalizedWorkspace, normalizedPath)) return ''
     return normalizedPath.slice(normalizedWorkspace.length + 1)
   }
 
@@ -110,10 +135,13 @@
   function topLevelNameUnderCurrentPath(filePath, fallbackName = '') {
     const normalizedFilePath = normalizePathForCompare(filePath)
     const normalizedCurrentPath = normalizePathForCompare(currentPath)
-    if (normalizedCurrentPath && normalizedFilePath.startsWith(normalizedCurrentPath + '/')) {
+    const isWin = isWindowsStylePath(normalizedFilePath) || isWindowsStylePath(normalizedCurrentPath)
+    const cmpFilePath = isWin ? normalizedFilePath.toLowerCase() : normalizedFilePath
+    const cmpCurrentPath = isWin ? normalizedCurrentPath.toLowerCase() : normalizedCurrentPath
+    if (cmpCurrentPath && cmpFilePath.startsWith(cmpCurrentPath + '/')) {
       return normalizedFilePath.slice(normalizedCurrentPath.length + 1).split('/')[0] || fallbackName
     }
-    if (!normalizedCurrentPath && normalizedFilePath.startsWith('/')) {
+    if (!cmpCurrentPath && cmpFilePath.startsWith('/')) {
       return normalizedFilePath.slice(1).split('/')[0] || fallbackName
     }
     return fallbackName
@@ -226,7 +254,7 @@
         depth: 0,
         expanded: false,  // 先折叠，后面再展开需要的
         loading: false,
-        isWorkspace: rootPath === wsPath
+        isWorkspace: pathsEqual(rootPath, wsPath)
       })
     }
 
@@ -276,7 +304,7 @@
       const segPath = childPath(parentPath, seg)
 
       // 确保该段在树中并展开
-      const nodeIdx = treeNodes.findIndex(n => n.path === segPath)
+      const nodeIdx = treeNodes.findIndex(n => pathsEqual(n.path, segPath))
       if (nodeIdx === -1) break
 
       treeNodes[nodeIdx].expanded = true
@@ -316,7 +344,7 @@
         depth,
         expanded: false,
         loading: false,
-        isWorkspace: path === wsPath,
+        isWorkspace: pathsEqual(path, wsPath),
         ...(c.symlink_target ? { symlink_target: c.symlink_target } : {}),
       }
     })
@@ -734,8 +762,8 @@
   function currentRelativeDir() {
     const normalizedCurrent = currentPath.replace(/\\/g, '/').replace(/\/$/, '')
     const normalizedWorkspace = workspacePath.replace(/\\/g, '/').replace(/\/$/, '')
-    if (normalizedCurrent === normalizedWorkspace) return ''
-    if (!normalizedCurrent.startsWith(normalizedWorkspace + '/')) return ''
+    if (pathsEqual(normalizedCurrent, normalizedWorkspace)) return ''
+    if (!pathStartsWith(normalizedWorkspace, normalizedCurrent)) return ''
     return normalizeUploadPath(normalizedCurrent.slice(normalizedWorkspace.length + 1))
   }
 
@@ -1243,7 +1271,7 @@
           {#each treeNodes as node (node.path)}
             <div 
               class="tree-node"
-              class:active={currentPath === node.path}
+              class:active={pathsEqual(currentPath, node.path)}
               class:workspace={node.isWorkspace}
               style="padding-left: {8 + node.depth * 16}px"
             >

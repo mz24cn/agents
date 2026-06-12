@@ -405,8 +405,8 @@ def _read_journal_git_blob(blob_ref: dict, workspace: str) -> bytes:
         text=False,
     )
     if result.returncode != 0:
-        raise ValueError(result.stderr.decode("utf-8", errors="replace") or "Could not read git blob")
-    raw = result.stdout
+        raise ValueError((result.stderr or b"").decode("utf-8", errors="replace") or "Could not read git blob")
+    raw = result.stdout or b""
     expected_sha = blob_ref.get("sha256")
     if expected_sha and _journal_sha256(raw) != expected_sha:
         raise ValueError("Git journal blob sha256 mismatch")

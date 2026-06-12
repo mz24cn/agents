@@ -324,7 +324,7 @@ def create_mcp_server(host: str = "0.0.0.0", port: int = 8000) -> FastMCP:
                 url, data=data, method="POST",
                 headers={"Content-Type": "application/json"},
             )
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=300) as resp:
                 result = json.loads(resp.read().decode("utf-8"))
                 return result
         except urllib.error.HTTPError as e:

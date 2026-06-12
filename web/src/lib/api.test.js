@@ -184,7 +184,7 @@ describe('sessions.list', () => {
 
     expect(fetch).toHaveBeenCalledOnce()
     const [url, opts] = fetch.mock.calls[0]
-    expect(url).toBe('/v1/sessions')
+    expect(url).toBe('/v1/sessions?page=1&page_size=100')
     expect(opts.method).toBe('GET')
     expect(result).toEqual(responseData)
   })

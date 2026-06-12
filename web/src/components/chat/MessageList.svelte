@@ -2,10 +2,22 @@
   import MessageBubble from './MessageBubble.svelte'
   import { t } from '../../lib/i18n.svelte.js'
   import { slide } from 'svelte/transition'
+  import { getContext } from 'svelte'
+  import AppLogo from '../../lib/components/AppLogo.svelte'
 
   let { messages = [], agentList = [], onRevoke, onScrollAtBottom, shouldScrollToBottom = false, collapsedGroups = new Set(), onToggleCollapse } = $props()
   let listEl = $state(null)
   let isAtBottom = $state(true)
+  
+  // 获取 appLogoStore
+  const appLogoStore = getContext('appLogoStore')
+  let logoConfig = $state('')
+  
+  if (appLogoStore) {
+    appLogoStore.subscribe(value => {
+      logoConfig = value
+    })
+  }
 
   // 展开/收起动画时长（ms），setTimeout 需要与此保持一致
   const SLIDE_DURATION = 600
@@ -107,7 +119,12 @@
 <div class="message-list" bind:this={listEl} onscroll={onScroll}>
   {#if messages.length === 0}
     <div class="empty">
-      <img src="/logo.svg" alt="Linglong Agent Service" class="empty-logo" />
+      <div class="logo-container">
+        {#if logoConfig && logoConfig.trim() !== ''}
+          <AppLogo class="empty-custom-logo" />
+        {/if}
+        <img src="/logo.svg" alt="Logo" class="default-logo" />
+      </div>
       <div class="empty-text">{t('startChat')}</div>
     </div>
   {:else}
@@ -172,14 +189,21 @@
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    gap: 24px;
+    gap: 16px;
     color: var(--text-secondary);
     padding: 40px 0;
   }
-  .empty-logo {
-    width: min(480px, 80vw);
-    height: auto;
-    opacity: 0.85;
+  .empty :global(.logo-container) {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .empty-custom-logo {
+    flex-shrink: 0;
+  }
+  .default-logo {
+    width: auto;
+    height: 64px;
   }
   .empty-text {
     font-size: 1rem;

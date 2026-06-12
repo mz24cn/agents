@@ -1046,6 +1046,30 @@ class TestSearchCodeUnit:
         assert result.get("fallback") == "grep"
         assert result["total_found"] >= 1
 
+    def test_grep_fallback_supports_path_aware_include_globs(self, workspace):
+        """grep fallback must not pass path globs like **/*.py directly to --include."""
+        nested = workspace / "runtime"
+        nested.mkdir()
+        target = nested / "fallback_path_glob.py"
+        other = workspace / "fallback_path_glob.txt"
+        target.write_text("path_glob_unique_pattern\n")
+        other.write_text("path_glob_unique_pattern\n")
+
+        original_which = _shutil.which
+
+        def mock_which(name):
+            if name == "rg":
+                return None
+            return original_which(name)
+
+        with _mock_patch("runtime.builtin_tools.shutil.which", side_effect=mock_which):
+            result = _json.loads(_search_code("path_glob_unique_pattern", include="runtime/*.py"))
+
+        assert "error" not in result, f"Unexpected error: {result}"
+        assert result.get("fallback") == "grep"
+        assert result["total_found"] == 1
+        assert result["results"][0]["file"] == "runtime/fallback_path_glob.py"
+
     def test_both_unavailable_returns_search_tool_not_found(self, workspace):
         """When both rg and grep are unavailable, returns SearchToolNotFound error."""
         def mock_which(name):

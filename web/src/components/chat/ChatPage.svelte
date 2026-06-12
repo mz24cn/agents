@@ -1,5 +1,6 @@
 <script>
-  import { onMount, onDestroy } from 'svelte'
+  import { onMount, onDestroy, setContext } from 'svelte'
+  import { writable } from 'svelte/store'
   import { inferStream, abortInferStream, subscribeSessionEvents, agents as agentsApi, sessions as sessionsApi, env as envApi } from '../../lib/api.js'
   import { catalog, loadAgents, loadTools, refreshAgents } from '../../lib/catalog-state.svelte.js'
   import ModelSelector from './ModelSelector.svelte'
@@ -17,6 +18,12 @@
 
   const STORAGE_MODEL_KEY = 'chat_selected_model'
   const STORAGE_TOOLS_KEY = 'chat_selected_tools'
+  
+  // 应用配置 store
+  const appLogoStore = writable('') // 初始为空，等待异步加载
+  
+  // 设置 context，供子组件使用
+  setContext('appLogoStore', appLogoStore)
 
   let selectedModelId = $state(localStorage.getItem(STORAGE_MODEL_KEY) ?? '')
   let selectedToolIds = $state(JSON.parse(localStorage.getItem(STORAGE_TOOLS_KEY) ?? '[]'))
@@ -101,18 +108,52 @@
   // 选中的文件列表（用于输入框）
   let selectedWorkspaceFiles = $state([])
   // 工作区是否为自定义路径（不等于默认路径，且默认路径已知）
-  // Ensure trailing slash for display. With CSS direction:rtl the trailing
-  // slash anchors the end, making paths like "/root" render as "/root/"
-  // instead of the confusing "root/". Also keeps D:\ displayable on Windows.
+  // Ensure trailing slash for display so that root paths like "D:\" or "/root"
+  // render with a trailing separator. We preserve the OS-native separator
+  // (backslash on Windows) so the displayed path matches what users expect.
   let displayWorkspacePath = $derived.by(() => {
     let p = workspacePath || ''
     if (!p) return ''
-    // Normalise Windows backslashes for display
-    p = p.replace(/\\/g, '/')
-    if (!p.endsWith('/')) p += '/'
+    const hasBackslash = p.includes('\\')
+    const sep = hasBackslash ? '\\' : '/'
+    if (!p.endsWith(sep)) p += sep
     return p
   })
   let isWorkspaceCustom = $derived(workspacePath && defaultWorkspacePath && workspacePath !== defaultWorkspacePath)
+
+  // --- Path truncation (show end when overflow) ---
+  // We avoid CSS direction:rtl because it renders backslash paths incorrectly
+  // on Windows (BiDi algorithm garbles "\:" sequences). Instead we use a
+  // ResizeObserver + binary search to compute "…" + tail that fits.
+  let pathEl = $state(null)
+
+  $effect(() => {
+    const path = displayWorkspacePath
+    const el = pathEl
+    if (!el) return
+
+    function update() {
+      if (!path) { el.textContent = ''; return }
+      // Set full text first
+      el.textContent = path
+      if (el.scrollWidth <= el.clientWidth) return  // fits, done
+
+      // Binary search: how many end-chars can we show with "…" prefix?
+      const ellipsis = '\u2026'
+      let lo = 0, hi = path.length
+      while (lo < hi) {
+        const mid = Math.ceil((lo + hi) / 2)
+        el.textContent = ellipsis + path.slice(-mid)
+        if (el.scrollWidth <= el.clientWidth) lo = mid; else hi = mid - 1
+      }
+      el.textContent = lo > 0 ? ellipsis + path.slice(-lo) : ellipsis
+    }
+
+    update()
+    const ro = new ResizeObserver(() => requestAnimationFrame(update))
+    ro.observe(el)
+    return () => ro.disconnect()
+  })
 
   // 添加为智能体状态
   let addAgentMode = $state(false)
@@ -149,6 +190,15 @@
     try {
       const resp = await envApi.list()
       const envMap = resp.env || {}
+      document.title = envMap.APP_TITLE || t('appTitle')
+      
+      // 处理 APP_LOGO 配置
+      const logoConfig = envMap.APP_LOGO ?? ''  // 空字符串表示未配置
+      
+      // 更新 store：如果配置为空，store 为空（不显示）
+      // AppLogo 组件会自动处理 favicon 更新
+      appLogoStore.set(logoConfig)
+      
       if (envMap.AGENT_WORKSPACE) {
         defaultWorkspacePath = envMap.AGENT_WORKSPACE
         workspacePath = envMap.AGENT_WORKSPACE
@@ -893,7 +943,7 @@
     {#if isWorkspaceCustom}
       <div class="workspace-indicator" title={workspacePath} onclick={openWorkspacePanel}>
         <span class="workspace-icon">📁</span>
-        <span class="workspace-path">{displayWorkspacePath}</span>
+        <span class="workspace-path" bind:this={pathEl}></span>
       </div>
     {/if}
     <div class="agent-selector-spacer"></div>
@@ -1097,10 +1147,9 @@
   }
   .workspace-path {
     overflow: hidden;
-    text-overflow: ellipsis;
     white-space: nowrap;
-    direction: rtl;
-    text-align: left;
+    flex: 1;
+    min-width: 0;
   }
   .agent-selector { display: flex; align-items: center; gap: 8px; }
   .agent-selector select {

@@ -150,12 +150,16 @@ class EnvManager:
         prompt_template_manager: object | None = None,
         agent_manager: object | None = None,
         include_project: bool = True,
+        include_env: bool = False,
         script_format: str = "sh",
     ) -> bytes:
         """生成可通过 ``curl ... | sh`` 或 ``irm ... | iex`` 执行的自解压安装脚本。
 
         脚本内嵌一个 tar.gz 载荷，包含当前 agent service 代码以及服务端
-        已注册的模型、工具、MCP server、提示词模板、智能体配置和 env.json。
+        已注册的模型、工具、MCP server、提示词模板和智能体配置。
+
+        Args:
+            include_env: 是否打包当前服务端的 env.json（默认不打包，避免把本地环境变量带到目标机器）。
         """
         payload = self._build_setup_payload(
             project_root=project_root,
@@ -164,6 +168,7 @@ class EnvManager:
             prompt_template_manager=prompt_template_manager,
             agent_manager=agent_manager,
             include_project=include_project,
+            include_env=include_env,
         )
         encoded = "\n".join(textwrap.wrap(base64.b64encode(payload).decode("ascii"), 76))
         fmt = script_format.lower().strip()
@@ -206,7 +211,7 @@ class EnvManager:
 
     def _build_setup_payload(self, *, project_root: str, data_dir: str, runtime: object | None,
                              prompt_template_manager: object | None, agent_manager: object | None,
-                             include_project: bool) -> bytes:
+                             include_project: bool, include_env: bool) -> bytes:
         project_root = os.path.realpath(project_root)
         data_dir = os.path.realpath(data_dir)
         with tempfile.TemporaryDirectory(prefix="agent_setup_") as tmpdir:
@@ -217,9 +222,15 @@ class EnvManager:
             os.makedirs(cfg_dir, exist_ok=True)
             if include_project:
                 self._copy_project(project_root, app_dir)
-            self._write_runtime_configs(cfg_dir, data_dir=data_dir, project_root=project_root, runtime=runtime,
-                                        prompt_template_manager=prompt_template_manager,
-                                        agent_manager=agent_manager)
+            self._write_runtime_configs(
+                cfg_dir,
+                data_dir=data_dir,
+                project_root=project_root,
+                runtime=runtime,
+                prompt_template_manager=prompt_template_manager,
+                agent_manager=agent_manager,
+                include_env=include_env,
+            )
             self._dump_json(os.path.join(payload_root, "manifest.json"), {
                 "name": "agent-service-setup", "version": 1,
                 "generated_at": datetime.datetime.utcnow().isoformat() + "Z",
@@ -234,6 +245,10 @@ class EnvManager:
         if tarinfo.issym() or tarinfo.islnk():
             target = getattr(tarinfo, "linkname", "")
             logger.warning("打包 setup payload 时跳过链接 %s -> %s", tarinfo.name, target)
+            return None
+        # 默认不打包本地环境变量，避免把开发者机器上的敏感配置带到目标机器。
+        if tarinfo.name in {"./agents_runtime/env.json", "agents_runtime/env.json"}:
+            logger.info("打包 setup payload 时跳过环境变量文件 %s", tarinfo.name)
             return None
         return tarinfo
 
@@ -289,8 +304,10 @@ class EnvManager:
 
     def _write_runtime_configs(self, cfg_dir: str, *, data_dir: str, project_root: str, runtime: object | None,
                                prompt_template_manager: object | None,
-                               agent_manager: object | None) -> None:
-        self._dump_json(os.path.join(cfg_dir, "env.json"), self.read())
+                               agent_manager: object | None,
+                               include_env: bool = False) -> None:
+        if include_env:
+            self._dump_json(os.path.join(cfg_dir, "env.json"), self.read())
         model_registry = getattr(runtime, "_model_registry", None)
         tool_registry = getattr(runtime, "_tool_registry", None)
         mcp_manager = getattr(runtime, "_mcp_manager", None)

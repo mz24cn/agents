@@ -229,7 +229,7 @@ class InferenceRequest:
     messages: Optional[list] = None
     text: Optional[str] = None
     stream: bool = False
-    max_tool_rounds: int = 20
+    max_tool_rounds: int = 100
 
 
 @dataclass

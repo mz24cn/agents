@@ -2,6 +2,7 @@
   import { agents } from '../../lib/api.js'
   import { catalog, loadAgents, refreshAgents } from '../../lib/catalog-state.svelte.js'
   import ConfirmDialog from '../ConfirmDialog.svelte'
+  import IconDisplay from '../../lib/components/IconDisplay.svelte'
   import { t } from '../../lib/i18n.svelte.js'
 
   let { onEdit = null, onCopy = null } = $props()
@@ -63,13 +64,7 @@
           <div class="agent-card">
             {#if agent.avatar}
               <div class="agent-avatar">
-                {#if agent.avatar.startsWith('data:')}
-                  <img src={agent.avatar} alt={agent.nickname} />
-                {:else if agent.avatar.startsWith('http') || agent.avatar.startsWith('//')}
-                  <img src={agent.avatar} alt={agent.nickname} />
-                {:else}
-                  <span class="avatar-emoji">{agent.avatar}</span>
-                {/if}
+                <IconDisplay value={agent.avatar} alt={agent.nickname} size={56} />
               </div>
             {/if}
             <div class="agent-info">

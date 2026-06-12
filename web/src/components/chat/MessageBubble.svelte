@@ -5,6 +5,7 @@
   import ImageViewer from './ImageViewer.svelte'
   import AudioPlayer from './AudioPlayer.svelte'
   import CopyButton from './CopyButton.svelte'
+  import IconDisplay from '../../lib/components/IconDisplay.svelte'
   import { t } from '../../lib/i18n.svelte.js'
   import { highlight } from '../../lib/highlight.js'
 
@@ -158,15 +159,11 @@
       </div>
     {:else if msg.role === 'assistant'}
       {#if matchedAgent}
-        {#if matchedAgent.avatar}
-          {#if matchedAgent.avatar.startsWith('data:') || matchedAgent.avatar.startsWith('http') || matchedAgent.avatar.startsWith('//')}
-            <img src={matchedAgent.avatar} class="agent-avatar" alt="" />
-          {:else}
-            <span>{matchedAgent.avatar}</span>
-          {/if}
-        {:else}
-          <span>🤖</span>
-        {/if}
+        <IconDisplay 
+          value={matchedAgent.avatar || '🤖'} 
+          class="agent-avatar" 
+          size={32}
+        />
       {/if}
       <span class="agent-name">{displayName}</span>
       <div class="role-actions">

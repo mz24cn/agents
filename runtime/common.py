@@ -474,8 +474,99 @@ def get_workspace() -> str:
 # Generic file search
 # ---------------------------------------------------------------------------
 
+import fnmatch
 import shutil
 import subprocess as _subprocess
+
+
+def _split_glob_patterns(patterns: Optional[str]) -> list[str]:
+    """Split ``|``-separated glob patterns into normalized, non-empty patterns."""
+    if not patterns:
+        return []
+    return [p.strip().replace("\\", "/") for p in patterns.split("|") if p.strip()]
+
+
+def _glob_matches_path(path: str, root: str, pattern: str) -> bool:
+    """Return whether *path* matches a ripgrep-style path glob best-effort.
+
+    Python's :mod:`fnmatch` is used as a portable fallback matcher.  We match
+    both the path relative to *root* and the basename so common patterns such as
+    ``*.py`` keep the same user-facing behavior across rg and grep.
+    """
+    normalized_pattern = pattern.strip().replace("\\", "/")
+    if normalized_pattern in {"*", "**", "**/*"}:
+        return True
+
+    try:
+        rel_path = os.path.relpath(os.path.realpath(path), root)
+    except ValueError:
+        return False
+    rel_path = rel_path.replace(os.sep, "/")
+    basename = os.path.basename(path)
+
+    if fnmatch.fnmatch(rel_path, normalized_pattern):
+        return True
+    if fnmatch.fnmatch(basename, normalized_pattern):
+        return True
+
+    # Treat ``**/foo`` as "foo at any depth", including the root directory.
+    if normalized_pattern.startswith("**/"):
+        suffix = normalized_pattern[3:]
+        return fnmatch.fnmatch(rel_path, suffix) or fnmatch.fnmatch(basename, suffix)
+
+    return False
+
+
+def _grep_include_args(globs: list[str]) -> list[str]:
+    """Build safe GNU grep ``--include`` args from path-aware glob patterns.
+
+    GNU grep applies ``--include`` to basenames only, so passing path globs like
+    ``**/*`` or ``**/conversation.json`` directly makes grep match nothing.  We
+    therefore only pass basename constraints to grep and do the authoritative
+    path-glob filtering in Python after the command returns.
+    """
+    args: list[str] = []
+    seen: set[str] = set()
+    for glob in globs:
+        normalized = glob.strip().replace("\\", "/")
+        if normalized in {"", "*", "**", "**/*"}:
+            continue
+        basename_glob = normalized.rsplit("/", 1)[-1]
+        if basename_glob in {"", "*", "**"} or basename_glob in seen:
+            continue
+        seen.add(basename_glob)
+        args.append(f"--include={basename_glob}")
+    return args
+
+
+def _filter_search_paths(paths: set[str], root: str, include_globs: list[str], exclude_dirs: list[str]) -> set[str]:
+    """Normalize and filter search result paths returned by rg/grep."""
+    filtered: set[str] = set()
+    root_real = os.path.realpath(root)
+
+    for raw_path in paths:
+        if not raw_path:
+            continue
+        abs_path = raw_path if os.path.isabs(raw_path) else os.path.join(root_real, raw_path)
+        abs_path = os.path.realpath(abs_path)
+
+        try:
+            rel_path = os.path.relpath(abs_path, root_real)
+            if rel_path == os.pardir or rel_path.startswith(os.pardir + os.sep):
+                continue
+        except ValueError:
+            continue
+
+        rel_parts = set(rel_path.replace(os.sep, "/").split("/"))
+        if any(excluded in rel_parts for excluded in exclude_dirs):
+            continue
+
+        if include_globs and not any(_glob_matches_path(abs_path, root_real, glob) for glob in include_globs):
+            continue
+
+        filtered.add(abs_path)
+
+    return filtered
 
 
 def parse_search_query(query: str) -> tuple[str, list[str]]:
@@ -549,9 +640,6 @@ def search_files(
     tool = rg or grep
 
     # ---- helpers ----------------------------------------------------------
-    def _split_glob(patterns: str) -> list[str]:
-        return [p.strip() for p in patterns.split("|") if p.strip()]
-
     def _run(cmd: list[str]) -> set[str]:
         proc = _subprocess.run(
             cmd,
@@ -563,10 +651,11 @@ def search_files(
         )
         if proc.returncode not in (0, 1):          # 1 = no matches
             return set()
-        return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+        return {line.strip() for line in (proc.stdout or "").splitlines() if line.strip()}
 
     # ---- build common flags ----------------------------------------------
-    globs = _split_glob(include)
+    globs = _split_glob_patterns(include)
+    grep_include_args = _grep_include_args(globs)
     result: set[str] = set()
 
     try:
@@ -585,13 +674,14 @@ def search_files(
                 pattern = "|".join(
                     re.escape(kw) if fixed_strings else kw for kw in keywords
                 )
-                cmd = [tool, "-R", "-l", "-E"]
-                for g in globs:
-                    cmd += [f"--include={g}"]
+                # Use -r (not -R): grep -R follows symlinks, unlike rg, and
+                # can walk huge external trees such as workspace symlinks.
+                cmd = [tool, "-r", "-l", "-I", "-E"]
+                cmd += grep_include_args
                 for d in exclude_dirs:
                     cmd += [f"--exclude-dir={d}"]
-                cmd += [pattern, root]
-            result = _run(cmd)
+                cmd += ["-e", pattern, root]
+            result = _filter_search_paths(_run(cmd), root, globs, exclude_dirs)
 
         else:
             # AND: iterative narrowing — first keyword narrows scope,
@@ -608,15 +698,15 @@ def search_files(
                             cmd += ["--fixed-strings"]
                         cmd += ["-e", kw, root]
                     else:
-                        cmd = [tool, "-R", "-l"]
+                        # Use -r (not -R) to avoid following workspace symlinks.
+                        cmd = [tool, "-r", "-l", "-I"]
                         if fixed_strings:
                             cmd += ["-F"]
-                        for g in globs:
-                            cmd += [f"--include={g}"]
+                        cmd += grep_include_args
                         for d in exclude_dirs:
                             cmd += [f"--exclude-dir={d}"]
                         cmd += ["-e", kw, root]
-                    result = _run(cmd)
+                    result = _filter_search_paths(_run(cmd), root, globs, exclude_dirs)
                 else:
                     if not result:
                         break
@@ -626,7 +716,7 @@ def search_files(
                             cmd += ["--fixed-strings"]
                         cmd += ["-e", kw] + sorted(result)
                     else:
-                        cmd = [tool, "-l"]
+                        cmd = [tool, "-l", "-I"]
                         if fixed_strings:
                             cmd += ["-F"]
                         cmd += ["-e", kw] + sorted(result)
@@ -637,7 +727,7 @@ def search_files(
     except Exception:
         return set()
 
-    return result
+    return _filter_search_paths(result, root, globs, exclude_dirs)
 
 
 # ---------------------------------------------------------------------------
