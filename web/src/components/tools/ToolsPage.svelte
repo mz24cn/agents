@@ -13,6 +13,7 @@
   let deleteTarget = $state(null)
   let detailTool = $state(null)
   let expandedGroups = $state(new Set())
+  let mcpServerConfigs = $state({})
 
   async function fetchTools({ force = false } = {}) {
     try {
@@ -21,6 +22,11 @@
     } catch {
       catalog.tools.error = catalog.tools.error || t('fetchToolListFailed')
     }
+    // Also load MCP server configs to show connection type
+    try {
+      const data = await mcpServers.list()
+      mcpServerConfigs = data.mcpServers ?? {}
+    } catch { /* ignore */ }
   }
 
   let groups = $derived.by(() => {
@@ -45,6 +51,14 @@
   }
 
   function isMcpGroup(key) { return key.startsWith('mcp:') }
+
+  function mcpServerType(key) {
+    if (!isMcpGroup(key)) return ''
+    const serverName = key.slice(4)
+    const cfg = mcpServerConfigs[serverName]
+    if (cfg?.url) return cfg.url
+    return 'stdio'
+  }
 
   function toggleCollapse(key) {
     const next = new Set(expandedGroups)
@@ -130,6 +144,7 @@
                 <span class="group-count">{t('toolCount', { n: groupTools.length })}</span>
               </span>
               {#if isMcpGroup(key)}
+                <span class="mcp-server-type" title={mcpServerType(key)}>{mcpServerType(key)}</span>
                 <button class="btn btn-sm" onclick={() => handleEditGroupClick(key)} title={t('editMcpServerTitle')}>{t('edit')}</button>
                 <button class="btn btn-sm btn-danger" onclick={() => handleDeleteGroupClick(key)} title={t('deleteMcpServerTitle')}>{t('delete')}</button>
               {/if}
@@ -210,6 +225,7 @@
   .group-title { flex: 1; display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 0.9rem; color: var(--text); }
   .badge { font-size: 0.7rem; padding: 1px 6px; border-radius: 4px; font-weight: 700; }
   .badge-mcp { background: #2563eb22; color: #2563eb; }
+  .mcp-server-type { color: var(--primary); font-size: 0.8rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 320px; margin-left: auto; }
   .badge-builtin { font-size: 0.7rem; padding: 1px 6px; border-radius: 4px; font-weight: 700; background: #16a34a22; color: #16a34a; }
   .group-count { font-weight: normal; font-size: 0.8rem; color: var(--text-secondary); }
   table { width: 100%; border-collapse: collapse; }

@@ -5,6 +5,7 @@
   import { catalog, loadAgents, loadTools, refreshAgents } from '../../lib/catalog-state.svelte.js'
   import ModelSelector from './ModelSelector.svelte'
   import ToolSelector from './ToolSelector.svelte'
+  import AgentSelector from './AgentSelector.svelte'
   import PromptTemplateSelector from './PromptTemplateSelector.svelte'
   import PlaceholderInputs from './PlaceholderInputs.svelte'
   import MarkdownRenderer from './MarkdownRenderer.svelte'
@@ -215,7 +216,7 @@
   function handleSelectFiles(files) {
     selectedWorkspaceFiles = files
     // 将文件路径添加到输入框，使用 <file> 标签避免和前后文本粘连，后端会解析该标签
-    const fileRefs = files.map(f => `<file>${f.relative_path || f.path}</file>`).join(' ')
+    const fileRefs = files.map(f => `<file>${f.relative_path}</file>`).join(' ')
     inputText = inputText ? `${inputText} ${fileRefs}` : fileRefs
     closeWorkspacePanel()
   }
@@ -838,14 +839,6 @@
     }
   })
 
-  function handleAgentChange(e) {
-    selectedAgentId = e.target.value
-    if (selectedAgentId) {
-      localStorage.setItem('chat_selected_agent', selectedAgentId)
-    } else {
-      localStorage.removeItem('chat_selected_agent')
-    }
-  }
 
   // 生成添加智能体的默认昵称
   function generateAgentDefaultNickname() {
@@ -947,18 +940,19 @@
       </div>
     {/if}
     <div class="agent-selector-spacer"></div>
-    <div class="agent-selector">
+    <div class="agent-selector-wrapper">
       🤖<a href="#/setup?tab=agents" class="nav-link">{t('agentSelector')}</a>
-      {#if loadingAgents}
-        <span class="hint">{t('loading')}</span>
-      {:else}
-        <select id="agent-select" value={selectedAgentId} onchange={handleAgentChange}>
-          <option value="">—</option>
-          {#each agentList as a (a.agent_id)}
-            <option value={a.agent_id}>{a.nickname}{a.myself_view ? ' (' + a.myself_view + ')' : ''}</option>
-          {/each}
-        </select>
-      {/if}
+      <AgentSelector 
+        bind:selectedAgentId 
+        onchange={(id) => {
+          if (id) {
+            localStorage.setItem('chat_selected_agent', id)
+          } else {
+            localStorage.removeItem('chat_selected_agent')
+          }
+        }}
+        disabled={loadingAgents}
+      />
     </div>
   </div>
   {#if systemPromptTemplate || systemPromptText}
@@ -1151,17 +1145,7 @@
     flex: 1;
     min-width: 0;
   }
-  .agent-selector { display: flex; align-items: center; gap: 8px; }
-  .agent-selector select {
-    padding: 6px 10px;
-    border-radius: 6px;
-    border: 1px solid var(--border);
-    background: var(--bg);
-    color: var(--text);
-    font-size: 0.9rem;
-    min-width: 180px;
-  }
-  .agent-selector .hint { font-size: 0.8rem; color: var(--text-secondary); }
+  .agent-selector-wrapper { display: flex; align-items: center; gap: 8px; }
   .system-prompt-bar {
     display: flex;
     align-items: center;

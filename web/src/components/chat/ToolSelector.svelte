@@ -69,6 +69,18 @@
 
   $effect(() => { loadTools().catch(() => {}) })
 
+  // 点击外部关闭下拉框
+  function handleClickOutside(event) {
+    if (!event.target.closest('.tool-selector')) {
+      expanded = false
+    }
+  }
+
+  $effect(() => {
+    document.addEventListener('click', handleClickOutside)
+    return () => document.removeEventListener('click', handleClickOutside)
+  })
+
   // 过滤掉已不存在的工具 ID，避免选中已删除的工具；共享列表刷新后即时生效。
   $effect(() => {
     if (!catalog.tools.loaded) return

@@ -2,6 +2,7 @@
   import { marked } from 'marked'
   import { highlight } from '$lib/highlight'
   import { t } from '$lib/i18n.svelte.js'
+  import { copyToClipboard } from '$lib/clipboard.js'
 
   let { content = '' } = $props()
 
@@ -124,7 +125,7 @@
           if (!rawCode) return
           try {
             const decoded = decodeURIComponent(escape(atob(rawCode)))
-            navigator.clipboard.writeText(decoded).catch(() => {})
+            copyToClipboard(decoded)
           } catch {
             // Silent failure
           }

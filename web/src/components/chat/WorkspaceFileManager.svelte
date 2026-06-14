@@ -4,6 +4,7 @@
   import { workspace as workspaceApi } from '../../lib/api.js'
   import { marked } from 'marked'
   import { highlight, escapeHtml, getFileLang, isMarkdownFile } from '../../lib/highlight.js'
+  import { copyToClipboard } from '../../lib/clipboard.js'
 
   /**
    * 工作区文件管理器面板
@@ -113,15 +114,36 @@
   function isInsideWorkspacePath(path) {
     return pathsEqual(path, workspacePath) || pathStartsWith(workspacePath, path)
   }
+  /**
+   * 计算相对于工作区的路径，支持 ../ 表示工作区外的路径
+   * 工作区根目录本身返回 '.'
+   */
+  function relativeWorkspacePath(targetPath) {
+    const normalizedTarget = normalizePathForCompare(targetPath)
+    const normalizedBase = normalizePathForCompare(workspacePath)
 
-  function relativeWorkspacePath(path) {
-    const normalizedPath = normalizePathForCompare(path)
-    const normalizedWorkspace = normalizePathForCompare(workspacePath)
-    // Use the same-case versions for slicing, but compare case-insensitively on Windows
-    const equal = pathsEqual(normalizedPath, normalizedWorkspace)
-    if (equal) return ''
-    if (!pathStartsWith(normalizedWorkspace, normalizedPath)) return ''
-    return normalizedPath.slice(normalizedWorkspace.length + 1)
+    if (normalizedTarget === normalizedBase) return '.'
+    if (normalizedTarget.startsWith(normalizedBase + '/')) {
+      return normalizedTarget.slice(normalizedBase.length + 1)
+    }
+
+    const targetParts = normalizedTarget.split('/').filter(Boolean)
+    const baseParts = normalizedBase.split('/').filter(Boolean)
+
+    let commonLength = 0
+    while (
+      commonLength < targetParts.length &&
+      commonLength < baseParts.length &&
+      targetParts[commonLength] === baseParts[commonLength]
+    ) {
+      commonLength++
+    }
+
+    const upCount = baseParts.length - commonLength
+    const upPath = '../'.repeat(upCount)
+    const remainingPath = targetParts.slice(commonLength).join('/')
+
+    return upCount > 0 ? (upPath + remainingPath).replace(/\/$/, '') || '..' : remainingPath || '.'
   }
 
   function isSelectableFile(file) {
@@ -642,7 +664,16 @@
   function copySelectedPaths() {
     const paths = getSelectedFiles().map(f => f.path)
     if (paths.length > 0) {
-      navigator.clipboard.writeText(paths.join('\n'))
+      copyToClipboard(paths.join('\n'))
+    }
+  }
+  
+  // 批量复制相对路径（相对于工作区）
+  function copySelectedRelativePaths() {
+    const files = getSelectedFiles()
+    if (files.length > 0) {
+      const relativePaths = files.map(f => relativeWorkspacePath(f.path))
+      copyToClipboard(relativePaths.join('\n'))
     }
   }
 
@@ -1354,12 +1385,22 @@
     }}>
       {t('download')}{isMulti ? ` (${selectedFiles.size})` : ''}
     </button>
-    <!-- 复制路径：支持多选 -->
+    <!-- 复制绝对路径：支持多选 -->
     <button onmousedown={() => { 
-      if (isMulti) { copySelectedPaths() } else { navigator.clipboard.writeText(menuFile?.path || '') }
+      if (isMulti) { copySelectedPaths() } else { copyToClipboard(menuFile?.path || '') }
       hideContextMenu() 
     }}>
-      {t('copyPath')}{isMulti ? ` (${selectedFiles.size})` : ''}
+      {t('copyAbsolutePath')}{isMulti ? ` (${selectedFiles.size})` : ''}
+    </button>
+    <!-- 复制相对路径：支持多选 -->
+    <button onmousedown={() => { 
+      if (isMulti) { copySelectedRelativePaths() } else { 
+        const relativePath = relativeWorkspacePath(menuFile?.path || '')
+        copyToClipboard(relativePath)
+      }
+      hideContextMenu() 
+    }}>
+      {t('copyRelativePath')}{isMulti ? ` (${selectedFiles.size})` : ''}
     </button>
     <!-- 重命名：多选时置灰 -->
     <button 
