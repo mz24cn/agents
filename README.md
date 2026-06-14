@@ -27,6 +27,7 @@ A minimal, zero-dependency Agent Service built with the pure Python standard lib
 - **Multi-agent collaboration** — delegate subtasks to independent Subagents via the built-in `delegate` tool; each Subagent runs with its own model and toolset, returning results to the parent agent. Supports streaming output, nested delegation, and automatic session persistence
 - **Agent management** — save current model, tools, and system prompt configurations as reusable Agents; quickly switch between saved Agents in the chat interface
 - **Web UI management console** — Svelte 5 SPA for managing models, tools, prompt templates, agents, and chat
+- **Service-level authorization** — optional single-tenant auth system for all `/v1/*` APIs, with Bearer API keys for scripts/SDKs and HttpOnly session cookies for the Web UI; credentials are stored locally as hashes in `~/.agents_runtime/auth_token.json`, and `/v1/setup` export links use short-lived setup tokens
 - **HTTP API server** — lightweight REST API built on `http.server`, no FastAPI/uvicorn needed
 - **Multimodal** — supports image (base64) and audio inputs for VLM models
 - **Multi-task concurrent conversations with real-time status tracking** — support multiple simultaneous chat sessions with independent streaming states; real-time session status updates via SSE (streaming, success, error, unread); automatic read status management based on user scroll position; session title broadcasting
@@ -346,6 +347,7 @@ Features:
 - Tool management (CRUD)
 - Prompt template management with `{{placeholder}}` variable support
 - Agent management — save current configuration as a reusable agent; switch agents in the chat interface
+- Authorization settings — configure the Web login password, session cookie lifetime, API Bearer Key, and short-lived `/v1/setup` export commands from the browser
 - Markdown rendering with syntax highlighting
 - Expandable long JSON string previews that auto-fit the available code block width
 - Workspace file manager — directory tree navigation, list/grid views, file search, rename/duplicate/delete, chunked upload with progress tracking, and clipboard paste upload
@@ -444,6 +446,7 @@ MIT License — see [LICENSE](LICENSE)
 - **多智能体协作** — 通过内置 `delegate` 工具将子任务委派给独立的 Subagent 执行；每个 Subagent 可使用不同的模型和工具集，完成后将结果返回给父 Agent。支持流式输出、嵌套委派和自动会话持久化
 - **智能体管理** — 将当前模型、工具和系统提示词配置保存为可复用的智能体；在聊天界面中快速切换已保存的智能体
 - **Web UI 管理控制台** — Svelte 5 SPA，支持模型、工具、提示词模板、智能体管理和对话
+- **服务级授权系统** — 面向单租户场景的可选授权机制，保护所有 `/v1/*` API；脚本/SDK 使用 Bearer API Key，Web UI 使用 HttpOnly Session Cookie；凭据以哈希形式保存在本地 `~/.agents_runtime/auth_token.json`，`/v1/setup` 导出链接使用短有效期 setup token
 - **HTTP API 服务** — 基于 `http.server` 的轻量 REST API，无需 FastAPI/uvicorn
 - **多模态** — 支持图片（base64）和音频输入，适配 VLM 模型
 - **多任务并发对话及实时状态跟踪** — 支持多个聊天会话同时进行，每个会话独立管理流式状态；通过SSE实时更新会话状态（流式中、成功、错误、未读）；基于用户滚动位置自动管理已读状态；会话标题实时广播更新
@@ -761,6 +764,7 @@ npm run build
 - 工具管理（增删改查）
 - 提示词模板管理
 - 智能体管理 — 将当前配置保存为可复用的智能体；在对话中快速切换智能体
+- 授权设置 — 在浏览器中配置 Web 登录密码、Session Cookie 有效期、API Bearer Key，以及带短有效期 token 的 `/v1/setup` 导出命令
 - Markdown 渲染与语法高亮
 - JSON 长字符串可折叠预览，并自动适配代码块可用宽度
 - 工作区文件管理器 — 目录树导航、列表/网格视图、文件搜索、重命名/复制/删除、分块上传及进度跟踪、剪贴板粘贴上传

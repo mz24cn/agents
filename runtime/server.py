@@ -19,6 +19,7 @@ import threading
 import urllib.parse
 from dataclasses import asdict
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
+from http import cookies
 from typing import Callable, Optional
 
 logger = logging.getLogger("runtime.server")
@@ -29,6 +30,7 @@ logger = logging.getLogger("runtime.server")
 # ---------------------------------------------------------------------------
 
 
+from runtime.auth_manager import AuthManager, COOKIE_NAME
 from runtime.env_manager import EnvManager
 from runtime.session_manager import SessionManager
 from runtime.mcp_client import MCPClientManager
@@ -282,6 +284,7 @@ _TOOLS_PATH = os.path.join(_DATA_DIR, "tools.json")
 _MCP_SERVERS_PATH = os.path.join(_DATA_DIR, "mcp_servers.json")
 _PROMPT_TEMPLATES_PATH = os.path.join(_DATA_DIR, "prompt_templates.json")
 _ENV_PATH = os.path.join(_DATA_DIR, "env.json")
+_AUTH_PATH = os.path.join(_DATA_DIR, "auth_token.json")
 _AGENTS_DIR = os.path.join(_DATA_DIR, "agents")
 
 # ---------------------------------------------------------------------------
@@ -369,7 +372,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         """Handle CORS preflight requests."""
         self.send_response(200)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Upload-Offset, X-Upload-Size, X-File-Size")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Upload-Offset, X-Upload-Size, X-File-Size")
         self.end_headers()
 
     # ------------------------------------------------------------------
@@ -406,6 +409,82 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         """Send a JSON error response."""
         self._send_json_response(status, {"error": message})
 
+    def _get_auth_manager(self) -> AuthManager:
+        return self.server.auth_manager  # type: ignore[attr-defined]
+
+    def _request_cookie(self, name: str) -> str:
+        raw = self.headers.get("Cookie", "")
+        if not raw:
+            return ""
+        try:
+            jar = cookies.SimpleCookie()
+            jar.load(raw)
+            morsel = jar.get(name)
+            return morsel.value if morsel else ""
+        except Exception:
+            return ""
+
+    def _bearer_token(self) -> str:
+        auth = self.headers.get("Authorization", "")
+        if auth.lower().startswith("bearer "):
+            return auth[7:].strip()
+        return ""
+
+    def _is_authorized(self, method: str, path: str) -> bool:
+        if not path.startswith("/v1/"):
+            return True
+        if method == "OPTIONS":
+            return True
+        # Login/logout endpoints must remain reachable so the browser can
+        # establish/clear its HttpOnly session cookie.
+        if method == "POST" and path in {"/v1/auth/login", "/v1/auth/logout"}:
+            return True
+
+        auth_manager = self._get_auth_manager()
+        # Missing auth_token.json or missing password/api-key keeps the whole
+        # authorization system invisible and preserves existing behavior.
+        if not auth_manager.is_enabled():
+            return True
+
+        # Short-lived setup token grants access only to /v1/setup.
+        if method == "GET" and path == "/v1/setup":
+            parsed = urllib.parse.urlparse(self.path)
+            params = urllib.parse.parse_qs(parsed.query)
+            token = params.get("token", [""])[0]
+            if token and auth_manager.verify_setup_token(token):
+                return True
+
+        session_token = self._request_cookie(COOKIE_NAME)
+        if session_token and auth_manager.verify_session_token(session_token):
+            return True
+
+        bearer = self._bearer_token()
+        if bearer and auth_manager.verify_api_key(bearer):
+            return True
+
+        return False
+
+    def _require_authorized(self, method: str, path: str) -> bool:
+        if self._is_authorized(method, path):
+            return True
+        self._send_json_response(401, {"error": "unauthorized", "message": "Authentication required"})
+        return False
+
+    def _send_session_cookie(self, token: str, max_age: int) -> None:
+        parts = [
+            f"{COOKIE_NAME}={token}",
+            f"Max-Age={int(max_age)}",
+            "Path=/",
+            "HttpOnly",
+            "SameSite=Strict",
+        ]
+        if self.headers.get("X-Forwarded-Proto", "").lower() == "https":
+            parts.append("Secure")
+        self.send_header("Set-Cookie", "; ".join(parts))
+
+    def _clear_session_cookie(self) -> None:
+        self.send_header("Set-Cookie", f"{COOKIE_NAME}=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict")
+
     def _get_runtime(self) -> Runtime:
         """Get the Runtime instance from the server."""
         return self.server.runtime  # type: ignore[attr-defined]
@@ -418,6 +497,8 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         """Handle GET requests."""
         # Strip query string before routing so GET endpoints can accept query params.
         path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
+        if path.startswith("/v1/") and not self._require_authorized("GET", path):
+            return
         if path == "/v1/models":
             self._handle_list_models()
         elif path == "/v1/tools":
@@ -428,6 +509,8 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self._handle_list_prompt_templates()
         elif path == "/v1/env":
             self._handle_get_env()
+        elif path == "/v1/auth/config":
+            self._handle_auth_config_get()
         elif path == "/v1/setup":
             self._handle_setup_script()
         elif path == "/v1/sessions":
@@ -506,7 +589,15 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         """Handle POST requests."""
         path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
-        if path == "/v1/infer":
+        if path.startswith("/v1/") and not self._require_authorized("POST", path):
+            return
+        if path == "/v1/auth/login":
+            self._handle_auth_login()
+        elif path == "/v1/auth/logout":
+            self._handle_auth_logout()
+        elif path == "/v1/auth/config":
+            self._handle_auth_config_post()
+        elif path == "/v1/infer":
             self._handle_infer()
         elif path == "/v1/infer/stream":
             self._handle_infer_stream()
@@ -557,6 +648,8 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
     def do_PUT(self) -> None:
         """Handle PUT requests."""
         path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
+        if path.startswith("/v1/") and not self._require_authorized("PUT", path):
+            return
         m = re.match(r"^/v1/models/([^/]+)$", path)
         if m:
             self._handle_update_model(m.group(1))
@@ -586,6 +679,8 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:
         """Handle DELETE requests."""
         path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
+        if path.startswith("/v1/") and not self._require_authorized("DELETE", path):
+            return
         m = re.match(r"^/v1/models/([^/]+)$", path)
         if m:
             self._handle_delete_model(m.group(1))
@@ -625,6 +720,84 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self._handle_workspace_upload_cancel(urllib.parse.unquote(m.group(1)))
             return
         self._send_json_error(404, f"Not found: {self.path}")
+
+    # ------------------------------------------------------------------
+    # Auth handlers
+    # ------------------------------------------------------------------
+
+    def _handle_auth_login(self) -> None:
+        auth_manager = self._get_auth_manager()
+        if not auth_manager.is_enabled():
+            self._send_json_response(200, {"ok": True, "auth_enabled": False})
+            return
+        data = self._read_json_body()
+        if data is None:
+            return
+        password = data.get("password", "")
+        if not auth_manager.verify_password(str(password)):
+            self._send_json_response(401, {"error": "invalid_password", "message": "Invalid password"})
+            return
+        token, max_age = auth_manager.create_session_token()
+        body = json.dumps({"ok": True}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self._send_session_cookie(token, max_age)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_auth_logout(self) -> None:
+        body = json.dumps({"ok": True}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self._clear_session_cookie()
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_auth_config_get(self) -> None:
+        auth_manager = self._get_auth_manager()
+        self._send_json_response(200, auth_manager.status(include_setup_token=True))
+
+    def _handle_auth_config_post(self) -> None:
+        data = self._read_json_body()
+        if data is None:
+            return
+        disable_auth = bool(data.get("disable_auth"))
+        password = data.get("password", None)
+        if password is not None:
+            password = str(password)
+        ttl = data.get("cookie_ttl_seconds", None)
+        if ttl is not None:
+            try:
+                ttl = int(ttl)
+            except (TypeError, ValueError):
+                self._send_json_response(400, {"error": "invalid_cookie_ttl", "message": "Invalid cookie TTL"})
+                return
+        auth_manager = self._get_auth_manager()
+        try:
+            if disable_auth:
+                result = auth_manager.disable_auth()
+            else:
+                result = auth_manager.update_config(password=password, cookie_ttl_seconds=ttl)
+        except ValueError as exc:
+            code = "invalid_password_format" if "Password" in str(exc) else "invalid_cookie_ttl"
+            self._send_json_response(400, {"error": code, "message": str(exc)})
+            return
+        except RuntimeError as exc:
+            self._send_json_response(500, {"error": "disable_auth_failed", "message": str(exc)})
+            return
+        body = json.dumps(result, ensure_ascii=False).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        if result.get("has_password"):
+            token, max_age = auth_manager.create_session_token()
+            self._send_session_cookie(token, max_age)
+        else:
+            self._clear_session_cookie()
+        self.end_headers()
+        self.wfile.write(body)
 
     # ------------------------------------------------------------------
     # GET handlers
@@ -2682,6 +2855,7 @@ class RuntimeHTTPServer:
         self._port = port
         self._prompt_template_manager = PromptTemplateManager()
         self._agent_manager = AgentManager()
+        self._auth_manager = AuthManager(_AUTH_PATH)
         self._server: Optional[HTTPServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -2770,6 +2944,7 @@ class RuntimeHTTPServer:
         self._server.static_dir = self._static_dir  # type: ignore[attr-defined]
         self._server.context_manager = self._context_manager  # type: ignore[attr-defined]
         self._server.env_manager = self._env_manager  # type: ignore[attr-defined]
+        self._server.auth_manager = self._auth_manager  # type: ignore[attr-defined]
         self._server.session_manager = self._session_manager  # type: ignore[attr-defined]
         self._server.active_streams = self._active_streams  # type: ignore[attr-defined]
         self._server.workspace_uploads = {}  # type: ignore[attr-defined]
@@ -2789,6 +2964,7 @@ class RuntimeHTTPServer:
         self._server.static_dir = self._static_dir  # type: ignore[attr-defined]
         self._server.context_manager = self._context_manager  # type: ignore[attr-defined]
         self._server.env_manager = self._env_manager  # type: ignore[attr-defined]
+        self._server.auth_manager = self._auth_manager  # type: ignore[attr-defined]
         self._server.session_manager = self._session_manager  # type: ignore[attr-defined]
         self._server.active_streams = self._active_streams  # type: ignore[attr-defined]
         self._server.workspace_uploads = {}  # type: ignore[attr-defined]

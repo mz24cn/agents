@@ -1,6 +1,7 @@
 <script>
   import { router, getQueryParam } from '../../lib/router.svelte.js'
   import ThemeToggle from '../ThemeToggle.svelte'
+  import AuthSettingsPage from './AuthSettingsPage.svelte'
   import { t, i18n, setLang } from '../../lib/i18n.svelte.js'
   import { catalog, loadPromptTemplates, refreshModels, refreshTools, refreshPromptTemplates, refreshAgents, refreshEnvVars } from '../../lib/catalog-state.svelte.js'
   import ModelsPage from '../models/ModelsPage.svelte'
@@ -14,10 +15,11 @@
   import AgentForm from '../agents/AgentForm.svelte'
   import { mcpServers } from '../../lib/api.js'
 
-  const validTabs = ['models', 'tools', 'prompts', 'agents', 'env', 'model-add', 'tool-add', 'prompt-add', 'agent-add', 'env-add', 'model-edit', 'tool-edit', 'prompt-edit', 'agent-edit']
+  const validTabs = ['models', 'tools', 'prompts', 'agents', 'env', 'auth', 'model-add', 'tool-add', 'prompt-add', 'agent-add', 'env-add', 'model-edit', 'tool-edit', 'prompt-edit', 'agent-edit']
   const initialTab = validTabs.includes(getQueryParam('tab')) ? getQueryParam('tab') : 'agents'
   let activeTab = $state(initialTab)
   let envDetectTrigger = $state(0)
+  let authRefreshTrigger = $state(0)
   let refreshing = $state(false)
 
   let editingModel = $state(null)
@@ -97,6 +99,11 @@
         { id: 'env-detect', label: '📡', icon: '📡', action: 'detect' },
       ]
     },
+    {
+      items: [
+        { id: 'auth', label: '授权', icon: '🔐' },
+      ]
+    },
   ])
 
   function handleTabClick(id) {
@@ -122,6 +129,7 @@
       else if (category === 'prompts') await refreshPromptTemplates()
       else if (category === 'agents') await refreshAgents()
       else if (category === 'env') await refreshEnvVars()
+      else if (category === 'auth') authRefreshTrigger += 1
     } catch { /* errors are shown in each page */ }
     refreshing = false
   }
@@ -299,6 +307,10 @@
       <div class="form-wrapper">
         <EnvPage showAddForm={true} />
       </div>
+    {:else if activeTab === 'auth'}
+      {#key authRefreshTrigger}
+        <AuthSettingsPage />
+      {/key}
     {/if}
   </div>
 </div>

@@ -1,5 +1,5 @@
 <script>
-  import { models } from '../../lib/api.js'
+  import { models, apiFetch } from '../../lib/api.js'
   import { refreshModels } from '../../lib/catalog-state.svelte.js'
   import { t, i18n } from '../../lib/i18n.svelte.js'
   import JsonEditor from '../JsonEditor.svelte'
@@ -104,7 +104,7 @@
         stream: false,
       }
 
-      const res = await fetch('/v1/infer', {
+      const res = await apiFetch('/v1/infer', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),

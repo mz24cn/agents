@@ -8,6 +8,7 @@
   import AgentsPage from './components/agents/AgentsPage.svelte'
   import EnvPage from './components/env/EnvPage.svelte'
   import SetupPage from './components/setup/SetupPage.svelte'
+  import AuthDialog from './components/AuthDialog.svelte'
 
   let currentPath = $derived(parseRoute().path)
   let isChatActive = $derived(currentPath === '#/chat' || !['#/models', '#/tools', '#/prompts', '#/agents', '#/env', '#/setup'].includes(currentPath))
@@ -34,3 +35,4 @@
     {/if}
   {/if}
 </Layout>
+<AuthDialog />

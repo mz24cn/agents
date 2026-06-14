@@ -5,6 +5,25 @@
  * proxy forwards them to the Python backend automatically.
  */
 
+import { ensureAuthenticated } from './auth-state.svelte.js'
+
+function isAuthFailure(res) {
+  return res && res.status === 401
+}
+
+export async function apiFetch(path, opts = {}, { retryAuth = true } = {}) {
+  let res = await fetch(path, opts)
+  if (retryAuth && isAuthFailure(res) && String(path).startsWith('/v1/') && !String(path).startsWith('/v1/auth/login')) {
+    await ensureAuthenticated()
+    res = await fetch(path, opts)
+  }
+  return res
+}
+
+async function readJsonMaybe(res) {
+  try { return await res.json() } catch { return null }
+}
+
 /**
  * Base fetch helper with unified error handling.
  *
@@ -21,18 +40,18 @@ async function request(method, path, body = null) {
   if (body !== null) {
     opts.body = JSON.stringify(body)
   }
-  const res = await fetch(path, opts)
-  const data = await res.json()
+  const res = await apiFetch(path, opts)
+  const data = await readJsonMaybe(res)
   if (!res.ok) {
     // Support both single "error" string and "errors" array
-    const msg = data.message
-      || data.error
-      || (Array.isArray(data.errors) ? data.errors.join('\n') : null)
+    const msg = data?.message
+      || data?.error
+      || (Array.isArray(data?.errors) ? data.errors.join('\n') : null)
       || `Request failed: ${res.status}`
     const err = new Error(msg)
     err.status = res.status
     err.data = data
-    err.code = data.error
+    err.code = data?.error
     throw err
   }
   return data
@@ -84,7 +103,7 @@ export const promptTemplates = {
 export function inferStream(body, onMessage, onDone, onError, onInit = null) {
   const controller = new AbortController()
 
-  fetch('/v1/infer/stream', {
+  apiFetch('/v1/infer/stream', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -172,7 +191,7 @@ export function inferStream(body, onMessage, onDone, onError, onInit = null) {
  */
 export async function abortInferStream(sessionId, forced = false) {
   try {
-    await fetch('/v1/infer/abort', {
+    await apiFetch('/v1/infer/abort', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ session_id: sessionId, forced }),
@@ -214,7 +233,7 @@ export const sessions = {
 export function subscribeSessionEvents(onEvent, onError) {
   const controller = new AbortController()
 
-  fetch('/v1/sessions/events', {
+  apiFetch('/v1/sessions/events', {
     signal: controller.signal,
   })
     .then((res) => {
@@ -263,6 +282,14 @@ export function subscribeSessionEvents(onEvent, onError) {
     })
 
   return () => controller.abort()
+}
+
+export const auth = {
+  config: () => request('GET', '/v1/auth/config'),
+  updateConfig: (data) => request('POST', '/v1/auth/config', data),
+  disable: () => request('POST', '/v1/auth/config', { disable_auth: true }),
+  login: (password) => request('POST', '/v1/auth/login', { password }),
+  logout: () => request('POST', '/v1/auth/logout', {}),
 }
 
 /** 智能体 API */
