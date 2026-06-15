@@ -1,5 +1,6 @@
 <script>
   import { authDialog, submitAuthLogin, cancelAuthLogin } from '../lib/auth-state.svelte.js'
+  import { LANGS, i18n, setLang, t } from '../lib/i18n.svelte.js'
 
   function handleKeydown(e) {
     if (e.key === 'Enter') submitAuthLogin()
@@ -9,23 +10,35 @@
 
 {#if authDialog.open}
   <div class="auth-backdrop" role="presentation">
-    <div class="auth-dialog" role="dialog" aria-modal="true" aria-label="Authentication required">
-      <h2>需要授权</h2>
-      <p class="hint">请输入访问密码后继续。</p>
+    <div class="auth-dialog" role="dialog" aria-modal="true" aria-label={t('authRequiredLabel')}>
+      <div class="auth-header">
+        <h2>{t('authRequiredTitle')}</h2>
+        <div class="lang-switch" aria-label={t('languageSwitch')}>
+          {#each LANGS as lang}
+            <button
+              type="button"
+              class:active={i18n.lang === lang.code}
+              aria-pressed={i18n.lang === lang.code}
+              onclick={() => setLang(lang.code)}
+            >{lang.label}</button>
+          {/each}
+        </div>
+      </div>
+      <p class="hint">{t('authRequiredHint')}</p>
       <input
         class="password-input"
         type="password"
         bind:value={authDialog.password}
         onkeydown={handleKeydown}
-        placeholder="密码"
+        placeholder={t('authPasswordPlaceholder')}
       />
       {#if authDialog.error}
         <div class="error">{authDialog.error}</div>
       {/if}
       <div class="actions">
-        <button class="btn secondary" onclick={cancelAuthLogin} disabled={authDialog.submitting}>取消</button>
+        <button class="btn secondary" onclick={cancelAuthLogin} disabled={authDialog.submitting}>{t('cancel')}</button>
         <button class="btn primary" onclick={submitAuthLogin} disabled={authDialog.submitting || !authDialog.password}>
-          {authDialog.submitting ? '登录中...' : '登录'}
+          {authDialog.submitting ? t('authLoggingIn') : t('authLogin')}
         </button>
       </div>
     </div>
@@ -52,9 +65,37 @@
     box-shadow: 0 18px 60px rgba(0,0,0,0.28);
     padding: 22px;
   }
+  .auth-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 8px;
+  }
   h2 {
-    margin: 0 0 8px;
+    margin: 0;
     font-size: 1.25rem;
+  }
+  .lang-switch {
+    display: inline-flex;
+    flex-shrink: 0;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--bg-secondary);
+  }
+  .lang-switch button {
+    border: none;
+    border-radius: 0;
+    padding: 4px 8px;
+    cursor: pointer;
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 0.78rem;
+  }
+  .lang-switch button.active {
+    background: var(--primary);
+    color: white;
   }
   .hint {
     margin: 0 0 16px;

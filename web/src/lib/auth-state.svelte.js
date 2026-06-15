@@ -1,3 +1,5 @@
+import { t } from './i18n.svelte.js'
+
 export const authDialog = $state({
   open: false,
   password: '',
@@ -8,6 +10,12 @@ export const authDialog = $state({
 let pendingLogin = null
 let pendingResolve = null
 let pendingReject = null
+
+function authErrorMessage(data) {
+  const code = data?.error
+  if (code === 'invalid_password') return t('authInvalidPassword')
+  return t('authLoginFailed')
+}
 
 export function ensureAuthenticated() {
   if (pendingLogin) return pendingLogin
@@ -35,7 +43,7 @@ function finishLogin(ok) {
     authDialog.error = ''
     if (resolve) resolve(true)
   } else {
-    const err = new Error('Authentication cancelled')
+    const err = new Error(t('authCancelled'))
     err.name = 'AuthCancelled'
     if (reject) reject(err)
   }
@@ -54,13 +62,13 @@ export async function submitAuthLogin() {
     let data = null
     try { data = await res.json() } catch { data = null }
     if (!res.ok) {
-      authDialog.error = data?.message || data?.error || 'Invalid password'
+      authDialog.error = authErrorMessage(data)
       authDialog.submitting = false
       return
     }
     finishLogin(true)
   } catch (err) {
-    authDialog.error = err?.message || 'Login failed'
+    authDialog.error = err?.message || t('authLoginFailed')
     authDialog.submitting = false
   }
 }

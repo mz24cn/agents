@@ -2,17 +2,18 @@
   import { onMount } from 'svelte'
   import { auth } from '../../lib/api.js'
   import { copyToClipboard } from '../../lib/clipboard.js'
+  import { t } from '../../lib/i18n.svelte.js'
 
   const ttlOptions = [
-    { value: 3600, label: '1 小时' },
-    { value: 21600, label: '6 小时' },
-    { value: 43200, label: '12 小时' },
-    { value: 86400, label: '1 天' },
-    { value: 604800, label: '7 天' },
-    { value: 2592000, label: '30 天' },
-    { value: 7776000, label: '90 天' },
-    { value: 15552000, label: '180 天' },
-    { value: 31536000, label: '1 年' },
+    { value: 3600, labelKey: 'authTtl1Hour' },
+    { value: 21600, labelKey: 'authTtl6Hours' },
+    { value: 43200, labelKey: 'authTtl12Hours' },
+    { value: 86400, labelKey: 'authTtl1Day' },
+    { value: 604800, labelKey: 'authTtl7Days' },
+    { value: 2592000, labelKey: 'authTtl30Days' },
+    { value: 7776000, labelKey: 'authTtl90Days' },
+    { value: 15552000, labelKey: 'authTtl180Days' },
+    { value: 31536000, labelKey: 'authTtl1Year' },
   ]
 
   let loading = $state(false)
@@ -54,8 +55,15 @@
 
     const localTime = `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`
     const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone
-    const timezoneLabel = timezone ? `${timezone}，${formatTimezoneOffset(date)}` : formatTimezoneOffset(date)
-    return `${localTime}（浏览器本地时间：${timezoneLabel}）`
+    const timezoneLabel = timezone ? `${timezone}, ${formatTimezoneOffset(date)}` : formatTimezoneOffset(date)
+    return t('authSetupTokenExpiresDisplay', { time: localTime, timezone: timezoneLabel })
+  }
+
+  function authSettingsError(err, fallbackKey) {
+    if (err?.code === 'invalid_password_format') return t('authInvalidPasswordFormat')
+    if (err?.code === 'invalid_cookie_ttl') return t('authInvalidCookieTtl')
+    if (err?.code === 'disable_auth_failed') return t('authDisableFailed')
+    return err?.status ? t(fallbackKey) : (err?.message || t(fallbackKey))
   }
 
   onMount(() => {
@@ -74,7 +82,7 @@
       setupToken = data.setup_token || ''
       setupTokenExpiresAt = data.setup_token_expires_at || ''
     } catch (err) {
-      error = err.message || '加载授权设置失败'
+      error = authSettingsError(err, 'authLoadFailed')
     } finally {
       loading = false
     }
@@ -95,9 +103,9 @@
       setupTokenExpiresAt = data.setup_token_expires_at || ''
       apiKey = data.api_key || ''
       password = ''
-      message = apiKey ? '授权已启用，已刷新当前登录状态。' : '授权设置已保存。'
+      message = apiKey ? t('authEnabledSavedMessage') : t('authSettingsSavedMessage')
     } catch (err) {
-      error = err.message || '保存授权设置失败'
+      error = authSettingsError(err, 'authSaveFailed')
     } finally {
       saving = false
     }
@@ -110,16 +118,16 @@
     apiKey = ''
     try {
       await auth.logout()
-      message = '已退出当前浏览器登录。下次访问接口时会要求重新输入密码。'
+      message = t('authLogoutSuccessMessage')
     } catch (err) {
-      error = err.message || '退出登录失败'
+      error = authSettingsError(err, 'authLogoutFailed')
     } finally {
       saving = false
     }
   }
 
   async function disableAuth() {
-    if (!window.confirm('确定要关闭授权并清除当前密码/API Key 吗？关闭后 /v1/* 接口将回到无密码放行状态。')) return
+    if (!window.confirm(t('authDisableConfirm'))) return
     saving = true
     error = ''
     message = ''
@@ -131,9 +139,9 @@
       setupToken = ''
       setupTokenExpiresAt = ''
       password = ''
-      message = '已关闭授权，当前密码、API Key 和登录 Cookie 已清除。'
+      message = t('authDisabledMessage')
     } catch (err) {
-      error = err.message || '关闭授权失败'
+      error = authSettingsError(err, 'authDisableFailed')
     } finally {
       saving = false
     }
@@ -144,9 +152,9 @@
     error = ''
     const ok = await copyToClipboard(text)
     if (ok) {
-      message = '已复制到剪贴板。'
+      message = t('copiedToClipboard')
     } else {
-      error = '复制失败，请手动选择并复制。'
+      error = t('copyFailedManual')
     }
   }
 </script>
@@ -155,17 +163,17 @@
   <div class="page-content">
     <div class="page-heading">
       <div>
-        <h2>授权设置</h2>
-        <p>配置 Web 登录密码、API Bearer Key 和安装导出命令的访问授权。</p>
+        <h2>{t('authSettingsTitle')}</h2>
+        <p>{t('authSettingsSubtitle')}</p>
       </div>
       <div class="status-pill" class:enabled={hasPassword}>
         <span class="dot"></span>
-        {hasPassword ? '已启用' : '未设置，无感放行'}
+        {hasPassword ? t('authEnabled') : t('authNotConfigured')}
       </div>
     </div>
 
     {#if loading}
-      <div class="loading">加载中...</div>
+      <div class="loading">{t('loading')}</div>
     {:else}
       {#if message}
         <div class="success-msg">{message}</div>
@@ -178,10 +186,10 @@
         <section class="api-key-card">
           <div class="card-header">
             <div>
-              <h3>API Key（仅显示一次）</h3>
-              <p>请立即复制并保存。切换到其它页面或刷新后这里不会再显示。</p>
+              <h3>{t('authApiKeyOneTimeTitle')}</h3>
+              <p>{t('authApiKeyOneTimeHint')}</p>
             </div>
-            <button class="btn btn-primary" type="button" onclick={() => copyText(apiKey)}>复制 API Key</button>
+            <button class="btn btn-primary" type="button" onclick={() => copyText(apiKey)}>{t('copyApiKey')}</button>
           </div>
           <input class="code-input" readonly value={apiKey} aria-label="API Key" />
         </section>
@@ -191,39 +199,39 @@
         <section class="card main-card">
           <div class="card-header compact">
             <div>
-              <h3>{hasPassword ? '修改授权配置' : '启用授权'}</h3>
-              <p>设置 Web 登录密码、Cookie 有效期和 API Bearer Key 授权。</p>
+              <h3>{hasPassword ? t('authEditConfigTitle') : t('authEnableTitle')}</h3>
+              <p>{t('authConfigDescription')}</p>
             </div>
           </div>
 
           <form class="settings-form" onsubmit={(event) => { event.preventDefault(); saveConfig() }}>
             <div class="form-row with-actions">
               <div class="field">
-                <label for="auth-password-input">访问密码</label>
+                <label for="auth-password-input">{t('authAccessPassword')}</label>
                 <input
                   id="auth-password-input"
                   type="password"
                   bind:value={password}
-                  placeholder={hasPassword ? '留空则不修改密码' : '6-20 位字符'}
+                  placeholder={hasPassword ? t('authPasswordUnchangedPlaceholder') : t('authPasswordNewPlaceholder')}
                 />
-                <div class="hint">重新设置密码会刷新 API Key，并只显示一次。</div>
+                <div class="hint">{t('authPasswordHint')}</div>
               </div>
 
               <div class="field">
-                <label for="auth-cookie-ttl-select">Cookie 有效期</label>
+                <label for="auth-cookie-ttl-select">{t('authCookieTtl')}</label>
                 <select id="auth-cookie-ttl-select" bind:value={cookieTtl}>
                   {#each ttlOptions as opt}
-                    <option value={opt.value}>{opt.label}</option>
+                    <option value={opt.value}>{t(opt.labelKey)}</option>
                   {/each}
                 </select>
-                <div class="hint">仅影响 Web UI 登录态；API 客户端继续使用 Bearer Key。</div>
+                <div class="hint">{t('authCookieTtlHint')}</div>
               </div>
 
               <div class="actions side-actions">
                 <button class="btn btn-primary" type="submit" disabled={saving || (!password && !hasPassword)}>
-                  {saving ? '保存中...' : (hasPassword ? '保存设置' : '启用授权')}
+                  {saving ? t('saving') : (hasPassword ? t('saveSettings') : t('authEnableTitle'))}
                 </button>
-                <button class="btn btn-secondary" type="button" onclick={loadConfig} disabled={saving}>重新加载</button>
+                <button class="btn btn-secondary" type="button" onclick={loadConfig} disabled={saving}>{t('reload')}</button>
               </div>
             </div>
           </form>
@@ -232,8 +240,8 @@
         <section class="card command-card">
           <div class="card-header compact">
             <div>
-              <h3>安装导出命令</h3>
-              <p>用于将当前配置导出到新环境。启用授权后命令中会包含临时 setup token。</p>
+              <h3>{t('authInstallExportCommandsTitle')}</h3>
+              <p>{t('authInstallExportCommandsHint')}</p>
             </div>
           </div>
 
@@ -241,24 +249,24 @@
             <div class="command-row">
               <label for="windows-setup-command">Windows PowerShell</label>
               <div class="copy-row">
-                <input id="windows-setup-command" readonly value={windowsSetupCommand} aria-label="Windows PowerShell 安装导出命令" />
-                <button class="btn btn-secondary" type="button" onclick={() => copyText(windowsSetupCommand)}>复制</button>
+                <input id="windows-setup-command" readonly value={windowsSetupCommand} aria-label={t('authWindowsCommandAria')} />
+                <button class="btn btn-secondary" type="button" onclick={() => copyText(windowsSetupCommand)}>{t('copy')}</button>
               </div>
             </div>
 
             <div class="command-row">
               <label for="linux-setup-command">Linux/macOS shell</label>
               <div class="copy-row">
-                <input id="linux-setup-command" readonly value={linuxSetupCommand} aria-label="Linux/macOS shell 安装导出命令" />
-                <button class="btn btn-secondary" type="button" onclick={() => copyText(linuxSetupCommand)}>复制</button>
+                <input id="linux-setup-command" readonly value={linuxSetupCommand} aria-label={t('authLinuxCommandAria')} />
+                <button class="btn btn-secondary" type="button" onclick={() => copyText(linuxSetupCommand)}>{t('copy')}</button>
               </div>
             </div>
           </div>
 
           {#if setupTokenExpiresAt}
-            <div class="hint warning">命令内含临时导出 token，仅用于 /v1/setup，有效期至：{setupTokenExpiresDisplay}</div>
+            <div class="hint warning">{t('authSetupTokenWarning', { expires: setupTokenExpiresDisplay })}</div>
           {:else}
-            <div class="hint">当前未设置密码，/v1/setup 无需 token。</div>
+            <div class="hint">{t('authSetupNoTokenHint')}</div>
           {/if}
         </section>
 
@@ -266,12 +274,12 @@
           <section class="card danger-card">
             <div class="card-header with-actions-header">
               <div>
-                <h3>登录与授权</h3>
-                <p>退出登录只清除当前浏览器 Cookie；关闭授权会清除密码和 API Key。</p>
+                <h3>{t('authLoginAndAuthorizationTitle')}</h3>
+                <p>{t('authLoginAndAuthorizationHint')}</p>
               </div>
               <div class="danger-actions side-actions">
-                <button class="btn btn-secondary" type="button" onclick={logout} disabled={saving}>退出当前浏览器登录</button>
-                <button class="btn btn-danger" type="button" onclick={disableAuth} disabled={saving}>关闭授权 / 清除密码</button>
+                <button class="btn btn-secondary" type="button" onclick={logout} disabled={saving}>{t('authLogoutCurrentBrowser')}</button>
+                <button class="btn btn-danger" type="button" onclick={disableAuth} disabled={saving}>{t('authDisableAndClear')}</button>
               </div>
             </div>
           </section>

@@ -101,7 +101,7 @@
     },
     {
       items: [
-        { id: 'auth', label: '授权', icon: '🔐' },
+        { id: 'auth', label: t('nav_auth'), icon: '🔐' },
       ]
     },
   ])
@@ -246,7 +246,7 @@
         <button
           class="setup-lang-btn"
           onclick={() => setLang(i18n.lang === 'zh' ? 'en' : 'zh')}
-          title={i18n.lang === 'zh' ? 'Switch to English' : '切换为中文'}
+          title={t('languageSwitch')}
         >{i18n.lang === 'zh' ? '中' : 'En'}</button>
         <button
           class="refresh-btn"
