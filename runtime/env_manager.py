@@ -60,7 +60,6 @@ class EnvManager:
                 f"env.json 内容必须是 JSON 对象，实际类型: {type(data).__name__}"
             )
         result = {str(k): str(v) for k, v in data.items()}
-        # 如果 env.json 中没有 AGENT_WORKSPACE，从 os.environ 中补充（app.py 启动时已保证 environ 中有值）
         if "AGENT_WORKSPACE" not in result:
             workspace = os.environ.get("AGENT_WORKSPACE", "")
             if workspace:
@@ -68,18 +67,7 @@ class EnvManager:
         return result
 
     def set(self, key: str, value: str) -> dict[str, str]:
-        """新增或更新一个键值对，原子写入 env.json，并同步到 os.environ。
-
-        Args:
-            key: 环境变量名。
-            value: 环境变量值。
-
-        Returns:
-            更新后的完整键值对字典。
-
-        Raises:
-            OSError: 文件写入失败时抛出。
-        """
+        """新增或更新一个键值对，原子写入 env.json，并同步到 os.environ。"""
         try:
             env_map = self.read()
         except ValueError:
@@ -91,17 +79,7 @@ class EnvManager:
         return env_map
 
     def delete(self, key: str) -> dict[str, str]:
-        """删除指定 key，原子写入 env.json。key 不存在时静默忽略。
-
-        Args:
-            key: 要删除的环境变量名。
-
-        Returns:
-            更新后的完整键值对字典。
-
-        Raises:
-            OSError: 文件写入失败时抛出。
-        """
+        """删除指定 key，原子写入 env.json。key 不存在时静默忽略。"""
         try:
             env_map = self.read()
         except ValueError:
@@ -112,20 +90,9 @@ class EnvManager:
         return env_map
 
     def detect_used_keys(self, scan_dir: str) -> list[str]:
-        """递归扫描 scan_dir 下所有 .py 文件，提取 os.environ.get( "KEY" ) 中的 KEY。
-
-        使用正则 ``os\\.environ\\.get\\("(\\w+)"`` 匹配，返回去重后的列表。
-        无法读取的文件会被跳过并记录日志。
-
-        Args:
-            scan_dir: 要扫描的根目录路径。
-
-        Returns:
-            去重后的环境变量 key 列表。
-        """
+        """递归扫描 scan_dir 下所有 .py 文件，提取 os.environ.get( "KEY" ) 中的 KEY。"""
         pattern = re.compile(r'os\.environ\.get\("(\w+)"')
         found: set[str] = set()
-
         for dirpath, _dirnames, filenames in os.walk(scan_dir):
             for filename in filenames:
                 if not filename.endswith(".py"):
@@ -138,7 +105,6 @@ class EnvManager:
                     found.update(matches)
                 except OSError as exc:
                     logger.warning("跳过不可读文件 %s: %s", filepath, exc)
-
         return list(found)
 
     def build_setup_script(
@@ -153,14 +119,7 @@ class EnvManager:
         include_env: bool = False,
         script_format: str = "sh",
     ) -> bytes:
-        """生成可通过 ``curl ... | sh`` 执行的自解压安装脚本。
-
-        脚本内嵌一个 tar.gz 载荷，包含当前 agent service 代码以及服务端
-        已注册的模型、工具、MCP server、提示词模板和智能体配置。
-
-        Args:
-            include_env: 是否打包当前服务端的 env.json（默认不打包，避免把本地环境变量带到目标机器）。
-        """
+        """生成可通过 ``curl ... | sh`` 或 ``irm ... | iex`` 执行的自解压安装脚本。"""
         payload = self._build_setup_payload(
             project_root=project_root,
             data_dir=data_dir,
@@ -172,34 +131,21 @@ class EnvManager:
         )
         encoded = "\n".join(textwrap.wrap(base64.b64encode(payload).decode("ascii"), 76))
         fmt = script_format.lower().strip()
-        if fmt not in {"sh", "shell", "posix", "unix"}:
-            raise ValueError(f"Unsupported setup script format: {script_format}")
-        return self._render_setup_script_sh(encoded).encode("utf-8")
+        if fmt in {"sh", "shell", "posix", "unix"}:
+            return self._render_setup_script_sh(encoded).encode("utf-8")
+        if fmt in {"ps1", "powershell", "pwsh"}:
+            return self._render_setup_script_ps1(encoded).encode("utf-8")
+        raise ValueError(f"Unsupported setup script format: {script_format}")
 
     # ------------------------------------------------------------------
     # 私有方法
     # ------------------------------------------------------------------
 
     def _atomic_write(self, path: str, content: str) -> None:
-        """原子写入：先写临时文件，再 os.replace。
-
-        Args:
-            path: 目标文件路径。
-            content: 要写入的文本内容。
-
-        Raises:
-            OSError: 写入或替换失败时抛出。
-        """
         from runtime.common import atomic_write_text
-
         atomic_write_text(path, content)
 
     def _sync_to_environ(self, env_map: dict[str, str]) -> None:
-        """将 env_map 中所有键值对写入 os.environ。
-
-        Args:
-            env_map: 要同步的键值对字典。
-        """
         for k, v in env_map.items():
             os.environ[str(k)] = str(v)
 
@@ -221,13 +167,9 @@ class EnvManager:
             if include_project:
                 self._copy_project(project_root, app_dir)
             self._write_runtime_configs(
-                cfg_dir,
-                data_dir=data_dir,
-                project_root=project_root,
-                runtime=runtime,
-                prompt_template_manager=prompt_template_manager,
-                agent_manager=agent_manager,
-                include_env=include_env,
+                cfg_dir, data_dir=data_dir, project_root=project_root,
+                runtime=runtime, prompt_template_manager=prompt_template_manager,
+                agent_manager=agent_manager, include_env=include_env,
             )
             self._dump_json(os.path.join(payload_root, "manifest.json"), {
                 "name": "agent-service-setup", "version": 1,
@@ -239,7 +181,6 @@ class EnvManager:
             return bio.getvalue()
 
     def _setup_tar_filter(self, tarinfo: tarfile.TarInfo) -> tarfile.TarInfo | None:
-        """过滤 setup payload 中不应包含的 tar 条目。"""
         if tarinfo.issym() or tarinfo.islnk():
             target = getattr(tarinfo, "linkname", "")
             logger.warning("打包 setup payload 时跳过链接 %s -> %s", tarinfo.name, target)
@@ -257,11 +198,8 @@ class EnvManager:
         def should_exclude_dir(parent_dir: str, name: str) -> bool:
             path = os.path.join(parent_dir, name)
             path_real = os.path.realpath(path)
-            # web/dist 是前端编译产物，部署后用于提供 Web UI，必须随源码一起打包。
             if path_real == web_dist_real:
                 return False
-            # Agent Service 部署目录下不应包含任何点号开头的目录（例如 .vscode、.git、.hypothesis）。
-            # 注意：运行时配置目录 payload/agents_runtime 会安装到 AGENTS_RUNTIME_DIR，不在部署目录下，不能因此排除。
             if name.startswith(".") and os.path.isdir(path):
                 return True
             return name in exclude_dirs
@@ -273,9 +211,6 @@ class EnvManager:
                 if name in exclude_files or should_exclude_dir(dirpath, name):
                     ignored.add(name)
                     continue
-                # Windows 自带 tar.exe 对 Linux/Unix 符号链接，尤其是指向绝对路径的链接，
-                # 经常会解压失败（例如项目根目录 chat_data -> /root/.agents_runtime/chat_data）。
-                # setup payload 需要跨平台可解压，因此项目源码打包时跳过符号链接。
                 if os.path.islink(path):
                     logger.warning("打包时跳过符号链接 %s -> %s", path, os.readlink(path))
                     ignored.add(name)
@@ -345,7 +280,6 @@ class EnvManager:
             src_agents = os.path.join(data_dir, "agents")
             if os.path.isdir(src_agents):
                 import shutil
-
                 def ignore_links(dirpath: str, names: list[str]) -> set[str]:
                     ignored: set[str] = set()
                     for name in names:
@@ -354,7 +288,6 @@ class EnvManager:
                             logger.warning("打包 agents 配置时跳过符号链接 %s -> %s", path, os.readlink(path))
                             ignored.add(name)
                     return ignored
-
                 shutil.copytree(src_agents, agents_dir, dirs_exist_ok=True, symlinks=False, ignore=ignore_links)
         package_root_real = os.path.realpath(os.path.dirname(os.path.dirname(__file__)))
         for tool in tools if isinstance(tools, list) else []:
@@ -392,7 +325,7 @@ class EnvManager:
             json.dump(data, fh, ensure_ascii=False, indent=2)
 
     def _render_setup_script_sh(self, encoded_payload: str) -> str:
-        return """#!/bin/sh
+        return r"""#!/bin/sh
 set -eu
 
 AGENT_SERVICE_HOME="$PWD/agents"
@@ -410,8 +343,6 @@ base64 -d > "$TMPDIR/payload.tar.gz" <<'__AGENT_SERVICE_TAR_GZ_BASE64__'
 __AGENT_SERVICE_TAR_GZ_BASE64__
 mkdir -p "$TMPDIR/payload"
 tar -xzf "$TMPDIR/payload.tar.gz" -C "$TMPDIR/payload"
-# setup 包不应包含符号链接。即使历史版本 payload 中误带链接，也在 shell 侧二次清理，
-# 避免 Linux/Windows tar 行为差异或无效链接影响安装。
 find "$TMPDIR/payload" -type l -exec rm -f {} \\;
 
 mkdir -p "$AGENT_SERVICE_HOME" "$AGENTS_RUNTIME_DIR"
@@ -430,20 +361,20 @@ mkdir -p "$AGENTS_RUNTIME_DIR"
 AGENT_DIR="$(cd "$(dirname "$0")/agents" >/dev/null 2>&1 && pwd)"
 
 case "$START_AGENT_SERVICE" in
-  background)
-    nohup python3 "$AGENT_DIR/app.py" "0.0.0.0:${AGENT_SERVICE_PORT}" >> "$AGENT_SERVICE_LOG" 2>&1 &
-    echo $!
-    ;;
-  foreground)
-    exec python3 "$AGENT_DIR/app.py" "0.0.0.0:${AGENT_SERVICE_PORT}" 2>&1 | tee -a "$AGENT_SERVICE_LOG"
-    ;;
-  none)
-    exit 0
-    ;;
-  *)
-    echo "Invalid START_AGENT_SERVICE=$START_AGENT_SERVICE. Expected: background, foreground, none" >&2
-    exit 2
-    ;;
+background)
+  nohup python3 "$AGENT_DIR/app.py" "0.0.0.0:${AGENT_SERVICE_PORT}" >> "$AGENT_SERVICE_LOG" 2>&1 &
+  echo $!
+  ;;
+foreground)
+  exec python3 "$AGENT_DIR/app.py" "0.0.0.0:${AGENT_SERVICE_PORT}" 2>&1 | tee -a "$AGENT_SERVICE_LOG"
+  ;;
+none)
+  exit 0
+  ;;
+*)
+  echo "Invalid START_AGENT_SERVICE=$START_AGENT_SERVICE. Expected: background, foreground, none" >&2
+  exit 2
+  ;;
 esac
 SH
 chmod +x "$PWD/start-agent-service.sh"
@@ -474,38 +405,6 @@ rm -f "$pid_file"
 SH
 chmod +x "$PWD/stop-agent-service.sh"
 
-cat > "$PWD/start-agent-service.bat" <<'BAT'
-@echo off
-setlocal
-set "PORT=%AGENT_SERVICE_PORT%"
-if "%PORT%"=="" set "PORT=7988"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; if (-not $env:AGENTS_RUNTIME_DIR) { $env:AGENTS_RUNTIME_DIR=Join-Path $HOME '.agents_runtime' }; $log=Join-Path $env:AGENTS_RUNTIME_DIR 'server.log'; $err=Join-Path $env:AGENTS_RUNTIME_DIR 'server.err.log'; $pidPath=Join-Path $env:AGENTS_RUNTIME_DIR 'server.pid'; New-Item -ItemType Directory -Force -Path $env:AGENTS_RUNTIME_DIR | Out-Null; $encoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes(\"python app.py '0.0.0.0:%PORT%' >> '$log' 2>> '$err'\")); $p=Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand',$encoded -WindowStyle Hidden -PassThru; Start-Sleep -Seconds 2; if ($p.HasExited) { throw ('service exited with code ' + $p.ExitCode) }; Set-Content -LiteralPath $pidPath -Value $p.Id -Encoding ASCII; Write-Host $p.Id"
-BAT
-
-cat > "$PWD/stop-agent-service.bat" <<'BAT'
-@echo off
-setlocal
-set "RUNTIME_DIR=%AGENTS_RUNTIME_DIR%"
-if "%RUNTIME_DIR%"=="" set "RUNTIME_DIR=%USERPROFILE%\\.agents_runtime"
-set "PIDFILE=%RUNTIME_DIR%\\\\server.pid"
-if not exist "%PIDFILE%" (
-    echo No pid file found: %PIDFILE%
-    exit /b 0
-)
-set /p PID=<"%PIDFILE%"
-if "%PID%"=="" (
-    echo Empty pid file: %PIDFILE%
-    exit /b 0
-)
-taskkill /PID %PID% /T /F >nul 2>nul
-if errorlevel 1 (
-    echo Process %PID% not running
-) else (
-    echo Stopped pid: %PID%
-)
-del "%PIDFILE%" >nul 2>nul
-BAT
-
 case "$START_AGENT_SERVICE" in
   background|foreground|none) ;;
   true) START_AGENT_SERVICE=background ;;
@@ -515,7 +414,6 @@ case "$START_AGENT_SERVICE" in
     exit 2
     ;;
 esac
-
 
 AGENT_SERVICE_LOG="$AGENTS_RUNTIME_DIR/server.log"
 export AGENT_SERVICE_HOME AGENT_SERVICE_LOG
@@ -541,3 +439,143 @@ esac
 exit 0
 """
 
+    def _render_setup_script_ps1(self, encoded_payload: str) -> str:
+        """生成 PowerShell 自解压安装脚本（用于 `irm ... | iex`）。
+
+        解压后只生成 .bat 文件，不生成 .ps1。
+        - base64 用单引号 here-string (@'...'@) 承载，避免变量展开
+        - bat 内容用 here-string 变量承载，支持多行
+        - 文件拷贝用 robocopy 替代 tar 管道，Windows 兼容性更好
+        """
+        # ── start-agent-service.bat ──────────────────────────────
+        # 用 PowerShell Start-Process -PassThru 启动 cmd /c python，
+        # cmd.exe 负责 >> 重定向日志，Start-Process 返回 PID 写入 server.pid。
+        start_bat = (
+            "@echo off\r\n"
+            "setlocal enabledelayedexpansion\r\n"
+            "if not defined AGENT_SERVICE_PORT set AGENT_SERVICE_PORT=7988\r\n"
+            "if not defined AGENTS_RUNTIME_DIR set \"AGENTS_RUNTIME_DIR=%USERPROFILE%\\.agents_runtime\"\r\n"
+            "if not defined AGENT_SERVICE_LOG set \"AGENT_SERVICE_LOG=%AGENTS_RUNTIME_DIR%\\server.log\"\r\n"
+            "if not defined START_AGENT_SERVICE set START_AGENT_SERVICE=background\r\n"
+            "if not defined AGENT_SERVICE_HOME set \"AGENT_SERVICE_HOME=%~dp0agents\"\r\n"
+            "\r\n"
+            "mkdir \"%AGENTS_RUNTIME_DIR%\" 2>nul\r\n"
+            "\r\n"
+            "if \"%START_AGENT_SERVICE%\"==\"background\" (\r\n"
+            "    set \"PS_START=%TEMP%\\agent-start.ps1\"\r\n"
+            "    > \"!PS_START!\" echo $ErrorActionPreference = 'Stop'\r\n"
+            "    >> \"!PS_START!\" echo $p = Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', 'python \"%AGENT_SERVICE_HOME%\\app.py\" 0.0.0.0:%AGENT_SERVICE_PORT% ^>^> \"%AGENT_SERVICE_LOG%\" 2^>^&1' -PassThru -WindowStyle Hidden\r\n"
+            "    >> \"!PS_START!\" echo $p.Id\r\n"
+            "    powershell -NoProfile -ExecutionPolicy Bypass -File \"!PS_START!\" > \"%AGENTS_RUNTIME_DIR%\\server.pid\" 2>nul\r\n"
+            "    del \"!PS_START!\" 2>nul\r\n"
+            "    set /p PID=<\"%AGENTS_RUNTIME_DIR%\\server.pid\"\r\n"
+            "    if defined PID (\r\n"
+            "        echo Agent service started in background, pid: !PID!\r\n"
+            "    ) else (\r\n"
+            "        echo Agent service started in background\r\n"
+            "    )\r\n"
+            "    echo Log: %AGENT_SERVICE_LOG%\r\n"
+            ") else if \"%START_AGENT_SERVICE%\"==\"foreground\" (\r\n"
+            "    python \"%AGENT_SERVICE_HOME%\\app.py\" 0.0.0.0:%AGENT_SERVICE_PORT%\r\n"
+            ") else if \"%START_AGENT_SERVICE%\"==\"none\" (\r\n"
+            "    echo Agent service not started because START_AGENT_SERVICE=none\r\n"
+            ") else (\r\n"
+            "    echo Invalid START_AGENT_SERVICE=%START_AGENT_SERVICE%. Expected: background, foreground, none\r\n"
+            "    exit /b 2\r\n"
+            ")\r\n"
+            "endlocal\r\n"
+        )
+        # ── stop-agent-service.bat ───────────────────────────────
+        # 读取 server.pid，用 taskkill /T (tree) 终止整个进程树（cmd.exe + python）。
+        stop_bat = (
+            "@echo off\r\n"
+            "setlocal\r\n"
+            "if not defined AGENTS_RUNTIME_DIR set \"AGENTS_RUNTIME_DIR=%USERPROFILE%\\.agents_runtime\"\r\n"
+            "set \"PID_FILE=%AGENTS_RUNTIME_DIR%\\server.pid\"\r\n"
+            "if not exist \"%PID_FILE%\" (\r\n"
+            "    echo No pid file found: %PID_FILE%\r\n"
+            "    exit /b 0\r\n"
+            ")\r\n"
+            "set /p PID=<\"%PID_FILE%\"\r\n"
+            "if \"%PID%\"==\"\" (\r\n"
+            "    echo Empty pid file: %PID_FILE%\r\n"
+            "    exit /b 0\r\n"
+            ")\r\n"
+            "taskkill /T /F /PID %PID% 2>nul\r\n"
+            "if %errorlevel%==0 (\r\n"
+            "    echo Stopped process tree: %PID%\r\n"
+            ") else (\r\n"
+            "    echo Process %PID% not running\r\n"
+            ")\r\n"
+            "del \"%PID_FILE%\" 2>nul\r\n"
+            "endlocal\r\n"
+        )
+        return (
+            "$ErrorActionPreference = 'Stop'\n"
+            "\n"
+            "$AgentServiceHome = Join-Path $PWD 'agents'\n"
+            "if (-not $env:AGENTS_RUNTIME_DIR) { $env:AGENTS_RUNTIME_DIR = Join-Path $HOME '.agents_runtime' }\n"
+            "if (-not $env:AGENT_SERVICE_PORT) { $env:AGENT_SERVICE_PORT = '7988' }\n"
+            "if (-not $env:START_AGENT_SERVICE) { $env:START_AGENT_SERVICE = 'background' }\n"
+            "\n"
+            "$tmpDir = Join-Path ([IO.Path]::GetTempPath()) ('agent-setup-' + [guid]::NewGuid().ToString('N').Substring(0,8))\n"
+            "New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null\n"
+            "try {\n"
+            "    Write-Host 'Extracting agent service package...' -ForegroundColor Cyan\n"
+            "    $b64 = @'\n"
+            + encoded_payload + "\n"
+            "'@\n"
+            "    $b64Clean = ($b64 -replace '\\s+', '')\n"
+            "    $bytes = [Convert]::FromBase64String($b64Clean)\n"
+            "    $tarGz = Join-Path $tmpDir 'payload.tar.gz'\n"
+            "    [IO.File]::WriteAllBytes($tarGz, $bytes)\n"
+            "\n"
+            "    $payloadDir = Join-Path $tmpDir 'payload'\n"
+            "    New-Item -ItemType Directory -Path $payloadDir -Force | Out-Null\n"
+            "    tar -xzf $tarGz -C $payloadDir 2>&1 | Out-Null\n"
+            "    if ($LASTEXITCODE -ne 0) { throw \"tar extraction failed (exit code $LASTEXITCODE)\" }\n"
+            "\n"
+            "    Get-ChildItem -Path $payloadDir -Recurse -Force |\n"
+            "        Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint } |\n"
+            "        ForEach-Object { Remove-Item $_.FullName -Force -EA SilentlyContinue }\n"
+            "\n"
+            "    New-Item -ItemType Directory -Path $AgentServiceHome -Force | Out-Null\n"
+            "    New-Item -ItemType Directory -Path $env:AGENTS_RUNTIME_DIR -Force | Out-Null\n"
+            "    $appSrc = Join-Path $payloadDir 'app'\n"
+            "    if (Test-Path $appSrc) {\n"
+            "        robocopy $appSrc $AgentServiceHome /E /NFL /NDL /NJH /NJS /NC /NS /NP | Out-Null\n"
+            "    }\n"
+            "    $cfgSrc = Join-Path $payloadDir 'agents_runtime'\n"
+            "    if (Test-Path $cfgSrc) {\n"
+            "        robocopy $cfgSrc $env:AGENTS_RUNTIME_DIR /E /NFL /NDL /NJH /NJS /NC /NS /NP | Out-Null\n"
+            "    }\n"
+            "\n"
+            "    $startBat = @'\n"
+            + start_bat +
+            "'@\n"
+            "    $stopBat = @'\n"
+            + stop_bat +
+            "'@\n"
+            "    Set-Content -Path (Join-Path $PWD 'start-agent-service.bat') -Value $startBat -Encoding ASCII\n"
+            "    Set-Content -Path (Join-Path $PWD 'stop-agent-service.bat')  -Value $stopBat  -Encoding ASCII\n"
+            "\n"
+            "    $logFile = if ($env:AGENT_SERVICE_LOG) { $env:AGENT_SERVICE_LOG } else { Join-Path $env:AGENTS_RUNTIME_DIR 'server.log' }\n"
+            "    Write-Host ''\n"
+            "    Write-Host 'Agent service installed:' -ForegroundColor Green\n"
+            "    Write-Host \"  app:    $AgentServiceHome\"\n"
+            "    Write-Host \"  config: $($env:AGENTS_RUNTIME_DIR)\"\n"
+            "    Write-Host \"  log:    $logFile\"\n"
+            "\n"
+            "    if ($env:START_AGENT_SERVICE -eq 'background') {\n"
+            "        $proc = Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', 'start-agent-service.bat' -PassThru -WindowStyle Hidden\n"
+            "        Write-Host \"Agent service started in background, pid: $($proc.Id)\" -ForegroundColor Green\n"
+            "        Write-Host \"Log: $logFile\"\n"
+            "    } elseif ($env:START_AGENT_SERVICE -eq 'foreground') {\n"
+            "        & (Join-Path $PWD 'start-agent-service.bat')\n"
+            "    } elseif ($env:START_AGENT_SERVICE -eq 'none') {\n"
+            "        Write-Host 'Agent service not started because START_AGENT_SERVICE=none'\n"
+            "    }\n"
+            "} finally {\n"
+            "    Remove-Item -Path $tmpDir -Recurse -Force -ErrorAction SilentlyContinue\n"
+            "}\n"
+        )

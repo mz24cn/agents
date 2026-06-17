@@ -551,9 +551,12 @@ def login_video_account_by_scan(
     android_find_and_click("扫一扫", scan_device_id)
     time.sleep(2)
 
-    print("   点击 '轻触照亮'...") #夜间识别需要
-    android_find_and_click("轻触照亮", scan_device_id)
-    time.sleep(2)
+    try:
+        android_find_and_click("轻触照亮", scan_device_id)
+        print(f"   ✅ 点击 '轻触照亮' 成功")
+        time.sleep(2)
+    except Exception as e:
+        pass
 
     # 此时手机B的相机已经打开，对准手机A的屏幕
     # 微信扫一扫会自动放大图片并识别二维码，无需手动拍照

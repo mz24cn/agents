@@ -28,8 +28,8 @@
   let setupTokenExpiresAt = $state('')
 
   let setupLink = $derived(`${window.location.origin}/v1/setup${setupToken ? `?token=${encodeURIComponent(setupToken)}` : ''}`)
-  let windowsSetupCommand = $derived(`irm "${setupLink}" | iex`)
-  let linuxSetupCommand = $derived(`curl -fsSL "${setupLink}" | sh`)
+  let windowsSetupCommand = $derived(`irm ${setupLink} | iex`)
+  let linuxSetupCommand = $derived(`curl -fsSL ${setupLink} | sh`)
   let setupTokenExpiresDisplay = $derived(formatSetupTokenExpiresAt(setupTokenExpiresAt))
 
   function pad2(value) {
