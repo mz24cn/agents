@@ -266,6 +266,8 @@
   function childPath(parentPath, name) {
     if (parentPath === '/') return `/${name}`
     const sep = parentPath.includes('\\') ? '\\' : '/'
+    // 如果父路径已以分隔符结尾（如 Windows 根 "D:\"），不再重复添加
+    if (parentPath.endsWith(sep)) return `${parentPath}${name}`
     return `${parentPath}${sep}${name}`
   }
 

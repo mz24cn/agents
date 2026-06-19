@@ -128,6 +128,7 @@ def _bash_execute(command: str, cwd: str = "") -> str:
         try:
             result = subprocess.run(
                 command, shell=True, capture_output=True, text=True,
+                encoding='utf-8', errors='replace',
                 timeout=timeout, cwd=cwd if cwd else None,
             )
             output = (result.stdout or "").strip()
@@ -856,7 +857,8 @@ class _FileJournalManager:
         return subprocess.run(["git"] + args, cwd=self.workspace, capture_output=True, text=False)
 
     def _git_text(self, args: list[str]) -> subprocess.CompletedProcess:
-        return subprocess.run(["git"] + args, cwd=self.workspace, capture_output=True, text=True)
+        return subprocess.run(["git"] + args, cwd=self.workspace, capture_output=True, text=True,
+                              encoding='utf-8', errors='replace')
 
     def _git_baseline_ref(self, rel_path: str, state: dict) -> Optional[dict]:
         if state.get("is_symlink") or not os.path.isdir(os.path.join(self.workspace, ".git")):
@@ -941,6 +943,7 @@ class _Linter:
                 cmd,
                 capture_output=True,
                 text=True,
+                encoding='utf-8', errors='replace',
                 timeout=30,
             )
             if result.returncode == 0:
@@ -1708,6 +1711,7 @@ def _run_patch(workspace: str, patch: str, dry_run: bool) -> subprocess.Complete
         cwd=workspace,
         capture_output=True,
         text=True,
+        encoding='utf-8', errors='replace',
     )
 
 
@@ -1944,6 +1948,7 @@ def _search_code(query: str, include: Optional[str] = None, exclude: Optional[st
                 cwd=workspace,
                 capture_output=True,
                 text=True,
+                encoding='utf-8', errors='replace',
             )
         except Exception as exc:
             return json.dumps({"error": "SearchToolNotFound", "message": str(exc)})
@@ -2036,6 +2041,7 @@ def _search_code(query: str, include: Optional[str] = None, exclude: Optional[st
                 cwd=workspace,
                 capture_output=True,
                 text=True,
+                encoding='utf-8', errors='replace',
             )
         except Exception as exc:
             return json.dumps({"error": "SearchToolNotFound", "message": str(exc)})
@@ -2234,6 +2240,7 @@ def _execute_command(command: str, timeout: Optional[int] = None, background: bo
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding='utf-8', errors='replace',
             start_new_session=sys.platform != "win32",
             creationflags=creationflags,
         )
