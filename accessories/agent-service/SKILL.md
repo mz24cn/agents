@@ -361,7 +361,7 @@ curl -fsS -X POST "$SERVER_URL/v1/infer" \
   -d @- <<'JSON' | python -m json.tool
 {
   "model_id": "qwen3-14b",
-  "tool_ids": ["bash", "fetch"],
+  "tool_ids": ["write_file", "execute_command"],
   "messages": [
     {"role": "system", "content": "你是一个有帮助的助手。"},
     {"role": "user", "content": "请用一句话介绍你自己。"}
@@ -393,7 +393,7 @@ curl -N -X POST "$SERVER_URL/v1/infer/stream" \
   -d @- <<'JSON'
 {
   "model_id": "qwen3-14b",
-  "tool_ids": ["bash", "fetch"],
+  "tool_ids": ["write_file", "execute_command"],
   "messages": [
     {"role": "user", "content": "现在几点？如果需要可以使用工具。"}
   ],
@@ -491,7 +491,7 @@ curl -fsS -X POST "$SERVER_URL/v1/agents" \
 {
   "model_id": "qwen3-14b",
   "nickname": "助手",
-  "tool_ids": ["bash", "fetch"],
+  "tool_ids": ["write_file", "execute_command"],
   "system_prompt": "你是一个严谨、简洁的助手。",
   "description": "默认助手 Agent",
   "avatar": ""

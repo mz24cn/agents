@@ -385,13 +385,13 @@ class Runtime:
                                 tool_use_id=fn_call.get("id") or fn_call.get("tool_use_id"),
                                 content=(
                                     f"用户选择了 {tool_name} 技能。以下是该技能的详细文档，"
-                                    f"请根据文档内容和用户的原始请求，使用 bash 或 fetch 等"
-                                    f"内置工具来执行相应操作。{cwd_hint}\n\n{skill_body}"
+                                    f"请根据文档内容和用户的原始请求，使用 write_file、execute_command "
+                                    f"等内置工具来执行相应操作。如需网络请求，可使用 execute_command 调用 curl。{cwd_hint}\n\n{skill_body}"
                                 ),
                             )
                         )
 
-                    # Add built-in tools (bash, fetch) to the tools list
+                    # Add built-in tools (write_file, execute_command) to the tools list
                     self._ensure_builtin_tools(tools)
 
                     # Remove the Skill itself from tools to avoid re-selection
@@ -551,22 +551,26 @@ class Runtime:
         return None
 
     def _ensure_builtin_tools(self, tools: list) -> None:
-        """Ensure built-in tools (bash, fetch) are registered and in the tools list.
+        """Ensure built-in tools (write_file, execute_command) are registered and in the tools list.
 
-        Only bash and fetch are auto-enabled during skill progressive disclosure.
+        Only write_file and execute_command are auto-enabled during skill progressive disclosure.
         Other built-in tools (read_file, edit_file, etc.) are NOT added here;
         they must be explicitly requested in tool_ids by the client.
+
+        Note: fetch functionality can be achieved using execute_command + curl
+        (curl is now available on Windows as well).
 
         Lazily registers callables if missing, and appends ToolConfigs to the
         provided tools list if not already present. Does not overwrite existing
         tools that share the same tool_id (e.g. a user-registered fetch tool).
         """
         from runtime.builtin_tools import (
-            BASH_TOOL_CONFIG, FETCH_TOOL_CONFIG, _bash_execute, _fetch_url,
+            WRITE_FILE_TOOL_CONFIG, EXECUTE_COMMAND_TOOL_CONFIG,
+            _write_file, _execute_command,
         )
         skill_builtin_tools = [
-            (BASH_TOOL_CONFIG, _bash_execute),
-            (FETCH_TOOL_CONFIG, _fetch_url),
+            (WRITE_FILE_TOOL_CONFIG, _write_file),
+            (EXECUTE_COMMAND_TOOL_CONFIG, _execute_command),
         ]
         for bt_config, bt_fn in skill_builtin_tools:
             # Only register if no callable exists yet for this tool_id
@@ -1125,8 +1129,8 @@ class Runtime:
                             tool_use_id=fn_call.get("id") or fn_call.get("tool_use_id"),
                             content=(
                                 f"用户选择了 {tool_name} 技能。以下是该技能的详细文档，"
-                                f"请根据文档内容和用户的原始请求，使用 bash 或 fetch 等"
-                                f"内置工具来执行相应操作。{cwd_hint}\n\n{skill_body}"
+                                f"请根据文档内容和用户的原始请求，使用 write_file、execute_command "
+                                f"等内置工具来执行相应操作。如需网络请求，可使用 execute_command 调用 curl。{cwd_hint}\n\n{skill_body}"
                             ),
                         )
                         messages.append(fn_msg)

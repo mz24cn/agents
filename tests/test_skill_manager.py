@@ -98,7 +98,7 @@ class TestSkillManagerLoad:
             registry = ToolRegistry()
             mgr = SkillManager(registry)
             tc = mgr.load_skill(skill_dir)
-            assert tc.tool_id == "my_skill"
+            assert tc.tool_id == "skill-my_skill"
             assert tc.tool_type == "skill"
             assert tc.name == "my_skill"
             assert tc.description == "Does things."
@@ -110,7 +110,7 @@ class TestSkillManagerLoad:
             registry = ToolRegistry()
             mgr = SkillManager(registry)
             mgr.load_skill(skill_dir)
-            tc = registry.get("my_skill")
+            tc = registry.get("skill-my_skill")
             assert tc is not None
             assert tc.tool_type == "skill"
 
@@ -125,7 +125,7 @@ class TestSkillManagerLoad:
             assert registry.get("my_skill_exec") is None
             all_tools = registry.list_all()
             assert len(all_tools) == 1
-            assert all_tools[0].tool_id == "my_skill"
+            assert all_tools[0].tool_id == "skill-my_skill"
 
     def test_load_skill_body_stored(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -195,18 +195,18 @@ class TestProgressiveDisclosure:
             registry = ToolRegistry()
             mgr = SkillManager(registry)
             mgr.load_skill(skill_dir)
-            tc = registry.get("my_skill")
+            tc = registry.get("skill-my_skill")
             assert tc.description == "Short description."
             assert tc.parameters == {"type": "object", "properties": {}, "required": []}
 
     def test_builtin_tools_not_registered_at_init(self):
-        """Runtime should NOT register bash/fetch at init — only on Skill disclosure."""
+        """Runtime should NOT register write_file/execute_command at init — only on Skill disclosure."""
         from runtime import Runtime, ModelRegistry
         model_registry = ModelRegistry()
         registry = ToolRegistry()
         Runtime(model_registry=model_registry, tool_registry=registry)
-        assert registry.get("bash") is None
-        assert registry.get("fetch") is None
+        assert registry.get("write_file") is None
+        assert registry.get("execute_command") is None
 
 
 if __name__ == "__main__":

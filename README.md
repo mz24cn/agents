@@ -46,7 +46,7 @@ runtime/
 ├── tools.py                 # Function tool decorator
 ├── skill_manager.py         # SkillManager: SKILL.md parsing and progressive disclosure
 ├── mcp_client.py            # MCP Client: pure stdlib stdio/SSE implementation (StreamReader limit raised to 100 MB for large payloads)
-├── builtin_tools.py         # Built-in tools: bash, fetch
+├── builtin_tools.py         # Built-in tools: write_file, execute_command
 ├── prompt_template_manager.py  # Prompt template CRUD
 ├── context_manager.py       # Context manager: session management, rolling summary, memory extraction
 ├── env_manager.py           # Environment variable manager
@@ -364,7 +364,7 @@ Features:
 | `examples/example_mcp_ollama.py` | Connect Ollama (qwen3:14b) with MCP `time` and `fetch` servers; supports `--stream` flag |
 | `examples/example_mcp_openai.py` | Same as above but using the OpenAI-compatible protocol; easily switch to OpenAI, vLLM, LiteLLM, etc. |
 | `examples/example_skill.py` | Load a Skill from a directory and run streaming inference with progressive SKILL.md disclosure |
-| `examples/example_vlm_tool_call.py` | VLM reads an image, understands the instruction in it, and calls built-in `bash`/`fetch` tools to execute |
+| `examples/example_vlm_tool_call.py` | VLM reads an image, understands the instruction in it, and calls built-in `write_file`/`execute_command` tools to execute |
 | `examples/example_browser_use.py` | Client/server split: server registers chrome-devtools MCP; client calls `/v1/tools/call` to open a page directly, then `/v1/infer/stream` to let the LLM inspect and interact with the browser |
 | `examples/example_stream_as_infer.py` | Use `/v1/infer/stream` (SSE) to receive streaming tokens and reassemble them into the same JSON structure as `/v1/infer` — avoids idle-timeout disconnections on long-running inference |
 | `examples/example_multi_agents.py` | Multi-Agent collaboration: PlanAgent delegates tasks to MainAgent via the `delegate` tool. Demonstrates prompt templates, MCP tools, and hierarchical task delegation with automatic TOOLS markdown generation |
@@ -465,7 +465,7 @@ runtime/
 ├── tools.py                 # Function 工具装饰器
 ├── skill_manager.py         # SkillManager：SKILL.md 解析与渐进披露管理
 ├── mcp_client.py            # MCP Client：纯标准库 stdio/SSE 实现（StreamReader 上限扩展至 100 MB，支持大数据量返回）
-├── builtin_tools.py         # 内置工具：bash、fetch
+├── builtin_tools.py         # 内置工具：write_file、execute_command
 ├── prompt_template_manager.py  # 提示词模板 CRUD
 ├── context_manager.py       # 上下文管理器：会话管理、滚动摘要、记忆提取
 ├── env_manager.py           # 环境变量管理器
@@ -781,7 +781,7 @@ npm run build
 | `examples/example_mcp_ollama.py` | Ollama（qwen3:14b）+ MCP `time`/`fetch` 工具，支持 `--stream` 流式输出 |
 | `examples/example_mcp_openai.py` | 同上，使用 OpenAI 兼容协议，可轻松切换 OpenAI、vLLM、LiteLLM 等服务 |
 | `examples/example_skill.py` | 从目录加载 Skill，流式推理演示 SKILL.md 渐进披露全流程 |
-| `examples/example_vlm_tool_call.py` | VLM 读取图片中的文字指令，自动调用内置 `bash`/`fetch` 工具执行 |
+| `examples/example_vlm_tool_call.py` | VLM 读取图片中的文字指令，自动调用内置 `write_file`/`execute_command` 工具执行 |
 | `examples/example_browser_use.py` | 客户端/服务端分离：Server 注册 chrome-devtools MCP；Client 通过 `/v1/tools/call` 直接打开页面，再通过 `/v1/infer/stream` 让大模型操控浏览器 |
 | `examples/example_stream_as_infer.py` | 通过 `/v1/infer/stream`（SSE）接收流式 token，在本地拼装成与 `/v1/infer` 完全一致的 JSON 结果，彻底规避长时推理的网关/代理 idle timeout 断连问题；支持 `--compare` 参数同时调用两个接口对比结果 |
 | `examples/example_multi_agents.py` | 多 Agent 协作：PlanAgent 通过 `delegate` 工具将任务委派给 MainAgent 执行。演示提示词模板、MCP 工具、层级化任务委派，以及自动生成 TOOLS markdown 表格 |

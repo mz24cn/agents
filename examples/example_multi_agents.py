@@ -132,7 +132,7 @@ PLAN_AGENT_SYSTEM_PROMPT = """你是 PlanAgent，一个负责规划与协调的 
 >
 > 委派时，为 SubAgent 写精确的 `task`，只传递它需要的工具。不要委派琐碎的步骤。
 >
-> 委派时，最大程度遵循信息不丢失原则，能提供文件绝对路径地址的，就不要自行摘要。同时携带 `bash` 或 `fetch` 工具供 SubAgent 操作。
+> 委派时，最大程度遵循信息不丢失原则，能提供文件绝对路径地址的，就不要自行摘要。同时携带 `write_file` 或 `execute_command` 工具供 SubAgent 操作。
 
 根据任务复杂度调整阈值：对于简单的两步任务，告知 MainAgent 直接处理；对于多阶段、异构步骤的任务，鼓励拆解。
 
@@ -168,7 +168,7 @@ PLAN_AGENT_SYSTEM_PROMPT = """你是 PlanAgent，一个负责规划与协调的 
 
 ## 你不能做的事
 
-- 不要自己调用 `bash`、`fetch` 或任何其他执行类工具。你负责规划，MainAgent 负责执行。
+- 不要自己调用 `write_file`、`execute_command` 或任何其他执行类工具。你负责规划，MainAgent 负责执行。
 - 原则上不要多次调用 delegate。但如果第一次委派的结果明显有误，需要修正指令后重试；或工作没有完成，或没有得到完成结果的清晰答案，有必要再次委派以获得关于结果的明确说明。
 - 不要过度拆解。如果 MainAgent 能合理地完成整个任务，就让它完成。
 - 不要使用相对路径。涉及文件的操作，使用绝对路径才是安全的。
@@ -271,7 +271,7 @@ def main():
         prompt_template_manager=prompt_template_manager,
     )
 
-    # 注册内置工具：bash, fetch, delegate（需要传入 runtime 以支持 delegate 工具）
+    # 注册内置工具：write_file, execute_command, delegate（需要传入 runtime 以支持 delegate 工具）
     builtin_tool_ids = register_builtin_tools(tool_registry, runtime=runtime)
     print(f">>> 已注册内置工具: {builtin_tool_ids}")
 
@@ -283,7 +283,7 @@ def main():
     # 6. 发送 /v1/infer 请求
     #    - 使用 PlanAgentSystemPrompt 系统提示词（prompt_template 方式）
     #    - 使用 medium 模型
-    #    - 工具集: delegate, bash, fetch, 以及 chrome-devtools-mcp 的全部工具
+    #    - 工具集: delegate, write_file, execute_command, 以及 chrome-devtools-mcp 的全部工具
     #    - 用户消息: 模板 read_model_intro_on_modelscope，参数 MODEL="deepseek v4"
 
     print("\n" + "=" * 60)
@@ -293,11 +293,11 @@ def main():
     print(f"系统提示词: PlanAgentSystemPrompt (prompt_template)")
     print(f"用户消息模板: read_model_intro_on_modelscope")
     print(f"模板参数: MODEL=\"deepseek v4\"")
-    print(f"工具集: delegate, bash, fetch, {', '.join(mcp_tool_ids)}")
+    print(f"工具集: delegate, write_file, execute_command, {', '.join(mcp_tool_ids)}")
     print("=" * 60 + "\n")
 
-    # 构建工具 ID 列表：delegate + bash + fetch + 所有 MCP 工具
-    tool_ids = ["delegate", "bash", "fetch"] + mcp_tool_ids
+    # 构建工具 ID 列表：delegate + write_file + execute_command + 所有 MCP 工具
+    tool_ids = ["delegate", "write_file", "execute_command"] + mcp_tool_ids
 
     # 生成 TOOLS 占位符的值，同时从 PlanAgent 中去掉非 delegate 工具
     # （否则 PlanAgent 可能自己会去执行，但这是 MainAgent 的职责）

@@ -548,7 +548,7 @@
         }
         aIdxRef.value = -1
       } else {
-        // 普通工具结果帧（bash、fetch 等）
+        // 普通工具结果帧（write_file、execute_command 等）
         store.messages = [...msgs, { role: 'tool', ...msg }]
         aIdxRef.value = -1
       }
