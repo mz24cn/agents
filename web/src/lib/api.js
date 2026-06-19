@@ -378,6 +378,8 @@ export const workspace = {
   rename:   (path, newName) => request('POST', '/v1/workspace/rename', { path, new_name: newName }),
   duplicate:(path) => request('POST', '/v1/workspace/duplicate', { path }),
   delete:   (path) => request('DELETE', '/v1/workspace/delete', { path }),
+  move:     (paths, destDir, overwrite = false) => request('POST', '/v1/workspace/move', { paths, dest_dir: destDir, overwrite }),
+  copy:     (paths, destDir, overwrite = false) => request('POST', '/v1/workspace/copy', { paths, dest_dir: destDir, overwrite }),
   uploadInit: (data) => request('POST', '/v1/workspace/upload/init', data),
   uploadChunk: (uploadId, chunk, blob, onProgress) => uploadChunkWithProgress(uploadId, chunk, blob, onProgress),
   uploadComplete: (uploadId) => request('POST', `/v1/workspace/upload/${encodeURIComponent(uploadId)}/complete`, {}),

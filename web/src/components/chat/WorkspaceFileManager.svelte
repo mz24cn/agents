@@ -5,6 +5,7 @@
   import { marked } from 'marked'
   import { highlight, escapeHtml, getFileLang, isMarkdownFile } from '../../lib/highlight.js'
   import { copyToClipboard } from '../../lib/clipboard.js'
+  import ConfirmDialog from '../ConfirmDialog.svelte'
 
   /**
    * 工作区文件管理器面板
@@ -81,6 +82,24 @@
   let treeInitialized = false
   let uploadTasks = $state([])
   let uploadQueueRunning = false
+  
+  // 拖放相关状态
+  let dragState = $state({
+    isDragging: false,
+    dragPaths: [],      // 正在拖拽的文件路径列表
+    isCopyMode: false,  // 是否按住 Ctrl (复制模式)
+    dropTargetPath: null, // 当前悬停的目录树节点路径
+  })
+  
+  // 确认对话框状态
+  let confirmDialog = $state({
+    open: false,
+    title: '',
+    message: '',
+    confirmText: '',
+    onConfirm: null,
+    onCancel: null,
+  })
 
   function normalizePathForCompare(path) {
     return String(path || '').replace(/\\/g, '/').replace(/\/$/, '')
@@ -778,6 +797,186 @@
     hideContextMenu()
   }
 
+  // ==================== 拖放功能 ====================
+  
+  /**
+   * 文件列表项开始拖拽
+   */
+  function handleFileDragStart(e, file) {
+    // 如果拖拽的文件不在选中列表中，先选中它
+    let dragPaths = []
+    if (selectedFiles.has(file.path)) {
+      // 拖拽已选中的文件，移动所有选中的
+      dragPaths = [...selectedFiles]
+    } else {
+      // 拖拽未选中的文件，只移动这一个
+      dragPaths = [file.path]
+    }
+    
+    dragState.isDragging = true
+    dragState.dragPaths = dragPaths
+    dragState.isCopyMode = e.ctrlKey || e.metaKey
+    
+    // 设置拖拽数据
+    e.dataTransfer.effectAllowed = dragState.isCopyMode ? 'copy' : 'move'
+    e.dataTransfer.setData('application/json', JSON.stringify({
+      paths: dragPaths,
+      isCopy: dragState.isCopyMode,
+    }))
+    
+    // 创建自定义拖拽图像（显示文件数量）
+    const ghost = document.createElement('div')
+    ghost.className = 'drag-ghost'
+    ghost.textContent = dragPaths.length > 1 ? `${dragPaths.length} ${t('files')}` : file.name
+    ghost.style.cssText = 'position: absolute; top: -1000px; padding: 8px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; font-size: 13px; box-shadow: 0 2px 8px rgba(0,0,0,0.15);'
+    document.body.appendChild(ghost)
+    e.dataTransfer.setDragImage(ghost, 0, 0)
+    
+    // 清理 ghost 元素
+    requestAnimationFrame(() => {
+      document.body.removeChild(ghost)
+    })
+  }
+
+  /**
+   * 文件列表项拖拽中（更新 Ctrl 状态）
+   */
+  function handleFileDrag(e) {
+    // 更新复制模式状态
+    dragState.isCopyMode = e.ctrlKey || e.metaKey
+  }
+
+  /**
+   * 文件列表项结束拖拽
+   */
+  function handleFileDragEnd() {
+    dragState.isDragging = false
+    dragState.dragPaths = []
+    dragState.dropTargetPath = null
+  }
+
+  /**
+   * 目录树节点 dragover
+   */
+  function handleTreeDragOver(e, node) {
+    // 只允许拖放到目录节点
+    if (!node.path) return
+    
+    // 检查是否拖放到自身或子目录
+    const isSelfOrChild = dragState.dragPaths.some(p => 
+      pathsEqual(p, node.path) || pathStartsWith(p, node.path)
+    )
+    if (isSelfOrChild) {
+      e.dataTransfer.dropEffect = 'none'
+      return
+    }
+    
+    e.preventDefault()
+    e.dataTransfer.dropEffect = dragState.isCopyMode ? 'copy' : 'move'
+    dragState.dropTargetPath = node.path
+  }
+
+  /**
+   * 目录树节点 dragleave
+   */
+  function handleTreeDragLeave(e, node) {
+    // 只有离开当前节点时才清除（避免子元素触发）
+    if (dragState.dropTargetPath === node.path) {
+      // 检查 relatedTarget 是否还在当前节点内
+      const rect = e.currentTarget.getBoundingClientRect()
+      const x = e.clientX
+      const y = e.clientY
+      if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) {
+        dragState.dropTargetPath = null
+      }
+    }
+  }
+
+  /**
+   * 目录树节点 drop
+   */
+  async function handleTreeDrop(e, node) {
+    e.preventDefault()
+    dragState.dropTargetPath = null
+    
+    const destPath = node.path
+    if (!destPath || dragState.dragPaths.length === 0) return
+    
+    const isCopy = e.ctrlKey || e.metaKey
+    const operation = isCopy ? 'copy' : 'move'
+    
+    // 执行操作
+    await executeMoveOrCopy(dragState.dragPaths, destPath, operation)
+  }
+
+  /**
+   * 执行移动或复制操作
+   */
+  async function executeMoveOrCopy(paths, destPath, operation, overwrite = false) {
+    try {
+      const apiMethod = operation === 'copy' ? workspaceApi.copy : workspaceApi.move
+      const result = await apiMethod(paths, destPath, overwrite)
+      
+      // 检查是否有冲突
+      if (result.errors && result.errors.length > 0) {
+        const conflicts = result.errors.filter(e => e.conflict)
+        if (conflicts.length > 0) {
+          // 显示覆盖确认对话框
+          showOverwriteDialog(paths, destPath, operation, conflicts)
+          return
+        }
+      }
+      
+      // 操作完成，刷新列表
+      const successCount = operation === 'copy' 
+        ? (result.copied?.length || 0) 
+        : (result.moved?.length || 0)
+      
+      if (successCount > 0) {
+        loadFiles(currentPath)
+        // 如果是移动操作，清除选中状态
+        if (operation === 'move') {
+          selectedFiles.clear()
+          selectedFiles = new Set(selectedFiles)
+        }
+      }
+      
+      // 显示错误信息（如果有非冲突错误）
+      const otherErrors = (result.errors || []).filter(e => !e.conflict)
+      if (otherErrors.length > 0) {
+        error = otherErrors.map(e => e.error).join('\n')
+      }
+    } catch (err) {
+      error = err.message
+    }
+  }
+
+  /**
+   * 显示覆盖确认对话框
+   */
+  function showOverwriteDialog(paths, destPath, operation, conflicts) {
+    const conflictNames = conflicts.map(c => {
+      const path = c.path
+      const parts = path.replace(/\\/g, '/').split('/')
+      return parts[parts.length - 1] || path
+    }).join('\n  • ')
+    
+    confirmDialog = {
+      open: true,
+      title: t('moveOrCopyConflict'),
+      message: t('moveOrCopyConflictMessage', { files: conflictNames }),
+      confirmText: t('overwrite'),
+      onConfirm: async () => {
+        confirmDialog.open = false
+        // 重新执行，这次带 overwrite 标志
+        await executeMoveOrCopy(paths, destPath, operation, true)
+      },
+      onCancel: () => {
+        confirmDialog.open = false
+      },
+    }
+  }
+
   function normalizeUploadPath(path) {
     return String(path || '')
       .replace(/\\/g, '/')
@@ -1252,9 +1451,14 @@
                   class:selected={selectedFiles.has(file.path)}
                   class:directory={file.is_dir}
                   class:outside-workspace={!file.is_dir && !isInsideWorkspacePath(file.path)}
+                  class:dragging={dragState.isDragging && dragState.dragPaths.includes(file.path)}
+                  draggable="true"
                   onclick={(e) => file.is_dir ? enterDirectory(file.path) : handleFileClick(file, e)}
                   ondblclick={() => handleDoubleClick(file)}
                   oncontextmenu={(e) => showContextMenu(e, file)}
+                  ondragstart={(e) => handleFileDragStart(e, file)}
+                  ondrag={handleFileDrag}
+                  ondragend={handleFileDragEnd}
                 >
                   <span class="file-icon">{getFileIcon(file)}</span>
                   <span class="file-name">{file.name}</span>
@@ -1271,9 +1475,14 @@
                     class="grid-item"
                     class:selected={selectedFiles.has(file.path)}
                     class:outside-workspace={!file.is_dir && !isInsideWorkspacePath(file.path)}
+                    class:dragging={dragState.isDragging && dragState.dragPaths.includes(file.path)}
+                    draggable="true"
                     onclick={(e) => file.is_dir ? enterDirectory(file.path) : handleFileClick(file, e)}
                     ondblclick={() => handleDoubleClick(file)}
                     oncontextmenu={(e) => showContextMenu(e, file)}
+                    ondragstart={(e) => handleFileDragStart(e, file)}
+                    ondrag={handleFileDrag}
+                    ondragend={handleFileDragEnd}
                   >
                     {#if file.is_image}
                       <div class="grid-thumbnail" style="background-image: url({workspaceApi.thumbnail(file.path, false)})"></div>
@@ -1304,7 +1513,12 @@
               class="tree-node"
               class:active={pathsEqual(currentPath, node.path)}
               class:workspace={node.isWorkspace}
+              class:drop-target={dragState.isDragging && pathsEqual(dragState.dropTargetPath, node.path)}
+              class:drop-invalid={dragState.isDragging && dragState.dragPaths.some(p => pathsEqual(p, node.path) || pathStartsWith(p, node.path))}
               style="padding-left: {8 + node.depth * 16}px"
+              ondragover={(e) => handleTreeDragOver(e, node)}
+              ondragleave={(e) => handleTreeDragLeave(e, node)}
+              ondrop={(e) => handleTreeDrop(e, node)}
             >
               <button 
                 class="tree-toggle"
@@ -1425,6 +1639,17 @@
     </button>
   </div>
 {/if}
+
+<!-- 确认对话框 -->
+<ConfirmDialog
+  open={confirmDialog.open}
+  title={confirmDialog.title}
+  message={confirmDialog.message}
+  confirmText={confirmDialog.confirmText}
+  cancelText={t('cancel')}
+  onConfirm={confirmDialog.onConfirm}
+  onCancel={confirmDialog.onCancel}
+/>
 
 <style>
   .workspace-panel {
@@ -2184,5 +2409,23 @@
     text-align: center;
     color: var(--text-secondary);
     font-size: 0.85rem;
+  }
+
+  /* 拖拽相关样式 */
+  .file-item.dragging,
+  .grid-item.dragging {
+    opacity: 0.5;
+  }
+
+  .tree-node.drop-target {
+    background: var(--primary-bg, rgba(59, 130, 246, 0.15));
+    outline: 2px dashed var(--primary, #3b82f6);
+    outline-offset: -2px;
+    border-radius: 4px;
+  }
+
+  .tree-node.drop-invalid {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
 </style>

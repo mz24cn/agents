@@ -281,6 +281,15 @@ const translations = {
     retryUpload: '重试',
     clipboardEmpty: '剪贴板为空',
     clipboardUploadFailed: '剪贴板上传失败',
+    moveFiles: '移动文件',
+    copyFiles: '复制文件',
+    moveOrCopyConflict: '目标位置已存在同名文件',
+    moveOrCopyConflictMessage: '以下文件在目标位置已存在：\n{files}\n\n是否覆盖？',
+    overwrite: '覆盖',
+    cancel: '取消',
+    moveOrCopySuccess: '操作完成',
+    moveOrCopyPartialError: '部分文件操作失败',
+    cannotMoveToSelf: '不能移动到自身或子目录',
 
     // ThinkingBlock
     collapseThinking: '收起思考过程',
@@ -722,6 +731,15 @@ const translations = {
     retryUpload: 'Retry',
     clipboardEmpty: 'Clipboard is empty',
     clipboardUploadFailed: 'Clipboard upload failed',
+    moveFiles: 'Move Files',
+    copyFiles: 'Copy Files',
+    moveOrCopyConflict: 'File already exists at destination',
+    moveOrCopyConflictMessage: 'The following files already exist at the destination:\n{files}\n\nDo you want to overwrite?',
+    overwrite: 'Overwrite',
+    cancel: 'Cancel',
+    moveOrCopySuccess: 'Operation completed',
+    moveOrCopyPartialError: 'Some files failed to process',
+    cannotMoveToSelf: 'Cannot move to itself or its subdirectory',
 
     // ThinkingBlock
     collapseThinking: 'Collapse ',

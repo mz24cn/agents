@@ -443,6 +443,110 @@ class WorkspaceManager:
         except PermissionError:
             raise ValueError(f"Permission denied: {file_path}")
 
+    def _resolve_path(self, path: str, restrict_workspace: bool = True) -> str:
+        """Resolve a path to absolute, optionally checking workspace restriction."""
+        if os.path.isabs(path):
+            resolved = os.path.realpath(path)
+        else:
+            resolved = os.path.realpath(os.path.join(self.workspace_path, path))
+        if restrict_workspace and not resolved.startswith(self.workspace_path):
+            raise ValueError("Access denied: path is outside workspace")
+        return resolved
+
+    def move_files(self, paths: list, dest_dir: str, restrict_workspace: bool = True, overwrite: bool = False) -> Dict[str, Any]:
+        """Move multiple files/directories to a destination directory.
+        
+        Returns dict with 'moved' list and 'errors' list.
+        """
+        dest_path = self._resolve_path(dest_dir, restrict_workspace)
+        if not os.path.isdir(dest_path):
+            raise ValueError(f"Destination is not a directory: {dest_dir}")
+
+        moved = []
+        errors = []
+        
+        for src in paths:
+            try:
+                src_path = self._resolve_path(src, restrict_workspace)
+                if not os.path.exists(src_path):
+                    errors.append({"path": src, "error": f"Path does not exist: {src}"})
+                    continue
+                
+                # Prevent moving a directory into itself
+                if os.path.isdir(src_path) and dest_path.startswith(src_path + os.sep):
+                    errors.append({"path": src, "error": "Cannot move a directory into itself"})
+                    continue
+                
+                base_name = os.path.basename(src_path)
+                new_path = os.path.join(dest_path, base_name)
+                
+                if os.path.exists(new_path):
+                    if not overwrite:
+                        errors.append({"path": src, "error": f"Target already exists: {base_name}", "conflict": True})
+                        continue
+                # Remove existing before move
+                    if os.path.isdir(new_path):
+                        shutil.rmtree(new_path)
+                    else:
+                        os.remove(new_path)
+                
+                shutil.move(src_path, new_path)
+                moved.append(self.get_file_info(new_path, restrict_workspace=False))
+            except ValueError as e:
+                errors.append({"path": src, "error": str(e)})
+            except PermissionError:
+                errors.append({"path": src, "error": f"Permission denied: {src}"})
+            except Exception as e:
+                errors.append({"path": src, "error": str(e)})
+        
+        return {"moved": moved, "errors": errors}
+
+    def copy_files(self, paths: list, dest_dir: str, restrict_workspace: bool = True, overwrite: bool = False) -> Dict[str, Any]:
+        """Copy multiple files/directories to a destination directory.
+        
+        Returns dict with 'copied' list and 'errors' list.
+        """
+        dest_path = self._resolve_path(dest_dir, restrict_workspace)
+        if not os.path.isdir(dest_path):
+            raise ValueError(f"Destination is not a directory: {dest_dir}")
+
+        copied = []
+        errors = []
+        
+        for src in paths:
+            try:
+                src_path = self._resolve_path(src, restrict_workspace)
+                if not os.path.exists(src_path):
+                    errors.append({"path": src, "error": f"Path does not exist: {src}"})
+                    continue
+                
+                base_name = os.path.basename(src_path)
+                new_path = os.path.join(dest_path, base_name)
+                
+                if os.path.exists(new_path):
+                    if not overwrite:
+                        errors.append({"path": src, "error": f"Target already exists: {base_name}", "conflict": True})
+                        continue
+                    # Remove existing before copy
+                    if os.path.isdir(new_path):
+                        shutil.rmtree(new_path)
+                    else:
+                        os.remove(new_path)
+                
+                if os.path.isdir(src_path):
+                    shutil.copytree(src_path, new_path)
+                else:
+                    shutil.copy2(src_path, new_path)
+                copied.append(self.get_file_info(new_path, restrict_workspace=False))
+            except ValueError as e:
+                errors.append({"path": src, "error": str(e)})
+            except PermissionError:
+                errors.append({"path": src, "error": f"Permission denied: {src}"})
+            except Exception as e:
+                errors.append({"path": src, "error": str(e)})
+        
+        return {"copied": copied, "errors": errors}
+
     def resolve_upload_target(self, target_path: str) -> str:
         if not isinstance(target_path, str) or not target_path.strip():
             raise ValueError("INVALID_TARGET_PATH: target_path is required")

@@ -637,6 +637,10 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self._handle_workspace_rename()
         elif path == "/v1/workspace/duplicate":
             self._handle_workspace_duplicate()
+        elif path == "/v1/workspace/move":
+            self._handle_workspace_move()
+        elif path == "/v1/workspace/copy":
+            self._handle_workspace_copy()
         elif path == "/v1/workspace/upload/init":
             self._handle_workspace_upload_init()
         elif re.match(r"^/v1/workspace/upload/[^/]+/complete$", path):
@@ -2566,6 +2570,62 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self._send_json_error(400, str(e))
         except Exception as e:
             logger.error(f"Workspace duplicate error: {e}")
+            self._send_json_error(500, "Internal server error")
+
+    def _handle_workspace_move(self) -> None:
+        """POST /v1/workspace/move — move multiple files/directories to a destination."""
+        try:
+            body = self._read_json_body()
+            if body is None:
+                return
+            
+            paths = body.get('paths')
+            dest_dir = body.get('dest_dir')
+            overwrite = body.get('overwrite', False)
+            
+            if not paths or not isinstance(paths, list):
+                self._send_json_error(400, "Missing or invalid 'paths' field (must be array)")
+                return
+            
+            if not dest_dir:
+                self._send_json_error(400, "Missing 'dest_dir' field")
+                return
+            
+            workspace_mgr = self._get_workspace_manager()
+            result = workspace_mgr.move_files(paths, dest_dir, restrict_workspace=False, overwrite=overwrite)
+            self._send_json_response(200, result)
+        except ValueError as e:
+            self._send_json_error(400, str(e))
+        except Exception as e:
+            logger.error(f"Workspace move error: {e}")
+            self._send_json_error(500, "Internal server error")
+
+    def _handle_workspace_copy(self) -> None:
+        """POST /v1/workspace/copy — copy multiple files/directories to a destination."""
+        try:
+            body = self._read_json_body()
+            if body is None:
+                return
+            
+            paths = body.get('paths')
+            dest_dir = body.get('dest_dir')
+            overwrite = body.get('overwrite', False)
+            
+            if not paths or not isinstance(paths, list):
+                self._send_json_error(400, "Missing or invalid 'paths' field (must be array)")
+                return
+            
+            if not dest_dir:
+                self._send_json_error(400, "Missing 'dest_dir' field")
+                return
+            
+            workspace_mgr = self._get_workspace_manager()
+            result = workspace_mgr.copy_files(paths, dest_dir, restrict_workspace=False, overwrite=overwrite)
+            self._send_json_response(200, result)
+        except ValueError as e:
+            self._send_json_error(400, str(e))
+        except Exception as e:
+            logger.error(f"Workspace copy error: {e}")
             self._send_json_error(500, "Internal server error")
 
     def _handle_workspace_delete(self) -> None:
