@@ -15,11 +15,11 @@
   let api_base = $state(_init.api_base ?? '')
   let model_name = $state(_init.model_name ?? '')
   let api_key = $state(_init.api_key ?? '')
-  let model_type = $state(_init.model_type ?? 'llm')
   let api_protocol = $state(_init.api_protocol ?? 'openai')
   let generate_params_text = $state(
     _init.generate_params ? JSON.stringify(_init.generate_params, null, 2) : ''
   )
+  let labelsText = $state((_init.labels ?? []).join(', '))
 
   let errors = $state({})
   let submitError = $state('')
@@ -65,9 +65,9 @@
       api_base: api_base.trim(),
       model_name: model_name.trim(),
       api_key: api_key.trim(),
-      model_type,
       api_protocol,
       generate_params: generate_params_text.trim() ? JSON.parse(generate_params_text) : {},
+      labels: labelsText.split(',').map(s => s.trim()).filter(Boolean),
     }
     try {
       if (isEdit) await models.update(originalModelId, config)
@@ -96,7 +96,6 @@
           api_base: api_base.trim(),
           model_name: model_name.trim(),
           api_key: api_key.trim(),
-          model_type,
           api_protocol,
           generate_params: generate_params_text.trim() ? JSON.parse(generate_params_text) : {},
         },
@@ -170,35 +169,27 @@
     <input id="api_key" type="password" bind:value={api_key} placeholder={t('apiKeyPlaceholder')} />
   </div>
 
-  <div class="form-row">
-    <div class="form-group">
-      <span class="radio-label">{t('modelType')}</span>
-      <div class="radio-group">
-        {#each [['llm','LLM'],['vlm','VLM']] as [val, label]}
-          <label class="radio-item">
-            <input type="radio" name="model_type" value={val} bind:group={model_type} />
-            {label}
-          </label>
-        {/each}
-      </div>
+  <div class="form-group">
+    <span class="radio-label">{t('apiProtocol')}</span>
+    <div class="radio-group">
+      {#each [['openai','OpenAI'],['ollama','Ollama'],['anthropic','Anthropic']] as [val, label]}
+        <label class="radio-item">
+          <input type="radio" name="api_protocol" value={val} bind:group={api_protocol} />
+          {label}
+        </label>
+      {/each}
     </div>
-      <div class="form-group">
-        <span class="radio-label">{t('apiProtocol')}</span>
-        <div class="radio-group">
-          {#each [['openai','OpenAI'],['ollama','Ollama'],['anthropic','Anthropic']] as [val, label]}
-            <label class="radio-item">
-              <input type="radio" name="api_protocol" value={val} bind:group={api_protocol} />
-              {label}
-            </label>
-          {/each}
-        </div>
-      </div>
   </div>
 
   <div class="form-group">
     <label for="generate_params">{t('generateParams')}</label>
     <JsonEditor id="generate_params" bind:value={generate_params_text} rows={4} placeholder={t('generateParamsPlaceholder')} />
     {#if errors.generate_params}<span class="field-error">{errors.generate_params}</span>{/if}
+  </div>
+
+  <div class="form-group">
+    <label for="model_labels">{t('labels')}</label>
+    <input id="model_labels" type="text" bind:value={labelsText} placeholder={t('labelsPlaceholder')} />
   </div>
 
   <div class="form-actions">

@@ -72,8 +72,10 @@
                 <span class="agent-name">{agent.nickname}</span>
                 <span class="agent-title-side">
                   <span class="agent-meta">{agent.model_id} · {agent.tool_ids?.length || 0} tools{agent.template_id ? ' · ' + agent.template_id : ''}</span>
-                  {#if agent.group}
-                    <span class="agent-group">{agent.group}</span>
+                  {#if agent.labels?.length}
+                    {#each agent.labels as label}
+                      <span class="label-tag">{label}</span>
+                    {/each}
                   {/if}
                 </span>
               </div>
@@ -133,7 +135,7 @@
   .agent-name { font-weight: 600; color: var(--text); font-size: 0.95rem; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .agent-title-side { margin-left: auto; display: flex; align-items: center; justify-content: flex-end; gap: 8px; min-width: 0; white-space: nowrap; }
   .agent-meta { font-size: 0.8rem; color: var(--text-secondary); white-space: nowrap; }
-  .agent-group { color: var(--primary); font-size: 0.8rem; white-space: nowrap; }
+  .label-tag { display: inline-block; padding: 1px 7px; background: #10b981; color: #fff; border-radius: 10px; font-size: 0.78rem; }
   .agent-myself { color: var(--primary); font-size: 0.85rem; margin-bottom: 2px; }
   .agent-description { color: var(--text-secondary); font-size: 0.82rem; white-space: pre-wrap; word-break: break-word; margin-bottom: 4px; }
   .agent-timestamp { font-size: 0.75rem; color: var(--text-secondary); opacity: 0.7; }

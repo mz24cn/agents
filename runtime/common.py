@@ -22,7 +22,47 @@ import sys
 import tempfile
 import threading
 import urllib.request
-from typing import Optional
+from typing import List, Optional, Union
+
+
+# ---------------------------------------------------------------------------
+# Label parsing
+# ---------------------------------------------------------------------------
+
+def parse_labels(labels_input: Union[str, List, None]) -> List[str]:
+    """Parse labels input into a list of unique strings.
+
+    Args:
+        labels_input: Can be a string (comma-separated), list, or None.
+
+    Returns:
+        List of unique label strings, preserving order (first occurrence kept).
+    """
+    if labels_input is None:
+        return []
+    if isinstance(labels_input, list):
+        seen: set[str] = set()
+        result: list[str] = []
+        for label in labels_input:
+            label_str = str(label).strip()
+            if label_str and label_str not in seen:
+                seen.add(label_str)
+                result.append(label_str)
+        return result
+    if isinstance(labels_input, str):
+        if not labels_input.strip():
+            return []
+        parts = re.split(r',\s*', labels_input)
+        seen: set[str] = set()
+        result: list[str] = []
+        for part in parts:
+            part = part.strip()
+            if part and part not in seen:
+                seen.add(part)
+                result.append(part)
+        return result
+    # For other types, convert to string and recurse
+    return parse_labels(str(labels_input))
 
 
 # ---------------------------------------------------------------------------

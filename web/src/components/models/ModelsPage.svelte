@@ -58,36 +58,44 @@
     {:else if modelList.length === 0 && !error}
       <div class="empty">{t('noModels')}</div>
     {:else if modelList.length > 0}
-      <div class="table-wrap">
-        <table>
-          <thead>
+      <table>
+        <colgroup>
+          <col style="width:15%" />
+          <col style="width:12%" />
+          <col style="width:28%" />
+          <col style="width:8%" />
+          <col style="width:18%" />
+          <col style="width:19%" />
+        </colgroup>
+        <thead>
+          <tr>
+            <th>{t('modelIdHeader')}</th>
+            <th>{t('modelNameHeader')}</th>
+            <th>{t('apiBaseHeader')}</th>
+            <th>{t('protocolHeader')}</th>
+            <th>{t('labels')}</th>
+            <th>{t('actions')}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {#each modelList as m (m.model_id)}
             <tr>
-              <th>{t('modelIdHeader')}</th>
-              <th>{t('modelNameHeader')}</th>
-              <th>{t('apiBaseHeader')}</th>
-              <th>{t('typeHeader')}</th>
-              <th>{t('protocolHeader')}</th>
-              <th>{t('actions')}</th>
-            </tr>
-          </thead>
-          <tbody>
-            {#each modelList as m (m.model_id)}
-              <tr>
-                <td>{m.model_id}</td>
-                <td>{m.model_name}</td>
-                <td>{m.api_base}</td>
-                <td>{m.model_type}</td>
-                <td>{m.api_protocol}</td>
-                <td class="actions">
+              <td class="nowrap">{m.model_id}</td>
+              <td class="nowrap">{m.model_name}</td>
+              <td class="ellipsis">{m.api_base}</td>
+              <td class="nowrap">{m.api_protocol}</td>
+              <td class="labels-cell"><div class="labels-wrap">{#each m.labels ?? [] as label}<span class="label-tag">{label}</span>{/each}</div></td>
+              <td class="nowrap">
+                <span class="btn-group">
                   <button class="btn btn-sm" onclick={() => handleEditClick(m)}>{t('edit')}</button>
                   <button class="btn btn-sm btn-secondary" onclick={() => handleCopyClick(m)}>{t('copyModel')}</button>
                   <button class="btn btn-sm btn-danger" onclick={() => handleDeleteClick(m)}>{t('delete')}</button>
-                </td>
-              </tr>
-            {/each}
-          </tbody>
-        </table>
-      </div>
+                </span>
+              </td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
     {/if}
   </div>
 </div>
@@ -105,7 +113,7 @@
     display: flex;
     flex-direction: column;
   }
-  .btn-sm { padding: 4px 12px; font-size: 0.85rem; background: var(--bg-secondary); color: var(--text); border: 1px solid var(--border); border-radius: 4px; }
+  .btn-sm { padding: 4px 12px; font-size: 0.85rem; background: var(--bg-secondary); color: var(--text); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; }
   .btn-sm:hover { opacity: 0.8; }
   .btn-secondary { background: var(--bg-secondary); color: var(--text); border: 1px solid var(--border); }
   .btn-secondary:hover { background: var(--primary); color: #fff; border-color: var(--primary); }
@@ -118,29 +126,21 @@
     padding: 20px;
   }
   .loading, .empty { text-align: center; padding: 40px 0; color: var(--text-secondary); font-size: 1rem; }
-  .table-wrap { overflow-x: auto; }
-  table { width: 100%; border-collapse: collapse; }
-  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+
+  table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
   th { background: var(--bg-secondary); color: var(--text-secondary); font-weight: 600; font-size: 0.85rem; }
   td { font-size: 0.9rem; color: var(--text); }
-  .actions { display: flex; gap: 8px; }
-  
-  /* 滚动条样式：默认隐藏，悬停时显示 */
-  .page-content::-webkit-scrollbar {
-    width: 8px;
-  }
-  .page-content::-webkit-scrollbar-track {
-    background: transparent;
-  }
-  .page-content::-webkit-scrollbar-thumb {
-    background: transparent;
-    border-radius: 4px;
-    transition: background 0.2s;
-  }
-  .page-content:hover::-webkit-scrollbar-thumb {
-    background: var(--border);
-  }
-  .page-content:hover::-webkit-scrollbar-thumb:hover {
-    background: var(--text-secondary);
-  }
+  .nowrap { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ellipsis { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .btn-group { display: inline-flex; gap: 8px; }
+  .labels-wrap { display: flex; flex-wrap: wrap; gap: 4px; }
+  .label-tag { display: inline-block; padding: 2px 7px; background: #10b981; color: #fff; border-radius: 10px; font-size: 0.78rem; width: fit-content; }
+
+  /* 滚动条样式 */
+  .page-content::-webkit-scrollbar { width: 8px; }
+  .page-content::-webkit-scrollbar-track { background: transparent; }
+  .page-content::-webkit-scrollbar-thumb { background: transparent; border-radius: 4px; transition: background 0.2s; }
+  .page-content:hover::-webkit-scrollbar-thumb { background: var(--border); }
+  .page-content:hover::-webkit-scrollbar-thumb:hover { background: var(--text-secondary); }
 </style>

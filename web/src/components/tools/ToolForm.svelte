@@ -19,6 +19,7 @@
   let function_file_path = $state(_init.function_file_path ?? '')
   let function_name = $state(_init.function_name ?? '')
   let skill_dir = $state(_init.skill_dir ?? '')
+  let labelsText = $state((_init.labels ?? []).join(', '))
 
   const MCP_PLACEHOLDER = JSON.stringify({
     mcpServers: {
@@ -72,26 +73,43 @@
     if (!validate()) return
     submitting = true
     submitError = ''
+    const parsedLabels = labelsText.trim() ? labelsText.split(',').map(s => s.trim()).filter(Boolean) : []
     try {
       if (tool_type === 'mcp') {
         const config = JSON.parse(mcp_config_text)
         const serverName = mcpServer?.serverName ?? _init.mcpServerName
+        let resp
         if (isMcpEdit && serverName) {
           // Edit: delete old first, rollback if create fails
           const oldConfig = _mcpServerConfig
           await mcpServers.delete(serverName)
           try {
-            await tools.createMcp(config)
+            resp = await tools.createMcp(config)
           } catch (createErr) {
             // Rollback: restore old config so the server isn't lost
             try { await mcpServers.restore(serverName, oldConfig) } catch { /* best-effort */ }
             throw createErr
           }
         } else {
-          await tools.createMcp(config)
+          resp = await tools.createMcp(config)
+        }
+        // Apply labels to all registered MCP tools
+        if (parsedLabels.length && resp?.registered_tools?.length) {
+          await Promise.all(resp.registered_tools.map(id => tools.update(id, { labels: parsedLabels })))
         }
       } else if (tool_type === 'skill') {
-        await tools.createSkill(skill_dir.trim())
+        if (isEdit) {
+          // Edit existing skill tool: update labels and other fields
+          const config = { tool_type: 'skill', labels: parsedLabels }
+          await tools.update(_init.tool_id, config)
+        } else {
+          // Create new skill tool
+          const resp = await tools.createSkill(skill_dir.trim())
+          // Apply labels to the registered skill tool
+          if (parsedLabels.length && resp?.tool_id) {
+            await tools.update(resp.tool_id, { tool_type: 'skill', labels: parsedLabels })
+          }
+        }
       } else {
         const config = {
           tool_type,
@@ -101,6 +119,7 @@
         }
         if (function_file_path.trim()) config.function_file_path = function_file_path.trim()
         if (function_name.trim()) config.function_name = function_name.trim()
+        if (parsedLabels.length) config.labels = parsedLabels
         if (isEdit) await tools.update(_init.tool_id, config)
         else await tools.create(config)
       }
@@ -180,6 +199,11 @@
       <span class="hint">{t('functionNameHint')}</span>
     </div>
   {/if}
+
+  <div class="form-group">
+    <label for="tool_labels">{t('labels')}</label>
+    <input id="tool_labels" type="text" bind:value={labelsText} placeholder={t('labelsPlaceholder')} />
+  </div>
 
   <div class="form-actions">
     <button type="button" class="btn btn-cancel" onclick={onCancel} disabled={submitting}>{t('cancel')}</button>

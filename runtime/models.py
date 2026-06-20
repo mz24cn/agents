@@ -5,7 +5,9 @@ as dataclasses with JSON serialization/deserialization support.
 """
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, List
+
+from runtime.common import parse_labels  # noqa: F401 — re-export
 
 
 @dataclass
@@ -96,18 +98,21 @@ class ModelConfig:
         api_base: Base URL of the model API (e.g. "http://localhost:11434").
         model_name: Model name as recognized by the API (e.g. "qwen3.5:9b").
         api_key: API key for authentication (empty string if not needed).
-        model_type: Type of model - "llm" or "vlm".
         api_protocol: API protocol - "openai" or "ollama".
         generate_params: Additional generation parameters (temperature, top_p, etc.).
+        labels: Tags for categorization (e.g. ["vlm"] for vision-language models).
     """
 
     model_id: str
     api_base: str
     model_name: str
     api_key: str = ""
-    model_type: str = "llm"
     api_protocol: str = "openai"
     generate_params: dict = field(default_factory=dict)
+    labels: list = field(default_factory=list)
+
+    def __post_init__(self):
+        self.labels = parse_labels(self.labels)
 
     def to_dict(self) -> dict:
         """Serialize to a dictionary."""
@@ -116,9 +121,9 @@ class ModelConfig:
             "api_base": self.api_base,
             "model_name": self.model_name,
             "api_key": self.api_key,
-            "model_type": self.model_type,
             "api_protocol": self.api_protocol,
             "generate_params": dict(self.generate_params),
+            "labels": list(self.labels),
         }
 
     @classmethod
@@ -129,9 +134,9 @@ class ModelConfig:
             api_base=data["api_base"],
             model_name=data["model_name"],
             api_key=data.get("api_key", ""),
-            model_type=data.get("model_type", "llm"),
             api_protocol=data.get("api_protocol", "openai"),
             generate_params=data.get("generate_params", {}),
+            labels=parse_labels(data.get("labels", [])),
         )
 
 
@@ -162,6 +167,10 @@ class ToolConfig:
     function_name: Optional[str] = None
     skill_dir: Optional[str] = None
     builtin: bool = False
+    labels: list = field(default_factory=list)
+
+    def __post_init__(self):
+        self.labels = parse_labels(self.labels)
 
     def to_dict(self) -> dict:
         """Serialize to a dictionary, omitting None optional fields."""
@@ -186,6 +195,8 @@ class ToolConfig:
             d["skill_dir"] = self.skill_dir
         if self.builtin:
             d["builtin"] = True
+        if self.labels:
+            d["labels"] = list(self.labels)
         return d
 
     @classmethod
@@ -204,6 +215,7 @@ class ToolConfig:
             function_name=data.get("function_name"),
             skill_dir=data.get("skill_dir"),
             builtin=data.get("builtin", False),
+            labels=parse_labels(data.get("labels", [])),
         )
 
 

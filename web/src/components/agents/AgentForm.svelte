@@ -20,7 +20,7 @@
   let systemPrompt = $state(_init.system_prompt ?? '')
   let myselfView = $state(_init.myself_view ?? '')
   let description = $state(_init.description ?? '')
-  let group = $state(_init.group ?? '')
+  let labelsText = $state((_init.labels ?? (_init.group ? [_init.group] : [])).join(', '))
   let avatar = $state(_init.avatar ?? '')
 
   const isTemplateSelected = $derived(templateId.trim() !== '')
@@ -66,7 +66,7 @@
       system_prompt: systemPrompt.trim(),
       myself_view: myselfView.trim(),
       description: description.trim(),
-      group: group.trim(),
+      labels: labelsText.split(',').map(s => s.trim()).filter(Boolean),
       avatar: avatar.trim(),
     }
     try {
@@ -142,8 +142,8 @@
   </div>
 
   <div class="form-group">
-    <label for="agent_group">{t('agentGroup')}</label>
-    <input id="agent_group" type="text" bind:value={group} placeholder={t('agentGroupPlaceholder')} />
+    <label for="agent_labels">{t('agentLabels')}</label>
+    <input id="agent_labels" type="text" bind:value={labelsText} placeholder={t('agentLabelsPlaceholder')} />
   </div>
 
   <div class="form-group">

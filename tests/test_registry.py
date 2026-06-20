@@ -17,7 +17,6 @@ def _make_config(model_id: str = "test-model", **kwargs) -> ModelConfig:
         "api_base": "http://localhost:11434",
         "model_name": "qwen3.5:9b",
         "api_key": "",
-        "model_type": "llm",
         "api_protocol": "openai",
         "generate_params": {"temperature": 0.7},
     }

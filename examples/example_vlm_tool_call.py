@@ -63,7 +63,7 @@ def main():
         api_base="http://localhost:11434",
         model_name="qwen3.5:9b",
         api_protocol="ollama",
-        model_type="vlm",
+        labels=["vlm"],
         generate_params={"temperature": 0.7},
     ))
 

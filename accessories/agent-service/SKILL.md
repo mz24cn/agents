@@ -96,7 +96,7 @@ curl -fsS "$SERVER_URL/v1/models" | python -m json.tool
 
 ### 注册 OpenAI-compatible 模型
 
-必需字段：`model_id`、`api_base`、`model_name`。可选字段：`api_key`、`model_type`（`llm`/`vlm`）、`api_protocol`（通常 `openai` 或 `ollama`）、`generate_params`。
+必需字段：`model_id`、`api_base`、`model_name`。可选字段：`api_key`、`api_protocol`（通常 `openai` 或 `ollama`）、`generate_params`、`labels`（如 `["vlm"]` 表示视觉语言模型）。
 
 ```bash
 SERVER_URL="${RUNTIME_SERVER_URL:-${AGENT_SERVER_URL:-http://${RUNTIME_SERVER_HOST:-127.0.0.1}:${RUNTIME_SERVER_PORT:-7988}}}"
@@ -108,7 +108,6 @@ curl -fsS -X POST "$SERVER_URL/v1/models" \
   "api_base": "http://127.0.0.1:8000/v1",
   "model_name": "gpt-4o-mini",
   "api_key": "",
-  "model_type": "llm",
   "api_protocol": "openai",
   "generate_params": {"temperature": 0.7}
 }
@@ -127,7 +126,6 @@ curl -fsS -X POST "$SERVER_URL/v1/models" \
   "api_base": "http://localhost:11434",
   "model_name": "qwen3:14b",
   "api_key": "",
-  "model_type": "llm",
   "api_protocol": "ollama",
   "generate_params": {"temperature": 0.7}
 }
@@ -140,7 +138,7 @@ JSON
 # 更新：PUT body 是完整 ModelConfig
 curl -fsS -X PUT "$SERVER_URL/v1/models/qwen3-14b" \
   -H 'Content-Type: application/json' \
-  -d '{"model_id":"qwen3-14b","api_base":"http://localhost:11434","model_name":"qwen3:14b","api_protocol":"ollama","model_type":"llm","generate_params":{"temperature":0.2}}' \
+  -d '{"model_id":"qwen3-14b","api_base":"http://localhost:11434","model_name":"qwen3:14b","api_protocol":"ollama","generate_params":{"temperature":0.2}}' \
   | python -m json.tool
 
 # 删除

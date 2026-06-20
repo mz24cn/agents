@@ -30,7 +30,6 @@ model_config_st = st.builds(
     api_base=st.text(min_size=1, max_size=100),
     model_name=st.text(min_size=1, max_size=50),
     api_key=st.text(max_size=100),
-    model_type=st.sampled_from(["llm", "vlm"]),
     api_protocol=st.sampled_from(["openai", "ollama"]),
     generate_params=generate_params_st,
 )
@@ -50,7 +49,6 @@ def test_model_config_round_trip(config: ModelConfig) -> None:
     assert deserialized.api_base == config.api_base
     assert deserialized.model_name == config.model_name
     assert deserialized.api_key == config.api_key
-    assert deserialized.model_type == config.model_type
     assert deserialized.api_protocol == config.api_protocol
     assert deserialized.generate_params == config.generate_params
 

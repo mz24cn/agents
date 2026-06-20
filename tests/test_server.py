@@ -613,6 +613,100 @@ class TestToolCRUD:
         assert cfg.name == "updated_tool"
         assert cfg.description == "An updated tool"
 
+    def test_put_update_mcp_tool_without_tool_id_in_body(self, server, runtime):
+        """PUT /v1/tools/{id} with MCP tool should keep tool_id from URL when body has no tool_id."""
+        # Register an MCP tool first
+        data = {
+            "tool_id": "mcp-firecrawl",
+            "tool_type": "mcp",
+            "name": "firecrawl",
+            "mcp_server_name": "firecrawl",
+            "description": "Web scraping tool",
+            "parameters": {"type": "object", "properties": {}},
+        }
+        status, body = _post(server, "/v1/tools", data)
+        assert status == 201
+
+        # Update without tool_id in body - should keep mcp-firecrawl
+        updated_data = {
+            "tool_type": "mcp",
+            "name": "firecrawl-v2",
+            "mcp_server_name": "firecrawl",
+            "description": "Updated web scraping tool",
+            "parameters": {"type": "object", "properties": {}},
+        }
+        status, body = _put(server, "/v1/tools/mcp-firecrawl", updated_data)
+        assert status == 200
+        assert body["tool_id"] == "mcp-firecrawl"
+
+        cfg = runtime._tool_registry.get("mcp-firecrawl")
+        assert cfg is not None
+        assert cfg.name == "firecrawl-v2"
+
+    def test_put_update_skill_tool_without_tool_id_in_body(self, server, runtime):
+        """PUT /v1/tools/{id} with skill tool should keep tool_id from URL when body has no tool_id."""
+        # Register a skill tool first
+        data = {
+            "tool_id": "skill-my_skill",
+            "tool_type": "skill",
+            "name": "my_skill",
+            "description": "A skill tool",
+            "parameters": {"type": "object", "properties": {}},
+            "steps": [{"step": 1, "action": "test"}],
+        }
+        status, body = _post(server, "/v1/tools", data)
+        assert status == 201
+
+        # Update without tool_id in body - should keep skill-my_skill
+        updated_data = {
+            "tool_type": "skill",
+            "name": "my_skill_v2",
+            "description": "Updated skill tool",
+            "parameters": {"type": "object", "properties": {}},
+            "steps": [{"step": 1, "action": "updated"}],
+        }
+        status, body = _put(server, "/v1/tools/skill-my_skill", updated_data)
+        assert status == 200
+        assert body["tool_id"] == "skill-my_skill"
+
+        cfg = runtime._tool_registry.get("skill-my_skill")
+        assert cfg is not None
+        assert cfg.name == "my_skill_v2"
+
+    def test_put_update_mcp_tool_with_new_tool_id(self, server, runtime):
+        """PUT /v1/tools/{id} with MCP tool should use body tool_id when provided."""
+        # Register an MCP tool first
+        data = {
+            "tool_id": "mcp-firecrawl",
+            "tool_type": "mcp",
+            "name": "firecrawl",
+            "mcp_server_name": "firecrawl",
+            "description": "Web scraping tool",
+            "parameters": {"type": "object", "properties": {}},
+        }
+        status, body = _post(server, "/v1/tools", data)
+        assert status == 201
+
+        # Update with new tool_id in body - should rename
+        updated_data = {
+            "tool_id": "mcp-firecrawl-v2",
+            "tool_type": "mcp",
+            "name": "firecrawl",
+            "mcp_server_name": "firecrawl",
+            "description": "Web scraping tool v2",
+            "parameters": {"type": "object", "properties": {}},
+        }
+        status, body = _put(server, "/v1/tools/mcp-firecrawl", updated_data)
+        assert status == 200
+        assert body["tool_id"] == "mcp-firecrawl-v2"
+
+        # Old tool should be removed
+        assert runtime._tool_registry.get("mcp-firecrawl") is None
+        # New tool should exist
+        cfg = runtime._tool_registry.get("mcp-firecrawl-v2")
+        assert cfg is not None
+        assert cfg.description == "Web scraping tool v2"
+
     def test_put_update_nonexistent_tool(self, server):
         """PUT /v1/tools/{id} for a tool that doesn't exist should return 404."""
         data = {

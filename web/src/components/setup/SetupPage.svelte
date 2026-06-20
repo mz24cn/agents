@@ -11,11 +11,12 @@
   import EnvPage from '../env/EnvPage.svelte'
   import ModelForm from '../models/ModelForm.svelte'
   import ToolForm from '../tools/ToolForm.svelte'
+  import McpToolForm from '../tools/McpToolForm.svelte'
   import PromptForm from '../prompts/PromptForm.svelte'
   import AgentForm from '../agents/AgentForm.svelte'
   import { mcpServers } from '../../lib/api.js'
 
-  const validTabs = ['models', 'tools', 'prompts', 'agents', 'env', 'auth', 'model-add', 'tool-add', 'prompt-add', 'agent-add', 'env-add', 'model-edit', 'tool-edit', 'prompt-edit', 'agent-edit']
+  const validTabs = ['models', 'tools', 'prompts', 'agents', 'env', 'auth', 'model-add', 'tool-add', 'prompt-add', 'agent-add', 'env-add', 'model-edit', 'tool-edit', 'mcp-tool-edit', 'prompt-edit', 'agent-edit']
   const initialTab = validTabs.includes(getQueryParam('tab')) ? getQueryParam('tab') : 'agents'
   let activeTab = $state(initialTab)
   let envDetectTrigger = $state(0)
@@ -24,6 +25,7 @@
 
   let editingModel = $state(null)
   let editingTool = $state(null)
+  let editingMcpTool = $state(null)
   let editingPrompt = $state(null)
   let editingAgent = $state(null)
 
@@ -152,11 +154,12 @@
 
   function handleFormCancel() {
     if (activeTab === 'model-add' || activeTab === 'model-edit') activeTab = 'models'
-    else if (activeTab === 'tool-add' || activeTab === 'tool-edit') activeTab = 'tools'
+    else if (activeTab === 'tool-add' || activeTab === 'tool-edit' || activeTab === 'mcp-tool-edit') activeTab = 'tools'
     else if (activeTab === 'prompt-add' || activeTab === 'prompt-edit') activeTab = 'prompts'
     else if (activeTab === 'agent-add' || activeTab === 'agent-edit') activeTab = 'agents'
     editingModel = null
     editingTool = null
+    editingMcpTool = null
     editingPrompt = null
     editingAgent = null
   }
@@ -188,6 +191,11 @@
       editingTool = tool
       activeTab = 'tool-edit'
     }
+  }
+
+  function handleEditMcpTool(tool) {
+    editingMcpTool = tool
+    activeTab = 'mcp-tool-edit'
   }
 
   function handleEditPrompt(prompt) {
@@ -272,7 +280,7 @@
         <ModelForm model={editingModel} onSuccess={handleModelFormSuccess} onCancel={handleFormCancel} />
       </div>
     {:else if activeTab === 'tools'}
-      <ToolsPage onEdit={handleEditTool} />
+      <ToolsPage onEdit={handleEditTool} onEditMcpTool={handleEditMcpTool} />
     {:else if activeTab === 'tool-add'}
       <div class="form-wrapper">
         <ToolForm onSuccess={handleToolFormSuccess} onCancel={handleFormCancel} />
@@ -280,6 +288,10 @@
     {:else if activeTab === 'tool-edit'}
       <div class="form-wrapper">
         <ToolForm tool={editingTool} onSuccess={handleToolFormSuccess} onCancel={handleFormCancel} />
+      </div>
+    {:else if activeTab === 'mcp-tool-edit'}
+      <div class="form-wrapper">
+        <McpToolForm tool={editingMcpTool} onSuccess={handleToolFormSuccess} onCancel={handleFormCancel} />
       </div>
     {:else if activeTab === 'prompts'}
       <PromptsPage onEdit={handleEditPrompt} onCopy={handleCopyPrompt} />

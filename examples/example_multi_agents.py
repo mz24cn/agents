@@ -223,7 +223,6 @@ def main():
             model_name=model_name,
             api_key=MIMO_API_KEY,
             api_protocol="openai",
-            model_type="llm",
             generate_params={"temperature": 0.7},
         ))
     print(f">>> 已注册模型: {list(MODEL_MAPPING.keys())}")

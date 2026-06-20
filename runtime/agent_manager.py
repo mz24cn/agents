@@ -11,6 +11,8 @@ import json
 import os
 from typing import Optional
 
+from runtime.common import parse_labels
+
 
 class AgentManager:
     """Manages agents with CRUD operations and JSON persistence.
@@ -48,8 +50,8 @@ class AgentManager:
         system_prompt: str = "",
         myself_view: str = "",
         description: str = "",
-        group: str = "",
         avatar: str = "",
+        labels: Optional[list] = None,
     ) -> dict:
         """Create a new agent."""
         agent = {
@@ -62,7 +64,7 @@ class AgentManager:
             "nickname": nickname,
             "myself_view": myself_view,
             "description": description,
-            "group": str(group or ""),
+            "labels": parse_labels(labels),
             "last_modified": datetime.datetime.now().isoformat(),
             "avatar": avatar,
         }
@@ -84,12 +86,13 @@ class AgentManager:
             return None
         agent = self._agents[agent_id]
         for key in ("model_id", "tool_ids", "template_id", "template_arguments",
-                     "system_prompt", "nickname", "myself_view", "description", "group", "avatar"):
+                     "system_prompt", "nickname", "myself_view", "description", "avatar"):
             if key in updates:
-                if key == "group":
-                    agent[key] = str(updates[key] or "")
-                else:
-                    agent[key] = updates[key]
+                agent[key] = updates[key]
+
+        if "labels" in updates:
+            agent["labels"] = parse_labels(updates["labels"])
+
         agent["last_modified"] = datetime.datetime.now().isoformat()
         self._save_to_disk(agent_id, agent)
         return agent
@@ -134,7 +137,13 @@ class AgentManager:
                         agent = json.load(f)
                         agent_id = agent.get("agent_id")
                         if agent_id:
-                            agent.setdefault("group", "")
+                            # Migration: convert old "group" field to "labels"
+                            if "group" in agent and "labels" not in agent:
+                                agent["labels"] = parse_labels(agent.pop("group"))
+                            elif "group" in agent:
+                                # Both exist: drop legacy group key
+                                del agent["group"]
+                            agent.setdefault("labels", [])
                             self._agents[agent_id] = agent
                 except (json.JSONDecodeError, OSError):
                     pass

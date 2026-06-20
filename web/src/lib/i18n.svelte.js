@@ -119,6 +119,9 @@ const translations = {
     description: '描述',
     type: '类型',
     id: 'ID',
+    labels: '标签',
+    labelsPlaceholder: '用逗号分隔，例如: 快速,本地,测试',
+    labelsHint: '标签用于分类和筛选工具，可留空',
 
     // AudioPlayer
     audioNotSupported: '浏览器不支持音频播放',
@@ -169,8 +172,8 @@ const translations = {
     agentMyselfViewPlaceholder: '简短的自我表达',
     agentDescription: '描述',
     agentDescriptionPlaceholder: '客观记录，长期记忆',
-    agentGroup: '组别',
-    agentGroupPlaceholder: '例如: 开发 / 写作 / 默认',
+    agentLabels: '标签',
+    agentLabelsPlaceholder: '用逗号分隔，例如: 开发,写作',
     agentAvatar: '头像',
     agentAvatarPlaceholder: '输入头像 URL 或 emoji',
 
@@ -325,7 +328,6 @@ const translations = {
     modelName: '模型名称',
     apiBase: 'API 地址',
     apiKey: 'API 密钥',
-    modelType: '模型类型',
     apiProtocol: 'API 协议',
     generateParams: '生成参数 (JSON)',
     modelIdRequired: '模型 ID 不能为空',
@@ -345,7 +347,6 @@ const translations = {
     modelIdHeader: '模型 ID',
     modelNameHeader: '模型名称',
     apiBaseHeader: 'API 地址',
-    typeHeader: '类型',
     protocolHeader: '协议',
     confirmDeleteModel: '确定要删除模型「{id}」吗？',
     copyModel: '复制',
@@ -411,11 +412,14 @@ const translations = {
     toolName: '名称',
     toolType: '类型',
     toolDescription: '描述',
+    parameters: '参数',
+    mcpServerName: 'MCP 服务器名称',
     functionFilePath: '函数文件路径',
     functionName: '函数名',
 
     // ToolForm
     editMcpServer: '编辑 MCP Server',
+    editMcpTool: '编辑 MCP 工具',
     editTool: '编辑工具',
     registerTool: '注册工具',
     toolTypeLabel: '工具类型',
@@ -569,6 +573,9 @@ const translations = {
     description: 'Description',
     type: 'Type',
     id: 'ID',
+    labels: 'Labels',
+    labelsPlaceholder: 'Comma-separated, e.g.: fast,local,test',
+    labelsHint: 'Labels are used to categorize and filter tools, can be left empty',
 
     // AudioPlayer
     audioNotSupported: 'Audio playback not supported',
@@ -619,8 +626,8 @@ const translations = {
     agentMyselfViewPlaceholder: 'Brief self-expression',
     agentDescription: 'Description',
     agentDescriptionPlaceholder: 'Objective record, long-term memory',
-    agentGroup: 'Group',
-    agentGroupPlaceholder: 'e.g. Development / Writing / Default',
+    agentLabels: 'Labels',
+    agentLabelsPlaceholder: 'Comma-separated, e.g.: development,writing',
     agentAvatar: 'Avatar',
     agentAvatarPlaceholder: 'Enter avatar URL or emoji',
 
@@ -775,7 +782,6 @@ const translations = {
     modelName: 'Model Name',
     apiBase: 'API Base URL',
     apiKey: 'API Key',
-    modelType: 'Model Type',
     apiProtocol: 'API Protocol',
     generateParams: 'Generate Params (JSON)',
     modelIdRequired: 'Model ID is required',
@@ -795,7 +801,6 @@ const translations = {
     modelIdHeader: 'Model ID',
     modelNameHeader: 'Model Name',
     apiBaseHeader: 'API Base',
-    typeHeader: 'Type',
     protocolHeader: 'Protocol',
     confirmDeleteModel: 'Delete model "{id}"?',
     copyModel: 'Copy',
@@ -861,11 +866,14 @@ const translations = {
     toolName: 'Name',
     toolType: 'Type',
     toolDescription: 'Description',
+    parameters: 'Parameters',
+    mcpServerName: 'MCP Server Name',
     functionFilePath: 'Function File Path',
     functionName: 'Function Name',
 
     // ToolForm
     editMcpServer: 'Edit MCP Server',
+    editMcpTool: 'Edit MCP Tool',
     editTool: 'Edit Tool',
     registerTool: 'Register Tool',
     toolTypeLabel: 'Tool Type',

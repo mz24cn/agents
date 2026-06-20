@@ -41,7 +41,6 @@ model_config_st = st.builds(
     api_base=st.just("http://localhost:11434"),
     model_name=st.just("qwen3.5:9b"),
     api_key=st.just(""),
-    model_type=st.just("vlm"),
     api_protocol=st.just("openai"),
 )
 
@@ -109,7 +108,6 @@ ollama_model_config_st = st.builds(
     api_base=st.just("http://localhost:11434"),
     model_name=st.just("qwen3.5:9b"),
     api_key=st.just(""),
-    model_type=st.just("vlm"),
     api_protocol=st.just("ollama"),
 )
 

@@ -8,8 +8,10 @@ Zero third-party dependencies — only Python standard library.
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
+
+from runtime.common import parse_labels
 
 
 @dataclass
@@ -22,13 +24,20 @@ class PromptTemplate:
 
     template_id: str
     content: str
+    labels: list = field(default_factory=list)
+
+    def __post_init__(self):
+        self.labels = parse_labels(self.labels)
 
     def to_dict(self) -> dict:
         """Serialize to a plain dict."""
-        return {
+        d = {
             "template_id": self.template_id,
             "content": self.content,
         }
+        if self.labels:
+            d["labels"] = list(self.labels)
+        return d
 
     @classmethod
     def from_dict(cls, data: dict) -> "PromptTemplate":
@@ -36,6 +45,7 @@ class PromptTemplate:
         return cls(
             template_id=data["template_id"],
             content=data["content"],
+            labels=parse_labels(data.get("labels", [])),
         )
 
 
@@ -68,34 +78,39 @@ class PromptTemplateManager:
         """
         return self._templates.get(template_id)
 
-    def create(self, template_id: str, content: str) -> PromptTemplate:
+    def create(self, template_id: str, content: str, labels: list = None) -> PromptTemplate:
         """Create a new prompt template.
 
         Args:
             template_id: The unique identifier for the template.
             content: The template content (may contain {placeholder} variables).
+            labels: Optional list of labels for categorization.
 
         Returns:
             The newly created PromptTemplate.
         """
-        template = PromptTemplate(template_id=template_id, content=content)
+        template = PromptTemplate(template_id=template_id, content=content, labels=labels or [])
         self._templates[template_id] = template
         return template
 
-    def update(self, template_id: str, new_template_id: str, content: str) -> Optional[PromptTemplate]:
+    def update(self, template_id: str, new_template_id: str, content: str, labels: list = None) -> Optional[PromptTemplate]:
         """Update an existing prompt template.
 
         Args:
             template_id: The current unique identifier of the template to update.
             new_template_id: The new unique identifier (may be the same as template_id).
             content: The new template content.
+            labels: Optional list of labels for categorization.
 
         Returns:
             The updated PromptTemplate, or None if template_id not found.
         """
         if template_id not in self._templates:
             return None
-        template = PromptTemplate(template_id=new_template_id, content=content)
+        # Get existing labels if not provided
+        if labels is None:
+            labels = self._templates[template_id].labels
+        template = PromptTemplate(template_id=new_template_id, content=content, labels=labels)
         del self._templates[template_id]
         self._templates[new_template_id] = template
         return template

@@ -1810,6 +1810,13 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
 
         if body.get("tool_type") == "function":
             body.setdefault("tool_id", f"function-{body.get('name', '')}")
+        elif body.get("tool_type") == "mcp" and "tool_id" not in body:
+            # For MCP tools, generate tool_id from server name if not provided
+            server_name = body.get("mcp_server_name", "unknown")
+            body.setdefault("tool_id", f"mcp-{server_name}")
+        elif body.get("tool_type") == "skill" and "tool_id" not in body:
+            # For skill tools, generate tool_id from skill name if not provided
+            body.setdefault("tool_id", f"skill-{body.get('name', '')}")
 
         required = ["tool_id", "tool_type", "name", "description", "parameters"]
         for field in required:
@@ -1876,7 +1883,8 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             return
 
         mgr = self.server.prompt_template_manager  # type: ignore[attr-defined]
-        template = mgr.create(template_id=body["template_id"], content=body["content"])
+        labels = body.get("labels")
+        template = mgr.create(template_id=body["template_id"], content=body["content"], labels=labels)
         mgr.save(_PROMPT_TEMPLATES_PATH)
         self._send_json_response(201, {
             "status": "created",
@@ -1914,7 +1922,13 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         self._send_json_response(200, {"status": "updated", "model_id": new_model_id})
 
     def _handle_update_tool(self, tool_id: str) -> None:
-        """PUT /v1/tools/{tool_id} — update a tool configuration."""
+        """PUT /v1/tools/{tool_id} — update a tool configuration.
+
+        tool_id 来源逻辑：
+        - URL 上的 tool_id 是"旧的" ID，用于查找要更新的工具
+        - Body 里的 tool_id 是"新的" ID，用于保存更新后的工具（支持重命名）
+        - 如果 body 里没有 tool_id，应理解为 tool_id 维持不变，从 URL 上获取
+        """
         body = self._read_json_body()
         if body is None:
             return
@@ -1928,8 +1942,29 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self._send_json_error(403, f"Cannot update built-in tool: {tool_id}")
             return
 
+        # 补充缺失的字段：从现有配置中获取默认值
+        # tool_type 是必需字段，如果 body 中没有，从现有配置中获取
+        if "tool_type" not in body:
+            body["tool_type"] = existing.tool_type
+        
+        # tool_id 更新逻辑
         if body.get("tool_type") == "function":
-            body["tool_id"] = f"function-{body.get('name', '')}"
+            # function 工具的 tool_id 由 name 自动生成，不支持自定义
+            body["tool_id"] = f"function-{body.get('name', existing.name)}"
+        elif "tool_id" not in body:
+            # mcp / skill / 其他类型：如果 body 中没有 tool_id，使用 URL 上的 tool_id（保持不变）
+            body["tool_id"] = tool_id
+
+        # 补充必需字段（如果 body 中没有提供，使用现有配置的值）
+        for field in ("name", "description", "parameters"):
+            if field not in body:
+                body[field] = getattr(existing, field)
+        
+        # 补充可选字段（如果 body 中没有提供，保留现有配置的值）
+        # 这些字段在更新时如果不提供，应该保持不变而不是被清除
+        for field in ("skill_dir", "mcp_server_name", "tool_name", "function_file_path", "function_name"):
+            if field not in body and getattr(existing, field) is not None:
+                body[field] = getattr(existing, field)
 
         try:
             config = ToolConfig.from_dict(body)
@@ -1981,10 +2016,12 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
 
         new_template_id = body.get("template_id", template_id)
         mgr = self.server.prompt_template_manager  # type: ignore[attr-defined]
+        labels = body.get("labels")
         updated = mgr.update(
             template_id,
             new_template_id=new_template_id,
             content=body.get("content", ""),
+            labels=labels,
         )
         if updated is None:
             self._send_json_error(404, f"Prompt template not found: {template_id}")
@@ -2499,8 +2536,8 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             system_prompt=body.get("system_prompt", ""),
             myself_view=body.get("myself_view", ""),
             description=body.get("description", ""),
-            group=body.get("group", ""),
             avatar=body.get("avatar", ""),
+            labels=body.get("labels"),
         )
         self._send_json_response(201, {"status": "created", "agent_id": agent_id})
 

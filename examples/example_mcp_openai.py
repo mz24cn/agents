@@ -152,7 +152,6 @@ def main():
         model_name=MODEL_NAME,
         api_key=API_KEY,
         api_protocol="openai",              # 关键区别：使用 openai 协议
-        model_type="llm",
         generate_params={"temperature": 0.7},
     ))
 

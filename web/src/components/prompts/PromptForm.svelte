@@ -11,6 +11,7 @@
 
   let templateId = $state('')
   let content = $state('')
+  let labelsText = $state('')
   let errors = $state({})
   let submitError = $state('')
   let submitting = $state(false)
@@ -20,6 +21,7 @@
     originalTemplateId = init.template_id ?? ''
     templateId = init.template_id ?? ''
     content = init.content ?? ''
+    labelsText = (init.labels ?? []).join(', ')
     errors = {}
     submitError = ''
   })
@@ -38,7 +40,7 @@
     if (!validate()) return
     submitting = true
     submitError = ''
-    const payload = { template_id: templateId.trim(), content: content.trim() }
+    const payload = { template_id: templateId.trim(), content: content.trim(), labels: labelsText.split(',').map(s => s.trim()).filter(Boolean) }
     try {
       if (isEdit) await promptTemplates.update(originalTemplateId, payload)
       else await promptTemplates.create(payload)
@@ -79,6 +81,11 @@
       {/each}
     </div>
   {/if}
+
+  <div class="form-group">
+    <label for="tpl_labels">{t('labels')}</label>
+    <input id="tpl_labels" type="text" bind:value={labelsText} placeholder={t('labelsPlaceholder')} />
+  </div>
 
   <div class="form-actions">
     <button type="button" class="btn btn-cancel" onclick={onCancel} disabled={submitting}>{t('cancel')}</button>
