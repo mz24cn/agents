@@ -135,7 +135,6 @@
   .agent-name { font-weight: 600; color: var(--text); font-size: 0.95rem; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .agent-title-side { margin-left: auto; display: flex; align-items: center; justify-content: flex-end; gap: 8px; min-width: 0; white-space: nowrap; }
   .agent-meta { font-size: 0.8rem; color: var(--text-secondary); white-space: nowrap; }
-  .label-tag { display: inline-block; padding: 1px 7px; background: #10b981; color: #fff; border-radius: 10px; font-size: 0.78rem; }
   .agent-myself { color: var(--primary); font-size: 0.85rem; margin-bottom: 2px; }
   .agent-description { color: var(--text-secondary); font-size: 0.82rem; white-space: pre-wrap; word-break: break-word; margin-bottom: 4px; }
   .agent-timestamp { font-size: 0.75rem; color: var(--text-secondary); opacity: 0.7; }

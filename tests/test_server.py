@@ -876,6 +876,41 @@ class TestPromptTemplateCRUD:
         assert saved[0]["template_id"] == "persist-test"
         assert saved[0]["content"] == "persisted {var}"
 
+    def test_chinese_template_id(self, server):
+        """Test that Chinese characters in template_id work correctly."""
+        import urllib.parse
+
+        # Create a template with Chinese ID
+        chinese_id = "中文模板ID"
+        data = {"template_id": chinese_id, "content": "你好 {name}"}
+        status, body = _post(server, "/v1/prompt-templates", data)
+        assert status == 201
+        assert body["status"] == "created"
+        assert body["template_id"] == chinese_id
+
+        # Update the template with Chinese ID (URL-encode the ID in the path)
+        encoded_id = urllib.parse.quote(chinese_id)
+        status, body = _put(
+            server,
+            f"/v1/prompt-templates/{encoded_id}",
+            {"template_id": chinese_id, "content": "更新后的内容 {name}"},
+        )
+        assert status == 200
+        assert body["status"] == "updated"
+        assert body["template_id"] == chinese_id
+
+        # Delete the template with Chinese ID
+        status, body = _delete(server, f"/v1/prompt-templates/{encoded_id}")
+        assert status == 200
+        assert body["status"] == "deleted"
+        assert body["template_id"] == chinese_id
+
+        # Verify it's gone
+        get_status, get_body = _get(server, "/v1/prompt-templates")
+        assert get_status == 200
+        templates = get_body["templates"]
+        assert len(templates) == 0
+
 
 # ------------------------------------------------------------------
 # Conversation persistence tests

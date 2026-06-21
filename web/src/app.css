@@ -119,6 +119,21 @@ body {
   overflow: hidden !important;
 }
 
+/* ===== Label Tag ===== */
+.label-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 10px;
+  border: 1px solid var(--success);
+  color: var(--success);
+  background: transparent;
+  white-space: nowrap;
+}
+
 /* ===== Responsive Breakpoint ===== */
 @media (max-width: 1023px) {
   .sidebar {

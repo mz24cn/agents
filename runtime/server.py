@@ -668,7 +668,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             return
         m = re.match(r"^/v1/prompt-templates/([^/]+)$", path)
         if m:
-            self._handle_update_prompt_template(m.group(1))
+            self._handle_update_prompt_template(urllib.parse.unquote(m.group(1)))
             return
         m = re.match(r"^/v1/agents/([^/]+)$", path)
         if m:
@@ -702,7 +702,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             return
         m = re.match(r"^/v1/prompt-templates/([^/]+)$", path)
         if m:
-            self._handle_delete_prompt_template(m.group(1))
+            self._handle_delete_prompt_template(urllib.parse.unquote(m.group(1)))
             return
         m = re.match(r"^/v1/env/([^/]+)$", path)
         if m:

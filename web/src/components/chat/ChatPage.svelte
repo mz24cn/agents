@@ -163,7 +163,8 @@
 
   // 智能体选择器状态
   let agentList = $derived(catalog.agents.items)
-  let selectedAgentId = $state(localStorage.getItem('chat_selected_agent') ?? '')
+  let selectedAgentIds = $state(JSON.parse(localStorage.getItem('chat_selected_agents') ?? '[]'))
+  let selectedAgentId = $derived(selectedAgentIds.length === 1 ? selectedAgentIds[0] : '') // 向后兼容单选场景
   let loadingAgents = $derived(catalog.agents.loading && !catalog.agents.loaded)
 
   function openTemplatePanel() {
@@ -283,7 +284,7 @@
   }
 
   function handleSend(text) {
-    if (!selectedModelId && !selectedAgentId || isStreaming) return
+    if (!selectedModelId && selectedAgentIds.length === 0 || isStreaming) return
     errorMsg = ''
     const apiMessages = []
     // Only send system message on the first request (no session yet)
@@ -301,7 +302,7 @@
   }
 
   function handleSendTemplate(templateId, args) {
-    if (!selectedModelId && !selectedAgentId || isStreaming) return
+    if (!selectedModelId && selectedAgentIds.length === 0 || isStreaming) return
     errorMsg = ''
     const apiMessages = []
     // Only send system message on the first request (no session yet)
@@ -331,8 +332,8 @@
 
     let aIdxRef = { value: -1 }
     const reqBody = { model_id: selectedModelId, tool_ids: selectedToolIds, messages: apiMessages, stream: true }
-    if (selectedAgentId) {
-      reqBody.agent_id = selectedAgentId
+    if (selectedAgentIds.length > 0) {
+      reqBody.agent_ids = selectedAgentIds
     }
     if (workspacePath) {
       reqBody.workspace = workspacePath
@@ -374,8 +375,10 @@
       }
       // 创建空助手消息占位
       const assistantMsg = { role: 'assistant', content: '', thinking: null }
-      if (selectedAgentId) {
-        assistantMsg.assistant_id = selectedAgentId
+      if (selectedAgentIds.length === 1) {
+        assistantMsg.assistant_id = selectedAgentIds[0]
+      } else if (selectedAgentIds.length > 1) {
+        assistantMsg.assistant_ids = selectedAgentIds
       }
       store.messages = [...store.messages, assistantMsg]
       aIdxRef.value = store.messages.length - 1
@@ -754,13 +757,17 @@
       // 优先使用 meta 中的设置（向下兼容：旧会话可能没有 meta）
       if (meta) {
         // 恢复智能体选择
-        if (meta.agent_id) {
-          selectedAgentId = meta.agent_id
-          localStorage.setItem('chat_selected_agent', meta.agent_id)
+        if (meta.agent_ids && Array.isArray(meta.agent_ids)) {
+          selectedAgentIds = meta.agent_ids
+          localStorage.setItem('chat_selected_agents', JSON.stringify(meta.agent_ids))
+        } else if (meta.agent_id) {
+          // 向后兼容：单个 agent_id
+          selectedAgentIds = [meta.agent_id]
+          localStorage.setItem('chat_selected_agents', JSON.stringify([meta.agent_id]))
         } else {
           // meta 中没有 agent_id，清除选择
-          selectedAgentId = ''
-          localStorage.removeItem('chat_selected_agent')
+          selectedAgentIds = []
+          localStorage.removeItem('chat_selected_agents')
         }
         // 恢复模型选择
         if (meta.model_id) {
@@ -779,9 +786,12 @@
         workspacePath = defaultWorkspacePath
         // 向下兼容：从最后一条 assistant 消息恢复 assistant_id
         const lastAssistantMsg = [...msgs].reverse().find(m => m.role === 'assistant')
-        if (lastAssistantMsg?.assistant_id) {
-          selectedAgentId = lastAssistantMsg.assistant_id
-          localStorage.setItem('chat_selected_agent', lastAssistantMsg.assistant_id)
+        if (lastAssistantMsg?.assistant_ids && Array.isArray(lastAssistantMsg.assistant_ids)) {
+          selectedAgentIds = lastAssistantMsg.assistant_ids
+          localStorage.setItem('chat_selected_agents', JSON.stringify(lastAssistantMsg.assistant_ids))
+        } else if (lastAssistantMsg?.assistant_id) {
+          selectedAgentIds = [lastAssistantMsg.assistant_id]
+          localStorage.setItem('chat_selected_agents', JSON.stringify([lastAssistantMsg.assistant_id]))
         }
         // 模型和工具选中状态维持不变（使用 localStorage 中的值）
       }
@@ -833,9 +843,13 @@
   $effect(() => { fetchAgents() })
 
   $effect(() => {
-    if (catalog.agents.loaded && selectedAgentId && !agentList.some(a => a.agent_id === selectedAgentId)) {
-      selectedAgentId = ''
-      localStorage.removeItem('chat_selected_agent')
+    if (catalog.agents.loaded && selectedAgentIds.length > 0) {
+      const validIds = new Set(agentList.map(a => a.agent_id))
+      const validSelected = selectedAgentIds.filter(id => validIds.has(id))
+      if (validSelected.length !== selectedAgentIds.length) {
+        selectedAgentIds = validSelected
+        localStorage.setItem('chat_selected_agents', JSON.stringify(validSelected))
+      }
     }
   })
 
@@ -925,13 +939,13 @@
 
 <div class="chat-page">
   <div class="selection-bar">
-    <div class="selector-wrapper" class:disabled={!!selectedAgentId}>
+    <div class="selector-wrapper" class:disabled={selectedAgentIds.length > 0}>
       📦<a href="#/setup?tab=models" class="nav-link">{t('modelLabel')}</a>
-      <ModelSelector bind:selectedModelId onchange={(id) => localStorage.setItem(STORAGE_MODEL_KEY, id)} disabled={!!selectedAgentId} />
+      <ModelSelector bind:selectedModelId onchange={(id) => localStorage.setItem(STORAGE_MODEL_KEY, id)} disabled={selectedAgentIds.length > 0} />
     </div>
-    <div class="selector-wrapper" class:disabled={!!selectedAgentId}>
+    <div class="selector-wrapper" class:disabled={selectedAgentIds.length > 0}>
       🛠️<a href="#/setup?tab=tools" class="nav-link">{t('tools')}</a>
-      <ToolSelector bind:selectedToolIds onchange={(ids) => localStorage.setItem(STORAGE_TOOLS_KEY, JSON.stringify(ids))} disabled={!!selectedAgentId} />
+      <ToolSelector bind:selectedToolIds onchange={(ids) => localStorage.setItem(STORAGE_TOOLS_KEY, JSON.stringify(ids))} disabled={selectedAgentIds.length > 0} />
     </div>
     {#if isWorkspaceCustom}
       <div class="workspace-indicator" title={workspacePath} onclick={openWorkspacePanel}>
@@ -943,12 +957,12 @@
     <div class="agent-selector-wrapper">
       🤖<a href="#/setup?tab=agents" class="nav-link">{t('agentSelector')}</a>
       <AgentSelector 
-        bind:selectedAgentId 
-        onchange={(id) => {
-          if (id) {
-            localStorage.setItem('chat_selected_agent', id)
+        bind:selectedAgentIds 
+        onchange={(ids) => {
+          if (ids.length > 0) {
+            localStorage.setItem('chat_selected_agents', JSON.stringify(ids))
           } else {
-            localStorage.removeItem('chat_selected_agent')
+            localStorage.removeItem('chat_selected_agents')
           }
         }}
         disabled={loadingAgents}
@@ -1069,7 +1083,7 @@
   </div>
 
   <ChatInput
-    disabled={!selectedModelId && !selectedAgentId}
+    disabled={!selectedModelId && selectedAgentIds.length === 0}
     onSend={handleSend}
     onStop={handleStop}
     onStopForce={handleStopForce}
@@ -1077,6 +1091,8 @@
     onOpenWorkspacePanel={openWorkspacePanel}
     {isStreaming}
     bind:text={inputText}
+    {selectedAgentIds}
+    {agentList}
   />
 </div>
 

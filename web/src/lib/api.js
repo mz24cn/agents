@@ -87,8 +87,8 @@ export const mcpServers = {
 export const promptTemplates = {
   list:   ()                        => request('GET',    '/v1/prompt-templates'),
   create: (data)                    => request('POST',   '/v1/prompt-templates', data),
-  update: (templateId, data)        => request('PUT',    `/v1/prompt-templates/${templateId}`, data),
-  delete: (templateId)              => request('DELETE', `/v1/prompt-templates/${templateId}`),
+  update: (templateId, data)        => request('PUT',    `/v1/prompt-templates/${encodeURIComponent(templateId)}`, data),
+  delete: (templateId)              => request('DELETE', `/v1/prompt-templates/${encodeURIComponent(templateId)}`),
 }
 
 /**

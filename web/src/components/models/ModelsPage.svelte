@@ -135,7 +135,6 @@
   .ellipsis { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .btn-group { display: inline-flex; gap: 8px; }
   .labels-wrap { display: flex; flex-wrap: wrap; gap: 4px; }
-  .label-tag { display: inline-block; padding: 2px 7px; background: #10b981; color: #fff; border-radius: 10px; font-size: 0.78rem; width: fit-content; }
 
   /* 滚动条样式 */
   .page-content::-webkit-scrollbar { width: 8px; }

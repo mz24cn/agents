@@ -66,11 +66,11 @@
               <div class="template-name-row">
                 <span class="template-name">{tpl.template_id}</span>
                 <div class="template-tags">
-                  {#each tpl.labels ?? [] as label}
-                    <span class="label-tag">{label}</span>
-                  {/each}
                   {#each extractPlaceholders(tpl.content) as ph}
                     <span class="placeholder-tag">{ph}</span>
+                  {/each}
+                  {#each tpl.labels ?? [] as label}
+                    <span class="label-tag">{label}</span>
                   {/each}
                 </div>
               </div>
@@ -121,7 +121,6 @@
   .template-name { font-weight: 600; color: var(--text); font-size: 0.95rem; }
   .template-tags { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }
   .placeholder-tag { display: inline-block; padding: 1px 7px; background: var(--primary); color: #fff; border-radius: 4px; font-size: 0.78rem; font-family: monospace; }
-  .label-tag { display: inline-block; padding: 1px 7px; background: #10b981; color: #fff; border-radius: 10px; font-size: 0.78rem; }
   .template-preview { 
     color: var(--text-secondary); 
     font-size: 0.85rem; 

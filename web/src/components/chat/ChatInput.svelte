@@ -2,10 +2,35 @@
   import { onDestroy, tick } from 'svelte'
   import { t } from '../../lib/i18n.svelte.js'
 
-  let { disabled = false, onSend, onStop, onStopForce, onOpenTemplatePanel, onOpenWorkspacePanel, text = $bindable(''), isStreaming = false } = $props()
+  let { disabled = false, onSend, onStop, onStopForce, onOpenTemplatePanel, onOpenWorkspacePanel, text = $bindable(''), isStreaming = false, selectedAgentIds = [], agentList = [] } = $props()
 
   let editorEl = $state(null)
   let lastRenderedText = ''
+
+  // @mention 相关状态
+  let mentionMenuOpen = $state(false)
+  let mentionMenuStyle = $state('')
+  let mentionQuery = $state('')
+  let mentionSelectedIndex = $state(0)
+  let mentionStartOffset = $state(-1) // @ 符号在文本中的位置
+
+  // 计算当前选中的智能体列表
+  let selectedAgents = $derived(
+    selectedAgentIds
+      .map(id => agentList.find(a => a.agent_id === id))
+      .filter(Boolean)
+  )
+
+  // 过滤匹配的智能体（显示所有可用的智能体）
+  let filteredAgents = $derived(
+    selectedAgentIds.length === 0
+      ? []  // 没有选中的智能体，不显示@菜单
+      : mentionQuery
+        ? selectedAgents.filter(a =>
+            (a.nickname || a.agent_id).toLowerCase().includes(mentionQuery.toLowerCase())
+          )
+        : selectedAgents
+  )
 
   // 输入框为空且不在流式状态时，显示"?"按钮（提示词模板入口）
   let showTemplateBtn = $derived(!isStreaming && !text.trim())
@@ -91,8 +116,129 @@
     lastRenderedText = serialized
   }
 
+  // 检测 @ 符号并显示菜单
+  function checkForMention() {
+    const sel = window.getSelection()
+    if (!sel.rangeCount || !editorEl) return
+
+    const range = sel.getRangeAt(0)
+    const node = range.startContainer
+    if (node.nodeType !== Node.TEXT_NODE) {
+      closeMentionMenu()
+      return
+    }
+
+    const textContent = node.textContent
+    const cursorPos = range.startOffset
+    
+    // 从光标位置向前查找 @ 符号
+    let atIndex = -1
+    for (let i = cursorPos - 1; i >= 0; i--) {
+      if (textContent[i] === '@') {
+        atIndex = i
+        break
+      }
+      // 如果遇到空格或换行，停止查找
+      if (textContent[i] === ' ' || textContent[i] === '\n') {
+        break
+      }
+    }
+
+    if (atIndex >= 0) {
+      const query = textContent.slice(atIndex + 1, cursorPos)
+      mentionQuery = query
+      mentionStartOffset = atIndex
+      mentionSelectedIndex = 0
+
+      // 计算菜单位置（使用 fixed 定位，基于光标的视口坐标）
+      const rect = range.getBoundingClientRect()
+      if (rect) {
+        const menuTop = rect.bottom + 4
+        const menuLeft = rect.left
+        mentionMenuStyle = `top: ${menuTop}px; left: ${menuLeft}px;`
+      } else {
+        mentionMenuStyle = ''
+      }
+
+      // 如果有匹配的智能体，显示菜单
+      if (filteredAgents.length > 0) {
+        mentionMenuOpen = true
+        adjustMenuPosition()
+      } else {
+        mentionMenuOpen = false
+      }
+    } else {
+      closeMentionMenu()
+    }
+  }
+
+  function closeMentionMenu() {
+    mentionMenuOpen = false
+    mentionQuery = ''
+    mentionStartOffset = -1
+  }
+
+  // 菜单右下角超出窗口时平移
+  async function adjustMenuPosition() {
+    await tick()
+    const menu = document.querySelector('.mention-menu')
+    if (!menu) return
+    const rect = menu.getBoundingClientRect()
+    let adjusted = false
+    let top = parseFloat(menu.style.top)
+    let left = parseFloat(menu.style.left)
+    // 右下角 y 超出窗口底部 → 上移
+    if (rect.bottom > window.innerHeight) {
+      top -= rect.bottom - window.innerHeight
+      adjusted = true
+    }
+    // 右下角 x 超出窗口右侧 → 左移
+    if (rect.right > window.innerWidth) {
+      left -= rect.right - window.innerWidth
+      adjusted = true
+    }
+    if (adjusted) {
+      mentionMenuStyle = `top: ${top}px; left: ${left}px;`
+    }
+  }
+
+  // 选择智能体
+  function selectAgent(agent) {
+    if (mentionStartOffset < 0 || !editorEl) return
+
+    const sel = window.getSelection()
+    if (!sel.rangeCount) return
+
+    const range = sel.getRangeAt(0)
+    const node = range.startContainer
+    if (node.nodeType !== Node.TEXT_NODE) return
+
+    const textContent = node.textContent
+    const cursorPos = range.startOffset
+
+    // 构建新文本：@之前的部分 + 智能体名称 + 空格 + @之后的部分
+    const before = textContent.slice(0, mentionStartOffset)
+    const after = textContent.slice(cursorPos)
+    const agentName = agent.nickname || agent.agent_id
+    const newText = before + '@' + agentName + ' ' + after
+
+    node.textContent = newText
+
+    // 将光标移到智能体名称后面的空格之后
+    const newCursorPos = mentionStartOffset + agentName.length + 2
+    const newRange = document.createRange()
+    newRange.setStart(node, Math.min(newCursorPos, newText.length))
+    newRange.setEnd(node, Math.min(newCursorPos, newText.length))
+    sel.removeAllRanges()
+    sel.addRange(newRange)
+
+    closeMentionMenu()
+    syncTextFromEditor()
+  }
+
   function handleInput() {
     syncTextFromEditor()
+    checkForMention()
   }
 
   function handlePaste(e) {
@@ -146,6 +292,33 @@
   }
 
   function handleKeydown(e) {
+    // 如果菜单打开，处理菜单导航
+    if (mentionMenuOpen) {
+      const agents = filteredAgents
+      if (e.key === 'ArrowDown') {
+        e.preventDefault()
+        mentionSelectedIndex = (mentionSelectedIndex + 1) % agents.length
+        return
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault()
+        mentionSelectedIndex = (mentionSelectedIndex - 1 + agents.length) % agents.length
+        return
+      }
+      if (e.key === 'Enter' || e.key === 'Tab') {
+        e.preventDefault()
+        if (agents.length > 0) {
+          selectAgent(agents[mentionSelectedIndex])
+        }
+        return
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        closeMentionMenu()
+        return
+      }
+    }
+
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
       if (isStreaming) return
@@ -174,6 +347,27 @@
       onkeydown={handleKeydown}
       onpaste={handlePaste}
     ></div>
+    {#if mentionMenuOpen && filteredAgents.length > 0}
+      <div 
+        class="mention-menu"
+        style={mentionMenuStyle}
+      >
+        {#each filteredAgents as agent, index}
+          <div
+            class="mention-item"
+            class:selected={index === mentionSelectedIndex}
+            onmousedown={(e) => {
+              e.preventDefault()
+              selectAgent(agent)
+            }}
+            onmouseenter={() => mentionSelectedIndex = index}
+          >
+            <span class="mention-icon">🤖</span>
+            <span class="mention-name">{agent.nickname || agent.agent_id}</span>
+          </div>
+        {/each}
+      </div>
+    {/if}
   </div>
   <div class="btn-stack">
     <!-- 工作区文件管理器按钮 -->
@@ -223,6 +417,42 @@
   .input-shell {
     flex: 1;
     min-width: 0;
+    position: relative;
+  }
+  .mention-menu {
+    position: fixed;
+    z-index: 1000;
+    width: 200px;
+    max-height: 220px;
+    overflow-y: auto;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    padding: 4px;
+  }
+  .mention-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.85rem;
+  }
+  .mention-item:hover,
+  .mention-item.selected {
+    background: var(--primary);
+    color: #fff;
+  }
+  .mention-icon {
+    font-size: 1rem;
+  }
+  .mention-name {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .input-box {
     width: 100%;
