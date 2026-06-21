@@ -760,12 +760,8 @@
         if (meta.agent_ids && Array.isArray(meta.agent_ids)) {
           selectedAgentIds = meta.agent_ids
           localStorage.setItem('chat_selected_agents', JSON.stringify(meta.agent_ids))
-        } else if (meta.agent_id) {
-          // 向后兼容：单个 agent_id
-          selectedAgentIds = [meta.agent_id]
-          localStorage.setItem('chat_selected_agents', JSON.stringify([meta.agent_id]))
         } else {
-          // meta 中没有 agent_id，清除选择
+          // meta 中没有 agent_ids，清除选择
           selectedAgentIds = []
           localStorage.removeItem('chat_selected_agents')
         }
