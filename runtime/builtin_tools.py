@@ -11,6 +11,7 @@ import fnmatch
 import gzip
 import hashlib
 import json
+import locale
 import logging
 import os
 import re
@@ -31,6 +32,24 @@ from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger("runtime.builtin_tools")
+
+
+def _get_system_encoding() -> str:
+    """Get the preferred system encoding for subprocess output.
+
+    Returns the system's preferred encoding for text I/O, with fallback to utf-8.
+    On Windows this is typically the OEM codepage (e.g. cp936/GBK for Chinese locales),
+    which matches what cmd.exe and PowerShell emit by default.  Using this instead
+    of hard-coding utf-8 prevents garbled output (mojibake) on non-UTF-8 systems.
+    """
+    encoding = locale.getpreferredencoding(False)
+    if encoding:
+        return encoding
+    return "utf-8"
+
+
+# Resolve once at module load time so every subprocess call uses the same codec.
+_SYSTEM_ENCODING: str = _get_system_encoding()
 
 if sys.platform != "win32":
     import fcntl
@@ -128,7 +147,7 @@ def _bash_execute(command: str, cwd: str = "") -> str:
         try:
             result = subprocess.run(
                 command, shell=True, capture_output=True, text=True,
-                encoding='utf-8', errors='replace',
+                encoding=_SYSTEM_ENCODING, errors='replace',
                 timeout=timeout, cwd=cwd if cwd else None,
             )
             output = (result.stdout or "").strip()
@@ -192,7 +211,7 @@ def _bash_execute(command: str, cwd: str = "") -> str:
         os.close(master_fd)
         proc.wait()
 
-        raw = b"".join(output_chunks).decode("utf-8", errors="replace")
+        raw = b"".join(output_chunks).decode(_SYSTEM_ENCODING, errors="replace")
         # Strip ANSI/VT escape sequences, keep plain text
         clean = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b[()][AB012]|\r", "", raw).strip()
 
@@ -858,7 +877,7 @@ class _FileJournalManager:
 
     def _git_text(self, args: list[str]) -> subprocess.CompletedProcess:
         return subprocess.run(["git"] + args, cwd=self.workspace, capture_output=True, text=True,
-                              encoding='utf-8', errors='replace')
+                              encoding=_SYSTEM_ENCODING, errors='replace')
 
     def _git_baseline_ref(self, rel_path: str, state: dict) -> Optional[dict]:
         if state.get("is_symlink") or not os.path.isdir(os.path.join(self.workspace, ".git")):
@@ -943,7 +962,7 @@ class _Linter:
                 cmd,
                 capture_output=True,
                 text=True,
-                encoding='utf-8', errors='replace',
+                encoding=_SYSTEM_ENCODING, errors='replace',
                 timeout=30,
             )
             if result.returncode == 0:
@@ -1711,7 +1730,7 @@ def _run_patch(workspace: str, patch: str, dry_run: bool) -> subprocess.Complete
         cwd=workspace,
         capture_output=True,
         text=True,
-        encoding='utf-8', errors='replace',
+        encoding=_SYSTEM_ENCODING, errors='replace',
     )
 
 
@@ -1948,7 +1967,7 @@ def _search_code(query: str, include: Optional[str] = None, exclude: Optional[st
                 cwd=workspace,
                 capture_output=True,
                 text=True,
-                encoding='utf-8', errors='replace',
+                encoding=_SYSTEM_ENCODING, errors='replace',
             )
         except Exception as exc:
             return json.dumps({"error": "SearchToolNotFound", "message": str(exc)})
@@ -2041,7 +2060,7 @@ def _search_code(query: str, include: Optional[str] = None, exclude: Optional[st
                 cwd=workspace,
                 capture_output=True,
                 text=True,
-                encoding='utf-8', errors='replace',
+                encoding=_SYSTEM_ENCODING, errors='replace',
             )
         except Exception as exc:
             return json.dumps({"error": "SearchToolNotFound", "message": str(exc)})
@@ -2240,7 +2259,7 @@ def _execute_command(command: str, timeout: Optional[int] = None, background: bo
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            encoding='utf-8', errors='replace',
+            encoding=_SYSTEM_ENCODING, errors='replace',
             start_new_session=sys.platform != "win32",
             creationflags=creationflags,
         )
