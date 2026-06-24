@@ -213,6 +213,32 @@ const C_RULES = [
   { pattern: /\b\d+(\.\d+)?([eE][+-]?\d+)?[fFlLuU]*\b/g, className: 'hl-number' },
 ]
 
+const CSHARP_RULES = [
+  // Strings (including interpolated and verbatim)
+  { pattern: /\$"(?:[^"\\]|\\.)*"/g, className: 'hl-string' },
+  { pattern: /@"(?:[^"]|"")*"/g, className: 'hl-string' },
+  { pattern: /"(?:[^"\\]|\\.)*"/g, className: 'hl-string' },
+  // Char literals
+  { pattern: /'(?:[^'\\]|\\.)*'/g, className: 'hl-string' },
+  // Comments
+  { pattern: /\/\/\/[^\n]*/g, className: 'hl-comment' },
+  { pattern: /\/\/[^\n]*/g, className: 'hl-comment' },
+  { pattern: /\/\*[\s\S]*?\*\//g, className: 'hl-comment' },
+  // Attributes
+  { pattern: /\[[\w,\s\.]+\]/g, className: 'hl-decorator' },
+  // Keywords
+  {
+    pattern: /\b(abstract|as|base|bool|break|byte|case|catch|char|checked|class|const|continue|decimal|default|delegate|do|double|else|enum|event|explicit|extern|false|finally|fixed|float|for|foreach|goto|if|implicit|in|int|interface|internal|is|lock|long|namespace|new|null|object|operator|out|override|params|private|protected|public|readonly|ref|return|sbyte|sealed|short|sizeof|stackalloc|static|string|struct|switch|this|throw|true|try|typeof|uint|ulong|unchecked|unsafe|ushort|using|var|virtual|void|volatile|while|async|await|yield|dynamic|nameof|when|and|or|not|init|record|with|required|file|scoped)\b/g,
+    className: 'hl-keyword',
+  },
+  // Built-in types
+  { pattern: /\b(String|Int32|Int64|Boolean|Object|Void|DateTime|Guid|Exception|Task|Action|Func|List|Dictionary|IEnumerable|IList|IDictionary|Array|Console|Math|Environment|Nullable|Tuple|ValueTuple)\b/g, className: 'hl-type' },
+  // Numbers
+  { pattern: /\b\d+(\.\d+)?([eE][+-]?\d+)?[fFdDmMlLuU]*\b/g, className: 'hl-number' },
+  // Hex numbers
+  { pattern: /\b0x[0-9a-fA-F]+\b/g, className: 'hl-number' },
+]
+
 const SQL_RULES = [
   // Strings
   { pattern: /'(?:[^'\\]|\\.)*'/g, className: 'hl-string' },
@@ -298,6 +324,8 @@ const RULES = {
   cxx: C_RULES,
   cc: C_RULES,
   hpp: C_RULES,
+  cs: CSHARP_RULES,
+  csharp: CSHARP_RULES,
   sql: SQL_RULES,
   yaml: YAML_RULES,
   yml: YAML_RULES,

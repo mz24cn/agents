@@ -295,6 +295,7 @@ const translations = {
     moveOrCopySuccess: '操作完成',
     moveOrCopyPartialError: '部分文件操作失败',
     cannotMoveToSelf: '不能移动到自身或子目录',
+    openAsText: '按ASCII文本打开',
 
     // ThinkingBlock
     collapseThinking: '收起思考过程',
@@ -751,6 +752,7 @@ const translations = {
     moveOrCopySuccess: 'Operation completed',
     moveOrCopyPartialError: 'Some files failed to process',
     cannotMoveToSelf: 'Cannot move to itself or its subdirectory',
+    openAsText: 'Open as ASCII Text',
 
     // ThinkingBlock
     collapseThinking: 'Collapse ',

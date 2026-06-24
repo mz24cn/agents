@@ -568,6 +568,26 @@
     }
   }
 
+  /**
+   * 强制按ASCII文本模式打开文件（忽略文件类型判断）
+   */
+  async function openAsTextFile(file) {
+    if (!file || file.is_dir) return
+    
+    previewReturnView = viewMode
+    previewFile = { ...file, is_text: true, is_image: false, is_audio: false, is_video: false, forcePlainText: true }
+    viewMode = 'preview'
+    previewContent = ''
+    
+    try {
+      const response = await fetch(workspaceApi.content(file.path, false))
+      if (!response.ok) throw new Error('Failed to load file content')
+      previewContent = await response.text()
+    } catch (err) {
+      error = err.message
+    }
+  }
+
   function closePreview() {
     viewMode = previewReturnView
     previewFile = null
@@ -575,8 +595,18 @@
   }
 
   // 渲染预览 HTML
-  function renderPreviewHtml(content, filename) {
+  function renderPreviewHtml(content, filename, forcePlainText = false) {
     if (!content) return ''
+    const renderCodeWithLines = (rawLines) => {
+      const lineCount = rawLines.length
+      const digits = Math.max(String(lineCount).length, 3)
+      const gutter = rawLines.map((_, i) => `<span>${i + 1}</span>`).join('')
+      const body = rawLines.join('\n')
+      return `<div class="code-container" style="--digits:${digits}"><div class="line-gutter">${gutter}</div><pre class="code-body"><code>${body}</code></pre></div>`
+    }
+    if (forcePlainText) {
+      return renderCodeWithLines(content.split('\n').map(l => escapeHtml(l)))
+    }
     if (isMarkdownFile(filename)) {
       try {
         const renderer = new marked.Renderer()
@@ -595,10 +625,11 @@
       }
     }
     const lang = getFileLang(filename)
+    const lines = content.split('\n')
     if (lang) {
-      return `<pre class="code-preview"><code>${highlight(content, lang)}</code></pre>`
+      return renderCodeWithLines(lines.map(line => highlight(line, lang)))
     }
-    return `<pre class="code-preview"><code>${escapeHtml(content)}</code></pre>`
+    return renderCodeWithLines(lines.map(l => escapeHtml(l)))
   }
 
   // 下载文件
@@ -1557,19 +1588,22 @@
       <div class="preview-overlay">
         <div class="preview-header">
           <span>{previewFile.name}</span>
-          <button onclick={() => closePreview()}>✕</button>
+          <div class="preview-header-actions">
+            {#if previewFile.is_text}
+              <button class="preview-copy-btn" onclick={() => copyToClipboard(previewContent)} title={t('copy')}>📋</button>
+            {/if}
+            <button onclick={() => closePreview()}>✕</button>
+          </div>
         </div>
-        <div class="preview-content">
         {#if previewFile.is_image}
-            <img src={workspaceApi.content(previewFile.path, false)} alt={previewFile.name} />
-          {:else if previewFile.is_video}
-            <video src={workspaceApi.content(previewFile.path, false)} controls></video>
-          {:else if previewFile.is_audio}
-            <audio src={workspaceApi.content(previewFile.path, false)} controls></audio>
-          {:else if previewFile.is_text}
-            <div class="text-preview">{@html renderPreviewHtml(previewContent, previewFile.name)}</div>
-          {/if}
-        </div>
+          <div class="preview-content"><img src={workspaceApi.content(previewFile.path, false)} alt={previewFile.name} /></div>
+        {:else if previewFile.is_video}
+          <div class="preview-content"><video src={workspaceApi.content(previewFile.path, false)} controls></video></div>
+        {:else if previewFile.is_audio}
+          <div class="preview-content"><audio src={workspaceApi.content(previewFile.path, false)} controls></audio></div>
+        {:else if previewFile.is_text}
+          <div class="text-preview">{@html renderPreviewHtml(previewContent, previewFile.name, previewFile.forcePlainText)}</div>
+        {/if}
       </div>
     {/if}
   </div>
@@ -1592,6 +1626,15 @@
         onmousedown={() => { if (!isMulti) { previewFileContent(menuFile); hideContextMenu() } }}
       >
         {t('preview')}
+      </button>
+    {/if}
+    <!-- 按ASCII文本打开：多选时置灰，非目录时可用 -->
+    {#if !menuFile?.is_dir}
+      <button 
+        disabled={isMulti}
+        onmousedown={() => { if (!isMulti) { openAsTextFile(menuFile); hideContextMenu() } }}
+      >
+        {t('openAsText')}
       </button>
     {/if}
     <!-- 下载：支持多选 -->
@@ -2184,6 +2227,22 @@
     color: var(--text);
   }
 
+  .preview-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .preview-copy-btn {
+    font-size: 0.85rem !important;
+    padding: 2px 6px;
+    border-radius: 4px;
+    transition: background 0.15s;
+  }
+  .preview-copy-btn:hover {
+    background: var(--bg-tertiary, rgba(0,0,0,0.1));
+  }
+
   .preview-content {
     flex: 1;
     overflow: auto;
@@ -2205,28 +2264,51 @@
   }
 
   .text-preview {
-    width: 100%;
-    height: 100%;
-    padding: 16px;
-    margin: 0;
-    background: var(--bg-secondary);
+    flex: 1;
+    overflow: auto;
+    background: var(--bg);
     color: var(--text);
     font-family: 'Fira Code', 'Consolas', monospace;
     font-size: 0.85rem;
     line-height: 1.5;
-    overflow: auto;
     word-break: break-word;
   }
 
-  /* Code preview */
-  .text-preview :global(.code-preview) {
-    margin: 0;
-    white-space: pre-wrap;
-    word-wrap: break-word;
+  /* Two-column code layout */
+  .text-preview :global(.code-container) {
+    display: flex;
+    min-height: 100%;
   }
-  .text-preview :global(.code-preview code) {
+  .text-preview :global(.line-gutter) {
+    flex-shrink: 0;
+    width: calc(var(--digits, 3) * 0.7em + 1.2em);
+    padding: 12px 0.4em 12px 0.6em;
+    text-align: right;
+    background: var(--bg-secondary);
+    color: var(--text-secondary, #888);
+    font-size: inherit;
+    line-height: inherit;
+    user-select: none;
+    border-right: 1px solid var(--border, rgba(0,0,0,0.08));
+  }
+  .text-preview :global(.line-gutter span) {
+    display: block;
+  }
+  .text-preview :global(.code-body) {
+    flex: 1;
+    margin: 0;
+    padding: 12px 16px;
+    overflow-x: auto;
+    white-space: pre;
+    word-wrap: normal;
+    background: transparent;
+  }
+  .text-preview :global(.code-body code) {
     font-family: inherit;
     font-size: inherit;
+    background: transparent;
+    padding: 0;
+    border-radius: 0;
   }
 
   /* Markdown rendering */
