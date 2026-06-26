@@ -1,11 +1,11 @@
 ---
 name: agent-service
-description: 通过本地 Agent Service HTTP server 管理模型、工具、MCP、Skill、提示模板、环境变量、会话、Agent，并发起/中止推理；使用 bash + curl 调用 server API，server 地址和端口可由环境变量配置。
+description: 通过本地 Agent Service HTTP server 管理模型、工具、MCP、Skill、提示模板、环境变量、会话、Agent，并发起/中止推理；使用 exec_shell + curl 调用 server API，server 地址和端口可由环境变量配置。
 ---
 
 # Agent Service 操作技能
 
-本 Skill 用于通过 HTTP API 操作当前 Agent Service server。需要执行实际操作时，优先使用 `bash` 工具调用 `curl`。所有请求都应面向运行中的 server；如果 server 未启动，先提示用户启动（通常为 `python app.py` 或 `python app.py 127.0.0.1:7988`）。
+本 Skill 用于通过 HTTP API 操作当前 Agent Service server。需要执行实际操作时，优先使用 `exec_shell` 工具调用 `curl`。所有请求都应面向运行中的 server；如果 server 未启动，先提示用户启动（通常为 `python app.py` 或 `python app.py 127.0.0.1:7988`）。
 
 ## 1. Server 地址配置
 
@@ -16,7 +16,7 @@ description: 通过本地 Agent Service HTTP server 管理模型、工具、MCP�
 - `RUNTIME_SERVER_HOST`：host，默认 `127.0.0.1`
 - `RUNTIME_SERVER_PORT`：port，默认 `7988`
 
-推荐在 bash 中使用：
+推荐在命令行中使用：
 
 ```bash
 SERVER_URL="${RUNTIME_SERVER_URL:-${AGENT_SERVER_URL:-http://${RUNTIME_SERVER_HOST:-127.0.0.1}:${RUNTIME_SERVER_PORT:-7988}}}"
@@ -359,7 +359,7 @@ curl -fsS -X POST "$SERVER_URL/v1/infer" \
   -d @- <<'JSON' | python -m json.tool
 {
   "model_id": "qwen3-14b",
-  "tool_ids": ["write_file", "execute_command"],
+  "tool_ids": ["write_file", "exec_shell"],
   "messages": [
     {"role": "system", "content": "你是一个有帮助的助手。"},
     {"role": "user", "content": "请用一句话介绍你自己。"}
@@ -391,7 +391,7 @@ curl -N -X POST "$SERVER_URL/v1/infer/stream" \
   -d @- <<'JSON'
 {
   "model_id": "qwen3-14b",
-  "tool_ids": ["write_file", "execute_command"],
+  "tool_ids": ["write_file", "exec_shell"],
   "messages": [
     {"role": "user", "content": "现在几点？如果需要可以使用工具。"}
   ],
@@ -489,7 +489,7 @@ curl -fsS -X POST "$SERVER_URL/v1/agents" \
 {
   "model_id": "qwen3-14b",
   "nickname": "助手",
-  "tool_ids": ["write_file", "execute_command"],
+  "tool_ids": ["write_file", "exec_shell"],
   "system_prompt": "你是一个严谨、简洁的助手。",
   "description": "默认助手 Agent",
   "avatar": ""

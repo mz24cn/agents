@@ -1,7 +1,7 @@
 """Tests for runtime.builtin_tools — new builtin tool functions.
 
 This file covers:
-  - read_file, write_file, edit_file, search_code, execute_command, undo
+  - read_file, write_file, edit_file, search_code, exec_shell, undo
 
 Test infrastructure:
   - `workspace` fixture: temporary directory with git init + initial commit
@@ -1259,36 +1259,36 @@ class TestSearchCodePropertyP14:
 
 
 # ---------------------------------------------------------------------------
-# Task 10.3 — Unit tests for _execute_command
+# Task 10.3 — Unit tests for _exec_shell
 # ---------------------------------------------------------------------------
 
-from runtime.builtin_tools import _execute_command
+from runtime.builtin_tools import _exec_shell
 
 
 class TestExecuteCommandUnit:
-    """Unit tests for _execute_command()."""
+    """Unit tests for _exec_shell()."""
 
     def test_empty_command_returns_empty_command_error(self, workspace):
         """Empty command string returns EmptyCommand error."""
-        result = _json.loads(_execute_command(""))
+        result = _json.loads(_exec_shell(""))
         assert result["error"] == "EmptyCommand"
         assert "message" in result
 
     def test_whitespace_only_command_returns_empty_command_error(self, workspace):
         """Whitespace-only command string returns EmptyCommand error."""
-        result = _json.loads(_execute_command("   "))
+        result = _json.loads(_exec_shell("   "))
         assert result["error"] == "EmptyCommand"
         assert "message" in result
 
     def test_exit_1_returns_exit_code_1_without_error_key(self, workspace):
         """Command 'exit 1' returns exit_code=1 with no 'error' key in response."""
-        result = _json.loads(_execute_command("exit 1"))
+        result = _json.loads(_exec_shell("exit 1"))
         assert "error" not in result, f"Unexpected error key: {result}"
         assert result["exit_code"] == 1
 
     def test_echo_term_outputs_dumb(self, workspace):
         """Command 'echo $TERM' outputs 'dumb' (TERM env var is set to dumb)."""
-        result = _json.loads(_execute_command("echo $TERM"))
+        result = _json.loads(_exec_shell("echo $TERM"))
         assert "error" not in result, f"Unexpected error: {result}"
         assert "dumb" in result["stdout"]
 
@@ -1305,7 +1305,7 @@ class TestExecuteCommandPropertyP15:
     @given(st.just(None))  # single-shot property, no interesting variation needed
     def test_cwd_is_workspace_and_response_has_required_fields(self, workspace, _):
         """Running 'pwd' returns the workspace path and response has exit_code/stdout/stderr/truncated."""
-        result = _json.loads(_execute_command("pwd"))
+        result = _json.loads(_exec_shell("pwd"))
 
         assert "error" not in result, f"Unexpected error: {result}"
 
@@ -1335,7 +1335,7 @@ class TestExecuteCommandPropertyP16:
     @given(st.just(None))  # single-shot property
     def test_timeout_forces_termination(self, workspace, _):
         """A sleep command with a very short timeout returns a Timeout error."""
-        result = _json.loads(_execute_command("sleep 60", timeout=1))
+        result = _json.loads(_exec_shell("sleep 60", timeout=1))
 
         assert result.get("error") == "Timeout", (
             f"Expected Timeout error, got: {result}"
@@ -1369,7 +1369,7 @@ class TestExecuteCommandPropertyP17:
 
         monkeypatch.setenv("EXEC_OUTPUT_LINE_LIMIT", str(limit))
 
-        result = _json.loads(_execute_command(command))
+        result = _json.loads(_exec_shell(command))
 
         assert "error" not in result, f"Unexpected error: {result}"
         assert result["truncated"] is True, (
@@ -1535,12 +1535,12 @@ class TestIntegration:
         )
 
     # -----------------------------------------------------------------------
-    # Task 12.4 — execute_command real subprocess
+    # Task 12.4 — exec_shell real subprocess
     # -----------------------------------------------------------------------
 
     def test_execute_command_echo_hello_integration_test(self, workspace):
-        """execute_command runs a real subprocess and returns the expected output."""
-        result = _json.loads(_execute_command("echo hello_integration_test"))
+        """exec_shell runs a real subprocess and returns the expected output."""
+        result = _json.loads(_exec_shell("echo hello_integration_test"))
 
         # exit_code must be 0
         assert result.get("exit_code") == 0, (

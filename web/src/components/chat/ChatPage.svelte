@@ -1,5 +1,5 @@
 <script>
-  import { onMount, onDestroy, setContext } from 'svelte'
+  import { onMount, onDestroy, setContext, untrack } from 'svelte'
   import { writable } from 'svelte/store'
   import { inferStream, abortInferStream, subscribeSessionEvents, agents as agentsApi, sessions as sessionsApi, env as envApi } from '../../lib/api.js'
   import { catalog, loadAgents, loadTools, refreshAgents } from '../../lib/catalog-state.svelte.js'
@@ -15,7 +15,8 @@
   import ConfirmDialog from '../ConfirmDialog.svelte'
   import { extractPlaceholders } from '../../lib/placeholder.js'
   import { t } from '../../lib/i18n.svelte.js'
-  import { sessionRestore, newSessionCreated, sessionDeleted, currentSession, newSessionRequest } from '../../lib/session-state.svelte.js'
+  import { sessionRestore, newSessionCreated, sessionDeleted, currentSession, newSessionRequest, terminalOpen } from '../../lib/session-state.svelte.js'
+  import Terminal from '../Terminal.svelte'
 
   const STORAGE_MODEL_KEY = 'chat_selected_model'
   const STORAGE_TOOLS_KEY = 'chat_selected_tools'
@@ -52,6 +53,85 @@
   let collapsedGroups = $derived(sessionStore[storeKey(sessionId)]?.collapsedGroups ?? new Set())
 
   let revokeConflict = $state(null)
+
+  // Terminal state: sessionId -> { ref, status }
+  // Terminal sessionId == Chat sessionId
+  let terminals = $state(new Map())
+  let terminalVisible = $state(false)  // Whether current session's terminal is shown
+
+  // Derived: current session's terminal data
+  let currentTerminalData = $derived(terminals.get(sessionId))
+  let currentTerminalStatus = $derived(currentTerminalData?.status || null)
+
+  // Listen for terminal open requests from sidebar
+  $effect(() => {
+    if (terminalOpen.token > 0 && terminalOpen.sessionId) {
+      openTerminal(terminalOpen.sessionId)
+    }
+  })
+
+  function openTerminal(sid) {
+    if (!sid) return
+    // Create terminal entry if not exists
+    if (!terminals.has(sid)) {
+      terminals = new Map(terminals).set(sid, {
+        ref: null,
+        status: { connected: false, error: null, loading: true, terminalId: null }
+      })
+    }
+    // If opening terminal for current session, show it.
+    // Use untrack() to avoid making sessionId a dependency of the caller
+    // effect (line 67), which would otherwise re-fire on every session switch.
+    if (sid === untrack(() => sessionId)) {
+      terminalVisible = true
+    }
+  }
+
+  // Close button: single click = hide, double click = destroy
+  let closeClickTimer = null
+  function handleTerminalCloseClick() {
+    if (closeClickTimer) {
+      // Double click - destroy terminal
+      clearTimeout(closeClickTimer)
+      closeClickTimer = null
+      destroyTerminal(sessionId)
+    } else {
+      // Single click - hide terminal (go back to messages)
+      closeClickTimer = setTimeout(() => {
+        closeClickTimer = null
+        terminalVisible = false
+      }, 250)
+    }
+  }
+
+  function destroyTerminal(sid) {
+    if (!sid) return
+    // Call Terminal component's destroy to prevent auto-reconnect
+    const termData = terminals.get(sid)
+    if (termData?.ref?.destroy) {
+      termData.ref.destroy()
+    }
+    // Call backend API to destroy terminal session
+    fetch(`/v1/terminals/${encodeURIComponent(sid)}`, { method: 'DELETE' })
+      .catch(err => console.warn('Failed to delete terminal:', err))
+    // Remove from local state
+    const newTerminals = new Map(terminals)
+    newTerminals.delete(sid)
+    terminals = newTerminals
+    // If destroying current session's terminal, hide it
+    if (sid === sessionId) {
+      terminalVisible = false
+    }
+  }
+
+  function handleTerminalStatusChange(sid, status) {
+    if (terminals.has(sid)) {
+      const newTerminals = new Map(terminals)
+      const terminal = { ...newTerminals.get(sid), status }
+      newTerminals.set(sid, terminal)
+      terminals = newTerminals
+    }
+  }
 
   // Track whether the message list is scrolled to the bottom (used for mark-read logic)
   let isAtBottom = $state(true)
@@ -409,7 +489,7 @@
     abortInferStream(sessionId)
   }
 
-  // Double-click stop = forced abort: kills running tool processes (bash, MCP)
+  // Double-click stop = forced abort: kills running tool processes (exec_shell, MCP)
   // and forces session status to done.  Use when the session is stuck in a
   // tool call that won't respond to a normal abort.
   function handleStopForce() {
@@ -551,7 +631,7 @@
         }
         aIdxRef.value = -1
       } else {
-        // 普通工具结果帧（write_file、execute_command 等）
+        // 普通工具结果帧（write_file、exec_shell 等）
         store.messages = [...msgs, { role: 'tool', ...msg }]
         aIdxRef.value = -1
       }
@@ -731,10 +811,16 @@
     revokeConflict = null
   }
 
+  // Watch for session restore requests
   $effect(() => {
-    if (sessionRestore.pending) {
-      const { sessionId: sid, messages: msgs, meta } = sessionRestore.pending
+    const pending = sessionRestore.pending;
+    if (pending) {
+      const { sessionId: sid, messages: msgs, meta } = pending
       sessionRestore.pending = null
+      
+      // Hide terminal when switching sessions
+      terminalVisible = false
+      
       // If the target session is not currently streaming, use fresh backend data.
       // If it IS streaming, keep the live data — don't overwrite with stale backend data.
       if (!sessionStore[sid]?.isStreaming) {
@@ -949,6 +1035,37 @@
         <span class="workspace-path" bind:this={pathEl}></span>
       </div>
     {/if}
+    <!-- Terminal control: show terminal icon/button if current session has terminal -->
+    {#if currentTerminalData}
+      <div class="terminal-control">
+        {#if terminalVisible}
+          <!-- Terminal is visible: show status + close button -->
+          <span>🖥️</span>
+          {#if currentTerminalStatus?.connected}
+            <button 
+              class="terminal-close-btn"
+              onclick={handleTerminalCloseClick}
+              title="Click to hide, double-click to destroy"
+            >
+              ▼
+            </button>
+          {:else}
+            <span class="terminal-status">
+              {currentTerminalStatus?.loading ? 'Loading...' : 'Connecting...'}
+            </span>
+          {/if}
+        {:else}
+          <!-- Terminal exists but hidden: show icon to switch to it -->
+          <button 
+            class="terminal-show-btn"
+            onclick={() => terminalVisible = true}
+            title="Show terminal"
+          >
+            💻
+          </button>
+        {/if}
+      </div>
+    {/if}
     <div class="agent-selector-spacer"></div>
     <div class="agent-selector-wrapper">
       🤖<a href="#/setup?tab=agents" class="nav-link">{t('agentSelector')}</a>
@@ -1011,17 +1128,32 @@
   />
 
   <div class="message-area">
-    <MessageList {messages} {agentList} onRevoke={handleRevoke} onScrollAtBottom={handleScrollAtBottom} {shouldScrollToBottom} {collapsedGroups} onToggleCollapse={toggleCollapse} />
+    <!-- Terminals: render all instances, show only current session's if visible -->
+    {#each Array.from(terminals.entries()) as [termId, termData] (termId)}
+      <div class="terminal-view" class:visible={terminalVisible && termId === sessionId}>
+        <Terminal 
+          bind:this={termData.ref}
+          sessionId={termId} 
+          visible={terminalVisible && termId === sessionId}
+          onStatusChange={(status) => handleTerminalStatusChange(termId, status)}
+        />
+      </div>
+    {/each}
 
-    {#if workspacePanelOpen}
-      <WorkspaceFileManager
-        bind:open={workspacePanelOpen}
-        bind:workspacePath={workspacePath}
-        onWorkspaceChange={handleWorkspaceChange}
-        onSelectFiles={handleSelectFiles}
-        onClose={closeWorkspacePanel}
-      />
-    {/if}
+    <!-- Message list: hidden when terminal is visible -->
+    <div class="message-list-container" class:hidden={terminalVisible}>
+      <MessageList {messages} {agentList} onRevoke={handleRevoke} onScrollAtBottom={handleScrollAtBottom} {shouldScrollToBottom} {collapsedGroups} onToggleCollapse={toggleCollapse} />
+
+      {#if workspacePanelOpen}
+        <WorkspaceFileManager
+          bind:open={workspacePanelOpen}
+          bind:workspacePath={workspacePath}
+          onWorkspaceChange={handleWorkspaceChange}
+          onSelectFiles={handleSelectFiles}
+          onClose={closeWorkspacePanel}
+        />
+      {/if}
+    </div>
 
     {#if templatePanelOpen}
       <div class="template-panel">
@@ -1158,6 +1290,85 @@
     min-width: 0;
   }
   .agent-selector-wrapper { display: flex; align-items: center; gap: 8px; }
+
+  /* Terminal close button in header */
+  .terminal-control {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 6px 10px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+  }
+
+  .terminal-close-btn {
+    background: none;
+    border: none;
+    cursor: pointer;
+    font-size: inherit;
+    padding: 0;
+    line-height: 1;
+    color: inherit;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    transition: color 0.2s;
+  }
+
+  .terminal-close-btn:hover {
+    color: var(--text);
+  }
+
+  .terminal-show-btn {
+    background: none;
+    border: none;
+    cursor: pointer;
+    font-size: 1rem;
+    padding: 2px 4px;
+    line-height: 1;
+    opacity: 0.7;
+    transition: opacity 0.2s;
+  }
+
+  .terminal-show-btn:hover {
+    opacity: 1;
+  }
+
+  .terminal-status {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    animation: pulse 1.5s infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+  }
+
+  /* Terminal and message list containers */
+  .terminal-view {
+    display: none;
+    flex: 1;
+    overflow: hidden;
+  }
+
+  .terminal-view.visible {
+    display: flex;
+  }
+
+  .message-list-container {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .message-list-container.hidden {
+    display: none;
+  }
   .system-prompt-bar {
     display: flex;
     align-items: center;
@@ -1211,6 +1422,8 @@
     display: flex;
     flex-direction: column;
   }
+
+  /* Terminal view styles moved to terminal-control section */
 
   .template-panel {
     position: absolute;

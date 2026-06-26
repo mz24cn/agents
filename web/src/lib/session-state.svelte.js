@@ -20,3 +20,8 @@ export const newSessionRequest = $state({ token: 0 })
 // 会话删除通知：Sidebar 通知 ChatPage 同步清空右侧面板
 export const sessionDeleted = $state({ sessionId: null })
 // sessionId: string | null — 被删除的会话 ID
+
+// 终端打开请求：Sidebar 菜单触发，ChatPage 监听并显示终端
+export const terminalOpen = $state({ sessionId: null, token: 0 })
+// sessionId: string | null — 要打开终端的会话 ID
+// token: number — 每次点击递增，确保重复打开也能响应

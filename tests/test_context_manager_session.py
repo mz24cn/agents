@@ -405,12 +405,12 @@ def test_record_tool_call_updates_references():
     with tempfile.TemporaryDirectory() as tmp_dir:
         cm = _make_cm(tmp_dir)
         session_id = cm.create_session()
-        cm.save_conversation(session_id, [_make_turn("user", "run bash")])
+        cm.save_conversation(session_id, [_make_turn("user", "run exec_cli")])
 
         result = cm.record_tool_call(
             session_id=session_id,
             turn_index=0,
-            tool_name="bash",
+            tool_name="exec_cli",
             arguments={"command": "ls"},
             result="file.txt",
             timestamp="2026-01-01T00:00:00",

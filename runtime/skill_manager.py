@@ -6,9 +6,9 @@ parses YAML front-matter for name/description, and stores the full markdown body
 The progressive disclosure pattern:
   1. First inference round: only Skill name + description are exposed to the LLM
   2. When LLM selects a Skill: full SKILL.md body is injected into context,
-     and built-in tools (write_file, execute_command) become available
+     and built-in tools (write_file, exec_shell) become available
   3. LLM reads the full body and decides how to use built-in tools to execute
-     (for network requests, use execute_command + curl)
+     (for network requests, use exec_shell + curl)
 
 SkillManager does NOT generate any command execution tools. The specific
 implementation of a skill is entirely determined by the SKILL.md content
@@ -86,7 +86,7 @@ class SkillManager:
 
     Does NOT generate any command execution tools. After the LLM reads
     the full SKILL.md body, it decides how to use built-in tools
-    (write_file, execute_command, etc.) to carry out the skill's operations.
+    (write_file, exec_shell, etc.) to carry out the skill's operations.
     """
 
     def __init__(self, tool_registry: ToolRegistry):

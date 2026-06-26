@@ -1,6 +1,6 @@
 """Built-in tools for the Agent Service.
 
-Provides basic tools (write_file, execute_command) that are always available to the LLM,
+Provides basic tools (write_file, exec_shell) that are always available to the LLM,
 especially after Skill progressive disclosure when the LLM needs to
 execute commands described in SKILL.md.
 
@@ -76,7 +76,7 @@ from runtime.common import (
 )
 
 # Shared registry mapping session_id → subprocess.Popen for the currently
-# executing bash command.  Populated by _execute_command so that the abort
+# executing exec_cli command.  Populated by _exec_shell so that the abort
 # handler (which runs in the HTTPServer thread) can kill the process.
 _active_processes: dict[str, subprocess.Popen] = {}
 _active_processes_lock = threading.Lock()
@@ -91,7 +91,7 @@ def _was_terminated_by_signal(proc: subprocess.Popen) -> bool:
 
 
 def kill_active_process(session_id: str) -> bool:
-    """Kill the bash process associated with *session_id*.
+    """Kill the shell process associated with *session_id*.
 
     Called from the abort handler in a different thread.  Returns True if a
     process was found and killed, False otherwise.
@@ -131,16 +131,38 @@ def _get_file_journal_manager(workspace: str) -> '_FileJournalManager':
     return journal_manager
 
 
-def _bash_execute(command: str, cwd: str = "") -> str:
-    """Execute a shell command via a pseudo-TTY so programs behave as if
-    running in an interactive terminal (spinner text, color, login prompts, etc.).
+def _exec_cli(command: str, cwd: str = "") -> str:
+    """Execute a command via exec_cli (terminal session if available, otherwise via a pseudo-TTY).
+    
+    When a terminal session exists for the current inference session, the command
+    is sent through that terminal's PTY. This ensures the command runs in the same
+    shell environment visible to the user in the chat UI.
+    
+    Falls back to creating a new PTY subprocess if no terminal session is available.
     On Windows, falls back to subprocess.run (no PTY support yet).
 
     Args:
-        command: The shell command to execute.
+        command: The command to execute via exec_cli.
         cwd: Working directory for the command. Empty string means current dir.
     """
-    timeout = int(os.environ.get("BASH_EXEC_TIMEOUT", 300))
+    timeout = int(os.environ.get("CLI_EXEC_TIMEOUT", 300))
+    
+    # Try to execute via terminal session first
+    session_id = get_request_context("session_id")
+    if session_id:
+        try:
+            # execute_command_in_terminal is now in this module
+            # If cwd is specified, prepend cd command
+            if cwd:
+                command = f"cd {shlex.quote(cwd)} && {command}"
+            result = execute_command_in_terminal(session_id, command, timeout=timeout)
+            # Check if result is an error (starts with "Error:")
+            if not result.startswith("Error:"):
+                return result
+            # If it's an error about no terminal session, fall back to local PTY
+            logger.debug("Terminal execution returned error, falling back to local PTY: %s", result)
+        except Exception as e:
+            logger.debug("Terminal execution failed, falling back to local PTY: %s", e)
 
     if sys.platform == "win32":
         # TODO: add Windows PTY support (e.g. via ConPTY / PowerShell)
@@ -262,17 +284,17 @@ def _fetch_url(url: str, method: str = "GET", body: str = "",
 
 
 # Tool configs for built-in tools
-BASH_TOOL_CONFIG = ToolConfig(
-    tool_id="bash",
+CLI_TOOL_CONFIG = ToolConfig(
+    tool_id="exec_cli",
     tool_type="function",
-    name="bash",
-    description="Execute a shell command. Use cwd to set the working directory.",
+    name="exec_cli",
+    description="Execute a command via CLI.",
     parameters={
         "type": "object",
         "properties": {
             "command": {
                 "type": "string",
-                "description": "The shell command to execute",
+                "description": "The command to execute via exec_cli",
             },
             "cwd": {
                 "type": "string",
@@ -368,7 +390,7 @@ def resolve_tool_ids(tools: list[str] | str, scope: list) -> list[str]:
     找不到对应工具的 name 会被跳过并记录警告。
 
     兼容大模型输出不稳定的情况：
-    - tools 可能是字符串而非列表，如 "bash, ppt-master" 或 "[bash, ppt-master]"
+    - tools 可能是字符串而非列表，如 "exec_cli, ppt-master" 或 "[exec_cli, ppt-master]"
     - 单个工具名可能携带多余的括号、引号、空格等噪声字符
 
     Args:
@@ -400,7 +422,7 @@ def resolve_tool_ids(tools: list[str] | str, scope: list) -> list[str]:
 
 
 BUILTIN_TOOLS = [
-    (BASH_TOOL_CONFIG, _bash_execute),
+    (CLI_TOOL_CONFIG, _exec_cli),
     (FETCH_TOOL_CONFIG, _fetch_url),
 ]
 
@@ -1031,7 +1053,7 @@ def _read_file(path: str, start_line: Optional[int] = None, end_line: Optional[i
     selected_lines = lines[start - 1:end]
     
     # Apply output limits (EXEC_OUTPUT_LINE_LIMIT and EXEC_OUTPUT_COLUMN_LIMIT)
-    # similar to execute_command and search_code
+    # similar to exec_shell and search_code
     output_line_limit = int(os.environ.get("EXEC_OUTPUT_LINE_LIMIT", 1000))
     max_line_length = int(os.environ.get("EXEC_OUTPUT_COLUMN_LIMIT", 1000))
     
@@ -2178,10 +2200,140 @@ BUILTIN_TOOLS.append((SEARCH_CODE_TOOL_CONFIG, _search_code))
 
 
 # ---------------------------------------------------------------------------
-# Task 10.1 — _execute_command implementation
+# Helper functions for terminal-based command execution
+# ---------------------------------------------------------------------------
+def execute_command_in_terminal(session_id: str, command: str, timeout: int = 300) -> str:
+    """Execute a command in the terminal session for the given session_id.
+    
+    This sends the command to the terminal's PTY and collects the output
+    from the shared output buffer (written by the read_pty thread).
+    
+    Args:
+        session_id: The inference session ID
+        command: The shell command to execute
+        timeout: Maximum time to wait for command completion (seconds)
+    
+    Returns:
+        The command output as a string
+    """
+    from runtime.server import get_terminal_for_session
+    
+    terminal_info = get_terminal_for_session(session_id)
+    if not terminal_info:
+        return "Error: No terminal session available for this session"
+    
+    master_fd = terminal_info.get("master_fd")
+    if not master_fd:
+        return "Error: Terminal session has no master_fd"
+    
+    # Clear the output buffer before sending command
+    with terminal_info["buffer_lock"]:
+        terminal_info["output_buffer"].clear()
+    
+    if command:
+        try:
+            os.write(master_fd, f"{command}\n".encode("utf-8"))
+        except OSError as e:
+            return f"Error writing to terminal: {e}"
+    
+    # Get check interval from environment variable
+    check_interval = float(os.environ.get("OUTPUT_CHECK_INTERVAL", "0.05"))
+    
+    # Get output over pattern from environment variable
+    output_over_pattern = os.environ.get("OUTPUT_OVER_PATTERN", "")
+    compiled_pattern = None
+    if output_over_pattern:
+        try:
+            compiled_pattern = re.compile(output_over_pattern)
+        except re.error:
+            compiled_pattern = None
+    
+    # Collect output from buffer until stable or timeout
+    collected_output = ""
+    prev_output = ""
+    has_output = False
+    deadline = time.monotonic() + timeout
+    
+    while time.monotonic() < deadline:
+        # Read from buffer
+        with terminal_info["buffer_lock"]:
+            if terminal_info["output_buffer"]:
+                chunk = "".join(terminal_info["output_buffer"])
+                terminal_info["output_buffer"].clear()
+                collected_output += chunk
+        
+        # Track if we've received any output
+        if collected_output:
+            has_output = True
+        
+        # Check stability: if we have output and it hasn't changed
+        if has_output and collected_output == prev_output:
+            break
+        
+        prev_output = collected_output
+        time.sleep(check_interval)
+    
+    # Process output
+    result = collected_output
+    
+    # Apply OUTPUT_OVER_PATTERN: match last two lines and truncate
+    if compiled_pattern and result:
+        # Find last two lines using rfind for \n
+        first_newline = result.rfind('\n')
+        if first_newline > 0:
+            second_newline = result.rfind('\n', 0, first_newline)
+            if second_newline >= 0:
+                # Two or more lines: take from second newline to end
+                last_two_lines = result[second_newline:]
+            else:
+                # Only one line: take the whole thing after first newline
+                last_two_lines = result[first_newline:]
+        else:
+            # No newline: use entire result
+            last_two_lines = result
+        
+        # Try to match the pattern
+        match = compiled_pattern.search(last_two_lines)
+        if match:
+            # Find where this match starts in the original result
+            match_start_in_tail = match.start()
+            # Calculate absolute position in result
+            if first_newline > 0:
+                if second_newline >= 0:
+                    absolute_start = second_newline + match_start_in_tail
+                else:
+                    absolute_start = first_newline + match_start_in_tail
+            else:
+                absolute_start = match_start_in_tail
+            
+            # Truncate: keep everything before the match
+            result = result[:absolute_start]
+    
+    # Remove ANSI escape sequences
+    ansi_escape = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07|\x1b\[.*?[~hlr]|[\x00-\x08\x0b\x0c\x0e-\x1f]')
+    result = ansi_escape.sub('', result)
+    result = re.sub(r'\[\?[0-9;]*[a-z]', '', result)
+    
+    # Remove command echo from beginning if present (last step)
+    cmd = command.strip()
+    if result[:len(cmd)] == cmd:
+        # Remove the command line (first line)
+        result = result[len(cmd):].lstrip('\n')
+    
+    if not result.strip():
+        if has_output:
+            return "(empty output)"
+        else:
+            return f"Error: command timed out after {timeout}s (no output received)"
+    
+    return result.strip()
+
+
+# ---------------------------------------------------------------------------
+# Task 10.1 — _exec_shell implementation
 # ---------------------------------------------------------------------------
 
-def _execute_command(command: str, timeout: Optional[int] = None, background: bool = False) -> str:
+def _exec_shell(command: str, timeout: Optional[int] = None, background: bool = False) -> str:
     """Execute a shell command in the workspace with output limits.
 
     Args:
@@ -2354,11 +2506,11 @@ def _execute_command(command: str, timeout: Optional[int] = None, background: bo
     return json.dumps(response)
 
 
-# Task 10.2 — Register execute_command tool
+# Task 10.2 — Register exec_shell tool
 EXECUTE_COMMAND_TOOL_CONFIG = ToolConfig(
-    tool_id="execute_command",
+    tool_id="exec_shell",
     tool_type="function",
-    name="execute_command",
+    name="exec_shell",
     description=(
         "Execute a shell command in the workspace directory. "
         "Runs in non-interactive mode (TERM=dumb). "
@@ -2388,7 +2540,7 @@ if sys.platform == "win32":
         "default": False,
     }
 
-BUILTIN_TOOLS.append((EXECUTE_COMMAND_TOOL_CONFIG, _execute_command))
+BUILTIN_TOOLS.append((EXECUTE_COMMAND_TOOL_CONFIG, _exec_shell))
 
 
 # ---------------------------------------------------------------------------

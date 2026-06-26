@@ -38,6 +38,15 @@
   )
 
   function handleSelect(agentId, event) {
+    // 空选项（"—"）：任何情况下都清除选择并关闭
+    if (!agentId) {
+      selectedAgentIds = []
+      expanded = false
+      multiSelectMode = false
+      onchange?.([])
+      return
+    }
+
     if (event.ctrlKey || event.metaKey) {
       // Ctrl/Cmd 点击：切换多选
       multiSelectMode = true
@@ -59,18 +68,12 @@
         }
       } else {
         // 普通单选模式
-        selectedAgentIds = agentId ? [agentId] : []
+        selectedAgentIds = [agentId]
         expanded = false
         multiSelectMode = false
       }
       onchange?.(selectedAgentIds)
     }
-  }
-
-  function handleClear() {
-    selectedAgentIds = []
-    multiSelectMode = false
-    onchange?.([])
   }
 
   function handleToggle() {
@@ -147,6 +150,17 @@
       {:else if agentList.length === 0}
         <span class="hint">{t('noAgents')}</span>
       {:else}
+        <!-- 空选项：不选智能体 -->
+        <button
+          type="button"
+          class="agent-item"
+          class:selected={selectedAgentIds.length === 0}
+          onclick={() => handleSelect('', { })}
+        >
+          <span class="agent-icon-placeholder"></span>
+          <span class="agent-name">—</span>
+        </button>
+        
         <!-- 无标签的智能体（默认组） -->
         {#each groupedAgents.untagged as agent (agent.agent_id)}
           <button 
@@ -191,15 +205,6 @@
             {/each}
           </div>
         {/each}
-      {/if}
-      
-      <!-- 底部操作栏 -->
-      {#if selectedAgentIds.length > 0}
-        <div class="bottom-bar">
-          <button type="button" class="clear-btn" onclick={handleClear}>
-            {t('clearSelection') || 'Clear'}
-          </button>
-        </div>
       {/if}
     </div>
   {/if}
@@ -296,26 +301,11 @@
     width: 16px;
     height: 16px;
   }
+  .agent-icon-placeholder {
+    width: 16px;
+    height: 16px;
+    flex-shrink: 0;
+  }
   .hint { font-size: 0.8rem; color: var(--text-secondary); padding: 4px 8px; }
   .hint.error { color: var(--danger); }
-  .bottom-bar {
-    padding: 6px 8px;
-    border-top: 1px solid var(--border);
-    margin-top: 4px;
-    display: flex;
-    justify-content: flex-end;
-  }
-  .clear-btn {
-    padding: 4px 10px;
-    font-size: 0.78rem;
-    color: var(--text-secondary);
-    background: none;
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    cursor: pointer;
-  }
-  .clear-btn:hover {
-    background: var(--bg-secondary);
-    color: var(--text);
-  }
 </style>

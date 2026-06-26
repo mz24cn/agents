@@ -185,7 +185,7 @@ export function inferStream(body, onMessage, onDone, onError, onInit = null) {
  *
  * @param {string} sessionId
  * @param {boolean} [forced=false]  When true, kills running tool processes
- *        (bash, MCP) and forces session status to done.  Use when the
+ *        (exec_shell, MCP) and forces session status to done.  Use when the
  *        session is stuck in a tool call that won't respond to a normal abort.
  * @returns {Promise<void>}
  */

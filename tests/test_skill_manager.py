@@ -200,13 +200,13 @@ class TestProgressiveDisclosure:
             assert tc.parameters == {"type": "object", "properties": {}, "required": []}
 
     def test_builtin_tools_not_registered_at_init(self):
-        """Runtime should NOT register write_file/execute_command at init — only on Skill disclosure."""
+        """Runtime should NOT register write_file/exec_shell at init — only on Skill disclosure."""
         from runtime import Runtime, ModelRegistry
         model_registry = ModelRegistry()
         registry = ToolRegistry()
         Runtime(model_registry=model_registry, tool_registry=registry)
         assert registry.get("write_file") is None
-        assert registry.get("execute_command") is None
+        assert registry.get("exec_shell") is None
 
 
 if __name__ == "__main__":

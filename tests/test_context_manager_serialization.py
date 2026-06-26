@@ -201,7 +201,7 @@ def test_parse_conversation_missing_role_line():
 
 
 def test_serialize_tool_call_structure():
-    fm = {"tool_name": "bash", "session_id": "s1", "turn_index": 0, "timestamp": "2026-01-01T00:00:00"}
+    fm = {"tool_name": "exec_cli", "session_id": "s1", "turn_index": 0, "timestamp": "2026-01-01T00:00:00"}
     text = serialize_tool_call(fm, {"command": "ls"}, "file.txt")
     assert "## Arguments" in text
     assert "## Result" in text

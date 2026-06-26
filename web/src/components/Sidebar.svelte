@@ -3,7 +3,7 @@
   import { router, navigate } from '../lib/router.svelte.js'
   import { t } from '../lib/i18n.svelte.js'
   import { sessions, subscribeSessionEvents } from '../lib/api.js'
-  import { sessionRestore, newSessionCreated, sessionDeleted, currentSession, newSessionRequest } from '../lib/session-state.svelte.js'
+  import { sessionRestore, newSessionCreated, sessionDeleted, currentSession, newSessionRequest, terminalOpen } from '../lib/session-state.svelte.js'
   import { sidebarWidth, setSidebarWidth, toggleSidebarCollapsed, collapseSidebar, SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH } from '../lib/sidebar-width.svelte.js'
 
   const SESSION_PAGE_SIZE = 100
@@ -227,6 +227,13 @@
     menuOpenId = null
   }
 
+  function handleOpenTerminal(e, sessionId) {
+    e.stopPropagation()
+    closeMenu()
+    terminalOpen.sessionId = sessionId
+    terminalOpen.token++
+  }
+
   // 移动端长按手势：长按会话条目 500ms 后弹出操作菜单
   let longPressTimer = $state(null)
 
@@ -426,6 +433,14 @@
         <line x1="14.5" y1="13.5" x2="16" y2="15"/>
       </svg>
       {t('generateTitle')}
+    </button>
+    <button
+      class="session-dropdown-item"
+      role="menuitem"
+      onclick={(e) => handleOpenTerminal(e, menuOpenId)}
+    >
+      <span class="menu-emoji">💻</span>
+      Open Terminal
     </button>
     <button
       class="session-dropdown-item session-dropdown-danger"
@@ -800,6 +815,10 @@
     width: 14px;
     height: 14px;
     flex-shrink: 0;
+  }
+  .menu-emoji {
+    font-size: 14px;
+    margin-right: 2px;
   }
   .session-loading, .session-empty, .session-error {
     padding: 6px 0 6px 10px;

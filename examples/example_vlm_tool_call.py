@@ -5,7 +5,7 @@
 演示：
   1. 使用 qwen3.5:9b VLM 通过 Ollama 原生协议读取图片
   2. 大模型识别图片中的文字，理解其中的指令
-  3. 大模型自行决定调用 write_file、execute_command 等内置工具执行指令
+  3. 大模型自行决定调用 write_file、exec_shell 等内置工具执行指令
   4. 全程流式输出
 
 用法：
@@ -91,7 +91,7 @@ def main():
         messages=[
             Message(role="system", content=(
                 "你是一个智能助手，能够识别图片中的文字并理解其含义。"
-                "如果图片中包含可执行的指令（如命令、URL等），请使用 write_file、execute_command 工具执行。"
+                "如果图片中包含可执行的指令（如命令、URL等），请使用 write_file、exec_shell 工具执行。"
                 "执行后请用中文总结结果。"
             )),
             Message(role="user", content=user_msg, images=[image_b64]),

@@ -8,19 +8,38 @@ Zero third-party dependencies — only Python standard library.
 """
 
 import datetime
+import hashlib
+import base64
+import struct
 import importlib.util
 import json
 import logging
 import mimetypes
 import os
 import re
+import select
+import signal
 import sys
 import threading
+import time
+import uuid
 import urllib.parse
 from dataclasses import asdict
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 from http import cookies
 from typing import Callable, Optional
+
+# PTY support for WebSocket terminal
+if sys.platform == 'win32':
+    try:
+        from winpty import PtyProcess
+    except ImportError:
+        PtyProcess = None
+else:
+    import pty
+    import fcntl
+    import termios
+    import signal
 
 logger = logging.getLogger("runtime.server")
 
@@ -306,6 +325,95 @@ _session_event_subscribers: list = []
 _session_state_lock = threading.Lock()
 
 
+# ---------------------------------------------------------------------------
+# Terminal Sessions – in-memory state
+# ---------------------------------------------------------------------------
+# Maps terminal_id -> { master_fd, pid, sock, session_id, output_buffer, buffer_lock }
+# terminal_id format: "{session_id}" or "{session_id}:{assistant_id}"
+_terminal_sessions: dict[str, dict] = {}
+_terminal_sessions_lock = threading.Lock()
+
+
+def get_terminal_session(terminal_id: str) -> Optional[dict]:
+    """Get terminal session by terminal_id."""
+    with _terminal_sessions_lock:
+        return _terminal_sessions.get(terminal_id)
+
+
+def register_terminal_session(terminal_id: str, master_fd, pid, sock, session_id: str) -> None:
+    """Register a new terminal session."""
+    with _terminal_sessions_lock:
+        _terminal_sessions[terminal_id] = {
+            "master_fd": master_fd,
+            "pid": pid,
+            "sock": sock,
+            "session_id": session_id,
+            "output_buffer": [],  # Buffer for collecting command output
+            "buffer_lock": threading.Lock(),
+            "disconnected_at": None,  # When the session was disconnected (for cleanup)
+            "active": True,  # Whether this connection is active
+        }
+
+
+def unregister_terminal_session(terminal_id: str) -> None:
+    """Remove terminal session from registry."""
+    with _terminal_sessions_lock:
+        session = _terminal_sessions.pop(terminal_id, None)
+        if session:
+            # Signal read_pty thread to stop
+            session["active"] = False
+            
+            # Kill the process
+            try:
+                os.kill(session["pid"], signal.SIGKILL)
+            except OSError:
+                pass
+            
+            # Wait for process to exit (with timeout)
+            try:
+                os.waitpid(session["pid"], os.WNOHANG)
+            except (OSError, ChildProcessError):
+                pass
+            
+            # Close master fd
+            try:
+                os.close(session["master_fd"])
+            except OSError:
+                pass
+
+
+def get_terminal_for_session(session_id: str) -> Optional[dict]:
+    """Get terminal session for a given inference session_id."""
+    with _terminal_sessions_lock:
+        for tid, info in _terminal_sessions.items():
+            if info["session_id"] == session_id:
+                return info
+    return None
+
+
+def cleanup_expired_terminal_sessions() -> None:
+    """Clean up terminal sessions that have been disconnected for too long."""
+    while True:
+        time.sleep(60)  # Check every minute
+        now = time.monotonic()
+        expired = []
+        
+        with _terminal_sessions_lock:
+            for tid, info in list(_terminal_sessions.items()):
+                disconnected_at = info.get("disconnected_at")
+                if disconnected_at and (now - disconnected_at) > os.getenv("TERMINAL_SESSION_TIMEOUT", 3600):
+                    expired.append(tid)
+        
+        for tid in expired:
+            logger.info("Cleaning up expired terminal session: %s", tid)
+            unregister_terminal_session(tid)
+
+
+# Start cleanup thread
+_cleanup_thread = threading.Thread(target=cleanup_expired_terminal_sessions, daemon=True)
+_cleanup_thread.start()
+
+
 def _broadcast_session_status(session_id: str, status: str) -> None:
     """Broadcast a session status change to all SSE subscribers.
 
@@ -541,10 +649,36 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self._handle_workspace_download()
         elif path == "/v1/workspace/thumbnail":
             self._handle_workspace_thumbnail()
+        elif path == "/v1/terminals":
+            self._handle_list_terminals()
         elif path.startswith("/v1/"):
             self._send_json_error(404, f"Not found: {self.path}")
+        elif path == "/ws" and self.headers.get("Upgrade", "").lower() == "websocket":
+            self._handle_websocket()
         else:
             self._handle_static_file()
+
+    def _handle_list_terminals(self) -> None:
+        """GET /v1/terminals — list active terminal sessions."""
+        with _terminal_sessions_lock:
+            terminals = []
+            for tid, info in _terminal_sessions.items():
+                terminals.append({
+                    "terminal_id": tid,
+                    "session_id": info["session_id"],
+                })
+        self._send_json_response(200, {"terminals": terminals})
+
+    def _handle_delete_terminal(self, terminal_id: str) -> None:
+        """DELETE /v1/terminals/{terminal_id} — destroy a terminal session."""
+        terminal_id = urllib.parse.unquote(terminal_id)
+        session = get_terminal_session(terminal_id)
+        if not session:
+            self._send_json_error(404, f"Terminal not found: {terminal_id}")
+            return
+        unregister_terminal_session(terminal_id)
+        logger.info("Terminal session deleted via API: %s", terminal_id)
+        self._send_json_response(200, {"status": "deleted", "terminal_id": terminal_id})
 
     def _handle_static_file(self) -> None:
         """Serve static files from the web/dist directory."""
@@ -587,6 +721,267 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    # ------------------------------------------------------------------
+    # WebSocket support
+    # ------------------------------------------------------------------
+
+    def _handle_websocket(self) -> None:
+        """Handle WebSocket upgrade request and start PTY session."""
+        key = self.headers.get("Sec-WebSocket-Key")
+        if not key:
+            self._send_json_error(400, "Missing Sec-WebSocket-Key")
+            return
+
+        # Parse terminal_id from query string: /ws?terminal_id=xxx
+        parsed = urllib.parse.urlparse(self.path)
+        params = urllib.parse.parse_qs(parsed.query)
+        terminal_id = params.get("terminal_id", [None])[0]
+
+        # Perform WebSocket handshake
+        magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+        accept_key = base64.b64encode(
+            hashlib.sha1((key + magic).encode("utf-8")).digest()
+        ).decode()
+
+        response = (
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Accept: {accept_key}\r\n\r\n"
+        )
+        sock = self.connection
+        sock.sendall(response.encode("utf-8"))
+
+        logger.info("WebSocket connection established: terminal_id=%s", terminal_id)
+        self._start_pty_session(sock, terminal_id)
+
+    @staticmethod
+    def _ws_send_frame(sock, text: str) -> None:
+        """Encode and send a WebSocket text frame."""
+        data = text.encode("utf-8", errors="replace")
+        length = len(data)
+        frame = bytearray([0x81])  # FIN + TEXT
+
+        if length <= 125:
+            frame.append(length)
+        elif length <= 65535:
+            frame.append(126)
+            frame.extend(struct.pack("!H", length))
+        else:
+            frame.append(127)
+            frame.extend(struct.pack("!Q", length))
+
+        frame.extend(data)
+        try:
+            sock.sendall(frame)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _ws_recv_frame(sock) -> Optional[str]:
+        """Receive and decode a WebSocket frame."""
+        try:
+            header = sock.recv(2)
+            if not header:
+                return None
+            b1, b2 = header[0], header[1]
+
+            opcode = b1 & 0x0F
+            if opcode == 8:  # Close frame
+                return None
+
+            payload_len = b2 & 0x7F
+            if payload_len == 126:
+                payload_len = struct.unpack("!H", sock.recv(2))[0]
+            elif payload_len == 127:
+                payload_len = struct.unpack("!Q", sock.recv(8))[0]
+
+            masking_key = sock.recv(4)
+            raw_data = sock.recv(payload_len)
+
+            # Unmask data
+            unmasked = bytearray(
+                b ^ masking_key[i % 4] for i, b in enumerate(raw_data)
+            )
+            return unmasked.decode("utf-8", errors="ignore")
+        except (OSError, struct.error):
+            return None
+
+    def _start_pty_session(self, sock, terminal_id: Optional[str] = None) -> None:
+        """Start a PTY session over WebSocket connection.
+        
+        Args:
+            sock: WebSocket connection socket
+            terminal_id: Optional terminal session ID (format: session_id or session_id:assistant_id)
+        """
+        if sys.platform == "win32":
+            self._start_pty_session_win32(sock, terminal_id)
+        else:
+            self._start_pty_session_unix(sock, terminal_id)
+
+    def _start_pty_session_win32(self, sock) -> None:
+        """Windows PTY session using winpty."""
+        if PtyProcess is None:
+            self._ws_send_frame(sock, '{"error": "winpty not available"}')
+            return
+
+        proc = PtyProcess.spawn("powershell.exe", dimensions=(24, 80))
+
+        def read_pty():
+            while True:
+                try:
+                    data = proc.read(1024)
+                    if data:
+                        self._ws_send_frame(sock, data)
+                    else:
+                        break
+                except EOFError:
+                    break
+
+        threading.Thread(target=read_pty, daemon=True).start()
+
+        try:
+            while True:
+                user_input = self._ws_recv_frame(sock)
+                if user_input is None:
+                    break
+
+                # Handle resize command
+                if user_input.startswith('{"__resize":'):
+                    try:
+                        msg = json.loads(user_input)
+                        proc.setwinsize(msg["rows"], msg["cols"])
+                        continue
+                    except Exception:
+                        pass
+
+                proc.write(user_input)
+        finally:
+            proc.terminate()
+            sock.close()
+
+    def _start_pty_session_unix(self, sock, terminal_id: Optional[str] = None) -> None:
+        """Unix PTY session using pty.fork().
+        
+        Supports session persistence: if a terminal session with the same ID already exists,
+        reconnect to it instead of creating a new one.
+        """
+        # Check if there's an existing session to reconnect to
+        existing_session = get_terminal_session(terminal_id) if terminal_id else None
+        
+        if existing_session:
+            # Reconnect to existing session
+            master_fd = existing_session["master_fd"]
+            pid = existing_session["pid"]
+            
+            # Deactivate old connection's read_pty thread
+            with _terminal_sessions_lock:
+                existing_session["active"] = False  # Signal old read_pty to stop
+                existing_session["sock"] = sock
+                existing_session["disconnected_at"] = None  # Clear disconnect time
+            
+            # Small delay to let old read_pty thread notice the flag
+            time.sleep(0.1)
+            
+            # Activate new connection
+            with _terminal_sessions_lock:
+                existing_session["active"] = True
+            
+            # Send terminal_id to client
+            if terminal_id:
+                self._ws_send_frame(sock, json.dumps({"__terminal_id": terminal_id}))
+            
+            logger.info("Reconnected to existing terminal session: %s (pid=%d)", terminal_id, pid)
+        else:
+            # Create new PTY session
+            pid, master_fd = pty.fork()
+            if pid == 0:
+                # Child process: start shell
+                env = os.environ.copy()
+                env["TERM"] = "xterm-256color"
+                shell = os.environ.get("SHELL", "/bin/bash")
+                os.execvpe(shell, [shell], env)
+
+            # Register terminal session if terminal_id provided
+            session_id = terminal_id.split(":")[0] if terminal_id else None
+            if terminal_id and session_id:
+                register_terminal_session(terminal_id, master_fd, pid, sock, session_id)
+
+            # Send terminal_id to client so it can reference this session
+            if terminal_id:
+                self._ws_send_frame(sock, json.dumps({"__terminal_id": terminal_id}))
+            
+            logger.info("Created new terminal session: %s (pid=%d)", terminal_id, pid)
+
+        # Parent process: bridge WebSocket <-> PTY
+        terminal_info = _terminal_sessions.get(terminal_id) if terminal_id else None
+        
+        def read_pty():
+            """Read from PTY and send to WebSocket."""
+            while True:
+                # Check if this connection is still active (only if tracking session)
+                if terminal_info:
+                    if not terminal_info.get("active", True):
+                        break
+                        
+                try:
+                    data = os.read(master_fd, 1024)
+                    if not data:
+                        break
+                    data = data.decode("utf-8", errors="replace")
+                    if data:
+                        # Send to current socket if available
+                        current_sock = terminal_info.get("sock") if terminal_info else sock
+                        if current_sock:
+                            try:
+                                self._ws_send_frame(current_sock, data)
+                            except Exception:
+                                # Socket error, will retry on next data
+                                pass
+                        # Always write to output buffer for command execution
+                        if terminal_info and "buffer_lock" in terminal_info:
+                            with terminal_info["buffer_lock"]:
+                                terminal_info["output_buffer"].append(data)
+                    else:
+                        break
+                except OSError:
+                    break
+
+        threading.Thread(target=read_pty, daemon=True).start()
+
+        def set_winsize(fd, rows, cols):
+            winsize = struct.pack("HHHH", rows, cols, 0, 0)
+            fcntl.ioctl(fd, termios.TIOCSWINSZ, winsize)
+
+        try:
+            while True:
+                user_input = self._ws_recv_frame(sock)
+                if user_input is None:
+                    break
+
+                # Handle resize command
+                if user_input.startswith('{"__resize":'):
+                    try:
+                        msg = json.loads(user_input)
+                        set_winsize(master_fd, msg["rows"], msg["cols"])
+                        continue
+                    except Exception:
+                        pass
+
+                # Regular keyboard input
+                os.write(master_fd, user_input.encode("utf-8"))
+        finally:
+            # On disconnect: don't kill the PTY process, just mark as disconnected
+            # The session will stay alive for potential reconnection
+            if terminal_info:
+                with _terminal_sessions_lock:
+                    terminal_info["active"] = False  # Mark this connection as inactive
+                    terminal_info["disconnected_at"] = time.monotonic()
+                    terminal_info["sock"] = None
+            
+            sock.close()
+            logger.info("Terminal session disconnected: %s (session stays alive for reconnection)", terminal_id)
 
     def do_POST(self) -> None:
         """Handle POST requests."""
@@ -724,6 +1119,10 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         m = re.match(r"^/v1/workspace/upload/([^/]+)$", path)
         if m:
             self._handle_workspace_upload_cancel(urllib.parse.unquote(m.group(1)))
+            return
+        m = re.match(r"^/v1/terminals/([^/]+)$", path)
+        if m:
+            self._handle_delete_terminal(m.group(1))
             return
         self._send_json_error(404, f"Not found: {self.path}")
 
@@ -1511,7 +1910,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         请求体: {"session_id": "<session_id>", "forced": true|false}
         找到对应的 cancel_event 并 set()，使推理线程在下一个检查点退出。
 
-        当 forced=true 时，还会主动杀死正在执行的工具进程（bash、MCP），
+        当 forced=true 时，还会主动杀死正在执行的工具进程（exec_cli、MCP），
         并强制将会话状态标记为 done_error_unread，适用于工具调用卡死的场景。
         """
         body = self._read_json_body()
@@ -1538,7 +1937,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
 
     def _force_abort(self, session_id: str) -> None:
         """Kill running tool processes and force session status to done."""
-        # 1. Kill any running bash process for this session.
+        # 1. Kill any running exec_cli process for this session.
         try:
             from runtime.builtin_tools import kill_active_process
             kill_active_process(session_id)

@@ -33,6 +33,7 @@ A minimal, zero-dependency Agent Service built with the pure Python standard lib
 - **Multi-task concurrent conversations with real-time status tracking** — support multiple simultaneous chat sessions with independent streaming states; real-time session status updates via SSE (streaming, success, error, unread); automatic read status management based on user scroll position; session title broadcasting
 - **Workspace file management** — full-featured workspace file manager with directory tree navigation, file listing (list/grid views), search (AND/OR modes via ripgrep/grep), rename, duplicate, delete, download, and chunked/parallel upload with pause/resume/retry support; workspace file references (`<file>path</file>`) in chat prompts are auto-expanded to inline content or attached images at inference time
 - **Self-install setup script** — export the current Agent Service code, built Web UI (`web/dist`), and runtime configuration as a self-extracting installer via `/v1/setup`; install on another machine from Linux/macOS shell with `curl -s http://{host}:7988/v1/setup | sh`, or from Windows PowerShell with `irm http://{host}:7988/v1/setup | iex`.
+- **Persistent terminal sessions for exec_cli tool** — the built-in `exec_cli` tool connects to persistent shell terminals that survive across multiple tool calls within a session; this enables seamless interaction with any command-line program including databases, containers, SSH sessions, and development environments. Supports multiple concurrent terminals per session, so you can run long-lived processes in one terminal while executing commands in another. Combined with the self-install script, this allows deploying the Agent Service itself to remote machines via SSH, turning it into a fully autonomous remote assistant that can operate any accessible environment with near-zero overhead.
 
 ### Architecture
 
@@ -46,7 +47,7 @@ runtime/
 ├── tools.py                 # Function tool decorator
 ├── skill_manager.py         # SkillManager: SKILL.md parsing and progressive disclosure
 ├── mcp_client.py            # MCP Client: pure stdlib stdio/SSE implementation (StreamReader limit raised to 100 MB for large payloads)
-├── builtin_tools.py         # Built-in tools: write_file, execute_command
+├── builtin_tools.py         # Built-in tools: write_file, exec_shell
 ├── prompt_template_manager.py  # Prompt template CRUD
 ├── context_manager.py       # Context manager: session management, rolling summary, memory extraction
 ├── env_manager.py           # Environment variable manager
@@ -364,7 +365,7 @@ Features:
 | `examples/example_mcp_ollama.py` | Connect Ollama (qwen3:14b) with MCP `time` and `fetch` servers; supports `--stream` flag |
 | `examples/example_mcp_openai.py` | Same as above but using the OpenAI-compatible protocol; easily switch to OpenAI, vLLM, LiteLLM, etc. |
 | `examples/example_skill.py` | Load a Skill from a directory and run streaming inference with progressive SKILL.md disclosure |
-| `examples/example_vlm_tool_call.py` | VLM reads an image, understands the instruction in it, and calls built-in `write_file`/`execute_command` tools to execute |
+| `examples/example_vlm_tool_call.py` | VLM reads an image, understands the instruction in it, and calls built-in `write_file`/`exec_shell` tools to execute |
 | `examples/example_browser_use.py` | Client/server split: server registers chrome-devtools MCP; client calls `/v1/tools/call` to open a page directly, then `/v1/infer/stream` to let the LLM inspect and interact with the browser |
 | `examples/example_stream_as_infer.py` | Use `/v1/infer/stream` (SSE) to receive streaming tokens and reassemble them into the same JSON structure as `/v1/infer` — avoids idle-timeout disconnections on long-running inference |
 | `examples/example_multi_agents.py` | Multi-Agent collaboration: PlanAgent delegates tasks to MainAgent via the `delegate` tool. Demonstrates prompt templates, MCP tools, and hierarchical task delegation with automatic TOOLS markdown generation |
@@ -452,6 +453,7 @@ MIT License — see [LICENSE](LICENSE)
 - **多任务并发对话及实时状态跟踪** — 支持多个聊天会话同时进行，每个会话独立管理流式状态；通过SSE实时更新会话状态（流式中、成功、错误、未读）；基于用户滚动位置自动管理已读状态；会话标题实时广播更新
 - **工作区文件管理** — 完整的工作区文件管理器，支持目录树导航、文件列表（列表/网格视图）、搜索（AND/OR模式，基于ripgrep/grep）、重命名、复制、删除、下载及分块/并行上传（支持暂停/恢复/重试）；对话中的工作区文件引用（`<file>路径</file>`）在推理时自动展开为内联内容或附加图片
 - **自安装脚本** — 通过 `/v1/setup` 将当前 Agent Service 源码、已编译 Web UI（`web/dist`）和运行时配置导出为自解压安装脚本；可在另一台机器上安装：Linux/macOS shell 使用 `curl -s http://{host}:7988/v1/setup | sh`，Windows PowerShell 使用 `irm http://{host}:7988/v1/setup | iex`。
+- **CLI工具对接持久化终端** — 内置 `exec_cli` 工具连接持久化 Shell 终端，终端会话在多次工具调用间保持存活；可无缝交互任意命令行程序，包括数据库客户端、容器、SSH 会话和开发环境。支持每个会话多个并发终端，可在执行其他命令的同时运行长时间进程。结合自安装脚本，可通过 SSH 将 Agent Service 自身部署到远程机器，使其成为完全自主的远程助手，以极低成本操作任意可连接的环境。
 
 ### 架构
 
@@ -465,7 +467,7 @@ runtime/
 ├── tools.py                 # Function 工具装饰器
 ├── skill_manager.py         # SkillManager：SKILL.md 解析与渐进披露管理
 ├── mcp_client.py            # MCP Client：纯标准库 stdio/SSE 实现（StreamReader 上限扩展至 100 MB，支持大数据量返回）
-├── builtin_tools.py         # 内置工具：write_file、execute_command
+├── builtin_tools.py         # 内置工具：write_file、exec_shell
 ├── prompt_template_manager.py  # 提示词模板 CRUD
 ├── context_manager.py       # 上下文管理器：会话管理、滚动摘要、记忆提取
 ├── env_manager.py           # 环境变量管理器
@@ -781,7 +783,7 @@ npm run build
 | `examples/example_mcp_ollama.py` | Ollama（qwen3:14b）+ MCP `time`/`fetch` 工具，支持 `--stream` 流式输出 |
 | `examples/example_mcp_openai.py` | 同上，使用 OpenAI 兼容协议，可轻松切换 OpenAI、vLLM、LiteLLM 等服务 |
 | `examples/example_skill.py` | 从目录加载 Skill，流式推理演示 SKILL.md 渐进披露全流程 |
-| `examples/example_vlm_tool_call.py` | VLM 读取图片中的文字指令，自动调用内置 `write_file`/`execute_command` 工具执行 |
+| `examples/example_vlm_tool_call.py` | VLM 读取图片中的文字指令，自动调用内置 `write_file`/`exec_shell` 工具执行 |
 | `examples/example_browser_use.py` | 客户端/服务端分离：Server 注册 chrome-devtools MCP；Client 通过 `/v1/tools/call` 直接打开页面，再通过 `/v1/infer/stream` 让大模型操控浏览器 |
 | `examples/example_stream_as_infer.py` | 通过 `/v1/infer/stream`（SSE）接收流式 token，在本地拼装成与 `/v1/infer` 完全一致的 JSON 结果，彻底规避长时推理的网关/代理 idle timeout 断连问题；支持 `--compare` 参数同时调用两个接口对比结果 |
 | `examples/example_multi_agents.py` | 多 Agent 协作：PlanAgent 通过 `delegate` 工具将任务委派给 MainAgent 执行。演示提示词模板、MCP 工具、层级化任务委派，以及自动生成 TOOLS markdown 表格 |

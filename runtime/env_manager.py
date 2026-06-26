@@ -363,7 +363,9 @@ AGENT_DIR="$(cd "$(dirname "$0")/agents" >/dev/null 2>&1 && pwd)"
 case "$START_AGENT_SERVICE" in
 background)
   nohup python3 "$AGENT_DIR/app.py" "0.0.0.0:${AGENT_SERVICE_PORT}" >> "$AGENT_SERVICE_LOG" 2>&1 &
-  echo $!
+  pid=$!
+  echo "$pid" > "$AGENTS_RUNTIME_DIR/server.pid"
+  echo "$pid"
   ;;
 foreground)
   exec python3 "$AGENT_DIR/app.py" "0.0.0.0:${AGENT_SERVICE_PORT}" 2>&1 | tee -a "$AGENT_SERVICE_LOG"
@@ -394,10 +396,13 @@ if [ -z "$pid" ]; then
   exit 0
 fi
 if kill -0 "$pid" 2>/dev/null; then
-  kill -- -"$pid" 2>/dev/null || true
-  sleep 0 2>/dev/null || true
-  kill -9 -- -"$pid" 2>/dev/null || true
-  echo "Stopped pid group: $pid" >&2
+  kill "$pid" 2>/dev/null || true
+  for _i in 1 2 3 4 5 6 7 8 9 10; do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.5 2>/dev/null || sleep 1
+  done
+  kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+  echo "Stopped pid: $pid" >&2
 else
   echo "Process $pid not running" >&2
 fi

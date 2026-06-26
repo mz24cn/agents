@@ -8,12 +8,29 @@ export default defineConfig({
       '/v1': {
         target: 'http://localhost:7988',
         changeOrigin: true
+      },
+      '/ws': {
+        target: 'ws://localhost:7988',
+        ws: true
       }
     }
   },
   resolve: {
     alias: {
       '$lib': '/src/lib',
+    }
+  },
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          // xterm 及其 addons 独立打包，只有 TerminalLazy 加载时才下载
+          'xterm': [
+            '@xterm/xterm',
+            '@xterm/addon-fit'
+          ]
+        }
+      }
     }
   },
   test: {
