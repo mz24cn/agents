@@ -11,7 +11,6 @@ import fnmatch
 import gzip
 import hashlib
 import json
-import locale
 import logging
 import os
 import re
@@ -34,22 +33,7 @@ from typing import Optional
 logger = logging.getLogger("runtime.builtin_tools")
 
 
-def _get_system_encoding() -> str:
-    """Get the preferred system encoding for subprocess output.
-
-    Returns the system's preferred encoding for text I/O, with fallback to utf-8.
-    On Windows this is typically the OEM codepage (e.g. cp936/GBK for Chinese locales),
-    which matches what cmd.exe and PowerShell emit by default.  Using this instead
-    of hard-coding utf-8 prevents garbled output (mojibake) on non-UTF-8 systems.
-    """
-    encoding = locale.getpreferredencoding(False)
-    if encoding:
-        return encoding
-    return "utf-8"
-
-
-# Resolve once at module load time so every subprocess call uses the same codec.
-_SYSTEM_ENCODING: str = _get_system_encoding()
+from runtime.common import get_system_encoding, SYSTEM_ENCODING
 
 if sys.platform != "win32":
     import fcntl
@@ -132,14 +116,12 @@ def _get_file_journal_manager(workspace: str) -> '_FileJournalManager':
 
 
 def _exec_cli(command: str, cwd: str = "") -> str:
-    """Execute a command via exec_cli (terminal session if available, otherwise via a pseudo-TTY).
+    """Execute a command via exec_cli (terminal session if available, otherwise via subprocess).
     
-    When a terminal session exists for the current inference session, the command
-    is sent through that terminal's PTY. This ensures the command runs in the same
-    shell environment visible to the user in the chat UI.
-    
-    Falls back to creating a new PTY subprocess if no terminal session is available.
-    On Windows, falls back to subprocess.run (no PTY support yet).
+    Flow:
+    1. Get or create a terminal session for the current session_id
+    2. Execute command in that terminal via execute_command_in_terminal
+    3. If any step fails, fall back to subprocess.run (platform-independent)
 
     Args:
         command: The command to execute via exec_cli.
@@ -147,100 +129,38 @@ def _exec_cli(command: str, cwd: str = "") -> str:
     """
     timeout = int(os.environ.get("CLI_EXEC_TIMEOUT", 300))
     
-    # Try to execute via terminal session first
+    # Step 1: Try to get or create terminal session
     session_id = get_request_context("session_id")
     if session_id:
         try:
-            # execute_command_in_terminal is now in this module
-            # If cwd is specified, prepend cd command
-            if cwd:
-                command = f"cd {shlex.quote(cwd)} && {command}"
-            result = execute_command_in_terminal(session_id, command, timeout=timeout)
-            # Check if result is an error (starts with "Error:")
-            if not result.startswith("Error:"):
-                return result
-            # If it's an error about no terminal session, fall back to local PTY
-            logger.debug("Terminal execution returned error, falling back to local PTY: %s", result)
+            from runtime.server import get_or_create_terminal
+            terminal_info = get_or_create_terminal(session_id)
+            
+            if terminal_info:
+                # Step 2: Execute in terminal
+                if cwd:
+                    command = f"cd {shlex.quote(cwd)} && {command}"
+                result = execute_command_in_terminal(session_id, command, timeout=timeout)
+                if not result.startswith("Error:"):
+                    return result
+                logger.debug("Terminal execution returned error, falling back to subprocess: %s", result)
         except Exception as e:
-            logger.debug("Terminal execution failed, falling back to local PTY: %s", e)
-
-    if sys.platform == "win32":
-        # TODO: add Windows PTY support (e.g. via ConPTY / PowerShell)
-        try:
-            result = subprocess.run(
-                command, shell=True, capture_output=True, text=True,
-                encoding=_SYSTEM_ENCODING, errors='replace',
-                timeout=timeout, cwd=cwd if cwd else None,
-            )
-            output = (result.stdout or "").strip()
-            if result.returncode != 0:
-                err = (result.stderr or "").strip()
-                return f"Exit code {result.returncode}\nstderr: {err}\nstdout: {output}"
-            return output if output else "(empty output)"
-        except subprocess.TimeoutExpired:
-            return f"Error: command timed out after {timeout}s"
-        except Exception as e:
-            return f"Error: {type(e).__name__}: {e}"
-
-    output_chunks = []
-
+            logger.debug("Terminal execution failed, falling back to subprocess: %s", e)
+    
+    # Step 3: Fallback to subprocess.run (platform-independent)
     try:
-        master_fd, slave_fd = pty.openpty()
-
-        # Set terminal size to 80x24 so apps don't complain
-        winsize = struct.pack("HHHH", 24, 80, 0, 0)
-        fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
-
-        proc = subprocess.Popen(
-            command,
-            shell=True,
-            stdin=slave_fd,
-            stdout=slave_fd,
-            stderr=slave_fd,
-            close_fds=True,
-            cwd=cwd if cwd else None,
+        result = subprocess.run(
+            command, shell=True, capture_output=True, text=True,
+            encoding=SYSTEM_ENCODING, errors='replace',
+            timeout=timeout, cwd=cwd if cwd else None,
         )
-        os.close(slave_fd)  # parent doesn't need the slave end
-
-        deadline = time.monotonic() + timeout
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                proc.kill()
-                return f"Error: command timed out after {timeout}s"
-            ready, _, _ = select.select([master_fd], [], [], min(remaining, 0.5))
-            if ready:
-                try:
-                    chunk = os.read(master_fd, 4096)
-                    if chunk:
-                        output_chunks.append(chunk)
-                except OSError:
-                    break  # slave closed (process exited)
-            if proc.poll() is not None:
-                # Drain any remaining output
-                while True:
-                    ready, _, _ = select.select([master_fd], [], [], 0.1)
-                    if not ready:
-                        break
-                    try:
-                        chunk = os.read(master_fd, 4096)
-                        if chunk:
-                            output_chunks.append(chunk)
-                    except OSError:
-                        break
-                break
-
-        os.close(master_fd)
-        proc.wait()
-
-        raw = b"".join(output_chunks).decode(_SYSTEM_ENCODING, errors="replace")
-        # Strip ANSI/VT escape sequences, keep plain text
-        clean = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b[()][AB012]|\r", "", raw).strip()
-
-        if proc.returncode != 0:
-            return f"Exit code {proc.returncode}\n{clean}" if clean else f"Exit code {proc.returncode}"
-        return clean if clean else "(empty output)"
-
+        output = (result.stdout or "").strip()
+        if result.returncode != 0:
+            err = (result.stderr or "").strip()
+            return f"Exit code {result.returncode}\nstderr: {err}\nstdout: {output}"
+        return output if output else "(empty output)"
+    except subprocess.TimeoutExpired:
+        return f"Error: command timed out after {timeout}s"
     except Exception as e:
         return f"Error: {type(e).__name__}: {e}"
 
@@ -899,7 +819,7 @@ class _FileJournalManager:
 
     def _git_text(self, args: list[str]) -> subprocess.CompletedProcess:
         return subprocess.run(["git"] + args, cwd=self.workspace, capture_output=True, text=True,
-                              encoding=_SYSTEM_ENCODING, errors='replace')
+                              encoding=SYSTEM_ENCODING, errors='replace')
 
     def _git_baseline_ref(self, rel_path: str, state: dict) -> Optional[dict]:
         if state.get("is_symlink") or not os.path.isdir(os.path.join(self.workspace, ".git")):
@@ -984,7 +904,7 @@ class _Linter:
                 cmd,
                 capture_output=True,
                 text=True,
-                encoding=_SYSTEM_ENCODING, errors='replace',
+                encoding=SYSTEM_ENCODING, errors='replace',
                 timeout=30,
             )
             if result.returncode == 0:
@@ -1752,7 +1672,7 @@ def _run_patch(workspace: str, patch: str, dry_run: bool) -> subprocess.Complete
         cwd=workspace,
         capture_output=True,
         text=True,
-        encoding=_SYSTEM_ENCODING, errors='replace',
+        encoding=SYSTEM_ENCODING, errors='replace',
     )
 
 
@@ -1989,7 +1909,7 @@ def _search_code(query: str, include: Optional[str] = None, exclude: Optional[st
                 cwd=workspace,
                 capture_output=True,
                 text=True,
-                encoding=_SYSTEM_ENCODING, errors='replace',
+                encoding=SYSTEM_ENCODING, errors='replace',
             )
         except Exception as exc:
             return json.dumps({"error": "SearchToolNotFound", "message": str(exc)})
@@ -2082,7 +2002,7 @@ def _search_code(query: str, include: Optional[str] = None, exclude: Optional[st
                 cwd=workspace,
                 capture_output=True,
                 text=True,
-                encoding=_SYSTEM_ENCODING, errors='replace',
+                encoding=SYSTEM_ENCODING, errors='replace',
             )
         except Exception as exc:
             return json.dumps({"error": "SearchToolNotFound", "message": str(exc)})
@@ -2222,9 +2142,19 @@ def execute_command_in_terminal(session_id: str, command: str, timeout: int = 30
     if not terminal_info:
         return "Error: No terminal session available for this session"
     
-    master_fd = terminal_info.get("master_fd")
-    if not master_fd:
-        return "Error: Terminal session has no master_fd"
+    # Get the appropriate method to write to terminal
+    if sys.platform == "win32":
+        # Windows: use proc.write()
+        proc = terminal_info.get("proc")
+        if not proc:
+            return "Error: Terminal session has no proc"
+        write_method = lambda cmd: proc.write(f"{cmd}\r\n")
+    else:
+        # Unix: use master_fd
+        master_fd = terminal_info.get("master_fd")
+        if not master_fd:
+            return "Error: Terminal session has no master_fd"
+        write_method = lambda cmd: os.write(master_fd, f"{cmd}\n".encode("utf-8"))
     
     # Clear the output buffer before sending command
     with terminal_info["buffer_lock"]:
@@ -2232,8 +2162,8 @@ def execute_command_in_terminal(session_id: str, command: str, timeout: int = 30
     
     if command:
         try:
-            os.write(master_fd, f"{command}\n".encode("utf-8"))
-        except OSError as e:
+            write_method(command)
+        except Exception as e:
             return f"Error writing to terminal: {e}"
     
     # Get check interval from environment variable
@@ -2254,6 +2184,9 @@ def execute_command_in_terminal(session_id: str, command: str, timeout: int = 30
     has_output = False
     deadline = time.monotonic() + timeout
     
+    logger.debug("execute_command_in_terminal: waiting for output, terminal_info=%s", 
+                 {k: v for k, v in terminal_info.items() if k != "buffer_lock"})
+    
     while time.monotonic() < deadline:
         # Read from buffer
         with terminal_info["buffer_lock"]:
@@ -2272,6 +2205,9 @@ def execute_command_in_terminal(session_id: str, command: str, timeout: int = 30
         
         prev_output = collected_output
         time.sleep(check_interval)
+    
+    logger.debug("execute_command_in_terminal: output collected, has_output=%s, len=%d", 
+                 has_output, len(collected_output))
     
     # Process output
     result = collected_output
@@ -2411,7 +2347,7 @@ def _exec_shell(command: str, timeout: Optional[int] = None, background: bool = 
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            encoding=_SYSTEM_ENCODING, errors='replace',
+            encoding=SYSTEM_ENCODING, errors='replace',
             start_new_session=sys.platform != "win32",
             creationflags=creationflags,
         )

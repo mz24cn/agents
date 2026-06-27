@@ -50,6 +50,7 @@ logger = logging.getLogger("runtime.server")
 
 
 from runtime.auth_manager import AuthManager, COOKIE_NAME
+from runtime.common import get_system_encoding, SYSTEM_ENCODING
 from runtime.env_manager import EnvManager
 from runtime.session_manager import SessionManager
 from runtime.mcp_client import MCPClientManager
@@ -355,6 +356,135 @@ def register_terminal_session(terminal_id: str, master_fd, pid, sock, session_id
         }
 
 
+def get_or_create_terminal(session_id: str, cols: int = 80, rows: int = 24) -> Optional[dict]:
+    """Get existing terminal session for session_id, or create a new one.
+    
+    Args:
+        session_id: Session identifier
+        cols: Initial terminal columns (used only when creating a new PTY)
+        rows: Initial terminal rows (used only when creating a new PTY)
+    
+    Returns terminal_info dict, or None if creation failed.
+    """
+    # Try to find existing terminal
+    terminal_info = get_terminal_for_session(session_id)
+    if terminal_info:
+        return terminal_info
+    
+    # Create new terminal session
+    terminal_id = f"{session_id}:auto"
+    session_id_short = session_id.split(":")[0] if session_id else session_id
+    
+    if sys.platform == "win32":
+        try:
+            from winpty import PtyProcess
+        except ImportError:
+            PtyProcess = None
+        
+        if PtyProcess is None:
+            return None
+        
+        try:
+            proc = PtyProcess.spawn("powershell.exe", dimensions=(rows, cols))
+            with _terminal_sessions_lock:
+                _terminal_sessions[terminal_id] = {
+                    "proc": proc,
+                    "sock": None,
+                    "session_id": session_id_short,
+                    "active": True,
+                    "disconnected_at": None,
+                    "output_buffer": [],
+                    "buffer_lock": threading.Lock(),
+                }
+            
+            # Start background thread to drain PTY output into buffer
+            terminal_info = _terminal_sessions[terminal_id]
+            def read_pty():
+                logger.debug("read_pty thread started for %s (win32)", terminal_id)
+                try:
+                    while terminal_info.get("active", True):
+                        try:
+                            data = proc.read(4096)
+                            if data:
+                                with terminal_info["buffer_lock"]:
+                                    terminal_info["output_buffer"].append(data)
+                            else:
+                                logger.debug("read_pty: EOF for %s (win32)", terminal_id)
+                                break
+                        except EOFError:
+                            logger.debug("read_pty: EOFError for %s (win32)", terminal_id)
+                            break
+                except Exception as e:
+                    logger.error("read_pty: unexpected error for %s (win32): %s", terminal_id, e)
+                logger.debug("read_pty thread exiting for %s (win32)", terminal_id)
+            threading.Thread(target=read_pty, daemon=True).start()
+            
+            return terminal_info
+        except Exception as e:
+            logger.debug("Failed to create winpty terminal: %s", e)
+            return None
+    else:
+        try:
+            pid, master_fd = pty.fork()
+            if pid == 0:
+                # Child process: start shell
+                env = os.environ.copy()
+                env["TERM"] = "xterm-256color"
+                shell = os.environ.get("SHELL", "/bin/bash")
+                os.execvpe(shell, [shell], env)
+            
+            # Set initial window size for the PTY
+            try:
+                winsize = struct.pack("HHHH", rows, cols, 0, 0)
+                fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsize)
+            except Exception:
+                pass
+            
+            with _terminal_sessions_lock:
+                _terminal_sessions[terminal_id] = {
+                    "master_fd": master_fd,
+                    "pid": pid,
+                    "sock": None,
+                    "session_id": session_id_short,
+                    "active": True,
+                    "disconnected_at": None,
+                    "output_buffer": [],
+                    "buffer_lock": threading.Lock(),
+                }
+            
+            # Start background thread to drain PTY output into buffer
+            terminal_info = _terminal_sessions[terminal_id]
+            def read_pty():
+                logger.debug("read_pty thread started for %s", terminal_id)
+                try:
+                    while terminal_info.get("active", True):
+                        try:
+                            ready, _, _ = select.select([master_fd], [], [], 0.1)
+                            if ready:
+                                data = os.read(master_fd, 4096)
+                                if data:
+                                    with terminal_info["buffer_lock"]:
+                                        terminal_info["output_buffer"].append(data.decode(get_system_encoding(), errors='replace'))
+                                else:
+                                    logger.debug("read_pty: EOF for %s", terminal_id)
+                                    break
+                        except select.error as e:
+                            logger.debug("read_pty: select error for %s: %s", terminal_id, e)
+                            break
+                        except OSError as e:
+                            logger.debug("read_pty: OSError for %s: %s", terminal_id, e)
+                            break
+                except Exception as e:
+                    logger.error("read_pty: unexpected error for %s: %s", terminal_id, e)
+                logger.debug("read_pty thread exiting for %s", terminal_id)
+            threading.Thread(target=read_pty, daemon=True).start()
+            
+            return terminal_info
+        except Exception as e:
+            logger.debug("Failed to create pty terminal: %s", e)
+            return None
+
+
 def unregister_terminal_session(terminal_id: str) -> None:
     """Remove terminal session from registry."""
     with _terminal_sessions_lock:
@@ -364,22 +494,32 @@ def unregister_terminal_session(terminal_id: str) -> None:
             session["active"] = False
             
             # Kill the process
-            try:
-                os.kill(session["pid"], signal.SIGKILL)
-            except OSError:
-                pass
-            
-            # Wait for process to exit (with timeout)
-            try:
-                os.waitpid(session["pid"], os.WNOHANG)
-            except (OSError, ChildProcessError):
-                pass
-            
-            # Close master fd
-            try:
-                os.close(session["master_fd"])
-            except OSError:
-                pass
+            if sys.platform == "win32":
+                # Windows: use proc.terminate()
+                proc = session.get("proc")
+                if proc:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+            else:
+                # Unix: use os.kill
+                try:
+                    os.kill(session["pid"], signal.SIGKILL)
+                except OSError:
+                    pass
+                
+                # Wait for process to exit (with timeout)
+                try:
+                    os.waitpid(session["pid"], os.WNOHANG)
+                except (OSError, ChildProcessError):
+                    pass
+                
+                # Close master fd
+                try:
+                    os.close(session["master_fd"])
+                except OSError:
+                    pass
 
 
 def get_terminal_for_session(session_id: str) -> Optional[dict]:
@@ -733,10 +873,12 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self._send_json_error(400, "Missing Sec-WebSocket-Key")
             return
 
-        # Parse terminal_id from query string: /ws?terminal_id=xxx
+        # Parse terminal_id and optional cols/rows from query string
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
         terminal_id = params.get("terminal_id", [None])[0]
+        initial_cols = int(params["cols"][0]) if params.get("cols") else None
+        initial_rows = int(params["rows"][0]) if params.get("rows") else None
 
         # Perform WebSocket handshake
         magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -753,8 +895,8 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         sock = self.connection
         sock.sendall(response.encode("utf-8"))
 
-        logger.info("WebSocket connection established: terminal_id=%s", terminal_id)
-        self._start_pty_session(sock, terminal_id)
+        logger.info("WebSocket connection established: terminal_id=%s, cols=%s, rows=%s", terminal_id, initial_cols, initial_rows)
+        self._start_pty_session(sock, terminal_id, initial_cols, initial_rows)
 
     @staticmethod
     def _ws_send_frame(sock, text: str) -> None:
@@ -808,32 +950,88 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         except (OSError, struct.error):
             return None
 
-    def _start_pty_session(self, sock, terminal_id: Optional[str] = None) -> None:
+    def _start_pty_session(self, sock, terminal_id: Optional[str] = None,
+                            initial_cols: Optional[int] = None,
+                            initial_rows: Optional[int] = None) -> None:
         """Start a PTY session over WebSocket connection.
         
         Args:
             sock: WebSocket connection socket
             terminal_id: Optional terminal session ID (format: session_id or session_id:assistant_id)
+            initial_cols: Terminal columns from the client
+            initial_rows: Terminal rows from the client
         """
         if sys.platform == "win32":
-            self._start_pty_session_win32(sock, terminal_id)
+            self._start_pty_session_win32(sock, terminal_id, initial_cols, initial_rows)
         else:
-            self._start_pty_session_unix(sock, terminal_id)
+            self._start_pty_session_unix(sock, terminal_id, initial_cols, initial_rows)
 
-    def _start_pty_session_win32(self, sock, terminal_id: Optional[str] = None) -> None:
-        """Windows PTY session using winpty."""
+    def _start_pty_session_win32(self, sock, terminal_id: Optional[str] = None,
+                                  initial_cols: Optional[int] = None,
+                                  initial_rows: Optional[int] = None) -> None:
+        """Windows PTY session using winpty.
+        
+        Supports session persistence: if a terminal session with the same ID already exists,
+        reconnect to it instead of creating a new one.
+        """
         if PtyProcess is None:
             self._ws_send_frame(sock, '{"error": "winpty not available"}')
             return
 
-        proc = PtyProcess.spawn("powershell.exe", dimensions=(24, 80))
-
+        # Get or create terminal
+        session_id = terminal_id.split(":")[0] if terminal_id else None
+        if session_id:
+            terminal_info = get_or_create_terminal(
+                session_id,
+                cols=initial_cols or 80,
+                rows=initial_rows or 24,
+            )
+        else:
+            terminal_info = None
+        
+        if not terminal_info:
+            self._ws_send_frame(sock, '{"error": "Failed to create terminal"}')
+            return
+        
+        # Attach socket to terminal
+        with _terminal_sessions_lock:
+            terminal_info["active"] = False  # Signal old read_pty to stop
+            terminal_info["sock"] = sock
+            terminal_info["disconnected_at"] = None
+        
+        time.sleep(0.1)
+        
+        with _terminal_sessions_lock:
+            terminal_info["active"] = True
+        
+        proc = terminal_info.get("proc")
+        
+        # Resize PTY to match the client's terminal dimensions on reconnect
+        if proc and initial_cols and initial_rows:
+            try:
+                proc.setwinsize(initial_rows, initial_cols)
+            except Exception:
+                pass
+        
+        # Send terminal_id to client
+        if terminal_id:
+            self._ws_send_frame(sock, json.dumps({"__terminal_id": terminal_id}))
+        
         def read_pty():
-            while True:
+            """Read from PTY and send to WebSocket."""
+            while terminal_info.get("active", True):
                 try:
                     data = proc.read(1024)
                     if data:
-                        self._ws_send_frame(sock, data)
+                        current_sock = terminal_info.get("sock")
+                        if current_sock:
+                            try:
+                                self._ws_send_frame(current_sock, data)
+                            except Exception:
+                                pass
+                        if "buffer_lock" in terminal_info:
+                            with terminal_info["buffer_lock"]:
+                                terminal_info["output_buffer"].append(data)
                     else:
                         break
                 except EOFError:
@@ -858,93 +1056,81 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
 
                 proc.write(user_input)
         finally:
-            proc.terminate()
+            # Mark session as disconnected but don't terminate
+            if terminal_info:
+                with _terminal_sessions_lock:
+                    terminal_info["active"] = False
+                    terminal_info["disconnected_at"] = time.time()
             sock.close()
 
-    def _start_pty_session_unix(self, sock, terminal_id: Optional[str] = None) -> None:
+    def _start_pty_session_unix(self, sock, terminal_id: Optional[str] = None,
+                                initial_cols: Optional[int] = None,
+                                initial_rows: Optional[int] = None) -> None:
         """Unix PTY session using pty.fork().
         
         Supports session persistence: if a terminal session with the same ID already exists,
         reconnect to it instead of creating a new one.
         """
-        # Check if there's an existing session to reconnect to
-        existing_session = get_terminal_session(terminal_id) if terminal_id else None
-        
-        if existing_session:
-            # Reconnect to existing session
-            master_fd = existing_session["master_fd"]
-            pid = existing_session["pid"]
-            
-            # Deactivate old connection's read_pty thread
-            with _terminal_sessions_lock:
-                existing_session["active"] = False  # Signal old read_pty to stop
-                existing_session["sock"] = sock
-                existing_session["disconnected_at"] = None  # Clear disconnect time
-            
-            # Small delay to let old read_pty thread notice the flag
-            time.sleep(0.1)
-            
-            # Activate new connection
-            with _terminal_sessions_lock:
-                existing_session["active"] = True
-            
-            # Send terminal_id to client
-            if terminal_id:
-                self._ws_send_frame(sock, json.dumps({"__terminal_id": terminal_id}))
-            
-            logger.info("Reconnected to existing terminal session: %s (pid=%d)", terminal_id, pid)
+        # Get or create terminal
+        session_id = terminal_id.split(":")[0] if terminal_id else None
+        if session_id:
+            terminal_info = get_or_create_terminal(
+                session_id,
+                cols=initial_cols or 80,
+                rows=initial_rows or 24,
+            )
         else:
-            # Create new PTY session
-            pid, master_fd = pty.fork()
-            if pid == 0:
-                # Child process: start shell
-                env = os.environ.copy()
-                env["TERM"] = "xterm-256color"
-                shell = os.environ.get("SHELL", "/bin/bash")
-                os.execvpe(shell, [shell], env)
-
-            # Register terminal session if terminal_id provided
-            session_id = terminal_id.split(":")[0] if terminal_id else None
-            if terminal_id and session_id:
-                register_terminal_session(terminal_id, master_fd, pid, sock, session_id)
-
-            # Send terminal_id to client so it can reference this session
-            if terminal_id:
-                self._ws_send_frame(sock, json.dumps({"__terminal_id": terminal_id}))
-            
-            logger.info("Created new terminal session: %s (pid=%d)", terminal_id, pid)
-
-        # Parent process: bridge WebSocket <-> PTY
-        terminal_info = _terminal_sessions.get(terminal_id) if terminal_id else None
+            terminal_info = None
+        
+        if not terminal_info:
+            self._ws_send_frame(sock, '{"error": "Failed to create terminal"}')
+            return
+        
+        master_fd = terminal_info.get("master_fd")
+        
+        # Attach socket to terminal
+        with _terminal_sessions_lock:
+            terminal_info["active"] = False  # Signal old read_pty to stop
+            terminal_info["sock"] = sock
+            terminal_info["disconnected_at"] = None
+        
+        time.sleep(0.1)
+        
+        with _terminal_sessions_lock:
+            terminal_info["active"] = True
+        
+        # Resize PTY to match the client's terminal dimensions on reconnect
+        if master_fd and initial_cols and initial_rows:
+            try:
+                winsize = struct.pack("HHHH", initial_rows, initial_cols, 0, 0)
+                fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsize)
+            except Exception:
+                pass
+        
+        # Send terminal_id to client
+        if terminal_id:
+            self._ws_send_frame(sock, json.dumps({"__terminal_id": terminal_id}))
         
         def read_pty():
             """Read from PTY and send to WebSocket."""
-            while True:
-                # Check if this connection is still active (only if tracking session)
-                if terminal_info:
-                    if not terminal_info.get("active", True):
-                        break
-                        
+            while terminal_info.get("active", True):
                 try:
-                    data = os.read(master_fd, 1024)
-                    if not data:
-                        break
-                    data = data.decode("utf-8", errors="replace")
-                    if data:
-                        # Send to current socket if available
-                        current_sock = terminal_info.get("sock") if terminal_info else sock
-                        if current_sock:
-                            try:
-                                self._ws_send_frame(current_sock, data)
-                            except Exception:
-                                # Socket error, will retry on next data
-                                pass
-                        # Always write to output buffer for command execution
-                        if terminal_info and "buffer_lock" in terminal_info:
-                            with terminal_info["buffer_lock"]:
-                                terminal_info["output_buffer"].append(data)
-                    else:
-                        break
+                    ready, _, _ = select.select([master_fd], [], [], 0.1)
+                    if ready:
+                        data = os.read(master_fd, 1024)
+                        if not data:
+                            break
+                        data = data.decode("utf-8", errors="replace")
+                        if data:
+                            current_sock = terminal_info.get("sock")
+                            if current_sock:
+                                try:
+                                    self._ws_send_frame(current_sock, data)
+                                except Exception:
+                                    pass
+                            if "buffer_lock" in terminal_info:
+                                with terminal_info["buffer_lock"]:
+                                    terminal_info["output_buffer"].append(data)
                 except OSError:
                     break
 

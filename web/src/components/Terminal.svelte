@@ -18,7 +18,15 @@
 
   function getWsUrl(sid) {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    return `${proto}//${location.host}/ws?terminal_id=${sid}`;
+    // Pass current terminal dimensions so the backend can create the PTY
+    // with the correct size from the start (avoids initial layout glitches).
+    let url = `${proto}//${location.host}/ws?terminal_id=${sid}`;
+    if (term && fitAddon) {
+      try {
+        url += `&cols=${term.cols}&rows=${term.rows}`;
+      } catch {}
+    }
+    return url;
   }
 
   function connect() {
@@ -35,7 +43,12 @@
       loading = false;
       connected = true;
       notifyStatus();
-      setTimeout(() => fitAddon?.fit(), 100);
+      // Fit immediately and send resize so the backend PTY matches
+      // the frontend terminal size before any shell output arrives.
+      try {
+        fitAddon?.fit();
+      } catch {}
+      if (term) handleResize({ cols: term.cols, rows: term.rows });
     };
 
     ws.onmessage = (evt) => {

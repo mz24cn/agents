@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import datetime
 import hashlib
+import locale
 import json
 import os
 import re
@@ -806,3 +807,20 @@ def kill_process_group(proc: subprocess.Popen) -> None:
             except (ProcessLookupError, OSError):
                 pass
     proc.kill()
+
+
+def get_system_encoding() -> str:
+    """Get the preferred system encoding for subprocess output.
+
+    Returns the system's preferred encoding for text I/O, with fallback to utf-8.
+    On Windows this is typically the OEM codepage (e.g. cp936/GBK for Chinese locales),
+    which matches what cmd.exe and PowerShell emit by default.
+    """
+    encoding = locale.getpreferredencoding(False)
+    if encoding:
+        return encoding
+    return "utf-8"
+
+
+# Resolve once at module load time so every subprocess call uses the same codec.
+SYSTEM_ENCODING: str = get_system_encoding()
