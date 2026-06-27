@@ -122,6 +122,11 @@
     if (sid === sessionId) {
       terminalVisible = false
     }
+    // Clear terminalOpen to prevent the effect from re-creating this terminal
+    if (terminalOpen.sessionId === sid) {
+      terminalOpen.sessionId = null
+      terminalOpen.token = 0
+    }
   }
 
   function handleTerminalStatusChange(sid, status) {
@@ -906,6 +911,10 @@
     if (deletedSid) {
       sessionDeleted.sessionId = null
       delete sessionStore[deletedSid]
+      // Clean up terminal for deleted session
+      if (terminals.has(deletedSid)) {
+        destroyTerminal(deletedSid)
+      }
       errorMsg = ''
       sessionId = null
       shouldScrollToBottom = false

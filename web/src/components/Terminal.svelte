@@ -4,14 +4,14 @@
   import { FitAddon } from '@xterm/addon-fit';
   import '@xterm/xterm/css/xterm.css';
 
-  let { sessionId, visible = true, onStatusChange = null, onDestroyRequest = null } = $props();
+  let { sessionId, visible = true, onStatusChange = null } = $props();
 
   let termEl;
   let term;
   let fitAddon;
   let ws;
-  let connected = $state(false);
-  let loading = $state(false);
+  let connected = false;  // Not reactive - only used in notifyStatus()
+  let loading = false;    // Not reactive - only used in notifyStatus()
   let resizeObserver;
   let retryTimeout;
   let destroyed = false;  // Flag to prevent reconnection after explicit destroy
@@ -22,6 +22,7 @@
   }
 
   function connect() {
+    if (destroyed) return;
     if (ws) { try { ws.close(); } catch {} }
     loading = true;
     connected = false;
@@ -76,11 +77,6 @@
 
   function doFit() {
     try { if (term && termEl?.offsetParent) fitAddon?.fit(); } catch {}
-  }
-
-  export function reconnect() {
-    clearTimeout(retryTimeout);
-    connect();
   }
 
   export function destroy() {
