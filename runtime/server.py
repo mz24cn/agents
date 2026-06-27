@@ -820,7 +820,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         else:
             self._start_pty_session_unix(sock, terminal_id)
 
-    def _start_pty_session_win32(self, sock) -> None:
+    def _start_pty_session_win32(self, sock, terminal_id: Optional[str] = None) -> None:
         """Windows PTY session using winpty."""
         if PtyProcess is None:
             self._ws_send_frame(sock, '{"error": "winpty not available"}')

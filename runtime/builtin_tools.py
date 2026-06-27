@@ -288,7 +288,7 @@ CLI_TOOL_CONFIG = ToolConfig(
     tool_id="exec_cli",
     tool_type="function",
     name="exec_cli",
-    description="Execute a command via CLI.",
+    description="Execute a command via CLI. Commands are executed in a persistent terminal session (same shell environment is reused across calls).",
     parameters={
         "type": "object",
         "properties": {
