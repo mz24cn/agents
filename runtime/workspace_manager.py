@@ -36,7 +36,7 @@ _TEXT_EXTENSIONS: set[str] = {
     ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".log",
     ".sh", ".bash", ".zsh", ".fish", ".ps1", ".bat", ".cmd", ".sql",
     ".xml", ".svg", ".csv", ".tsv", ".env", ".gitignore", ".dockerignore",
-    ".editorconfig", ".prettierrc", ".eslintrc", ".babelrc",
+    ".editorconfig", ".prettierrc", ".eslintrc", ".babelrc", ".cs", ".csharp",
 }
 
 _TEXT_MIME_PREFIXES = ("text/",)
