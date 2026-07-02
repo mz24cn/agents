@@ -23,6 +23,19 @@ _logger = logging.getLogger("runtime.runtime")
 # first response bytes, and each subsequent read on streaming responses.
 _MODEL_API_TIMEOUT = int(os.environ.get("MODEL_API_TIMEOUT", "600"))
 
+# Default User-Agent for outbound model API requests.
+# urllib.request auto-fills "Python-urllib/3.x" when no UA is set, and many
+# Cloudflare-fronted LLM gateways (e.g. those using Bot Fight Mode or WAF
+# custom rules) block that UA string with HTTP 403 / error code: 1010.
+# Injecting a generic browser-style UA here keeps all protocols (OpenAI,
+# Ollama, Anthropic, ...) compatible with such gateways without requiring
+# each protocol adapter to set its own UA. Protocol-level User-Agent
+# values, if any, take precedence (see setdefault below).
+_DEFAULT_USER_AGENT = os.environ.get(
+    "AGENT_SERVICE_USER_AGENT",
+    "Mozilla/5.0 (compatible; AgentService/1.0)",
+)
+
 from runtime.models import (
     InferenceRequest,
     InferenceResult,
@@ -254,6 +267,7 @@ class Runtime:
             # Send HTTP request
             round_start = time.monotonic()
             try:
+                headers.setdefault("User-Agent", _DEFAULT_USER_AGENT)
                 http_req = urllib.request.Request(
                     url, data=body_bytes, headers=headers, method="POST"
                 )
@@ -884,6 +898,7 @@ class Runtime:
 
             round_start = time.monotonic()
             try:
+                headers.setdefault("User-Agent", _DEFAULT_USER_AGENT)
                 http_req = urllib.request.Request(
                     url, data=body_bytes, headers=headers, method="POST")
                 http_resp = urllib.request.urlopen(http_req, timeout=_MODEL_API_TIMEOUT)

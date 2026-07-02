@@ -2443,13 +2443,14 @@ def _exec_shell(command: str, timeout: Optional[int] = None, background: bool = 
 
 
 # Task 10.2 — Register exec_shell tool
-EXECUTE_COMMAND_TOOL_CONFIG = ToolConfig(
+EXEC_SHELL_TOOL_CONFIG = ToolConfig(
     tool_id="exec_shell",
     tool_type="function",
     name="exec_shell",
     description=(
-        "Execute a shell command in the workspace directory. "
-        "Runs in non-interactive mode (TERM=dumb). "
+        "Execute a "
+        + ("Windows cmd shell " if sys.platform == "win32" else "")
+        + "command in the workspace directory. Runs in non-interactive mode (TERM=dumb). "
     ),
     parameters={
         "type": "object",
@@ -2470,13 +2471,13 @@ EXECUTE_COMMAND_TOOL_CONFIG = ToolConfig(
 
 # Add background parameter only on Windows
 if sys.platform == "win32":
-    EXECUTE_COMMAND_TOOL_CONFIG.parameters["properties"]["background"] = {
+    EXEC_SHELL_TOOL_CONFIG.parameters["properties"]["background"] = {
         "type": "boolean",
         "description": "Run command in background mode.",
         "default": False,
     }
 
-BUILTIN_TOOLS.append((EXECUTE_COMMAND_TOOL_CONFIG, _exec_shell))
+BUILTIN_TOOLS.append((EXEC_SHELL_TOOL_CONFIG, _exec_shell))
 
 
 # ---------------------------------------------------------------------------
