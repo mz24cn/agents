@@ -629,6 +629,21 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
     # Helpers
     # ------------------------------------------------------------------
 
+    def _content_disposition(self, disposition: str, filename: str) -> str:
+        """Build a Content-Disposition header that supports non-ASCII filenames.
+
+        ``BaseHTTPRequestHandler.send_header`` encodes header values as latin-1.
+        Raw Chinese (or other non-latin-1) characters in ``filename=`` therefore
+        raise UnicodeEncodeError. RFC 5987/6266 allows UTF-8 names through the
+        ASCII-only ``filename*`` parameter, while ``filename`` remains a safe
+        fallback for older clients.
+        """
+        safe_disposition = re.sub(r"[^A-Za-z]", "", disposition) or "attachment"
+        fallback = filename.encode("ascii", "ignore").decode("ascii").strip() or "download"
+        fallback = fallback.replace('\\', '_').replace('"', '_').replace('\r', '_').replace('\n', '_')
+        encoded = urllib.parse.quote(filename, safe="")
+        return f'{safe_disposition}; filename="{fallback}"; filename*=UTF-8\'\'{encoded}'
+
     def _read_json_body(self) -> Optional[dict]:
         """Read and parse JSON from the request body.
 
@@ -1542,7 +1557,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             
             self.send_response(200)
             self.send_header('Content-Type', content_type)
-            self.send_header('Content-Disposition', f'attachment; filename="{file_name}"')
+            self.send_header('Content-Disposition', self._content_disposition('attachment', file_name))
             self.send_header('Content-Length', str(len(content)))
             self.end_headers()
             self.wfile.write(content)

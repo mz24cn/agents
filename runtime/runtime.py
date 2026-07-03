@@ -579,12 +579,12 @@ class Runtime:
         tools that share the same tool_id (e.g. a user-registered fetch tool).
         """
         from runtime.builtin_tools import (
-            WRITE_FILE_TOOL_CONFIG, EXECUTE_COMMAND_TOOL_CONFIG,
+            WRITE_FILE_TOOL_CONFIG, EXEC_SHELL_TOOL_CONFIG,
             _write_file, _exec_shell,
         )
         skill_builtin_tools = [
             (WRITE_FILE_TOOL_CONFIG, _write_file),
-            (EXECUTE_COMMAND_TOOL_CONFIG, _exec_shell),
+            (EXEC_SHELL_TOOL_CONFIG, _exec_shell),
         ]
         for bt_config, bt_fn in skill_builtin_tools:
             # Only register if no callable exists yet for this tool_id
