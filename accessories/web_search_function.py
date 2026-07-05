@@ -5,13 +5,14 @@
 演示：
   1. 将 SearXNG 搜索封装为 Function Tool 注册到 ToolRegistry
   2. 大模型根据用户问题自动调用搜索工具
-  3. 搜索结果回传给大模型，大模型整理后回复
+  3. 支持按 SearXNG 分类搜索，如 general、images、videos、news、map、music、it、science、files、social media
+  4. 搜索结果回传给大模型，大模型整理后回复
 
 用法：
-  python examples/example_function_register.py [搜索问题]
+  python accessories/web_search_function.py [搜索问题]
 
 示例：
-  python examples/example_function_register.py "Python 3.13 有什么新特性"
+  python accessories/web_search_function.py "Python 3.13 有什么新特性"
 
 前置条件：
   - Ollama 服务运行在 localhost:11434，已拉取 qwen3:14b
@@ -38,25 +39,64 @@ from runtime import (
 )
 
 SEARXNG_URL = os.environ.get("SEARXNG_URL", "http://pi:8080")
+SEARCH_TYPES = {
+    "general",
+    "images",
+    "videos",
+    "news",
+    "map",
+    "music",
+    "it",
+    "science",
+    "files",
+    "social media",
+}
 
+# Function Tool JSON Schema：
+WEB_SEARCH_TOOL_CONFIG = {
+  "type": "object",
+  "properties": {
+    "query": {
+      "type": "string",
+      "description": "搜索关键词"
+    },
+    "num_results": {
+      "type": "integer",
+      "description": "返回结果数量，默认10"
+    },
+    "search_type": {
+      "type": "string",
+      "description": "搜索类型/SearXNG 分类，默认general。可选：general、images、videos、news、map、music、it、science、files、social media"
+    }
+  },
+  "required": [
+    "query"
+  ]
+}
 
-def searxng_search(query: str, num_results: int = 5) -> str:
+def searxng_search(query: str, num_results: int = 10, search_type: str = "general") -> str:
     """通过 SearXNG 执行互联网搜索。
 
     Args:
         query: 搜索关键词。
-        num_results: 返回结果数量，默认 5。
+        num_results: 返回结果数量，默认 10。
+        search_type: 搜索类型/SearXNG 分类，默认 general。
     """
+    search_type = (search_type or "general").strip().lower()
+    if search_type not in SEARCH_TYPES:
+        return f"搜索失败: 不支持的搜索类型 {search_type!r}。可选：{', '.join(sorted(SEARCH_TYPES))}"
+
     params = urllib.parse.urlencode({
         "q": query,
         "format": "json",
         "language": "zh-CN",
+        "categories": search_type,
     })
     url = f"{SEARXNG_URL}/search?{params}"
 
     try:
         req = urllib.request.Request(url)
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=45) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         return f"搜索失败: HTTP {e.code}"
@@ -69,14 +109,21 @@ def searxng_search(query: str, num_results: int = 5) -> str:
     if not results:
         return "未找到相关结果。"
 
-    lines = [f"共找到约 {data.get('number_of_results', '?')} 条结果，展示前 {len(results)} 条：\n"]
+    number_of_results = data.get("number_of_results")
+    if isinstance(number_of_results, int) and number_of_results >= len(results):
+        result_summary = f"共找到约 {number_of_results} 条结果，展示前 {len(results)} 条：\n"
+    else:
+        result_summary = f"本次返回 {len(data.get('results', []))} 条结果，展示前 {len(results)} 条：\n"
+
+    lines = [f"搜索类型：{search_type}", result_summary]
     for i, r in enumerate(results, 1):
         title = r.get("title", "(无标题)")
-        url = r.get("url", "")
+        url = r.get("img_src") or r.get("thumbnail_src") or r.get("url", "")
         content = r.get("content", "").strip()
         engine = r.get("engine", "")
         lines.append(f"{i}. {title}")
-        lines.append(f"   链接: {url}")
+        if url:
+            lines.append(f"   链接: {url}")
         if content:
             lines.append(f"   摘要: {content[:200]}")
         if engine:
@@ -127,21 +174,8 @@ def main():
             tool_id="web_search",
             tool_type="function",
             name="web_search",
-            description="通过互联网搜索引擎搜索信息。当需要查询实时信息、最新新闻、技术文档等时使用。",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "搜索关键词",
-                    },
-                    "num_results": {
-                        "type": "integer",
-                        "description": "返回结果数量，默认5",
-                    },
-                },
-                "required": ["query"],
-            },
+            description="通过互联网搜索引擎搜索信息。需要查询实时信息、最新新闻、图片、视频、技术文档等时使用。",
+            parameters=WEB_SEARCH_TOOL_CONFIG,
         ),
         callable_fn=searxng_search,
     )
@@ -163,7 +197,8 @@ def main():
         messages=[
             Message(role="system", content=(
                 "你是一个智能助手，可以通过搜索引擎获取最新信息。"
-                "当用户提问需要实时数据或你不确定的内容时，请使用 web_search 工具搜索。"
+                "当用户提问需要实时数据、图片、视频、新闻或你不确定的内容时，请使用 web_search 工具搜索。"
+                "可根据问题选择 search_type，例如图片用 images，新闻用 news，视频用 videos。"
                 "搜索后请用中文整理结果，给出清晰的回答。"
             )),
             Message(role="user", content=query),

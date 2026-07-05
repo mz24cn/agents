@@ -115,39 +115,48 @@ def _get_file_journal_manager(workspace: str) -> '_FileJournalManager':
     return journal_manager
 
 
-def _exec_cli(command: str, cwd: str = "") -> str:
-    """Execute a command via exec_cli (terminal session if available, otherwise via subprocess).
-    
-    Flow:
-    1. Get or create a terminal session for the current session_id
-    2. Execute command in that terminal via execute_command_in_terminal
-    3. If any step fails, fall back to subprocess.run (platform-independent)
+def _exec_cli(
+    command: str,
+    cwd: str = "",
+    prompt_pattern: str = "",
+    idle_timeout: int = 1000,
+    read_after_delay: int = 0,
+) -> str:
+    """Execute input via a persistent CLI terminal and return observed screen output.
 
-    Args:
-        command: The command to execute via exec_cli.
-        cwd: Working directory for the command. Empty string means current dir.
+    Completion is driven by provided parameters:
+    - prompt_pattern: regex that completes when it matches visible output.
+    - idle_timeout: milliseconds of no new output before returning.
+    - read_after_delay: milliseconds to read before returning regardless of output.
+
+    An empty command reads the latest terminal progress without sending input.
+    timeout is intentionally not a tool parameter; CLI_EXEC_TIMEOUT is the
+    hard safety cap for all completion conditions.
     """
     timeout = int(os.environ.get("CLI_EXEC_TIMEOUT", 300))
-    
-    # Step 1: Try to get or create terminal session
     session_id = get_request_context("session_id")
     if session_id:
         try:
             from runtime.server import get_or_create_terminal
             terminal_info = get_or_create_terminal(session_id)
-            
             if terminal_info:
-                # Step 2: Execute in terminal
-                if cwd:
+                if cwd and command:
                     command = f"cd {shlex.quote(cwd)} && {command}"
-                result = execute_command_in_terminal(session_id, command, timeout=timeout)
+                result = execute_command_in_terminal(
+                    session_id,
+                    command,
+                    timeout=timeout,
+                    prompt_pattern=prompt_pattern,
+                    idle_timeout=idle_timeout,
+                    read_after_delay=read_after_delay,
+                )
                 if not result.startswith("Error:"):
                     return result
                 logger.debug("Terminal execution returned error, falling back to subprocess: %s", result)
         except Exception as e:
             logger.debug("Terminal execution failed, falling back to subprocess: %s", e)
-    
-    # Step 3: Fallback to subprocess.run (platform-independent)
+
+    # Fallback for contexts without a terminal session.
     try:
         result = subprocess.run(
             command, shell=True, capture_output=True, text=True,
@@ -155,9 +164,9 @@ def _exec_cli(command: str, cwd: str = "") -> str:
             timeout=timeout, cwd=cwd if cwd else None,
         )
         output = (result.stdout or "").strip()
-        if result.returncode != 0:
-            err = (result.stderr or "").strip()
-            return f"Exit code {result.returncode}\nstderr: {err}\nstdout: {output}"
+        err = (result.stderr or "").strip()
+        if err:
+            return (output + "\n" + err).strip()
         return output if output else "(empty output)"
     except subprocess.TimeoutExpired:
         return f"Error: command timed out after {timeout}s"
@@ -208,17 +217,33 @@ CLI_TOOL_CONFIG = ToolConfig(
     tool_id="exec_cli",
     tool_type="function",
     name="exec_cli",
-    description="Execute a command via CLI. Commands are executed in a persistent terminal session (same shell environment is reused across calls).",
+    description=(
+        "Execute input in a persistent terminal session and return observed screen output. "
+        "Completion is driven by prompt_pattern, idle_timeout, and read_after_delay; "
+        "the first satisfied condition returns. Time values are in milliseconds."
+    ),
     parameters={
         "type": "object",
         "properties": {
             "command": {
                 "type": "string",
-                "description": "The command to execute via exec_cli",
+                "description": "The command or terminal input to send via exec_cli. Empty string only reads the latest terminal progress without sending input.",
             },
             "cwd": {
                 "type": "string",
-                "description": "Working directory for the command (optional)",
+                "description": "Working directory for the command (optional, shell commands only)",
+            },
+            "prompt_pattern": {
+                "type": "string",
+                "description": "Regex that completes output collection when it matches visible terminal output.",
+            },
+            "idle_timeout": {
+                "type": "integer",
+                "description": "Milliseconds of no new output before returning (default 1000). Set to 0 to disable idle completion.",
+            },
+            "read_after_delay": {
+                "type": "integer",
+                "description": "Milliseconds to read before returning regardless of output (default 0; disabled).",
             },
         },
         "required": ["command"],
@@ -2122,147 +2147,121 @@ BUILTIN_TOOLS.append((SEARCH_CODE_TOOL_CONFIG, _search_code))
 # ---------------------------------------------------------------------------
 # Helper functions for terminal-based command execution
 # ---------------------------------------------------------------------------
-def execute_command_in_terminal(session_id: str, command: str, timeout: int = 300) -> str:
-    """Execute a command in the terminal session for the given session_id.
-    
-    This sends the command to the terminal's PTY and collects the output
-    from the shared output buffer (written by the read_pty thread).
-    
-    Args:
-        session_id: The inference session ID
-        command: The shell command to execute
-        timeout: Maximum time to wait for command completion (seconds)
-    
-    Returns:
-        The command output as a string
-    """
+def _drain_terminal_buffer(terminal_info: dict) -> str:
+    with terminal_info["buffer_lock"]:
+        if not terminal_info["output_buffer"]:
+            return ""
+        chunk = "".join(terminal_info["output_buffer"])
+        terminal_info["output_buffer"].clear()
+        return chunk
+
+
+def _strip_terminal_noise(text: str, command: str) -> str:
+    """Clean terminal control noise while preserving human-visible output."""
+    text = re.sub(r'\x1b\].*?(?:\x07|\x1b\\)', '', text)
+    text = re.sub(r'\x1b\[[0-9;?]*[ -/]*[@-~]', '', text)
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text)
+    text = re.sub(r'\[\?[0-9;]*[a-z]', '', text)
+
+    cmd = command.strip()
+    if cmd and text.startswith(cmd):
+        text = text[len(cmd):].lstrip('\r\n')
+    return text.strip()
+
+
+def execute_command_in_terminal(
+    session_id: str,
+    command: str,
+    timeout: int = 300,
+    prompt_pattern: str = "",
+    idle_timeout: int = 1000,
+    read_after_delay: int = 0,
+) -> str:
+    """Send optional input to a terminal and collect screen output."""
     from runtime.server import get_terminal_for_session
-    
+
     terminal_info = get_terminal_for_session(session_id)
     if not terminal_info:
         return "Error: No terminal session available for this session"
-    
-    # Get the appropriate method to write to terminal
+
     if sys.platform == "win32":
-        # Windows: use proc.write()
         proc = terminal_info.get("proc")
         if not proc:
             return "Error: Terminal session has no proc"
         write_method = lambda cmd: proc.write(f"{cmd}\r\n")
     else:
-        # Unix: use master_fd
         master_fd = terminal_info.get("master_fd")
         if not master_fd:
             return "Error: Terminal session has no master_fd"
         write_method = lambda cmd: os.write(master_fd, f"{cmd}\n".encode("utf-8"))
-    
-    # Clear the output buffer before sending command
-    with terminal_info["buffer_lock"]:
-        terminal_info["output_buffer"].clear()
-    
+
+    try:
+        idle_timeout_value = int(idle_timeout or 0)
+    except (TypeError, ValueError):
+        idle_timeout_value = 1000
+    try:
+        read_after_delay_value = int(read_after_delay or 0)
+    except (TypeError, ValueError):
+        read_after_delay_value = 0
+
+    raw_enabled = read_after_delay_value > 0
+    prompt_enabled = bool(prompt_pattern)
+    idle_enabled = idle_timeout_value > 0
+
+    if not raw_enabled and not prompt_enabled and not idle_enabled:
+        idle_enabled = True
+        idle_timeout_value = 1000
+
+    idle_timeout_seconds = max(0.1, idle_timeout_value / 1000.0)
+    read_after_delay_seconds = max(0.0, read_after_delay_value / 1000.0)
+    check_interval = float(os.environ.get("OUTPUT_CHECK_INTERVAL", "0.05"))
+    deadline = time.monotonic() + timeout
+
     if command:
+        with terminal_info["buffer_lock"]:
+            terminal_info["output_buffer"].clear()
+
         try:
             write_method(command)
         except Exception as e:
             return f"Error writing to terminal: {e}"
-    
-    # Get check interval from environment variable
-    check_interval = float(os.environ.get("OUTPUT_CHECK_INTERVAL", "0.05"))
-    
-    # Get output over pattern from environment variable
-    output_over_pattern = os.environ.get("OUTPUT_OVER_PATTERN", "")
-    compiled_pattern = None
-    if output_over_pattern:
+
+    collected = ""
+    last_output_at = time.monotonic()
+    start = last_output_at
+    compiled_prompt = None
+    if prompt_enabled:
         try:
-            compiled_pattern = re.compile(output_over_pattern)
-        except re.error:
-            compiled_pattern = None
-    
-    # Collect output from buffer until stable or timeout
-    collected_output = ""
-    prev_output = ""
-    has_output = False
-    deadline = time.monotonic() + timeout
-    
-    logger.debug("execute_command_in_terminal: waiting for output, terminal_info=%s", 
-                 {k: v for k, v in terminal_info.items() if k != "buffer_lock"})
-    
+            compiled_prompt = re.compile(prompt_pattern, re.MULTILINE)
+        except re.error as exc:
+            return f"Error: invalid prompt_pattern: {exc}"
+
     while time.monotonic() < deadline:
-        # Read from buffer
-        with terminal_info["buffer_lock"]:
-            if terminal_info["output_buffer"]:
-                chunk = "".join(terminal_info["output_buffer"])
-                terminal_info["output_buffer"].clear()
-                collected_output += chunk
-        
-        # Track if we've received any output
-        if collected_output:
-            has_output = True
-        
-        # Check stability: if we have output and it hasn't changed
-        if has_output and collected_output == prev_output:
+        chunk = _drain_terminal_buffer(terminal_info)
+        now = time.monotonic()
+        if chunk:
+            collected += chunk
+            last_output_at = now
+
+        if raw_enabled and now - start >= read_after_delay_seconds:
             break
-        
-        prev_output = collected_output
+
+        if compiled_prompt:
+            visible = _strip_terminal_noise(collected, command)
+            if compiled_prompt.search(visible):
+                break
+
+        if idle_enabled and (collected or not command) and now - last_output_at >= idle_timeout_seconds:
+            break
+
         time.sleep(check_interval)
-    
-    logger.debug("execute_command_in_terminal: output collected, has_output=%s, len=%d", 
-                 has_output, len(collected_output))
-    
-    # Process output
-    result = collected_output
-    
-    # Apply OUTPUT_OVER_PATTERN: match last two lines and truncate
-    if compiled_pattern and result:
-        # Find last two lines using rfind for \n
-        first_newline = result.rfind('\n')
-        if first_newline > 0:
-            second_newline = result.rfind('\n', 0, first_newline)
-            if second_newline >= 0:
-                # Two or more lines: take from second newline to end
-                last_two_lines = result[second_newline:]
-            else:
-                # Only one line: take the whole thing after first newline
-                last_two_lines = result[first_newline:]
-        else:
-            # No newline: use entire result
-            last_two_lines = result
-        
-        # Try to match the pattern
-        match = compiled_pattern.search(last_two_lines)
-        if match:
-            # Find where this match starts in the original result
-            match_start_in_tail = match.start()
-            # Calculate absolute position in result
-            if first_newline > 0:
-                if second_newline >= 0:
-                    absolute_start = second_newline + match_start_in_tail
-                else:
-                    absolute_start = first_newline + match_start_in_tail
-            else:
-                absolute_start = match_start_in_tail
-            
-            # Truncate: keep everything before the match
-            result = result[:absolute_start]
-    
-    # Remove ANSI escape sequences
-    ansi_escape = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07|\x1b\[.*?[~hlr]|[\x00-\x08\x0b\x0c\x0e-\x1f]')
-    result = ansi_escape.sub('', result)
-    result = re.sub(r'\[\?[0-9;]*[a-z]', '', result)
-    
-    # Remove command echo from beginning if present (last step)
-    cmd = command.strip()
-    if result[:len(cmd)] == cmd:
-        # Remove the command line (first line)
-        result = result[len(cmd):].lstrip('\n')
-    
-    if not result.strip():
-        if has_output:
-            return "(empty output)"
-        else:
-            return f"Error: command timed out after {timeout}s (no output received)"
-    
-    return result.strip()
+
+    if time.monotonic() >= deadline:
+        suffix = "" if collected else " (no output received)"
+        return f"Error: command timed out after {timeout}s{suffix}"
+
+    result = _strip_terminal_noise(collected, command)
+    return result if result else "(empty output)"
 
 
 # ---------------------------------------------------------------------------

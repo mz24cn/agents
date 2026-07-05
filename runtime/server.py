@@ -395,6 +395,7 @@ def get_or_create_terminal(session_id: str, cols: int = 80, rows: int = 24) -> O
                     "disconnected_at": None,
                     "output_buffer": [],
                     "buffer_lock": threading.Lock(),
+                    "shell_kind": "powershell",
                 }
             
             # Start background thread to drain PTY output into buffer
@@ -425,12 +426,12 @@ def get_or_create_terminal(session_id: str, cols: int = 80, rows: int = 24) -> O
             return None
     else:
         try:
+            shell = os.environ.get("SHELL", "/bin/bash")
             pid, master_fd = pty.fork()
             if pid == 0:
                 # Child process: start shell
                 env = os.environ.copy()
                 env["TERM"] = "xterm-256color"
-                shell = os.environ.get("SHELL", "/bin/bash")
                 os.execvpe(shell, [shell], env)
             
             # Set initial window size for the PTY
@@ -450,6 +451,7 @@ def get_or_create_terminal(session_id: str, cols: int = 80, rows: int = 24) -> O
                     "disconnected_at": None,
                     "output_buffer": [],
                     "buffer_lock": threading.Lock(),
+                    "shell_kind": os.path.basename(shell or "/bin/bash"),
                 }
             
             # Start background thread to drain PTY output into buffer

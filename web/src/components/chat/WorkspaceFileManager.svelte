@@ -745,7 +745,8 @@
   // 批量删除
   async function deleteSelectedFiles() {
     const files = getSelectedFiles()
-    if (!confirm(t('confirmDeleteFile') + ` (${files.length} ${t('files')})`)) return
+    const names = files.map(f => f.name).join(', ')
+    if (!confirm(`${t('confirmDeleteFile')} (${files.length} ${t('files')}: ${names})`)) return
     for (const file of files) {
       try {
         await workspaceApi.delete(file.path)
@@ -819,7 +820,7 @@
 
   // 删除文件
   async function deleteFile(file) {
-    if (!confirm(t('confirmDeleteFile'))) return
+    if (!confirm(t('confirmDeleteNamedFile').replace('{name}', file.name))) return
     
     try {
       await workspaceApi.delete(file.path)
@@ -1298,6 +1299,26 @@
     }
   }
 
+  function getTreeIcon(node) {
+    if (node.symlink_target) return '🔗'
+    return node.depth === 0 ? '💾' : '📁'
+  }
+
+  function getTreeIconLabel(node) {
+    if (node.symlink_target) return `${t('linkTarget')}: ${node.symlink_target}`
+    return node.depth === 0 ? t('rootDirectory') : t('directory')
+  }
+
+  function getFileSecondaryText(file) {
+    if (file.symlink_target) return file.symlink_target
+    return file.is_dir ? '' : formatSize(file.size)
+  }
+
+  function getFileSecondaryTitle(file) {
+    if (file.symlink_target) return `${t('linkTarget')}: ${file.symlink_target}`
+    return ''
+  }
+
   // 双击文件处理
   function handleDoubleClick(file) {
     if (file.is_dir) {
@@ -1309,6 +1330,7 @@
 
   // 获取文件图标
   function getFileIcon(file) {
+    if (file.symlink_target) return '🔗'
     if (file.is_dir) return '📁'
     if (file.is_image) return '🖼️'
     if (file.is_audio) return '🎵'
@@ -1493,9 +1515,9 @@
                   ondrag={handleFileDrag}
                   ondragend={handleFileDragEnd}
                 >
-                  <span class="file-icon">{getFileIcon(file)}</span>
+                  <span class="file-icon" role="img" aria-label={file.symlink_target ? getFileSecondaryTitle(file) : undefined} title={file.symlink_target ? getFileSecondaryTitle(file) : undefined}>{getFileIcon(file)}</span>
                   <span class="file-name">{file.name}</span>
-                  <span class="file-size">{file.is_dir ? '' : formatSize(file.size)}</span>
+                  <span class="file-size" title={getFileSecondaryTitle(file)}>{getFileSecondaryText(file)}</span>
                   <span class="file-date">{formatFileTime(file.modified)}</span>
                 </button>
               {/each}
@@ -1524,7 +1546,7 @@
                     {/if}
                     <div class="grid-info">
                       <span class="grid-name">{file.name}</span>
-                      <span class="grid-size">{file.is_dir ? '' : formatSize(file.size)}</span>
+                      <span class="grid-size" title={getFileSecondaryTitle(file)}>{getFileSecondaryText(file)}</span>
                     </div>
                   </button>
                 {/each}
@@ -1571,7 +1593,7 @@
                 ondblclick={() => setAsWorkspace(node.path)}
                 title={node.path}
               >
-                <span class="tree-icon">{node.depth === 0 ? '💾' : '📁'}</span>
+                <span class="tree-icon" role="img" aria-label={getTreeIconLabel(node)} title={getTreeIconLabel(node)}>{getTreeIcon(node)}</span>
                 <span class="tree-name">{node.name}</span>
                 {#if node.isWorkspace}
                   <span class="ws-tag">{t('currentWorkspace')}</span>
@@ -2012,6 +2034,10 @@
     color: var(--text-secondary);
     flex-shrink: 0;
     min-width: 60px;
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     text-align: right;
   }
 
@@ -2081,8 +2107,12 @@
   }
 
   .grid-size {
+    display: block;
     font-size: 0.7rem;
     color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .tree-container {

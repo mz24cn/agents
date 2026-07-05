@@ -361,7 +361,7 @@ Features:
 
 | File | Description |
 |------|-------------|
-| `examples/example_function_register.py` | Register a SearXNG search as a Function Tool; the LLM automatically calls it to answer queries |
+| `accessories/web_search_function.py` | Register a SearXNG search as a Function Tool; the LLM automatically calls it to answer queries |
 | `examples/example_mcp_ollama.py` | Connect Ollama (qwen3:14b) with MCP `time` and `fetch` servers; supports `--stream` flag |
 | `examples/example_mcp_openai.py` | Same as above but using the OpenAI-compatible protocol; easily switch to OpenAI, vLLM, LiteLLM, etc. |
 | `examples/example_skill.py` | Load a Skill from a directory and run streaming inference with progressive SKILL.md disclosure |
@@ -779,7 +779,7 @@ npm run build
 
 | 文件 | 说明 |
 |------|------|
-| `examples/example_function_register.py` | 将 SearXNG 搜索封装为 Function Tool，大模型自动调用搜索工具回答问题 |
+| `accessories/web_search_function.py` | 将 SearXNG 搜索封装为 Function Tool，大模型自动调用搜索工具回答问题 |
 | `examples/example_mcp_ollama.py` | Ollama（qwen3:14b）+ MCP `time`/`fetch` 工具，支持 `--stream` 流式输出 |
 | `examples/example_mcp_openai.py` | 同上，使用 OpenAI 兼容协议，可轻松切换 OpenAI、vLLM、LiteLLM 等服务 |
 | `examples/example_skill.py` | 从目录加载 Skill，流式推理演示 SKILL.md 渐进披露全流程 |
