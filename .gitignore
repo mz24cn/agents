@@ -57,6 +57,7 @@ Thumbs.db
 .idea/
 .claude/
 .kiro/
+.codebase-memory/
 
 # user data
 /chats

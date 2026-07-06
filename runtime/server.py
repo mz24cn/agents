@@ -1235,6 +1235,8 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self._handle_create_agent()
         elif path == "/v1/workspace/rename":
             self._handle_workspace_rename()
+        elif path == "/v1/workspace/mkdir":
+            self._handle_workspace_mkdir()
         elif path == "/v1/workspace/duplicate":
             self._handle_workspace_duplicate()
         elif path == "/v1/workspace/move":
@@ -3194,6 +3196,33 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             logger.error(f"Workspace rename error: {e}")
             self._send_json_error(500, "Internal server error")
 
+    def _handle_workspace_mkdir(self) -> None:
+        """POST /v1/workspace/mkdir — create a directory."""
+        try:
+            body = self._read_json_body()
+            if body is None:
+                return
+
+            parent_path = body.get('parent_path')
+            name = body.get('name')
+
+            if not parent_path:
+                self._send_json_error(400, "Missing 'parent_path' field")
+                return
+
+            if not name:
+                self._send_json_error(400, "Missing 'name' field")
+                return
+
+            workspace_mgr = self._get_workspace_manager()
+            result = workspace_mgr.create_directory(parent_path, name, restrict_workspace=True)
+            self._send_json_response(200, result)
+        except ValueError as e:
+            self._send_json_error(400, str(e))
+        except Exception as e:
+            logger.error(f"Workspace mkdir error: {e}")
+            self._send_json_error(500, "Internal server error")
+
     def _handle_workspace_duplicate(self) -> None:
         """POST /v1/workspace/duplicate — create a duplicate of a file."""
         try:
@@ -3338,6 +3367,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 body.get('target_path'),
                 parallel_size,
                 parallel_max_threads,
+                body.get('target_dir_path'),
             )
             task['workspace_id'] = body.get('workspace_id')
 

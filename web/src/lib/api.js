@@ -376,6 +376,7 @@ export const workspace = {
   download: (path, restrict = true) => `/v1/workspace/download?path=${encodeURIComponent(path)}&restrict=${restrict ? 1 : 0}`,
   thumbnail:(path, restrict = true) => `/v1/workspace/thumbnail?path=${encodeURIComponent(path)}&restrict=${restrict ? 1 : 0}`,
   rename:   (path, newName) => request('POST', '/v1/workspace/rename', { path, new_name: newName }),
+  mkdir:    (parentPath, name) => request('POST', '/v1/workspace/mkdir', { parent_path: parentPath, name }),
   duplicate:(path) => request('POST', '/v1/workspace/duplicate', { path }),
   delete:   (path) => request('DELETE', '/v1/workspace/delete', { path }),
   move:     (paths, destDir, overwrite = false) => request('POST', '/v1/workspace/move', { paths, dest_dir: destDir, overwrite }),

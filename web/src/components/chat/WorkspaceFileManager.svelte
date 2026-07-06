@@ -459,6 +459,18 @@
     loadFiles(currentPath)
   }
 
+  async function refreshTreeNodeChildren(dirPath) {
+    const idx = treeNodes.findIndex(n => pathsEqual(n.path, dirPath))
+    if (idx === -1 || !treeNodes[idx].expanded) return
+    try {
+      const children = await workspaceApi.children(dirPath)
+      insertChildren(idx, dirPath, children, workspacePath)
+      treeNodes = [...treeNodes]
+    } catch (err) {
+      console.error('Failed to refresh tree children:', err)
+    }
+  }
+
   function handleNameFilterInput(e) {
     nameFilterQuery = e.currentTarget.value
     writeLocalStorage(NAME_FILTER_STORAGE_KEY, nameFilterQuery)
@@ -1011,6 +1023,26 @@
     }
   }
 
+  function canWriteCurrentDirectory() {
+    return Boolean(currentPath && isInsideWorkspacePath(currentPath))
+  }
+
+  async function handleCreateFolder() {
+    if (!canWriteCurrentDirectory()) return
+    const targetDirPath = currentPath
+    const name = prompt(t('enterFolderName'), t('newFolderDefaultName'))?.trim()
+    if (!name) return
+
+    try {
+      await workspaceApi.mkdir(targetDirPath, name)
+      if (pathsEqual(currentPath, targetDirPath)) reloadCurrentDirectory()
+      await refreshTreeNodeChildren(targetDirPath)
+    } catch (err) {
+      console.error('Create folder error:', err)
+      error = err.message
+    }
+  }
+
   function normalizeUploadPath(path) {
     return String(path || '')
       .replace(/\\/g, '/')
@@ -1023,16 +1055,17 @@
     return parts.map(normalizeUploadPath).filter(Boolean).join('/')
   }
 
-  function currentRelativeDir() {
-    const normalizedCurrent = currentPath.replace(/\\/g, '/').replace(/\/$/, '')
+  function relativeDirForPath(dirPath) {
+    const normalizedCurrent = dirPath.replace(/\\/g, '/').replace(/\/$/, '')
     const normalizedWorkspace = workspacePath.replace(/\\/g, '/').replace(/\/$/, '')
     if (pathsEqual(normalizedCurrent, normalizedWorkspace)) return ''
-    if (!pathStartsWith(normalizedWorkspace, normalizedCurrent)) return ''
+    if (!pathStartsWith(normalizedWorkspace, normalizedCurrent)) return null
     return normalizeUploadPath(normalizedCurrent.slice(normalizedWorkspace.length + 1))
   }
 
-  function makeUploadEntries(files, useRelativePath = false) {
-    const baseDir = currentRelativeDir()
+  function makeUploadEntries(files, useRelativePath = false, targetDirPath = currentPath) {
+    const baseDir = relativeDirForPath(targetDirPath)
+    if (baseDir === null) return []
     return files.map((file) => {
       const relativeName = useRelativePath && file.webkitRelativePath ? file.webkitRelativePath : file.name
       return {
@@ -1042,14 +1075,15 @@
     }).filter((entry) => entry.targetPath)
   }
 
-  async function enqueueUploads(entries) {
-    if (!workspacePath) return
+  async function enqueueUploads(entries, targetDirPath = currentPath) {
+    if (!workspacePath || !isInsideWorkspacePath(targetDirPath)) return
     const tasks = entries.map((entry) => ({
       client_id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
       upload_id: null,
       file: entry.file,
       file_name: entry.file.name,
       file_size: entry.file.size,
+      target_dir_path: targetDirPath,
       target_path: entry.targetPath,
       chunks: [],
       status: 'queued',
@@ -1086,6 +1120,7 @@
         workspace_id: 'default',
         file_name: task.file_name,
         file_size: task.file_size,
+        target_dir_path: task.target_dir_path,
         target_path: task.target_path,
       })
       task.upload_id = init.upload_id
@@ -1114,7 +1149,8 @@
         chunk.status = 'completed'
       })
       refreshUploads()
-      loadFiles(currentPath)
+      if (pathsEqual(currentPath, task.target_dir_path)) loadFiles(currentPath)
+      await refreshTreeNodeChildren(task.target_dir_path)
     } catch (err) {
       if (err?.name === 'AbortError' || task.status === 'paused' || task.status === 'cancelled') return
       task.status = 'failed'
@@ -1191,7 +1227,8 @@
       await workspaceApi.uploadComplete(task.upload_id)
       task.status = 'completed'
       refreshUploads()
-      loadFiles(currentPath)
+      if (pathsEqual(currentPath, task.target_dir_path)) loadFiles(currentPath)
+      await refreshTreeNodeChildren(task.target_dir_path)
     } catch (err) {
       task.status = 'failed'
       task.error = err.message || String(err)
@@ -1247,22 +1284,28 @@
   }
 
   function handleUploadFile() {
+    if (!canWriteCurrentDirectory()) return
+    const targetDirPath = currentPath
     const input = document.createElement('input')
     input.type = 'file'
     input.multiple = true
-    input.onchange = (e) => enqueueUploads(makeUploadEntries(Array.from(e.target.files || [])))
+    input.onchange = (e) => enqueueUploads(makeUploadEntries(Array.from(e.target.files || []), false, targetDirPath), targetDirPath)
     input.click()
   }
 
   function handleUploadFolder() {
+    if (!canWriteCurrentDirectory()) return
+    const targetDirPath = currentPath
     const input = document.createElement('input')
     input.type = 'file'
     input.webkitdirectory = true
-    input.onchange = (e) => enqueueUploads(makeUploadEntries(Array.from(e.target.files || []), true))
+    input.onchange = (e) => enqueueUploads(makeUploadEntries(Array.from(e.target.files || []), true, targetDirPath), targetDirPath)
     input.click()
   }
 
   async function handlePasteUpload() {
+    if (!canWriteCurrentDirectory()) return
+    const targetDirPath = currentPath
     try {
       if (navigator.clipboard.read) {
         const clipboardItems = await navigator.clipboard.read()
@@ -1272,7 +1315,7 @@
               const blob = await item.getType(type)
               const ext = type.split('/')[1] || 'png'
               const file = new File([blob], `pasted-image-${Date.now()}.${ext}`, { type })
-              enqueueUploads(makeUploadEntries([file]))
+              enqueueUploads(makeUploadEntries([file], false, targetDirPath), targetDirPath)
               return
             }
           }
@@ -1284,7 +1327,7 @@
         return
       }
       const file = new File([text], `pasted-text-${Date.now()}.txt`, { type: 'text/plain' })
-      enqueueUploads(makeUploadEntries([file]))
+      enqueueUploads(makeUploadEntries([file], false, targetDirPath), targetDirPath)
     } catch (err) {
       error = `${t('clipboardUploadFailed')}: ${err.message || err}`
     }
@@ -1417,13 +1460,16 @@
         
         <!-- 上传按钮组 -->
         <div class="upload-group">
-          <button class="header-btn" onclick={handleUploadFile} title={t('uploadFile')}>
+          <button class="header-btn" onclick={handleCreateFolder} disabled={!canWriteCurrentDirectory()} title={t('newFolder')}>
+            📁+
+          </button>
+          <button class="header-btn" onclick={handleUploadFile} disabled={!canWriteCurrentDirectory()} title={t('uploadFile')}>
             📤
           </button>
-          <button class="header-btn" onclick={handleUploadFolder} title={t('uploadFolder')}>
+          <button class="header-btn" onclick={handleUploadFolder} disabled={!canWriteCurrentDirectory()} title={t('uploadFolder')}>
             📂
           </button>
-          <button class="header-btn" onclick={handlePasteUpload} title={t('pasteUpload')}>
+          <button class="header-btn" onclick={handlePasteUpload} disabled={!canWriteCurrentDirectory()} title={t('pasteUpload')}>
             📋
           </button>
         </div>
@@ -1786,10 +1832,16 @@
     transition: all 0.2s;
   }
 
-  .header-btn:hover {
+  .header-btn:hover:not(:disabled) {
     background: var(--primary);
     color: #fff;
     border-color: var(--primary);
+  }
+
+  .header-btn:disabled {
+    color: var(--text-secondary);
+    opacity: 0.6;
+    cursor: not-allowed;
   }
 
   .header-btn.active {

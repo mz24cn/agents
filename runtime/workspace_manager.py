@@ -392,6 +392,22 @@ class WorkspaceManager:
             return self.get_file_info(new_path, restrict_workspace=False)
         except PermissionError:
             raise ValueError(f"Permission denied: {old_path}")
+
+    def create_directory(self, parent_path: str, name: str, restrict_workspace: bool = True) -> Dict[str, Any]:
+        """Create a directory under the given parent path."""
+        if not name or '/' in name or '\\' in name or ':' in name:
+            raise ValueError("Invalid directory name")
+        parent_dir = self._resolve_path(parent_path, restrict_workspace)
+        if not os.path.isdir(parent_dir):
+            raise ValueError(f"Parent is not a directory: {parent_path}")
+        new_path = os.path.join(parent_dir, name)
+        if os.path.exists(new_path):
+            raise ValueError(f"Target already exists: {name}")
+        try:
+            os.mkdir(new_path)
+            return self.get_file_info(new_path, restrict_workspace=False)
+        except PermissionError:
+            raise ValueError(f"Permission denied: {parent_dir}")
     
     def duplicate_file(self, path: str, restrict_workspace: bool = True) -> Dict[str, Any]:
         """Create a duplicate of a file."""
@@ -453,6 +469,47 @@ class WorkspaceManager:
             raise ValueError("Access denied: path is outside workspace")
         return resolved
 
+    def _remove_existing_path(self, path: str) -> None:
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path)
+        else:
+            os.remove(path)
+
+    def _move_path_overwrite(self, src_path: str, dest_path: str) -> None:
+        """Move src to dest, overwriting only paths that are actually written."""
+        if os.path.isdir(src_path) and not os.path.islink(src_path) and os.path.isdir(dest_path) and not os.path.islink(dest_path):
+            for name in os.listdir(src_path):
+                child_src = os.path.join(src_path, name)
+                child_dest = os.path.join(dest_path, name)
+                if os.path.exists(child_dest):
+                    if os.path.isdir(child_src) and not os.path.islink(child_src) and os.path.isdir(child_dest) and not os.path.islink(child_dest):
+                        self._move_path_overwrite(child_src, child_dest)
+                        continue
+                    self._remove_existing_path(child_dest)
+                shutil.move(child_src, child_dest)
+            os.rmdir(src_path)
+            return
+
+        if os.path.exists(dest_path):
+            self._remove_existing_path(dest_path)
+        shutil.move(src_path, dest_path)
+
+    def _copy_path_overwrite(self, src_path: str, dest_path: str) -> None:
+        """Copy src to dest, overwriting only paths that are actually written."""
+        if os.path.isdir(src_path) and not os.path.islink(src_path):
+            if os.path.exists(dest_path) and (not os.path.isdir(dest_path) or os.path.islink(dest_path)):
+                self._remove_existing_path(dest_path)
+            os.makedirs(dest_path, exist_ok=True)
+            for name in os.listdir(src_path):
+                child_src = os.path.join(src_path, name)
+                child_dest = os.path.join(dest_path, name)
+                self._copy_path_overwrite(child_src, child_dest)
+            return
+
+        if os.path.exists(dest_path):
+            self._remove_existing_path(dest_path)
+        shutil.copy2(src_path, dest_path)
+
     def move_files(self, paths: list, dest_dir: str, restrict_workspace: bool = True, overwrite: bool = False) -> Dict[str, Any]:
         """Move multiple files/directories to a destination directory.
         
@@ -480,17 +537,18 @@ class WorkspaceManager:
                 base_name = os.path.basename(src_path)
                 new_path = os.path.join(dest_path, base_name)
                 
-                if os.path.exists(new_path):
-                    if not overwrite:
-                        errors.append({"path": src, "error": f"Target already exists: {base_name}", "conflict": True})
-                        continue
-                # Remove existing before move
-                    if os.path.isdir(new_path):
-                        shutil.rmtree(new_path)
-                    else:
-                        os.remove(new_path)
+                if os.path.exists(new_path) and os.path.samefile(src_path, new_path):
+                    errors.append({"path": src, "error": "Source and target are the same path"})
+                    continue
+
+                if os.path.exists(new_path) and not overwrite:
+                    errors.append({"path": src, "error": f"Target already exists: {base_name}", "conflict": True})
+                    continue
                 
-                shutil.move(src_path, new_path)
+                if overwrite:
+                    self._move_path_overwrite(src_path, new_path)
+                else:
+                    shutil.move(src_path, new_path)
                 moved.append(self.get_file_info(new_path, restrict_workspace=False))
             except ValueError as e:
                 errors.append({"path": src, "error": str(e)})
@@ -523,17 +581,17 @@ class WorkspaceManager:
                 base_name = os.path.basename(src_path)
                 new_path = os.path.join(dest_path, base_name)
                 
-                if os.path.exists(new_path):
-                    if not overwrite:
-                        errors.append({"path": src, "error": f"Target already exists: {base_name}", "conflict": True})
-                        continue
-                    # Remove existing before copy
-                    if os.path.isdir(new_path):
-                        shutil.rmtree(new_path)
-                    else:
-                        os.remove(new_path)
+                if os.path.exists(new_path) and os.path.samefile(src_path, new_path):
+                    errors.append({"path": src, "error": "Source and target are the same path"})
+                    continue
+
+                if os.path.exists(new_path) and not overwrite:
+                    errors.append({"path": src, "error": f"Target already exists: {base_name}", "conflict": True})
+                    continue
                 
-                if os.path.isdir(src_path):
+                if overwrite:
+                    self._copy_path_overwrite(src_path, new_path)
+                elif os.path.isdir(src_path):
                     shutil.copytree(src_path, new_path)
                 else:
                     shutil.copy2(src_path, new_path)
@@ -546,6 +604,17 @@ class WorkspaceManager:
                 errors.append({"path": src, "error": str(e)})
         
         return {"copied": copied, "errors": errors}
+
+    def resolve_upload_dir(self, target_dir_path: str) -> str:
+        """Resolve an absolute selected upload directory inside the workspace."""
+        if not isinstance(target_dir_path, str) or not target_dir_path.strip():
+            raise ValueError("INVALID_TARGET_DIR: target_dir_path is required")
+        target_dir = os.path.realpath(target_dir_path if os.path.isabs(target_dir_path) else os.path.join(self.workspace_path, target_dir_path))
+        if os.path.commonpath([self.workspace_path, target_dir]) != self.workspace_path:
+            raise ValueError("INVALID_TARGET_DIR: target directory is outside workspace")
+        if not os.path.isdir(target_dir):
+            raise ValueError("INVALID_TARGET_DIR: target directory does not exist")
+        return target_dir
 
     def resolve_upload_target(self, target_path: str) -> str:
         if not isinstance(target_path, str) or not target_path.strip():
@@ -566,7 +635,7 @@ class WorkspaceManager:
             raise ValueError("INVALID_TARGET_PATH: target cannot be workspace root")
         return target_abs
 
-    def create_upload_task(self, file_name: str, file_size: int, target_path: str, parallel_size: int, parallel_max_threads: int) -> Dict[str, Any]:
+    def create_upload_task(self, file_name: str, file_size: int, target_path: str, parallel_size: int, parallel_max_threads: int, target_dir_path: Optional[str] = None) -> Dict[str, Any]:
         if not isinstance(file_name, str) or not file_name.strip():
             raise ValueError("INVALID_REQUEST: file_name is required")
         try:
@@ -577,6 +646,10 @@ class WorkspaceManager:
             raise ValueError("INVALID_REQUEST: file_size cannot be negative")
 
         target_abs = self.resolve_upload_target(target_path)
+        if target_dir_path is not None:
+            target_dir_abs = self.resolve_upload_dir(target_dir_path)
+            if os.path.commonpath([target_dir_abs, target_abs]) != target_dir_abs:
+                raise ValueError("INVALID_TARGET_PATH: target is outside selected directory")
         if os.path.isdir(target_abs):
             raise ValueError("INVALID_TARGET_PATH: target is a directory")
 
