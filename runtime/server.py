@@ -806,6 +806,16 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self._handle_workspace_download()
         elif path == "/v1/workspace/thumbnail":
             self._handle_workspace_thumbnail()
+        elif re.match(r"^/v1/sessions/[^/]+/file-journals/[^/]+$", path):
+            # GET /v1/sessions/{session_id}/file-journals/{turn_key}
+            parts = path[len("/v1/sessions/"):].split("/file-journals/")
+            session_id = urllib.parse.unquote(parts[0])
+            turn_key = urllib.parse.unquote(parts[1])
+            self._handle_get_file_journal_diff(session_id, turn_key)
+        elif re.match(r"^/v1/sessions/[^/]+/file-journals$", path):
+            # GET /v1/sessions/{session_id}/file-journals
+            session_id = path[len("/v1/sessions/"):-len("/file-journals")]
+            self._handle_get_file_journals(urllib.parse.unquote(session_id))
         elif path == "/v1/terminals":
             self._handle_list_terminals()
         elif path.startswith("/v1/"):
@@ -3105,6 +3115,35 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         except RuntimeError as exc:
             self._send_json_error(500, str(exc))
             return
+
+    def _handle_get_file_journals(self, session_id: str) -> None:
+        """GET /v1/sessions/{session_id}/file-journals — list turn keys with file changes."""
+        from runtime.context_manager import get_file_journals_list
+
+        context_manager = self.server.context_manager  # type: ignore[attr-defined]
+        session_dir = os.path.join(context_manager._chats_dir, session_id)
+        try:
+            turn_keys = get_file_journals_list(session_dir)
+        except Exception as exc:
+            self._send_json_error(500, f"Failed to list file journals: {exc}")
+            return
+        self._send_json_response(200, {"session_id": session_id, "turn_keys": turn_keys})
+
+    def _handle_get_file_journal_diff(self, session_id: str, turn_key: str) -> None:
+        """GET /v1/sessions/{session_id}/file-journals/{turn_key} — return per-file diff data."""
+        from runtime.context_manager import get_file_journal_diff
+
+        context_manager = self.server.context_manager  # type: ignore[attr-defined]
+        session_dir = os.path.join(context_manager._chats_dir, session_id)
+        try:
+            data = get_file_journal_diff(session_dir, turn_key)
+        except Exception as exc:
+            self._send_json_error(500, f"Failed to get file journal diff: {exc}")
+            return
+        if data.get("error") == "not_found":
+            self._send_json_error(404, f"No file journal found for turn: {turn_key}")
+            return
+        self._send_json_response(200, data)
 
 
     # ------------------------------------------------------------------

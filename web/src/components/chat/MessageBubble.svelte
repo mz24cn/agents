@@ -5,11 +5,12 @@
   import ImageViewer from './ImageViewer.svelte'
   import AudioPlayer from './AudioPlayer.svelte'
   import CopyButton from './CopyButton.svelte'
+  import FileDiffViewer from './FileDiffViewer.svelte'
   import IconDisplay from '../../lib/components/IconDisplay.svelte'
   import { t } from '../../lib/i18n.svelte.js'
   import { highlight } from '../../lib/highlight.js'
 
-  let { msg, agentList = [], onRevoke, collapseButton = null, onCollapse } = $props()
+  let { msg, agentList = [], onRevoke, collapseButton = null, onCollapse, hasFileChanges = false, onToggleFileDiff, fileDiffData = null, fileDiffVisible = false } = $props()
 
   /**
    * Detect the content type of a tool result.
@@ -150,6 +151,11 @@
             {t('revoke')}
           </button>
         {/if}
+        {#if hasFileChanges}
+          <button class="file-changes-btn" onclick={onToggleFileDiff}>
+            {t('fileChanges')}
+          </button>
+        {/if}
         {#if collapseButton === 'expand'}
           <button class="toggle-btn" onclick={onCollapse}>
             {t('expandExecution')}
@@ -273,6 +279,10 @@
     <AudioPlayer audio={msg.audio} />
   {/if}
 </div>
+
+{#if msg.role === 'user' && fileDiffVisible && fileDiffData?.files}
+  <FileDiffViewer files={fileDiffData.files} turnKey={fileDiffData.turn_key || ''} />
+{/if}
 
 <style>
   .message {
@@ -439,6 +449,23 @@
   .message.user .revoke-btn:hover {
     color: #fff;
     background: rgba(239, 68, 68, 0.6);
+  }
+  .file-changes-btn {
+    padding: 2px 8px;
+    font-size: 0.75rem;
+    color: rgba(255,255,255,0.7);
+    background: rgba(255,255,255,0.15);
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    letter-spacing: 0.05em;
+    line-height: 1.4;
+    white-space: nowrap;
+    transition: background 0.1s;
+  }
+  .file-changes-btn:hover {
+    color: #fff;
+    background: rgba(59, 130, 246, 0.5);
   }
   .tool-result-block {
     margin-top: 4px;

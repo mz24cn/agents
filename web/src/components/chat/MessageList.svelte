@@ -5,7 +5,7 @@
   import { getContext } from 'svelte'
   import AppLogo from '../../lib/components/AppLogo.svelte'
 
-  let { messages = [], agentList = [], onRevoke, onScrollAtBottom, shouldScrollToBottom = false, collapsedGroups = new Set(), onToggleCollapse } = $props()
+  let { messages = [], agentList = [], onRevoke, onScrollAtBottom, shouldScrollToBottom = false, collapsedGroups = new Set(), onToggleCollapse, fileJournalTurnKeys = new Set(), fileDiffVisible = new Set(), fileDiffCache = {}, onToggleFileDiff } = $props()
   let listEl = $state(null)
   let isAtBottom = $state(true)
   
@@ -145,6 +145,10 @@
                 {msg} 
                 {agentList} 
                 {onRevoke}
+                hasFileChanges={fileJournalTurnKeys.has(msg.timestamp)}
+                fileDiffData={fileDiffCache[msg.timestamp] || null}
+                fileDiffVisible={fileDiffVisible.has(msg.timestamp)}
+                onToggleFileDiff={msg.timestamp ? () => onToggleFileDiff(msg.timestamp) : undefined}
               />
             {:else if isLastAssistant}
               <!-- 最后一条 assistant 消息始终显示，带有折叠/展开按钮（仅当有中间消息时） -->

@@ -54,6 +54,11 @@
 
   let revokeConflict = $state(null)
 
+  // File journal / diff viewer state
+  let fileJournalTurnKeys = $state(new Set())    // turn keys that have file journals
+  let fileDiffCache = $state({})                 // turnKey -> { turn_key, files: [...] }
+  let fileDiffVisible = $state(new Set())        // turnKeys currently showing diff
+
   // Terminal state: sessionId -> { ref, status }
   // Terminal sessionId == Chat sessionId
   let terminals = $state(new Map())
@@ -678,6 +683,8 @@
       } else {
         needsRead = true
       }
+      // Refresh file journals list after stream completes
+      loadFileJournals(sessionId)
     }
   }
 
@@ -816,6 +823,45 @@
     revokeConflict = null
   }
 
+  async function handleToggleFileDiff(turnKey) {
+    if (!sessionId || !turnKey) return
+    // If already visible, hide it
+    if (fileDiffVisible.has(turnKey)) {
+      const next = new Set(fileDiffVisible)
+      next.delete(turnKey)
+      fileDiffVisible = next
+      return
+    }
+    // Fetch diff data if not cached
+    if (!fileDiffCache[turnKey]) {
+      try {
+        const data = await sessionsApi.fileJournalDiff(sessionId, turnKey)
+        fileDiffCache = { ...fileDiffCache, [turnKey]: data }
+      } catch (err) {
+        errorMsg = err?.message || 'Failed to load file diff'
+        return
+      }
+    }
+    // Show the diff
+    const next = new Set(fileDiffVisible)
+    next.add(turnKey)
+    fileDiffVisible = next
+  }
+
+  // Fetch file journals list when a session is restored
+  async function loadFileJournals(sid) {
+    if (!sid) return
+    try {
+      const data = await sessionsApi.fileJournals(sid)
+      fileJournalTurnKeys = new Set(data.turn_keys || [])
+      // Reset diff state for new session
+      fileDiffCache = {}
+      fileDiffVisible = new Set()
+    } catch {
+      fileJournalTurnKeys = new Set()
+    }
+  }
+
   // Watch for session restore requests
   $effect(() => {
     const pending = sessionRestore.pending;
@@ -844,7 +890,10 @@
       needsRead = false
       sessionRestored = true
       shouldScrollToBottom = false
-      
+
+      // Load file journals for this session
+      loadFileJournals(sid)
+
       // 优先使用 meta 中的设置（向下兼容：旧会话可能没有 meta）
       if (meta) {
         // 恢复智能体选择
@@ -892,6 +941,9 @@
     currentSession.sessionId = null
     shouldScrollToBottom = false
     workspacePath = defaultWorkspacePath
+    fileJournalTurnKeys = new Set()
+    fileDiffCache = {}
+    fileDiffVisible = new Set()
   }
 
   // 监听 Sidebar 顶部的新建会话按钮。即使当前会话正在推理，也允许切换到新会话，
@@ -1151,7 +1203,7 @@
 
     <!-- Message list: hidden when terminal is visible -->
     <div class="message-list-container" class:hidden={terminalVisible}>
-      <MessageList {messages} {agentList} onRevoke={handleRevoke} onScrollAtBottom={handleScrollAtBottom} {shouldScrollToBottom} {collapsedGroups} onToggleCollapse={toggleCollapse} />
+      <MessageList {messages} {agentList} onRevoke={handleRevoke} onScrollAtBottom={handleScrollAtBottom} {shouldScrollToBottom} {collapsedGroups} onToggleCollapse={toggleCollapse} {fileJournalTurnKeys} {fileDiffCache} {fileDiffVisible} onToggleFileDiff={handleToggleFileDiff} />
 
       {#if workspacePanelOpen}
         <WorkspaceFileManager

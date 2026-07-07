@@ -772,6 +772,135 @@ def diff_journal_session(session_dir: str) -> str:
     return "".join(chunks)
 
 
+def get_file_journals_list(session_dir: str) -> list[str]:
+    """Return ISO timestamps of turns that have a file journal manifest.
+
+    Only returns timestamps whose manifest is not revoked and contains at least
+    one file entry with both baseline and after.
+    """
+    journals_dir = os.path.join(session_dir, "file_journals")
+    if not os.path.isdir(journals_dir):
+        return []
+    timestamps: list[str] = []
+    for entry in sorted(os.listdir(journals_dir)):
+        manifest_path = os.path.join(journals_dir, entry, "manifest.json")
+        if not os.path.isfile(manifest_path):
+            continue
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as fh:
+                manifest = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if manifest.get("revoked"):
+            continue
+        if not isinstance(manifest.get("files"), dict) or not manifest["files"]:
+            continue
+        has_changes = False
+        for _rel, entry_data in manifest["files"].items():
+            if isinstance(entry_data, dict) and "baseline" in entry_data and "after" in entry_data:
+                has_changes = True
+                break
+        if not has_changes:
+            continue
+        # Use the ISO timestamp from the manifest (matches msg.timestamp).
+        ts = manifest.get("timestamp")
+        if ts:
+            timestamps.append(ts)
+    return timestamps
+
+
+def _find_journal_turn_dir(session_dir: str, timestamp: str) -> Optional[str]:
+    """Find the journal turn directory whose manifest has the given timestamp."""
+    journals_dir = os.path.join(session_dir, "file_journals")
+    if not os.path.isdir(journals_dir):
+        return None
+    for entry in os.listdir(journals_dir):
+        manifest_path = os.path.join(journals_dir, entry, "manifest.json")
+        if not os.path.isfile(manifest_path):
+            continue
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as fh:
+                manifest = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if manifest.get("timestamp") == timestamp:
+            return os.path.join(journals_dir, entry)
+    return None
+
+
+def get_file_journal_diff(session_dir: str, timestamp: str) -> dict:
+    """Return structured per-file diff data for a single file-journal turn.
+
+    *timestamp* is the ISO-format timestamp that appears on the user message
+    (matches ``manifest[\"timestamp\"]``).
+
+    Returns:
+        A dict with ``turn_key`` and ``files`` (list of per-file objects).
+        Each file object contains: path, change_type, baseline, after, diff.
+    """
+    turn_dir = _find_journal_turn_dir(session_dir, timestamp)
+    if turn_dir is None:
+        return {"turn_key": timestamp, "files": [], "error": "not_found"}
+
+    manifest_path = os.path.join(turn_dir, "manifest.json")
+    with open(manifest_path, "r", encoding="utf-8") as fh:
+        manifest = json.load(fh)
+
+    turn_key = manifest.get("turn_key", os.path.basename(turn_dir))
+    journal_dir = turn_dir
+    workspace = manifest.get("workspace") or os.getcwd()
+    files: list[dict] = []
+
+    for rel_path, entry in manifest.get("files", {}).items():
+        rel_path = rel_path.replace("\\", "/")
+        if not isinstance(entry, dict) or "baseline" not in entry or "after" not in entry:
+            continue
+        baseline_blob = entry["baseline"]
+        after_blob = entry["after"]
+        baseline_exists = bool(baseline_blob.get("exists"))
+        after_exists = bool(after_blob.get("exists"))
+
+        if baseline_exists and after_exists:
+            change_type = "modified"
+        elif after_exists and not baseline_exists:
+            change_type = "added"
+        elif baseline_exists and not after_exists:
+            change_type = "deleted"
+        else:
+            continue
+
+        before = b""
+        after = b""
+        try:
+            if baseline_exists:
+                before = _read_journal_blob(baseline_blob, workspace, journal_dir)
+        except Exception:
+            before = b"<read error>"
+        try:
+            if after_exists:
+                after = _read_journal_blob(after_blob, workspace, journal_dir)
+        except Exception:
+            after = b"<read error>"
+
+        file_obj: dict = {
+            "path": rel_path,
+            "change_type": change_type,
+            "baseline": before.decode("utf-8", errors="replace"),
+            "after": after.decode("utf-8", errors="replace"),
+        }
+        a_label = f"a/{rel_path}" if baseline_exists else "/dev/null"
+        b_label = f"b/{rel_path}" if after_exists else "/dev/null"
+        before_lines = file_obj["baseline"].splitlines(keepends=True)
+        after_lines = file_obj["after"].splitlines(keepends=True)
+        file_obj["diff"] = "".join(difflib.unified_diff(
+            before_lines, after_lines,
+            fromfile=a_label, tofile=b_label,
+        ))
+        files.append(file_obj)
+
+    return {"turn_key": turn_key, "files": files}
+
+
 class ContextManager:
     """Manages multi-turn conversation sessions: directory creation, file I/O,
     tool call recording, and artifact storage.
