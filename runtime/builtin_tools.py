@@ -467,6 +467,7 @@ def _make_delegate_fn(runtime, thread_local):
 
             # 推送结束帧：通知前端流式消息框已完成，并重置 assistant 消息索引
             # 不携带 content（内容已通过流式增量帧完整推送），仅作状态信号
+            # 注意：切勿添加 content 字段，即使是空字符串也会被前端展开覆盖已累积的内容
             if sse_callback is not None:
                 try:
                     sse_callback({
@@ -474,7 +475,6 @@ def _make_delegate_fn(runtime, thread_local):
                         "name": "delegate",
                         "tool_call_id": tool_call_id,
                         "streaming": False,
-                        "content": "",
                     })
                 except Exception:
                     pass

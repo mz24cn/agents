@@ -278,6 +278,19 @@
     }
   }
 
+  async function handleRegenerateSummary(e, sid) {
+    e.stopPropagation()
+    closeMenu()
+    try {
+      const result = await sessions.regenerateSummary(sid)
+      if (result.status !== 'success') {
+        restoreError = t('regenerateSummaryFailed')
+      }
+    } catch (err) {
+      restoreError = err.message || t('regenerateSummaryFailed')
+    }
+  }
+
   async function handleDeleteSession(e, sid) {
     e.stopPropagation()
     closeMenu()
@@ -433,6 +446,19 @@
         <line x1="14.5" y1="13.5" x2="16" y2="15"/>
       </svg>
       {t('generateTitle')}
+    </button>
+    <button
+      class="session-dropdown-item"
+      role="menuitem"
+      onclick={(e) => handleRegenerateSummary(e, menuOpenId)}
+    >
+      <svg class="menu-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+        <path d="M1 2v4h4"/>
+        <path d="M14 8A6 6 0 0 0 3.2 4.8L1 6"/>
+        <path d="M15 14v-4h-4"/>
+        <path d="M2 8a6 6 0 0 0 10.8 3.2L15 10"/>
+      </svg>
+      {t('regenerateSummary')}
     </button>
     <button
       class="session-dropdown-item"

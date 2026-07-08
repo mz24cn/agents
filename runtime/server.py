@@ -1233,6 +1233,10 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             # POST /v1/sessions/{session_id}/generate-title
             session_id = path[len("/v1/sessions/"):-len("/generate-title")]
             self._handle_generate_session_title(urllib.parse.unquote(session_id))
+        elif re.match(r"^/v1/sessions/[^/]+/regenerate-summary$", path):
+            # POST /v1/sessions/{session_id}/regenerate-summary
+            session_id = path[len("/v1/sessions/"):-len("/regenerate-summary")]
+            self._handle_regenerate_session_summary(urllib.parse.unquote(session_id))
         elif re.match(r"^/v1/sessions/[^/]+/read$", path):
             # POST /v1/sessions/{session_id}/read
             session_id = path[len("/v1/sessions/"):-len("/read")]
@@ -1511,7 +1515,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 return
             
             workspace_mgr = self._get_workspace_manager()
-            results = workspace_mgr.search_files(path, query, restrict_workspace=False)
+            results = workspace_mgr.search_files(path, query, restrict_workspace=self._should_restrict_workspace())
             self._send_json_response(200, results)
         except ValueError as e:
             self._send_json_error(400, str(e))
@@ -3073,6 +3077,29 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self._send_json_error(400, str(exc))
             return
 
+    def _handle_regenerate_session_summary(self, session_id: str) -> None:
+        """POST /v1/sessions/{session_id}/regenerate-summary — 手动重新生成概要和记忆。"""
+        context_manager = self.server.context_manager  # type: ignore[attr-defined]
+        try:
+            # Verify session exists
+            conv_path = os.path.join(
+                context_manager._chats_dir, session_id, "conversation.json"
+            )
+            if not os.path.isfile(conv_path):
+                self._send_json_error(404, f"Session not found: {session_id}")
+                return
+
+            context_manager.compress_context_forced(session_id)
+            self._send_json_response(200, {
+                "status": "success",
+                "session_id": session_id,
+            })
+        except Exception as exc:
+            logging.warning(
+                "regenerate-summary: failed for session %s: %s", session_id, exc
+            )
+            self._send_json_error(500, f"Failed to regenerate summary for session: {session_id}")
+
     def _handle_revoke_session(self, session_id: str) -> None:
         """POST /v1/sessions/{session_id}/revoke — 撤回指定用户消息及其后的所有消息。"""
         body = self._read_json_body()
@@ -3227,7 +3254,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 return
             
             workspace_mgr = self._get_workspace_manager()
-            result = workspace_mgr.rename_file(path, new_name, restrict_workspace=False)
+            result = workspace_mgr.rename_file(path, new_name, restrict_workspace=self._should_restrict_workspace())
             self._send_json_response(200, result)
         except ValueError as e:
             self._send_json_error(400, str(e))
@@ -3254,7 +3281,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 return
 
             workspace_mgr = self._get_workspace_manager()
-            result = workspace_mgr.create_directory(parent_path, name, restrict_workspace=True)
+            result = workspace_mgr.create_directory(parent_path, name, restrict_workspace=self._should_restrict_workspace())
             self._send_json_response(200, result)
         except ValueError as e:
             self._send_json_error(400, str(e))
@@ -3276,7 +3303,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 return
             
             workspace_mgr = self._get_workspace_manager()
-            result = workspace_mgr.duplicate_file(path, restrict_workspace=False)
+            result = workspace_mgr.duplicate_file(path, restrict_workspace=self._should_restrict_workspace())
             self._send_json_response(200, result)
         except ValueError as e:
             self._send_json_error(400, str(e))
@@ -3304,7 +3331,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 return
             
             workspace_mgr = self._get_workspace_manager()
-            result = workspace_mgr.move_files(paths, dest_dir, restrict_workspace=False, overwrite=overwrite)
+            result = workspace_mgr.move_files(paths, dest_dir, restrict_workspace=self._should_restrict_workspace(), overwrite=overwrite)
             self._send_json_response(200, result)
         except ValueError as e:
             self._send_json_error(400, str(e))
@@ -3332,7 +3359,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 return
             
             workspace_mgr = self._get_workspace_manager()
-            result = workspace_mgr.copy_files(paths, dest_dir, restrict_workspace=False, overwrite=overwrite)
+            result = workspace_mgr.copy_files(paths, dest_dir, restrict_workspace=self._should_restrict_workspace(), overwrite=overwrite)
             self._send_json_response(200, result)
         except ValueError as e:
             self._send_json_error(400, str(e))
@@ -3354,7 +3381,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 return
             
             workspace_mgr = self._get_workspace_manager()
-            workspace_mgr.delete_file(path, restrict_workspace=False)
+            workspace_mgr.delete_file(path, restrict_workspace=self._should_restrict_workspace())
             self._send_json_response(200, {"status": "deleted", "path": path})
         except ValueError as e:
             self._send_json_error(400, str(e))
@@ -3568,6 +3595,11 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             from runtime.workspace_manager import WorkspaceManager
             self.server._workspace_manager = WorkspaceManager(workspace_path)
         return self.server._workspace_manager
+
+    @staticmethod
+    def _should_restrict_workspace() -> bool:
+        """Read RESTRICT_WORKSPACE_IN_BACKEND env var dynamically (default False)."""
+        return os.environ.get('RESTRICT_WORKSPACE_IN_BACKEND', '').strip().lower() in ('1', 'true', 'yes', 'on')
 
     # ------------------------------------------------------------------
     # RuntimeHTTPServer

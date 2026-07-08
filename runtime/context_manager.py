@@ -1584,6 +1584,37 @@ trivial or uncertain items.
                 session_id,
             )
 
+    def compress_context_forced(self, session_id: str) -> None:
+        """Force regeneration of summary and memory for *session_id*.
+
+        Similar to :meth:`compress_context` but skips the token-threshold
+        check, making it suitable for manual re-generation (e.g. after a
+        previous automatic attempt failed due to a missing model or API error).
+
+        All other guards still apply (e.g. ``SUMMARY_MODEL_ID`` must be
+        configured and the session must have at least 2 turns).
+        """
+        if not self._summary_model_id:
+            logging.warning(
+                "compress_context_forced: SUMMARY_MODEL_ID not configured; "
+                "cannot regenerate summary/memory for session %s",
+                session_id,
+            )
+            return
+
+        turns = self.load_conversation(session_id)
+        if not turns:
+            logging.warning(
+                "compress_context_forced: no turns found for session %s",
+                session_id,
+            )
+            return
+
+        # Pass a large fake token count to bypass the threshold check while
+        # still going through the same code path.
+        fake_tokens = self._max_tokens_in_context + 1
+        self.compress_context(session_id, turns, last_total_tokens=fake_tokens)
+
     def get_summary(self, session_id: str) -> tuple[str, dict]:
         """Return ``(summary_text, front_matter_dict)`` for *session_id*.
 

@@ -443,6 +443,9 @@ def convert_image_to_base64(img_data: str) -> str:
         except Exception as e:
             raise ValueError(f"Failed to download image: {e}")
 
+    if '/' not in img_data and '\\' not in img_data or len(img_data) > 4096:
+        return img_data  # 已经是 base64，无需再编码
+
     expanded_path = os.path.expanduser(img_data)
     try:
         with open(expanded_path, "rb") as f:

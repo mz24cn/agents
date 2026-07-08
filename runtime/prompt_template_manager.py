@@ -54,10 +54,38 @@ class PromptTemplateManager:
 
     Stores PromptTemplate instances keyed by template_id. Supports saving
     to and loading from JSON files for persistent storage.
+
+    Also maintains a labels index for flexible lookup: when get(template_id)
+    fails to find by ID, it falls back to searching the labels index.
     """
 
     def __init__(self) -> None:
         self._templates: dict[str, PromptTemplate] = {}
+        self._labels_index: dict[str, dict[str, None]] = {}
+
+    # -- labels index helpers --------------------------------------------------
+
+    def _index_labels(self, item_id: str, labels: list) -> None:
+        """Add an item's labels to the index."""
+        for label in labels:
+            if label not in self._labels_index:
+                self._labels_index[label] = {}
+            self._labels_index[label][item_id] = None
+
+    def _unindex_labels(self, item_id: str, labels: list) -> None:
+        """Remove an item's labels from the index."""
+        for label in labels:
+            ids = self._labels_index.get(label)
+            if ids is not None:
+                ids.pop(item_id, None)
+                if not ids:
+                    del self._labels_index[label]
+
+    def _rebuild_labels_index(self) -> None:
+        """Rebuild the entire labels index from current items."""
+        self._labels_index.clear()
+        for item_id, template in self._templates.items():
+            self._index_labels(item_id, template.labels)
 
     def list_all(self) -> list[PromptTemplate]:
         """Return a list of all prompt templates.
@@ -68,15 +96,25 @@ class PromptTemplateManager:
         return list(self._templates.values())
 
     def get(self, template_id: str) -> Optional[PromptTemplate]:
-        """Retrieve a prompt template by its ID.
+        """Retrieve a prompt template by its ID, with labels fallback.
+
+        First attempts a direct lookup by template_id.  If that fails, treats
+        the argument as a label and returns the first matching template.
 
         Args:
-            template_id: The unique identifier of the template.
+            template_id: The unique identifier of the template, or a label.
 
         Returns:
             The PromptTemplate if found, or None if not registered.
         """
-        return self._templates.get(template_id)
+        template = self._templates.get(template_id)
+        if template is not None:
+            return template
+        # Fallback: search by label
+        ids = self._labels_index.get(template_id)
+        if ids:
+            return self._templates.get(next(iter(ids)))
+        return None
 
     def create(self, template_id: str, content: str, labels: list = None) -> PromptTemplate:
         """Create a new prompt template.
@@ -91,6 +129,7 @@ class PromptTemplateManager:
         """
         template = PromptTemplate(template_id=template_id, content=content, labels=labels or [])
         self._templates[template_id] = template
+        self._index_labels(template_id, template.labels)
         return template
 
     def update(self, template_id: str, new_template_id: str, content: str, labels: list = None) -> Optional[PromptTemplate]:
@@ -108,11 +147,16 @@ class PromptTemplateManager:
         if template_id not in self._templates:
             return None
         # Get existing labels if not provided
+        old_labels = self._templates[template_id].labels
         if labels is None:
-            labels = self._templates[template_id].labels
+            labels = old_labels
         template = PromptTemplate(template_id=new_template_id, content=content, labels=labels)
+        # Remove old index entry
+        self._unindex_labels(template_id, old_labels)
         del self._templates[template_id]
+        # Insert new
         self._templates[new_template_id] = template
+        self._index_labels(new_template_id, template.labels)
         return template
 
     def delete(self, template_id: str) -> bool:
@@ -125,6 +169,7 @@ class PromptTemplateManager:
             True if the template was found and deleted, False otherwise.
         """
         if template_id in self._templates:
+            self._unindex_labels(template_id, self._templates[template_id].labels)
             del self._templates[template_id]
             return True
         return False
@@ -159,6 +204,8 @@ class PromptTemplateManager:
         if not isinstance(data, list):
             raise ValueError(f"Expected a JSON array in {path}, got {type(data).__name__}")
         self._templates.clear()
+        self._labels_index.clear()
         for item in data:
             template = PromptTemplate.from_dict(item)
             self._templates[template.template_id] = template
+        self._rebuild_labels_index()
