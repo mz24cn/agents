@@ -389,6 +389,10 @@ class Runtime:
                     # Progressive disclosure: inject SKILL.md body + built-in tools
                     skill_body, skill_dir = self._get_skill_body_and_dir(tool_name)
 
+                    # Change working directory to the skill's directory
+                    if skill_dir:
+                        os.chdir(skill_dir)
+
                     # Inject the full SKILL.md body as a function/tool result message
                     if skill_body:
                         cwd_hint = f"\n\n技能工作目录: {skill_dir}" if skill_dir else ""
@@ -414,7 +418,7 @@ class Runtime:
                     # Don't consume a tool_round for skill disclosure
                     tool_round -= 1
                     skill_triggered = True
-                    break  # Break inner loop; continue outer while loop
+                    continue  # Skill result injected; continue processing remaining tool calls
 
                 # Parse arguments
                 try:
@@ -1155,7 +1159,7 @@ class Runtime:
                     tools = [t for t in tools if t.tool_id != tool_name and t.name != tool_name]
                     tool_round -= 1
                     skill_triggered = True
-                    break  # Break inner loop; continue outer while loop
+                    continue  # Skill result injected; continue processing remaining tool calls
 
                 # Execute tool
                 try:

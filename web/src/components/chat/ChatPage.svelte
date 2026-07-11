@@ -53,6 +53,7 @@
   let collapsedGroups = $derived(sessionStore[storeKey(sessionId)]?.collapsedGroups ?? new Set())
 
   let revokeConflict = $state(null)
+  let revokeConfirm = $state(null)  // initial revoke confirmation dialog state
 
   // File journal / diff viewer state
   let fileJournalTurnKeys = $state(new Set())    // turn keys that have file journals
@@ -772,11 +773,15 @@
     return `${t('revokeConflictMessage')}${fileList}`
   }
 
-  async function handleRevoke(timestamp) {
+  async function handleRevoke(timestamp, hasFileChanges = false) {
     if (!sessionId) return
-    if (!confirm(t('confirmRevoke'))) {
-      return
-    }
+    revokeConfirm = { timestamp, hasFileChanges }
+  }
+
+  async function confirmRevoke() {
+    if (!sessionId || !revokeConfirm) return
+    const timestamp = revokeConfirm.timestamp
+    revokeConfirm = null
     errorMsg = ''
     try {
       await sessionsApi.revoke(sessionId, timestamp)
@@ -791,6 +796,23 @@
       }
       errorMsg = err?.message || t('revokeFailed')
     }
+  }
+
+  async function keepFilesRevoke() {
+    if (!sessionId || !revokeConfirm) return
+    const timestamp = revokeConfirm.timestamp
+    revokeConfirm = null
+    errorMsg = ''
+    try {
+      await sessionsApi.revoke(sessionId, timestamp, { keepFiles: true })
+      applyRevokeSuccess(timestamp)
+    } catch (err) {
+      errorMsg = err?.message || t('revokeFailed')
+    }
+  }
+
+  function cancelRevoke() {
+    revokeConfirm = null
   }
 
   async function confirmForceRevoke() {
@@ -1177,6 +1199,17 @@
   {#if errorMsg}
     <div class="error-bar">{errorMsg}</div>
   {/if}
+
+  <ConfirmDialog
+    open={!!revokeConfirm}
+    title={t('revoke')}
+    message={t('confirmRevoke')}
+    confirmText={t('revoke')}
+    customText={revokeConfirm?.hasFileChanges ? t('revokeKeepFiles') : ''}
+    onConfirm={confirmRevoke}
+    onCustom={revokeConfirm?.hasFileChanges ? keepFilesRevoke : null}
+    onCancel={cancelRevoke}
+  />
 
   <ConfirmDialog
     open={!!revokeConflict}

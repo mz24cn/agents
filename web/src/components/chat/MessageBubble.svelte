@@ -147,7 +147,7 @@
           <span class="timestamp">{formatTimestamp(msg.timestamp)}</span>
         {/if}
         {#if onRevoke && msg.timestamp}
-          <button class="revoke-btn" onclick={() => onRevoke(msg.timestamp)}>
+          <button class="revoke-btn" onclick={() => onRevoke(msg.timestamp, hasFileChanges)}>
             {t('revoke')}
           </button>
         {/if}

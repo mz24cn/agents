@@ -1464,30 +1464,59 @@ and complete TWO tasks. Output ONLY the two tagged blocks — no other text.
 ---
 
 **Task 1 — Rolling Summary**
-Write a concise prose summary that preserves:
-- User intents and goals
-- Decisions made
-- Key tool call results
-- Unresolved questions or pending actions
+Write a thorough, information-dense summary. This summary will REPLACE the \
+original conversation in the model's context window, so every detail matters. \
+Capture:
 
-If a previous summary is provided, produce an updated summary that incorporates \
-the new turns into it (do not just append — rewrite as a coherent whole).
+- **User goals & intents**: what the user is trying to achieve, in their own \
+  words when possible. Include the full problem statement, not just a one-liner.
+- **Technical context**: programming languages, frameworks, libraries, file \
+  paths, project structure, environment details mentioned.
+- **Code & commands**: specific code snippets, shell commands, SQL queries, \
+  configuration changes the user showed or asked about. Preserve key syntax.
+- **Tool calls & results**: which tools were invoked, with what arguments, and \
+  what they returned (especially errors, file contents, search results).
+- **Decisions & rationale**: choices made and WHY — e.g. "chose PostgreSQL over \
+  MySQL because of JSON support".
+- **Errors & fixes**: any error messages encountered and how they were resolved \
+  (or not yet resolved).
+- **Unresolved items**: questions still open, tasks pending, next steps planned.
+
+If a previous summary is provided, merge it with the new turns into a single \
+coherent narrative. Do NOT just append — rewrite from scratch as one integrated \
+summary. Keep the most recent summary's information when still relevant; drop \
+only what has been superseded.
 
 **Task 2 — Structured Memory**
-Extract facts, preferences, decisions, and named entities worth remembering \
-long-term. For each entry assign a confidence score (0.0–1.0) reflecting how \
-clearly it was stated. Only include entries with meaningful information; omit \
-trivial or uncertain items.
+Extract long-term facts, preferences, decisions, and entities from the \
+conversation. Be thorough — err on the side of including borderline items. \
+Assign a confidence score (0.0–1.0) reflecting how clearly it was stated.
+
+Categories (use in entry_type):
+- "fact": objective information (e.g. "the server runs on port 8080", "the \
+  database name is app_production")
+- "preference": user likes/dislikes (e.g. "prefers async/await over raw \
+  promises", "dislikes ORMs, prefers raw SQL")
+- "decision": a choice made with rationale (e.g. "decided to use Redis for \
+  caching because latency must be < 5ms")
+- "entity": a named thing the user cares about (e.g. "Working on project \
+  'AcmeChat'", "Uses AWS S3 bucket 'uploads-prod'")
+
+For each entry:
+- Write a self-contained sentence that makes sense without surrounding context.
+- Include specific names, versions, numbers when available.
+- Skip truly trivial chit-chat ("hello", "thanks") but include anything that \
+  might be useful to recall in a future session.
 
 **Output format (strictly follow — no extra text outside the tags):**
 <summary>
-(summary prose here)
+(thorough summary prose, typically 2–6 paragraphs)
 </summary>
 <memory>
 [
   {{
     "entry_type": "fact|preference|decision|entity",
-    "content": "concise description",
+    "content": "self-contained descriptive sentence",
     "source_turn_index": 0,
     "confidence": 0.9,
     "created_at": "{current_ts}"
