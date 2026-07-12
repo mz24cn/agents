@@ -2840,7 +2840,11 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
     def _handle_detect_env(self) -> None:
         """POST /v1/env/detect — 扫描项目目录，返回检测到的 key 列表。"""
         env_manager = self.server.env_manager  # type: ignore[attr-defined]
-        keys = env_manager.detect_used_keys(os.path.dirname(os.path.abspath(__file__)))
+        runtime_dir = os.path.dirname(os.path.abspath(__file__))
+        accessories_dir = os.path.realpath(os.path.join(runtime_dir, "..", "accessories"))
+        keys_runtime = env_manager.detect_used_keys(runtime_dir)
+        keys_accessories = env_manager.detect_used_keys(accessories_dir) if os.path.isdir(accessories_dir) else []
+        keys = sorted(set(keys_runtime) | set(keys_accessories))
         self._send_json_response(200, {"keys": keys})
 
     def _handle_setup_script(self) -> None:
@@ -3434,6 +3438,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 parallel_size,
                 parallel_max_threads,
                 body.get('target_dir_path'),
+                restrict_workspace=self._should_restrict_workspace(),
             )
             task['workspace_id'] = body.get('workspace_id')
 

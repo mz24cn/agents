@@ -46,6 +46,7 @@ from runtime.models import InferenceRequest, Message, ToolConfig
 from runtime.registry import ToolRegistry
 from runtime.common import (
     _thread_local,
+    convert_image_to_base64,
     set_request_context,
     get_request_context,
     clear_request_context,
@@ -523,35 +524,41 @@ def _make_delegate_fn(runtime, thread_local):
 
 
 def _no_runtime_delegate(**kwargs) -> str:
-    """当 runtime 未提供时的 delegate 占位函数，向后兼容。"""
-    return "Error: delegate tool requires a Runtime instance. Pass runtime= to register_builtin_tools()."
+    """当 runtime 未提供时，delegate / read_image 工具的占位函数，向后兼容。"""
+    return "Error: this tool requires a Runtime instance. Pass runtime= to register_builtin_tools()."
 
 
 def register_builtin_tools(tool_registry: ToolRegistry, runtime=None) -> list[str]:
     """Register all built-in tools into the given ToolRegistry.
 
-    When runtime is None, the delegate tool is registered but its callable
-    returns an error string when called (backward compatibility).
+    When runtime is None, the delegate and read_image tools are registered
+    but their callables return an error string when called (backward compatibility).
 
     Args:
         tool_registry: The ToolRegistry to register tools into.
-        runtime: Optional Runtime instance for the delegate tool. If None,
-            delegate tool is registered with a no-op callable.
+        runtime: Optional Runtime instance for runtime-dependent tools
+            (delegate, read_image). If None, those tools are registered
+            with a no-op callable.
 
     Returns:
         List of registered tool_ids.
     """
     ids = []
     for config, fn in BUILTIN_TOOLS:
-        tool_registry.register(config, callable_fn=fn)
+        if fn is not None:
+            tool_registry.register(config, callable_fn=fn)
+        # fn is None for runtime-dependent tools — skip here, handled below
         ids.append(config.tool_id)
 
     # Register delegate tool with runtime-aware callable
     if runtime is not None:
-        callable_fn = _make_delegate_fn(runtime, _thread_local)
+        delegate_fn = _make_delegate_fn(runtime, _thread_local)
+        read_image_fn = _make_read_image_fn(runtime)
     else:
-        callable_fn = _no_runtime_delegate
-    tool_registry.register(DELEGATE_TOOL_CONFIG, callable_fn=callable_fn)
+        delegate_fn = _no_runtime_delegate
+        read_image_fn = _no_runtime_delegate
+    tool_registry.register(DELEGATE_TOOL_CONFIG, callable_fn=delegate_fn)
+    tool_registry.register(READ_IMAGE_TOOL_CONFIG, callable_fn=read_image_fn)
     ids.append("delegate")
 
     return ids
@@ -1112,11 +1119,39 @@ def _write_file(path: str, content: str) -> str:
     import tempfile
 
     workspace = get_workspace()
+    encoded = content.encode("utf-8")
+    bytes_written = len(encoded)
+
+    # Always write to a temp file first so content is never lost even when
+    # path validation fails (content may be large / expensive in tokens).
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(
+            prefix="write_file_", suffix=".tmp", dir="/tmp"
+        )
+        try:
+            with os.fdopen(fd, "wb") as tmp_file:
+                tmp_file.write(encoded)
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+    except Exception as exc:
+        return json.dumps({"error": "WriteFailure", "message": str(exc)})
 
     try:
         resolved_path = _validate_path(workspace, path)
     except ValueError as exc:
-        return json.dumps({"error": exc.error_code, "message": str(exc)})  # type: ignore[attr-defined]
+        # Validation failed – temp file in /tmp is kept; point caller at it.
+        return json.dumps({
+            "error": exc.error_code,  # type: ignore[attr-defined]
+            "message": (
+                f"{exc}. Content was NOT written to the requested path "
+                f"but has been saved to temporary file: {tmp_path}"
+            ),
+        })
 
     journal_manager = _get_file_journal_manager(workspace)
     backup = _capture_file_state(resolved_path)
@@ -1131,52 +1166,34 @@ def _write_file(path: str, content: str) -> str:
     except OSError as exc:
         return json.dumps({"error": "WriteFailure", "message": str(exc)})
 
-    # Atomic write: write to a tempfile in the same directory, then os.replace
-    encoded = content.encode("utf-8")
-    bytes_written = len(encoded)
-
-    tmp_path = None
+    # Move temp file to target.  shutil.move uses os.rename (atomic) when
+    # /tmp and the target are on the same filesystem, falling back to
+    # copy+delete otherwise.
     try:
-        # Create temp file in the same directory to ensure same filesystem
-        fd, tmp_path = tempfile.mkstemp(dir=parent_dir)
-        try:
-            with os.fdopen(fd, "wb") as tmp_file:
-                tmp_file.write(encoded)
-        except Exception:
-            # fd was already opened via fdopen; if fdopen fails, close fd manually
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-            raise
-
-        os.replace(tmp_path, resolved_path)
-        tmp_path = None  # successfully replaced, no cleanup needed
-
-        journal_result = journal_manager.record_after("write_file", resolved_path)
-        if isinstance(journal_result, dict) and journal_result.get("error"):
-            try:
-                _restore_file_state(resolved_path, backup)
-            except Exception:
-                return json.dumps({
-                    "error": "JournalFailed",
-                    "message": "Could not save after snapshot and failed to restore file",
-                })
-            return json.dumps({
-                "error": "JournalFailed",
-                "message": "Could not save after snapshot; file was restored to pre-call state",
-            })
+        shutil.move(tmp_path, resolved_path)
+        tmp_path = None  # moved successfully, no cleanup needed
     except OSError as exc:
         return json.dumps({"error": "WriteFailure", "message": str(exc)})
-    except Exception as exc:
-        return json.dumps({"error": "WriteFailure", "message": str(exc)})
     finally:
-        # Clean up temp file if os.replace failed
         if tmp_path is not None:
             try:
                 os.unlink(tmp_path)
             except OSError:
                 pass
+
+    journal_result = journal_manager.record_after("write_file", resolved_path)
+    if isinstance(journal_result, dict) and journal_result.get("error"):
+        try:
+            _restore_file_state(resolved_path, backup)
+        except Exception:
+            return json.dumps({
+                "error": "JournalFailed",
+                "message": "Could not save after snapshot and failed to restore file",
+            })
+        return json.dumps({
+            "error": "JournalFailed",
+            "message": "Could not save after snapshot; file was restored to pre-call state",
+        })
 
     # Compute relative path from workspace root for the response
     rel_path = os.path.relpath(resolved_path, workspace)
@@ -2524,3 +2541,101 @@ UNDO_TOOL_CONFIG = ToolConfig(
 )
 
 BUILTIN_TOOLS.append((UNDO_TOOL_CONFIG, _undo))
+
+
+# ---------------------------------------------------------------------------
+# read_image — VLM 图片解读内置工具
+# ---------------------------------------------------------------------------
+
+def _make_read_image_fn(runtime):
+    """创建 read_image 工具的可调用函数。
+
+    Args:
+        runtime: Runtime 实例，用于执行 VLM 推理
+    """
+
+    def read_image(base64_contents: list[str], prompt: str = "") -> str:
+        """通过 VLM 解读图片内容。
+
+        使用本地 VLM 对一张或多张图片进行理解。
+        模型 ID 为 "read-image"，需在模型配置中预先注册。
+
+        Args:
+            base64_contents: 图片内容数组。每个元素可以是：
+                - base64 编码的图片字符串
+                - 本地文件路径
+                - HTTP/HTTPS 图片链接
+            prompt: 图片理解的指令。如果不提供，默认使用详细描述。
+
+        Returns:
+            VLM 对图片的解读结果文本。
+        """
+        # 解析所有图片为 base64
+        resolved_images: list[str] = []
+        for item in base64_contents:
+            resolved = convert_image_to_base64(item)
+            resolved_images.append(resolved)
+
+        if not prompt:
+            prompt = "请详细描述这张图片的内容。如果图片中包含文字，请完整识别出来。"
+
+        # 构建消息：图片放在 images 字段
+        user_message = Message(
+            role="user",
+            content=prompt,
+            images=resolved_images,
+        )
+
+        # 非流式推理，使用 "read-image" 模型
+        result = runtime.infer(InferenceRequest(
+            model_id="read-image",
+            messages=[user_message],
+        ))
+
+        if not result.success:
+            return f"Error: VLM 推理失败: {result.error}"
+
+        # 提取助手回复
+        for msg in reversed(result.messages):
+            if msg.role == "assistant" and msg.content:
+                return msg.content
+
+        return "（VLM 未返回任何内容）"
+
+    return read_image
+
+
+READ_IMAGE_TOOL_CONFIG = ToolConfig(
+    tool_id="read_image",
+    tool_type="function",
+    name="read_image",
+    description=(
+        "通过 VLM（视觉语言模型）解读图片内容。"
+        "支持本地文件路径、HTTP(S) 链接或 base64 编码的图片。"
+        "适用于需要理解图片、识别图中文字、描述图像内容等场景。"
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "base64_contents": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "图片内容数组。每个元素可以是：本地文件路径（/path/to/img.png）、"
+                    "HTTP/HTTPS URL（https://...）、或 base64 编码字符串。"
+                ),
+            },
+            "prompt": {
+                "type": "string",
+                "description": (
+                    "图片理解的指令（可选）。例如：'描述这张图片'、'识别图中的文字'、"
+                    "'这张图片里有什么物体'。不提供则默认详细描述图片内容。"
+                ),
+            },
+        },
+        "required": ["base64_contents"],
+    },
+    builtin=True,
+)
+
+BUILTIN_TOOLS.append((READ_IMAGE_TOOL_CONFIG, None))  # callable 在 register_builtin_tools 中注入

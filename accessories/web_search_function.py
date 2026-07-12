@@ -38,7 +38,6 @@ from runtime import (
     Message,
 )
 
-SEARXNG_URL = os.environ.get("SEARXNG_URL", "http://pi:8080")
 SEARCH_TYPES = {
     "general",
     "images",
@@ -92,6 +91,8 @@ def searxng_search(query: str, num_results: int = 10, search_type: str = "genera
         "language": "zh-CN",
         "categories": search_type,
     })
+    
+    SEARXNG_URL = os.environ.get("SEARXNG_URL", "http://pi:8080")
     url = f"{SEARXNG_URL}/search?{params}"
 
     try:

@@ -165,11 +165,11 @@
       </div>
     {:else if msg.role === 'assistant'}
       {#if matchedAgent}
-        <IconDisplay 
-          value={matchedAgent.avatar || '🤖'} 
-          class="agent-avatar" 
-          size={32}
-        />
+          <IconDisplay 
+            value={matchedAgent.avatar || '🤖'} 
+            class="agent-avatar" 
+            size={32}
+          />
       {/if}
       <span class="agent-name">{displayName}</span>
       <div class="role-actions">
@@ -330,6 +330,7 @@
   }
   .agent-name {
     margin-right: auto;
+    font-size: 0.9rem;
   }
   .agent-avatar {
     width: 18px;

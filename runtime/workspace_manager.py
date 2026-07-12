@@ -605,18 +605,18 @@ class WorkspaceManager:
         
         return {"copied": copied, "errors": errors}
 
-    def resolve_upload_dir(self, target_dir_path: str) -> str:
+    def resolve_upload_dir(self, target_dir_path: str, restrict_workspace: bool = True) -> str:
         """Resolve an absolute selected upload directory inside the workspace."""
         if not isinstance(target_dir_path, str) or not target_dir_path.strip():
             raise ValueError("INVALID_TARGET_DIR: target_dir_path is required")
         target_dir = os.path.realpath(target_dir_path if os.path.isabs(target_dir_path) else os.path.join(self.workspace_path, target_dir_path))
-        if os.path.commonpath([self.workspace_path, target_dir]) != self.workspace_path:
+        if restrict_workspace and os.path.commonpath([self.workspace_path, target_dir]) != self.workspace_path:
             raise ValueError("INVALID_TARGET_DIR: target directory is outside workspace")
         if not os.path.isdir(target_dir):
             raise ValueError("INVALID_TARGET_DIR: target directory does not exist")
         return target_dir
 
-    def resolve_upload_target(self, target_path: str) -> str:
+    def resolve_upload_target(self, target_path: str, restrict_workspace: bool = True, base_dir: Optional[str] = None) -> str:
         if not isinstance(target_path, str) or not target_path.strip():
             raise ValueError("INVALID_TARGET_PATH: target_path is required")
 
@@ -628,14 +628,15 @@ class WorkspaceManager:
         if not parts or any(part in {'.', '..'} for part in parts):
             raise ValueError("INVALID_TARGET_PATH: path traversal is not allowed")
 
-        target_abs = os.path.realpath(os.path.join(self.workspace_path, *parts))
-        if os.path.commonpath([self.workspace_path, target_abs]) != self.workspace_path:
+        base = base_dir if not restrict_workspace and base_dir else self.workspace_path
+        target_abs = os.path.realpath(os.path.join(base, *parts))
+        if restrict_workspace and os.path.commonpath([self.workspace_path, target_abs]) != self.workspace_path:
             raise ValueError("INVALID_TARGET_PATH: target is outside workspace")
-        if target_abs == self.workspace_path:
+        if restrict_workspace and target_abs == self.workspace_path:
             raise ValueError("INVALID_TARGET_PATH: target cannot be workspace root")
         return target_abs
 
-    def create_upload_task(self, file_name: str, file_size: int, target_path: str, parallel_size: int, parallel_max_threads: int, target_dir_path: Optional[str] = None) -> Dict[str, Any]:
+    def create_upload_task(self, file_name: str, file_size: int, target_path: str, parallel_size: int, parallel_max_threads: int, target_dir_path: Optional[str] = None, restrict_workspace: bool = True) -> Dict[str, Any]:
         if not isinstance(file_name, str) or not file_name.strip():
             raise ValueError("INVALID_REQUEST: file_name is required")
         try:
@@ -645,9 +646,9 @@ class WorkspaceManager:
         if file_size < 0:
             raise ValueError("INVALID_REQUEST: file_size cannot be negative")
 
-        target_abs = self.resolve_upload_target(target_path)
+        target_abs = self.resolve_upload_target(target_path, restrict_workspace=restrict_workspace, base_dir=target_dir_path)
         if target_dir_path is not None:
-            target_dir_abs = self.resolve_upload_dir(target_dir_path)
+            target_dir_abs = self.resolve_upload_dir(target_dir_path, restrict_workspace=restrict_workspace)
             if os.path.commonpath([target_dir_abs, target_abs]) != target_dir_abs:
                 raise ValueError("INVALID_TARGET_PATH: target is outside selected directory")
         if os.path.isdir(target_abs):

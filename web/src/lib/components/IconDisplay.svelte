@@ -33,8 +33,12 @@
   // 处理后的配置
   let processed = $derived(processValue(value))
   
-  // 生成样式
-  let style = $derived(size ? `width: ${size}px; height: ${size}px;` : '')
+  // 生成样式：emoji 不设宽高让其自然继承字号水平展开，图片用固定宽高
+  let style = $derived.by(() => {
+    if (!size) return ''
+    if (processed.isEmoji) return `width: auto; height: auto;`
+    return `width: ${size}px; height: ${size}px;`
+  })
   
   // 判断是否为 URL/图片格式
   function isImageUrl(val) {
@@ -58,13 +62,14 @@
     return false
   }
   
-  // 判断是否为 emoji
+  // 判断是否为 emoji（纯 emoji 字符组成的短文本，含变体选择器和零宽连接符）
   function isEmoji(val) {
     if (!val || val.trim() === '') return false
     if (isImageUrl(val)) return false
     
-    // 短文本（≤4字符）且包含 emoji 字符
-    if (val.length <= 4 && /\p{Emoji}/u.test(val)) return true
+    // 全部由 emoji 相关字符组成（Emoji、修饰符、变体选择器、零宽连接符等）
+    // 长度放宽到 32 以支持多字符 emoji 序列（如 👨‍👩‍👧‍👦 等 ZWJ 序列可达 11 个码点）
+    if (val.length <= 32 && /^[\p{Emoji}\p{Emoji_Modifier}\p{Emoji_Component}\p{Emoji_Presentation}\u200D\uFE0F\u20E3]+$/u.test(val)) return true
     
     return false
   }
@@ -156,6 +161,8 @@
     align-items: center;
     justify-content: center;
     line-height: 1;
+    white-space: nowrap;
+    overflow: visible;
   }
   
   .icon-text {
