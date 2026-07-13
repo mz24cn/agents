@@ -253,7 +253,7 @@
     min-width: 240px;
     max-height: 400px;
     overflow-y: auto;
-    z-index: 10;
+    z-index: 100;
     box-shadow: 0 4px 12px rgba(0,0,0,0.15);
   }
   .agent-group {

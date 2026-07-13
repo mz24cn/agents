@@ -1335,6 +1335,8 @@
     border-bottom: 1px solid var(--border);
     background: var(--bg);
     align-items: center;
+    position: relative;
+    z-index: 100;
   }
   .selector-wrapper {
     display: flex;

@@ -501,6 +501,8 @@ def _make_delegate_fn(runtime, thread_local):
                     sub_cm._memory_store = {}  # 隔离 memory 缓存，避免污染父 context_manager
                     # persist 时使用不含父路径前缀的短 ID（最后一段）
                     short_sub_id = sub_session_id[len(session_id) + 1:]  # "sub_YYMMDD_HHmmss"
+                    sub_agent_ids = getattr(thread_local, "agent_ids", None) or None
+                    sub_model_id = model_id or getattr(thread_local, "model_id", None) or None
                     exc = persist_conversation(
                         context_manager=sub_cm,
                         session_id=short_sub_id,
@@ -508,6 +510,8 @@ def _make_delegate_fn(runtime, thread_local):
                         collected_messages=collected_msgs,
                         session_manager=None,  # sub session 不更新顶层 index
                         tool_ids=resolved_ids,
+                        agent_ids=sub_agent_ids,
+                        model_id=sub_model_id,
                         extra_meta={"parent_session_id": session_id},
                     )
                     if exc is not None:
@@ -2146,11 +2150,11 @@ SEARCH_CODE_TOOL_CONFIG = ToolConfig(
             },
             "include": {
                 "type": "string",
-                "description": "Optional glob pattern to restrict search to matching files. Multiple patterns can be separated by | (e.g. '*.svelte|*.js').",
+                "description": "Optional glob pattern to restrict search to matching file paths. Multiple patterns can be separated by | (e.g. '*.svelte|*.js' for file extensions, 'src/**' to limit to a directory, 'src/**/*.py' for specific files in a directory).",
             },
             "exclude": {
                 "type": "string",
-                "description": "Optional glob pattern to exclude files from search. Multiple patterns can be separated by | (e.g. '*.log|*.bak').",
+                "description": "Optional glob pattern to exclude matching file paths from the search. Multiple patterns can be separated by | (e.g. '*_test.py|*.pyc' to skip test files and bytecode, 'vendor/**' to skip a directory).",
             },
         },
         "required": ["query"],

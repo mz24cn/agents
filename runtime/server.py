@@ -1789,6 +1789,8 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             tool_scope=tool_scope,
             context_manager=context_manager,
             session_manager=self.server.session_manager,  # type: ignore[attr-defined]
+            agent_ids=agent_ids,
+            model_id=body["model_id"],
         )
 
         agent_nickname = agent.get("nickname") if agent else None

@@ -745,8 +745,34 @@ def _diff_bytes(before: bytes, after: bytes, before_name: str, after_name: str) 
     return "".join(difflib.unified_diff(before_lines, after_lines, fromfile=before_name, tofile=after_name))
 
 
+def _journal_dirs(session_dir: str) -> list[str]:
+    """Return ``file_journals`` directory paths for *session_dir* and its sub-sessions."""
+    dirs: list[str] = []
+    parent = os.path.join(session_dir, "file_journals")
+    if os.path.isdir(parent):
+        dirs.append(parent)
+    try:
+        for entry in os.listdir(session_dir):
+            if entry.startswith("sub_") and os.path.isdir(os.path.join(session_dir, entry)):
+                sub = os.path.join(session_dir, entry, "file_journals")
+                if os.path.isdir(sub):
+                    dirs.append(sub)
+    except OSError:
+        pass
+    return dirs
+
+
 def diff_journal_turn(session_dir: str, turn_key: str) -> str:
-    manifest_path = os.path.join(session_dir, "file_journals", turn_key, "manifest.json")
+    # Search parent and sub-session directories for the journal turn
+    manifest_path = None
+    for journals_dir in _journal_dirs(session_dir):
+        candidate = os.path.join(journals_dir, turn_key, "manifest.json")
+        if os.path.isfile(candidate):
+            manifest_path = candidate
+            break
+    if manifest_path is None:
+        # Legacy fallback
+        manifest_path = os.path.join(session_dir, "file_journals", turn_key, "manifest.json")
     if not os.path.isfile(manifest_path):
         return ""
     with open(manifest_path, "r", encoding="utf-8") as fh:
@@ -777,54 +803,64 @@ def get_file_journals_list(session_dir: str) -> list[str]:
 
     Only returns timestamps whose manifest is not revoked and contains at least
     one file entry with both baseline and after.
+
+    Also scans sub-session directories (``sub_*``) so that file changes made
+    by delegate / child agents are visible alongside the parent session's own
+    changes.
     """
-    journals_dir = os.path.join(session_dir, "file_journals")
-    if not os.path.isdir(journals_dir):
+    journals_dirs = _journal_dirs(session_dir)
+    if not journals_dirs:
         return []
+
+    seen: set[str] = set()
     timestamps: list[str] = []
-    for entry in sorted(os.listdir(journals_dir)):
-        manifest_path = os.path.join(journals_dir, entry, "manifest.json")
-        if not os.path.isfile(manifest_path):
-            continue
-        try:
-            with open(manifest_path, "r", encoding="utf-8") as fh:
-                manifest = json.load(fh)
-        except (OSError, ValueError):
-            continue
-        if manifest.get("revoked"):
-            continue
-        if not isinstance(manifest.get("files"), dict) or not manifest["files"]:
-            continue
-        has_changes = False
-        for _rel, entry_data in manifest["files"].items():
-            if isinstance(entry_data, dict) and "baseline" in entry_data and "after" in entry_data:
-                has_changes = True
-                break
-        if not has_changes:
-            continue
-        # Use the ISO timestamp from the manifest (matches msg.timestamp).
-        ts = manifest.get("timestamp")
-        if ts:
-            timestamps.append(ts)
+    for journals_dir in journals_dirs:
+        for entry in sorted(os.listdir(journals_dir)):
+            manifest_path = os.path.join(journals_dir, entry, "manifest.json")
+            if not os.path.isfile(manifest_path):
+                continue
+            try:
+                with open(manifest_path, "r", encoding="utf-8") as fh:
+                    manifest = json.load(fh)
+            except (OSError, ValueError):
+                continue
+            if manifest.get("revoked"):
+                continue
+            if not isinstance(manifest.get("files"), dict) or not manifest["files"]:
+                continue
+            has_changes = False
+            for _rel, entry_data in manifest["files"].items():
+                if isinstance(entry_data, dict) and "baseline" in entry_data and "after" in entry_data:
+                    has_changes = True
+                    break
+            if not has_changes:
+                continue
+            # Use the ISO timestamp from the manifest (matches msg.timestamp).
+            ts = manifest.get("timestamp")
+            if ts and ts not in seen:
+                seen.add(ts)
+                timestamps.append(ts)
     return timestamps
 
 
 def _find_journal_turn_dir(session_dir: str, timestamp: str) -> Optional[str]:
-    """Find the journal turn directory whose manifest has the given timestamp."""
-    journals_dir = os.path.join(session_dir, "file_journals")
-    if not os.path.isdir(journals_dir):
-        return None
-    for entry in os.listdir(journals_dir):
-        manifest_path = os.path.join(journals_dir, entry, "manifest.json")
-        if not os.path.isfile(manifest_path):
-            continue
-        try:
-            with open(manifest_path, "r", encoding="utf-8") as fh:
-                manifest = json.load(fh)
-        except (OSError, ValueError):
-            continue
-        if manifest.get("timestamp") == timestamp:
-            return os.path.join(journals_dir, entry)
+    """Find the journal turn directory whose manifest has the given timestamp.
+
+    Also searches sub-session directories (``sub_*``) so that diffs for
+    delegate / child-agent file changes can be retrieved.
+    """
+    for journals_dir in _journal_dirs(session_dir):
+        for entry in os.listdir(journals_dir):
+            manifest_path = os.path.join(journals_dir, entry, "manifest.json")
+            if not os.path.isfile(manifest_path):
+                continue
+            try:
+                with open(manifest_path, "r", encoding="utf-8") as fh:
+                    manifest = json.load(fh)
+            except (OSError, ValueError):
+                continue
+            if manifest.get("timestamp") == timestamp:
+                return os.path.join(journals_dir, entry)
     return None
 
 

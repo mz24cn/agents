@@ -607,7 +607,8 @@
   }
 
   // 渲染预览 HTML
-  function renderPreviewHtml(content, filename, forcePlainText = false) {
+  // filePath: 当前预览文件的绝对路径，用于解析 markdown 中相对路径的图片/资源
+  function renderPreviewHtml(content, filename, forcePlainText = false, filePath = '') {
     if (!content) return ''
     const renderCodeWithLines = (rawLines) => {
       const lineCount = rawLines.length
@@ -616,6 +617,40 @@
       const body = rawLines.join('\n')
       return `<div class="code-container" style="--digits:${digits}"><div class="line-gutter">${gutter}</div><pre class="code-body"><code>${body}</code></pre></div>`
     }
+
+    // 解析 markdown 文件所在目录，用于解决相对路径引用
+    function getMarkdownDir() {
+      if (!filePath) return ''
+      const normalized = filePath.replace(/\\/g, '/')
+      const lastSep = normalized.lastIndexOf('/')
+      return lastSep >= 0 ? normalized.slice(0, lastSep) : ''
+    }
+
+    // 将 markdown 中的图片/资源 src 解析为可访问的 API URL
+    function resolveResourceUrl(src) {
+      if (!src) return ''
+      // 外部链接（http/https）保持不变
+      if (/^https?:\/\//i.test(src)) return src
+      // data URI 保持不变
+      if (/^data:/i.test(src)) return src
+      // 绝对路径（以 / 开头）直接用 workspace API
+      if (src.startsWith('/')) return workspaceApi.content(src, false)
+      // 相对路径：相对于 markdown 文件所在目录解析
+      const dir = getMarkdownDir()
+      if (!dir) return src // 无法解析目录，保持原样
+      // 拼接并规范化路径
+      const parts = (dir + '/' + src).split('/')
+      const resolved = []
+      for (const p of parts) {
+        if (p === '.' || p === '') continue
+        if (p === '..') { resolved.pop(); continue }
+        resolved.push(p)
+      }
+      // Unix 绝对路径需要前导 /，Windows 路径（如 C:）已包含在 resolved[0]
+      const absolutePath = (filePath.startsWith('/') ? '/' : '') + resolved.join('/')
+      return workspaceApi.content(absolutePath, false)
+    }
+
     if (forcePlainText) {
       return renderCodeWithLines(content.split('\n').map(l => escapeHtml(l)))
     }
@@ -630,6 +665,11 @@
         renderer.link = function({ href, title, text }) {
           const titleAttr = title ? ` title="${title}"` : ''
           return `<a href="${href}"${titleAttr} target="_blank" rel="noopener noreferrer">${text}</a>`
+        }
+        renderer.image = function({ href, title, text }) {
+          const titleAttr = title ? ` title="${title}"` : ''
+          const src = resolveResourceUrl(href)
+          return `<img src="${src}" alt="${text}"${titleAttr} />`
         }
         return marked.parse(content, { renderer, gfm: true, breaks: true })
       } catch {
@@ -1670,7 +1710,7 @@
         {:else if previewFile.is_audio}
           <div class="preview-content"><audio src={workspaceApi.content(previewFile.path, false)} controls></audio></div>
         {:else if previewFile.is_text}
-          <div class="text-preview">{@html renderPreviewHtml(previewContent, previewFile.name, previewFile.forcePlainText)}</div>
+          <div class="text-preview">{@html renderPreviewHtml(previewContent, previewFile.name, previewFile.forcePlainText, previewFile.path)}</div>
         {/if}
       </div>
     {/if}
