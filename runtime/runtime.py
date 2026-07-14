@@ -21,7 +21,41 @@ _logger = logging.getLogger("runtime.runtime")
 # Socket timeout (seconds) for model API calls (connect + read).
 # Covers the entire lifecycle: TCP handshake, TLS negotiation, waiting for
 # first response bytes, and each subsequent read on streaming responses.
-_MODEL_API_TIMEOUT = int(os.environ.get("MODEL_API_TIMEOUT", "600"))
+# Read dynamically via _get_model_api_timeout() so runtime env changes are
+# picked up without restart.
+def _get_model_api_timeout() -> int:
+    """Return MODEL_API_TIMEOUT (seconds), read dynamically each call."""
+    try:
+        return int(os.environ.get("MODEL_API_TIMEOUT", "600"))
+    except (TypeError, ValueError):
+        return 600
+
+
+def _get_infer_round_timeout() -> Optional[float]:
+    """Return MODEL_INFER_ROUND_TIMEOUT (seconds), read dynamically each call.
+
+    Caps the wall-clock duration of a single model API request within the
+    inference loop.  When exceeded the runtime aborts the request, closing
+    the HTTP stream for streaming or relying on the socket timeout for
+    non-streaming.
+
+    Returns None when the guard is disabled (env var empty / unset / <= 0).
+    Default: 600 s (same as MODEL_API_TIMEOUT).
+    """
+    raw = os.environ.get("MODEL_INFER_ROUND_TIMEOUT", "600").strip()
+    if not raw:
+        return None
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        _logger.warning(
+            "invalid MODEL_INFER_ROUND_TIMEOUT=%r; using default 600s", raw,
+        )
+        return 600.0
+    if val <= 0:
+        return None
+    return val
+
 
 # Default User-Agent for outbound model API requests.
 # urllib.request auto-fills "Python-urllib/3.x" when no UA is set, and many
@@ -266,12 +300,17 @@ class Runtime:
 
             # Send HTTP request
             round_start = time.monotonic()
+            api_timeout = _get_model_api_timeout()
+            round_timeout = _get_infer_round_timeout()
+            effective_timeout = api_timeout
+            if round_timeout is not None:
+                effective_timeout = min(api_timeout, round_timeout)
             try:
                 headers.setdefault("User-Agent", _DEFAULT_USER_AGENT)
                 http_req = urllib.request.Request(
                     url, data=body_bytes, headers=headers, method="POST"
                 )
-                with urllib.request.urlopen(http_req, timeout=_MODEL_API_TIMEOUT) as http_resp:
+                with urllib.request.urlopen(http_req, timeout=effective_timeout) as http_resp:
                     response_data = http_resp.read()
             except urllib.error.HTTPError as exc:
                 error_body = ""
@@ -293,11 +332,11 @@ class Runtime:
                 reason = getattr(exc, "reason", exc)
                 is_timeout = isinstance(reason, socket.timeout) or "timed out" in str(reason).lower()
                 if is_timeout:
-                    _logger.error("infer timeout | url=%s timeout=%ds", url, _MODEL_API_TIMEOUT)
+                    _logger.error("infer timeout | url=%s timeout=%ds", url, effective_timeout)
                     return InferenceResult(
                         success=False,
                         messages=messages,
-                        error=f"Model API request timed out after {_MODEL_API_TIMEOUT}s",
+                        error=f"Model API request timed out after {effective_timeout}s",
                         error_code="TIMEOUT",
                     )
                 return InferenceResult(
@@ -884,7 +923,7 @@ class Runtime:
         overall_start = time.monotonic()
         while True:
             # Check cancel_event before each round (including before model API call)
-            # so we don't block for MODEL_API_TIMEOUT seconds after a forced abort.
+            # so we don't block on a long urlopen timeout after a forced abort.
             if cancel_event is not None and cancel_event.is_set():
                 yield Message(role="assistant", timestamp=_now_iso(), content="Error: user interrupted.")
                 return
@@ -901,11 +940,16 @@ class Runtime:
             )
 
             round_start = time.monotonic()
+            api_timeout = _get_model_api_timeout()
+            round_timeout = _get_infer_round_timeout()
+            effective_timeout = api_timeout
+            if round_timeout is not None:
+                effective_timeout = min(api_timeout, round_timeout)
             try:
                 headers.setdefault("User-Agent", _DEFAULT_USER_AGENT)
                 http_req = urllib.request.Request(
                     url, data=body_bytes, headers=headers, method="POST")
-                http_resp = urllib.request.urlopen(http_req, timeout=_MODEL_API_TIMEOUT)
+                http_resp = urllib.request.urlopen(http_req, timeout=effective_timeout)
             except urllib.error.HTTPError as exc:
                 error_body = ""
                 try:
@@ -926,9 +970,9 @@ class Runtime:
                 reason = getattr(exc, "reason", exc)
                 is_timeout = isinstance(reason, socket.timeout) or "timed out" in str(reason).lower()
                 if is_timeout:
-                    _logger.error("infer_stream timeout | url=%s timeout=%ds", url, _MODEL_API_TIMEOUT)
+                    _logger.error("infer_stream timeout | url=%s timeout=%ds", url, effective_timeout)
                     yield Message(role="assistant", timestamp=_now_iso(),
-                                  content=f"Error: model API request timed out after {_MODEL_API_TIMEOUT}s")
+                                  content=f"Error: model API request timed out after {effective_timeout}s")
                 else:
                     _logger.error("infer_stream connection error | url=%s err=%s", url, reason)
                     yield Message(role="assistant", timestamp=_now_iso(), content=f"Error: {exc}")
@@ -957,6 +1001,30 @@ class Runtime:
                         http_resp.close()
                         yield Message(role="assistant", timestamp=_now_iso(), content="Error: user interrupted.")
                         return
+
+                    # Per-round wall-clock guard (MODEL_INFER_ROUND_TIMEOUT).
+                    # Prevents runaway streaming loops where the model keeps
+                    # emitting tokens indefinitely without the socket ever
+                    # being idle long enough for the read timeout to fire.
+                    if round_timeout is not None:
+                        elapsed_round = time.monotonic() - round_start
+                        if elapsed_round > round_timeout:
+                            http_resp.close()
+                            _logger.error(
+                                "infer_stream round timeout | url=%s "
+                                "elapsed=%.1fs limit=%.1fs",
+                                url, elapsed_round, round_timeout,
+                            )
+                            yield Message(
+                                role="assistant",
+                                timestamp=_now_iso(),
+                                content=(
+                                    f"Error: model inference round timed out "
+                                    f"after {elapsed_round:.1f}s "
+                                    f"(limit: {round_timeout:.1f}s)"
+                                ),
+                            )
+                            return
 
                     # Intercept usage messages — accumulate, don't yield raw
                     if msg.role == "usage":
