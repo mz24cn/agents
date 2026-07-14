@@ -80,6 +80,8 @@
   let pageSize = 50
   // 树是否已初始化
   let treeInitialized = false
+  // 跟踪上次的工作区路径，用于检测外部变化
+  let trackedWorkspace = $state('')
   let uploadTasks = $state([])
   let uploadQueueRunning = false
   
@@ -224,6 +226,17 @@
 
   // 初始化：加载工作区根目录
   $effect(() => {
+    // 检测工作区路径是否从外部变化
+    if (workspacePath !== trackedWorkspace) {
+      trackedWorkspace = workspacePath
+      if (treeInitialized && workspacePath) {
+        // 工作区变化，重置状态以便重新加载
+        treeInitialized = false
+        currentPath = ''
+        treeNodes = []
+      }
+    }
+
     if (open && workspacePath) {
       if (!currentPath) {
         currentPath = workspacePath
@@ -234,9 +247,7 @@
         initTree(workspacePath)
       }
     }
-    if (!open) {
-      treeInitialized = false
-    }
+    // 面板关闭时不再重置 treeInitialized，保留树状态以便再次打开时即时显示
   })
 
   // 加载文件列表
@@ -441,6 +452,7 @@
 
   // 设置目录为新工作区
   function setAsWorkspace(dirPath) {
+    trackedWorkspace = dirPath   // 防止 $effect 重复触发
     workspacePath = dirPath
     currentPath = dirPath
     page = 1
@@ -1450,8 +1462,7 @@
   }
 </script>
 
-{#if open}
-  <div class="workspace-panel">
+<div class="workspace-panel" style="display: {open ? '' : 'none'}">
     <!-- 顶栏 -->
     <div class="panel-header">
       <div class="header-left">
@@ -1526,8 +1537,6 @@
           </button>
         {/if}
         
-        <!-- 关闭按钮 -->
-        <button class="panel-close" onclick={() => { onClose?.(); hideContextMenu() }}>✕</button>
       </div>
     </div>
 
@@ -1715,7 +1724,6 @@
       </div>
     {/if}
   </div>
-{/if}
 
 <!-- 右键菜单和背景层：放在组件根级别，避免被 panel 的层叠上下文限制 -->
 {#if contextMenu.visible}

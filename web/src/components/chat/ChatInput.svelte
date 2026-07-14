@@ -2,7 +2,7 @@
   import { onDestroy, tick } from 'svelte'
   import { t } from '../../lib/i18n.svelte.js'
 
-  let { disabled = false, onSend, onStop, onStopForce, onOpenTemplatePanel, onOpenWorkspacePanel, text = $bindable(''), isStreaming = false, selectedAgentIds = [], agentList = [] } = $props()
+  let { disabled = false, onSend, onStop, onStopForce, onToggleTemplatePanel, onToggleWorkspacePanel, workspacePanelOpen = false, templatePanelOpen = false, text = $bindable(''), isStreaming = false, selectedAgentIds = [], agentList = [] } = $props()
 
   let editorEl = $state(null)
   let lastRenderedText = ''
@@ -370,21 +370,32 @@
     {/if}
   </div>
   <div class="btn-stack">
-    <!-- 工作区文件管理器按钮 -->
+    <!-- 工作区文件管理器按钮：打开时显示减号，关闭时显示加号 -->
     <button
       class="send-btn workspace-btn"
-      onclick={() => onOpenWorkspacePanel?.()}
+      class:active={workspacePanelOpen}
+      onclick={() => onToggleWorkspacePanel?.()}
       title={t('workspaceFileManager')}
       disabled={disabled}
     >
-      +
+      {workspacePanelOpen ? '−' : '+'}
     </button>
     
-    {#if showTemplateBtn}
+    {#if templatePanelOpen}
+      <!-- 提示词面板打开时显示叉号关闭按钮 -->
+      <button
+        class="send-btn template-btn active"
+        onclick={() => onToggleTemplatePanel?.()}
+        title={t('promptTemplatePanelTitle')}
+        disabled={disabled}
+      >
+        ✕
+      </button>
+    {:else if showTemplateBtn}
       <!-- 输入框为空时显示"?"提示词模板按钮 -->
       <button
         class="send-btn template-btn"
-        onclick={() => onOpenTemplatePanel?.()}
+        onclick={() => onToggleTemplatePanel?.()}
         title={t('promptTemplatePanelTitle')}
         disabled={disabled}
       >
@@ -555,6 +566,13 @@
     font-weight: 700;
   }
   .send-btn.template-btn:hover:not(:disabled) {
+    background: var(--primary);
+    color: #fff;
+    border-color: var(--primary);
+  }
+  /* Active state when panel is open */
+  .send-btn.workspace-btn.active,
+  .send-btn.template-btn.active {
     background: var(--primary);
     color: #fff;
     border-color: var(--primary);

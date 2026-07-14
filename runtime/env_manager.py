@@ -428,6 +428,11 @@ echo "  app:    $AGENT_SERVICE_HOME" >&2
 echo "  config: $AGENTS_RUNTIME_DIR" >&2
 echo "  log:    $AGENT_SERVICE_LOG" >&2
 
+if [ -d "$AGENTS_RUNTIME_DIR/patch" ]; then
+  echo "Applying patch from $AGENTS_RUNTIME_DIR/patch..." >&2
+  cp -r "$AGENTS_RUNTIME_DIR/patch"/. "$AGENT_SERVICE_HOME"/ 2>/dev/null || true
+fi
+
 case "$START_AGENT_SERVICE" in
   background)
     pid=$("$PWD/start-agent-service.sh")
@@ -570,6 +575,12 @@ exit 0
             "    Write-Host \"  app:    $AgentServiceHome\"\n"
             "    Write-Host \"  config: $($env:AGENTS_RUNTIME_DIR)\"\n"
             "    Write-Host \"  log:    $logFile\"\n"
+            "\n"
+            "    $patchDir = Join-Path $env:AGENTS_RUNTIME_DIR 'patch'\n"
+            "    if (Test-Path $patchDir) {\n"
+            "        Write-Host \"Applying patch from $patchDir...\"\n"
+            "        Copy-Item -Path (Join-Path $patchDir '*') -Destination $AgentServiceHome -Recurse -Force -ErrorAction SilentlyContinue\n"
+            "    }\n"
             "\n"
             "    if ($env:START_AGENT_SERVICE -eq 'background') {\n"
             "        $proc = Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', 'start-agent-service.bat' -PassThru -WindowStyle Hidden\n"

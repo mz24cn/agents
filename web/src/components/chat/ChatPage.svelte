@@ -258,25 +258,17 @@
   let selectedAgentId = $derived(selectedAgentIds.length === 1 ? selectedAgentIds[0] : '') // 向后兼容单选场景
   let loadingAgents = $derived(catalog.agents.loading && !catalog.agents.loaded)
 
-  function openTemplatePanel() {
-    templatePanelOpen = true
-  }
-
-  function closeTemplatePanel() {
-    templatePanelOpen = false
+  function toggleTemplatePanel() {
+    templatePanelOpen = !templatePanelOpen
   }
 
   // 工作区文件管理器相关函数
-  function openWorkspacePanel() {
-    workspacePanelOpen = true
+  function toggleWorkspacePanel() {
+    workspacePanelOpen = !workspacePanelOpen
     // 从环境变量获取工作区路径
-    if (!workspacePath) {
+    if (workspacePanelOpen && !workspacePath) {
       fetchWorkspacePath()
     }
-  }
-
-  function closeWorkspacePanel() {
-    workspacePanelOpen = false
   }
 
   async function fetchWorkspacePath() {
@@ -310,7 +302,7 @@
     // 将文件路径添加到输入框，使用 <file> 标签避免和前后文本粘连，后端会解析该标签
     const fileRefs = files.map(f => `<file>${f.relative_path}</file>`).join(' ')
     inputText = inputText ? `${inputText} ${fileRefs}` : fileRefs
-    closeWorkspacePanel()
+    workspacePanelOpen = false
   }
 
   function handleTemplatePanelSelect(result) {
@@ -355,22 +347,22 @@
   function handleApplyAsSystem(finalText) {
     systemPromptText = finalText
     systemPromptTemplate = null
-    closeTemplatePanel()
+    templatePanelOpen = false
   }
 
   function handleApplyAsSystemTemplate(templateId, args) {
     systemPromptTemplate = { template_id: templateId, arguments: args }
     systemPromptText = ''
-    closeTemplatePanel()
+    templatePanelOpen = false
   }
 
   function handleApplyAsUserTemplate(templateId, args) {
-    closeTemplatePanel()
+    templatePanelOpen = false
     handleSendTemplate(templateId, args)
   }
 
   function handleApplyAsUserSend(finalText) {
-    closeTemplatePanel()
+    templatePanelOpen = false
     handleSend(finalText)
   }
 
@@ -937,11 +929,16 @@
           selectedToolIds = meta.tool_ids
           localStorage.setItem(STORAGE_TOOLS_KEY, JSON.stringify(meta.tool_ids))
         }
-        // 恢复工作区路径
-        workspacePath = meta.workspace || defaultWorkspacePath
+        // 恢复工作区路径（仅当不同于当前设置时才触发更新）
+        const newWorkspace = meta.workspace || defaultWorkspacePath
+        if (newWorkspace && newWorkspace !== workspacePath) {
+          workspacePath = newWorkspace
+        }
       } else {
         // 无 meta 的旧会话，工作区回退到默认值
-        workspacePath = defaultWorkspacePath
+        if (defaultWorkspacePath && defaultWorkspacePath !== workspacePath) {
+          workspacePath = defaultWorkspacePath
+        }
         // 向下兼容：从最后一条 assistant 消息恢复 assistant_id
         const lastAssistantMsg = [...msgs].reverse().find(m => m.role === 'assistant')
         if (lastAssistantMsg?.assistant_ids && Array.isArray(lastAssistantMsg.assistant_ids)) {
@@ -1113,7 +1110,7 @@
       <ToolSelector bind:selectedToolIds onchange={(ids) => localStorage.setItem(STORAGE_TOOLS_KEY, JSON.stringify(ids))} disabled={selectedAgentIds.length > 0} />
     </div>
     {#if isWorkspaceCustom}
-      <div class="workspace-indicator" title={workspacePath} onclick={openWorkspacePanel}>
+      <div class="workspace-indicator" title={workspacePath} onclick={toggleWorkspacePanel}>
         <span class="workspace-icon">📁</span>
         <span class="workspace-path" bind:this={pathEl}></span>
       </div>
@@ -1238,19 +1235,16 @@
     <div class="message-list-container" class:hidden={terminalVisible}>
       <MessageList {messages} {agentList} onRevoke={handleRevoke} onScrollAtBottom={handleScrollAtBottom} {shouldScrollToBottom} {collapsedGroups} onToggleCollapse={toggleCollapse} {fileJournalTurnKeys} {fileDiffCache} {fileDiffVisible} onToggleFileDiff={handleToggleFileDiff} />
 
-      {#if workspacePanelOpen}
-        <WorkspaceFileManager
-          bind:open={workspacePanelOpen}
-          bind:workspacePath={workspacePath}
-          onWorkspaceChange={handleWorkspaceChange}
-          onSelectFiles={handleSelectFiles}
-          onClose={closeWorkspacePanel}
-        />
-      {/if}
+      <WorkspaceFileManager
+        bind:open={workspacePanelOpen}
+        bind:workspacePath={workspacePath}
+        onWorkspaceChange={handleWorkspaceChange}
+        onSelectFiles={handleSelectFiles}
+        onClose={toggleWorkspacePanel}
+      />
     </div>
 
-    {#if templatePanelOpen}
-      <div class="template-panel">
+    <div class="template-panel" class:hidden={!templatePanelOpen}>
         <div class="panel-header">
           <!-- 标题 -->
           📝<a href="#/setup?tab=prompts" class="nav-link">{t('promptTemplatePanelTitle')}</a>
@@ -1269,7 +1263,6 @@
               <button class="btn btn-primary" onclick={() => handleHeaderApply('user')}>{t('applyAsUserSend')}</button>
             {/if}
           </div>
-          <button class="panel-close" onclick={closeTemplatePanel}>✕</button>
         </div>
         <div class="panel-body">
           <!-- 左侧：模板内容预览 + 占位符输入 -->
@@ -1301,7 +1294,6 @@
           </div>
         </div>
       </div>
-    {/if}
   </div>
 
   <ChatInput
@@ -1309,8 +1301,10 @@
     onSend={handleSend}
     onStop={handleStop}
     onStopForce={handleStopForce}
-    onOpenTemplatePanel={openTemplatePanel}
-    onOpenWorkspacePanel={openWorkspacePanel}
+    onToggleTemplatePanel={toggleTemplatePanel}
+    onToggleWorkspacePanel={toggleWorkspacePanel}
+    bind:workspacePanelOpen
+    bind:templatePanelOpen
     {isStreaming}
     bind:text={inputText}
     {selectedAgentIds}
@@ -1533,6 +1527,9 @@
     flex-direction: column;
     box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.12);
     z-index: 10;
+  }
+  .template-panel.hidden {
+    display: none;
   }
 
   .panel-header {
