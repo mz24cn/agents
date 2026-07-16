@@ -628,7 +628,8 @@ class WorkspaceManager:
         if not parts or any(part in {'.', '..'} for part in parts):
             raise ValueError("INVALID_TARGET_PATH: path traversal is not allowed")
 
-        base = base_dir if not restrict_workspace and base_dir else self.workspace_path
+        # 始终以 base_dir（前端当前目录）为基准解析 target_path，目录合法性通过 resolve_upload_dir 保证
+        base = base_dir if base_dir else self.workspace_path
         target_abs = os.path.realpath(os.path.join(base, *parts))
         if restrict_workspace and os.path.commonpath([self.workspace_path, target_abs]) != self.workspace_path:
             raise ValueError("INVALID_TARGET_PATH: target is outside workspace")

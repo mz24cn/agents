@@ -359,8 +359,6 @@ def _find_location_by_image(base64_big: str, base64_small: str) -> list[dict]:
 server = FastMCP(
     "ocr",
     instructions="OCR 服务：基于 PaddleOCR 的文字识别和定位，支持 base64 图片输入",
-    host="0.0.0.0",
-    port=8000,
 )
 
 
@@ -671,13 +669,6 @@ def find_location(
     }, ensure_ascii=False)
 
 
-def create_mcp_server(host: str = "0.0.0.0", port: int = 8000) -> FastMCP:
-    """创建或配置 MCP server 实例并返回"""
-    # 更新全局 server 的配置
-    server.settings.host = host
-    server.settings.port = port
-    return server
-
 
 def main():
     """主入口函数，供 uvx 和命令行调用"""
@@ -723,10 +714,7 @@ def main():
         logger.info(f"挂载路径: {args.mount_path}")
         logger.info(f"访问地址: http://{args.host}:{args.port}{args.mount_path}")
 
-    # 配置 MCP server（设置 host 和 port）
-    mcp = create_mcp_server(host=args.host, port=args.port)
-
-    mcp.run(transport=args.transport)
+    server.run(transport=args.transport, host=args.host, port=args.port, path=args.mount_path)
 
 
 if __name__ == "__main__":

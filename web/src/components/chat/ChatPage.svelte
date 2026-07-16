@@ -1262,6 +1262,7 @@
               <button class="btn btn-secondary" onclick={() => handleHeaderApply('system')}>{t('applyAsSystem')}</button>
               <button class="btn btn-primary" onclick={() => handleHeaderApply('user')}>{t('applyAsUserSend')}</button>
             {/if}
+            <button class="panel-close" onclick={toggleTemplatePanel} title={t('close')}>✕</button>
           </div>
         </div>
         <div class="panel-body">

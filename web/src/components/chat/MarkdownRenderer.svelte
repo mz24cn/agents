@@ -71,8 +71,15 @@
   const renderer = new marked.Renderer()
 
   // Code blocks: render with language label, syntax highlighting, and copy button
+  // Mermaid diagrams are rendered asynchronously in the $effect below (dynamic import)
   renderer.code = function ({ text, lang }) {
-    const normalizedLang = lang || ''
+    const normalizedLang = (lang || '').toLowerCase()
+    // Mermaid: output placeholder; actual rendering happens in $effect via dynamic import()
+    if (normalizedLang === 'mermaid') {
+      const encoded = btoa(unescape(encodeURIComponent(text)))
+      const escaped = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      return `<div class="code-block mermaid-placeholder" data-mermaid-code="${encoded}"><pre><code>${escaped}</code></pre></div>`
+    }
     const highlightedHtml = highlight(text, normalizedLang)
     const rawBase64 = btoa(unescape(encodeURIComponent(text)))
     const langLabel = normalizedLang
@@ -111,11 +118,22 @@
 
   let markdownContainer
 
+  // Encode mermaid code for mermaid.ink API (base64url, no pako needed for typical diagrams)
+  function encodeForMermaidInk(code) {
+    try {
+      const raw = unescape(encodeURIComponent(code))
+      return btoa(raw).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+    } catch {
+      return ''
+    }
+  }
+
   $effect(() => {
     void html
     if (!markdownContainer) return
     Promise.resolve().then(() => {
       if (!markdownContainer) return
+      // --- Copy button bindings ---
       const buttons = markdownContainer.querySelectorAll('[data-copy-btn]')
       buttons.forEach((btn) => {
         if (btn.dataset.copyBound) return
@@ -131,6 +149,22 @@
           }
         })
       })
+      // --- Mermaid rendering via mermaid.ink (zero local deps) ---
+      const placeholders = markdownContainer.querySelectorAll('.mermaid-placeholder:not([data-mermaid-rendered])')
+      for (const el of placeholders) {
+        el.dataset.mermaidRendered = '1'
+        const code = decodeURIComponent(escape(atob(el.dataset.mermaidCode)))
+        const encoded = encodeForMermaidInk(code)
+        if (!encoded) { el.classList.add('mermaid-error'); continue }
+        const url = `https://mermaid.ink/svg/${encoded}`
+        fetch(url)
+          .then(r => { if (!r.ok) throw new Error(r.status); return r.text() })
+          .then(svg => {
+            el.innerHTML = svg
+            el.classList.add('mermaid-rendered')
+          })
+          .catch(() => { el.classList.add('mermaid-error') })
+      }
     })
   })
 </script>
@@ -301,5 +335,29 @@
   .markdown-content :global(img) {
     max-width: 100%;
     border-radius: 4px;
+  }
+
+  /* Mermaid diagram containers */
+  .markdown-content :global(.mermaid-placeholder) {
+    display: flex;
+    justify-content: center;
+  }
+  .markdown-content :global(.mermaid-rendered) {
+    display: flex;
+    justify-content: center;
+    padding: 0.6em 0;
+    overflow-x: auto;
+  }
+  .markdown-content :global(.mermaid-rendered svg) {
+    max-width: 100%;
+    height: auto;
+  }
+  .markdown-content :global(.mermaid-error) {
+    opacity: 0.7;
+  }
+  .markdown-content :global(.mermaid-error)::after {
+    content: ' ⚠';
+    color: #f78c6c;
+    font-size: 0.8em;
   }
 </style>

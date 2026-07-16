@@ -1103,26 +1103,14 @@
       .join('/')
   }
 
-  function joinUploadPath(...parts) {
-    return parts.map(normalizeUploadPath).filter(Boolean).join('/')
-  }
-
-  function relativeDirForPath(dirPath) {
-    const normalizedCurrent = dirPath.replace(/\\/g, '/').replace(/\/$/, '')
-    const normalizedWorkspace = workspacePath.replace(/\\/g, '/').replace(/\/$/, '')
-    if (pathsEqual(normalizedCurrent, normalizedWorkspace)) return ''
-    if (!pathStartsWith(normalizedWorkspace, normalizedCurrent)) return null
-    return normalizeUploadPath(normalizedCurrent.slice(normalizedWorkspace.length + 1))
-  }
-
   function makeUploadEntries(files, useRelativePath = false, targetDirPath = currentPath) {
-    const baseDir = relativeDirForPath(targetDirPath)
-    if (baseDir === null) return []
+    // target_dir_path 已作为 base_dir 发送到后端，target_path 只需文件名即可
+    if (!isInsideWorkspacePath(targetDirPath)) return []
     return files.map((file) => {
       const relativeName = useRelativePath && file.webkitRelativePath ? file.webkitRelativePath : file.name
       return {
         file,
-        targetPath: joinUploadPath(baseDir, relativeName),
+        targetPath: normalizeUploadPath(relativeName),
       }
     }).filter((entry) => entry.targetPath)
   }
@@ -1537,6 +1525,7 @@
           </button>
         {/if}
         
+        <button class="panel-close" onclick={() => onClose?.()} title={t('close')}>✕</button>
       </div>
     </div>
 
