@@ -325,7 +325,7 @@ class ToolRegistry:
                     import sys as _sys
                     _mod_name = f"_dynamic_tool_{hash(config.function_file_path)}"
                     _sys.modules.pop(_mod_name, None)
-                    _spec = _ilu.spec_from_file_location(_mod_name, config.function_file_path)
+                    _spec = _ilu.spec_from_file_location(_mod_name, os.path.expanduser(config.function_file_path))
                     if _spec and _spec.loader:
                         _mod = _ilu.module_from_spec(_spec)
                         _sys.modules[_mod_name] = _mod

@@ -281,6 +281,7 @@ from runtime.common import DATA_DIR as _DATA_DIR, set_request_context, get_reque
 
 def _load_function_from_file(file_path: str, func_name: str) -> Callable:
     """从指定 .py 文件动态加载函数，每次调用都重新从磁盘读取。"""
+    file_path = os.path.expanduser(file_path)
     module_name = f"_dynamic_tool_{hash(file_path)}"
     if module_name in sys.modules:
         del sys.modules[module_name]
@@ -2480,7 +2481,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         if config.tool_type == "function" and config.function_file_path and config.function_name:
             try:
                 callable_fn = _load_function_from_file(
-                    config.function_file_path, config.function_name
+                    os.path.expanduser(config.function_file_path), config.function_name
                 )
             except (FileNotFoundError, AttributeError, TypeError, RuntimeError) as exc:
                 logger.error("加载函数工具失败 [tool_id=%s]: %s", config.tool_id, exc, exc_info=True)
@@ -2620,12 +2621,21 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         if config.tool_type == "function" and config.function_file_path and config.function_name:
             try:
                 callable_fn = _load_function_from_file(
-                    config.function_file_path, config.function_name
+                    os.path.expanduser(config.function_file_path), config.function_name
                 )
             except (FileNotFoundError, AttributeError, TypeError, RuntimeError) as exc:
                 logger.error("更新函数工具失败 [tool_id=%s]: %s", tool_id, exc, exc_info=True)
                 self._send_json_error(400, f"加载函数失败: {exc}")
                 return
+
+        # For skill tools, reload skill in skill_manager if skill_dir is provided
+        if config.tool_type == "skill" and config.skill_dir:
+            skill_manager = runtime._skill_manager
+            if skill_manager is not None:
+                try:
+                    skill_manager.load_skill(config.skill_dir)
+                except ValueError:
+                    pass  # best-effort reload; config change is still persisted
 
         if config.tool_id != tool_id:
             runtime._tool_registry.remove(tool_id)

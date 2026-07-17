@@ -104,7 +104,7 @@ class SkillManager:
         5. Returns the Skill's ToolConfig
 
         Args:
-            skill_dir: Path to the skill directory.
+            skill_dir: Path to the skill directory (supports ~ expansion).
 
         Returns:
             The Skill's ToolConfig.
@@ -112,9 +112,10 @@ class SkillManager:
         Raises:
             ValueError: If SKILL.md is missing or malformed.
         """
-        skill_md_path = os.path.join(skill_dir, "SKILL.md")
+        expanded_dir = os.path.expanduser(skill_dir)
+        skill_md_path = os.path.join(expanded_dir, "SKILL.md")
         if not os.path.isfile(skill_md_path):
-            raise ValueError(f"SKILL.md not found in {skill_dir}")
+            raise ValueError(f"SKILL.md not found in {expanded_dir}")
 
         with open(skill_md_path, "r", encoding="utf-8") as f:
             content = f.read()
@@ -123,7 +124,8 @@ class SkillManager:
         skill_name = metadata["name"]
         description = metadata["description"]
 
-        # Generate Skill ToolConfig (lightweight — only name + description)
+        # Persist the original user-provided path (may contain ~/) for portability;
+        # store the expanded absolute path in memory for runtime use.
         skill_tool_config = ToolConfig(
             tool_id=f"skill-{skill_name}",
             tool_type="skill",
@@ -134,7 +136,7 @@ class SkillManager:
                 "properties": {},
                 "required": [],
             },
-            skill_dir=os.path.abspath(skill_dir),
+            skill_dir=skill_dir,
         )
         self._tool_registry.register(skill_tool_config)
 
@@ -142,7 +144,7 @@ class SkillManager:
         self._skills[skill_name] = {
             "metadata": metadata,
             "body": body,
-            "skill_dir": os.path.abspath(skill_dir),
+            "skill_dir": os.path.abspath(expanded_dir),
             "tool_config": skill_tool_config,
         }
 

@@ -456,12 +456,12 @@ const translations = {
     toolNamePlaceholder: '例如: Bash 命令执行',
     toolDescPlaceholder: '工具功能描述',
     parametersPlaceholder: '{"type": "object", "properties": {}}',
-    functionFilePathPlaceholder: '例如: /home/user/tools/my_tools.py 或 ./tools/my_tools.py',
-    functionFilePathHint: '支持绝对路径或相对路径（相对于服务器工作目录）',
+    functionFilePathPlaceholder: '例如: ~/tools/my_tools.py 或 /home/user/tools/my_tools.py 或 ./tools/my_tools.py',
+    functionFilePathHint: '支持 ~/ 开头的用户目录、绝对路径或相对路径（相对于服务器工作目录）',
     functionNamePlaceholder: '例如: searxng_search',
     functionNameHint: 'py 文件中的函数名，注册时将从文件动态加载',
-    skillDirPlaceholder: '例如: /home/user/skills/my_skill 或 ./skills/my_skill',
-    skillDirHint: '文件夹内须包含 SKILL.md，名称和描述将从其 front-matter 自动读取',
+    skillDirPlaceholder: '例如: ~/skills/my_skill 或 /home/user/skills/my_skill 或 ./skills/my_skill',
+    skillDirHint: '文件夹内须包含 SKILL.md（配置名称和描述），路径支持 ~/ 开头的用户目录',
     mcpConfigHint: '支持 stdio（command）和 HTTP（url）两种模式，可一次配置多个 MCP server，工具将在首次调用时自动启动',
 
     // ToolsPage
@@ -929,12 +929,12 @@ const translations = {
     toolNamePlaceholder: 'e.g. Bash Command Runner',
     toolDescPlaceholder: 'Describe what this tool does',
     parametersPlaceholder: '{"type": "object", "properties": {}}',
-    functionFilePathPlaceholder: 'e.g. /home/user/tools/my_tools.py or ./tools/my_tools.py',
-    functionFilePathHint: 'Supports absolute or relative paths (relative to server working directory)',
+    functionFilePathPlaceholder: 'e.g. ~/tools/my_tools.py or /home/user/tools/my_tools.py or ./tools/my_tools.py',
+    functionFilePathHint: 'Supports ~/ home directory, absolute or relative paths (relative to server working directory)',
     functionNamePlaceholder: 'e.g. searxng_search',
     functionNameHint: 'Function name in the .py file, loaded dynamically on registration',
-    skillDirPlaceholder: 'e.g. /home/user/skills/my_skill or ./skills/my_skill',
-    skillDirHint: 'Directory must contain SKILL.md; name and description are read from its front-matter',
+    skillDirPlaceholder: 'e.g. ~/skills/my_skill or /home/user/skills/my_skill or ./skills/my_skill',
+    skillDirHint: 'Directory must contain SKILL.md; name and description are read from its front-matter. Supports ~/ home directory paths',
     mcpConfigHint: 'Supports stdio (command) and HTTP (url) modes; multiple servers can be configured at once and tools start automatically on first call',
 
     // ToolsPage

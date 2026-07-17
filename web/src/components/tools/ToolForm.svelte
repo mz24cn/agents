@@ -99,8 +99,8 @@
         }
       } else if (tool_type === 'skill') {
         if (isEdit) {
-          // Edit existing skill tool: update labels and other fields
-          const config = { tool_type: 'skill', labels: parsedLabels }
+          // Edit existing skill tool: update skill_dir, labels, and other fields
+          const config = { tool_type: 'skill', labels: parsedLabels, skill_dir: skill_dir.trim() }
           await tools.update(_init.tool_id, config)
         } else {
           // Create new skill tool

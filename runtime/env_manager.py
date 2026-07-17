@@ -295,9 +295,9 @@ class EnvManager:
                 continue
             for key in ("function_file_path", "skill_dir"):
                 pth = tool.get(key)
-                if not pth or not os.path.exists(pth):
+                if not pth or not os.path.exists(os.path.expanduser(pth)):
                     continue
-                real = os.path.realpath(pth)
+                real = os.path.realpath(os.path.expanduser(pth))
                 try:
                     common = os.path.commonpath([package_root_real, real])
                 except ValueError:

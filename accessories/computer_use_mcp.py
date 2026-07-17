@@ -7,9 +7,11 @@ Computer Use MCP Server
     # Python 包（所有平台）
     pip install fastmcp pyautogui
 
-    # 仅 Ubuntu/Debian：tkinter 被拆为独立包，需额外安装。
-    # Windows / macOS 的 Python 发行版自带 tkinter，无需此步骤。
+    # 仅 Ubuntu/Debian：tkinter 被拆为独立包，需额外安装。Windows/macOS 自带。
     sudo apt-get install python3-tk
+
+    # Wayland 桌面需额外依赖（用于输入注入，自动编译 C 守护进程）
+    sudo apt-get install build-essential pkg-config libei-dev libglib2.0-dev
 
 功能：
 1. get_screen_size - 获取屏幕尺寸
@@ -61,21 +63,58 @@ import urllib.error
 from typing import List, Dict, Optional
 
 
+def _find_xauth_file():
+    """找到当前 DISPLAY 对应的 Xauthority 文件路径。
+
+    优先从 Xwayland 进程命令行中提取（避免 $XAUTHORITY 过期），
+    其次用环境变量，最后 fallback 到 ~/.Xauthority。
+    """
+    display = os.environ.get('DISPLAY', '')
+    if not display:
+        return None
+
+    # 方法1：从 Xwayland 进程参数中解析 -auth 参数（最可靠）
+    try:
+        result = subprocess.run(
+            ['pgrep', '-a', 'Xwayland'],
+            capture_output=True, text=True, timeout=3
+        )
+        for line in result.stdout.strip().split('\n'):
+            if display in line:
+                import re
+                m = re.search(r'-auth\s+(\S+)', line)
+                if m:
+                    return m.group(1)
+    except Exception:
+        pass
+
+    # 方法2：环境变量
+    xauth = os.environ.get('XAUTHORITY')
+    if xauth:
+        return xauth
+
+    # 方法3：默认路径
+    return os.path.expanduser('~/.Xauthority')
+
+
 def _fix_xauth():
     """修复 Linux Xwayland 下 python3-xlib 的 xauth 认证问题。
 
     Xwayland 生成的 Xauthority 文件中 display number 可能为空字符串，
     而 python3-xlib 用严格匹配（如 b'1' 匹配 :1），导致认证失败。
-    这里通过 xauth add 补一条带正确 display number 的条目。
+    这里自动发现正确的 Xauthority 文件，并补一条带 display number 的条目。
 
-    仅在 Linux 上执行；Windows/macOS 的 pyautogui 使用原生 API，不需要 X11。
+    仅在 Linux 上执行；Windows/macOS 的 pyautogui 使用原生 API。
     """
     if sys.platform != 'linux':
         return
 
-    xauth_file = os.environ.get('XAUTHORITY')
     display = os.environ.get('DISPLAY', '')
     if not display:
+        return
+
+    xauth_file = _find_xauth_file()
+    if not xauth_file:
         return
 
     display_num = display.lstrip(':').split('.')[0]
@@ -92,6 +131,12 @@ def _fix_xauth():
         # 检查是否已有带正确 display number 的条目
         for line in output.split('\n'):
             if display in line.split()[0]:
+                # 条目正确，但确保 python3-xlib 能读到正确的文件
+                if os.environ.get('XAUTHORITY') != xauth_file:
+                    os.environ['XAUTHORITY'] = xauth_file
+                    logging.getLogger(__name__).info(
+                        'XAUTHORITY updated: %s', xauth_file
+                    )
                 return
 
         # 从现有条目取 cookie，补一条带 display number 的
@@ -101,12 +146,14 @@ def _fix_xauth():
             protocol, cookie = parts[1], parts[2]
             hostname = os.uname().nodename
             subprocess.run(
-                ['xauth', 'add', f'{hostname}/unix:{display_num}',
-                 protocol, cookie],
+                ['xauth', '-f', xauth_file, 'add',
+                 f'{hostname}/unix:{display_num}', protocol, cookie],
                 capture_output=True, timeout=5
             )
+            os.environ['XAUTHORITY'] = xauth_file
             logging.getLogger(__name__).info(
-                'Xauthority fixed: added display :%s entry', display_num
+                'Xauthority fixed: added display :%s entry, updated env to %s',
+                display_num, xauth_file
             )
     except Exception:
         pass
@@ -114,17 +161,52 @@ def _fix_xauth():
 
 _fix_xauth()
 
-from fastmcp import FastMCP  # noqa: E402
-import pyautogui  # noqa: E402
-
-# 配置日志
+# 配置日志——必须在任何可能抛异常的导入前完成
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+from fastmcp import FastMCP  # noqa: E402
+import time  # noqa: E402
+
+# --- Platform detection & input backend ---
+_USE_WAYLAND = False
+
+# Ensure parent directory is on sys.path so "from accessories import ..." works
+# regardless of cwd.
+_parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _parent_dir not in sys.path:
+    sys.path.insert(0, _parent_dir)
+
+# Wayland input uses Mutter RemoteDesktop DBus API, which works on the session
+# bus whenever a GNOME Wayland session is active—even from SSH/tty.
+try:
+    from accessories import wayland_input as wi
+    wi.ensure()
+    _USE_WAYLAND = True
+    logger.info("Using Wayland-native input backend")
+except Exception as e:
+    logger.info("Wayland input not available: %s. Using pyautogui.", e)
+
+# Always import pyautogui for screenshots (works through Xwayland)
+try:
+    import pyautogui  # noqa: E402
+    _PYAUTOGUI_OK = True
+except Exception:
+    _PYAUTOGUI_OK = False
+    logging.getLogger(__name__).warning(
+        "pyautogui not available; screenshots will use gnome-screenshot"
+    )
+
+if not _USE_WAYLAND and not _PYAUTOGUI_OK:
+    logging.getLogger(__name__).warning(
+        "Neither wayland_input nor pyautogui is available; "
+        "input functions will fail at runtime"
+    )
 
 # 全局 MCP Server 实例
 server = FastMCP(
     "computer-use",
-    instructions="计算机桌面操作服务：基于 pyautogui 提供鼠标、键盘控制及屏幕截图等工具",
+    instructions="计算机桌面操作服务：提供鼠标、键盘控制及屏幕截图等工具",
 )
 
 
@@ -133,12 +215,17 @@ server = FastMCP(
 @server.tool()
 def get_screen_size() -> Dict[str, str]:
     """获取屏幕尺寸。"""
+    if _USE_WAYLAND:
+        w, h = wi.screen_size()
+        return {"status": "success", "message": f"Screen size: Size(width={w}, height={h})"}
     return {"status": "success", "message": f"Screen size: {pyautogui.size()}"}
 
 
 @server.tool()
 def get_mouse_position() -> Dict[str, str]:
     """获取当前鼠标位置。"""
+    if _USE_WAYLAND:
+        return {"status": "success", "message": "Mouse position: unknown (Wayland limitation)"}
     return {"status": "success", "message": f"Mouse position: {pyautogui.position()}"}
 
 
@@ -146,79 +233,117 @@ def get_mouse_position() -> Dict[str, str]:
 def move_to(x: int, y: int) -> Dict[str, str]:
     """移动鼠标到指定的 (x, y) 坐标。"""
     try:
-        pyautogui.moveTo(x, y)
+        if _USE_WAYLAND:
+            wi.move_abs(x, y)
+        else:
+            pyautogui.moveTo(x, y)
         return {"status": "success", "message": f"Mouse moved to coordinates ({x}, {y})"}
-    except pyautogui.FailSafeException:
-        return {"status": "error", "message": "Operation cancelled - mouse moved to screen corner (failsafe)"}
     except Exception as e:
-        return {"status": "error", "message": f"Failed to move mouse: {str(e)}"}
+        return {"status": "error", "message": f"move_to({x},{y}) failed: {e}"}
 
 
 @server.tool()
 def click() -> Dict[str, str]:
     """在当前鼠标位置单击。"""
     try:
-        pyautogui.click()
+        if _USE_WAYLAND:
+            wi.click(1)
+        else:
+            pyautogui.click()
         return {"status": "success", "message": "Mouse clicked at current position"}
-    except pyautogui.FailSafeException:
-        return {"status": "error", "message": "Operation cancelled - mouse in screen corner (failsafe)"}
     except Exception as e:
-        return {"status": "error", "message": f"Failed to click mouse: {str(e)}"}
+        return {"status": "error", "message": f"click failed: {e}"}
 
 
 @server.tool()
 def double_click() -> Dict[str, str]:
     """在当前鼠标位置双击。"""
     try:
-        pyautogui.doubleClick()
+        if _USE_WAYLAND:
+            wi.click(1)
+            time.sleep(0.05)
+            wi.click(1)
+        else:
+            pyautogui.doubleClick()
         return {"status": "success", "message": "Mouse double-clicked at current position"}
-    except pyautogui.FailSafeException:
-        return {"status": "error", "message": "Operation cancelled - mouse in screen corner (failsafe)"}
     except Exception as e:
-        return {"status": "error", "message": f"Failed to double-click mouse: {str(e)}"}
+        return {"status": "error", "message": f"double_click failed: {e}"}
+
+
+@server.tool()
+def right_click() -> Dict[str, str]:
+    """在当前鼠标位置右键单击。"""
+    try:
+        if _USE_WAYLAND:
+            wi.click(3)
+        else:
+            pyautogui.rightClick()
+        return {"status": "success", "message": "Mouse right-clicked at current position"}
+    except Exception as e:
+        return {"status": "error", "message": f"right_click failed: {e}"}
 
 
 @server.tool()
 def hotkey(keys: List[str]) -> Dict[str, str]:
     """同时按下多个按键（组合键）。"""
     try:
-        pyautogui.hotkey(*keys)
+        if _USE_WAYLAND:
+            wi.hotkey(keys)
+        else:
+            pyautogui.hotkey(*keys)
         return {"status": "success", "message": f"Pressed hotkey combination: {' + '.join(keys)}"}
-    except pyautogui.FailSafeException:
-        return {"status": "error", "message": "Operation cancelled - mouse in screen corner (failsafe)"}
     except Exception as e:
-        return {"status": "error", "message": f"Failed to press hotkey: {str(e)}"}
+        return {"status": "error", "message": f"hotkey({keys}) failed: {e}"}
 
 
 @server.tool()
 def press_key(key: str) -> Dict[str, str]:
     """按下并释放单个按键（如 'enter', 'space', 'a'）。"""
     try:
-        pyautogui.press(key)
+        if _USE_WAYLAND:
+            wi.press_key(key)
+        else:
+            pyautogui.press(key)
         return {"status": "success", "message": f"Pressed key: {key}"}
-    except pyautogui.FailSafeException:
-        return {"status": "error", "message": "Operation cancelled - mouse in screen corner (failsafe)"}
     except Exception as e:
-        return {"status": "error", "message": f"Failed to press key: {str(e)}"}
+        return {"status": "error", "message": f"press_key({key}) failed: {e}"}
 
 
 @server.tool()
-def typewrite(message: str) -> Dict[str, str]:
+def type_text(text: str) -> Dict[str, str]:
     """输入一串字符。"""
     try:
-        pyautogui.typewrite(message)
-        return {"status": "success", "message": f"Typed string of length {len(message)} characters"}
-    except pyautogui.FailSafeException:
-        return {"status": "error", "message": "Operation cancelled - mouse in screen corner (failsafe)"}
+        if _USE_WAYLAND:
+            wi.type_text(text)
+        else:
+            pyautogui.typewrite(text)
+        return {"status": "success", "text": f"Typed string of length {len(text)} characters"}
     except Exception as e:
-        return {"status": "error", "message": f"Failed to type string: {str(e)}"}
+        return {"status": "error", "text": f"type_text failed: {e}"}
+
+
+def _do_screenshot():
+    """Take a screenshot, returning a PIL Image or None."""
+    if _PYAUTOGUI_OK:
+        return pyautogui.screenshot()
+    # Fallback: gnome-screenshot
+    import tempfile
+    tmp = tempfile.mktemp(suffix='.png')
+    subprocess.run(['gnome-screenshot', '-f', tmp], capture_output=True, timeout=5)
+    try:
+        from PIL import Image
+        return Image.open(tmp)
+    except Exception:
+        return None
 
 
 @server.tool()
 def take_screenshot(filePath: Optional[str] = None, quality: int = 60) -> Dict[str, str]:
     """截取当前屏幕截图。"""
     try:
-        screenshot = pyautogui.screenshot()
+        screenshot = _do_screenshot()
+        if screenshot is None:
+            return {"status": "error", "message": "Failed to capture screenshot"}
         if filePath:
             screenshot.convert("RGB").save(filePath, format="JPEG", quality=quality, optimize=True)
             return {"status": "success", "filePath": filePath}
@@ -226,8 +351,6 @@ def take_screenshot(filePath: Optional[str] = None, quality: int = 60) -> Dict[s
             buffer = io.BytesIO()
             screenshot.convert("RGB").save(buffer, format="JPEG", quality=quality, optimize=True)
             return {"status": "success", "base64_content": base64.b64encode(buffer.getvalue()).decode("utf-8")}
-    except pyautogui.FailSafeException:
-        return {"status": "error", "message": "Operation cancelled - mouse in screen corner (failsafe)"}
     except Exception as e:
         return {"status": "error", "message": f"Failed to take screenshot: {str(e)}"}
 
@@ -236,10 +359,13 @@ def take_screenshot(filePath: Optional[str] = None, quality: int = 60) -> Dict[s
 def scroll(amount: int) -> Dict[str, str]:
     """滚动鼠标滚轮。正数向上滚动，负数向下滚动。"""
     try:
-        pyautogui.scroll(amount)
+        if _USE_WAYLAND:
+            wi.scroll(amount)
+        else:
+            pyautogui.scroll(amount)
         return {"status": "success", "message": f"Scrolled {amount}"}
     except Exception as e:
-        return {"status": "error", "message": f"Failed to scroll: {str(e)}"}
+        return {"status": "error", "message": f"scroll({amount}) failed: {e}"}
 
 
 # ==================== OCR 辅助函数 ====================
@@ -252,75 +378,32 @@ def screenshot_to_base64() -> str:
         base64 编码的图片字符串，如果失败则返回空字符串。
     """
     try:
-        screenshot = pyautogui.screenshot()
+        screenshot = _do_screenshot()
+        if screenshot is None:
+            return ""
         buffer = io.BytesIO()
         screenshot.save(buffer, format="PNG")
-        img_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
-        return img_base64
+        return base64.b64encode(buffer.getvalue()).decode('utf-8')
     except Exception as e:
         logger.error(f"截图失败: {str(e)}")
         return ""
 
 
-def _safe_move_to(x: int, y: int) -> bool:
-    """移动鼠标到目标坐标，自动处理 FAILSAFE（鼠标在屏幕边缘时）。"""
-    try:
-        pyautogui.moveTo(x, y)
-        return True
-    except pyautogui.FailSafeException:
-        failsafe = pyautogui.FAILSAFE
-        pyautogui.FAILSAFE = False
-        try:
-            pyautogui.moveTo(x, y)
-            return True
-        finally:
-            pyautogui.FAILSAFE = failsafe
-
-
 def click_at(x: int, y: int) -> bool:
-    """
-    在指定坐标处点击鼠标。
-
-    先 moveTo 移动到目标，延迟 0.1s 让目标窗口响应鼠标进入事件，
-    再 click 点击。比 pyautogui.click(x, y) 更逼真，避免点击太快
-    导致目标应用（如浏览器）来不及响应。
-
-    Args:
-        x: X 坐标
-        y: Y 坐标
-
-    Returns:
-        是否成功
-    """
+    """移动到 (x, y) 并单击。先移动，延迟 0.1s 让目标窗口响应，再点击。"""
     try:
-        if not _safe_move_to(x, y):
-            return False
-        pyautogui.sleep(0.1)  # 给目标窗口一点反应时间
-        pyautogui.click()
-        return True
-    except pyautogui.FailSafeException:
-        # 鼠标在屏幕边缘触发了安全保护。因为坐标来自 OCR 验证，
-        # 不是 bug 产生的 (0,0)，可以临时绕过安全检查。
-        logger.warning(
-            "FailSafe triggered (mouse at screen edge), "
-            "temporarily bypassing to click at (%d, %d)", x, y
-        )
-        failsafe = pyautogui.FAILSAFE
-        pyautogui.FAILSAFE = False
-        try:
+        if _USE_WAYLAND:
+            wi.move_abs(x, y)
+            time.sleep(0.1)
+            wi.click(1)
+        else:
             pyautogui.moveTo(x, y)
-            pyautogui.sleep(0.1)
+            time.sleep(0.1)
             pyautogui.click()
-            return True
-        except Exception as e:
-            logger.error(f"点击失败: {str(e)}")
-            return False
-        finally:
-            pyautogui.FAILSAFE = failsafe
+        return True
     except Exception as e:
-        logger.error(f"点击失败: {str(e)}")
+        logger.error("click_at(%d,%d) failed: %s", x, y, e)
         return False
-
 
 def call_mcp_ocr_tool(tool_name: str, arguments: dict) -> dict:
     """
@@ -351,8 +434,7 @@ def call_mcp_ocr_tool(tool_name: str, arguments: dict) -> dict:
             headers={"Content-Type": "application/json"},
         )
         with urllib.request.urlopen(req, timeout=300) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-            return result
+            return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
         error_msg = f"调用 MCP-OCR 工具失败: HTTP {e.code} - {body}"
@@ -372,9 +454,9 @@ def find_and_click(keyword_or_image_file: str, is_image: bool = False) -> str:
     查找并点击屏幕上的文字或图片。
 
     实现逻辑：
-    1. 使用 pyautogui 截取当前屏幕
+    1. 使用截图功能截取当前屏幕
     2. 调用 MCP-OCR 服务的 find_location 工具定位目标
-    3. 根据返回的坐标使用 pyautogui 点击
+    3. 根据返回的坐标执行点击
 
     Args:
         keyword_or_image_file: 如果 is_image=True，则为小图片路径；否则为要查找的关键词（支持正则）。
@@ -396,26 +478,20 @@ def find_and_click(keyword_or_image_file: str, is_image: bool = False) -> str:
         logger.info("截图成功，正在调用 MCP-OCR find_location 工具定位...")
 
         # 步骤 2: 调用 MCP-OCR 服务的 find_location 工具
-        find_args = {
-            "base64_image_big": screenshot_base64
-        }
+        find_args = {"base64_image_big": screenshot_base64}
 
         if is_image:
-            # 图片模式：读取小图片文件
             if not os.path.exists(keyword_or_image_file):
                 return json.dumps({
                     "success": False,
                     "message": f"图片文件不存在: {keyword_or_image_file}"
                 }, ensure_ascii=False)
-
             with open(keyword_or_image_file, 'rb') as f:
                 small_img_bytes = f.read()
             find_args["base64_image_small"] = base64.b64encode(small_img_bytes).decode('utf-8')
         else:
-            # 文字模式：使用 pattern 参数
             find_args["pattern"] = keyword_or_image_file
 
-        # 调用 MCP-OCR find_location 工具
         location_result = call_mcp_ocr_tool("find_location", find_args)
 
         if not location_result.get("success"):
@@ -441,7 +517,6 @@ def find_and_click(keyword_or_image_file: str, is_image: bool = False) -> str:
         else:
             logger.info(f"找到图片，中心坐标: ({center_x}, {center_y})，置信度: {score:.2f}")
 
-        # 步骤 4: 执行 pyautogui 点击
         if click_at(center_x, center_y):
             return json.dumps({
                 "success": True,

@@ -655,7 +655,8 @@ class Runtime:
         # Fall back: read SKILL.md directly from ToolConfig.skill_dir
         tool_config = self._find_tool_by_name(tool_name)
         if tool_config and tool_config.tool_type == "skill" and tool_config.skill_dir:
-            skill_md_path = os.path.join(tool_config.skill_dir, "SKILL.md")
+            expanded_dir = os.path.expanduser(tool_config.skill_dir)
+            skill_md_path = os.path.join(expanded_dir, "SKILL.md")
             try:
                 with open(skill_md_path, "r", encoding="utf-8") as f:
                     content = f.read()
@@ -665,7 +666,7 @@ class Runtime:
                     end_idx = content.find("---", 3)
                     if end_idx != -1:
                         body = content[end_idx + 3:].strip()
-                        return body, tool_config.skill_dir
+                        return body, expanded_dir
             except OSError:
                 pass
 
