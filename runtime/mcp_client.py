@@ -14,6 +14,7 @@ Idle process reaping:
 """
 
 import asyncio
+import concurrent.futures
 import json
 import os
 import signal
@@ -30,7 +31,7 @@ from runtime.common import kill_process_group
 # Default idle timeout in seconds before a stdio process is reaped.
 _DEFAULT_IDLE_TIMEOUT = 300
 
-# HTTP request timeout (seconds) for MCP tool calls.
+# Execution timeout (seconds) for MCP tool calls — applies to both stdio and HTTP.
 # Long-running tools (e.g. read_verification_code with retries) may need minutes.
 # Override via the MCP_EXEC_TIMEOUT environment variable.
 _MCP_EXEC_TIMEOUT = int(os.environ.get("MCP_EXEC_TIMEOUT", 300))
@@ -117,7 +118,7 @@ class MCPClientManager:
     # stdio transport helpers
     # ------------------------------------------------------------------
 
-    async def _stdio_send(self, conn: dict, request: dict) -> dict:
+    async def _stdio_send(self, conn: dict, request: dict, timeout: float | None = None) -> dict:
         process: asyncio.subprocess.Process = conn["process"]
         if process.stdin is None or process.stdout is None:
             raise RuntimeError("stdio pipes not available")
@@ -126,8 +127,11 @@ class MCPClientManager:
         await process.stdin.drain()
         # Some MCP servers emit non-JSON lines or JSON-RPC notifications before
         # the actual response.  Skip non-JSON lines and notifications (no "id").
+        # Each readline is guarded by asyncio.wait_for so that a hung server
+        # is detected; as long as lines keep arriving the timeout resets.
+        t = timeout if timeout is not None else _MCP_EXEC_TIMEOUT
         while True:
-            line = await process.stdout.readline()
+            line = await asyncio.wait_for(process.stdout.readline(), timeout=t)
             if not line:
                 raise RuntimeError("MCP server closed stdout unexpectedly")
             stripped = line.decode("utf-8").strip()
@@ -160,6 +164,70 @@ class MCPClientManager:
     # HTTP Streamable HTTP transport helpers
     # ------------------------------------------------------------------
 
+    def _http_reinitialize_and_retry(self, conn: dict, body: bytes, reason: str) -> dict:
+        """Re-initialize the HTTP connection and retry the original request once.
+
+        Called when the server returns 404 (session expired) or when a
+        connection-level error (e.g. connection reset) indicates the server
+        has restarted.  Uses a per-connection lock to serialise recovery so
+        that multiple threads do not re-initialise simultaneously.
+        """
+        import logging
+        url = conn["url"]
+        session_id = conn.get("session_id")
+        logger = logging.getLogger("runtime.mcp_client")
+        logger.info(
+            "MCP %s for %s, re-initializing",
+            reason, conn.get("server_name", url),
+        )
+        reinit_lock = conn.setdefault("_reinit_lock", threading.Lock())
+        with reinit_lock:
+            # If another thread already recovered, just retry with the new session.
+            if conn.get("connected") and conn.get("session_id") != session_id:
+                headers2 = dict(conn.get("headers") or {})
+                headers2.setdefault("Content-Type", "application/json")
+                headers2.setdefault("Accept", "application/json, text/event-stream")
+                new_sid = conn.get("session_id")
+                if new_sid:
+                    headers2["mcp-session-id"] = new_sid
+                try:
+                    req2 = urllib.request.Request(url, data=body, headers=headers2, method="POST")
+                    with urllib.request.urlopen(req2, timeout=_MCP_EXEC_TIMEOUT) as resp2:
+                        new_session_id2 = resp2.headers.get("mcp-session-id")
+                        if new_session_id2:
+                            conn["session_id"] = new_session_id2
+                        ct2 = resp2.headers.get("Content-Type", "")
+                        if "text/event-stream" in ct2:
+                            return self._read_sse_stream(resp2)
+                        return json.loads(resp2.read().decode("utf-8"))
+                except Exception:
+                    pass  # fall through to full re-initialize below
+            conn["session_id"] = None
+            conn["tools_cache"] = None
+            try:
+                self._http_initialize(conn)
+                # Retry the original request with the fresh session
+                headers2 = dict(conn.get("headers") or {})
+                headers2.setdefault("Content-Type", "application/json")
+                headers2.setdefault("Accept", "application/json, text/event-stream")
+                new_sid = conn.get("session_id")
+                if new_sid:
+                    headers2["mcp-session-id"] = new_sid
+                req2 = urllib.request.Request(url, data=body, headers=headers2, method="POST")
+                with urllib.request.urlopen(req2, timeout=_MCP_EXEC_TIMEOUT) as resp2:
+                    new_session_id2 = resp2.headers.get("mcp-session-id")
+                    if new_session_id2:
+                        conn["session_id"] = new_session_id2
+                    ct2 = resp2.headers.get("Content-Type", "")
+                    if "text/event-stream" in ct2:
+                        return self._read_sse_stream(resp2)
+                    return json.loads(resp2.read().decode("utf-8"))
+            except Exception as retry_exc:
+                conn["connected"] = False
+                raise RuntimeError(
+                    f"MCP re-initialize after {reason} failed: {retry_exc}"
+                ) from retry_exc
+
     def _http_send(self, conn: dict, request: dict) -> dict:
         """Send a JSON-RPC request over Streamable HTTP and return the response.
 
@@ -171,8 +239,10 @@ class MCPClientManager:
         Also captures the ``mcp-session-id`` header from the response and
         stores it on *conn* so subsequent requests include it automatically.
 
-        When the server returns 404 (session not found / expired), the stale
-        session is cleared and the request is retried after re-initialization.
+        When the server returns 404 (session not found / expired) or a
+        connection-level error occurs (e.g. connection reset after server
+        restart), the stale session is cleared and the request is retried
+        after re-initialization.
         """
         url = conn["url"]
         headers = dict(conn.get("headers") or {})
@@ -199,63 +269,12 @@ class MCPClientManager:
             # session expired.  Clear the stale session and re-initialize,
             # then retry the original request exactly once.
             if exc.code == 404 and session_id:
-                import logging
-                logger = logging.getLogger("runtime.mcp_client")
-                logger.info(
-                    "MCP session %s expired (404), re-initializing %s",
-                    session_id[:12], conn.get("server_name", url),
-                )
-                # Use a per-connection lock to prevent multiple threads from
-                # re-initializing simultaneously when they all see 404.
-                reinit_lock = conn.setdefault("_reinit_lock", threading.Lock())
-                with reinit_lock:
-                    # If another thread already re-initialized, session_id will
-                    # have changed — just retry with the new session.
-                    if conn.get("session_id") != session_id:
-                        headers2 = dict(conn.get("headers") or {})
-                        headers2.setdefault("Content-Type", "application/json")
-                        headers2.setdefault("Accept", "application/json, text/event-stream")
-                        new_sid = conn.get("session_id")
-                        if new_sid:
-                            headers2["mcp-session-id"] = new_sid
-                        req2 = urllib.request.Request(url, data=body, headers=headers2, method="POST")
-                        with urllib.request.urlopen(req2, timeout=_MCP_EXEC_TIMEOUT) as resp2:
-                            new_session_id2 = resp2.headers.get("mcp-session-id")
-                            if new_session_id2:
-                                conn["session_id"] = new_session_id2
-                            ct2 = resp2.headers.get("Content-Type", "")
-                            if "text/event-stream" in ct2:
-                                return self._read_sse_stream(resp2)
-                            return json.loads(resp2.read().decode("utf-8"))
-                    # We are the first thread to discover the stale session.
-                    conn["session_id"] = None
-                    conn["tools_cache"] = None
-                    try:
-                        self._http_initialize(conn)
-                        # Retry the original request with the fresh session
-                        headers2 = dict(conn.get("headers") or {})
-                        headers2.setdefault("Content-Type", "application/json")
-                        headers2.setdefault("Accept", "application/json, text/event-stream")
-                        new_sid = conn.get("session_id")
-                        if new_sid:
-                            headers2["mcp-session-id"] = new_sid
-                        req2 = urllib.request.Request(url, data=body, headers=headers2, method="POST")
-                        with urllib.request.urlopen(req2, timeout=_MCP_EXEC_TIMEOUT) as resp2:
-                            new_session_id2 = resp2.headers.get("mcp-session-id")
-                            if new_session_id2:
-                                conn["session_id"] = new_session_id2
-                            ct2 = resp2.headers.get("Content-Type", "")
-                            if "text/event-stream" in ct2:
-                                return self._read_sse_stream(resp2)
-                            return json.loads(resp2.read().decode("utf-8"))
-                    except Exception as retry_exc:
-                        conn["connected"] = False
-                        raise RuntimeError(
-                            f"MCP re-initialize after 404 failed: {retry_exc}"
-                        ) from retry_exc
+                return self._http_reinitialize_and_retry(conn, body, "session expired (404)")
             raise RuntimeError(f"MCP HTTP error {exc.code}: {exc.reason}") from exc
         except urllib.error.URLError as exc:
-            raise RuntimeError(f"MCP connection error: {exc.reason}") from exc
+            # Connection-level error (e.g. server restarted, connection reset).
+            # Re-initialize once so subsequent calls transparently reconnect.
+            return self._http_reinitialize_and_retry(conn, body, f"connection error: {exc.reason}")
 
     def _read_sse_stream(self, resp) -> dict:
         """Read an SSE stream line-by-line and return the first JSON-RPC response.
@@ -677,18 +696,28 @@ class MCPClientManager:
             except (ProcessLookupError, OSError):
                 pass
 
-    def _run_async(self, coro) -> object:
+    def _run_async(self, coro, timeout: Optional[float] = None) -> object:
         """Submit a coroutine to the dedicated event loop and block until done.
 
         This is safe to call from any thread (including ThreadingHTTPServer
         worker threads).  The coroutine always executes on ``self._loop``,
         which is the same loop that created the subprocess pipes, so there
         is never a "Future attached to a different loop" mismatch.
+
+        If *timeout* is given and the coroutine does not complete within
+        that many seconds, the underlying asyncio task is cancelled and a
+        ``RuntimeError`` is raised.
         """
         if not self._loop.is_running():
             raise RuntimeError("Dedicated MCP event loop is not running")
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return future.result()  # blocks the calling thread until done
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            raise RuntimeError(
+                f"MCP tool call timed out after {timeout:.0f}s"
+            ) from None
 
     @classmethod
     def _reset(cls) -> None:

@@ -576,6 +576,12 @@ def login_video_account_by_scan(
             break
         except Exception as e:
             time.sleep(5)
+            try:
+                android_find_and_click("允许", scan_device_id)
+                print("   ✅ 已在手机上确认登录")
+                break
+            except Exception as e:
+                time.sleep(3)
             print(f"   ⏳ 重试第 {attempt + 1} 次: {e}")
 
     # 等待浏览器页面跳转（登录成功后会跳转到后台页面）

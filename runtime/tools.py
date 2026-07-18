@@ -294,15 +294,83 @@ def process_tool_arguments_for_base64(arguments: dict) -> dict:
     return arguments
 
 
+def _detect_extension(data: bytes) -> str:
+    """根据二进制头部 magic bytes 检测文件扩展名，支持常见图片/视频/音频格式。"""
+    if len(data) < 12:
+        return ".png"  # 太短无法判断，fallback
+
+    # --- 图片 ---
+    if data[:4] == b'\x89PNG':
+        return ".png"
+    if data[:3] == b'\xff\xd8\xff':
+        return ".jpg"
+    if data[:4] == b'GIF8':
+        return ".gif"
+    if data[:2] == b'BM':
+        return ".bmp"
+    if data[:4] == b'RIFF' and len(data) >= 12 and data[8:12] == b'WEBP':
+        return ".webp"
+    if data[:4] == b'\x00\x00\x01\x00':
+        return ".ico"
+    if data[:4] in (b'II*\x00', b'MM\x00*'):
+        return ".tiff"
+
+    # --- 视频 ---
+    # MP4 / MOV / M4A: 都以 ...ftyp 开头 (offset 4)
+    if len(data) >= 12 and data[4:8] == b'ftyp':
+        brand = data[8:12]
+        if brand in (b'qt  ', b'QT  '):
+            return ".mov"
+        if brand == b'M4A ':
+            return ".m4a"
+        return ".mp4"
+    # WebM / MKV
+    if data[:4] == b'\x1a\x45\xdf\xa3':
+        # 进一步区分：MKV 的 DocType 在 EBML 头部里是 "matroska"，简单用偏移粗略判断
+        # 大多数场景下 WebM 更常见，无法精确区分时归为 .webm
+        if len(data) >= 40 and b'matroska' in data[20:50]:
+            return ".mkv"
+        return ".webm"
+    # AVI
+    if data[:4] == b'RIFF' and len(data) >= 12 and data[8:12] == b'AVI ':
+        return ".avi"
+    # FLV
+    if data[:4] == b'FLV\x01':
+        return ".flv"
+
+    # --- 音频 ---
+    # WAV
+    if data[:4] == b'RIFF' and len(data) >= 12 and data[8:12] == b'WAVE':
+        return ".wav"
+    # MP3: ID3 tag 或 frame sync
+    if data[:3] == b'ID3':
+        return ".mp3"
+    if data[:2] in (b'\xff\xfb', b'\xff\xf3', b'\xff\xf2', b'\xff\xfa'):
+        return ".mp3"
+    # FLAC
+    if data[:4] == b'fLaC':
+        return ".flac"
+    # OGG (Vorbis/Opus)
+    if data[:4] == b'OggS':
+        return ".ogg"
+    # AAC (ADTS)
+    if data[:2] in (b'\xff\xf1', b'\xff\xf9'):
+        return ".aac"
+
+    # 无法识别，fallback
+    return ".bin"
+
+
 def save_and_replace_base64(text: str, output_dir: str ="/tmp"):
     # 1. 确保输出目录存在
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
     # 2. 正则表达式：匹配 "key": "base64内容"
-    # 这里的 key 涵盖了 windows-mcp、chrome-devtools 和 file-transfer-mcp 常用的字段名
+    # 这里的 key 涵盖了 windows-mcp、chrome-devtools 和 file-transfer-mcp 常用的字段名，
+    # 以及任何包含 "base64" 的字段名（如 target_base64、result_base64 等）
     # {100,} 确保只抓取长字符串，避免误伤普通的 JSON 字段
-    pattern = r'"(screenshot|data|image|base64|base64_content|base64_data|image_base64)":\s*"([A-Za-z0-9+/]{100,}={0,2})"'
+    pattern = r'"(screenshot|data|image|[^"]*base64[^"]*)":\s*"([A-Za-z0-9+/]{100,}={0,2})"'
 
     def replace_logic(match):
         # match.group(1) 是原来的 key，group(2) 是 base64 内容
@@ -315,8 +383,9 @@ def save_and_replace_base64(text: str, output_dir: str ="/tmp"):
             # 解码失败，说明不是真正的 base64，返回原始匹配
             return match.group(0)
         
-        # 生成唯一文件名
-        file_name = f"snap_{int(time.time()*1000)}.png"
+        # 根据二进制头部 magic bytes 检测文件格式，生成带正确扩展名的文件名
+        ext = _detect_extension(decoded_bytes)
+        file_name = f"snap_{int(time.time()*1000)}{ext}"
         file_path = os.path.abspath(os.path.join(output_dir, file_name))
         
         # 写入文件
