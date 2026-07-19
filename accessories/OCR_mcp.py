@@ -48,6 +48,9 @@ import io
 import re
 import logging
 import argparse
+import threading
+import time
+from datetime import datetime
 from typing import Optional
 
 import numpy as np
@@ -57,7 +60,7 @@ from PIL import Image, ImageOps
 os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "true"
 from paddleocr import PaddleOCR
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -65,6 +68,19 @@ logger = logging.getLogger(__name__)
 
 # 全局模型实例
 _model = None
+_model_lock = threading.Lock()
+
+# ---- 按日卸载显存配置 ----
+# OFFLOAD_MEMORY_HOUR: 每天几点执行模型卸载，取值 0-23，默认 2（凌晨2点）
+# 取值不在 0-23 范围内则禁用按日卸载
+_offload_hour_str = os.environ.get("OFFLOAD_MEMORY_HOUR", "2")
+try:
+    OFFLOAD_MEMORY_HOUR = int(_offload_hour_str)
+    _offload_enabled = 0 <= OFFLOAD_MEMORY_HOUR <= 23
+except ValueError:
+    OFFLOAD_MEMORY_HOUR = -1
+    _offload_enabled = False
+_last_offload_date = None  # 记录上次卸载的日期，避免同一天重复卸载
 
 
 def load_model():
@@ -79,12 +95,14 @@ def load_model():
 
 
 def get_model():
-    """获取或懒加载模型"""
+    """获取或懒加载模型（线程安全）"""
     global _model
     if _model is None:
-        logger.info("首次调用，正在加载 PaddleOCR 模型...")
-        _model = load_model()
-        logger.info("模型加载完成")
+        with _model_lock:
+            if _model is None:  # 双重检查
+                logger.info("首次调用，正在加载 PaddleOCR 模型...")
+                _model = load_model()
+                logger.info("模型加载完成")
     return _model
 
 
@@ -245,6 +263,85 @@ def merge_text_lines(lines, add_spaces_for_english=True):
         result_lines.append(''.join(line_text))
     
     return '\n'.join(result_lines)
+
+
+# ---------------------------------------------------------------------------
+# 按日卸载显存
+# ---------------------------------------------------------------------------
+
+def offload_model():
+    """卸载模型，释放内存和显存"""
+    global _model
+    with _model_lock:
+        if _model is not None:
+            logger.info("按日卸载：正在卸载 PaddleOCR 模型...")
+            _model = None
+            # 尝试清理 GPU 显存
+            try:
+                import paddle
+                if hasattr(paddle, 'device') and hasattr(paddle.device, 'cuda'):
+                    paddle.device.cuda.empty_cache()
+                    logger.info("GPU 显存已清理")
+            except Exception:
+                pass
+            logger.info("模型已卸载，内存/显存已释放")
+
+
+def warmup_model():
+    """卸载后执行一次 OCR warmup，重新加载模型"""
+    logger.info("正在执行 warmup OCR 任务...")
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # 按优先级尝试多个路径
+    candidates = [
+        os.path.join(script_dir, "resources", "example_vlm_tool_call.png"),
+        os.path.join(script_dir, "..", "resources", "example_vlm_tool_call.png"),
+        os.path.join("resources", "example_vlm_tool_call.png"),
+    ]
+
+    warmup_image_path = None
+    for path in candidates:
+        if os.path.isfile(path):
+            warmup_image_path = path
+            break
+
+    if warmup_image_path is None:
+        logger.warning(f"Warmup 图片不存在，已尝试: {candidates}，跳过 warmup")
+        return
+
+    try:
+        with open(warmup_image_path, 'rb') as f:
+            base64_content = base64.b64encode(f.read()).decode('utf-8')
+        # 直接调用 ocr 工具函数进行 warmup
+        result_json = ocr(base64_content)
+        result = json.loads(result_json)
+        if result.get("success"):
+            logger.info(f"Warmup OCR 完成，识别到 {len(result.get('locations', []))} 个文字块")
+        else:
+            logger.warning(f"Warmup OCR 返回失败: {result.get('message', 'unknown')}")
+    except Exception as e:
+        logger.error(f"Warmup 执行失败: {e}")
+
+
+def _offload_scheduler():
+    """后台线程：每天在指定时刻卸载模型并 warmup"""
+    global _last_offload_date
+    logger.info(f"按日卸载调度器已启动，卸载时刻：每天 {OFFLOAD_MEMORY_HOUR}:00 左右")
+    while True:
+        try:
+            now = datetime.now()
+            current_date = now.date()
+            current_hour = now.hour
+
+            if current_hour == OFFLOAD_MEMORY_HOUR and _last_offload_date != current_date:
+                logger.info(f"到达卸载时刻 {OFFLOAD_MEMORY_HOUR}:00，开始卸载...")
+                _last_offload_date = current_date
+                offload_model()
+                warmup_model()
+        except Exception as e:
+            logger.error(f"卸载调度器异常: {e}")
+
+        time.sleep(60)  # 每分钟检查一次
 
 
 # ---------------------------------------------------------------------------
@@ -704,6 +801,16 @@ def main():
     args = parser.parse_args()
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+
+    # 启动按日卸载调度器（后台守护线程）
+    if _offload_enabled:
+        scheduler_thread = threading.Thread(target=_offload_scheduler, daemon=True, name="offload-scheduler")
+        scheduler_thread.start()
+    else:
+        logger.info(f"按日卸载已禁用（OFFLOAD_MEMORY_HOUR={OFFLOAD_MEMORY_HOUR}，需在 0-23 范围内）")
+
+    # 启动时执行一次 warmup，确保模型已加载就绪
+    warmup_model()
 
     logger.info("启动 OCR MCP Server...")
     logger.info(f"传输协议: {args.transport}")

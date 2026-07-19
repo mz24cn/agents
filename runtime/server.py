@@ -1766,8 +1766,6 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                             msg.arguments["TOOLS"] = tools_markdown
                         break
 
-            tool_ids = ["delegate"]
-
         request = InferenceRequest(
             model_id=body["model_id"],
             model_config_override=model_override,

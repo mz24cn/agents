@@ -533,6 +533,12 @@ class Runtime:
         This prevents name collisions when multiple tools share the same name
         (e.g. a function tool and an MCP tool both named "fetch").
 
+        Before execution, argument names are validated against the tool's
+        declared parameters.  When an argument key does not match any declared
+        parameter, a fuzzy match is attempted (substring containment, both
+        directions).  If a single unambiguous match is found the argument is
+        silently corrected and a compatibility note is appended to the result.
+
         Args:
             tool_name: The name of the tool to execute.
             arguments: The arguments dict to pass to the tool.
@@ -548,8 +554,14 @@ class Runtime:
         if tool_config is None:
             return f"Error: tool '{tool_name}' not found in registry", None
 
+        # --- Compatible argument name correction ---
+        arguments, compat_notes = self._normalize_argument_names(tool_config, arguments)
+        if compat_notes is None:
+            # _normalize_argument_names returned error -> arguments is the error string
+            return arguments, tool_config
+
         if tool_config.tool_type == "function":
-            return self._execute_function_tool(tool_config, arguments), tool_config
+            result_str = self._execute_function_tool(tool_config, arguments)
         elif tool_config.tool_type == "mcp":
             # --- Base64 file path auto-conversion (for file transfer MCP) ---
             # 检测参数中的 base64_content 等字段，如果值看起来是文件路径（非 base64），
@@ -565,11 +577,112 @@ class Runtime:
             if len(result_str) > int(os.environ.get("BASE64_CHECK_THRESHOLD", "1024")):
                 from runtime.tools import save_and_replace_base64
                 result_str = save_and_replace_base64(result_str)
-            return result_str, tool_config
         elif tool_config.tool_type == "skill":
-            return f"Error: skill '{tool_name}' should be triggered via progressive disclosure, not direct execution", tool_config
+            result_str = f"Error: skill '{tool_name}' should be triggered via progressive disclosure, not direct execution"
         else:
-            return f"Error: unsupported tool_type '{tool_config.tool_type}' for tool '{tool_name}'", tool_config
+            result_str = f"Error: unsupported tool_type '{tool_config.tool_type}' for tool '{tool_name}'"
+
+        # Append compatibility notes if any argument names were corrected
+        if compat_notes:
+            result_str = self._append_compat_notes(result_str, compat_notes)
+
+        return result_str, tool_config
+
+    # ------------------------------------------------------------------
+    # Argument name compatibility
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_argument_names(
+        tool_config: ToolConfig, arguments: dict
+    ) -> tuple[dict, Optional[list]]:
+        """Validate and correct argument names against the tool's declared parameters.
+
+        When a key in *arguments* is not found in the tool's parameter list, a
+        fuzzy match is attempted: if a parameter name **contains** the argument
+        key, or the argument key **contains** a parameter name, the first such
+        match is used.  Only one-to-one matches are attempted; ambiguous cases
+        (one key matching multiple parameters) still pick the first match.
+
+        Args:
+            tool_config: The resolved ToolConfig.
+            arguments: The original arguments dict (may be empty).
+
+        Returns:
+            A tuple of ``(normalized_args, compat_notes)``.
+            ``compat_notes`` is a list of human-readable correction strings
+            (empty when no corrections were needed), or **None** when a fatal
+            error occurred — in that case ``normalized_args`` is an error
+            message string (not a dict).
+        """
+        param_properties = tool_config.parameters.get("properties", {})
+        param_names = list(param_properties.keys()) if param_properties else []
+
+        if not param_names or not arguments:
+            return dict(arguments), []
+
+        corrected: dict = {}
+        notes: list = []
+
+        for arg_key, arg_value in arguments.items():
+            if arg_key in param_names:
+                corrected[arg_key] = arg_value
+                continue
+
+            # Fuzzy match: find a parameter name that contains arg_key,
+            # or that arg_key contains.
+            matched: Optional[str] = None
+            for pname in param_names:
+                if arg_key in pname or pname in arg_key:
+                    matched = pname
+                    break
+
+            if matched is not None:
+                corrected[matched] = arg_value
+                notes.append(
+                    f"请求{arg_key}参数已按{matched}纠正，下次调用应使用{matched}参数"
+                )
+            else:
+                return (
+                    f"Error: tool '{tool_config.name}' has no parameter "
+                    f"'{arg_key}', available parameters: {param_names}",
+                    None,
+                )
+
+        return corrected, notes
+
+    @staticmethod
+    def _append_compat_notes(result_str: str, notes: list) -> str:
+        """Append compatibility notes to a tool result string.
+
+        If *result_str* appears to be JSON (ends with ``}``), the notes are
+        injected as a ``"_notes"`` key before the closing brace.  Otherwise
+        they are appended as a newline-prefixed "注：" paragraph.
+
+        Args:
+            result_str: The original tool result string.
+            notes: List of human-readable note strings.
+
+        Returns:
+            The result string with compatibility notes included.
+        """
+        if not notes:
+            return result_str
+
+        note_text = "；".join(notes)
+
+        if result_str.rstrip().endswith("}"):
+            # JSON-like: inject "_notes" before the final "}"
+            stripped = result_str.rstrip()
+            # Find the matching closing brace at the top level
+            inner = stripped.rstrip()[:-1].rstrip()
+            if inner.endswith(",") or inner.endswith(":"):
+                # Already has a trailing separator, just append
+                return inner + f'"_notes": "{note_text}"}}'
+            else:
+                return inner + f', "_notes": "{note_text}"}}'
+        else:
+            return result_str + f"\n注：{note_text}"
 
     def _find_tool_by_name(
         self, tool_name: str, scope: Optional[list] = None
