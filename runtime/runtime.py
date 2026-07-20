@@ -586,7 +586,61 @@ class Runtime:
         if compat_notes:
             result_str = self._append_compat_notes(result_str, compat_notes)
 
+        # --- Content length guard ---
+        # When a tool returns an excessively long result it can blow up the
+        # model context.  Save oversized results to a temp file and return a
+        # hint so the model can fetch slices with read_file / exec_shell.
+        result_str = self._guard_tool_result_length(result_str)
+
         return result_str, tool_config
+
+    # ------------------------------------------------------------------
+    # Tool result post-processing
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _guard_tool_result_length(result_str: str) -> str:
+        """Cap oversized tool results by writing them to a temp file.
+
+        The threshold is controlled by the TOOL_RESULT_MAX_LENGTH environment
+        variable (default 262144 = 256 KiB).  When exceeded the full result is
+        written to a temporary file under /tmp and a short hint is returned
+        instead, telling the caller how many characters / lines were produced
+        and where the file was saved.
+
+        Args:
+            result_str: The original tool result string.
+
+        Returns:
+            The original string when under the threshold, or a short hint
+            pointing at a temp file.
+        """
+        max_len = int(os.environ.get("TOOL_RESULT_MAX_LENGTH", "262144"))
+        if len(result_str) <= max_len:
+            return result_str
+
+        import tempfile
+        fd, tmp_path = tempfile.mkstemp(
+            prefix="tool_result_", suffix=".txt", dir="/tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(result_str)
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+
+        chars = len(result_str)
+        lines = result_str.count("\n") + 1
+        return (
+            f"工具返回了长度超长的内容（{chars}字符，{lines}行），"
+            f"内容已写入临时文件: {tmp_path}。"
+            f"请使用工具局部获取查看（如 read_file 指定 start_line/end_line、"
+            f"exec_shell 调用 head/tail/sed 等）。"
+        )
 
     # ------------------------------------------------------------------
     # Argument name compatibility

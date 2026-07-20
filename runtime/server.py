@@ -1506,17 +1506,23 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             
             path = params.get('path', [''])[0]
             query = params.get('query', [''])[0]
+            name_filter = params.get('name_filter', [''])[0]
             
             if not path:
                 self._send_json_error(400, "Missing 'path' parameter")
                 return
             
-            if not query:
-                self._send_json_error(400, "Missing 'query' parameter")
+            if not query and not name_filter:
+                self._send_json_error(400, "Missing 'query' or 'name_filter' parameter")
                 return
             
             workspace_mgr = self._get_workspace_manager()
-            results = workspace_mgr.search_files(path, query, restrict_workspace=self._should_restrict_workspace())
+            results = workspace_mgr.search_files(
+                path,
+                query,
+                restrict_workspace=self._should_restrict_workspace(),
+                name_filter=name_filter,
+            )
             self._send_json_response(200, results)
         except ValueError as e:
             self._send_json_error(400, str(e))

@@ -272,8 +272,65 @@ class WorkspaceManager:
         
         return children
     
-    def search_files(self, path: str, query: str, restrict_workspace: bool = True) -> List[Dict[str, Any]]:
-        """Search for files matching the query."""
+    def _search_by_filename(
+        self,
+        search_path: str,
+        name_filter: str,
+        max_results: int = 500,
+    ) -> List[Dict[str, Any]]:
+        """Recursively walk *search_path* and return files whose name matches *name_filter*.
+
+        Matching is case-insensitive substring (``filter_text in name.lower()``).
+        Directories are included when their name matches as well.
+        """
+        filter_text = name_filter.strip().lower()
+        if not filter_text:
+            return []
+
+        results: List[Dict[str, Any]] = []
+        for dirpath, dirnames, filenames in os.walk(search_path):
+            # Skip hidden / commonly-excluded directories
+            dirnames[:] = [d for d in dirnames if d not in ('.git', 'node_modules', 'dist', '__pycache__', '.venv', 'venv')]
+
+            for name in filenames + dirnames:
+                if filter_text in name.lower():
+                    full_path = os.path.join(dirpath, name)
+                    try:
+                        stat = os.stat(full_path)
+                        is_dir = os.path.isdir(full_path)
+                        flags = classify_file(full_path) if not is_dir else {
+                            'is_text': False, 'is_image': False, 'is_audio': False, 'is_video': False
+                        }
+                        entry = {
+                            'name': name,
+                            'path': full_path,
+                            'is_dir': is_dir,
+                            'size': stat.st_size if not is_dir else 0,
+                            'modified': int(stat.st_mtime * 1000),
+                            **flags,
+                        }
+                        if os.path.islink(full_path):
+                            entry['symlink_target'] = os.readlink(full_path)
+                        results.append(entry)
+                    except (OSError, PermissionError):
+                        continue
+                    if len(results) >= max_results:
+                        return results
+        return results
+
+    def search_files(
+        self,
+        path: str,
+        query: str,
+        restrict_workspace: bool = True,
+        name_filter: str = '',
+    ) -> List[Dict[str, Any]]:
+        """Search for files matching the query and / or filename filter.
+
+        When *query* is empty and *name_filter* is provided, performs a recursive
+        filename search via :meth:`_search_by_filename`.
+        When both are provided, content search results are post-filtered by name.
+        """
         if os.path.isabs(path):
             search_path = os.path.abspath(path)
         else:
@@ -283,25 +340,35 @@ class WorkspaceManager:
             real_search = os.path.realpath(search_path)
             if not real_search.startswith(self.workspace_path):
                 raise ValueError("Access denied: path is outside workspace")
-        
-        # Use common.py search function
+
+        filter_text = (name_filter or '').strip().lower()
+
+        # --- recursive filename-only search (no content query) -----------
+        if (not query or not query.strip()) and filter_text:
+            return self._search_by_filename(search_path, name_filter)
+
+        # --- content search (with optional name post-filter) -------------
         from runtime.common import search_files
         try:
             matched_paths = search_files(search_path, query)
-            
-            # Convert to file info objects
+
             results = []
             for file_path in matched_paths:
                 try:
                     stat = os.stat(file_path)
                     is_dir = os.path.isdir(file_path)
-                    
+                    name = os.path.basename(file_path)
+
+                    # Apply name post-filter when both are provided
+                    if filter_text and filter_text not in name.lower():
+                        continue
+
                     flags = classify_file(file_path) if not is_dir else {
                         'is_text': False, 'is_image': False, 'is_audio': False, 'is_video': False
                     }
-                    
+
                     entry = {
-                        'name': os.path.basename(file_path),
+                        'name': name,
                         'path': file_path,
                         'is_dir': is_dir,
                         'size': stat.st_size if not is_dir else 0,
@@ -313,7 +380,7 @@ class WorkspaceManager:
                     results.append(entry)
                 except (OSError, PermissionError):
                     continue
-            
+
             return results
         except Exception as e:
             logger.error(f"Search failed: {e}")

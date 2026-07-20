@@ -1475,11 +1475,30 @@ class ContextManager:
         if not isinstance(existing_version, int):
             existing_version = 0
 
-        # Build the turns text for the turns being compressed
-        turns_text = "\n".join(
-            f"[Turn {i}] {t.role}: {t.content}"
-            for i, t in enumerate(turns[: summarized_up_to + 1])
-        )
+        # Build the turns text for the turns being compressed.
+        # Annotate turn types so the LLM can distinguish:
+        #   - user instructions (define the conversation framework)
+        #   - assistant tool-call loops (intermediate reasoning)
+        #   - assistant final responses (synthesis / conclusions)
+        #   - tool results (raw data returned by tools)
+        lines: list[str] = []
+        for i, t in enumerate(turns[: summarized_up_to + 1]):
+            if t.role == "user":
+                label = "[USER INSTRUCTION]"
+            elif t.role == "assistant":
+                if t.tool_calls:
+                    label = "[ASSISTANT — TOOL CALLS (intermediate)]"
+                else:
+                    label = "[ASSISTANT — FINAL RESPONSE]"
+            elif t.role == "tool":
+                tool_name = f" ({t.name})" if t.name else ""
+                label = f"[TOOL RESULT{tool_name}]"
+            elif t.role == "system":
+                label = "[SYSTEM]"
+            else:
+                label = f"[{t.role}]"
+            lines.append(f"Turn {i} {label}: {t.content}")
+        turns_text = "\n".join(lines)
 
         # Compose prompt — two clearly separated tasks with strict output format
         if existing_summary:
@@ -1499,44 +1518,66 @@ and complete TWO tasks. Output ONLY the two tagged blocks — no other text.
 
 ---
 
-**Task 1 — Rolling Summary**
-Write a thorough, information-dense summary. This summary will REPLACE the \
-original conversation in the model's context window, so every detail matters. \
-Capture:
+**Task 1 — Rolling Summary (conversation FRAMEWORK)**
 
-- **User goals & intents**: what the user is trying to achieve, in their own \
-  words when possible. Include the full problem statement, not just a one-liner.
-- **Technical context**: programming languages, frameworks, libraries, file \
-  paths, project structure, environment details mentioned.
-- **Code & commands**: specific code snippets, shell commands, SQL queries, \
-  configuration changes the user showed or asked about. Preserve key syntax.
-- **Tool calls & results**: which tools were invoked, with what arguments, and \
-  what they returned (especially errors, file contents, search results).
-- **Decisions & rationale**: choices made and WHY — e.g. "chose PostgreSQL over \
-  MySQL because of JSON support".
-- **Errors & fixes**: any error messages encountered and how they were resolved \
-  (or not yet resolved).
-- **Unresolved items**: questions still open, tasks pending, next steps planned.
+Focus on what determines the DIRECTION of the conversation: the user's \
+instructions and the assistant's final responses. This summary will replace the \
+original conversation in the model's context window, so it must preserve the \
+narrative arc — what was asked, what was decided, and where things stand now.
+
+Prioritise these (they define the framework):
+- **User instructions & goals**: every user message that states a request, \
+  goal, question, or feedback. Reproduce the full intent — do not reduce a \
+  detailed request to a one-liner. Pay special attention to the LAST user \
+  message, as it typically sets the current task.
+- **Assistant final responses** (marked [ASSISTANT — FINAL RESPONSE]): these \
+  are the assistant's synthesised answers, decisions, and deliverables. \
+  Capture the conclusions reached, the approach chosen, the solution delivered, \
+  and the reasoning behind key choices.
+- **Key decisions & rationale**: what was decided, by whom, and why. Include \
+  trade-offs discussed (e.g. "chose X over Y because Z").
+- **Unresolved items**: questions still open, tasks pending, explicit next \
+  steps the user or assistant committed to.
+
+Do NOT duplicate raw factual data into the summary. The following belong in \
+Task 2 (Memory), not here:
+- Tool call arguments and raw tool outputs (file listings, search result \
+  snippets, stack traces, command output).
+- Specific file paths, version numbers, port numbers, configuration values \
+  (unless essential to understanding a decision).
+- Intermediate error messages and their step-by-step resolution.
 
 If a previous summary is provided, merge it with the new turns into a single \
 coherent narrative. Do NOT just append — rewrite from scratch as one integrated \
 summary. Keep the most recent summary's information when still relevant; drop \
 only what has been superseded.
 
-**Task 2 — Structured Memory**
-Extract long-term facts, preferences, decisions, and entities from the \
-conversation. Be thorough — err on the side of including borderline items. \
-Assign a confidence score (0.0–1.0) reflecting how clearly it was stated.
+**Task 2 — Structured Memory (factual DETAILS)**
+
+Extract SPECIFIC, FACTUAL details from the conversation — especially from \
+tool-call loops, tool results, and intermediate reasoning — that are useful \
+reference material for future sessions. These are the raw facts deliberately \
+left out of the summary. Be thorough — err on the side of including borderline \
+items. Assign a confidence score (0.0–1.0).
 
 Categories (use in entry_type):
-- "fact": objective information (e.g. "the server runs on port 8080", "the \
-  database name is app_production")
+- "fact": objective, verifiable information (e.g. "the server runs on port \
+  8080", "database name is app_production", "error message was 'connection \
+  refused on 127.0.0.1:5432'", "file src/auth.py is 342 lines")
 - "preference": user likes/dislikes (e.g. "prefers async/await over raw \
   promises", "dislikes ORMs, prefers raw SQL")
 - "decision": a choice made with rationale (e.g. "decided to use Redis for \
   caching because latency must be < 5ms")
 - "entity": a named thing the user cares about (e.g. "Working on project \
   'AcmeChat'", "Uses AWS S3 bucket 'uploads-prod'")
+
+Pay extra attention to:
+- **Tool results**: file paths discovered, search results, command output, \
+  stack traces, error messages, test failure details.
+- **Code & configuration**: specific code snippets, shell commands, SQL \
+  queries, config values, environment variables mentioned or discovered.
+- **Version / environment info**: language versions, library versions, OS \
+  details, hardware specs mentioned.
 
 For each entry:
 - Write a self-contained sentence that makes sense without surrounding context.
@@ -1546,7 +1587,7 @@ For each entry:
 
 **Output format (strictly follow — no extra text outside the tags):**
 <summary>
-(thorough summary prose, typically 2–6 paragraphs)
+(concise summary prose, typically 2–5 paragraphs)
 </summary>
 <memory>
 [

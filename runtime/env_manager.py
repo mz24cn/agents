@@ -46,7 +46,11 @@ class EnvManager:
             ValueError: 文件内容不是合法的 JSON 对象时抛出。
         """
         if not os.path.isfile(self._env_path):
-            return {}
+            result: dict[str, str] = {}
+            workspace = os.environ.get("AGENT_WORKSPACE", "")
+            if workspace:
+                result["AGENT_WORKSPACE"] = workspace
+            return result
         try:
             with open(self._env_path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)

@@ -1077,10 +1077,15 @@ class TestEnvAPI:
     """Tests for GET/POST/DELETE /v1/env endpoints."""
 
     def test_get_env_empty_when_no_file(self, server_with_env):
-        """GET /v1/env 返回空字典（env.json 不存在时）。"""
+        """GET /v1/env 返回空字典（env.json 不存在时），
+        但如果 os.environ 中有 AGENT_WORKSPACE 则会包含该键。"""
         status, body = _get(server_with_env, "/v1/env")
         assert status == 200
-        assert body == {"env": {}}
+        env = body["env"]
+        # env.json 不存在时，至少不应包含用户自定义的 key
+        # AGENT_WORKSPACE 可能从 os.environ 自动注入
+        for k in env:
+            assert k == "AGENT_WORKSPACE", f"Unexpected key in empty env: {k}"
 
     def test_post_env_add_key_value(self, server_with_env):
         """POST /v1/env 成功新增键值对，返回 200 及完整列表。"""

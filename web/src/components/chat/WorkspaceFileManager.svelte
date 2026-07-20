@@ -193,9 +193,11 @@
   function matchesNameFilter(file, isSearchList) {
     const filterText = nameFilterQuery.trim().toLowerCase()
     if (!filterText) return true
-    const nameToCheck = isSearchList
-      ? topLevelNameUnderCurrentPath(file.path, file.name)
-      : file.name
+    // For search results the backend has already applied the name filter;
+    // for the defensive frontend fallback, match against the file basename
+    // (search results span subdirectories, so we need the actual filename,
+    // not the top-level component under currentPath).
+    const nameToCheck = isSearchList ? (file.name || '') : file.name
     return (nameToCheck || '').toLowerCase().includes(filterText)
   }
 
@@ -488,18 +490,28 @@
     writeLocalStorage(NAME_FILTER_STORAGE_KEY, nameFilterQuery)
     if (nameFilterTimer) clearTimeout(nameFilterTimer)
     nameFilterTimer = setTimeout(() => {
-      reloadCurrentDirectory()
+      // In search mode the displayed list is driven by searchResults
+      // (filtered on the frontend via matchesNameFilter); avoid a
+      // redundant directory reload.
+      if (!searchMode) reloadCurrentDirectory()
     }, 200)
   }
 
   function handleNameFilterKeydown(e) {
     if (e.key === 'Enter') {
       if (nameFilterTimer) clearTimeout(nameFilterTimer)
-      reloadCurrentDirectory()
+      if (nameFilterQuery.trim()) {
+        // Enter with non-empty filter → recursive filename search (or content+name)
+        handleSearch()
+      } else {
+        reloadCurrentDirectory()
+      }
     } else if (e.key === 'Escape') {
       nameFilterQuery = ''
       writeLocalStorage(NAME_FILTER_STORAGE_KEY, '')
       if (nameFilterTimer) clearTimeout(nameFilterTimer)
+      searchMode = false
+      searchResults = []
       reloadCurrentDirectory()
     }
   }
@@ -512,7 +524,7 @@
 
   // 搜索文件
   async function handleSearch() {
-    if (!searchQuery.trim()) {
+    if (!searchQuery.trim() && !nameFilterQuery.trim()) {
       searchMode = false
       searchResults = []
       return
@@ -521,7 +533,7 @@
     searchMode = true
     loading = true
     try {
-      const results = await workspaceApi.search(currentPath, searchQuery)
+      const results = await workspaceApi.search(currentPath, searchQuery.trim(), nameFilterQuery.trim())
       searchResults = results
     } catch (err) {
       error = err.message
@@ -1465,22 +1477,24 @@
         <!-- 文件名过滤器 + 内容搜索 -->
         <input
           class="inline-search-input filename-filter-input"
+          class:has-value={nameFilterQuery.trim()}
           type="text"
           bind:value={nameFilterQuery}
           oninput={handleNameFilterInput}
           onkeydown={handleNameFilterKeydown}
           placeholder={t('filterFileNames')}
-          title={t('filterFileNames')}
+          title={t('filterFileNames') + ' — Enter: ' + t('searchFiles')}
         />
         {#if searchOpen}
-          <input
-            class="inline-search-input"
-            type="text"
-            bind:this={searchInputEl}
-            bind:value={searchQuery}
-            onkeydown={handleSearchKeydown}
-            placeholder={t('searchFiles')}
-          />
+            <input
+              class="inline-search-input"
+              class:has-value={searchQuery.trim()}
+              type="text"
+              bind:this={searchInputEl}
+              bind:value={searchQuery}
+              onkeydown={handleSearchKeydown}
+              placeholder={t('searchFiles')}
+            />
         {/if}
         <button class="header-btn" class:active={searchOpen} onclick={toggleSearch} title={t('search')}>
           🔍
@@ -1947,6 +1961,14 @@
 
   .inline-search-input:focus {
     border-color: var(--primary);
+  }
+
+  .inline-search-input.has-value {
+    border-color: var(--danger, #e74c3c);
+  }
+
+  .inline-search-input.has-value:focus {
+    border-color: var(--danger, #e74c3c);
   }
 
   .filename-filter-input {

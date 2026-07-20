@@ -374,7 +374,11 @@ export const workspace = {
   },
   tree:     (path) => request('GET', `/v1/workspace/tree?path=${encodeURIComponent(path)}`),
   children: (path) => request('GET', `/v1/workspace/children?path=${encodeURIComponent(path)}`),
-  search:   (path, query) => request('GET', `/v1/workspace/search?path=${encodeURIComponent(path)}&query=${encodeURIComponent(query)}`),
+  search:   (path, query, nameFilter = '') => {
+    const params = new URLSearchParams({ path, query })
+    if (nameFilter) params.set('name_filter', nameFilter)
+    return request('GET', `/v1/workspace/search?${params.toString()}`)
+  },
   content:  (path, restrict = true) => `/v1/workspace/content?path=${encodeURIComponent(path)}&restrict=${restrict ? 1 : 0}`,
   download: (path, restrict = true) => `/v1/workspace/download?path=${encodeURIComponent(path)}&restrict=${restrict ? 1 : 0}`,
   thumbnail:(path, restrict = true) => `/v1/workspace/thumbnail?path=${encodeURIComponent(path)}&restrict=${restrict ? 1 : 0}`,

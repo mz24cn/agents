@@ -1153,7 +1153,8 @@ def _write_file(path: str, content: str) -> str:
             "error": exc.error_code,  # type: ignore[attr-defined]
             "message": (
                 f"{exc}. Content was NOT written to the requested path "
-                f"but has been saved to temporary file: {tmp_path}"
+                f"but has been saved to temporary file: {tmp_path}."
+                f" Please use a file move command to move it to a relative path under the workspace."
             ),
         })
 
