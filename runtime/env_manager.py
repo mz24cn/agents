@@ -350,6 +350,7 @@ tar -xzf "$TMPDIR/payload.tar.gz" -C "$TMPDIR/payload"
 find "$TMPDIR/payload" -type l -exec rm -f {} \\;
 
 mkdir -p "$AGENT_SERVICE_HOME" "$AGENTS_RUNTIME_DIR"
+rm -rf "$AGENT_SERVICE_HOME/web/dist"
 [ ! -d "$TMPDIR/payload/app" ] || tar -C "$TMPDIR/payload/app" -cf - . | tar -C "$AGENT_SERVICE_HOME" -xf -
 [ ! -d "$TMPDIR/payload/agents_runtime" ] || tar -C "$TMPDIR/payload/agents_runtime" -cf - . | tar -C "$AGENTS_RUNTIME_DIR" -xf -
 
@@ -555,6 +556,7 @@ exit 0
             "\n"
             "    New-Item -ItemType Directory -Path $AgentServiceHome -Force | Out-Null\n"
             "    New-Item -ItemType Directory -Path $env:AGENTS_RUNTIME_DIR -Force | Out-Null\n"
+            "    Remove-Item -Path (Join-Path $AgentServiceHome 'web\\dist') -Recurse -Force -ErrorAction SilentlyContinue\n"
             "    $appSrc = Join-Path $payloadDir 'app'\n"
             "    if (Test-Path $appSrc) {\n"
             "        robocopy $appSrc $AgentServiceHome /E /NFL /NDL /NJH /NJS /NC /NS /NP | Out-Null\n"

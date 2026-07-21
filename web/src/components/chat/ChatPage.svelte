@@ -1224,7 +1224,8 @@
       <div class="terminal-view" class:visible={terminalVisible && termId === sessionId}>
         <Terminal 
           bind:this={termData.ref}
-          sessionId={termId} 
+          sessionId={termId}
+          workspace={workspacePath}
           visible={terminalVisible && termId === sessionId}
           onStatusChange={(status) => handleTerminalStatusChange(termId, status)}
         />

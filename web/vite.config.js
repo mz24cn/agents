@@ -24,7 +24,7 @@ export default defineConfig({
     rollupOptions: {
       output: {
         manualChunks: {
-          // xterm 及其 addons 独立打包，只有 TerminalLazy 加载时才下载
+          // xterm JS (~334KB) 独立打包，Terminal.svelte 在 onMount 中动态 import，只有打开终端时才下载
           'xterm': [
             '@xterm/xterm',
             '@xterm/addon-fit'

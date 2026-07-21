@@ -8,10 +8,12 @@ Zero third-party dependencies — only Python standard library.
 """
 
 import datetime
+import gzip
 import hashlib
 import base64
 import struct
 import importlib.util
+import io
 import json
 import logging
 import mimetypes
@@ -386,7 +388,10 @@ def get_or_create_terminal(session_id: str, cols: int = 80, rows: int = 24) -> O
             return None
         
         try:
-            proc = PtyProcess.spawn("powershell.exe", dimensions=(rows, cols))
+            # Resolve the workspace directory for this terminal session.
+            from runtime.common import get_workspace as _get_ws
+            workspace_dir = _get_ws()
+            proc = PtyProcess.spawn("powershell.exe", dimensions=(rows, cols), cwd=workspace_dir)
             with _terminal_sessions_lock:
                 _terminal_sessions[terminal_id] = {
                     "proc": proc,
@@ -428,11 +433,22 @@ def get_or_create_terminal(session_id: str, cols: int = 80, rows: int = 24) -> O
     else:
         try:
             shell = os.environ.get("SHELL", "/bin/bash")
+            # Resolve the workspace directory for this terminal session.
+            # Respects per-request workspace overrides (set_request_context)
+            # falling back to AGENT_WORKSPACE env var, then os.getcwd().
+            from runtime.common import get_workspace as _get_ws
+            workspace_dir = _get_ws()
             pid, master_fd = pty.fork()
             if pid == 0:
-                # Child process: start shell
+                # Child process: change to workspace directory, then start shell
+                try:
+                    os.chdir(workspace_dir)
+                except OSError:
+                    pass  # If the workspace dir doesn't exist, stay in inherited CWD
                 env = os.environ.copy()
                 env["TERM"] = "xterm-256color"
+                # Ensure the shell also knows the workspace
+                env["AGENT_WORKSPACE"] = workspace_dir
                 os.execvpe(shell, [shell], env)
             
             # Set initial window size for the PTY
@@ -842,14 +858,81 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         terminal_id = urllib.parse.unquote(terminal_id)
         session = get_terminal_session(terminal_id)
         if not session:
+            # Frontend may send the bare session_id (without ":auto" suffix).
+            # Try lookup by session_id as well.
+            session = get_terminal_for_session(terminal_id)
+            if session:
+                # Find the actual terminal_id key for this session
+                with _terminal_sessions_lock:
+                    for tid, info in _terminal_sessions.items():
+                        if info is session:
+                            terminal_id = tid
+                            break
+        if not session:
             self._send_json_error(404, f"Terminal not found: {terminal_id}")
             return
         unregister_terminal_session(terminal_id)
         logger.info("Terminal session deleted via API: %s", terminal_id)
         self._send_json_response(200, {"status": "deleted", "terminal_id": terminal_id})
 
+    # MIME types that benefit from gzip compression (text-based).
+    _COMPRESSIBLE_MIME_PREFIXES = (
+        "text/",
+        "application/javascript",
+        "application/json",
+        "application/xml",
+        "application/xhtml+xml",
+        "application/rss+xml",
+        "application/atom+xml",
+        "image/svg+xml",
+        "application/wasm",
+    )
+
+    @staticmethod
+    def _is_compressible(mime_type: str) -> bool:
+        """Return True if the given MIME type is a candidate for gzip."""
+        for prefix in _RuntimeRequestHandler._COMPRESSIBLE_MIME_PREFIXES:
+            if mime_type.startswith(prefix):
+                return True
+        return False
+
+    @staticmethod
+    def _file_etag(file_path: str, stat_info: os.stat_result) -> str:
+        """Build a weak ETag from the file's mtime, size, and inode."""
+        raw = f"{stat_info.st_mtime:.6f}-{stat_info.st_size}-{stat_info.st_ino}"
+        return f'W/"{hashlib.md5(raw.encode()).hexdigest()}"'
+
+    @staticmethod
+    def _is_hashed_asset(filename: str) -> bool:
+        """Detect assets with content-hash in filename (e.g. app.abc123.js).
+
+        These can be cached aggressively (immutable / 1 year).
+        """
+        # Common patterns: name.[8+ hex chars].ext  or  name-[8+ hex chars].ext
+        base, _ = os.path.splitext(filename)
+        # Check for dot-separated hash suffix:  chunk.2a4d8f.js
+        if "." in base:
+            candidate = base.rsplit(".", 1)[-1]
+            if len(candidate) >= 8 and re.match(r"^[0-9a-fA-F]+$", candidate):
+                return True
+        # Check for dash-separated hash suffix:  chunk-2a4d8f.js
+        if "-" in base:
+            candidate = base.rsplit("-", 1)[-1]
+            if len(candidate) >= 8 and re.match(r"^[0-9a-fA-F]+$", candidate):
+                return True
+        return False
+
     def _handle_static_file(self) -> None:
-        """Serve static files from the web/dist directory."""
+        """Serve static files from the web/dist directory.
+
+        Supports:
+        - gzip compression for text-based MIME types (when client
+          advertises ``Accept-Encoding: gzip``).
+        - Conditional requests via ``If-None-Match`` (ETag) and
+          ``If-Modified-Since`` → 304 Not Modified.
+        - Cache-Control with a long max-age for content-hashed assets
+          and a short (or ``no-cache``) lifetime for HTML / non-hashed.
+        """
         static_dir = self.server.static_dir  # type: ignore[attr-defined]
         if static_dir is None:
             self._send_json_error(404, f"Not found: {self.path}")
@@ -878,17 +961,102 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self._send_json_error(404, f"Not found: {self.path}")
             return
 
+        # ---------- file metadata ----------
+        try:
+            stat_info = os.stat(file_path)
+        except OSError:
+            self._send_json_error(500, "Failed to stat file")
+            return
+
         mime_type, _ = mimetypes.guess_type(file_path)
         mime_type = mime_type or "application/octet-stream"
+        last_modified = datetime.datetime.fromtimestamp(
+            stat_info.st_mtime, tz=datetime.timezone.utc
+        )
+        etag = self._file_etag(file_path, stat_info)
 
-        with open(file_path, "rb") as f:
-            data = f.read()
+        # ---------- conditional request ----------
+        if_none_match = self.headers.get("If-None-Match", "")
+        if if_none_match and if_none_match == etag:
+            self._send_304(last_modified, etag, mime_type)
+            return
 
+        if_modified_since = self.headers.get("If-Modified-Since", "")
+        if if_modified_since:
+            try:
+                # Parse IMF-fixdate (RFC 7231 §7.1.1.1)
+                ims = datetime.datetime.strptime(
+                    if_modified_since, "%a, %d %b %Y %H:%M:%S %Z"
+                ).replace(tzinfo=datetime.timezone.utc)
+                # Truncate both to seconds for comparison per HTTP spec
+                if last_modified.replace(microsecond=0) <= ims:
+                    self._send_304(last_modified, etag, mime_type)
+                    return
+            except ValueError:
+                pass  # malformed header → serve full response
+
+        # ---------- read file ----------
+        try:
+            with open(file_path, "rb") as f:
+                data = f.read()
+        except OSError:
+            self._send_json_error(500, "Failed to read file")
+            return
+
+        # ---------- gzip ----------
+        accept_encoding = self.headers.get("Accept-Encoding", "")
+        supports_gzip = "gzip" in accept_encoding.lower()
+        do_gzip = supports_gzip and self._is_compressible(mime_type) and len(data) > 256
+
+        if do_gzip:
+            buf = io.BytesIO()
+            with gzip.GzipFile(fileobj=buf, mode="wb", mtime=stat_info.st_mtime) as gz:
+                gz.write(data)
+            compressed = buf.getvalue()
+            # Only use compressed version if it's actually smaller
+            if len(compressed) < len(data):
+                data = compressed
+            else:
+                do_gzip = False
+
+        # ---------- cache-control ----------
+        filename = os.path.basename(file_path)
+        if self._is_hashed_asset(filename):
+            # Content-hashed assets are immutable → 1 year
+            cache_control = "public, max-age=31536000, immutable"
+        elif filename == "index.html" or mime_type == "text/html":
+            # HTML should always be revalidated (SPA entry point)
+            cache_control = "no-cache"
+        else:
+            # Other assets: cache for 1 hour, allow stale for 1 day
+            cache_control = "public, max-age=3600, stale-while-revalidate=86400"
+
+        # ---------- response ----------
         self.send_response(200)
         self.send_header("Content-Type", mime_type)
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("Last-Modified", last_modified.strftime("%a, %d %b %Y %H:%M:%S GMT"))
+        self.send_header("ETag", etag)
+        self.send_header("Cache-Control", cache_control)
+        if do_gzip:
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Vary", "Accept-Encoding")
         self.end_headers()
         self.wfile.write(data)
+
+    def _send_304(
+        self,
+        last_modified: datetime.datetime,
+        etag: str,
+        mime_type: str,
+    ) -> None:
+        """Send a 304 Not Modified response with appropriate headers."""
+        self.send_response(304)
+        self.send_header("Content-Type", mime_type)
+        self.send_header("Last-Modified", last_modified.strftime("%a, %d %b %Y %H:%M:%S GMT"))
+        self.send_header("ETag", etag)
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
 
     # ------------------------------------------------------------------
     # WebSocket support
@@ -901,12 +1069,16 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self._send_json_error(400, "Missing Sec-WebSocket-Key")
             return
 
-        # Parse terminal_id and optional cols/rows from query string
+        # Parse terminal_id and optional params from query string
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
         terminal_id = params.get("terminal_id", [None])[0]
         initial_cols = int(params["cols"][0]) if params.get("cols") else None
         initial_rows = int(params["rows"][0]) if params.get("rows") else None
+        workspace = params.get("workspace", [None])[0]
+        if workspace:
+            from runtime.common import set_request_context as _set_ctx
+            _set_ctx(workspace=workspace)
 
         # Perform WebSocket handshake
         magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"

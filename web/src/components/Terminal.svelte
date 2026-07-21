@@ -1,26 +1,36 @@
 <script>
   import { onMount, onDestroy } from 'svelte';
-  import { Terminal } from '@xterm/xterm';
-  import { FitAddon } from '@xterm/addon-fit';
+  import { copyToClipboard } from '$lib/clipboard.js';
   import '@xterm/xterm/css/xterm.css';
 
-  let { sessionId, visible = true, onStatusChange = null } = $props();
+  let { sessionId, workspace = '', visible = true, onStatusChange = null } = $props();
 
   let termEl;
   let term;
   let fitAddon;
   let ws;
-  let connected = false;  // Not reactive - only used in notifyStatus()
-  let loading = false;    // Not reactive - only used in notifyStatus()
+  let connected = false;
+  let loading = false;
   let resizeObserver;
   let retryTimeout;
-  let destroyed = false;  // Flag to prevent reconnection after explicit destroy
+  let destroyed = false;
+
+  // ── mouse-tracking: persistently disable ──────────────────
+  const MOUSE_MODES = [1000, 1002, 1003, 1006];
+
+  /** Write disable-mouse sequence to the terminal emulator. */
+  function disableMouseTracking() {
+    try {
+      term?.write('\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l');
+    } catch {}
+  }
 
   function getWsUrl(sid) {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    // Pass current terminal dimensions so the backend can create the PTY
-    // with the correct size from the start (avoids initial layout glitches).
     let url = `${proto}//${location.host}/ws?terminal_id=${sid}`;
+    if (workspace) {
+      url += `&workspace=${encodeURIComponent(workspace)}`;
+    }
     if (term && fitAddon) {
       try {
         url += `&cols=${term.cols}&rows=${term.rows}`;
@@ -43,12 +53,9 @@
       loading = false;
       connected = true;
       notifyStatus();
-      // Fit immediately and send resize so the backend PTY matches
-      // the frontend terminal size before any shell output arrives.
-      try {
-        fitAddon?.fit();
-      } catch {}
+      try { fitAddon?.fit(); } catch {}
       if (term) handleResize({ cols: term.cols, rows: term.rows });
+      disableMouseTracking();
     };
 
     ws.onmessage = (evt) => {
@@ -58,16 +65,18 @@
           if (data.__terminal_id) { terminalIdReceived = true; return; }
         } catch {}
       }
-      term?.write(evt.data);
+      try {
+        term?.write(evt.data);
+      } catch (e) {
+        console.warn('[term] write error caught:', e.message || e);
+      }
     };
 
     ws.onclose = () => {
       loading = false;
       connected = false;
       notifyStatus();
-      if (!destroyed) {
-        scheduleRetry();
-      }
+      if (!destroyed) scheduleRetry();
     };
 
     ws.onerror = () => {};
@@ -98,38 +107,117 @@
     try { ws?.close(); } catch {}
   }
 
-  onMount(() => {
-    term = new Terminal({
+  onMount(async () => {
+    const [{ Terminal: _Terminal }, { FitAddon: _FitAddon }] = await Promise.all([
+      import('@xterm/xterm'),
+      import('@xterm/addon-fit')
+    ]);
+    term = new _Terminal({
       cursorBlink: true,
       theme: { background: '#1e1e1e' },
       fontFamily: "'courier-new', courier, monospace",
-      fontSize: 15
+      fontSize: 15,
     });
-    fitAddon = new FitAddon();
+    fitAddon = new _FitAddon();
     term.loadAddon(fitAddon);
     term.onResize(handleResize);
+
     term.onData((data) => {
       if (ws?.readyState === WebSocket.OPEN) ws.send(data);
     });
+
     term.open(termEl);
     fitAddon.fit();
 
+    // ── Ctrl+C / Cmd+C → copy when there is a selection ──────────
+    // xterm.js sends Ctrl+C to the PTY as SIGINT by default.  When the user
+    // has an active selection, intercept it and copy to the clipboard instead
+    // (returning false stops the keystroke from reaching the PTY).  With no
+    // selection, let it through so it still behaves as a normal interrupt.
+    term.attachCustomKeyEventHandler((ev) => {
+      if (ev.type !== 'keydown') return true;
+      const key = String(ev.key || '').toLowerCase();
+      if ((ev.ctrlKey || ev.metaKey) && key === 'c') {
+        if (term.hasSelection && term.hasSelection()) {
+          const sel = term.getSelection ? term.getSelection() : '';
+          if (sel) copyToClipboard(sel).catch(() => {});
+          return false; // swallow → no \x03 is sent to the PTY
+        }
+      }
+      return true;
+    });
+
+    // ── DECRPM workaround (CSI ? Ps $ p) ───────────────────
+    try {
+      term.parser.registerCsiHandler(
+        { prefix: '?', intermediates: '$', final: 'p' },
+        (params) => {
+          const modes = [];
+          try {
+            for (let i = 0; i < params.length; i++) modes.push(params[i]);
+          } catch {
+            try { modes.push(...params); } catch {}
+          }
+          for (const mode of modes) {
+            const pm = (mode === 1) ? 2 : 0;
+            if (ws?.readyState === WebSocket.OPEN) {
+              ws.send(`\x1b[?${mode};${pm}$y`);
+            }
+          }
+          return true;
+        }
+      );
+    } catch (e) {
+      console.warn('[term] registerCsiHandler for DECRPM failed:', e.message || e);
+    }
+
+    // ── DECSET interceptor: block shell from enabling mouse tracking ──
+    //     CSI ? Ps h   (private-mode SET).  If any Ps is a mouse mode
+    //     (1000/1002/1003/1006) we swallow the sequence so the terminal
+    //     never enters mouse-tracking and text-selection keeps working.
+    try {
+      term.parser.registerCsiHandler(
+        { prefix: '?', final: 'h' },
+        (params) => {
+          let hasMouse = false;
+          const modes = [];
+          try {
+            for (let i = 0; i < params.length; i++) modes.push(params[i]);
+          } catch {
+            try { modes.push(...params); } catch {}
+          }
+          for (const m of modes) {
+            if (MOUSE_MODES.includes(m)) {
+              hasMouse = true;
+            }
+          }
+          if (hasMouse) {
+            // Also ensure the internal mode flag is off
+            disableMouseTracking();
+            return true; // handled — swallow the sequence
+          }
+          return false; // not a mouse mode — let xterm.js process normally
+        }
+      );
+    } catch (e) {
+      console.warn('[term] registerCsiHandler for DECSET failed:', e.message || e);
+    }
+
+    // ── Initial mouse-tracking disable ─────────────────────
+    disableMouseTracking();
+
     resizeObserver = new ResizeObserver(() => { if (visible) requestAnimationFrame(doFit); });
     if (termEl) resizeObserver.observe(termEl);
-
-    // 初始连接
-    if (sessionId) connect();
   });
 
   onDestroy(() => {
-    destroyed = true;  // Prevent ws.onclose from scheduling retry
+    destroyed = true;
     clearTimeout(retryTimeout);
     resizeObserver?.disconnect();
     try { ws?.close(); } catch {}
     try { term?.dispose(); } catch {}
   });
 
-  // 仅用于 fit 和 focus，不触发连接
   $effect(() => {
     requestAnimationFrame(() => {
       doFit();
@@ -137,10 +225,8 @@
     });
   });
 
-  // 监听 visible 变化：重新显示时重连
   $effect(() => {
     if (visible && sessionId && !destroyed) {
-      // 仅在完全断开时连接（不包括正在连接中）
       if (!ws || ws.readyState === WebSocket.CLOSED) {
         const timer = setTimeout(() => connect(), 0);
         return () => clearTimeout(timer);

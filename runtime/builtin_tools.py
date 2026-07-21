@@ -573,8 +573,19 @@ def register_builtin_tools(tool_registry: ToolRegistry, runtime=None) -> list[st
 # ---------------------------------------------------------------------------
 
 
+# Resolve /tmp once so that symlinked setups (e.g. macOS where /tmp -> /private/tmp)
+# are handled correctly.  Any path under the *real* /tmp is unconditionally allowed
+# regardless of workspace boundaries, so tools can always use it as a scratch /
+# data-exchange directory.
+_REAL_TMP = os.path.realpath("/tmp")
+
+
 def _validate_path(workspace: str, raw_path: str) -> str:
     """Resolve *raw_path* and verify it stays inside *workspace*.
+
+    Paths under ``/tmp`` (after resolution) are **always** permitted,
+    regardless of the current workspace.  This allows tools to use
+    ``/tmp`` as a reliable data-exchange / scratch directory.
 
     Returns the resolved absolute path on success.
 
@@ -586,18 +597,22 @@ def _validate_path(workspace: str, raw_path: str) -> str:
     """
     if os.path.isabs(raw_path):
         resolved = os.path.realpath(raw_path)
-        if not (resolved == workspace or resolved.startswith(workspace + os.sep)):
+    else:
+        resolved = os.path.realpath(os.path.join(workspace, raw_path))
+
+    # /tmp and anything underneath it is always allowed
+    if resolved == _REAL_TMP or resolved.startswith(_REAL_TMP + os.sep):
+        return resolved
+
+    if not (resolved == workspace or resolved.startswith(workspace + os.sep)):
+        if os.path.isabs(raw_path):
             err = ValueError("Absolute paths outside workspace are not permitted")
             err.error_code = "AbsolutePathDenied"  # type: ignore[attr-defined]
-            raise err
-        return resolved
-    else:
-        joined = os.path.realpath(os.path.join(workspace, raw_path))
-        if not (joined == workspace or joined.startswith(workspace + os.sep)):
+        else:
             err = ValueError("Path escapes the workspace boundary")
             err.error_code = "PathTraversalDenied"  # type: ignore[attr-defined]
-            raise err
-        return joined
+        raise err
+    return resolved
 
 
 def _journal_turn_key(value: Optional[str]) -> tuple[str, str, bool]:
