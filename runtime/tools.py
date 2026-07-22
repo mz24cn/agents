@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 from runtime.models import ToolConfig
 from runtime.registry import ToolRegistry
+from runtime.common import is_likely_base64
 
 # Python type -> JSON Schema type mapping
 _TYPE_MAP: dict[type, str] = {
@@ -179,40 +180,6 @@ def register_function_tool(registry: ToolRegistry, name: str = None, description
         registry.register(tool_config, callable_fn=fn)
         return fn
     return decorator
-
-
-def is_likely_base64(value: str, threshold: int = 256) -> bool:
-    """判断字符串是否看起来像 base64 编码内容。
-
-    检测逻辑：
-    1. 长度必须大于阈值（默认256字符）
-    2. 只包含 base64 合法字符（A-Z, a-z, 0-9, +, /, =）
-    3. 末尾可能有 0-2 个 '=' 填充符
-
-    Args:
-        value: 要检测的字符串
-        threshold: 长度阈值，低于此值认为不是 base64（可能是文件路径）
-
-    Returns:
-        True 如果看起来像 base64，False 否则
-    """
-    if not isinstance(value, str):
-        return False
-    
-    # 长度检查：base64 编码的文件内容通常很长
-    if len(value) < threshold:
-        return False
-    
-    # 字符合法性检查：只包含 base64 字符集
-    # 移除末尾的 '=' 填充符后检查
-    content = value.rstrip('=')
-    if not content:
-        return False
-    
-    # base64 字符集：A-Z, a-z, 0-9, +, /
-    import string
-    valid_chars = set(string.ascii_letters + string.digits + '+/')
-    return all(c in valid_chars for c in content)
 
 
 def convert_file_path_to_base64(value: str) -> tuple[str, bool]:

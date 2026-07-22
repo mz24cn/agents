@@ -226,16 +226,18 @@
   let isCurrentPathInWorkspace = $derived(isInsideWorkspacePath(currentPath))
 
 
+  // 跟踪上次的面板打开状态，用于打开时滚动工作区节点
+  let prevOpen = false
+
   // 初始化：加载工作区根目录
   $effect(() => {
     // 检测工作区路径是否从外部变化
     if (workspacePath !== trackedWorkspace) {
       trackedWorkspace = workspacePath
       if (treeInitialized && workspacePath) {
-        // 工作区变化，重置状态以便重新加载
-        treeInitialized = false
+        // 工作区变化：增量导航到新路径，复用已加载的树节点
         currentPath = ''
-        treeNodes = []
+        navigateTreeToPath(workspacePath)
       }
     }
 
@@ -249,6 +251,19 @@
         initTree(workspacePath)
       }
     }
+
+    // 面板从关闭变为打开时，已初始化的树需要滚动到工作区节点
+    // （navigateTreeToPath 在面板关闭期间执行时 DOM 不存在，scrollIntoView 无效）
+    if (open && !prevOpen && treeInitialized && workspacePath) {
+      requestAnimationFrame(() => {
+        const wsNode = document.querySelector('.tree-node.workspace')
+        if (wsNode) {
+          wsNode.scrollIntoView({ behavior: 'smooth', block: 'start' })
+        }
+      })
+    }
+    prevOpen = open
+
     // 面板关闭时不再重置 treeInitialized，保留树状态以便再次打开时即时显示
   })
 
@@ -380,6 +395,101 @@
     treeNodes = [...treeNodes] // 触发响应式
 
     // 自动滚动工作区节点到顶部
+    requestAnimationFrame(() => {
+      const wsNode = document.querySelector('.tree-node.workspace')
+      if (wsNode) {
+        wsNode.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      }
+    })
+  }
+
+  // 判断节点是否已有子节点（已加载过）
+  function hasChildrenLoaded(nodeIdx) {
+    if (nodeIdx >= treeNodes.length - 1) return false
+    const node = treeNodes[nodeIdx]
+    for (let i = nodeIdx + 1; i < treeNodes.length; i++) {
+      if (treeNodes[i].depth <= node.depth) return false
+      if (treeNodes[i].depth === node.depth + 1) return true
+    }
+    return false
+  }
+
+  // 增量导航到新工作区路径：复用已加载的树节点，仅加载缺失的层级
+  async function navigateTreeToPath(wsPath) {
+    if (treeNodes.length === 0) {
+      return initTree(wsPath)
+    }
+
+    const normalizedWs = wsPath.replace(/\\/g, '/').toLowerCase()
+
+    // 找到包含工作区路径的根节点
+    const wsRootIdx = treeNodes.findIndex(n => {
+      const normalizedRoot = n.path.replace(/\\/g, '/').toLowerCase().replace(/\/$/, '')
+      return normalizedWs === normalizedRoot || normalizedWs.startsWith(normalizedRoot + '/')
+    })
+
+    if (wsRootIdx === -1) {
+      // 工作区不在任何已加载的根下（如新挂载的盘符），全量重建
+      return initTree(wsPath)
+    }
+
+    // 清除旧的 isWorkspace 标记
+    for (const node of treeNodes) {
+      if (node.isWorkspace) node.isWorkspace = false
+    }
+
+    // 确保工作区根已展开且子节点已加载
+    const wsRoot = treeNodes[wsRootIdx]
+    wsRoot.expanded = true
+    if (!hasChildrenLoaded(wsRootIdx)) {
+      try {
+        const children = await workspaceApi.children(wsRoot.path)
+        insertChildren(wsRootIdx, wsRoot.path, children, wsPath)
+      } catch { return }
+    }
+
+    // 从根到工作区逐级展开
+    const normalizedRootPath = wsRoot.path.replace(/\\/g, '/').replace(/\/$/, '')
+    const relative = normalizedWs.startsWith(normalizedRootPath.toLowerCase())
+      ? wsPath.replace(/\\/g, '/').slice(normalizedRootPath.length)
+      : wsPath.replace(/\\/g, '/')
+    const segments = relative.split('/').filter(Boolean)
+
+    let parentPath = wsRoot.path
+    let parentIdx = wsRootIdx
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i]
+      const segPath = childPath(parentPath, seg)
+
+      let nodeIdx = treeNodes.findIndex(n => pathsEqual(n.path, segPath))
+
+      if (nodeIdx === -1) {
+        // 节点不在树中，重新加载父节点的子节点
+        try {
+          const subChildren = await workspaceApi.children(parentPath)
+          insertChildren(parentIdx, parentPath, subChildren, wsPath)
+        } catch { break }
+        nodeIdx = treeNodes.findIndex(n => pathsEqual(n.path, segPath))
+        if (nodeIdx === -1) break
+      }
+
+      treeNodes[nodeIdx].expanded = true
+      treeNodes[nodeIdx].isWorkspace = (i === segments.length - 1)
+
+      // 加载子节点（如果尚未加载）
+      if (!hasChildrenLoaded(nodeIdx)) {
+        try {
+          const subChildren = await workspaceApi.children(segPath)
+          insertChildren(nodeIdx, segPath, subChildren, wsPath)
+        } catch { break }
+      }
+
+      parentPath = segPath
+      parentIdx = nodeIdx
+    }
+
+    treeNodes = [...treeNodes]
+
     requestAnimationFrame(() => {
       const wsNode = document.querySelector('.tree-node.workspace')
       if (wsNode) {

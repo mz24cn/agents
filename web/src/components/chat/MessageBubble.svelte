@@ -206,6 +206,9 @@
     {:else if msg.role === 'tool'}
       <span>{t('roleFunction')}{#if msg.name}: {msg.name}{/if}</span>
       <div class="role-actions">
+        {#if msg.timestamp}
+          <span class="timestamp">{formatTimestamp(msg.timestamp)}</span>
+        {/if}
         {#if toolResultOverLimit}
           <button class="toggle-btn" onclick={() => toolResultExpanded = !toolResultExpanded}>
             {toolResultExpanded ? t('collapseResult') : t('expandResult')}
@@ -348,6 +351,10 @@
     color: rgba(255, 255, 255, 0.6);
     white-space: nowrap;
     margin-right: 4px;
+  }
+  .message.tool .timestamp {
+    color: var(--text-secondary, #888);
+    opacity: 0.75;
   }
   .toggle-btn {
     padding: 2px 8px;

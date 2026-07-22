@@ -431,6 +431,39 @@ def build_front_matter(front_matter: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
+def is_likely_base64(value: str) -> bool:
+    """判断字符串是否看起来像 base64 编码内容。
+
+    检测逻辑：
+    1. 长度必须大于阈值（默认 1024 字符，可通过 ``BASE64_CHECK_THRESHOLD`` 调整）
+    2. 只包含 base64 合法字符（A-Z, a-z, 0-9, +, /, =）
+    3. 末尾可能有 0-2 个 '=' 填充符
+
+    Args:
+        value: 要检测的字符串
+
+    Returns:
+        True 如果看起来像 base64，False 否则
+    """
+    if not isinstance(value, str):
+        return False
+
+    # 长度检查：base64 编码的文件内容通常很长
+    if len(value) < int(os.environ.get("BASE64_CHECK_THRESHOLD", "1024")):
+        return False
+
+    # 字符合法性检查：只包含 base64 字符集
+    # 移除末尾的 '=' 填充符后检查
+    content = value.rstrip('=')
+    if not content:
+        return False
+
+    # base64 字符集：A-Z, a-z, 0-9, +, /
+    import string
+    valid_chars = set(string.ascii_letters + string.digits + '+/')
+    return all(c in valid_chars for c in content)
+
+
 def convert_image_to_base64(img_data: str) -> str:
     """Convert an image source (URL, local path, or data URI) to a raw base64 string."""
     if img_data.startswith("data:"):
@@ -443,7 +476,8 @@ def convert_image_to_base64(img_data: str) -> str:
         except Exception as e:
             raise ValueError(f"Failed to download image: {e}")
 
-    if '/' not in img_data and '\\' not in img_data or len(img_data) > 4096:
+    # 没有路径分隔符、或者长度超过阈值（看起来像 base64），直接返回
+    if ('/' not in img_data and '\\' not in img_data) or is_likely_base64(img_data):
         return img_data  # 已经是 base64，无需再编码
 
     expanded_path = os.path.expanduser(img_data)
