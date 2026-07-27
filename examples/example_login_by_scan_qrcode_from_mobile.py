@@ -27,7 +27,7 @@
 本脚本通过 /v1/tools/call 接口调用 chrome-devtools-mcp 和 android_use_mcp 工具，全程无大模型参与。
 - tool_id 格式：mcp-{service}-{tool_name}
 - 浏览器工具：mcp-chrome-devtools-take_snapshot, mcp-chrome-devtools-take_screenshot, mcp-chrome-devtools-navigate_page
-- Android工具：mcp-android-show_image, mcp-android-run_adb_command, mcp-android-find_and_click
+- Android工具：mcp-android-use-show_image, mcp-android-use-run_adb_command, mcp-android-use-find_and_click
 
 """
 
@@ -82,7 +82,7 @@ def call_tool(tool_id: str, arguments: dict, format: str = "json") -> Any:
     调用 Agent Service 的 /v1/tools/call 接口。
 
     Args:
-        tool_id: 工具ID，如 "mcp-chrome-devtools-take_snapshot", "mcp-android-show_image"
+        tool_id: 工具ID，如 "mcp-chrome-devtools-take_snapshot", "mcp-android-use-show_image"
         arguments: 工具参数，与大模型调用时的 arguments 格式完全一致
         format: 返回格式，"json" 返回 JSON 对象，否则返回原始文本
 
@@ -280,7 +280,7 @@ def android_show_image(base64_content: str, device_id: str) -> dict:
         device_id: 手机设备ID
     """
     return call_tool(
-        "mcp-android-show_image",
+        "mcp-android-use-show_image",
         {"base64_content": base64_content, "device_id": device_id},
     )
 
@@ -288,7 +288,7 @@ def android_show_image(base64_content: str, device_id: str) -> dict:
 def android_run_adb(command: str, device_id: str) -> dict:
     """执行 ADB 命令"""
     return call_tool(
-        "mcp-android-run_adb_command",
+        "mcp-android-use-run_adb_command",
         {"command": command, "device_id": device_id},
     )
 
@@ -362,7 +362,7 @@ def android_wakeup_and_unlock(device_id: str, pin: str = None) -> bool:
 def android_find_and_click(keyword: str, device_id: str) -> dict:
     """在手机屏幕上查找并点击包含指定文字的元素"""
     return call_tool(
-        "mcp-android-find_and_click",
+        "mcp-android-use-find_and_click",
         {"keyword_or_image_file": keyword, "device_id": device_id},
     )
 

@@ -326,6 +326,33 @@ DELEGATE_TOOL_CONFIG = ToolConfig(
     builtin=True,
 )
 
+TALK_TO_TOOL_CONFIG = ToolConfig(
+    tool_id="talk_to",
+    tool_type="function",
+    name="talk_to",
+    description=(
+        "向一个或多个 Agent 发送私密消息并获取回复。"
+        "每个目标 Agent 独立处理消息后返回文本结果。"
+        "适用于需要与其他 Agent 一对一/一对多私下沟通的场景。"
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "agents": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "目标 Agent 的 ID 列表，如 ['alice', 'bob']。可通过 {{AGENTS}} 查看可用的 Agent。",
+            },
+            "message": {
+                "type": "string",
+                "description": "要发送给目标 Agent 的消息内容。",
+            },
+        },
+        "required": ["agents", "message"],
+    },
+    builtin=True,
+)
+
 
 def resolve_tool_ids(tools: list[str] | str, scope: list) -> list[str]:
     """将工具 name 列表解析为 tool_id 列表，仅在 scope 内查找。
@@ -527,8 +554,195 @@ def _make_delegate_fn(runtime, thread_local):
     return delegate
 
 
+def _make_talk_to_fn(runtime, thread_local):
+    """创建 talk_to 工具的可调用函数。
+
+    talk_to 是对 delegate 的简化，通过 Agent 的 ID 或 labels 定位目标，
+    向其发送私密消息并获取回复。支持同时向多个 Agent 并行发送。
+
+    与 delegate 的核心区别：
+    - 不需要手动指定 model_id / tools / context —— 从 Agent 注册信息自动获取
+    - 不需要 images 参数 —— 视觉处理由 Agent 自己的工具完成
+    - 多个目标 Agent 并行推理，子会话各自独立持久化
+    - 返回格式：每个 Agent 的结果用 [nickname](agent_id): 前缀标注
+
+    Args:
+        runtime: Runtime 实例，用于执行 SubAgent 推理
+        thread_local: threading.local 实例，用于读取上下文信息
+
+    Returns:
+        talk_to 可调用函数
+    """
+    def talk_to(agents: list[str], message: str) -> str:
+        tool_call_id = "call_" + uuid.uuid4().hex[:8]
+
+        # 捕获父线程上下文（子线程中 thread_local 是隔离的，需要显式传递）
+        parent_session_id = getattr(thread_local, "session_id", None)
+        parent_depth = getattr(thread_local, "depth", 0)
+        parent_sse_callback = getattr(thread_local, "sse_callback", None)
+        agent_manager = getattr(thread_local, "agent_manager", None)
+        context_manager = getattr(thread_local, "context_manager", None)
+        cancel_event = getattr(thread_local, "cancel_event", None)
+
+        if agent_manager is None:
+            return "Error: talk_to requires an AgentManager. Ensure agent_manager is set in the request context."
+
+        # 第一阶段：解析所有 agent 名称（保持原始顺序）
+        resolved: list[tuple[str, dict | None]] = []
+        for name in agents:
+            agent = agent_manager.get(name)
+            resolved.append((name, agent))
+
+        # 用于收集并行结果
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def run_one(agent_name: str, agent: dict | None):
+            """在子线程中运行单个 agent 的推理，完成后持久化。"""
+            if agent is None:
+                return (agent_name, agent_name, f"Error: Agent not found.", None)
+
+            agent_id = agent["agent_id"]
+            model_id = agent.get("model_id", "default")
+            agent_tool_ids = agent.get("tool_ids", [])
+            system_prompt = agent.get("system_prompt", "")
+            nickname = agent.get("nickname", agent_id)
+
+            # 生成子 session_id（每个 agent 独立）
+            sub_session_id = None
+            if parent_session_id is not None:
+                sub_ts = session_timestamp()
+                sub_session_id = f"{parent_session_id}-talk_{sub_ts}_{agent_id}"
+
+            # 在子线程中设置 thread_local 上下文
+            thread_local.depth = parent_depth + 1
+            thread_local.session_id = sub_session_id
+            thread_local.session_dir = None
+            thread_local.file_journal_manager = None
+            thread_local.user_message_timestamp = None
+            # 子线程中 tool_scope 和 agent_manager 继承父线程
+            thread_local.tool_scope = getattr(thread_local, "tool_scope", [])
+            thread_local.agent_manager = agent_manager
+            thread_local.context_manager = context_manager
+            thread_local.sse_callback = parent_sse_callback
+            thread_local.cancel_event = cancel_event
+
+            # 构建消息
+            messages = []
+            if system_prompt:
+                messages.append(Message(role="system", content=system_prompt))
+            messages.append(Message(role="user", content=message))
+
+            request = InferenceRequest(
+                model_id=model_id,
+                tool_ids=agent_tool_ids,
+                messages=messages,
+                max_tool_rounds=int(os.environ.get("MAX_TOOL_ROUNDS", 100))
+            )
+
+            chunks = []
+            collected_msgs = []
+            try:
+                for msg in runtime.infer_stream(request, cancel_event=cancel_event):
+                    collected_msgs.append(msg)
+                    if msg.role == "assistant" and msg.content:
+                        chunks.append(msg.content)
+                        if parent_sse_callback is not None:
+                            try:
+                                parent_sse_callback({
+                                    "role": "tool",
+                                    "name": "talk_to",
+                                    "tool_call_id": tool_call_id,
+                                    "streaming": True,
+                                    "delta": msg.content,
+                                    "depth": parent_depth + 1,
+                                    "agent_id": agent_id,
+                                })
+                            except Exception:
+                                pass
+            except Exception as exc:
+                return (agent_id, nickname, f"Error: {exc}", None)
+
+            result = "".join(chunks)
+
+            # 持久化子会话（复用 delegate 的 persist_conversation 机制）
+            persistence_info = None
+            if context_manager is not None and sub_session_id is not None and parent_session_id is not None:
+                try:
+                    from runtime.server import persist_conversation
+                    import copy as _copy
+                    sub_cm = _copy.copy(context_manager)
+                    sub_cm._chats_dir = os.path.join(
+                        context_manager._chats_dir,
+                        parent_session_id.replace("-", os.sep),
+                    )
+                    sub_cm._memory_store = {}
+                    short_sub_id = sub_session_id[len(parent_session_id) + 1:]
+                    sub_agent_ids = [agent_id]
+                    sub_model_id = model_id
+                    exc = persist_conversation(
+                        context_manager=sub_cm,
+                        session_id=short_sub_id,
+                        original_messages=messages,
+                        collected_messages=collected_msgs,
+                        session_manager=None,  # 子会话不更新顶层 index
+                        tool_ids=agent_tool_ids,
+                        agent_ids=sub_agent_ids,
+                        model_id=sub_model_id,
+                        extra_meta={"parent_session_id": parent_session_id},
+                    )
+                    if exc is not None:
+                        raise exc
+                    persistence_info = short_sub_id
+                except Exception as persist_err:
+                    logger.warning("talk_to: 持久化 SubAgent Session 失败 (%s): %s",
+                                   agent_id, persist_err)
+
+            return (agent_id, nickname, result, persistence_info)
+
+        # 第二阶段：并行执行所有 agent 推理
+        all_results: list[tuple[str, str, str, object]] = []
+        with ThreadPoolExecutor(max_workers=min(len(resolved), 8)) as executor:
+            future_map = {}
+            for name, agent in resolved:
+                future = executor.submit(run_one, name, agent)
+                future_map[future] = name
+
+            for future in as_completed(future_map):
+                try:
+                    agent_id, nickname, result, persisted = future.result()
+                    all_results.append((agent_id, nickname, result, persisted))
+                except Exception as exc:
+                    name = future_map[future]
+                    all_results.append((name, name, f"Error: {exc}", None))
+
+        # 按原始 agents 参数顺序排列结果
+        result_by_agent = {agent_id: (nickname, result)
+                           for agent_id, nickname, result, _ in all_results}
+        ordered: list[str] = []
+        for name, agent in resolved:
+            aid = agent["agent_id"] if agent else name
+            nickname, result = result_by_agent.get(aid, (name, f"Error: Agent not found."))
+            ordered.append(f"[{nickname}]({aid}): {result}")
+
+        # 推送结束帧
+        if parent_sse_callback is not None:
+            try:
+                parent_sse_callback({
+                    "role": "tool",
+                    "name": "talk_to",
+                    "tool_call_id": tool_call_id,
+                    "streaming": False,
+                })
+            except Exception:
+                pass
+
+        return "\n".join(ordered)
+
+    return talk_to
+
+
 def _no_runtime_delegate(**kwargs) -> str:
-    """当 runtime 未提供时，delegate / read_image 工具的占位函数，向后兼容。"""
+    """当 runtime 未提供时，delegate / talk_to / read_image 工具的占位函数，向后兼容。"""
     return "Error: this tool requires a Runtime instance. Pass runtime= to register_builtin_tools()."
 
 
@@ -554,16 +768,20 @@ def register_builtin_tools(tool_registry: ToolRegistry, runtime=None) -> list[st
         # fn is None for runtime-dependent tools — skip here, handled below
         ids.append(config.tool_id)
 
-    # Register delegate tool with runtime-aware callable
+    # Register delegate and talk_to tools with runtime-aware callable
     if runtime is not None:
         delegate_fn = _make_delegate_fn(runtime, _thread_local)
         read_image_fn = _make_read_image_fn(runtime)
+        talk_to_fn = _make_talk_to_fn(runtime, _thread_local)
     else:
         delegate_fn = _no_runtime_delegate
         read_image_fn = _no_runtime_delegate
+        talk_to_fn = _no_runtime_delegate
     tool_registry.register(DELEGATE_TOOL_CONFIG, callable_fn=delegate_fn)
     tool_registry.register(READ_IMAGE_TOOL_CONFIG, callable_fn=read_image_fn)
+    tool_registry.register(TALK_TO_TOOL_CONFIG, callable_fn=talk_to_fn)
     ids.append("delegate")
+    ids.append("talk_to")
 
     return ids
 

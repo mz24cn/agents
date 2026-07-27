@@ -233,6 +233,7 @@ def persist_conversation(
                 name=getattr(m, "name", None),
                 tool_id=getattr(m, "tool_id", None),
                 tool_use_id=getattr(m, "tool_use_id", None),
+                mentions=getattr(m, "mentions", None),
             ))
         merged_turns, last_stat = merge_stream_messages(collected_messages)
         # 如果有 agent_ids，为所有 role=assistant 的消息设置 name（nickname）和 assistant_id 字段
@@ -240,9 +241,11 @@ def persist_conversation(
             primary_agent_id = agent_ids[0]
             for turn in merged_turns:
                 if turn.role == "assistant":
-                    if agent_nickname:
+                    # Only overwrite if not already set (group-chat messages come pre-tagged)
+                    if agent_nickname and not turn.name:
                         turn.name = agent_nickname
-                    turn.assistant_id = primary_agent_id
+                    if not turn.assistant_id:
+                        turn.assistant_id = primary_agent_id
         new_turns.extend(merged_turns)
         last_total_tokens = (
             (last_stat.get("prompt_tokens", 0) + last_stat.get("completion_tokens", 0))
@@ -1793,7 +1796,33 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             body["model_id"] = agent["model_id"]
             body["tool_ids"] = agent.get("tool_ids", [])
 
-            # On first turn (new session or stateless), prepend agent system prompt to messages
+        # === @-mention parsing (before system prompt prepend, so we know
+        #     whether this is group chat or single-agent) ===
+        mentioned_agent_ids: list[str] = []
+        if len(agent_ids) > 1:
+            from runtime.group_chat import parse_mentions, resolve_mentions
+            raw_messages = body.get("messages", [])
+            for m in reversed(raw_messages):
+                if m.get("role") == "user":
+                    mentions = parse_mentions(m.get("content", ""))
+                    if mentions:
+                        resolved = resolve_mentions(
+                            mentions,
+                            self.server.agent_manager,  # type: ignore[attr-defined]
+                            agent_ids,
+                        )
+                        mentioned_agent_ids = resolved
+                    else:
+                        # No @ → broadcast to all agents
+                        mentioned_agent_ids = list(agent_ids)
+                    break
+            if not mentioned_agent_ids:
+                mentioned_agent_ids = list(agent_ids)
+
+        # On first turn (new session or stateless), prepend agent system prompt.
+        # Skip for group chat — each agent gets its own system prompt in group_chat.py.
+        is_group_chat = len(mentioned_agent_ids) > 1
+        if primary_agent_id and not is_group_chat:
             raw_sid = body.get("session_id") or None
             if raw_sid in ("new", None):
                 sys_prompt = agent.get("system_prompt", "")
@@ -1885,6 +1914,9 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                     msg.timestamp = now_ts
                 if user_message_timestamp is None and msg.role == "user":
                     user_message_timestamp = msg.timestamp
+                # Tag user messages with @-mentioned agent IDs for group chat
+                if msg.role == "user" and mentioned_agent_ids:
+                    msg.mentions = mentioned_agent_ids
                 original_messages.append(msg)
             try:
                 original_messages = expand_workspace_file_refs(original_messages, _get_ws())
@@ -1904,8 +1936,10 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
 
         tool_ids = body.get("tool_ids", [])
         has_delegate = "delegate" in tool_ids
+        has_talk_to = "talk_to" in tool_ids
 
         tool_scope: list = []
+        # --- TOOLS 占位符（delegate 专用）---
         if has_delegate and len(tool_ids) > 1:
             runtime = self._get_runtime()
             mcp_by_server: dict[str, list[str]] = {}
@@ -1944,6 +1978,36 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                             msg.arguments["TOOLS"] = tools_markdown
                         break
 
+        # --- AGENTS 占位符（talk_to 专用）---
+        if has_talk_to and agent_ids:
+            agent_manager = self.server.agent_manager  # type: ignore[attr-defined]
+            if assembled_messages:
+                rows = []
+                for aid in agent_ids:
+                    agent = agent_manager.get(aid) if agent_manager else None
+                    if agent is None:
+                        continue
+                    nickname = agent.get("nickname", aid)
+                    desc = (agent.get("description") or "").replace("\n", " ")
+                    rows.append((nickname, aid, desc))
+
+                if rows:
+                    lines = [
+                        "| Nickname | Agent ID | Description |",
+                        "| --- | --- | --- |",
+                    ]
+                    for nick, aid, desc in rows:
+                        lines.append(f"| {nick} | {aid} | {desc} |")
+                    agents_markdown = "\n".join(lines)
+
+                    for msg in assembled_messages:
+                        if msg.role == "system":
+                            if msg.arguments is None:
+                                msg.arguments = {}
+                            if not msg.arguments.get("AGENTS"):
+                                msg.arguments["AGENTS"] = agents_markdown
+                            break
+
         request = InferenceRequest(
             model_id=body["model_id"],
             model_config_override=model_override,
@@ -1966,7 +2030,9 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             tool_scope=tool_scope,
             context_manager=context_manager,
             session_manager=self.server.session_manager,  # type: ignore[attr-defined]
+            agent_manager=self.server.agent_manager,  # type: ignore[attr-defined]
             agent_ids=agent_ids,
+            mentioned_agent_ids=mentioned_agent_ids,
             model_id=body["model_id"],
         )
 
@@ -1990,7 +2056,8 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         clear_request_context([
             "sse_callback", "cancel_event", "session_id", "session_dir",
             "user_message_timestamp", "depth", "tool_scope",
-            "context_manager", "session_manager", "workspace",
+            "context_manager", "session_manager", "agent_manager", "workspace",
+            "mentioned_agent_ids",
         ])
 
     def _persist_conversation(self, context_manager, session_id, original_messages, collected_messages, agent_ids=None, agent_nickname=None, model_id=None, tool_ids=None, workspace=None):
@@ -2027,16 +2094,35 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             runtime = self._get_runtime()
 
             collected_messages: list[Message] = []
+            # === Group chat routing (non-streaming) ===
+            mentioned_agent_ids = get_request_context("mentioned_agent_ids") or []
             try:
-                for msg in runtime.infer_stream(request):
-                    collected_messages.append(msg)
-                    if msg.role == "assistant" and msg.content and msg.content.startswith("Error:"):
-                        logger.error("infer error event | model=%s %s", request.model_id, msg.content)
+                if len(mentioned_agent_ids) > 1:
+                    # Multi-agent group chat without SSE streaming
+                    from runtime.group_chat import run_group_chat_stream
+                    collected_messages = run_group_chat_stream(
+                        runtime=runtime,
+                        mentioned_agent_ids=mentioned_agent_ids,
+                        original_messages=original_messages,
+                        base_request=request,
+                        cancel_event=None,  # non-streaming: no cancel support
+                        sse_callback=None,   # non-streaming: no SSE output
+                        context_manager=context_manager,
+                        session_id=session_id,
+                        agent_manager=self.server.agent_manager,  # type: ignore[attr-defined]
+                        model_id=model_id,
+                        tool_ids=tool_ids,
+                    )
+                else:
+                    for msg in runtime.infer_stream(request):
+                        collected_messages.append(msg)
+                        if msg.role == "assistant" and msg.content and msg.content.startswith("Error:"):
+                            logger.error("infer error event | model=%s %s", request.model_id, msg.content)
             except Exception as exc:
                 self._send_json_error(500, f"Inference failed: {exc}")
                 return
 
-            if agent_ids:
+            if agent_ids and len(mentioned_agent_ids) <= 1:
                 for msg in collected_messages:
                     if msg.role == "assistant":
                         msg.assistant_id = agent_ids[0]
@@ -2053,9 +2139,10 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             if agent_ids:
                 for turn in merged_turns:
                     if turn.role == "assistant":
-                        turn.assistant_id = agent_ids[0]
-                        if agent_nickname:
+                        if agent_nickname and not turn.name:
                             turn.name = agent_nickname
+                        if not turn.assistant_id:
+                            turn.assistant_id = agent_ids[0]
 
             merged_messages = [
                 {k: v for k, v in asdict(turn).items() if v is not None}
@@ -2150,15 +2237,22 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         if not session_title:
             session_title = session_id  # 兜底：用 session_id 作为标题
 
+        # Check if group chat mode is active
+        mentioned_for_init = get_request_context("mentioned_agent_ids") or []
+        is_group_chat = len(mentioned_for_init) > 1
+
         init_payload = {
             "session_id": session_id,
             "type": "init",
             "user_message_timestamp": user_message_ts,
             "has_system_prompt": has_system_prompt,
             "agent_ids": agent_ids,
-            "agent_nickname": agent_nickname,
+            "agent_nickname": None if is_group_chat else agent_nickname,
             "title": session_title,
         }
+        if is_group_chat:
+            init_payload["group_chat"] = True
+            init_payload["mentioned_agent_ids"] = mentioned_for_init
         # 发送 event: init 帧
         self.wfile.write(f"event: init\ndata: {json.dumps(init_payload, ensure_ascii=False)}\n\n".encode("utf-8"))
         self.wfile.flush()
@@ -2200,20 +2294,40 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 logger.error("infer_stream: failed to pre-persist conversation for session %s: %s", session_id, pre_exc)
 
         try:
-            for msg in runtime.infer_stream(request, cancel_event=cancel_event):
-                collected_messages.append(msg)
-                if msg.role == "assistant" and agent_ids:
-                    msg.assistant_id = agent_ids[0]
-                    if agent_nickname:
-                        msg.name = agent_nickname
-                # delegate 工具通过 sse_callback 自行管理流式帧和结束帧，跳过 infer_stream 的重复输出
-                if msg.role == "tool" and msg.name == "delegate":
-                    continue
-                event_data = json.dumps(msg.to_dict(), ensure_ascii=False)
-                self.wfile.write(f"data: {event_data}\n\n".encode("utf-8"))
-                self.wfile.flush()
-                if msg.role == "assistant" and msg.content and msg.content.startswith("Error:"):
-                    logger.error("infer_stream error event | model=%s %s", request.model_id, msg.content)
+            # === Group chat routing ===
+            mentioned_agent_ids = get_request_context("mentioned_agent_ids") or []
+            if len(mentioned_agent_ids) > 1:
+                # Multi-agent group chat: each @-mentioned agent runs in parallel
+                from runtime.group_chat import run_group_chat_stream
+                collected_messages = run_group_chat_stream(
+                    runtime=runtime,
+                    mentioned_agent_ids=mentioned_agent_ids,
+                    original_messages=original_messages,
+                    base_request=request,
+                    cancel_event=cancel_event,
+                    sse_callback=_sse_write,
+                    context_manager=context_manager,
+                    session_id=session_id,
+                    agent_manager=self.server.agent_manager,  # type: ignore[attr-defined]
+                    model_id=model_id,
+                    tool_ids=tool_ids,
+                )
+            else:
+                # Single agent (existing path)
+                for msg in runtime.infer_stream(request, cancel_event=cancel_event):
+                    collected_messages.append(msg)
+                    if msg.role == "assistant" and agent_ids:
+                        msg.assistant_id = agent_ids[0]
+                        if agent_nickname:
+                            msg.name = agent_nickname
+                    # delegate / talk_to 工具通过 sse_callback 自行管理流式帧和结束帧，跳过 infer_stream 的重复输出
+                    if msg.role == "tool" and msg.name in ("delegate", "talk_to"):
+                        continue
+                    event_data = json.dumps(msg.to_dict(), ensure_ascii=False)
+                    self.wfile.write(f"data: {event_data}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+                    if msg.role == "assistant" and msg.content and msg.content.startswith("Error:"):
+                        logger.error("infer_stream error event | model=%s %s", request.model_id, msg.content)
 
             # 【已移除】尾部发送 session_id 的逻辑，已在第一条消息中发送
 

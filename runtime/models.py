@@ -41,6 +41,7 @@ class Message:
     tool_id: Optional[str] = None
     tool_use_id: Optional[str] = None
     assistant_id: Optional[str] = None
+    mentions: Optional[list[str]] = None
 
     def to_dict(self) -> dict:
         """Serialize to a dictionary, omitting None fields."""
@@ -67,6 +68,8 @@ class Message:
             d["tool_use_id"] = self.tool_use_id
         if self.assistant_id is not None:
             d["assistant_id"] = self.assistant_id
+        if self.mentions is not None:
+            d["mentions"] = self.mentions
         return d
 
     @classmethod
@@ -86,6 +89,7 @@ class Message:
             tool_id=data.get("tool_id"),
             tool_use_id=data.get("tool_use_id"),
             assistant_id=data.get("assistant_id"),
+            mentions=data.get("mentions"),
         )
 
 

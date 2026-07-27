@@ -132,13 +132,13 @@
   </div>
 
   <div class="form-group">
-    <label for="agent_myself">{t('agentMyselfView')}</label>
-    <input id="agent_myself" type="text" bind:value={myselfView} placeholder={t('agentMyselfViewPlaceholder')} />
+    <label for="agent_desc">{t('agentDescription')}</label>
+    <input id="agent_desc" type="text" bind:value={description} placeholder={t('agentDescriptionPlaceholder')} />
   </div>
 
   <div class="form-group">
-    <label for="agent_desc">{t('agentDescription')}</label>
-    <textarea id="agent_desc" bind:value={description} rows="2" placeholder={t('agentDescriptionPlaceholder')}></textarea>
+    <label for="agent_myself">{t('agentMyselfView')}</label>
+    <textarea id="agent_myself" bind:value={myselfView} rows="3" placeholder={t('agentMyselfViewPlaceholder')}></textarea>
   </div>
 
   <div class="form-group">

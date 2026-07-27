@@ -574,7 +574,9 @@ class Runtime:
             # --- Base64 image interception (inference loop only) ---
             # Long base64 payloads (e.g. screenshots from windows-mcp / chrome-devtools)
             # are harmful to the model context. Replace them with saved file paths.
-            if is_likely_base64(result_str):
+            if len(result_str) > int(os.environ.get("BASE64_CHECK_THRESHOLD", "1024")):
+                if is_likely_base64(result_str):
+                    result_str = '{"data":"' + result_str + '"}'
                 from runtime.tools import save_and_replace_base64
                 result_str = save_and_replace_base64(result_str)
         elif tool_config.tool_type == "skill":

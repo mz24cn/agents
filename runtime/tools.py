@@ -251,12 +251,6 @@ def process_tool_arguments_for_base64(arguments: dict) -> dict:
 
             if was_converted:
                 arguments[param_name] = converted_value
-                # 添加元数据，便于调试
-                arguments['_original_path'] = original_value
-                arguments['_converted_to_base64'] = True
-                logger.info(f"自动转换文件路径到 base64: {param_name} = {original_value} -> (已转换, 长度 {len(converted_value)})")
-            else:
-                logger.debug(f"参数 {param_name} 无需转换 (长度 {len(original_value)}, 看起来像 base64: {is_likely_base64(original_value)})")
 
     return arguments
 

@@ -74,6 +74,7 @@ class ConversationTurn:
     tool_id: Optional[str] = None
     tool_use_id: Optional[str] = None
     completed_at: Optional[str] = None
+    mentions: Optional[list[str]] = None
 
 
 @dataclass
@@ -1165,6 +1166,7 @@ class ContextManager:
                 tool_id=msg.get("tool_id"),
                 tool_use_id=msg.get("tool_use_id"),
                 completed_at=msg.get("completed_at"),
+                mentions=msg.get("mentions"),
             ))
         return turns
 
