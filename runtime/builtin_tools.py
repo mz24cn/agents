@@ -44,6 +44,7 @@ if sys.platform != "win32":
 
 from runtime.models import InferenceRequest, Message, ToolConfig
 from runtime.registry import ToolRegistry
+from runtime.group_chat import build_agents_markdown, _GC_DEFAULT_PROMPT
 from runtime.common import (
     _thread_local,
     convert_image_to_base64,
@@ -341,7 +342,7 @@ TALK_TO_TOOL_CONFIG = ToolConfig(
             "agents": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "目标 Agent 的 ID 列表，如 ['alice', 'bob']。可通过 {{AGENTS}} 查看可用的 Agent。",
+                "description": "目标 Agent 的 ID 列表，如 ['alice', 'bob']。",
             },
             "message": {
                 "type": "string",
@@ -564,7 +565,7 @@ def _make_talk_to_fn(runtime, thread_local):
     - 不需要手动指定 model_id / tools / context —— 从 Agent 注册信息自动获取
     - 不需要 images 参数 —— 视觉处理由 Agent 自己的工具完成
     - 多个目标 Agent 并行推理，子会话各自独立持久化
-    - 返回格式：每个 Agent 的结果用 [nickname](agent_id): 前缀标注
+    - 返回格式：每个 Agent 的结果用 **nickname** (agent_id): 前缀标注
 
     Args:
         runtime: Runtime 实例，用于执行 SubAgent 推理
@@ -583,6 +584,8 @@ def _make_talk_to_fn(runtime, thread_local):
         agent_manager = getattr(thread_local, "agent_manager", None)
         context_manager = getattr(thread_local, "context_manager", None)
         cancel_event = getattr(thread_local, "cancel_event", None)
+        all_agent_ids: list[str] = getattr(thread_local, "all_agent_ids", None) or []
+        caller_agent_id: str = getattr(thread_local, "agent_id", None) or ""
 
         if agent_manager is None:
             return "Error: talk_to requires an AgentManager. Ensure agent_manager is set in the request context."
@@ -625,11 +628,32 @@ def _make_talk_to_fn(runtime, thread_local):
             thread_local.context_manager = context_manager
             thread_local.sse_callback = parent_sse_callback
             thread_local.cancel_event = cancel_event
+            thread_local.all_agent_ids = all_agent_ids
 
             # 构建消息
             messages = []
+            # 若子 agent 持有 talk_to 工具且外层提供了 all_agent_ids，
+            # 则将 AGENTS 表格注入系统提示词，确保子 agent 能正确使用 agent_id
+            agents_md = ""
+            if "talk_to" in agent_tool_ids and all_agent_ids:
+                agents_md = build_agents_markdown(all_agent_ids, agent_manager)
             if system_prompt:
+                if agents_md:
+                    gc_prompt = _GC_DEFAULT_PROMPT.replace("{{AGENTS}}", agents_md)
+                    # 避免重复注入
+                    if gc_prompt not in system_prompt:
+                        system_prompt = system_prompt + "\n\n" + gc_prompt
+                # 若知道调用者身份，告知当前 agent 对方是谁
+                if caller_agent_id and agents_md:
+                    caller_agent = agent_manager.get(caller_agent_id)
+                    if caller_agent:
+                        caller_nickname = caller_agent.get("nickname", caller_agent_id)
+                        system_prompt += "\n\n用户的角色是 " + caller_nickname + " (" + caller_agent_id + ")"
                 messages.append(Message(role="system", content=system_prompt))
+            elif agents_md:
+                # 无 system_prompt，直接用默认的群聊提示词
+                gc_prompt = _GC_DEFAULT_PROMPT.replace("{{AGENTS}}", agents_md)
+                messages.append(Message(role="system", content=gc_prompt))
             messages.append(Message(role="user", content=message))
 
             request = InferenceRequest(
@@ -656,6 +680,7 @@ def _make_talk_to_fn(runtime, thread_local):
                                     "delta": msg.content,
                                     "depth": parent_depth + 1,
                                     "agent_id": agent_id,
+                                    "agent_nickname": nickname,
                                 })
                             except Exception:
                                 pass
@@ -722,7 +747,7 @@ def _make_talk_to_fn(runtime, thread_local):
         for name, agent in resolved:
             aid = agent["agent_id"] if agent else name
             nickname, result = result_by_agent.get(aid, (name, f"Error: Agent not found."))
-            ordered.append(f"[{nickname}]({aid}): {result}")
+            ordered.append(f"**{nickname}** ({aid}): {result}")
 
         # 推送结束帧
         if parent_sse_callback is not None:
@@ -732,6 +757,7 @@ def _make_talk_to_fn(runtime, thread_local):
                     "name": "talk_to",
                     "tool_call_id": tool_call_id,
                     "streaming": False,
+                    "agent_id": caller_agent_id,
                 })
             except Exception:
                 pass

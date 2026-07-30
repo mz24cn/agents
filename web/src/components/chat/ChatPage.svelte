@@ -247,12 +247,12 @@
     return () => ro.disconnect()
   })
 
-  // 添加为智能体状态
+  // 添加为AI代理状态
   let addAgentMode = $state(false)
   let addAgentNickname = $state('')
   let addAgentSaving = $state(false)
 
-  // 智能体选择器状态
+  // AI代理选择器状态
   let agentList = $derived(catalog.agents.items)
   let selectedAgentIds = $state(JSON.parse(localStorage.getItem('chat_selected_agents') ?? '[]'))
   let selectedAgentId = $derived(selectedAgentIds.length === 1 ? selectedAgentIds[0] : '') // 向后兼容单选场景
@@ -413,7 +413,7 @@
     // Force scroll to bottom when user sends a new message
     shouldScrollToBottom = true
 
-    let aIdxRef = { value: -1 }
+    let aIdxRef = { value: -1, groupMode: false, groupMap: {} }
     const reqBody = { model_id: selectedModelId, tool_ids: selectedToolIds, messages: apiMessages, stream: true }
     if (selectedAgentIds.length > 0) {
       reqBody.agent_ids = selectedAgentIds
@@ -456,20 +456,26 @@
         userMsg.timestamp = initData.user_message_timestamp
         store.messages = [...store.messages, userMsg]
       }
-      // 创建空助手消息占位
-      const assistantMsg = { role: 'assistant', content: '', thinking: null }
-      if (selectedAgentIds.length === 1) {
-        assistantMsg.assistant_id = selectedAgentIds[0]
-      } else if (selectedAgentIds.length > 1) {
-        assistantMsg.assistant_ids = selectedAgentIds
-      }
-      store.messages = [...store.messages, assistantMsg]
-      aIdxRef.value = store.messages.length - 1
-      // 继承 agent_nickname
-      const prevAgent = [...store.messages].reverse().find(m => m.role === 'assistant' && m.agent_nickname)
-      if (prevAgent) {
-        store.messages[aIdxRef.value] = { ...store.messages[aIdxRef.value], agent_nickname: prevAgent.agent_nickname }
-        store.messages = [...store.messages]  // trigger reactivity
+      // 创建空助手消息占位（群聊模式不创建，由 onStreamMsg 按 agent_id 动态创建）
+      if (initData.group_chat) {
+        aIdxRef.groupMode = true
+        aIdxRef.groupMap = {}
+        aIdxRef.value = -1
+      } else {
+        const assistantMsg = { role: 'assistant', content: '', thinking: null }
+        if (selectedAgentIds.length === 1) {
+          assistantMsg.agent_id = selectedAgentIds[0]
+        } else if (selectedAgentIds.length > 1) {
+          assistantMsg.assistant_ids = selectedAgentIds
+        }
+        store.messages = [...store.messages, assistantMsg]
+        aIdxRef.value = store.messages.length - 1
+        // 继承 agent_nickname
+        const prevAgent = [...store.messages].reverse().find(m => m.role === 'assistant' && m.agent_nickname)
+        if (prevAgent) {
+          store.messages[aIdxRef.value] = { ...store.messages[aIdxRef.value], agent_nickname: prevAgent.agent_nickname }
+          store.messages = [...store.messages]  // trigger reactivity
+        }
       }
     }
 
@@ -564,7 +570,30 @@
     const msgs = store.messages
 
     if (msg.role === 'assistant') {
-      if (aIdxRef.value === -1) {
+      if (aIdxRef.groupMode) {
+        // ── Group chat: route each agent's stream to its own bubble ──
+        const agentId = msg.agent_id || msg.assistant_id || '__unknown__'
+        const gIdx = aIdxRef.groupMap[agentId]
+        if (gIdx === undefined) {
+          // First frame for this agent → create new bubble
+          const idx = msgs.length
+          aIdxRef.groupMap[agentId] = idx
+          const initialMsg = { role: 'assistant', content: '', thinking: null, ...msg }
+          if (msg.tool_calls) initialMsg.tool_calls = mergeToolCallDeltas([], msg.tool_calls)
+          store.messages = [...msgs, initialMsg]
+        } else {
+          // Subsequent frames → append to existing bubble
+          let u = [...msgs]
+          if (!u[gIdx]) return
+          const { content: _inc, thinking: _incT, tool_calls: _incTC, ...msgMeta } = msg
+          const newMsg = { ...u[gIdx], ...msgMeta }
+          if (msg.content) newMsg.content = (u[gIdx].content || '') + msg.content
+          if (msg.thinking) newMsg.thinking = (u[gIdx].thinking || '') + msg.thinking
+          if (msg.tool_calls) newMsg.tool_calls = mergeToolCallDeltas(u[gIdx].tool_calls || [], msg.tool_calls)
+          u[gIdx] = newMsg
+          store.messages = u
+        }
+      } else if (aIdxRef.value === -1) {
         aIdxRef.value = msgs.length
         // Inherit agent_nickname from the previous assistant message (if any)
         const prevAgent = [...msgs].reverse().find(m => m.role === 'assistant' && m.agent_nickname)
@@ -573,36 +602,78 @@
         if (msg.tool_calls) initialMsg.tool_calls = mergeToolCallDeltas([], msg.tool_calls)
         store.messages = [...msgs, initialMsg]
         return  // 首次创建已完成所有字段的设置，跳过后续合并逻辑
+      } else {
+        // 后续帧：增量追加 content 和 thinking
+        let u = [...msgs]
+        const aIdx = aIdxRef.value
+        if (!u[aIdx]) return
+        // 仅合并非内容元数据字段（role, timestamp 等），
+        // 避免 msg 中的 content:"" 覆盖已累积的内容（工具调用帧常携带 content:""）
+        const { content: _inc, thinking: _incT, tool_calls: _incTC, ...msgMeta } = msg
+        const newMsg = { ...u[aIdx], ...msgMeta }
+        if (msg.content) newMsg.content = (u[aIdx].content || '') + msg.content
+        if (msg.thinking) newMsg.thinking = (u[aIdx].thinking || '') + msg.thinking
+        if (msg.tool_calls) newMsg.tool_calls = mergeToolCallDeltas(u[aIdx].tool_calls || [], msg.tool_calls)
+        u[aIdx] = newMsg
+        store.messages = u
       }
-      // 后续帧：增量追加 content 和 thinking
-      let u = [...msgs]
-      const aIdx = aIdxRef.value
-      if (!u[aIdx]) return
-      // 仅合并非内容元数据字段（role, timestamp 等），
-      // 避免 msg 中的 content:"" 覆盖已累积的内容（工具调用帧常携带 content:""）
-      const { content: _inc, thinking: _incT, tool_calls: _incTC, ...msgMeta } = msg
-      const newMsg = { ...u[aIdx], ...msgMeta }
-      if (msg.content) newMsg.content = (u[aIdx].content || '') + msg.content
-      if (msg.thinking) newMsg.thinking = (u[aIdx].thinking || '') + msg.thinking
-      if (msg.tool_calls) newMsg.tool_calls = mergeToolCallDeltas(u[aIdx].tool_calls || [], msg.tool_calls)
-      u[aIdx] = newMsg
-      store.messages = u
     } else if (msg.role === 'tool') {
       if (msg.streaming === true) {
-        // delegate 流式增量帧：找到对应 tool_call_id 的已有工具消息，追加 delta
         const delta = msg.delta || ''
         const tcId = msg.tool_call_id
+        const isTalkTo = msg.name === 'talk_to'
         const existingIdx = tcId
           ? msgs.findLastIndex(m => m.role === 'tool' && m.tool_call_id === tcId)
           : -1
-        if (existingIdx >= 0) {
+
+        if (isTalkTo && msg.agent_id) {
+          // talk_to sub-agent delta: route to per-agent sub_message
+          if (existingIdx >= 0) {
+            const arr = [...msgs]
+            const existing = arr[existingIdx]
+            const subMsgs = { ...(existing.sub_messages || {}) }
+            const agentKey = msg.agent_id
+            const prev = subMsgs[agentKey]
+            subMsgs[agentKey] = {
+              agent_id: msg.agent_id,
+              agent_nickname: msg.agent_nickname || agentKey,
+              content: (prev?.content || '') + delta,
+              streaming: true,
+            }
+            arr[existingIdx] = {
+              ...existing,
+              ...msg,
+              content: (existing.content || '') + delta,
+              sub_messages: subMsgs,
+            }
+            store.messages = arr
+          } else {
+            const subMsgs = {}
+            const agentKey = msg.agent_id
+            subMsgs[agentKey] = {
+              agent_id: msg.agent_id,
+              agent_nickname: msg.agent_nickname || agentKey,
+              content: delta,
+              streaming: true,
+            }
+            store.messages = [...msgs, {
+              role: 'tool',
+              name: msg.name || '',
+              content: delta,
+              tool_call_id: tcId,
+              streaming: true,
+              sub_messages: subMsgs,
+              ...msg,
+            }]
+          }
+        } else if (existingIdx >= 0) {
+          // delegate / legacy tool streaming: concatenate to content
           const arr = [...msgs]
           const newMsg = { ...arr[existingIdx], ...msg }
           newMsg.content = (arr[existingIdx].content || '') + delta
           arr[existingIdx] = newMsg
           store.messages = arr
         } else {
-          // 第一帧：创建新的工具消息占位
           store.messages = [...msgs, {
             role: 'tool',
             name: msg.name || '',
@@ -614,18 +685,25 @@
         }
         // 流式帧不重置 aIdxRef，让 assistant 消息继续累积
       } else if (msg.streaming === false) {
-        // delegate 结束帧：标记流式消息框已完成
+        // delegate / talk_to 结束帧：标记流式消息框已完成
         const tcId = msg.tool_call_id
         const existingIdx = tcId
           ? msgs.findLastIndex(m => m.role === 'tool' && m.tool_call_id === tcId)
           : -1
         if (existingIdx >= 0) {
           const arr = [...msgs]
-          // 只更新 streaming 状态，不覆盖内容（内容已通过流式增量帧完整推送）
-          const newMsg = { ...arr[existingIdx], ...msg, streaming: false }
-          // 如果结束帧携带了 content（非空），才更新
+          const existing = arr[existingIdx]
+          const newMsg = { ...existing, ...msg, streaming: false }
           if (msg.content) {
             newMsg.content = msg.content
+          }
+          // For talk_to, finalize all sub_messages as well
+          if (existing.sub_messages) {
+            const finalized = {}
+            for (const [k, v] of Object.entries(existing.sub_messages)) {
+              finalized[k] = { ...v, streaming: false }
+            }
+            newMsg.sub_messages = finalized
           }
           arr[existingIdx] = newMsg
           store.messages = arr
@@ -633,17 +711,43 @@
           store.messages = [...msgs, { role: 'tool', ...msg }]
         }
         aIdxRef.value = -1
+        // Group-chat: reset per-agent index so next assistant frame creates new bubble
+        if (aIdxRef.groupMode) {
+          const agId = msg.agent_id || msg.assistant_id
+          if (agId) delete aIdxRef.groupMap[agId]
+        }
       } else {
         // 普通工具结果帧（write_file、exec_shell 等）
         store.messages = [...msgs, { role: 'tool', ...msg }]
         aIdxRef.value = -1
+        // Group-chat: reset per-agent index
+        if (aIdxRef.groupMode) {
+          const agId = msg.agent_id || msg.assistant_id
+          if (agId) delete aIdxRef.groupMap[agId]
+        }
       }
     } else if (msg.role === 'system') {
-      aIdxRef.value = -1
+      if (aIdxRef.groupMode) {
+        // Group-chat: system messages don't affect per-agent routing
+      } else {
+        aIdxRef.value = -1
+      }
     } else if (msg.role === 'usage') {
       try {
         const s = JSON.parse(msg.content || '{}')
-        const lastAIdx = msgs.map((m, i) => m.role === 'assistant' ? i : -1).filter(i => i >= 0).pop()
+        let lastAIdx
+        if (aIdxRef.groupMode && (msg.agent_id || msg.assistant_id)) {
+          // Group-chat: find last assistant message from the same agent
+          const agId = msg.agent_id || msg.assistant_id
+          for (let i = msgs.length - 1; i >= 0; i--) {
+            if (msgs[i].role === 'assistant' && (msgs[i].agent_id === agId || msgs[i].assistant_id === agId)) {
+              lastAIdx = i
+              break
+            }
+          }
+        } else {
+          lastAIdx = msgs.map((m, i) => m.role === 'assistant' ? i : -1).filter(i => i >= 0).pop()
+        }
         if (lastAIdx !== undefined) {
           const arr = [...msgs]
           const update = { ...arr[lastAIdx], stat: s }
@@ -659,9 +763,14 @@
     if (store) {
       store.isStreaming = false
       if (store.messages.length > 0) {
-        const last = store.messages[store.messages.length - 1]
-        if (last.role === 'assistant' && !last.content && !last.thinking && !last.tool_calls) {
-          store.messages = store.messages.slice(0, -1)
+        // Remove trailing empty assistant bubbles (placeholder or failed starts)
+        while (store.messages.length > 0) {
+          const last = store.messages[store.messages.length - 1]
+          if (last.role === 'assistant' && !last.content && !last.thinking && !last.tool_calls) {
+            store.messages = store.messages.slice(0, -1)
+          } else {
+            break
+          }
         }
       }
       // 2 秒后自动收起本轮工具调用消息
@@ -910,7 +1019,7 @@
 
       // 优先使用 meta 中的设置（向下兼容：旧会话可能没有 meta）
       if (meta) {
-        // 恢复智能体选择
+        // 恢复AI代理选择
         if (meta.agent_ids && Array.isArray(meta.agent_ids)) {
           selectedAgentIds = meta.agent_ids
           localStorage.setItem('chat_selected_agents', JSON.stringify(meta.agent_ids))
@@ -939,14 +1048,15 @@
         if (defaultWorkspacePath && defaultWorkspacePath !== workspacePath) {
           workspacePath = defaultWorkspacePath
         }
-        // 向下兼容：从最后一条 assistant 消息恢复 assistant_id
+        // 向下兼容：从最后一条 assistant 消息恢复 agent_id
         const lastAssistantMsg = [...msgs].reverse().find(m => m.role === 'assistant')
         if (lastAssistantMsg?.assistant_ids && Array.isArray(lastAssistantMsg.assistant_ids)) {
           selectedAgentIds = lastAssistantMsg.assistant_ids
           localStorage.setItem('chat_selected_agents', JSON.stringify(lastAssistantMsg.assistant_ids))
-        } else if (lastAssistantMsg?.assistant_id) {
-          selectedAgentIds = [lastAssistantMsg.assistant_id]
-          localStorage.setItem('chat_selected_agents', JSON.stringify([lastAssistantMsg.assistant_id]))
+        } else if (lastAssistantMsg?.agent_id || lastAssistantMsg?.assistant_id) {
+          const aid = lastAssistantMsg.agent_id || lastAssistantMsg.assistant_id
+          selectedAgentIds = [aid]
+          localStorage.setItem('chat_selected_agents', JSON.stringify([aid]))
         }
         // 模型和工具选中状态维持不变（使用 localStorage 中的值）
       }
@@ -992,7 +1102,7 @@
     }
   })
 
-  // 加载智能体列表（共享数据源：设置页变更后会即时反映到这里）
+  // 加载AI代理列表（共享数据源：设置页变更后会即时反映到这里）
   async function fetchAgents({ force = false } = {}) {
     try {
       if (force) await refreshAgents()
@@ -1016,7 +1126,7 @@
   })
 
 
-  // 生成添加智能体的默认昵称
+  // 生成添加AI代理的默认昵称
   function generateAgentDefaultNickname() {
     const model = selectedModelId || 'unknown'
     const toolCount = selectedToolIds.length

@@ -62,7 +62,38 @@
         const isCollapsed = collapsedGroups.has(startIndex)
         // 是否存在中间消息（user 和 lastAssistant 之间的 tool/assistant）
         const hasIntermediate = lastAssistantIndex >= 0 && lastAssistantIndex > startIndex + 1
-        result.push({ startIndex, endIndex, lastAssistantIndex, isCollapsed, hasIntermediate })
+
+        // 在 group 内部按 assistant_id 拆分为 agent-blocks
+        const agentBlocks = []
+        let blockStart = startIndex + 1
+        let currentAgentId = null
+        for (let j = startIndex + 1; j <= endIndex; j++) {
+          const m = messages[j]
+          // 获取消息所属 agent：统一使用 agent_id，向下兼容 assistant_id
+          const msgAgentId = m.agent_id || m.assistant_id || null
+          if (m.role === 'assistant') {
+            // 新的 assistant 消息开始一个新的 agent-block
+            if (blockStart < j) {
+              agentBlocks.push({ start: blockStart, end: j - 1, agentId: currentAgentId })
+            }
+            blockStart = j
+            currentAgentId = msgAgentId
+          } else if (m.role === 'tool') {
+            // tool 消息属于当前 agent-block；如果 agent_id 变了也切分
+            if (msgAgentId && currentAgentId && msgAgentId !== currentAgentId) {
+              agentBlocks.push({ start: blockStart, end: j - 1, agentId: currentAgentId })
+              blockStart = j
+              currentAgentId = msgAgentId
+            } else if (!currentAgentId && msgAgentId) {
+              currentAgentId = msgAgentId
+            }
+          }
+        }
+        if (blockStart <= endIndex) {
+          agentBlocks.push({ start: blockStart, end: endIndex, agentId: currentAgentId })
+        }
+
+        result.push({ startIndex, endIndex, lastAssistantIndex, isCollapsed, hasIntermediate, agentBlocks })
         i = endIndex + 1
       } else {
         // 非 user 消息（如 system 消息）单独处理，不折叠
@@ -133,45 +164,59 @@
         <!-- 非 user 消息（如 system 消息）单独显示，不折叠 -->
         <MessageBubble msg={messages[group.startIndex]} {agentList} {onRevoke} />
       {:else}
+        {@const userMsg = messages[group.startIndex]}
         <div class="group" class:collapsed={group.isCollapsed} data-start-index={group.startIndex}>
-          {#each Array.from({ length: group.endIndex - group.startIndex + 1 }) as _, offset}
-            {@const msgIndex = group.startIndex + offset}
-            {@const msg = messages[msgIndex]}
-            {@const isUser = offset === 0}
-            {@const isLastAssistant = msgIndex === group.lastAssistantIndex && group.lastAssistantIndex >= 0}
-            {#if isUser}
-              <!-- user 消息始终显示 -->
-              <MessageBubble 
-                {msg} 
-                {agentList} 
-                {onRevoke}
-                hasFileChanges={fileJournalTurnKeys.has(msg.timestamp)}
-                fileDiffData={fileDiffCache[msg.timestamp] || null}
-                fileDiffVisible={fileDiffVisible.has(msg.timestamp)}
-                onToggleFileDiff={msg.timestamp ? () => onToggleFileDiff(msg.timestamp) : undefined}
-              />
-            {:else if isLastAssistant}
-              <!-- 最后一条 assistant 消息始终显示，带有折叠/展开按钮（仅当有中间消息时） -->
+          <!-- user 消息始终显示 -->
+          <MessageBubble
+            msg={userMsg}
+            {agentList}
+            {onRevoke}
+            hasFileChanges={fileJournalTurnKeys.has(userMsg.timestamp)}
+            fileDiffData={fileDiffCache[userMsg.timestamp] || null}
+            fileDiffVisible={fileDiffVisible.has(userMsg.timestamp)}
+            onToggleFileDiff={userMsg.timestamp ? () => onToggleFileDiff(userMsg.timestamp) : undefined}
+          />
+
+          {#if !group.isCollapsed}
+            {#each group.agentBlocks as block (block.start)}
+              <div class="agent-block">
+                {#each Array.from({ length: block.end - block.start + 1 }) as _, offset}
+                  {@const msgIndex = block.start + offset}
+                  {@const msg = messages[msgIndex]}
+                  {@const isLastAssistant = msgIndex === group.lastAssistantIndex && group.lastAssistantIndex >= 0}
+                  {#if isLastAssistant}
+                    <div data-anchor={group.startIndex}>
+                      <MessageBubble
+                        {msg}
+                        {agentList}
+                        {onRevoke}
+                        collapseButton={group.hasIntermediate ? (group.isCollapsed ? 'expand' : 'collapse') : null}
+                        onCollapse={group.hasIntermediate ? () => toggleCollapse(group.startIndex) : undefined}
+                      />
+                    </div>
+                  {:else}
+                    <div transition:slide={{ duration: SLIDE_DURATION }} data-intermediate={group.startIndex}>
+                      <MessageBubble {msg} {agentList} {onRevoke} />
+                    </div>
+                  {/if}
+                {/each}
+              </div>
+            {/each}
+          {:else}
+            <!-- 折叠状态：只显示最后一条 assistant 消息 -->
+            {#if group.lastAssistantIndex >= 0}
+              {@const msg = messages[group.lastAssistantIndex]}
               <div data-anchor={group.startIndex}>
-                <MessageBubble 
-                  {msg} 
-                  {agentList} 
+                <MessageBubble
+                  {msg}
+                  {agentList}
                   {onRevoke}
-                  collapseButton={group.hasIntermediate ? (group.isCollapsed ? 'expand' : 'collapse') : null}
+                  collapseButton={group.hasIntermediate ? 'expand' : null}
                   onCollapse={group.hasIntermediate ? () => toggleCollapse(group.startIndex) : undefined}
                 />
               </div>
-            {:else if !group.isCollapsed}
-              <!-- 中间消息（tool/assistant）：展开时用 slide 动画显示，折叠时隐藏 -->
-              <div transition:slide={{ duration: SLIDE_DURATION }} data-intermediate={group.startIndex}>
-                <MessageBubble 
-                  {msg} 
-                  {agentList} 
-                  {onRevoke}
-                />
-              </div>
             {/if}
-          {/each}
+          {/if}
         </div>
       {/if}
     {/each}
@@ -219,5 +264,12 @@
   }
   .group.collapsed {
     gap: 12px;
+  }
+
+  /* Agent block: 逻辑分组容器（视觉不可见），将同一 agent 的 assistant + tool 消息聚拢 */
+  .agent-block {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
   }
 </style>

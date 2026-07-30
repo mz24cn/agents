@@ -32,7 +32,7 @@
     return { tagged: sortedGroups, untagged: noTagAgents }
   })
 
-  // 获取选中的智能体列表
+  // 获取选中的AI代理列表
   let selectedAgents = $derived(
     agentList.filter(a => selectedAgentIds.includes(a.agent_id))
   )
@@ -133,7 +133,7 @@
           class="agent-icon"
           fallback="🤖"
         />
-        <span class="agent-name">{agent.nickname}{agent.myself_view ? ` (${agent.myself_view})` : ''}</span>
+        <span class="agent-name">{agent.nickname}</span>
       {/if}
     {:else}
       <span class="agent-name">{selectedAgentIds.length} {t('agentsSelected') || 'agents selected'}</span>
@@ -150,7 +150,7 @@
       {:else if agentList.length === 0}
         <span class="hint">{t('noAgents')}</span>
       {:else}
-        <!-- 空选项：不选智能体 -->
+        <!-- 空选项：不选AI代理 -->
         <button
           type="button"
           class="agent-item"
@@ -161,7 +161,7 @@
           <span class="agent-name">—</span>
         </button>
         
-        <!-- 无标签的智能体（默认组） -->
+        <!-- 无标签的AI代理（默认组） -->
         {#each groupedAgents.untagged as agent (agent.agent_id)}
           <button 
             type="button" 
@@ -176,11 +176,11 @@
               class="agent-icon"
               fallback="🤖"
             />
-            <span class="agent-name">{agent.nickname}{agent.myself_view ? ` (${agent.myself_view})` : ''}</span>
+            <span class="agent-name">{agent.nickname}</span>
           </button>
         {/each}
         
-        <!-- 有标签的智能体分组 -->
+        <!-- 有标签的AI代理分组 -->
         {#each groupedAgents.tagged as [tag, agents] (tag)}
           <div class="agent-group">
             <div class="group-header">
@@ -200,7 +200,7 @@
                   class="agent-icon"
                   fallback="🤖"
                 />
-                <span class="agent-name">{agent.nickname}{agent.myself_view ? ` (${agent.myself_view})` : ''}</span>
+                <span class="agent-name">{agent.nickname}</span>
               </button>
             {/each}
           </div>

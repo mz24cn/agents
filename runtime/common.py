@@ -481,6 +481,9 @@ def convert_image_to_base64(img_data: str) -> str:
         return img_data  # 已经是 base64，无需再编码
 
     expanded_path = os.path.expanduser(img_data)
+    # 相对路径时，基于当前会话工作区解析
+    if not os.path.isabs(expanded_path):
+        expanded_path = os.path.join(get_workspace(), expanded_path)
     try:
         with open(expanded_path, "rb") as f:
             return base64.b64encode(f.read()).decode("utf-8")

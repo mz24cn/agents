@@ -69,8 +69,8 @@
     return parts
   }
 
-  // 获取智能体信息
-  const matchedAgent = $derived(msg.assistant_id ? agentList.find(a => a.agent_id === msg.assistant_id) : null)
+  // 获取AI代理信息
+  const matchedAgent = $derived((msg.agent_id || msg.assistant_id) ? agentList.find(a => a.agent_id === (msg.agent_id || msg.assistant_id)) : null)
   const agentNickname = $derived(matchedAgent?.nickname)
   const displayName = $derived(agentNickname || msg.name || t('roleAssistant'))
 
@@ -97,14 +97,24 @@
 
   // 工具结果：按实际显示内容计算行数，超过5行默认收缩，否则默认展开。
   // JSON 会先 pretty-print，因此即使原始 JSON 是单行，也能按格式化后的行数收缩。
-  const toolResultRender = $derived(msg.role === 'tool' && msg.content ? renderToolResult(msg.content) : { html: null, lang: null, displayContent: msg.content ?? '' })
+  // talk_to 子消息渲染时用 sub_messages[] 各自的 content；传统 tool 消息用 msg.content。
+  const toolContentSource = $derived(
+    msg.sub_messages
+      ? Object.values(msg.sub_messages).map(sm => sm.content || '').join('\n')
+      : (msg.content ?? '')
+  )
+  const toolResultRender = $derived(msg.role === 'tool' && toolContentSource ? renderToolResult(toolContentSource) : { html: null, lang: null, displayContent: toolContentSource })
   const toolResultPreviewContent = $derived((toolResultRender.displayContent ?? '').split('\n').slice(0, 5).join('\n'))
   const toolResultPreviewHtml = $derived(toolResultRender.html ? highlight(toolResultPreviewContent, toolResultRender.lang) : null)
   const toolResultLines = $derived((toolResultRender.displayContent ?? '').split('\n').length)
   const toolResultOverLimit = $derived(msg.role === 'tool' && toolResultLines > 5)
+  // 流式期间始终展开；结束后根据行数决定
+  const isToolStreaming = $derived(msg.streaming === true)
   let toolResultExpanded = $state(true)
   $effect(() => {
-    toolResultExpanded = !toolResultOverLimit
+    if (!isToolStreaming) {
+      toolResultExpanded = !toolResultOverLimit
+    }
   })
 
   // 思考过程：有正文或工具调用时自动收起；用户手动操作后不再自动跟随
@@ -119,6 +129,10 @@
     thinkingUserToggled = true
     thinkingExpanded = !thinkingExpanded
   }
+
+  // System messages default to collapsed (they're context, not conversational)
+  let systemExpanded = $state(false)
+  function toggleSystem() { systemExpanded = !systemExpanded }
 
   // 格式化时间戳为 MM/DD HH:mm:ss 格式
   function formatTimestamp(timestamp) {
@@ -202,7 +216,16 @@
         }} />
       </div>
     {:else if msg.role === 'system'}
-      {t('roleSystem')}
+      <span>{t('roleSystem')}</span>
+      <div class="role-actions">
+        {#if msg.timestamp}
+          <span class="timestamp">{formatTimestamp(msg.timestamp)}</span>
+        {/if}
+        <button class="toggle-btn" onclick={toggleSystem}>
+          {systemExpanded ? t('collapseExecution') : t('expandExecution')}
+        </button>
+        <CopyButton getText={() => msg.content ?? ''} />
+      </div>
     {:else if msg.role === 'tool'}
       <span>{t('roleFunction')}{#if msg.name}: {msg.name}{/if}</span>
       <div class="role-actions">
@@ -225,11 +248,34 @@
     <ThinkingBlock thinking={msg.thinking} expanded={thinkingExpanded} />
   {/if}
 
+  {#if msg.sub_messages && msg.role === 'tool'}
+    <!-- talk_to sub-agent messages: inline markdown matching historical
+         "**nickname** (agent_id): content" format -->
+    <div class="talk-to-subs">
+      {#each Object.values(msg.sub_messages) as sm}
+        <div class="talk-to-sub" class:streaming={sm.streaming}>
+          {#if sm.streaming}
+            <span class="talk-to-sub-badge">⏳</span>
+          {/if}
+          {#if sm.content}
+            {@const prefix = '**' + (sm.agent_nickname || sm.agent_id) + '** (' + sm.agent_id + '): '}
+            <MarkdownRenderer content={prefix + (sm.content || '')} />
+          {/if}
+        </div>
+      {/each}
+    </div>
+  {/if}
+
   {#if msg.content}
     {#if msg.role === 'assistant'}
       <MarkdownRenderer content={msg.content} />
+    {:else if msg.role === 'system'}
+      {#if systemExpanded}
+        <MarkdownRenderer content={msg.content} />
+      {/if}
     {:else if msg.role === 'tool'}
-      <div class="tool-result-block" ondblclick={() => toolResultExpanded = !toolResultExpanded}>
+      {#if !msg.sub_messages}
+        <div class="tool-result-block" ondblclick={() => toolResultExpanded = !toolResultExpanded}>
         {#if toolResultRender.html}
           {#if toolResultExpanded}
             <div class="code-block tool-result-code">
@@ -248,6 +294,7 @@
           <div class="tool-result-markdown preview-fade"><MarkdownRenderer content={toolResultPreviewContent} /></div>
         {/if}
       </div>
+      {/if}
     {:else}
       <div class="content">
         {#each renderContentParts(msg.content) as part}
@@ -542,4 +589,37 @@
   :root[data-theme="light"] .tool-result-code :global(.hl-null)    { color: #dc2626; }
   :root[data-theme="light"] .tool-result-code :global(.hl-key)     { color: #1d4ed8; }
   :root[data-theme="light"] .tool-result-code :global(.hl-variable){ color: #b45309; }
+
+  /* talk_to sub-agent messages — inline markdown, visually matching
+     the historical "**nickname** (agent_id): content" format */
+  .talk-to-subs {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 4px;
+  }
+  .talk-to-sub {
+    /* no border / background — same look as a regular markdown paragraph */
+    line-height: 1.5;
+  }
+  .talk-to-sub.streaming {
+    /* subtle left-border pulse to hint "still arriving" */
+    border-left: 2px solid var(--primary, #7c3aed);
+    padding-left: 8px;
+  }
+  .talk-to-sub-badge {
+    display: inline-block;
+    vertical-align: middle;
+    font-size: 0.65rem;
+    padding: 1px 6px;
+    margin-right: 4px;
+    border-radius: 999px;
+    background: var(--primary, #7c3aed);
+    color: #fff;
+    animation: talk-to-pulse 1.5s ease-in-out infinite;
+  }
+  @keyframes talk-to-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+  }
 </style>

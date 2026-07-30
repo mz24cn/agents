@@ -14,17 +14,17 @@
   let mentionSelectedIndex = $state(0)
   let mentionStartOffset = $state(-1) // @ 符号在文本中的位置
 
-  // 计算当前选中的智能体列表
+  // 计算当前选中的AI代理列表
   let selectedAgents = $derived(
     selectedAgentIds
       .map(id => agentList.find(a => a.agent_id === id))
       .filter(Boolean)
   )
 
-  // 过滤匹配的智能体（显示所有可用的智能体）
+  // 过滤匹配的AI代理（显示所有可用的AI代理）
   let filteredAgents = $derived(
     selectedAgentIds.length === 0
-      ? []  // 没有选中的智能体，不显示@菜单
+      ? []  // 没有选中的AI代理，不显示@菜单
       : mentionQuery
         ? selectedAgents.filter(a =>
             (a.nickname || a.agent_id).toLowerCase().includes(mentionQuery.toLowerCase())
@@ -160,7 +160,7 @@
         mentionMenuStyle = ''
       }
 
-      // 如果有匹配的智能体，显示菜单
+      // 如果有匹配的AI代理，显示菜单
       if (filteredAgents.length > 0) {
         mentionMenuOpen = true
         adjustMenuPosition()
@@ -202,7 +202,7 @@
     }
   }
 
-  // 选择智能体
+  // 选择AI代理
   function selectAgent(agent) {
     if (mentionStartOffset < 0 || !editorEl) return
 
@@ -216,7 +216,7 @@
     const textContent = node.textContent
     const cursorPos = range.startOffset
 
-    // 构建新文本：@之前的部分 + 智能体名称 + 空格 + @之后的部分
+    // 构建新文本：@之前的部分 + AI代理名称 + 空格 + @之后的部分
     const before = textContent.slice(0, mentionStartOffset)
     const after = textContent.slice(cursorPos)
     const agentName = agent.nickname || agent.agent_id
@@ -224,7 +224,7 @@
 
     node.textContent = newText
 
-    // 将光标移到智能体名称后面的空格之后
+    // 将光标移到AI代理名称后面的空格之后
     const newCursorPos = mentionStartOffset + agentName.length + 2
     const newRange = document.createRange()
     newRange.setStart(node, Math.min(newCursorPos, newText.length))
