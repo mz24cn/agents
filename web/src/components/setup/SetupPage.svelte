@@ -16,12 +16,38 @@
   import AgentForm from '../agents/AgentForm.svelte'
   import { mcpServers } from '../../lib/api.js'
 
+  const SORT_TIME_DESC_STORAGE_KEY = 'setup_sort_by_time_desc'
+
+  function readLocalStorage(key, fallback = '') {
+    try {
+      if (typeof localStorage === 'undefined') return fallback
+      return localStorage.getItem(key) ?? fallback
+    } catch {
+      return fallback
+    }
+  }
+
+  function writeLocalStorage(key, value) {
+    try {
+      if (typeof localStorage !== 'undefined') {
+        localStorage.setItem(key, value)
+      }
+    } catch {}
+  }
+
   const validTabs = ['models', 'tools', 'prompts', 'agents', 'env', 'auth', 'model-add', 'tool-add', 'prompt-add', 'agent-add', 'env-add', 'model-edit', 'tool-edit', 'mcp-tool-edit', 'prompt-edit', 'agent-edit']
   const initialTab = validTabs.includes(getQueryParam('tab')) ? getQueryParam('tab') : 'agents'
   let activeTab = $state(initialTab)
   let envDetectTrigger = $state(0)
   let authRefreshTrigger = $state(0)
   let refreshing = $state(false)
+
+  let sortByTimeDesc = $state(readLocalStorage(SORT_TIME_DESC_STORAGE_KEY, '0') === '1')
+
+  function toggleTimeSort() {
+    sortByTimeDesc = !sortByTimeDesc
+    writeLocalStorage(SORT_TIME_DESC_STORAGE_KEY, sortByTimeDesc ? '1' : '0')
+  }
 
   let editingModel = $state(null)
   let editingTool = $state(null)
@@ -248,6 +274,12 @@
         {/each}
       </div>
       <div class="setup-header-actions">
+        <button
+          class="sort-time-btn"
+          class:active={sortByTimeDesc}
+          onclick={toggleTimeSort}
+          title={t('sortByTimeDesc')}
+        >🕒</button>
         <div class="setup-theme-wrap">
           <ThemeToggle />
         </div>
@@ -270,7 +302,7 @@
 
   <div class="setup-content">
     {#if activeTab === 'models'}
-      <ModelsPage onEdit={handleEditModel} onCopy={handleCopyModel} />
+      <ModelsPage onEdit={handleEditModel} onCopy={handleCopyModel} sortByTimeDesc={sortByTimeDesc} />
     {:else if activeTab === 'model-add'}
       <div class="form-wrapper">
         <ModelForm onSuccess={handleModelFormSuccess} onCancel={handleFormCancel} />
@@ -280,7 +312,7 @@
         <ModelForm model={editingModel} onSuccess={handleModelFormSuccess} onCancel={handleFormCancel} />
       </div>
     {:else if activeTab === 'tools'}
-      <ToolsPage onEdit={handleEditTool} onEditMcpTool={handleEditMcpTool} />
+      <ToolsPage onEdit={handleEditTool} onEditMcpTool={handleEditMcpTool} sortByTimeDesc={sortByTimeDesc} />
     {:else if activeTab === 'tool-add'}
       <div class="form-wrapper">
         <ToolForm onSuccess={handleToolFormSuccess} onCancel={handleFormCancel} />
@@ -294,7 +326,7 @@
         <McpToolForm tool={editingMcpTool} onSuccess={handleToolFormSuccess} onCancel={handleFormCancel} />
       </div>
     {:else if activeTab === 'prompts'}
-      <PromptsPage onEdit={handleEditPrompt} onCopy={handleCopyPrompt} />
+      <PromptsPage onEdit={handleEditPrompt} onCopy={handleCopyPrompt} sortByTimeDesc={sortByTimeDesc} />
     {:else if activeTab === 'prompt-add'}
       <div class="form-wrapper">
         <PromptForm onSuccess={handlePromptFormSuccess} onCancel={handleFormCancel} />
@@ -304,7 +336,7 @@
         <PromptForm template={editingPrompt} onSuccess={handlePromptFormSuccess} onCancel={handleFormCancel} />
       </div>
     {:else if activeTab === 'agents'}
-      <AgentsPage onEdit={handleEditAgent} onCopy={handleCopyAgent} />
+      <AgentsPage onEdit={handleEditAgent} onCopy={handleCopyAgent} sortByTimeDesc={sortByTimeDesc} />
     {:else if activeTab === 'agent-add'}
       <div class="form-wrapper">
         <AgentForm onSuccess={handleAgentFormSuccess} onCancel={handleFormCancel} />
@@ -377,6 +409,32 @@
   .setup-theme-wrap :global(.theme-toggle:hover) {
     background: var(--border);
     color: var(--text);
+  }
+  .sort-time-btn {
+    width: 38px;
+    height: 36px;
+    padding: 0;
+    box-sizing: border-box;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    font-size: 1rem;
+    cursor: pointer;
+    transition: all 0.15s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .sort-time-btn:hover {
+    background: var(--primary);
+    color: #fff;
+    border-color: var(--primary);
+  }
+  .sort-time-btn.active {
+    background: var(--primary);
+    color: #fff;
+    border-color: var(--primary);
   }
   .setup-lang-btn {
     width: 38px;

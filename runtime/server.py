@@ -96,9 +96,13 @@ def merge_stream_messages(stream_messages: list) -> tuple[list, Optional[dict]]:
     assistant_thinking_buf: str = ""
     pending_tool_calls: list = []
     last_stat: Optional[dict] = None
+    # Agent identity tracking — carried over from stream Message objects
+    current_agent_id: Optional[str] = None
+    current_name: Optional[str] = None
 
     def _flush_assistant(stat=None):
         nonlocal assistant_text_buf, assistant_thinking_buf, pending_tool_calls
+        nonlocal current_agent_id, current_name
         if assistant_text_buf or pending_tool_calls or assistant_thinking_buf:
             # timestamp should be the inference completion time from stat
             # Fall back to now_iso() if stat doesn't have it
@@ -112,10 +116,14 @@ def merge_stream_messages(stream_messages: list) -> tuple[list, Optional[dict]]:
                 tool_calls=pending_tool_calls if pending_tool_calls else None,
                 thinking=assistant_thinking_buf or None,
                 stat=stat,
+                agent_id=current_agent_id,
+                name=current_name,
             ))
             assistant_text_buf = ""
             assistant_thinking_buf = ""
             pending_tool_calls = []
+            current_agent_id = None
+            current_name = None
 
     current_stat: Optional[dict] = None
 
@@ -132,6 +140,13 @@ def merge_stream_messages(stream_messages: list) -> tuple[list, Optional[dict]]:
             current_stat = None
             continue
         if m.role == "assistant":
+            # Track agent identity from the first assistant chunk that carries it
+            if getattr(m, "agent_id", None) and not current_agent_id:
+                current_agent_id = m.agent_id
+            elif getattr(m, "assistant_id", None) and not current_agent_id:
+                current_agent_id = m.assistant_id
+            if getattr(m, "name", None) and not current_name:
+                current_name = m.name
             if m.tool_calls:
                 # tool_calls 到来时，合并到当前 assistant turn（不单独 flush）
                 for tc in m.tool_calls:
@@ -167,6 +182,7 @@ def merge_stream_messages(stream_messages: list) -> tuple[list, Optional[dict]]:
                 name=m.name or "",
                 tool_id=getattr(m, "tool_id", None),
                 tool_use_id=getattr(m, "tool_use_id", None),
+                agent_id=getattr(m, "agent_id", None),
             ))
         # skip system deltas
 
@@ -204,7 +220,7 @@ def persist_conversation(
         tool_ids: 可选的工具 ID 列表，记录到会话 meta 中，便于回溯。
         extra_meta: 可选的额外 meta 字段（如 parent_session_id），与 tool_ids
             一并通过 save_conversation 的 extra_meta 参数一次写入。
-        agent_ids: 可选的 agent ID 列表（多选支持），用于标记 role=assistant 的消息的 assistant_id。
+        agent_ids: 可选的 agent ID 列表（多选支持），用于标记 role=assistant 的消息的 agent_id。
         agent_nickname: 可选的 agent nickname，用于标记 role=assistant 的消息的 name 字段。
         model_id: 可选的模型 ID，记录到会话 meta 中，便于恢复会话设置。
 
@@ -231,12 +247,13 @@ def persist_conversation(
                 prompt_template=getattr(m, "prompt_template", None) or None,
                 arguments=getattr(m, "arguments", None) or None,
                 name=getattr(m, "name", None),
+                agent_id=getattr(m, "agent_id", None),
                 tool_id=getattr(m, "tool_id", None),
                 tool_use_id=getattr(m, "tool_use_id", None),
                 mentions=getattr(m, "mentions", None),
             ))
         merged_turns, last_stat = merge_stream_messages(collected_messages)
-        # 如果有 agent_ids，为所有 role=assistant 的消息设置 name（nickname）和 assistant_id 字段
+        # 如果有 agent_ids，为所有 role=assistant 的消息设置 name（nickname）和 agent_id 字段
         if agent_ids:
             primary_agent_id = agent_ids[0]
             for turn in merged_turns:
@@ -244,8 +261,11 @@ def persist_conversation(
                     # Only overwrite if not already set (group-chat messages come pre-tagged)
                     if agent_nickname and not turn.name:
                         turn.name = agent_nickname
-                    if not turn.assistant_id:
-                        turn.assistant_id = primary_agent_id
+                    if not turn.agent_id:
+                        turn.agent_id = primary_agent_id
+                elif turn.role == "tool" and not turn.agent_id:
+                    # Tool messages inherit agent_id from the assistant that called them
+                    turn.agent_id = primary_agent_id
         new_turns.extend(merged_turns)
         last_total_tokens = (
             (last_stat.get("prompt_tokens", 0) + last_stat.get("completion_tokens", 0))
@@ -1820,8 +1840,10 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 mentioned_agent_ids = list(agent_ids)
 
         # On first turn (new session or stateless), prepend agent system prompt.
-        # Skip for group chat — each agent gets its own system prompt in group_chat.py.
-        is_group_chat = len(mentioned_agent_ids) > 1
+        # Skip per-agent prompt for group chat — each agent gets its own system
+        # prompt in group_chat.py.  Group chat still gets a shared default system
+        # prompt so it appears in conversation.json.
+        is_group_chat = len(agent_ids) > 1
         if primary_agent_id and not is_group_chat:
             raw_sid = body.get("session_id") or None
             if raw_sid in ("new", None):
@@ -1839,6 +1861,20 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                     # Remove any existing system message, then prepend agent's
                     msgs = [m for m in msgs if m.get("role") != "system"]
                     body["messages"] = [sys_msg] + msgs
+
+        if is_group_chat:
+            raw_sid = body.get("session_id") or None
+            if raw_sid in ("new", None):
+                msgs = body.get("messages", [])
+                existing_system = any(m.get("role") == "system" for m in msgs)
+                if not existing_system:
+                    from runtime.group_chat import build_agents_markdown, _GC_DEFAULT_PROMPT
+                    agents_md = build_agents_markdown(
+                        agent_ids,
+                        self.server.agent_manager,  # type: ignore[attr-defined]
+                    )
+                    default_prompt = _GC_DEFAULT_PROMPT.replace("{{AGENTS}}", agents_md)
+                    body["messages"] = [{"role": "system", "content": default_prompt}] + msgs
 
         if "model_id" not in body:
             self._send_json_error(400, "Missing required field: model_id")
@@ -2097,12 +2133,13 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             # === Group chat routing (non-streaming) ===
             mentioned_agent_ids = get_request_context("mentioned_agent_ids") or []
             try:
-                if len(mentioned_agent_ids) > 1:
+                if len(agent_ids) > 1:
                     # Multi-agent group chat without SSE streaming
                     from runtime.group_chat import run_group_chat_stream
                     collected_messages = run_group_chat_stream(
                         runtime=runtime,
                         mentioned_agent_ids=mentioned_agent_ids,
+                        all_agent_ids=agent_ids,
                         original_messages=original_messages,
                         base_request=request,
                         cancel_event=None,  # non-streaming: no cancel support
@@ -2122,10 +2159,10 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 self._send_json_error(500, f"Inference failed: {exc}")
                 return
 
-            if agent_ids and len(mentioned_agent_ids) <= 1:
+            if agent_ids and len(agent_ids) <= 1:
                 for msg in collected_messages:
                     if msg.role == "assistant":
-                        msg.assistant_id = agent_ids[0]
+                        msg.agent_id = agent_ids[0]
                         if agent_nickname:
                             msg.name = agent_nickname
 
@@ -2141,8 +2178,8 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                     if turn.role == "assistant":
                         if agent_nickname and not turn.name:
                             turn.name = agent_nickname
-                        if not turn.assistant_id:
-                            turn.assistant_id = agent_ids[0]
+                        if not turn.agent_id:
+                            turn.agent_id = agent_ids[0]
 
             merged_messages = [
                 {k: v for k, v in asdict(turn).items() if v is not None}
@@ -2239,7 +2276,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
 
         # Check if group chat mode is active
         mentioned_for_init = get_request_context("mentioned_agent_ids") or []
-        is_group_chat = len(mentioned_for_init) > 1
+        is_group_chat = len(agent_ids) > 1
 
         init_payload = {
             "session_id": session_id,
@@ -2296,12 +2333,13 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         try:
             # === Group chat routing ===
             mentioned_agent_ids = get_request_context("mentioned_agent_ids") or []
-            if len(mentioned_agent_ids) > 1:
+            if len(agent_ids) > 1:
                 # Multi-agent group chat: each @-mentioned agent runs in parallel
                 from runtime.group_chat import run_group_chat_stream
                 collected_messages = run_group_chat_stream(
                     runtime=runtime,
                     mentioned_agent_ids=mentioned_agent_ids,
+                    all_agent_ids=agent_ids,
                     original_messages=original_messages,
                     base_request=request,
                     cancel_event=cancel_event,
@@ -2317,7 +2355,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 for msg in runtime.infer_stream(request, cancel_event=cancel_event):
                     collected_messages.append(msg)
                     if msg.role == "assistant" and agent_ids:
-                        msg.assistant_id = agent_ids[0]
+                        msg.agent_id = agent_ids[0]
                         if agent_nickname:
                             msg.name = agent_nickname
                     # delegate / talk_to 工具通过 sse_callback 自行管理流式帧和结束帧，跳过 infer_stream 的重复输出
@@ -2574,6 +2612,10 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 self._send_json_error(400, f"Missing required field: {field}")
                 return
 
+        now = datetime.datetime.now().isoformat()
+        body.setdefault("created_at", now)
+        body.setdefault("last_modified", now)
+
         try:
             config = ModelConfig.from_dict(body)
         except (KeyError, TypeError, ValueError) as exc:
@@ -2645,6 +2687,10 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 # Discover tools — this is the moment the process starts
                 discovered = mcp_manager.get_tools(server_name)
                 for t in discovered:
+                    # Preserve created_at from existing tool if already registered
+                    existing = runtime._tool_registry.get(t.tool_id)
+                    if existing and existing.created_at:
+                        t.created_at = existing.created_at
                     runtime._tool_registry.register(t)
                     registered_tool_ids.append(t.tool_id)
                 registered_servers.append(server_name)
@@ -2740,6 +2786,10 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 self._send_json_error(400, f"Missing required field: {field}")
                 return
 
+        now = datetime.datetime.now().isoformat()
+        body.setdefault("created_at", now)
+        body.setdefault("last_modified", now)
+
         try:
             config = ToolConfig.from_dict(body)
         except (KeyError, TypeError, ValueError) as exc:
@@ -2823,6 +2873,10 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self._send_json_error(404, f"Model not found: {model_id}")
             return
 
+        # Preserve created_at from existing config, update last_modified
+        body.setdefault("created_at", existing.created_at)
+        body["last_modified"] = datetime.datetime.now().isoformat()
+
         try:
             config = ModelConfig.from_dict(body)
         except (KeyError, TypeError, ValueError) as exc:
@@ -2857,6 +2911,10 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         if existing.builtin:
             self._send_json_error(403, f"Cannot update built-in tool: {tool_id}")
             return
+
+        # Preserve created_at from existing config, update last_modified
+        body.setdefault("created_at", existing.created_at)
+        body["last_modified"] = datetime.datetime.now().isoformat()
 
         # 补充缺失的字段：从现有配置中获取默认值
         # tool_type 是必需字段，如果 body 中没有，从现有配置中获取
@@ -3506,7 +3564,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             if field not in body:
                 self._send_json_error(400, f"Missing required field: {field}")
                 return
-        agent_id = session_timestamp()
+        agent_id = body.get("agent_id") or session_timestamp()
         self.server.agent_manager.create(  # type: ignore[attr-defined]
             agent_id=agent_id,
             model_id=body["model_id"],
@@ -3531,7 +3589,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         if updated is None:
             self._send_json_error(404, f"Agent not found: {agent_id}")
             return
-        self._send_json_response(200, {"status": "updated", "agent_id": agent_id})
+        self._send_json_response(200, {"status": "updated", "agent_id": updated.get("agent_id", agent_id)})
 
     def _handle_delete_agent(self, agent_id: str) -> None:
         """DELETE /v1/agents/{agent_id} — delete an agent."""

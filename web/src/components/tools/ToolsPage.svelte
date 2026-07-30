@@ -5,9 +5,21 @@
   import ConfirmDialog from '../ConfirmDialog.svelte'
   import { t } from '../../lib/i18n.svelte.js'
 
-  let { onEdit = null, onEditMcpTool = null } = $props()
+  let { onEdit = null, onEditMcpTool = null, sortByTimeDesc = false } = $props()
 
-  let toolList = $derived(catalog.tools.items)
+  let toolList = $derived.by(() => {
+    const items = [...catalog.tools.items]
+    if (sortByTimeDesc) {
+      items.sort((a, b) => {
+        const timeDiff = (b.last_modified || '').localeCompare(a.last_modified || '')
+        if (timeDiff !== 0) return timeDiff
+        return (a.tool_id || '').localeCompare(b.tool_id || '')
+      })
+    } else {
+      items.sort((a, b) => (a.tool_id || '').localeCompare(b.tool_id || ''))
+    }
+    return items
+  })
   let loading = $derived(catalog.tools.loading && !catalog.tools.loaded)
   let error = $derived(catalog.tools.error)
   let deleteTarget = $state(null)

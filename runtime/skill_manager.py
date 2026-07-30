@@ -15,6 +15,7 @@ implementation of a skill is entirely determined by the SKILL.md content
 and the LLM's judgment after reading it.
 """
 
+import datetime
 import os
 import re
 from typing import Optional
@@ -126,6 +127,7 @@ class SkillManager:
 
         # Persist the original user-provided path (may contain ~/) for portability;
         # store the expanded absolute path in memory for runtime use.
+        now = datetime.datetime.now().isoformat()
         skill_tool_config = ToolConfig(
             tool_id=f"skill-{skill_name}",
             tool_type="skill",
@@ -137,6 +139,8 @@ class SkillManager:
                 "required": [],
             },
             skill_dir=skill_dir,
+            created_at=now,
+            last_modified=now,
         )
         self._tool_registry.register(skill_tool_config)
 

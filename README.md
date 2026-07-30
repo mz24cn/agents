@@ -444,9 +444,9 @@ MIT License — see [LICENSE](LICENSE)
 - **Skill 渐进披露** — 第一轮推理仅暴露技能摘要，大模型选择后才注入完整 `SKILL.md`
 - **流式推理** — 实时 token 流式输出，支持 thinking/reasoning 内容
 - **提示词模板推理** — 用户消息可通过模板 ID 引用命名模板，`{{占位符}}` 变量在推理时从请求的 `arguments` 字典动态替换，无需重新部署即可调整提示词，并支持参数化以适应不同模型和工具
-- **多智能体协作** — 通过内置 `delegate` 工具将子任务委派给独立的 Subagent 执行；每个 Subagent 可使用不同的模型和工具集，完成后将结果返回给父 Agent。支持流式输出、嵌套委派和自动会话持久化
-- **智能体管理** — 将当前模型、工具和系统提示词配置保存为可复用的智能体；在聊天界面中快速切换已保存的智能体
-- **Web UI 管理控制台** — Svelte 5 SPA，支持模型、工具、提示词模板、智能体管理和对话
+- **多AI代理协作** — 通过内置 `delegate` 工具将子任务委派给独立的 Subagent 执行；每个 Subagent 可使用不同的模型和工具集，完成后将结果返回给父 Agent。支持流式输出、嵌套委派和自动会话持久化
+- **AI代理管理** — 将当前模型、工具和系统提示词配置保存为可复用的AI代理；在聊天界面中快速切换已保存的AI代理
+- **Web UI 管理控制台** — Svelte 5 SPA，支持模型、工具、提示词模板、AI代理管理和对话
 - **服务级授权系统** — 面向单租户场景的可选授权机制，保护所有 `/v1/*` API；脚本/SDK 使用 Bearer API Key，Web UI 使用 HttpOnly Session Cookie；凭据以哈希形式保存在本地 `~/.agents_runtime/auth_token.json`，`/v1/setup` 导出链接使用短有效期 setup token
 - **HTTP API 服务** — 基于 `http.server` 的轻量 REST API，无需 FastAPI/uvicorn
 - **多模态** — 支持图片（base64）和音频输入，适配 VLM 模型
@@ -629,7 +629,7 @@ result = runtime.infer(InferenceRequest(
 print(result.messages[-1].content)
 ```
 
-**5. 多智能体协作（Delegate 工具）**
+**5. 多AI代理协作（Delegate 工具）**
 
 内置 `delegate` 工具支持层级化任务委派。父 Agent 可以生成使用不同模型和工具集的 Subagent 来处理专门的子任务：
 
@@ -705,11 +705,11 @@ python app.py 0.0.0.0:9000 # 自定义主机和端口
 | GET | `/v1/sessions/{session_id}` | 获取会话详情 |
 | DELETE | `/v1/sessions/{session_id}` | 删除会话 |
 | POST | `/v1/sessions/{session_id}/read` | 标记会话为已读 |
-| GET | `/v1/agents` | 列出所有智能体 |
-| GET | `/v1/agents/{agent_id}` | 获取单个智能体 |
-| POST | `/v1/agents` | 创建智能体 |
-| PUT | `/v1/agents/{agent_id}` | 更新智能体 |
-| DELETE | `/v1/agents/{agent_id}` | 删除智能体 |
+| GET | `/v1/agents` | 列出所有AI代理 |
+| GET | `/v1/agents/{agent_id}` | 获取单个AI代理 |
+| POST | `/v1/agents` | 创建AI代理 |
+| PUT | `/v1/agents/{agent_id}` | 更新AI代理 |
+| DELETE | `/v1/agents/{agent_id}` | 删除AI代理 |
 | GET | `/v1/workspace/list` | 列出工作区目录中的文件（分页） |
 | GET | `/v1/workspace/tree` | 获取工作区目录树结构 |
 | GET | `/v1/workspace/children` | 列出任意路径的子目录（不限工作区） |
@@ -758,14 +758,14 @@ npm run build
 构建产物 `web/dist/` 会由 HTTP 服务器自动在根路径提供服务。
 
 功能包括：
-- 对话页面：模型选择、工具选择、提示词模板（支持 `{{占位符}}` 变量）、智能体选择
+- 对话页面：模型选择、工具选择、提示词模板（支持 `{{占位符}}` 变量）、AI代理选择
 - 多任务并发对话 — 每个会话独立维护流式状态，切换会话不影响正在进行的推理
 - 侧边栏实时会话状态指示（流式中、成功未读、错误未读），通过SSE推送
 - 自动已读状态管理 — 用户滚动到底部时自动标记会话为已读
 - 模型管理（增删改查）— 支持复制现有模型配置，快速创建新模型
 - 工具管理（增删改查）
 - 提示词模板管理
-- 智能体管理 — 将当前配置保存为可复用的智能体；在对话中快速切换智能体
+- AI代理管理 — 将当前配置保存为可复用的AI代理；在对话中快速切换AI代理
 - 授权设置 — 在浏览器中配置 Web 登录密码、Session Cookie 有效期、API Bearer Key，以及带短有效期 token 的 `/v1/setup` 导出命令
 - Markdown 渲染与语法高亮
 - JSON 长字符串可折叠预览，并自动适配代码块可用宽度
@@ -799,8 +799,8 @@ npm run build
 ├── mcp_servers.json
 ├── prompt_templates.json
 ├── env.json
-├── agents/                  # 智能体数据目录
-│   └── {agent_id}.json     # 智能体配置文件
+├── agents/                  # AI代理数据目录
+│   └── {agent_id}.json     # AI代理配置文件
 └── chat_data/              # 会话数据目录
     └── {session_id}/
         ├── conversation.json

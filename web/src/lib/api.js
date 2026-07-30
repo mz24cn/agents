@@ -295,7 +295,7 @@ export const auth = {
   logout: () => request('POST', '/v1/auth/logout', {}),
 }
 
-/** 智能体 API */
+/** AI代理 API */
 export const agents = {
   list:   ()              => request('GET',    '/v1/agents'),
   get:    (agentId)       => request('GET',    `/v1/agents/${encodeURIComponent(agentId)}`),

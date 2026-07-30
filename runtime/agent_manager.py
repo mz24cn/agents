@@ -64,15 +64,19 @@ class AgentManager:
         return agents
 
     def get(self, agent_id: str) -> Optional[dict]:
-        """Retrieve an agent by its ID, with labels fallback.
+        """Retrieve an agent by nickname, ID, or labels (in that order).
 
-        First attempts a direct lookup by agent_id.  If that fails, treats
-        the argument as a label and returns the first matching agent.
+        Priority: nickname → agent_id → labels.
         """
+        # 1. Search by nickname
+        for agent in self._agents.values():
+            if agent.get("nickname") == agent_id:
+                return agent
+        # 2. Direct lookup by agent_id
         agent = self._agents.get(agent_id)
         if agent is not None:
             return agent
-        # Fallback: search by label
+        # 3. Fallback: search by label
         ids = self._labels_index.get(agent_id)
         if ids:
             return self._agents.get(next(iter(ids)))
@@ -104,6 +108,7 @@ class AgentManager:
             "myself_view": myself_view,
             "description": description,
             "labels": parse_labels(labels),
+            "created_at": datetime.datetime.now().isoformat(),
             "last_modified": datetime.datetime.now().isoformat(),
             "avatar": avatar,
         }
@@ -116,8 +121,9 @@ class AgentManager:
         """Update an existing agent.
 
         Args:
-            agent_id: The agent ID to update.
-            updates: Dict of fields to update.
+            agent_id: The agent ID to update (current ID, used for lookup).
+            updates: Dict of fields to update. May include ``agent_id`` to
+                     rename the agent (old file deleted, new file created).
 
         Returns:
             The updated agent, or None if not found.
@@ -127,18 +133,36 @@ class AgentManager:
         agent = self._agents[agent_id]
         old_labels = agent.get("labels", [])
 
-        for key in ("model_id", "tool_ids", "template_id", "template_arguments",
-                     "system_prompt", "nickname", "myself_view", "description", "avatar"):
+        for key in ("agent_id", "model_id", "tool_ids", "template_id",
+                     "template_arguments", "system_prompt", "nickname",
+                     "myself_view", "description", "avatar"):
             if key in updates:
                 agent[key] = updates[key]
 
         if "labels" in updates:
-            new_labels = parse_labels(updates["labels"])
-            self._unindex_labels(agent_id, old_labels)
-            self._index_labels(agent_id, new_labels)
-            agent["labels"] = new_labels
+            agent["labels"] = parse_labels(updates["labels"])
 
         agent["last_modified"] = datetime.datetime.now().isoformat()
+
+        # Handle agent_id rename: move dict key, delete old file, save new file
+        new_agent_id = agent.get("agent_id")
+        if new_agent_id and new_agent_id != agent_id:
+            # Delete old disk file
+            self._delete_from_disk(agent_id)
+            # Unindex old labels under old ID, index new labels under new ID
+            self._unindex_labels(agent_id, old_labels)
+            self._index_labels(new_agent_id, agent.get("labels", []))
+            # Move in-memory entry to new key
+            del self._agents[agent_id]
+            self._agents[new_agent_id] = agent
+            self._save_to_disk(new_agent_id, agent)
+            return agent
+
+        # No ID change: update labels index in place if labels changed
+        if "labels" in updates:
+            self._unindex_labels(agent_id, old_labels)
+            self._index_labels(agent_id, agent.get("labels", []))
+
         self._save_to_disk(agent_id, agent)
         return agent
 
@@ -191,6 +215,8 @@ class AgentManager:
                                 # Both exist: drop legacy group key
                                 del agent["group"]
                             agent.setdefault("labels", [])
+                            # Migration: add created_at for agents without it
+                            agent.setdefault("created_at", agent.get("last_modified", ""))
                             self._agents[agent_id] = agent
                 except (json.JSONDecodeError, OSError):
                     pass

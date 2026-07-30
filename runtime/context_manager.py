@@ -51,7 +51,8 @@ class ConversationTurn:
         audio: Optional base64-encoded audio string (multimodal).
         prompt_template: Optional prompt template ID for this turn.
         arguments: Optional dict of template arguments for this turn.
-        assistant_id: Optional agent_id for assistant-role turns, identifying which agent sent this message.
+        agent_id: Optional agent_id for all roles, identifying which agent produced this turn
+            (set on assistant and tool turns alike, so the frontend can group by agent).
         tool_id: Optional tool_id for tool-role turns, identifying which tool produced this result.
         tool_use_id: Optional protocol-level tool call ID linking a tool result to its assistant tool call.
         completed_at: Kept for backward compatibility with old sessions.
@@ -70,7 +71,7 @@ class ConversationTurn:
     audio: Optional[str] = None
     prompt_template: Optional[str] = None
     arguments: Optional[dict] = None
-    assistant_id: Optional[str] = None
+    agent_id: Optional[str] = None
     tool_id: Optional[str] = None
     tool_use_id: Optional[str] = None
     completed_at: Optional[str] = None
@@ -1162,7 +1163,7 @@ class ContextManager:
                 audio=msg.get("audio"),
                 prompt_template=msg.get("prompt_template"),
                 arguments=msg.get("arguments"),
-                assistant_id=msg.get("assistant_id"),
+                agent_id=msg.get("agent_id") or msg.get("assistant_id"),
                 tool_id=msg.get("tool_id"),
                 tool_use_id=msg.get("tool_use_id"),
                 completed_at=msg.get("completed_at"),

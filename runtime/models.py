@@ -25,7 +25,8 @@ class Message:
         thinking: Optional thinking/reasoning content from the model.
         tool_id: Optional tool_id (used for tool role messages, records the tool_id of the tool that produced this result).
         tool_use_id: Optional protocol-level tool call ID linking a tool result to its assistant tool call.
-        assistant_id: Optional assistant_id (used for assistant role messages, records the agent_id of the agent that sent this message).
+        agent_id: Optional agent_id identifying which agent produced this message
+            (used for all roles: assistant, tool, etc.).
     """
 
     role: str
@@ -40,8 +41,8 @@ class Message:
     arguments: Optional[dict] = None
     tool_id: Optional[str] = None
     tool_use_id: Optional[str] = None
-    assistant_id: Optional[str] = None
     mentions: Optional[list[str]] = None
+    agent_id: Optional[str] = None
 
     def to_dict(self) -> dict:
         """Serialize to a dictionary, omitting None fields."""
@@ -66,10 +67,10 @@ class Message:
             d["tool_id"] = self.tool_id
         if self.tool_use_id is not None:
             d["tool_use_id"] = self.tool_use_id
-        if self.assistant_id is not None:
-            d["assistant_id"] = self.assistant_id
         if self.mentions is not None:
             d["mentions"] = self.mentions
+        if self.agent_id is not None:
+            d["agent_id"] = self.agent_id
         return d
 
     @classmethod
@@ -88,8 +89,8 @@ class Message:
             arguments=data.get("arguments"),
             tool_id=data.get("tool_id"),
             tool_use_id=data.get("tool_use_id"),
-            assistant_id=data.get("assistant_id"),
             mentions=data.get("mentions"),
+            agent_id=data.get("agent_id") or data.get("assistant_id"),
         )
 
 
@@ -105,6 +106,8 @@ class ModelConfig:
         api_protocol: API protocol - "openai" or "ollama".
         generate_params: Additional generation parameters (temperature, top_p, etc.).
         labels: Tags for categorization (e.g. ["vlm"] for vision-language models).
+        created_at: ISO 8601 timestamp when this config was first created.
+        last_modified: ISO 8601 timestamp of the last modification.
     """
 
     model_id: str
@@ -114,6 +117,8 @@ class ModelConfig:
     api_protocol: str = "openai"
     generate_params: dict = field(default_factory=dict)
     labels: list = field(default_factory=list)
+    created_at: str = ""
+    last_modified: str = ""
 
     def __post_init__(self):
         self.labels = parse_labels(self.labels)
@@ -128,6 +133,8 @@ class ModelConfig:
             "api_protocol": self.api_protocol,
             "generate_params": dict(self.generate_params),
             "labels": list(self.labels),
+            "created_at": self.created_at,
+            "last_modified": self.last_modified,
         }
 
     @classmethod
@@ -141,6 +148,8 @@ class ModelConfig:
             api_protocol=data.get("api_protocol", "openai"),
             generate_params=data.get("generate_params", {}),
             labels=parse_labels(data.get("labels", [])),
+            created_at=data.get("created_at", ""),
+            last_modified=data.get("last_modified", ""),
         )
 
 
@@ -157,6 +166,8 @@ class ToolConfig:
         mcp_server_name: MCP server name (MCP tools only).
         tool_name: Original tool name on the MCP server (MCP tools only).
         steps: List of step definitions (skill tools only).
+        created_at: ISO 8601 timestamp when this config was first created.
+        last_modified: ISO 8601 timestamp of the last modification.
     """
 
     tool_id: str
@@ -172,6 +183,8 @@ class ToolConfig:
     skill_dir: Optional[str] = None
     builtin: bool = False
     labels: list = field(default_factory=list)
+    created_at: str = ""
+    last_modified: str = ""
 
     def __post_init__(self):
         self.labels = parse_labels(self.labels)
@@ -184,6 +197,8 @@ class ToolConfig:
             "name": self.name,
             "description": self.description,
             "parameters": dict(self.parameters),
+            "created_at": self.created_at,
+            "last_modified": self.last_modified,
         }
         if self.mcp_server_name is not None:
             d["mcp_server_name"] = self.mcp_server_name
@@ -220,6 +235,8 @@ class ToolConfig:
             skill_dir=data.get("skill_dir"),
             builtin=data.get("builtin", False),
             labels=parse_labels(data.get("labels", [])),
+            created_at=data.get("created_at", ""),
+            last_modified=data.get("last_modified", ""),
         )
 
 

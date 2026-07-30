@@ -5,9 +5,21 @@
   import IconDisplay from '../../lib/components/IconDisplay.svelte'
   import { t } from '../../lib/i18n.svelte.js'
 
-  let { onEdit = null, onCopy = null } = $props()
+  let { onEdit = null, onCopy = null, sortByTimeDesc = false } = $props()
 
-  let agentList = $derived(catalog.agents.items)
+  let agentList = $derived.by(() => {
+    const items = [...catalog.agents.items]
+    if (sortByTimeDesc) {
+      items.sort((a, b) => {
+        const timeDiff = (b.last_modified || '').localeCompare(a.last_modified || '')
+        if (timeDiff !== 0) return timeDiff
+        return (a.agent_id || '').localeCompare(b.agent_id || '')
+      })
+    } else {
+      items.sort((a, b) => (a.agent_id || '').localeCompare(b.agent_id || ''))
+    }
+    return items
+  })
   let loading = $derived(catalog.agents.loading && !catalog.agents.loaded)
   let error = $derived(catalog.agents.error)
   let deleteTarget = $state(null)

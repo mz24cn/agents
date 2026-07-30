@@ -4,9 +4,21 @@
   import ConfirmDialog from '../ConfirmDialog.svelte'
   import { t } from '../../lib/i18n.svelte.js'
 
-  let { onEdit = null, onCopy = null } = $props()
+  let { onEdit = null, onCopy = null, sortByTimeDesc = false } = $props()
 
-  let modelList = $derived(catalog.models.items)
+  let modelList = $derived.by(() => {
+    const items = [...catalog.models.items]
+    if (sortByTimeDesc) {
+      items.sort((a, b) => {
+        const timeDiff = (b.last_modified || '').localeCompare(a.last_modified || '')
+        if (timeDiff !== 0) return timeDiff
+        return (a.model_id || '').localeCompare(b.model_id || '')
+      })
+    } else {
+      items.sort((a, b) => (a.model_id || '').localeCompare(b.model_id || ''))
+    }
+    return items
+  })
   let loading = $derived(catalog.models.loading && !catalog.models.loaded)
   let error = $derived(catalog.models.error)
   let deleteTarget = $state(null)

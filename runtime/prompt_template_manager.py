@@ -6,6 +6,7 @@ prompt templates. Follows the same patterns as ModelRegistry in runtime/registry
 Zero third-party dependencies — only Python standard library.
 """
 
+import datetime
 import json
 import os
 from dataclasses import dataclass, field
@@ -25,6 +26,8 @@ class PromptTemplate:
     template_id: str
     content: str
     labels: list = field(default_factory=list)
+    created_at: str = ""
+    last_modified: str = ""
 
     def __post_init__(self):
         self.labels = parse_labels(self.labels)
@@ -34,6 +37,8 @@ class PromptTemplate:
         d = {
             "template_id": self.template_id,
             "content": self.content,
+            "created_at": self.created_at,
+            "last_modified": self.last_modified,
         }
         if self.labels:
             d["labels"] = list(self.labels)
@@ -46,6 +51,8 @@ class PromptTemplate:
             template_id=data["template_id"],
             content=data["content"],
             labels=parse_labels(data.get("labels", [])),
+            created_at=data.get("created_at", ""),
+            last_modified=data.get("last_modified", ""),
         )
 
 
@@ -127,7 +134,14 @@ class PromptTemplateManager:
         Returns:
             The newly created PromptTemplate.
         """
-        template = PromptTemplate(template_id=template_id, content=content, labels=labels or [])
+        now = datetime.datetime.now().isoformat()
+        template = PromptTemplate(
+            template_id=template_id,
+            content=content,
+            labels=labels or [],
+            created_at=now,
+            last_modified=now,
+        )
         self._templates[template_id] = template
         self._index_labels(template_id, template.labels)
         return template
@@ -147,10 +161,20 @@ class PromptTemplateManager:
         if template_id not in self._templates:
             return None
         # Get existing labels if not provided
-        old_labels = self._templates[template_id].labels
+        existing = self._templates[template_id]
+        old_labels = existing.labels
         if labels is None:
             labels = old_labels
-        template = PromptTemplate(template_id=new_template_id, content=content, labels=labels)
+        # Preserve created_at from existing template
+        created_at = existing.created_at
+        now = datetime.datetime.now().isoformat()
+        template = PromptTemplate(
+            template_id=new_template_id,
+            content=content,
+            labels=labels,
+            created_at=created_at,
+            last_modified=now,
+        )
         # Remove old index entry
         self._unindex_labels(template_id, old_labels)
         del self._templates[template_id]

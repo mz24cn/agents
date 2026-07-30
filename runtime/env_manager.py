@@ -309,7 +309,7 @@ class EnvManager:
                 if common != package_root_real:
                     logger.info(
                         "工具资源不在 env_manager.py 所在目录的父目录下，跳过打包但保留工具注册信息不变: "
-                        "tool_id=%s, %s=%s。安装后相关工具或智能体可能无法正常工作。",
+                        "tool_id=%s, %s=%s。安装后相关工具或AI代理可能无法正常工作。",
                         tool.get("tool_id", ""), key, pth,
                     )
         self._dump_json(os.path.join(cfg_dir, "tools.json"), tools)

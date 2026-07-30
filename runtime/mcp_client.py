@@ -15,6 +15,7 @@ Idle process reaping:
 
 import asyncio
 import concurrent.futures
+import datetime
 import json
 import os
 import signal
@@ -667,6 +668,7 @@ class MCPClientManager:
         return conn
 
     def _convert_tools(self, server_name: str, raw_tools: list) -> list:
+        now = datetime.datetime.now().isoformat()
         tools: list = []
         for raw in raw_tools:
             name = raw.get("name", "")
@@ -680,6 +682,8 @@ class MCPClientManager:
                 parameters=input_schema,
                 mcp_server_name=server_name,
                 tool_name=name,
+                created_at=now,
+                last_modified=now,
             ))
         return tools
 

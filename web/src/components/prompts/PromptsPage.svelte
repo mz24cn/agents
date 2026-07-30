@@ -5,9 +5,21 @@
   import { extractPlaceholders } from '../../lib/placeholder.js'
   import { t } from '../../lib/i18n.svelte.js'
 
-  let { onEdit = null, onCopy = null } = $props()
+  let { onEdit = null, onCopy = null, sortByTimeDesc = false } = $props()
 
-  let templateList = $derived(catalog.promptTemplates.items)
+  let templateList = $derived.by(() => {
+    const items = [...catalog.promptTemplates.items]
+    if (sortByTimeDesc) {
+      items.sort((a, b) => {
+        const timeDiff = (b.last_modified || '').localeCompare(a.last_modified || '')
+        if (timeDiff !== 0) return timeDiff
+        return (a.template_id || '').localeCompare(b.template_id || '')
+      })
+    } else {
+      items.sort((a, b) => (a.template_id || '').localeCompare(b.template_id || ''))
+    }
+    return items
+  })
   let loading = $derived(catalog.promptTemplates.loading && !catalog.promptTemplates.loaded)
   let error = $derived(catalog.promptTemplates.error)
   let deleteTarget = $state(null)
