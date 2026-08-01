@@ -15,6 +15,37 @@ import datetime
 from runtime.models import Message, ModelConfig, TokenStat, ToolConfig
 
 
+def _merge_leading_system_messages(messages: list) -> list:
+    """Collapse consecutive leading ``role="system"`` messages into one.
+
+    Request-format specifications (and several strict OpenAI-compatible
+    servers) require at most a single system message at the head of the
+    payload.  This is a safety net for stateless requests where the caller
+    (or upstream context assembly) may have emitted multiple system messages;
+    session-based flows already merge them in ``ContextManager.assemble_context``.
+
+    Returns a new list with the leading system messages joined by blank lines.
+    Non-system messages and their relative order are preserved.
+    """
+    if not messages:
+        return messages
+    idx = 0
+    parts: list[str] = []
+    while idx < len(messages) and messages[idx].role == "system":
+        content = (messages[idx].content or "").strip()
+        if content:
+            parts.append(content)
+        idx += 1
+    if idx <= 1:
+        # Single leading system message: keep it when it has content,
+        # otherwise drop the pointless empty entry.
+        if idx == 1 and messages[0].role == "system" and not parts:
+            return messages[1:]
+        return messages
+    merged = Message(role="system", content="\n\n".join(parts))
+    return [merged] + messages[idx:]
+
+
 class BaseProtocol(ABC):
     """Abstract base class for LLM API protocol adapters.
 
@@ -234,6 +265,10 @@ class OpenAIProtocol(BaseProtocol):
         headers = {"Content-Type": "application/json"}
         if config.api_key:
             headers["Authorization"] = "Bearer " + config.api_key
+
+        # Strict OpenAI-compatible servers reject multiple leading system
+        # messages — collapse them into a single one.
+        messages = _merge_leading_system_messages(messages)
 
         body = {
             "model": config.model_name,
@@ -618,6 +653,9 @@ class OllamaProtocol(BaseProtocol):
         headers = {"Content-Type": "application/json"}
         if config.api_key:
             headers["Authorization"] = "Bearer " + config.api_key
+
+        # Ollama's /api/chat expects a single leading system message.
+        messages = _merge_leading_system_messages(messages)
 
         body = {
             "model": config.model_name,

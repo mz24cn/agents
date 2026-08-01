@@ -169,7 +169,7 @@ def _build_cm_from_state(
 @given(state=session_state_strategy())
 @settings(max_examples=25)
 def test_assemble_context_ordering(state: dict) -> None:
-    """assemble_context must return messages in summary → memory → turns → new order.
+    """assemble_context must return a single merged system message → turns → new order.
 
     **Validates: Requirements 8.2**
     """
@@ -178,6 +178,15 @@ def test_assemble_context_ordering(state: dict) -> None:
     with tempfile.TemporaryDirectory() as tmp_dir:
         cm, session_id = _build_cm_from_state(tmp_dir, state)
         result = cm.assemble_context(session_id, new_messages)
+
+    # When compression is active (summary present), all system content must be
+    # merged into AT MOST ONE leading system message.
+    if state["summary"] is not None:
+        system_msgs = [m for m in result if m.get("role") == "system"]
+        assert len(system_msgs) <= 1, (
+            f"Expected at most one system message when summary exists, "
+            f"got {len(system_msgs)}"
+        )
 
     # Classify each message
     summary_indices = []
@@ -310,7 +319,7 @@ def test_introspect_consistency(state: dict) -> None:
 
 
 def test_assemble_context_ordering_unit():
-    """assemble_context must return summary → memory → recent unsummarized turns → new_messages."""
+    """assemble_context must return a single merged system message → turns → new_messages."""
     with tempfile.TemporaryDirectory() as tmp_dir:
         cm = _make_cm(tmp_dir, recent_turns_k=5)
         session_id = cm.create_session()
@@ -335,29 +344,64 @@ def test_assemble_context_ordering_unit():
         new_msgs = [{"role": "user", "content": "new question"}]
         result = cm.assemble_context(session_id, new_msgs)
 
-        # First message: summary
-        assert result[0]["role"] == "system"
-        assert result[0]["content"].startswith("## Summary")
-
-        # Next two: memory
-        assert result[1]["role"] == "system"
-        assert result[1]["content"].startswith("## Memory")
-        assert result[2]["role"] == "system"
-        assert result[2]["content"].startswith("## Memory")
+        # Exactly ONE leading system message merging summary + memory.
+        system_msgs = [m for m in result if m["role"] == "system"]
+        assert len(system_msgs) == 1, "system messages must be merged into one"
+        content = system_msgs[0]["content"]
+        assert content.startswith("## Summary")
+        assert "This is the summary." in content
+        assert "## Memory\nfact: user likes Python" in content
+        assert "## Memory\ndecision: use async" in content
 
         # Then unsummarized recent turns (turn 1, turn 2)
-        assert result[3]["role"] == "assistant"
-        assert result[3]["content"] == "turn 1"
-        assert result[4]["role"] == "user"
-        assert result[4]["content"] == "turn 2"
+        assert result[1]["role"] == "assistant"
+        assert result[1]["content"] == "turn 1"
+        assert result[2]["role"] == "user"
+        assert result[2]["content"] == "turn 2"
 
         # Last: new_messages
         assert result[-1] == new_msgs[0]
 
 
-def test_compressed_context_preserves_system_template_message():
+def test_compressed_context_merges_system_prompt_summary_and_memory():
+    """Agent system prompt, summary and memory are merged into ONE system message."""
     with tempfile.TemporaryDirectory() as tmp_dir:
         cm = _make_cm(tmp_dir, recent_turns_k=2)
+        session_id = cm.create_session()
+        turns = [
+            ConversationTurn(
+                role="system",
+                content="You are a coding agent.",
+                timestamp="2026-01-01T00:00:00",
+            ),
+            _make_turn("user", "turn 1"),
+            _make_turn("assistant", "turn 2"),
+        ]
+        cm.save_conversation(session_id, turns)
+        _write_summary(cm, session_id, "Summary text.", summarized_up_to_turn=1)
+
+        result = cm.assemble_context(session_id, [{"role": "user", "content": "next"}])
+
+        system_msgs = [m for m in result if m["role"] == "system"]
+        assert len(system_msgs) == 1, "system messages must be merged into one"
+        content = system_msgs[0]["content"]
+        assert "You are a coding agent." in content
+        assert "## Summary\nSummary text." in content
+        # Recent turns follow the merged system message
+        assert result[0]["role"] == "system"
+        assert result[1]["role"] == "assistant"
+        assert result[1]["content"] == "turn 2"
+
+
+def test_compressed_context_resolves_system_template_into_merged_message():
+    """A prompt_template system turn is resolved and merged with summary/memory."""
+    from runtime.prompt_template_manager import PromptTemplateManager
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        mgr = PromptTemplateManager()
+        mgr.create(template_id="ExcelIn", content="Act as an expert in {{ExcelIn}}.")
+        cm = _make_cm(tmp_dir, recent_turns_k=2)
+        cm._prompt_template_manager = mgr
         session_id = cm.create_session()
         turns = [
             ConversationTurn(
@@ -375,10 +419,13 @@ def test_compressed_context_preserves_system_template_message():
 
         result = cm.assemble_context(session_id, [{"role": "user", "content": "next"}])
 
-        assert result[0]["role"] == "system"
-        assert result[0]["prompt_template"] == "ExcelIn"
-        assert result[0]["arguments"] == {"ExcelIn": "python、svelte"}
-        assert result[1]["content"].startswith("## Summary")
+        system_msgs = [m for m in result if m["role"] == "system"]
+        assert len(system_msgs) == 1, "system messages must be merged into one"
+        content = system_msgs[0]["content"]
+        assert "Act as an expert in python、svelte." in content
+        assert "## Summary\nSummary text." in content
+        # The merged message is plain content — no dangling template reference.
+        assert "prompt_template" not in system_msgs[0]
 
 
 def test_compressed_context_does_not_start_recent_window_with_tool_result():

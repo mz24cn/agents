@@ -239,6 +239,103 @@ def test_openai_parse_response_produces_assistant_message(response_data: bytes) 
         )
 
 
+# ---------------------------------------------------------------------------
+# Leading system-message merging (request-format compliance)
+# ---------------------------------------------------------------------------
+
+
+def test_merge_leading_system_messages_single() -> None:
+    """A single system message must pass through unchanged."""
+    from runtime.protocols import _merge_leading_system_messages
+
+    msgs = [Message(role="system", content="prompt"), Message(role="user", content="hi")]
+    result = _merge_leading_system_messages(msgs)
+    assert result is msgs
+    assert len(result) == 2
+
+
+def test_merge_leading_system_messages_multiple() -> None:
+    """Multiple leading system messages collapse into one, preserving order."""
+    from runtime.protocols import _merge_leading_system_messages
+
+    msgs = [
+        Message(role="system", content="agent prompt"),
+        Message(role="system", content="## Summary\nsummary text"),
+        Message(role="system", content="## Memory\nfact: x"),
+        Message(role="user", content="hello"),
+        Message(role="assistant", content="hi"),
+    ]
+    result = _merge_leading_system_messages(msgs)
+
+    system_msgs = [m for m in result if m.role == "system"]
+    assert len(system_msgs) == 1, "all leading system messages must be merged"
+    assert system_msgs[0].content == (
+        "agent prompt\n\n## Summary\nsummary text\n\n## Memory\nfact: x"
+    )
+    # Non-system messages preserved in order
+    rest = [m for m in result if m.role != "system"]
+    assert [m.content for m in rest] == ["hello", "hi"]
+
+
+def test_merge_leading_system_messages_no_system() -> None:
+    """A list without system messages passes through unchanged."""
+    from runtime.protocols import _merge_leading_system_messages
+
+    msgs = [Message(role="user", content="hello")]
+    assert _merge_leading_system_messages(msgs) is msgs
+
+
+def test_merge_leading_system_messages_skips_empty() -> None:
+    """Empty system messages are dropped when merging; later system stays."""
+    from runtime.protocols import _merge_leading_system_messages
+
+    msgs = [
+        Message(role="system", content=""),
+        Message(role="system", content="real prompt"),
+        Message(role="system", content=""),
+        Message(role="user", content="hi"),
+    ]
+    result = _merge_leading_system_messages(msgs)
+    system_msgs = [m for m in result if m.role == "system"]
+    assert len(system_msgs) == 1
+    assert system_msgs[0].content == "real prompt"
+
+
+def test_merge_leading_system_messages_drops_single_empty() -> None:
+    """A single empty leading system message is dropped (no-op otherwise)."""
+    from runtime.protocols import _merge_leading_system_messages
+
+    msgs = [Message(role="system", content=""), Message(role="user", content="hi")]
+    result = _merge_leading_system_messages(msgs)
+    assert [m.role for m in result] == ["user"]
+    assert result[0].content == "hi"
+
+
+def test_openai_build_request_merges_multiple_system_messages() -> None:
+    """OpenAI build_request must emit a single leading system message."""
+    proto = OpenAIProtocol()
+    config = ModelConfig(
+        model_id="test",
+        api_base="http://localhost:8000",
+        model_name="test-model",
+        api_key="",
+        api_protocol="openai",
+    )
+    messages = [
+        Message(role="system", content="agent prompt"),
+        Message(role="system", content="## Summary\nsummary"),
+        Message(role="user", content="hello"),
+    ]
+    _, _, body_bytes = proto.build_request(config, messages)
+    body = json.loads(body_bytes)
+    api_messages = body["messages"]
+
+    system_msgs = [m for m in api_messages if m.get("role") == "system"]
+    assert len(system_msgs) == 1, "OpenAI payload must have a single system message"
+    assert system_msgs[0]["content"] == "agent prompt\n\n## Summary\nsummary"
+    assert [m["role"] for m in api_messages] == ["system", "user"]
+
+
 # **Validates: Requirements 1.9**
 @given(response_data=ollama_response_st)
 @settings(max_examples=100)

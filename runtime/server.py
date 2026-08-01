@@ -2018,10 +2018,17 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             if tools_markdown and assembled_messages:
                 for msg in assembled_messages:
                     if msg.role == "system":
-                        if msg.arguments is None:
-                            msg.arguments = {}
-                        if not msg.arguments.get("TOOLS"):
-                            msg.arguments["TOOLS"] = tools_markdown
+                        # Merged system messages already carry resolved
+                        # content — substitute the placeholder directly.
+                        # Unresolved template messages get the value injected
+                        # into `arguments` for Runtime._normalize_messages.
+                        if "{{TOOLS}}" in (msg.content or ""):
+                            msg.content = msg.content.replace("{{TOOLS}}", tools_markdown)
+                        else:
+                            if msg.arguments is None:
+                                msg.arguments = {}
+                            if not msg.arguments.get("TOOLS"):
+                                msg.arguments["TOOLS"] = tools_markdown
                         break
 
         # --- AGENTS 占位符（talk_to 专用）---
@@ -2048,10 +2055,13 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
 
                     for msg in assembled_messages:
                         if msg.role == "system":
-                            if msg.arguments is None:
-                                msg.arguments = {}
-                            if not msg.arguments.get("AGENTS"):
-                                msg.arguments["AGENTS"] = agents_markdown
+                            if "{{AGENTS}}" in (msg.content or ""):
+                                msg.content = msg.content.replace("{{AGENTS}}", agents_markdown)
+                            else:
+                                if msg.arguments is None:
+                                    msg.arguments = {}
+                                if not msg.arguments.get("AGENTS"):
+                                    msg.arguments["AGENTS"] = agents_markdown
                             break
 
         request = InferenceRequest(
@@ -4086,30 +4096,16 @@ class RuntimeHTTPServer:
         self._context_manager = ContextManager(
             infer_fn=self._runtime.infer,
             chats_dir=chats_dir if chats_dir is not None else os.path.join(_DATA_DIR, "chat_data"),
+            prompt_template_manager=self._prompt_template_manager,
+            model_registry=self._runtime._model_registry,
         )
         # Initialize SessionManager
         self._session_manager = SessionManager(
             chats_dir=chats_dir if chats_dir is not None else os.path.join(_DATA_DIR, "chat_data"),
             infer_fn=self._runtime.infer,
             broadcast_fn=_broadcast_session_event,
+            model_registry=self._runtime._model_registry,
         )
-        # Log Phase 2 configuration status
-        _summary_model = os.environ.get("SUMMARY_MODEL_ID", "")
-        _max_tokens = os.environ.get("MAX_TOKENS_IN_CONTEXT", "")
-        if _summary_model:
-            logger.info(
-                "ContextManager Phase 2 enabled: SUMMARY_MODEL_ID=%s, "
-                "MAX_TOKENS_IN_CONTEXT=%s (default 65536 if unset). "
-                "Both values are re-read from env vars at runtime.",
-                _summary_model,
-                _max_tokens if _max_tokens else "65536 (default)",
-            )
-        else:
-            logger.info(
-                "ContextManager running in Phase 1 (storage-only) mode. "
-                "Set SUMMARY_MODEL_ID env var to enable Phase 2 compression "
-                "(takes effect immediately without restart)."
-            )
 
     def start(self) -> None:
         """Start the HTTP server (blocking).

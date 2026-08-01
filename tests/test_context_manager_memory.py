@@ -39,6 +39,7 @@ def _make_cm(
     max_tokens_in_context: int = 1000,
     memory_confidence_threshold: float = 0.7,
     infer_fn=None,
+    model_registry=None,
 ) -> ContextManager:
     """Return a ContextManager backed by *tmp_dir*."""
     if infer_fn is None:
@@ -52,6 +53,7 @@ def _make_cm(
         summary_model_id=summary_model_id,
         max_tokens_in_context=max_tokens_in_context,
         memory_confidence_threshold=memory_confidence_threshold,
+        model_registry=model_registry,
     )
 
 
@@ -271,13 +273,23 @@ def test_get_summary_returns_empty_when_no_file():
 
 
 def test_update_rolling_summary_skipped_when_no_model():
-    """update_rolling_summary must be a no-op when summary_model_id is empty."""
+    """update_rolling_summary must be a no-op when SUMMARY_MODEL_ID resolves to no registered model."""
     import os as _os
+
+    from runtime.registry import ModelRegistry
+
     with tempfile.TemporaryDirectory() as tmp_dir:
-        # Ensure SUMMARY_MODEL_ID env var is not set so the override="" takes effect
+        # Ensure SUMMARY_MODEL_ID env var is not set so the default "summary"
+        # is used; an empty registry means it cannot resolve to a model.
         old_val = _os.environ.pop("SUMMARY_MODEL_ID", None)
         try:
-            cm = _make_cm(tmp_dir, summary_model_id="", recent_turns_k=2, max_tokens_in_context=1000)
+            cm = _make_cm(
+                tmp_dir,
+                summary_model_id="",
+                recent_turns_k=2,
+                max_tokens_in_context=1000,
+                model_registry=ModelRegistry(),
+            )
             session_id = cm.create_session()
 
             turns = [_make_turn(content=f"turn {i}") for i in range(4)]
@@ -285,8 +297,77 @@ def test_update_rolling_summary_skipped_when_no_model():
 
             summary_path = os.path.join(tmp_dir, session_id, "summary.md")
             assert not os.path.isfile(summary_path), (
-                "summary.md must NOT be created in Phase 1 (no summary_model_id)"
+                "summary.md must NOT be created when SUMMARY_MODEL_ID does not "
+                "resolve to a registered model"
             )
+        finally:
+            if old_val is not None:
+                _os.environ["SUMMARY_MODEL_ID"] = old_val
+
+
+def test_summary_model_resolved_via_registry_label():
+    """Default SUMMARY_MODEL_ID "summary" must resolve via the registry label index."""
+    import os as _os
+
+    from runtime.models import ModelConfig
+    from runtime.registry import ModelRegistry
+
+    registry = ModelRegistry()
+    registry.register(ModelConfig(
+        model_id="qwen-vl",
+        api_base="http://localhost:11434",
+        model_name="qwen3-vl:8b",
+        labels=["summary"],
+    ))
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        old_val = _os.environ.pop("SUMMARY_MODEL_ID", None)
+        try:
+            cm = _make_cm(
+                tmp_dir,
+                summary_model_id="",
+                recent_turns_k=2,
+                max_tokens_in_context=1000,
+                model_registry=registry,
+            )
+            # Registry lookup by label must yield the registered model ID.
+            assert cm._summary_model_id == "qwen-vl"
+
+            session_id = cm.create_session()
+            turns = [_make_turn(content=f"turn {i}") for i in range(4)]
+            cm.update_rolling_summary(session_id, turns, last_total_tokens=2000)
+
+            summary_path = os.path.join(tmp_dir, session_id, "summary.md")
+            assert os.path.isfile(summary_path), (
+                "summary.md must be created when SUMMARY_MODEL_ID resolves to a model"
+            )
+        finally:
+            if old_val is not None:
+                _os.environ["SUMMARY_MODEL_ID"] = old_val
+
+
+def test_summary_model_missing_from_registry_logs_warning(caplog):
+    """Unresolvable SUMMARY_MODEL_ID must log a warning and disable compression."""
+    import logging
+    import os as _os
+
+    from runtime.registry import ModelRegistry
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        old_val = _os.environ.pop("SUMMARY_MODEL_ID", None)
+        try:
+            cm = _make_cm(
+                tmp_dir,
+                summary_model_id="",
+                recent_turns_k=2,
+                max_tokens_in_context=1000,
+                model_registry=ModelRegistry(),  # empty registry
+            )
+            with caplog.at_level(logging.WARNING):
+                assert cm._summary_model_id == ""
+            assert any(
+                "not found in model registry" in rec.message for rec in caplog.records
+            ), "expected a warning when SUMMARY_MODEL_ID cannot be resolved"
         finally:
             if old_val is not None:
                 _os.environ["SUMMARY_MODEL_ID"] = old_val
@@ -359,19 +440,29 @@ def test_get_memory_entries_by_type():
 
 
 def test_extract_memory_skipped_when_no_model():
-    """compress_context must be a no-op when summary_model_id is empty."""
+    """compress_context must be a no-op when SUMMARY_MODEL_ID resolves to no registered model."""
     called = {"n": 0}
 
     def mock_infer(req: Any) -> SimpleNamespace:
         called["n"] += 1
         return SimpleNamespace(content="<summary>x</summary><memory>[]</memory>")
 
+    from runtime.registry import ModelRegistry
+
     with tempfile.TemporaryDirectory() as tmp_dir:
-        cm = _make_cm(tmp_dir, summary_model_id="", infer_fn=mock_infer)
+        cm = _make_cm(
+            tmp_dir,
+            summary_model_id="",
+            infer_fn=mock_infer,
+            model_registry=ModelRegistry(),
+        )
         session_id = cm.create_session()
         cm.compress_context(session_id, [_make_turn()], last_total_tokens=2000)
 
-        assert called["n"] == 0, "infer_fn must not be called when summary_model_id is empty"
+        assert called["n"] == 0, (
+            "infer_fn must not be called when SUMMARY_MODEL_ID does not "
+            "resolve to a registered model"
+        )
         assert cm.get_memory_entries(session_id) == []
 
 

@@ -122,6 +122,8 @@ const translations = {
     labels: '标签',
     labelsPlaceholder: '用逗号分隔，例如: 快速,本地,测试',
     labelsHint: '标签用于分类和筛选工具，可留空',
+    labelsModelHint:
+      'summary：用于指定为上下文压缩使用模型；vlm：用于说明模型接受图像输入；read-image：用于内置图像理解工具用 VLM 模型；general、complex：用于规划AI代理（Plan Agent）的可选模型类型。',
 
     // AudioPlayer
     audioNotSupported: '浏览器不支持音频播放',
@@ -598,6 +600,8 @@ const translations = {
     labels: 'Labels',
     labelsPlaceholder: 'Comma-separated, e.g.: fast,local,test',
     labelsHint: 'Labels are used to categorize and filter tools, can be left empty',
+    labelsModelHint:
+      'summary: model used for context compression; vlm: model accepts image input; read-image: VLM model used by the built-in image-understanding tool; general, complex: optional model types for the planning AI agent (Plan Agent).',
 
     // AudioPlayer
     audioNotSupported: 'Audio playback not supported',

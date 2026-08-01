@@ -27,10 +27,13 @@ class SessionManager:
     """
 
     def __init__(self, chats_dir: str, infer_fn: Optional[Callable] = None,
-                 broadcast_fn: Optional[Callable] = None) -> None:
+                 broadcast_fn: Optional[Callable] = None,
+                 model_registry: Optional[object] = None) -> None:
         self._chats_dir = chats_dir
         self._infer_fn = infer_fn
         self._broadcast_fn = broadcast_fn
+        # Optional model registry used to resolve SUMMARY_MODEL_ID by ID/label.
+        self._model_registry = model_registry
 
     # ------------------------------------------------------------------
     # 内部属性
@@ -162,7 +165,7 @@ class SessionManager:
 
         条件：
         - last_total_tokens > 1000
-        - SUMMARY_MODEL_ID 环境变量已配置
+        - SUMMARY_MODEL_ID 环境变量解析出的模型已注册（默认标签 "summary"）
         - self._infer_fn 不为 None
         - index 中该会话的 title 为空（避免重复生成）
 
@@ -194,10 +197,18 @@ class SessionManager:
         Returns:
             生成的标题，失败时返回 None。
         """
-        summary_model_id = os.environ.get("SUMMARY_MODEL_ID", "")
+        summary_model_id = os.environ.get("SUMMARY_MODEL_ID", "summary")
         if not summary_model_id:
-            logger.warning("generate_title: SUMMARY_MODEL_ID 环境变量未配置")
             return None
+        if self._model_registry is not None:
+            config = self._model_registry.get(summary_model_id)
+            if config is None:
+                logger.warning(
+                    "generate_title: SUMMARY_MODEL_ID=%r not found in model registry",
+                    summary_model_id,
+                )
+                return None
+            summary_model_id = config.model_id
         if self._infer_fn is None:
             logger.warning("generate_title: 推理函数未设置")
             return None

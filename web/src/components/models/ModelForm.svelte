@@ -190,6 +190,7 @@
   <div class="form-group">
     <label for="model_labels">{t('labels')}</label>
     <input id="model_labels" type="text" bind:value={labelsText} placeholder={t('labelsPlaceholder')} />
+    <span class="field-hint">{t('labelsModelHint')}</span>
   </div>
 
   <div class="form-actions">

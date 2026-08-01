@@ -953,8 +953,9 @@ class ContextManager:
         summary_model_id: Hard-coded override for the model ID used for
             rolling summaries.  When non-empty, takes precedence over the
             ``SUMMARY_MODEL_ID`` environment variable.  Leave empty (default)
-            to rely solely on the environment variable, which is re-read on
-            every call so changes take effect without a restart.
+            to rely solely on the environment variable (default ``"summary"``),
+            which is re-read on every call so changes take effect without a
+            restart.
         max_tokens_in_context: Hard-coded override for the token threshold
             that triggers compression.  When not ``None``, takes precedence
             over the ``MAX_TOKENS_IN_CONTEXT`` environment variable.  Leave
@@ -962,9 +963,15 @@ class ContextManager:
             which is re-read on every call.  Default when neither is set: 65536.
         memory_confidence_threshold: Minimum confidence score for a
             ``MemoryEntry`` to be retained.
+        model_registry: Optional model registry used to resolve the summary
+            model reference (by ID or label).  When provided and the resolved
+            ``SUMMARY_MODEL_ID`` is not found in the registry, a warning is
+            logged and compression stays disabled.  When ``None`` (library
+            usage), the resolved value is used as-is without validation.
     """
 
     _DEFAULT_MAX_TOKENS: int = 65536
+    _DEFAULT_SUMMARY_MODEL_ID: str = "summary"
 
     def __init__(
         self,
@@ -974,6 +981,8 @@ class ContextManager:
         summary_model_id: str = "",
         max_tokens_in_context: Optional[int] = None,
         memory_confidence_threshold: float = 0.7,
+        prompt_template_manager: Optional[object] = None,
+        model_registry: Optional[object] = None,
     ) -> None:
         self._infer_fn = infer_fn
         self._chats_dir = chats_dir
@@ -982,6 +991,11 @@ class ContextManager:
         self._summary_model_id_override: str = summary_model_id
         self._max_tokens_override: Optional[int] = max_tokens_in_context
         self._memory_confidence_threshold = memory_confidence_threshold
+        # Optional PromptTemplateManager used to resolve prompt-template
+        # references inside system turns when merging context.
+        self._prompt_template_manager = prompt_template_manager
+        # Optional model registry used to resolve SUMMARY_MODEL_ID by ID/label.
+        self._model_registry = model_registry
         self._memory_store: dict[str, list[MemoryEntry]] = {}
 
     # ------------------------------------------------------------------
@@ -992,12 +1006,31 @@ class ContextManager:
     def _summary_model_id(self) -> str:
         """Return the effective summary model ID.
 
-        Priority: constructor override > ``SUMMARY_MODEL_ID`` env var > ``""``
-        (Phase 1 / storage-only mode).
+        Priority: constructor override > ``SUMMARY_MODEL_ID`` env var >
+        ``"summary"`` (default).  When a model registry is available and the
+        resolved value is non-empty, it is looked up in the registry (by ID
+        or label); if not found, a warning is logged and ``""`` is returned
+        so compression stays disabled.  Other cases produce no log output.
         """
         if self._summary_model_id_override:
-            return self._summary_model_id_override
-        return os.environ.get("SUMMARY_MODEL_ID", "")
+            candidate = self._summary_model_id_override
+        else:
+            candidate = os.environ.get(
+                "SUMMARY_MODEL_ID", self._DEFAULT_SUMMARY_MODEL_ID
+            )
+        if not candidate:
+            return ""
+        if self._model_registry is None:
+            return candidate
+        config = self._model_registry.get(candidate)
+        if config is None:
+            logging.warning(
+                "ContextManager: SUMMARY_MODEL_ID=%r not found in model "
+                "registry; context compression disabled",
+                candidate,
+            )
+            return ""
+        return config.model_id
 
     @property
     def _max_tokens_in_context(self) -> int:
@@ -1009,8 +1042,8 @@ class ContextManager:
         """
         if self._max_tokens_override is not None:
             return self._max_tokens_override
-        env_val = os.environ.get("MAX_TOKENS_IN_CONTEXT", "")
-        if env_val.strip():
+        env_val = os.environ.get("MAX_TOKENS_IN_CONTEXT", "").strip()
+        if env_val:
             try:
                 return int(env_val)
             except ValueError:
@@ -1421,7 +1454,8 @@ class ContextManager:
 
         Triggered when ALL of the following are true:
 
-        - ``SUMMARY_MODEL_ID`` is configured (non-empty).
+        - ``SUMMARY_MODEL_ID`` resolves to a registered model (non-empty;
+          default ``"summary"``).
         - ``last_total_tokens`` exceeds the effective ``MAX_TOKENS_IN_CONTEXT``
           threshold (env var, default 65536).
 
@@ -1700,8 +1734,8 @@ For each entry:
         check, making it suitable for manual re-generation (e.g. after a
         previous automatic attempt failed due to a missing model or API error).
 
-        All other guards still apply (e.g. ``SUMMARY_MODEL_ID`` must be
-        configured and the session must have at least 2 turns).
+        All other guards still apply (e.g. ``SUMMARY_MODEL_ID`` must resolve
+        to a registered model).
         """
         if not self._summary_model_id:
             logging.warning(
@@ -1836,6 +1870,54 @@ For each entry:
     # Context assembly
     # ------------------------------------------------------------------
 
+    def _system_message_text(self, msg: dict) -> str:
+        """Return the effective text of a system-role message dict.
+
+        Plain ``content`` messages are returned as-is.  Prompt-template
+        references (empty ``content`` + ``prompt_template``) are resolved
+        against the optional ``prompt_template_manager`` and their
+        ``arguments`` are substituted, mirroring ``Runtime._normalize_messages``.
+        Returns ``""`` when nothing can be resolved (so the caller can drop
+        the part without breaking assembly).
+        """
+        content = msg.get("content") or ""
+        if content:
+            return content
+        template_id = msg.get("prompt_template")
+        manager = self._prompt_template_manager
+        if template_id and manager is not None:
+            try:
+                template = manager.get(template_id)
+            except Exception:  # noqa: BLE001 — never block assembly on a bad template
+                template = None
+            if template is not None:
+                text = getattr(template, "content", None) or ""
+                for key, value in (msg.get("arguments") or {}).items():
+                    text = text.replace(f"{{{{{key}}}}}", str(value))
+                return text
+        return ""
+
+    @staticmethod
+    def _merge_system_parts(
+        system_parts: list[str],
+        summary_part: Optional[str],
+        memory_parts: list[str],
+    ) -> Optional[dict]:
+        """Combine system-prompt / summary / memory parts into ONE system message.
+
+        Merging all head system messages into a single ``{"role": "system"}``
+        message keeps the assembled context compatible with request-format
+        specifications that reject (or discourage) multiple system messages
+        (e.g. Anthropic's single top-level ``system`` field and strict
+        OpenAI-compatible servers).
+
+        Returns ``None`` when there is no non-empty part to include.
+        """
+        parts = [p for p in [*system_parts, summary_part, *memory_parts] if p and p.strip()]
+        if not parts:
+            return None
+        return {"role": "system", "content": "\n\n".join(parts)}
+
     def assemble_context(
         self,
         session_id: str,
@@ -1852,10 +1934,11 @@ For each entry:
         2. *new_messages* appended as-is
 
         **Summary exists (token threshold was exceeded at some point):**
-        1. Rolling summary → ``{"role": "system", "content": "## Summary\\n{text}"}``
-        2. Structured memory entries → one ``{"role": "system", ...}`` per entry
-        3. Most recent ``min(K, len(turns))`` conversation turns
-        4. *new_messages* appended as-is
+        1. ONE merged ``{"role": "system", ...}`` message combining the agent /
+           session system prompt(s), the rolling summary and the structured
+           memory entries
+        2. Most recent ``min(K, len(turns))`` conversation turns
+        3. *new_messages* appended as-is
 
         The ``recent_turns_k`` parameter only controls how many turns are kept
         verbatim when compression is active.  It has no effect when the
@@ -1864,8 +1947,8 @@ For each entry:
         When *token_budget* is provided and > 0, the assembled list is
         trimmed to fit within the budget:
         - Structured memory entries are removed oldest-first.
-        - If still over budget after removing all memory, the summary message
-          is removed.
+        - If still over budget after removing all memory, the summary part is
+          removed.
 
         Args:
             session_id: Target session.  When empty or the session does not
@@ -1917,21 +2000,29 @@ For each entry:
                 # caller handle overflow.
             return assembled
 
-        # Compression is active — use summary + unsummarized recent context.
+        # Compression is active — use a SINGLE merged system message plus
+        # unsummarized recent context.
+        #
+        # Multiple system messages at the head of a request violate the
+        # request-format conventions of several providers (Anthropic accepts
+        # exactly one top-level ``system`` field; many OpenAI-compatible
+        # servers reject repeated ``role="system"`` entries).  We therefore
+        # merge the agent/session system prompt(s), the rolling summary and
+        # the structured memory entries into one ``system`` message.
 
-        system_msgs: list[dict] = [
-            {k: v for k, v in asdict(t).items() if v is not None}
-            for t in turns
-            if t.role == "system" and (t.content or t.prompt_template)
-        ]
+        # 1. Agent / session system prompt(s) from persisted system turns.
+        system_parts: list[str] = []
+        for t in turns:
+            if t.role == "system" and (t.content or t.prompt_template):
+                msg = {k: v for k, v in asdict(t).items() if v is not None}
+                text = self._system_message_text(msg)
+                if text.strip():
+                    system_parts.append(text.strip())
 
-        # 2. Structured memory entries
+        # 2. Structured memory entries (dropped oldest-first when over budget).
         memory_entries = self.get_memory_entries(session_id)
-        memory_msgs: list[dict] = [
-            {
-                "role": "system",
-                "content": f"## Memory\n{entry.entry_type}: {entry.content}",
-            }
+        memory_parts: list[str] = [
+            f"## Memory\n{entry.entry_type}: {entry.content}"
             for entry in memory_entries
         ]
 
@@ -1993,36 +2084,28 @@ For each entry:
             if t.role != "system"
         ]
 
-        # Assemble full list
-        assembled = []
-        assembled.extend(system_msgs)
-        assembled.append(summary_msg)
-        assembled.extend(memory_msgs)
-        assembled.extend(turn_msgs)
-        assembled.extend(new_messages)
+        # 4. Rolling summary (dropped when still over budget after memory).
+        summary_part: Optional[str] = None
+        if summary_text.strip():
+            summary_part = f"## Summary\n{summary_text}"
 
-        # Apply token budget if set
+        # Merge everything into ONE system message (see note above).
+        merged_system = self._merge_system_parts(system_parts, summary_part, memory_parts)
+        assembled = ([merged_system] if merged_system is not None else []) + turn_msgs + new_messages
+
+        # Apply token budget if set (memory oldest-first, then summary).
         if effective_budget is not None:
             total_tokens = sum(estimate_tokens(str(msg)) for msg in assembled)
-
-            if total_tokens > effective_budget:
-                while memory_msgs and total_tokens > effective_budget:
-                    removed = memory_msgs.pop(0)
-                    total_tokens -= estimate_tokens(str(removed))
-
-                # Rebuild assembled after memory truncation
-                assembled = []
-                assembled.extend(system_msgs)
-                assembled.append(summary_msg)
-                assembled.extend(memory_msgs)
-                assembled.extend(turn_msgs)
-                assembled.extend(new_messages)
-
+            while memory_parts and total_tokens > effective_budget:
+                memory_parts.pop(0)
+                merged_system = self._merge_system_parts(system_parts, summary_part, memory_parts)
+                assembled = ([merged_system] if merged_system is not None else []) + turn_msgs + new_messages
                 total_tokens = sum(estimate_tokens(str(msg)) for msg in assembled)
-
-            # If still over budget, remove the summary
-            if total_tokens > effective_budget:
-                assembled = [m for m in assembled if m is not summary_msg]
+            # If still over budget, remove the summary part.
+            if summary_part is not None and total_tokens > effective_budget:
+                summary_part = None
+                merged_system = self._merge_system_parts(system_parts, summary_part, memory_parts)
+                assembled = ([merged_system] if merged_system is not None else []) + turn_msgs + new_messages
 
         return assembled
 
