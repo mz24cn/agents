@@ -241,7 +241,7 @@ def test_ollama_non_stream_extracts_all_tool_calls(tool_calls: list[dict]) -> No
     """
     response_data = _build_ollama_non_stream_response(tool_calls)
     proto = OllamaProtocol()
-    messages = proto._parse_non_stream_response(response_data)
+    messages, _stat = proto._parse_non_stream_response(response_data)
 
     assert len(messages) == 1
     msg = messages[0]
@@ -275,7 +275,7 @@ def test_ollama_stream_extracts_all_tool_calls(tool_calls: list[dict]) -> None:
     """
     response_data = _build_ollama_stream_response(tool_calls)
     proto = OllamaProtocol()
-    messages = proto._parse_stream_response(response_data)
+    messages, _stat = proto._parse_stream_response(response_data)
 
     assert len(messages) == 1
     msg = messages[0]
@@ -310,7 +310,7 @@ def test_openai_stream_extracts_all_tool_calls(tool_calls: list[dict]) -> None:
     """
     response_data = _build_openai_stream_response(tool_calls)
     proto = OpenAIProtocol()
-    messages = proto._parse_stream_response(response_data)
+    messages, _stat = proto._parse_stream_response(response_data)
 
     assert len(messages) == 1
     msg = messages[0]

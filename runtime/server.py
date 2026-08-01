@@ -147,6 +147,12 @@ def merge_stream_messages(stream_messages: list) -> tuple[list, Optional[dict]]:
                 current_agent_id = m.assistant_id
             if getattr(m, "name", None) and not current_name:
                 current_name = m.name
+            if getattr(m, "tool_calls_dropped", False):
+                # Max tool-call rounds reached: the tool_calls in this round were
+                # never executed.  Drop the accumulated (already-streamed) tool_call
+                # deltas so the flushed assistant turn has no dangling tool_calls —
+                # otherwise OpenAI/Anthropic reject the next request.
+                pending_tool_calls = []
             if m.tool_calls:
                 # tool_calls 到来时，合并到当前 assistant turn（不单独 flush）
                 for tc in m.tool_calls:
@@ -173,7 +179,11 @@ def merge_stream_messages(stream_messages: list) -> tuple[list, Optional[dict]]:
             if m.thinking:
                 assistant_thinking_buf += m.thinking
         elif m.role == "tool":
-            # tool result 到来时，直接 append（assistant 已经在 stat 到来时 flush 了）
+            # tool result 到来时，直接 append（assistant 已经在 stat 到来时 flush 了）。
+            # 加固：若 pending assistant 尚未 flush（如异常分支中 tool 消息先于 stat
+            # 到达），先 flush 再 append，避免落盘成 [tool, assistant] 的非法顺序。
+            if assistant_text_buf or assistant_thinking_buf or pending_tool_calls:
+                _flush_assistant(stat=current_stat or last_stat)
             ts = m.timestamp if m.timestamp else now_iso()
             turns.append(ConversationTurn(
                 role="tool",

@@ -144,7 +144,7 @@ def test_openai_single_tool_call_preserves_tool_calls(
     has tool_calls with the correct name and arguments (JSON string)."""
     response_data = _build_openai_single_tool_call_response(name, arguments, content)
     proto = OpenAIProtocol()
-    messages = proto._parse_non_stream_response(response_data)
+    messages, _stat = proto._parse_non_stream_response(response_data)
 
     assert len(messages) == 1
     msg = messages[0]
@@ -177,7 +177,7 @@ def test_openai_no_tool_call_preserves_content(content: str) -> None:
     tool_calls=None and content is preserved."""
     response_data = _build_openai_no_tool_call_response(content)
     proto = OpenAIProtocol()
-    messages = proto._parse_non_stream_response(response_data)
+    messages, _stat = proto._parse_non_stream_response(response_data)
 
     assert len(messages) == 1
     msg = messages[0]
@@ -204,7 +204,7 @@ def test_ollama_single_tool_call_preserves_tool_calls(
     has tool_calls with the correct name and arguments (JSON string of dict)."""
     response_data = _build_ollama_single_tool_call_response(name, arguments, content)
     proto = OllamaProtocol()
-    messages = proto._parse_non_stream_response(response_data)
+    messages, _stat = proto._parse_non_stream_response(response_data)
 
     assert len(messages) == 1
     msg = messages[0]
@@ -237,7 +237,7 @@ def test_ollama_no_tool_call_preserves_content(content: str) -> None:
     tool_calls=None and content is preserved."""
     response_data = _build_ollama_no_tool_call_response(content)
     proto = OllamaProtocol()
-    messages = proto._parse_non_stream_response(response_data)
+    messages, _stat = proto._parse_non_stream_response(response_data)
 
     assert len(messages) == 1
     msg = messages[0]

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-使用示例：通过 runtime 调用 OpenAI 兼容 API + MCP 工具
+使用示例：通过 runtime 调用 OpenAI 兼容 API + 内置工具
 
 演示：
   1. 连接 OpenAI 兼容 API（支持 OpenAI 官方、Ollama、vLLM、LiteLLM 等）
-  2. 通过 load_config 一行连接两个 MCP Server（time、fetch）并注册工具
+  2. 注册内置工具（exec_shell、fetch 等）
   3. 询问当前时间
   4. 下载一个网页
 
@@ -15,7 +15,6 @@
 前置条件：
   - 设置环境变量 OPENAI_API_KEY（如使用 OpenAI 官方）
   - 或者使用 Ollama 等本地服务（无需 API Key）
-  - 已安装 uv/uvx（用于启动 MCP Server）
 
 配置说明：
   本示例默认使用 Ollama 的 OpenAI 兼容端点（http://localhost:11434/v1）。
@@ -45,7 +44,7 @@ from runtime import (
     InferenceRequest,
     Message,
 )
-from runtime.mcp_client import MCPClientManager
+from runtime.builtin_tools import register_builtin_tools
 
 # ANSI colors
 DIM = "\033[2m"
@@ -56,26 +55,11 @@ RESET = "\033[0m"
 BOLD = "\033[1m"
 
 # ============================================================
-# 模型配置 —— 修改这三行即可切换不同的 OpenAI 兼容服务
+# 模型配置 — 修改这三行即可切换不同的 OpenAI 兼容服务
 # ============================================================
-API_BASE = "http://localhost:11434/v1"              # Ollama OpenAI 兼容端点（协议层自动拼接 /chat/completions）
-MODEL_NAME = "qwen3:14b"                        # Ollama 中的模型名
-API_KEY = os.environ.get("OPENAI_API_KEY", "")  # Ollama 不需要 key，留空即可
-
-
-# MCP 配置（与 Kiro / Claude Desktop 格式一致）
-MCP_CONFIG = {
-    "mcpServers": {
-        "time": {
-            "command": "uvx",
-            "args": ["mcp-server-time", "--local-timezone=Asia/Shanghai"],
-        },
-        "fetch": {
-            "command": "uvx",
-            "args": ["mcp-server-fetch"],
-        },
-    }
-}
+API_BASE = "http://localhost:11434/v1"              # Ollama OpenAI 兼容端点
+MODEL_NAME = "qwen3.5:9b"                           # Ollama 中的模型名
+API_KEY = os.environ.get("OPENAI_API_KEY", "")      # Ollama 不需要 key，留空即可
 
 
 def print_result(result):
@@ -144,7 +128,7 @@ def run_stream(runtime, request):
 def main():
     stream = "--stream" in sys.argv
 
-    # 1. 注册模型 —— 使用 OpenAI 兼容协议
+    # 1. 注册模型 — 使用 OpenAI 兼容协议
     model_registry = ModelRegistry()
     model_registry.register(ModelConfig(
         model_id="openai-compatible",
@@ -155,25 +139,10 @@ def main():
         generate_params={"temperature": 0.7},
     ))
 
-    # 2. 一行搞定：连接所有 MCP Server + 发现工具 + 注册到 ToolRegistry
+    # 2. 注册内置工具：exec_shell（运行 date 获取时间）、fetch（下载网页）
     tool_registry = ToolRegistry()
-    mcp = MCPClientManager()
-
-    print(">>> 正在连接 MCP Server 并发现工具...")
-    mcp.load_config(MCP_CONFIG)
-
-    # load_config 只注册配置，需要显式调用 get_tools 来连接并发现工具
-    all_tools = []
-    for server_name in MCP_CONFIG["mcpServers"]:
-        tools = mcp.get_tools(server_name)
-        for t in tools:
-            tool_registry.register(t)
-        all_tools.extend(tools)
-
-    all_tool_ids = [t.tool_id for t in all_tools]
-    for t in all_tools:
-        print(f"    {t.tool_id}  ({t.mcp_server_name})")
-    print(f">>> 共 {len(all_tools)} 个工具就绪")
+    builtin_ids = register_builtin_tools(tool_registry)
+    print(f">>> 内置工具: {builtin_ids}")
     print(f">>> 模型: {MODEL_NAME} @ {API_BASE} (openai 协议)")
     if stream:
         print(">>> 模式: 流式输出\n")
@@ -184,7 +153,6 @@ def main():
     runtime = Runtime(
         model_registry=model_registry,
         tool_registry=tool_registry,
-        mcp_manager=mcp,
     )
 
     # 4. 对话 1：询问当前时间
@@ -193,7 +161,7 @@ def main():
     print("=" * 60)
     req1 = InferenceRequest(
         model_id="openai-compatible",
-        tool_ids=all_tool_ids,
+        tool_ids=builtin_ids,
         text="现在几点了？请告诉我当前的日期和时间。",
         max_tool_rounds=5,
     )
@@ -208,7 +176,7 @@ def main():
     print("=" * 60)
     req2 = InferenceRequest(
         model_id="openai-compatible",
-        tool_ids=all_tool_ids,
+        tool_ids=builtin_ids,
         text="请帮我下载 https://httpbin.org/html 这个网页，并简要描述网页内容。",
         max_tool_rounds=5,
     )
@@ -217,10 +185,7 @@ def main():
     else:
         print_result(runtime.infer(req2))
 
-    # 6. 清理
-    print("\n\n>>> 断开所有 MCP 连接...")
-    mcp.disconnect_all()
-    print(">>> 完成")
+    print("\n>>> 完成")
 
 
 if __name__ == "__main__":

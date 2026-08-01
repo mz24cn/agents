@@ -83,12 +83,22 @@ def chats_tmp(tmp_path):
 
 @pytest.fixture()
 def mock_runtime(tmp_path):
-    """Runtime whose infer method is replaced with a simple mock."""
+    """Runtime whose infer and infer_stream are replaced with mocks."""
     model_reg = ModelRegistry()
     tool_reg = ToolRegistry()
+    model_reg.register(ModelConfig(
+        model_id="any-model",
+        api_base="http://localhost:11434",
+        model_name="mock-model",
+        api_protocol="ollama",
+    ))
     rt = Runtime(model_reg, tool_reg)
-    # Patch infer to avoid needing a real model
+    def _mock_infer_stream(request):
+        for msg in (request.messages or []):
+            yield msg
+        yield Message(role="assistant", content="Hello from mock")
     rt.infer = _make_mock_infer()
+    rt.infer_stream = _mock_infer_stream
     return rt
 
 
@@ -124,6 +134,7 @@ class TestServerInferReturnsSessionId:
     def test_server_infer_returns_session_id(self, server):
         data = {
             "model_id": "any-model",
+            "session_id": "new",
             "messages": [{"role": "user", "content": "Hello"}],
         }
         status, body = _post(server, "/v1/infer", data)
@@ -137,13 +148,14 @@ class TestServerInferReturnsSessionId:
         """session_id should follow YYYY-MM-DD_HH-MM-SS format."""
         data = {
             "model_id": "any-model",
+            "session_id": "new",
             "messages": [{"role": "user", "content": "Hi"}],
         }
         _, body = _post(server, "/v1/infer", data)
         session_id = body["session_id"]
         # Validate format: YYYY-MM-DD_HH-MM-SS
         import re
-        assert re.match(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$", session_id), (
+        assert re.match(r"^\d{6}_\d{6}$", session_id), (
             f"session_id '{session_id}' does not match expected format"
         )
 
@@ -169,6 +181,7 @@ class TestSessionPersistence:
         """After a request, conversation.json should exist in the session directory."""
         data = {
             "model_id": "any-model",
+            "session_id": "new",
             "messages": [{"role": "user", "content": "First message"}],
         }
         _, body = _post(server, "/v1/infer", data)
@@ -182,6 +195,7 @@ class TestSessionPersistence:
         # First request — creates session
         data1 = {
             "model_id": "any-model",
+            "session_id": "new",
             "messages": [{"role": "user", "content": "Turn one"}],
         }
         _, body1 = _post(server, "/v1/infer", data1)
@@ -210,6 +224,7 @@ class TestSessionPersistence:
         """The chats directory and session subdirectory should be created."""
         data = {
             "model_id": "any-model",
+            "session_id": "new",
             "messages": [{"role": "user", "content": "Hello"}],
         }
         _, body = _post(server, "/v1/infer", data)
@@ -245,13 +260,13 @@ class TestContextAssemblyWithRealFiles:
         # Track what messages the mock infer receives
         received_messages: list = []
 
-        def capturing_infer(request: InferenceRequest) -> InferenceResult:
-            received_messages.extend(request.messages or [])
-            msgs = list(request.messages or [])
-            msgs.append(Message(role="assistant", content="Captured"))
-            return InferenceResult(success=True, messages=msgs)
+        def capturing_infer_stream(request):
+            for m in (request.messages or []):
+                received_messages.append(m)
+                yield m
+            yield Message(role="assistant", content="Captured")
 
-        server._runtime.infer = capturing_infer
+        server._runtime.infer_stream = capturing_infer_stream
 
         # Make a new request with the existing session_id
         data = {

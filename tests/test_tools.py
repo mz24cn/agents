@@ -4,36 +4,9 @@ from runtime.registry import ToolRegistry
 from runtime.tools import (
     _extract_tool_config,
     _parse_docstring,
-    _python_type_to_json_schema,
+    _TYPE_MAP,
     register_function_tool,
 )
-
-
-# ---------------------------------------------------------------------------
-# _python_type_to_json_schema
-# ---------------------------------------------------------------------------
-
-class TestTypeMapping:
-    def test_str(self):
-        assert _python_type_to_json_schema(str) == "string"
-
-    def test_int(self):
-        assert _python_type_to_json_schema(int) == "integer"
-
-    def test_float(self):
-        assert _python_type_to_json_schema(float) == "number"
-
-    def test_bool(self):
-        assert _python_type_to_json_schema(bool) == "boolean"
-
-    def test_list(self):
-        assert _python_type_to_json_schema(list) == "array"
-
-    def test_dict(self):
-        assert _python_type_to_json_schema(dict) == "object"
-
-    def test_unknown_falls_back_to_string(self):
-        assert _python_type_to_json_schema(bytes) == "string"
 
 
 # ---------------------------------------------------------------------------
@@ -259,7 +232,7 @@ import types as _types
 from hypothesis import given, settings, assume
 import hypothesis.strategies as st
 
-from runtime.tools import _extract_tool_config, _python_type_to_json_schema
+from runtime.tools import _extract_tool_config, _TYPE_MAP
 
 # Feature: agent-service, Property 7: 函数工具 Schema 自动生成
 
@@ -388,7 +361,7 @@ class TestProperty7FunctionToolSchemaGeneration:
         cfg = _extract_tool_config(fn)
 
         for name, typ, _ in param_specs:
-            expected_json_type = _python_type_to_json_schema(typ)
+            expected_json_type = _TYPE_MAP.get(typ, "string")
             actual_json_type = cfg.parameters["properties"][name]["type"]
             assert actual_json_type == expected_json_type, (
                 f"Param '{name}': expected '{expected_json_type}', got '{actual_json_type}'"

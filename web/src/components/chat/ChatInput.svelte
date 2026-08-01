@@ -97,7 +97,8 @@
       }
       out += serializeNode(child)
     }
-    return out.replace(/\n$/g, '')
+    // Normalize line endings (CRLF / CR → LF), then strip trailing newline
+    return out.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\n$/g, '')
   }
 
   function placeCaretAtEnd() {
@@ -243,7 +244,7 @@
 
   function handlePaste(e) {
     e.preventDefault()
-    const pasted = e.clipboardData?.getData('text/plain') ?? ''
+    const pasted = (e.clipboardData?.getData('text/plain') ?? '').replace(/\r\n/g, '\n').replace(/\r/g, '\n')
     document.execCommand('insertText', false, pasted)
     syncTextFromEditor()
   }

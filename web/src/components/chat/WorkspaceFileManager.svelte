@@ -744,7 +744,12 @@
   // filePath: 当前预览文件的绝对路径，用于解析 markdown 中相对路径的图片/资源
   function renderPreviewHtml(content, filename, forcePlainText = false, filePath = '') {
     if (!content) return ''
+    // Normalize line endings: CRLF / CR → LF, so \r does not leak into <pre> as extra line breaks
+    content = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+
     const renderCodeWithLines = (rawLines) => {
+      // Drop trailing empty string caused by final newline (keeps gutter line-count accurate)
+      if (rawLines.length && rawLines[rawLines.length - 1] === '') rawLines.pop()
       const lineCount = rawLines.length
       const digits = Math.max(String(lineCount).length, 3)
       const gutter = rawLines.map((_, i) => `<span>${i + 1}</span>`).join('')

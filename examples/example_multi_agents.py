@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-使用示例：多 Agent 协作 —— PlanAgent 委派任务给 MainAgent
+使用示例：多 Agent 协作 — PlanAgent 委派任务给 MainAgent
 
 演示：
-  1. 注册 small/medium/large 三个模型（以 NVIDIA NIM OpenAI 兼容接口为例）
-  2. 注册 chrome-devtools-mcp 工具
+  1. 注册 general/complex 两个模型（使用 Ollama qwen3.5:9b）
+  2. 注册 chrome-devtools-mcp 工具（无头 Chrome）
   3. 注册系统提示词模板（PlanAgentSystemPrompt）
   4. 注册用户消息模板（read_model_intro_on_modelscope）
   5. 发送 /v1/infer 请求，使用 prompt_template 方式指定系统提示词和用户消息
@@ -14,27 +14,9 @@
   python examples/example_multi_agents.py
 
 前置条件：
-  1. 模型注册 —— 需要注册 ID 为 small、medium、large 的三个模型。
-     示例使用小米 MiMo 开放平台 (https://platform.xiaomimimo.com) 提供的 OpenAI 兼容接口：
-       - small:   mimo-v2.5
-       - medium:  mimo-v2.5
-       - large:   mimo-v2.5-pro
-     需要设置环境变量 MIMO_API_KEY（从 https://platform.xiaomimimo.com/ 获取）
-
-  2. MCP 工具注册 —— 需要注册 chrome-devtools-mcp 工具：
-     {
-       "mcpServers": {
-         "chrome-devtools": {
-           "command": "npx",
-           "args": ["-y", "chrome-devtools-mcp@latest", "--browser-url=http://127.0.0.1:9222"]
-         }
-       }
-     }
-     需要 Chrome/Chromium 以 --remote-debugging-port=9222 启动
-
-  3. 系统提示词注册 —— 需要将 PlanAgent 系统提示词按 ID 为 PlanAgentSystemPrompt 注册
-
-  4. 用户消息模板注册 —— 需要将内容按 ID 为 read_model_intro_on_modelscope 注册
+  1. Ollama 服务运行在 localhost:11434，已拉取 qwen3.5:9b
+  2. 已安装 npx（用于启动 chrome-devtools-mcp）
+  3. 不需要预先启动 Chrome（MCP 会自动启动无头 Chrome）
 """
 
 import sys
@@ -63,25 +45,23 @@ RESET = "\033[0m"
 BOLD = "\033[1m"
 
 # ============================================================
-# 小米 MiMo 开放平台 API 配置（OpenAI 兼容接口）
-# 获取 API Key：https://platform.xiaomimimo.com/
+# 模型配置 — 使用本地 Ollama qwen3.5:9b
 # ============================================================
-MIMO_API_BASE = "https://token-plan-cn.xiaomimimo.com/v1"
-MIMO_API_KEY = os.environ.get("MIMO_API_KEY", "")
+OLLAMA_BASE = "http://localhost:11434"
+OLLAMA_MODEL = "qwen3.5:9b"
 
-# 模型映射
+# 模型映射：general 和 complex 共用同一个模型（实际可按需要分配不同模型）
 MODEL_MAPPING = {
-    "small": "mimo-v2.5",
-    "medium": "mimo-v2.5",
-    "large": "mimo-v2.5-pro",
+    "general": OLLAMA_MODEL,
+    "complex": OLLAMA_MODEL,
 }
 
-# MCP 配置
+# MCP 配置 — 无头 Chrome（不指定 --browser-url）
 MCP_CONFIG = {
     "mcpServers": {
         "chrome-devtools": {
             "command": "npx",
-            "args": ["-y", "chrome-devtools-mcp@latest", "--browser-url=http://127.0.0.1:9222"],
+            "args": ["-y", "chrome-devtools-mcp@latest"],
         }
     }
 }
@@ -95,7 +75,7 @@ PLAN_AGENT_SYSTEM_PROMPT = """你是 PlanAgent，一个负责规划与协调的 
 
 2. **选择工具** — 从可用工具中，判断哪些与本次任务相关。你将通过 `tools` 把这个工具集传给 MainAgent。
 
-3. **评估复杂度** — 在委派之前，判断任务是否简单到可以由 MainAgent 端到端完成，还是复杂到需要 MainAgent 进一步拆解、将子任务委派给专用 SubAgent。
+3. **评估复杂度** — 在委派之前，判断任务是简单到可以由 MainAgent 端到端完成，还是复杂到需要 MainAgent 进一步拆解、将子任务委派给专用 SubAgent。
 
 4. **委派给 MainAgent** — 调用一次 `delegate`，在 `task` 中写清楚结构化的执行指令，在 `context` 中给 MainAgent 提供完成任务所需的全部背景信息。
 
@@ -107,17 +87,17 @@ PLAN_AGENT_SYSTEM_PROMPT = """你是 PlanAgent，一个负责规划与协调的 
 
 - 明确陈述目标，而不是直接转述用户的原话。
 - 包含相关约束（格式、范围、质量标准等）。
-- 如果任务有自然的子部分，逐一点名，让 MainAgent 能够推理是否需要拆解。
+- 如果任务有自然的部分，逐一具名，让 MainAgent 能够推理是否需要拆解。
 - 不要写实现细节——MainAgent 自己决定怎么执行。
 
 ## 如何为 MainAgent 编写 `context`
 
 `context` 字段会成为 MainAgent 的系统提示词。用它来：
 
-- 定义 MainAgent 在本次任务中的角色（例如："你是一名正在处理 Python 代码库的高级软件工程师"）。
-- 说明分解策略：MainAgent 应该自己处理哪些事情，哪些情况下应该委派给 SubAgent。
-- 提供在整个任务过程中保持稳定的背景知识（项目规范、领域事实、约束条件）。
-- 如果本次任务前已有部分完成的前序步骤，需要交代清楚当前的工作状态及进度情况。如果是继续前一次 SubAgent 会话，传入占位符 `[continue]` 将在之前的 SubAgent 会话上继续进行。
+- 定义 MainAgent 在本次任务中的角色
+- 说明分解策略
+- 提供在整个任务过程中保持稳定的背景知识
+- 如果本次任务前已有部分完成的前序步骤，需要交代清楚当前的工作状态及进度情况
 
 `context` 要保持聚焦，不要重复 `task` 中已有的信息。
 
@@ -126,19 +106,15 @@ PLAN_AGENT_SYSTEM_PROMPT = """你是 PlanAgent，一个负责规划与协调的 
 在编写 MainAgent/SubAgent 的 `context` 时，加入关于何时委派的指导。以下是模板，根据具体任务调整：
 
 > 当某个子部分满足以下一个或多个条件时，对其进行拆解委派：
-> - 它需要与其他部分不同的能力或模型（例如视觉理解、代码执行、网络检索）。
+> - 它需要与其他部分不同的能力或模型
 > - 它耗时较长，且其结果是后续步骤的输入。
 > - 它可以被描述为一个有明确输出的独立工作单元。
 >
-> 委派时，为 SubAgent 写精确的 `task`，只传递它需要的工具。不要委派琐碎的步骤。
->
-> 委派时，最大程度遵循信息不丢失原则，能提供文件绝对路径地址的，就不要自行摘要。同时携带 `write_file` 或 `exec_shell` 工具供 SubAgent 操作。
-
-根据任务复杂度调整阈值：对于简单的两步任务，告知 MainAgent 直接处理；对于多阶段、异构步骤的任务，鼓励拆解。
+> 委派时，为 SubAgent 写精确的 `task`，只传递它需要的工具。
 
 ## 可用工具目录
 
-以下是系统中已注册、可供 MainAgent 和 SubAgent 使用的工具。在调用 `delegate` 时，从中选择与任务相关的工具名称填入 `tools`（逗号分隔）。
+以下是系统中已注册、可供 MainAgent 和 SubAgent 使用的工具。
 
 {{TOOLS}}
 
@@ -152,24 +128,23 @@ PLAN_AGENT_SYSTEM_PROMPT = """你是 PlanAgent，一个负责规划与协调的 
 
 ## 可用模型目录
 
-以下是系统中已注册、可供 MainAgent 和 SubAgent 调用的模型列表。在制定执行计划时，请根据任务的复杂度和性质，合理选择最适合的模型，以平衡执行效率与输出质量。
+以下是系统中已注册、可供 MainAgent 和 SubAgent 调用的模型列表。在制訂执行计划时，请根据任务的复杂度和性质，合理选择最适合的模型。
 
-| model_id | 适用场景                                                                 |
-|----------|--------------------------------------------------------------------------|
-| `small`  | 适用于目标明确、逻辑简单的任务，响应速度快，优先考虑执行效率。           |
-| `medium` | 适用于需要较强理解能力与指令跟随能力的任务，可处理中等复杂度的工具调用。 |
-| `large`  | 适用于需要深度推理与多步骤思考的复杂任务，优先保证输出质量与准确性。     |
+| model_id  | 适用场景                                                                 |
+|-----------|--------------------------------------------------------------------------|
+| `general` | 适用于目标明确、逻辑简单的任务，响应速度快，优先考虑执行效率。           |
+| `complex` | 适用于需要深度推理与多步骤思考的复杂任务，优先保证输出质量与准确性。     |
 
 ## 模型选择
 
-优先使用 `small` 处理简单子任务以提升整体效率；当任务涉及复杂逻辑、多轮工具调用或需要高质量输出时，升级至 `medium` 或 `large`。
+优先使用 `general` 处理简单子任务以提升整体效率；当任务涉及复杂逻辑、多轮工具调用或需要高质量输出时，升级至 `complex`。
 
-**注意:** 当把 `delegate` 工具提供给 MainAgent 或由 MainAgent 提供给 SubAgent，都务必在 `context` 中说明可供选择的 `model_id` 。
+**注意:** 当把 `delegate` 工具提供给 MainAgent 或由 MainAgent 提供给 SubAgent，都务必在 `context` 中说明可供选择的 `model_id`。
 
 ## 你不能做的事
 
 - 不要自己调用 `write_file`、`exec_shell` 或任何其他执行类工具。你负责规划，MainAgent 负责执行。
-- 原则上不要多次调用 delegate。但如果第一次委派的结果明显有误，需要修正指令后重试；或工作没有完成，或没有得到完成结果的清晰答案，有必要再次委派以获得关于结果的明确说明。
+- 原则上不要多次调用 delegate。但如果第一次委派的结果明显有误，需要修正指令后重试。
 - 不要过度拆解。如果 MainAgent 能合理地完成整个任务，就让它完成。
 - 不要使用相对路径。涉及文件的操作，使用绝对路径才是安全的。
 
@@ -208,30 +183,23 @@ def print_result(result):
 
 
 def main():
-    # 检查 API Key
-    if not MIMO_API_KEY:
-        print("错误: 请设置环境变量 MIMO_API_KEY")
-        print("从 https://platform.xiaomimimo.com/ 获取 API Key")
-        sys.exit(1)
-
-    # 1. 注册模型 —— small, medium, large
+    # 1. 注册模型 — general, complex（均使用本地 Ollama qwen3.5:9b）
     model_registry = ModelRegistry()
     for model_id, model_name in MODEL_MAPPING.items():
         model_registry.register(ModelConfig(
             model_id=model_id,
-            api_base=MIMO_API_BASE,
+            api_base=OLLAMA_BASE,
             model_name=model_name,
-            api_key=MIMO_API_KEY,
-            api_protocol="openai",
+            api_protocol="ollama",
             generate_params={"temperature": 0.7},
         ))
     print(f">>> 已注册模型: {list(MODEL_MAPPING.keys())}")
 
-    # 2. 注册 MCP 工具 —— chrome-devtools
+    # 2. 注册 MCP 工具 — chrome-devtools（无头 Chrome）
     tool_registry = ToolRegistry()
     mcp = MCPClientManager()
 
-    print(">>> 正在连接 chrome-devtools MCP Server...")
+    print(">>> 正在连接 chrome-devtools MCP Server（无头 Chrome）...")
     mcp.load_config(MCP_CONFIG)
 
     # 连接并发现工具
@@ -247,7 +215,7 @@ def main():
         print(f"    {t.tool_id}  ({t.mcp_server_name})")
     print(f">>> 共 {len(mcp_tools)} 个 MCP 工具就绪")
 
-    # 3. 注册系统提示词模板 —— PlanAgentSystemPrompt
+    # 3. 注册系统提示词模板 — PlanAgentSystemPrompt
     prompt_template_manager = PromptTemplateManager()
     prompt_template_manager.create(
         template_id="PlanAgentSystemPrompt",
@@ -255,7 +223,7 @@ def main():
     )
     print(">>> 已注册系统提示词: PlanAgentSystemPrompt")
 
-    # 4. 注册用户消息模板 —— read_model_intro_on_modelscope
+    # 4. 注册用户消息模板 — read_model_intro_on_modelscope
     prompt_template_manager.create(
         template_id="read_model_intro_on_modelscope",
         content=READ_MODEL_INTRO_TEMPLATE,
@@ -279,16 +247,11 @@ def main():
     from runtime.builtin_tools import _thread_local
     _thread_local.tool_scope = list(tool_registry._tools.values())
 
-    # 6. 发送 /v1/infer 请求
-    #    - 使用 PlanAgentSystemPrompt 系统提示词（prompt_template 方式）
-    #    - 使用 medium 模型
-    #    - 工具集: delegate, write_file, exec_shell, 以及 chrome-devtools-mcp 的全部工具
-    #    - 用户消息: 模板 read_model_intro_on_modelscope，参数 MODEL="deepseek v4"
-
+    # 6. 发送推理请求
     print("\n" + "=" * 60)
     print("发送推理请求")
     print("=" * 60)
-    print(f"模型: medium")
+    print(f"模型: general")
     print(f"系统提示词: PlanAgentSystemPrompt (prompt_template)")
     print(f"用户消息模板: read_model_intro_on_modelscope")
     print(f"模板参数: MODEL=\"deepseek v4\"")
@@ -298,8 +261,7 @@ def main():
     # 构建工具 ID 列表：delegate + write_file + exec_shell + 所有 MCP 工具
     tool_ids = ["delegate", "write_file", "exec_shell"] + mcp_tool_ids
 
-    # 生成 TOOLS 占位符的值，同时从 PlanAgent 中去掉非 delegate 工具
-    # （否则 PlanAgent 可能自己会去执行，但这是 MainAgent 的职责）
+    # 生成 TOOLS 占位符的值
     mcp_by_server: dict[str, list[str]] = {}
     non_mcp_rows: list[tuple[str, str]] = []
 
@@ -332,7 +294,7 @@ def main():
     tool_ids = ["delegate"]
 
     result = runtime.infer(InferenceRequest(
-        model_id="medium",
+        model_id="general",
         tool_ids=tool_ids,
         messages=[
             # 系统提示词使用 prompt_template 方式

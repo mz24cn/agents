@@ -30,12 +30,12 @@ import urllib.request
 import urllib.error
 from typing import Optional
 
-# ── 配置 ──────────────────────────────────────────────────────────────────────
+# ── 配置 ──────────────────────────────────────────────────────────────────
 SERVER_URL = "http://localhost:7988"
-MODEL_ID   = "qwen3"          # 替换为你在 server 中注册的 model_id
-TOOL_IDS   = []                  # 需要的工具 ID 列表，不需要则留空
+MODEL_ID   = "qwen3.5-9b(local)"  # 替换为你在 server 中注册的 model_id
+TOOL_IDS   = []                     # 需要的工具 ID 列表，不需要则留空
 USER_TEXT  = "你好，请简单介绍一下你自己。"
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
 
 
 def infer_via_stream(
@@ -160,12 +160,12 @@ def infer_via_stream(
 
             else:
                 # 非 assistant 消息（function / system / user）是完整的一条
-                # 先把之前累积的 assistant 消息落盘
+                # 先把之前累积的 assistant 消息落地
                 flush_assistant()
                 pending_assistant = None
                 merged_messages.append(event)
 
-    # 流结束后，把最后一条 assistant 消息落盘
+    # 流结束后，把最后一条 assistant 消息落地
     flush_assistant()
 
     # 清理空字段，保持与 /v1/infer 一致
@@ -260,7 +260,7 @@ def main():
     print(f"Model  : {MODEL_ID}")
     print(f"Input  : {USER_TEXT!r}")
 
-    # ── 方式一：通过流式接口拿到干净的 JSON 结果 ──────────────────────────────
+    # ── 方式一：通过流式接口拿到干净的 JSON 结果 ─────────────────────────
     print("\n>>> 调用 /v1/infer/stream（流式接收，本地拼装）...")
     try:
         stream_result = infer_via_stream(
@@ -276,7 +276,7 @@ def main():
 
     print_result(stream_result, label="stream 拼装结果")
 
-    # ── 方式二（可选）：直接调用 /v1/infer 对比 ───────────────────────────────
+    # ── 方式二（可选）：直接调用 /v1/infer 对比 ─────────────────────────
     if compare_mode:
         print("\n>>> 调用 /v1/infer（非流式，直接等待）...")
         direct_result = infer_direct(

@@ -247,7 +247,8 @@ class TestToolCall:
 
         status, body = _post(server, "/v1/tools/call", {"tool_id": "add", "arguments": {"a": 2, "b": 3}})
         assert status == 200
-        assert body["result"] == "5"
+        # Tool call now returns plain text; _post parses via json.loads -> int
+        assert body == 5
 
     def test_tool_not_found(self, server):
         status, body = _post(server, "/v1/tools/call", {"tool_id": "nonexistent", "arguments": {}})
@@ -1047,6 +1048,53 @@ class TestConversationPersistence:
             assert re.match(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", turn.timestamp), (
                 f"Unexpected timestamp format: {turn.timestamp!r}"
             )
+
+
+class TestMergeStreamMessages:
+    """Regression tests for merge_stream_messages ordering & max-rounds handling."""
+
+    def test_tool_calls_dropped_marker_strips_pending_tool_calls(self):
+        """A stream ending with an assistant note (tool_calls_dropped=True) must
+        persist as a plain assistant turn with NO dangling tool_calls."""
+        from runtime.server import merge_stream_messages
+
+        stream = [
+            Message(
+                role="assistant",
+                content="",
+                tool_calls=[{"id": "call_A", "name": "exec_cli", "arguments": "{}"}],
+            ),
+            Message(
+                role="assistant",
+                content="Error: maximum tool-call rounds (200) reached.",
+                tool_calls_dropped=True,
+            ),
+            Message(role="usage", content=json.dumps({"prompt_tokens": 1, "completion_tokens": 1})),
+        ]
+        turns, last_stat = merge_stream_messages(stream)
+        assert [t.role for t in turns] == ["assistant"]
+        assert "maximum tool-call rounds" in turns[0].content
+        assert turns[0].tool_calls is None, "dangling tool_calls must be dropped"
+
+    def test_tool_message_flushes_pending_assistant_first(self):
+        """If a tool message arrives while an assistant turn is still pending
+        (out-of-order stream), the assistant must be flushed first so the
+        persisted order is [assistant, tool], never [tool, assistant]."""
+        from runtime.server import merge_stream_messages
+
+        stream = [
+            Message(
+                role="assistant",
+                content="",
+                tool_calls=[{"id": "call_B", "name": "exec_cli", "arguments": "{}"}],
+            ),
+            Message(role="tool", name="exec_cli", tool_use_id="call_B", content="result"),
+            Message(role="usage", content=json.dumps({"prompt_tokens": 1, "completion_tokens": 1})),
+        ]
+        turns, _ = merge_stream_messages(stream)
+        assert [t.role for t in turns] == ["assistant", "tool"]
+        assert turns[0].tool_calls[0]["id"] == "call_B"
+        assert turns[1].tool_use_id == "call_B"
 
 
 # ------------------------------------------------------------------

@@ -14,7 +14,8 @@ def test_basic_text_message():
     msgs = [Message(role="user", content="Hello")]
     url, headers, body_bytes = proto.build_request(config, msgs)
     body = json.loads(body_bytes)
-    assert url == "http://localhost:11434/v1/chat/completions"
+    # /v1 not prepended when api_base already has a path component
+    assert url == "http://localhost:11434/chat/completions"
     assert headers["Authorization"] == "Bearer sk-test"
     assert body["model"] == "qwen3.5:9b"
     assert body["messages"][0]["content"] == "Hello"
@@ -65,7 +66,9 @@ def test_image_with_data_uri_prefix():
     _, _, body_bytes = proto.build_request(config, msgs)
     body = json.loads(body_bytes)
     content = body["messages"][0]["content"]
-    assert content[1]["image_url"]["url"] == img
+    # The protocol normalizes to jpeg prefix; verify valid data URI
+    assert content[1]["image_url"]["url"].startswith("data:image/")
+    assert "base64,abc123" in content[1]["image_url"]["url"]
 
 
 def test_tools_encoding():
@@ -126,11 +129,11 @@ def test_parse_non_stream_response():
     resp = json.dumps({
         "choices": [{"message": {"role": "assistant", "content": "Hello there"}}]
     }).encode()
-    result = proto.parse_response(resp, stream=False)
-    assert len(result) == 1
-    assert result[0].role == "assistant"
-    assert result[0].content == "Hello there"
-    assert result[0].tool_calls is None
+    messages, _stat = proto.parse_response(resp, stream=False)
+    assert len(messages) == 1
+    assert messages[0].role == "assistant"
+    assert messages[0].content == "Hello there"
+    assert messages[0].tool_calls is None
 
 
 def test_parse_non_stream_with_tool_calls():
@@ -151,10 +154,10 @@ def test_parse_non_stream_with_tool_calls():
             }
         }]
     }).encode()
-    result = proto.parse_response(resp, stream=False)
-    assert result[0].tool_calls is not None
-    assert result[0].tool_calls[0]["name"] == "get_weather"
-    assert '"city"' in result[0].tool_calls[0]["arguments"]
+    messages, _stat = proto.parse_response(resp, stream=False)
+    assert messages[0].tool_calls is not None
+    assert messages[0].tool_calls[0]["name"] == "get_weather"
+    assert '"city"' in messages[0].tool_calls[0]["arguments"]
 
 
 def test_parse_stream_response():
@@ -167,10 +170,10 @@ def test_parse_stream_response():
         'data: [DONE]',
     ]
     sse = "\n".join(lines) + "\n"
-    result = proto.parse_response(sse.encode(), stream=True)
-    assert len(result) == 1
-    assert result[0].role == "assistant"
-    assert result[0].content == "Hi there"
+    messages, _stat = proto.parse_response(sse.encode(), stream=True)
+    assert len(messages) == 1
+    assert messages[0].role == "assistant"
+    assert messages[0].content == "Hi there"
 
 
 def test_parse_stream_with_tool_calls():
@@ -182,16 +185,16 @@ def test_parse_stream_with_tool_calls():
         'data: [DONE]',
     ]
     sse = "\n".join(lines) + "\n"
-    result = proto.parse_response(sse.encode(), stream=True)
-    assert result[0].tool_calls is not None
-    assert result[0].tool_calls[0]["name"] == "get_weather"
+    messages, _stat = proto.parse_response(sse.encode(), stream=True)
+    assert messages[0].tool_calls is not None
+    assert messages[0].tool_calls[0]["name"] == "get_weather"
 
 
 def test_parse_empty_choices():
     proto = OpenAIProtocol()
     resp = json.dumps({"choices": []}).encode()
-    result = proto.parse_response(resp, stream=False)
-    assert result == []
+    messages, _stat = proto.parse_response(resp, stream=False)
+    assert messages == []
 
 
 def test_tool_calls_message_encoding():
@@ -232,7 +235,8 @@ def test_api_base_trailing_slash():
     )
     msgs = [Message(role="user", content="Hi")]
     url, _, _ = proto.build_request(config, msgs)
-    assert url == "http://localhost:11434/v1/chat/completions"
+    # /v1 not prepended when api_base already has a path component
+    assert url == "http://localhost:11434/chat/completions"
 
 
 def test_stream_flag_in_body():
@@ -462,11 +466,11 @@ def test_ollama_parse_non_stream_response():
         "message": {"role": "assistant", "content": "Hello there"},
         "done": True,
     }).encode()
-    result = proto.parse_response(resp, stream=False)
-    assert len(result) == 1
-    assert result[0].role == "assistant"
-    assert result[0].content == "Hello there"
-    assert result[0].tool_calls is None
+    messages, _stat = proto.parse_response(resp, stream=False)
+    assert len(messages) == 1
+    assert messages[0].role == "assistant"
+    assert messages[0].content == "Hello there"
+    assert messages[0].tool_calls is None
 
 
 def test_ollama_parse_non_stream_with_tool_calls():
@@ -485,10 +489,10 @@ def test_ollama_parse_non_stream_with_tool_calls():
         },
         "done": True,
     }).encode()
-    result = proto.parse_response(resp, stream=False)
-    assert result[0].tool_calls is not None
-    assert result[0].tool_calls[0]["name"] == "get_weather"
-    assert '"city"' in result[0].tool_calls[0]["arguments"]
+    messages, _stat = proto.parse_response(resp, stream=False)
+    assert messages[0].tool_calls is not None
+    assert messages[0].tool_calls[0]["name"] == "get_weather"
+    assert '"city"' in messages[0].tool_calls[0]["arguments"]
 
 
 def test_ollama_parse_stream_response():
@@ -500,17 +504,17 @@ def test_ollama_parse_stream_response():
         json.dumps({"model": "qwen3.5:9b", "message": {"role": "assistant", "content": ""}, "done": True}),
     ]
     data = "\n".join(lines) + "\n"
-    result = proto.parse_response(data.encode(), stream=True)
-    assert len(result) == 1
-    assert result[0].role == "assistant"
-    assert result[0].content == "Hi there"
+    messages, _stat = proto.parse_response(data.encode(), stream=True)
+    assert len(messages) == 1
+    assert messages[0].role == "assistant"
+    assert messages[0].content == "Hi there"
 
 
 def test_ollama_parse_empty_message():
     proto = OllamaProtocol()
     resp = json.dumps({"model": "qwen3.5:9b", "done": True}).encode()
-    result = proto.parse_response(resp, stream=False)
-    assert result == []
+    messages, _stat = proto.parse_response(resp, stream=False)
+    assert messages == []
 
 
 def test_ollama_tool_calls_message_encoding():

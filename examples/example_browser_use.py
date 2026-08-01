@@ -7,7 +7,7 @@
   无参数    作为客户端，调用 Server 的 /v1/infer/stream 和 /v1/tools/call
 
 演示流程：
-  1. Server 端连接 chrome-devtools-mcp，注册浏览器控制工具
+  1. Server 端连接 chrome-devtools-mcp（无头 Chrome），注册浏览器控制工具
   2. Client 调用 /v1/tools/call 直接打开百度首页（确定性操作）
   3. Client 调用 /v1/infer/stream，让大模型查看网页内容并关闭页面
 
@@ -19,9 +19,9 @@
   python examples/example_browser_use.py
 
 前置条件：
-  - Ollama 服务运行在 localhost:11434，已拉取 qwen3:14b
-  - Chrome/Chromium 以 --remote-debugging-port=9222 启动
+  - Ollama 服务运行在 localhost:11434，已拉取 qwen3.5:9b
   - 已安装 npx（用于启动 chrome-devtools-mcp）
+  - 不需要预先启动 Chrome（MCP 会自动启动无头 Chrome）
 """
 
 import sys
@@ -53,12 +53,12 @@ def run_server():
     )
     from runtime.mcp_client import MCPClientManager
 
+    # 不指定 --browser-url，chrome-devtools-mcp 会自动启动无头 Chrome
     MCP_CONFIG = {
         "mcpServers": {
             "chrome-devtools": {
                 "command": "npx",
-                "args": ["-y", "chrome-devtools-mcp@latest",
-                         "--browser-url=http://localhost:9222"],
+                "args": ["-y", "chrome-devtools-mcp@latest"],
             }
         }
     }
@@ -66,9 +66,9 @@ def run_server():
     # 1. 注册模型
     model_registry = ModelRegistry()
     model_registry.register(ModelConfig(
-        model_id="qwen3",
+        model_id="qwen3.5-9b",
         api_base="http://localhost:11434",
-        model_name="qwen3:14b",
+        model_name="qwen3.5:9b",
         api_protocol="ollama",
         generate_params={"temperature": 0.7},
     ))
@@ -77,7 +77,7 @@ def run_server():
     tool_registry = ToolRegistry()
     mcp = MCPClientManager()
 
-    print(">>> 正在连接 chrome-devtools MCP Server...")
+    print(">>> 正在连接 chrome-devtools MCP Server（无头 Chrome）...")
     mcp.load_config(MCP_CONFIG)
 
     # load_config 只注册配置，需要显式调用 get_tools 来连接并发现工具
@@ -125,6 +125,18 @@ def api_post_json(path, body):
         return json.loads(resp.read().decode("utf-8"))
 
 
+def api_post_text(path, body):
+    """向 Server 发送 JSON POST 请求，返回原始文本响应（如 /v1/tools/call 返回 text/plain）。"""
+    url = f"http://{SERVER_HOST}:{SERVER_PORT}{path}"
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+
 def api_stream(path, body):
     """向 Server 发送 SSE 流式请求，逐行 yield 解析后的 dict。"""
     url = f"http://{SERVER_HOST}:{SERVER_PORT}{path}"
@@ -155,11 +167,6 @@ def run_client():
 
     # 0. 检查 Server 是否可达
     try:
-        tools_resp = api_post_json("/v1/tools", {})  # GET via POST won't work
-    except Exception:
-        pass
-    # 用 GET 获取工具列表
-    try:
         url = f"http://{SERVER_HOST}:{SERVER_PORT}/v1/tools"
         with urllib.request.urlopen(url) as resp:
             tools_data = json.loads(resp.read().decode("utf-8"))
@@ -184,11 +191,11 @@ def run_client():
         print(f"{DIM}未找到 new_page 工具，尝试默认 ID: {new_page_tool_id}{RESET}")
 
     try:
-        open_result = api_post_json("/v1/tools/call", {
+        open_result = api_post_text("/v1/tools/call", {
             "tool_id": new_page_tool_id,
             "arguments": {"url": "https://www.baidu.com"},
         })
-        print(f"{CYAN}结果: {json.dumps(open_result, ensure_ascii=False, indent=2)}{RESET}")
+        print(f"{CYAN}结果: {open_result}{RESET}")
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
         print(f"{RED}打开页面失败: {e.code} {body}{RESET}")
@@ -206,7 +213,7 @@ def run_client():
     in_content = False
 
     for event in api_stream("/v1/infer/stream", {
-        "model_id": "qwen3",
+        "model_id": "qwen3.5-9b",
         "tool_ids": tool_ids,
         "messages": [
             {"role": "system", "content": (

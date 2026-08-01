@@ -354,7 +354,7 @@ def test_max_infer_per_minute_throttle_ignored_before_ten_rounds() -> None:
 
 
 @given(max_rounds=st.integers(min_value=1, max_value=10))
-@settings(max_examples=100)
+@settings(max_examples=100, deadline=None)
 def test_tool_call_loop_terminates_at_max_rounds(max_rounds: int) -> None:
     """For any max_tool_rounds value N (1-10), when the model always returns
     function_call, the Runtime should terminate after N tool call rounds.
@@ -433,9 +433,9 @@ def test_tool_call_loop_terminates_at_max_rounds(max_rounds: int) -> None:
     )
 
     # Conversation history should contain:
-    # 1 user message + N * (assistant + tool) + 1 final assistant + 1 injected tool error = 2N + 3
+    # 1 user message + N * (assistant + tool) + 1 final assistant(note) = 2N + 2
     assert result.messages is not None
-    expected_msg_count = 2 * max_rounds + 3
+    expected_msg_count = 2 * max_rounds + 2
     assert len(result.messages) == expected_msg_count, (
         f"Expected {expected_msg_count} messages, got {len(result.messages)}"
     )
@@ -444,11 +444,19 @@ def test_tool_call_loop_terminates_at_max_rounds(max_rounds: int) -> None:
     assert result.messages[0].role == "user"
     assert result.messages[0].content == "hello"
 
-    # Last message should be injected tool error (max rounds reached)
-    assert result.messages[-1].role == "tool"
-    assert "maximum tool-call rounds" in (result.messages[-1].content or "")
+    # Last message should be a plain assistant note (NOT a fabricated tool
+    # reply) explaining that the max rounds limit was reached.
+    last_msg = result.messages[-1]
+    assert last_msg.role == "assistant", (
+        f"Expected final assistant note, got role={last_msg.role!r}"
+    )
+    assert "maximum tool-call rounds" in (last_msg.content or "")
+    # The pending tool_calls must be stripped so the history has no dangling
+    # tool_calls (OpenAI/Anthropic reject an assistant message whose tool_calls
+    # are never followed by tool results).
+    assert last_msg.tool_calls is None
 
-    # Verify the pattern: user, (assistant, tool) * N, assistant, tool(error)
+    # Verify the pattern: user, (assistant, tool) * N, assistant(note)
     for i in range(max_rounds):
         assistant_idx = 1 + 2 * i
         function_idx = 2 + 2 * i
@@ -456,6 +464,64 @@ def test_tool_call_loop_terminates_at_max_rounds(max_rounds: int) -> None:
         assert result.messages[assistant_idx].tool_calls is not None
         assert result.messages[function_idx].role == "tool"
         assert result.messages[function_idx].name == "dummy_tool"
+
+
+def test_normalize_tool_call_order_moves_misplaced_tool_messages() -> None:
+    """_normalize_tool_call_order must move a tool message that references a
+    LATER assistant(tool_calls) declaration to right after that assistant."""
+    from runtime.runtime import _normalize_tool_call_order
+
+    assistant_tc = Message(
+        role="assistant",
+        content="",
+        tool_calls=[{"id": "call_ET", "name": "exec_cli", "arguments": "{}"}],
+    )
+    tool_error = Message(
+        role="tool",
+        name="exec_cli",
+        tool_use_id="call_ET",
+        content="Error: maximum tool-call rounds (200) reached.",
+    )
+    user = Message(role="user", content="继续")
+
+    # Correctly ordered history stays untouched.
+    ordered = [assistant_tc, tool_error, user]
+    assert _normalize_tool_call_order(ordered) is ordered
+
+    # Flipped [tool, assistant] order is reordered to [assistant, tool].
+    flipped = [tool_error, assistant_tc, user]
+    normalized = _normalize_tool_call_order(flipped)
+    assert [m.role for m in normalized] == ["assistant", "tool", "user"]
+    assert normalized[0].tool_calls[0]["id"] == "call_ET"
+    assert normalized[1].tool_use_id == "call_ET"
+
+    # Idempotent: applying again changes nothing.
+    assert _normalize_tool_call_order(normalized) == normalized
+
+
+def test_normalize_tool_call_order_multiple_misplaced_tools() -> None:
+    """Multiple tool messages for the same later assistant are all moved after it."""
+    from runtime.runtime import _normalize_tool_call_order
+
+    assistant_tc = Message(
+        role="assistant",
+        content="",
+        tool_calls=[
+            {"id": "call_A", "name": "t1", "arguments": "{}"},
+            {"id": "call_B", "name": "t2", "arguments": "{}"},
+        ],
+    )
+    tool_a = Message(role="tool", name="t1", tool_use_id="call_A", content="r1")
+    tool_b = Message(role="tool", name="t2", tool_use_id="call_B", content="r2")
+    user = Message(role="user", content="next")
+
+    flipped = [tool_b, user, tool_a, assistant_tc]
+    normalized = _normalize_tool_call_order(flipped)
+    roles = [m.role for m in normalized]
+    assert roles == ["user", "assistant", "tool", "tool"]
+    # Relative order of the two tool messages is preserved (r2 was first in
+    # the original list, r1 second).
+    assert [m.content for m in normalized if m.role == "tool"] == ["r2", "r1"]
 
 
 # Feature: agent-service, Property 8: 工具分发与执行

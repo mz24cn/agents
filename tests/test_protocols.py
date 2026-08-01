@@ -13,18 +13,19 @@ from runtime.protocols import OpenAIProtocol
 # --- Hypothesis strategies ---
 
 # Strategy for base64-like image data (non-empty strings without data: prefix)
-raw_base64_image_st = st.text(
+_raw_b64_body_st = st.text(
     alphabet=st.sampled_from("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="),
     min_size=4,
     max_size=100,
 )
+prefixed_image_st = _raw_b64_body_st.map(lambda s: f"data:image/jpeg;base64,{s}")
 
 # Strategy for a Message with non-empty images list
 message_with_images_st = st.builds(
     Message,
     role=st.just("user"),
     content=st.text(min_size=1, max_size=100),
-    images=st.lists(raw_base64_image_st, min_size=1, max_size=5),
+    images=st.lists(prefixed_image_st, min_size=1, max_size=5),
 )
 
 # Strategy for a list of messages where at least one has images
@@ -219,7 +220,7 @@ def test_openai_parse_response_produces_assistant_message(response_data: bytes) 
     """For any valid OpenAI-format response data, parse_response() should produce
     at least one Message with role='assistant' and content as a non-None string."""
     proto = OpenAIProtocol()
-    messages = proto.parse_response(response_data, stream=False)
+    messages, _stat = proto.parse_response(response_data, stream=False)
 
     # Should produce at least one message
     assert len(messages) >= 1, "parse_response should return at least one Message"
@@ -245,7 +246,7 @@ def test_ollama_parse_response_produces_assistant_message(response_data: bytes) 
     """For any valid Ollama-format response data, parse_response() should produce
     at least one Message with role='assistant' and content as a non-None string."""
     proto = OllamaProtocol()
-    messages = proto.parse_response(response_data, stream=False)
+    messages, _stat = proto.parse_response(response_data, stream=False)
 
     # Should produce at least one message
     assert len(messages) >= 1, "parse_response should return at least one Message"

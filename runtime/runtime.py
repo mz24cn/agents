@@ -81,6 +81,72 @@ from runtime.protocols import PROTOCOL_MAP
 from runtime.registry import ModelRegistry, ToolRegistry
 
 
+def _max_rounds_note(max_rounds: int, pending_calls: Optional[list] = None) -> str:
+    """Build the plain-text note appended when the max tool-call rounds is hit.
+
+    Replaces the old "fake tool reply" behaviour: the tools were never
+    executed, so fabricating a role='tool' result is semantically wrong and
+    can produce an invalid message sequence when the conversation is resumed
+    (tool result placed before its assistant(tool_calls) declaration).  A
+    plain assistant text note keeps the history protocol-valid while telling
+    the user exactly what happened.
+    """
+    names = ", ".join(
+        sorted({str(c.get("name", "unknown_tool")) for c in (pending_calls or [])})
+    ) or "unknown_tool"
+    return (
+        f"Error: maximum tool-call rounds ({max_rounds}) reached. "
+        f"Tool call(s) were NOT executed: {names}."
+    )
+
+
+def _normalize_tool_call_order(messages: list) -> list:
+    """Reorder tool messages that precede their assistant(tool_calls) declaration.
+
+    OpenAI / Anthropic require every role='tool' (tool_result) message to
+    FOLLOW the assistant message that declared the matching tool_call id.
+    If a tool message references an id declared by a LATER assistant message
+    (e.g. after a max-tool-rounds recovery with legacy history), move the
+    tool message to immediately after that assistant message.
+
+    This is a defensive safety net on the request-serialization path; it is
+    idempotent and a no-op for correctly ordered history.
+    """
+    # Map tool_call_id -> index of the assistant message that declared it.
+    assistant_idx_by_call_id: dict[str, int] = {}
+    for i, m in enumerate(messages):
+        if m.role != "assistant" or not m.tool_calls:
+            continue
+        for tc in m.tool_calls:
+            cid = tc.get("id") or tc.get("tool_use_id")
+            if cid:
+                assistant_idx_by_call_id.setdefault(cid, i)
+
+    # Defer misplaced tool messages until their matching assistant is reached.
+    deferred: dict[int, list] = {}
+    result: list = []
+    moved = False
+    for i, m in enumerate(messages):
+        if m.role == "tool":
+            cid = getattr(m, "tool_use_id", None)
+            a_idx = assistant_idx_by_call_id.get(cid) if cid else None
+            if a_idx is not None and a_idx > i:
+                deferred.setdefault(a_idx, []).append(m)
+                moved = True
+                continue
+        result.append(m)
+        if m.role == "assistant":
+            pending = deferred.pop(i, None)
+            if pending:
+                result.extend(pending)
+    if not moved:
+        return messages
+    # Any leftover deferred tools (defensive) — append at the end.
+    for pending in deferred.values():
+        result.extend(pending)
+    return result
+
+
 class Runtime:
     """Core runtime engine that coordinates model inference and tool execution.
 
@@ -290,7 +356,8 @@ class Runtime:
             # next model API request, if MAX_INFER_PER_MINUTE is configured.
             self._maybe_throttle_inference_loop(overall_start, tool_round)
 
-            # Build HTTP request
+            # Build HTTP request (normalize any out-of-order tool messages first)
+            messages = _normalize_tool_call_order(messages)
             url, headers, body_bytes = protocol.build_request(
                 config=model_config,
                 messages=messages,
@@ -401,19 +468,16 @@ class Runtime:
             # Check max_tool_rounds (once per inference round, not per tool call)
             tool_round += 1
             if tool_round > request.max_tool_rounds:
-                # Exceeded max rounds — inject a function result for every pending
-                # tool call so the conversation history stays valid, then stop.
-                for fn_call in (tool_calls_to_execute or []):
-                    pending_name = fn_call.get("name", "unknown_tool")
-                    messages.append(Message(
-                        role="tool",
-                        name=pending_name,
-                        tool_use_id=fn_call.get("id") or fn_call.get("tool_use_id"),
-                        content=(
-                            f"Error: maximum tool-call rounds ({request.max_tool_rounds}) "
-                            f"reached. Tool '{pending_name}' was not executed."
-                        ),
-                    ))
+                # Exceeded max rounds — do NOT fabricate a role='tool' reply for
+                # tool calls that were never executed (semantically wrong, and it
+                # can yield an invalid [tool, assistant] sequence when the session
+                # is resumed).  Instead strip the pending tool_calls from the
+                # assistant message and append a plain-text note, so the history
+                # stays valid for OpenAI/Anthropic (no dangling tool_calls, no
+                # orphan tool result).
+                assistant_msg.tool_calls = None
+                note = _max_rounds_note(request.max_tool_rounds, tool_calls_to_execute)
+                assistant_msg.content = ((assistant_msg.content or "") + "\n\n" + note).strip()
                 break
 
             # Execute all tool calls sequentially in this round
@@ -1104,6 +1168,7 @@ class Runtime:
                 yield Message(role="assistant", timestamp=_now_iso(), content="Error: user interrupted.")
                 return
 
+            messages = _normalize_tool_call_order(messages)
             url, headers, body_bytes = protocol.build_request(
                 config=model_config, messages=messages,
                 tools=tools if tools else None, stream=True,
@@ -1309,21 +1374,24 @@ class Runtime:
             # Max rounds check
             tool_round += 1
             if tool_round > request.max_tool_rounds:
-                # Yield a function-role result for every pending tool call so the
-                # conversation history stays valid (assistant tool_calls must always
-                # be followed by a matching function/tool result).
-                for fn_call in (tool_calls_to_execute or []):
-                    pending_name = fn_call.get("name", "unknown_tool")
-                    yield Message(
-                        role="tool",
-                        timestamp=_now_iso(),
-                        name=pending_name,
-                        tool_use_id=fn_call.get("id") or fn_call.get("tool_use_id"),
-                        content=(
-                            f"Error: maximum tool-call rounds ({request.max_tool_rounds}) "
-                            f"reached. Tool '{pending_name}' was not executed."
-                        ),
-                    )
+                # Exceeded max rounds — do NOT fabricate role='tool' replies for
+                # tool calls that were never executed.  Fabricated tool results
+                # were previously yielded BEFORE the usage/stat message, which
+                # broke the "stat flushes the assistant turn first" invariant in
+                # merge_stream_messages and persisted [tool, assistant] in the
+                # wrong order.  Instead, strip the pending tool_calls from the
+                # local assistant message and yield a plain-text assistant note
+                # carrying the tool_calls_dropped marker so the persistence layer
+                # drops the already-streamed (unexecuted) tool_calls deltas.
+                assistant_msg.tool_calls = None
+                note = _max_rounds_note(request.max_tool_rounds, tool_calls_to_execute)
+                assistant_msg.content = ((assistant_msg.content or "") + "\n\n" + note).strip()
+                yield Message(
+                    role="assistant",
+                    timestamp=_now_iso(),
+                    content=note,
+                    tool_calls_dropped=True,
+                )
                 stat_dict = {
                     "prompt_tokens": round_prompt,
                     "completion_tokens": round_completion,

@@ -224,25 +224,52 @@ class TestConnectionState:
 # ------------------------------------------------------------------
 
 class TestSSEParsing:
-    def test_parse_sse_response_basic(self):
-        mgr = MCPClientManager()
-        sse_data = b'data: {"jsonrpc":"2.0","id":1,"result":{"tools":[]}}\n\n'
-        result = mgr._parse_sse_response(sse_data)
-        assert result["jsonrpc"] == "2.0"
-        assert result["result"]["tools"] == []
+    """Tests for _read_sse_stream(resp) — the SSE stream reader.
 
-    def test_parse_sse_response_skips_done(self):
-        mgr = MCPClientManager()
-        sse_data = b'data: [DONE]\ndata: {"jsonrpc":"2.0","id":1,"result":{}}\n'
-        result = mgr._parse_sse_response(sse_data)
-        assert result["jsonrpc"] == "2.0"
+    _read_sse_stream wraps an HTTP response in a TextIOWrapper and reads
+    ``data:`` lines, returning the first JSON-RPC response found (dict with
+    an ``id`` or ``error`` field).
+    """
 
-    def test_parse_sse_response_no_valid_data_raises(self):
-        mgr = MCPClientManager()
-        sse_data = b'event: ping\ndata: [DONE]\n\n'
-        with pytest.raises(RuntimeError, match="No valid JSON-RPC"):
-            mgr._parse_sse_response(sse_data)
+    @staticmethod
+    def _sse_response(*lines: str):
+        """Build a BytesIO simulating an HTTP response body with SSE data."""
+        import io
+        return io.BytesIO("\n".join(lines).encode("utf-8"))
 
+    def test_reads_first_jsonrpc_response(self):
+        """The first data: line with an 'id' is returned as a dict."""
+        import io
+        mgr = MCPClientManager()
+        resp = self._sse_response(
+            "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}",
+        )
+        result = mgr._read_sse_stream(resp)
+        assert result == {"jsonrpc": "2.0", "id": 1, "result": {"tools": []}}
+
+    def test_skips_done_and_empty_data(self):
+        """[DONE] markers and empty data lines are ignored."""
+        mgr = MCPClientManager()
+        resp = self._sse_response(
+            "data: [DONE]",
+            "data: ",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":42,\"result\":\"ok\"}",
+        )
+        result = mgr._read_sse_stream(resp)
+        assert result["id"] == 42
+        assert result["result"] == "ok"
+
+    def test_raises_on_no_valid_data(self):
+        """When no data: line contains a JSON-RPC response, RuntimeError is raised."""
+        mgr = MCPClientManager()
+        resp = self._sse_response(
+            "data: [DONE]",
+            "data: ",
+            "event: heartbeat",
+        )
+        with pytest.raises(RuntimeError, match="No valid JSON-RPC response"):
+            mgr._read_sse_stream(resp)
 
 # ------------------------------------------------------------------
 # Property-based tests

@@ -43,6 +43,12 @@ class Message:
     tool_use_id: Optional[str] = None
     mentions: Optional[list[str]] = None
     agent_id: Optional[str] = None
+    # Internal, in-memory marker (never persisted / never sent to clients):
+    # on an assistant message, signals that the pending tool_calls were NOT
+    # executed (e.g. max tool-call rounds reached) and should be dropped when
+    # merging a streamed round into conversation history.  Excluded from
+    # to_dict() so it cannot leak into SSE frames or conversation.json.
+    tool_calls_dropped: Optional[bool] = None
 
     def to_dict(self) -> dict:
         """Serialize to a dictionary, omitting None fields."""

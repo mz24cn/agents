@@ -1,5 +1,5 @@
 """
-示例：通过手机扫码自动登录视频号创作者平台
+示例：通过手机扫码自动登录视频号创作者平台（需要 Android 设备）
 
 【目标】
 在电脑浏览器上自动化登录微信视频号创作者平台（https://channels.weixin.qq.com/login.html）。
@@ -8,12 +8,12 @@
 - 手机B（扫码手机）：打开微信扫一扫，扫描手机A上的二维码完成登录
 
 【前提条件】
-1. 电脑已连接两台Android手机（通过USB并开启ADB调试）
-2. 电脑浏览器已安装并运行 chrome-devtools-mcp 服务（提供 /v1/tools/call 接口）
+1. Agent Service 服务已启动（localhost:7988），android-use MCP server 已注册并连接两台 Android 手机
+2. chrome-devtools-mcp 和 android-use-mcp 工具已注册
 3. 手机B（扫码手机）已安装微信并登录
 4. 两台手机的屏幕已解锁
-5. Agent Service服务已启动
-6. 已安装Python Pillow库（用于图片旋转处理）
+5. 已安装 Python Pillow 库（用于图片旋转处理）
+6. 运行前请修改下方 PHONES 配置为你的实际设备信息（device_id 可通过本脚本启动时的设备检测自动列出）
 
 【流程概览】
 1. 电脑浏览器打开视频号登录页面
@@ -24,14 +24,19 @@
 6. 等待扫码完成，点击"登录"。在浏览器中确认登录成功
 
 【API说明】
-本脚本通过 /v1/tools/call 接口调用 chrome-devtools-mcp 和 android_use_mcp 工具，全程无大模型参与。
+本脚本通过 /v1/tools/call 接口调用 chrome-devtools-mcp 和 android-use-mcp 工具，全程无大模型参与。
 - tool_id 格式：mcp-{service}-{tool_name}
 - 浏览器工具：mcp-chrome-devtools-take_snapshot, mcp-chrome-devtools-take_screenshot, mcp-chrome-devtools-navigate_page
 - Android工具：mcp-android-use-show_image, mcp-android-use-run_adb_command, mcp-android-use-find_and_click
+- 设备检测通过 mcp-android-use-run_adb_command（command="devices"）完成，不再依赖本机 adb 命令行
+
+【注意】
+如果 Agent Service 不可达、android-use MCP 未注册或没有已连接设备，脚本会在启动时检测并报错退出。
 
 """
 
 import re
+import sys
 import json
 import urllib.request
 import urllib.error
@@ -282,14 +287,16 @@ def android_show_image(base64_content: str, device_id: str) -> dict:
     return call_tool(
         "mcp-android-use-show_image",
         {"base64_content": base64_content, "device_id": device_id},
+        format="json",
     )
 
 
 def android_run_adb(command: str, device_id: str) -> dict:
-    """执行 ADB 命令"""
+    """执行 ADB 命令（通过 android-use MCP server，非本机命令行）"""
     return call_tool(
         "mcp-android-use-run_adb_command",
         {"command": command, "device_id": device_id},
+        format="json",
     )
 
 
@@ -364,6 +371,7 @@ def android_find_and_click(keyword: str, device_id: str) -> dict:
     return call_tool(
         "mcp-android-use-find_and_click",
         {"keyword_or_image_file": keyword, "device_id": device_id},
+        format="json",
     )
 
 
@@ -652,6 +660,84 @@ def login_video_account_by_scan(
 # 入口
 # ============================================================
 
+# 启动时必需的 android-use MCP 工具
+REQUIRED_ANDROID_TOOLS = {
+    "mcp-android-use-run_adb_command",
+    "mcp-android-use-show_image",
+    "mcp-android-use-find_and_click",
+}
+
+
+def _check_android_mcp():
+    """
+    通过 Agent Service 检查 android-use MCP server 及已连接设备。
+
+    不再依赖本机 adb 命令行：设备检测走 localhost:7988 上已注册的
+    mcp-android-use-run_adb_command 工具（command="devices"）。
+    """
+    # 1. 检查 Agent Service 可达 + android-use 工具已注册
+    try:
+        with urllib.request.urlopen("http://localhost:7988/v1/tools", timeout=10) as resp:
+            tools_data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"错误: 无法连接 Agent Service (http://localhost:7988): {e}")
+        print("      请先启动 Agent Service，并确保 android-use MCP server 已注册。")
+        sys.exit(1)
+
+    tool_ids = {t["tool_id"] for t in tools_data.get("tools", [])}
+    android_tool_ids = sorted(t for t in tool_ids if t.startswith("mcp-android-use-"))
+    if not android_tool_ids:
+        print("错误: Agent Service 上未注册 android-use MCP server 的任何工具。")
+        print("      请检查 android-use MCP server 配置并重新加载。")
+        sys.exit(1)
+
+    missing = REQUIRED_ANDROID_TOOLS - tool_ids
+    if missing:
+        print(f"错误: android-use MCP 缺少必需工具: {sorted(missing)}")
+        print(f"      当前已注册的 android-use 工具: {android_tool_ids}")
+        sys.exit(1)
+
+    print(f"✅ android-use MCP server 已注册（{len(android_tool_ids)} 个工具）")
+
+    # 2. 通过 MCP server 的 run_adb_command 检测已连接设备（走 server 侧 adb）
+    try:
+        result = call_tool(
+            "mcp-android-use-run_adb_command",
+            {"command": "devices"},
+            format="json",
+        )
+    except Exception as e:
+        print(f"错误: 通过 android-use MCP 检测设备失败: {e}")
+        sys.exit(1)
+
+    stdout_text = str(result.get("stdout", ""))
+    devices = []
+    for line in stdout_text.splitlines():
+        line = line.strip()
+        if not line or "List of devices" in line:
+            continue
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == "device":
+            devices.append(parts[0])
+
+    if not devices:
+        print("错误: android-use MCP 未检测到已连接的 Android 设备。")
+        print("      请确认手机已连接并通过 MCP server 的 ADB 可见。")
+        sys.exit(1)
+
+    print(f"✅ 检测到 {len(devices)} 台设备: {devices}")
+
+    # 3. 对比 PHONES 配置的设备是否全部在线
+    configured = {p["device_id"] for p in PHONES.values()}
+    missing_cfg = configured - set(devices)
+    if missing_cfg:
+        print(f"⚠️  以下 PHONES 中配置的设备未在线: {missing_cfg}")
+        print(f"    当前在线设备: {devices}")
+        print("    请更新 PHONES 配置或连接对应设备后重试。")
+        sys.exit(1)
+    print("✅ PHONES 配置的全部设备均在线")
+
 if __name__ == "__main__":
+    _check_android_mcp()
     success = login_video_account_by_scan()
     exit(0 if success else 1)

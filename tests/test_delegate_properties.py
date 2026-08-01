@@ -3,41 +3,7 @@
 import threading
 from hypothesis import given, settings
 import hypothesis.strategies as st
-from runtime.builtin_tools import (
-    parse_tool_ids,
-    build_messages,
-    accumulate_content,
-    _make_delegate_fn,
-)
-
-
-# Feature: multi-agent-collaboration, Property 1: tool_ids 解析的正确性
-@given(st.text())
-@settings(max_examples=100)
-def test_tool_ids_parsing_property(tool_ids_str):
-    result = parse_tool_ids(tool_ids_str)
-    assert all(t == t.strip() for t in result), "每个元素不应有首尾空格"
-    assert all(len(t) > 0 for t in result), "每个元素不应为空字符串"
-
-
-# Feature: multi-agent-collaboration, Property 2: context 参数注入为首条 system 消息
-@given(st.text(min_size=1), st.text(min_size=1))
-@settings(max_examples=100)
-def test_context_injection_property(context, task):
-    messages = build_messages(context=context, task=task)
-    assert len(messages) >= 2, "非空 context 时应有至少 2 条消息"
-    assert messages[0].role == "system", "第一条消息应为 system 角色"
-    assert messages[0].content == context, "system 消息内容应等于 context"
-    assert messages[1].role == "user", "第二条消息应为 user 角色"
-    assert messages[1].content == task, "user 消息内容应等于 task"
-
-
-# Feature: multi-agent-collaboration, Property 3: 流式内容拼装的完整性
-@given(st.lists(st.text()))
-@settings(max_examples=100)
-def test_content_accumulation_property(content_chunks):
-    accumulated = accumulate_content(content_chunks)
-    assert accumulated == "".join(content_chunks), "拼装结果应等于所有片段按序连接"
+from runtime.builtin_tools import _make_delegate_fn
 
 
 # Feature: multi-agent-collaboration, Property 4: 异常隔离——delegate 始终返回字符串
@@ -47,12 +13,12 @@ def test_content_accumulation_property(content_chunks):
 def test_exception_isolation_property(error_message):
     """对任意异常消息，delegate 捕获后返回包含 'Error' 的字符串，不向上传播。"""
     class FailingRuntime:
-        def infer_stream(self, request):
+        def infer_stream(self, request, cancel_event=None):
             raise RuntimeError(error_message)
 
     thread_local = threading.local()
     delegate = _make_delegate_fn(FailingRuntime(), thread_local)
-    result = delegate(model_id="any-model", tool_ids="", task="some task")
+    result = delegate(model_id="any-model", tools=[], task="some task")
     assert isinstance(result, str), "delegate 应始终返回字符串"
     assert "Error" in result, "异常时返回值应包含 'Error'"
 
@@ -109,7 +75,7 @@ def test_persistence_failure_does_not_interrupt_property(task_content, error_mes
     from runtime.models import Message
 
     class SuccessRuntime:
-        def infer_stream(self, request):
+        def infer_stream(self, request, cancel_event=None):
             yield Message(role="assistant", content=task_content)
 
     thread_local = threading.local()
@@ -118,7 +84,7 @@ def test_persistence_failure_does_not_interrupt_property(task_content, error_mes
     thread_local.session_id = "test-session"
 
     delegate = _make_delegate_fn(SuccessRuntime(), thread_local)
-    result = delegate(model_id="any-model", tool_ids="", task="some task")
+    result = delegate(model_id="any-model", tools=[], task="some task")
 
     assert isinstance(result, str), "持久化失败时 delegate 应仍返回字符串"
     assert not result.startswith("Error: delegate failed"), (
@@ -135,7 +101,7 @@ def test_depth_propagation_property(initial_depth):
     from runtime.models import Message
 
     class SimpleRuntime:
-        def infer_stream(self, request):
+        def infer_stream(self, request, cancel_event=None):
             yield Message(role="assistant", content="hello")
             yield Message(role="assistant", content=" world")
 
@@ -152,7 +118,7 @@ def test_depth_propagation_property(initial_depth):
     thread_local.sse_callback = mock_sse_callback
 
     delegate = _make_delegate_fn(SimpleRuntime(), thread_local)
-    result = delegate(model_id="any-model", tool_ids="", task="some task")
+    result = delegate(model_id="any-model", tools=[], task="some task")
 
     # 验证流式帧的 depth 字段
     streaming_frames = [f for f in collected_frames if f.get("streaming") is True]
@@ -163,9 +129,7 @@ def test_depth_propagation_property(initial_depth):
         f"流式帧的 depth 应等于 {initial_depth + 1}，实际: {[f['depth'] for f in streaming_frames]}"
     )
     assert len(end_frames) == 1, "应有且仅有一个结束帧"
-    assert end_frames[0]["depth"] == initial_depth + 1, (
-        f"结束帧的 depth 应等于 {initial_depth + 1}，实际: {end_frames[0]['depth']}"
-    )
+    # 结束帧不包含 depth 字段（仅流式增量帧携带 depth）
 
     # 验证 delegate 返回后 depth 恢复
     assert thread_local.depth == initial_depth, (

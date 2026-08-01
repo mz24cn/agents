@@ -9,10 +9,14 @@
   - 多轮推理全程流式
 
 用法：
-  python examples/example_skill.py <skill_dir> <user_message>
+  python examples/example_skill.py [user_message]
 
 示例：
-  python examples/example_skill.py /path/to/my_skill "帮我查一下最近的数据"
+  python examples/example_skill.py "帮我查一下当前有哪些模型可用"
+
+前置条件：
+  - Ollama 服务运行在 localhost:11434，已拉取 qwen3.5:9b
+  - accessories/agent-service/SKILL.md 存在（默认使用内置 agent-service skill）
 """
 
 import sys
@@ -38,25 +42,27 @@ YELLOW = "\033[33m"
 RESET = "\033[0m"
 BOLD = "\033[1m"
 
+# 默认 skill 目录 — accessories/agent-service
+_DEFAULT_SKILL_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "accessories", "agent-service"
+)
+
 
 def main():
-    if len(sys.argv) < 3:
-        print(f"用法: {sys.argv[0]} <skill_dir> <user_message>")
-        sys.exit(1)
-
-    skill_dir = sys.argv[1]
-    user_message = sys.argv[2]
+    skill_dir = _DEFAULT_SKILL_DIR
+    user_message = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "帮我列出当前 Agent Service 中注册的所有模型和工具"
 
     if not os.path.isdir(skill_dir):
-        print(f"错误: 目录不存在: {skill_dir}")
+        print(f"错误: Skill 目录不存在: {skill_dir}")
         sys.exit(1)
 
     # 1. 注册模型
     model_registry = ModelRegistry()
     model_registry.register(ModelConfig(
-        model_id="qwen3-14b",
+        model_id="qwen3.5-9b",
         api_base="http://localhost:11434",
-        model_name="qwen3:14b",
+        model_name="qwen3.5:9b",
         api_protocol="ollama",
         generate_params={"temperature": 0.7},
     ))
@@ -65,7 +71,7 @@ def main():
     tool_registry = ToolRegistry()
     skill_manager = SkillManager(tool_registry)
     skill_config = skill_manager.load_skill(skill_dir)
-    print(f"{DIM}Skill: {skill_config.name} — {skill_config.description[:60]}...{RESET}\n")
+    print(f"{DIM}Skill: {skill_config.name} — {skill_config.description[:80]}...{RESET}\n")
 
     # 3. 创建 Runtime
     runtime = Runtime(
@@ -81,7 +87,7 @@ def main():
     in_content = False
 
     for msg in runtime.infer_stream(InferenceRequest(
-        model_id="qwen3-14b",
+        model_id="qwen3.5-9b",
         tool_ids=[skill_config.tool_id],
         messages=[
             Message(role="system", content=(

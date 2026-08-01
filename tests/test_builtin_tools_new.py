@@ -91,6 +91,13 @@ def journal_context(monkeypatch, tmp_path):
 # Tests for _PathValidator
 # ---------------------------------------------------------------------------
 
+@pytest.fixture
+def no_tmp_bypass(monkeypatch):
+    """Prevent /tmp bypass in _validate_path."""
+    import runtime.builtin_tools as _bt
+    monkeypatch.setattr(_bt, "_REAL_TMP", "/__nonexistent_tmp_bypass__")
+
+
 class TestPathValidator:
     """Unit tests for _PathValidator.validate()."""
 
@@ -108,21 +115,21 @@ class TestPathValidator:
         result = validator.validate(abs_path)
         assert result == os.path.realpath(abs_path)
 
-    def test_raises_path_traversal_denied_for_escape_path(self, workspace):
+    def test_raises_path_traversal_denied_for_escape_path(self, workspace, no_tmp_bypass):
         """Raises ValueError with error_code='PathTraversalDenied' for ../escape paths."""
         validator = _PathValidator(str(workspace))
         with pytest.raises(ValueError) as exc_info:
             validator.validate("../escape")
         assert exc_info.value.error_code == "PathTraversalDenied"
 
-    def test_raises_path_traversal_denied_for_deep_escape(self, workspace):
+    def test_raises_path_traversal_denied_for_deep_escape(self, workspace, no_tmp_bypass):
         """Raises ValueError with error_code='PathTraversalDenied' for deeply nested escape."""
         validator = _PathValidator(str(workspace))
         with pytest.raises(ValueError) as exc_info:
             validator.validate("subdir/../../escape")
         assert exc_info.value.error_code == "PathTraversalDenied"
 
-    def test_raises_absolute_path_denied_for_path_outside_workspace(self, workspace, tmp_path):
+    def test_raises_absolute_path_denied_for_path_outside_workspace(self, workspace, tmp_path, no_tmp_bypass):
         """Raises ValueError with error_code='AbsolutePathDenied' for absolute paths outside workspace."""
         # Use a different temp directory as the "outside" path
         outside_dir = tmp_path.parent
@@ -242,7 +249,7 @@ class TestReadFileUnit:
         assert result["error"] == "LineOutOfRange"
         assert "message" in result
 
-    def test_path_traversal_returns_error_when_strict_path_check_enabled(self, workspace, monkeypatch):
+    def test_path_traversal_returns_error_when_strict_path_check_enabled(self, workspace, monkeypatch, no_tmp_bypass):
         """With strict path validation enabled, ../ traversal is denied."""
         monkeypatch.setenv("CHECK_PATH_FOR_READ", "true")
         result = _json.loads(_read_file("../escape.txt"))
@@ -474,7 +481,7 @@ class TestWriteFileUnit:
         actual = (workspace / "verify.txt").read_text(encoding="utf-8")
         assert actual == content
 
-    def test_path_traversal_returns_error(self, workspace):
+    def test_path_traversal_returns_error(self, workspace, no_tmp_bypass):
         """Returns PathTraversalDenied error for path traversal attempts."""
         result = _json.loads(_write_file("../escape.txt", "bad"))
         assert result["error"] == "PathTraversalDenied"
@@ -737,7 +744,7 @@ class TestEditFileUnit:
         assert content.count("x = 99") == 1
         assert content.count("x = 1") == 2
 
-    def test_path_traversal_returns_error(self, workspace):
+    def test_path_traversal_returns_error(self, workspace, no_tmp_bypass):
         """Returns PathTraversalDenied error for path traversal attempts."""
         result = _json.loads(_edit_file("../escape.py", "search_replace",
                                         old_str="x", new_str="y"))

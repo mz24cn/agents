@@ -79,7 +79,7 @@ class TestOllamaThinkingNonStream:
             "done": True,
         }).encode("utf-8")
 
-        messages = protocol.parse_response(response, stream=False)
+        messages, _stat = protocol.parse_response(response, stream=False)
         assert len(messages) == 1
         assert messages[0].content == "The answer is 42."
         assert messages[0].thinking == "Let me calculate... 6 times 7 equals 42."
@@ -92,7 +92,7 @@ class TestOllamaThinkingNonStream:
             "done": True,
         }).encode("utf-8")
 
-        messages = protocol.parse_response(response, stream=False)
+        messages, _stat = protocol.parse_response(response, stream=False)
         assert len(messages) == 1
         assert messages[0].thinking is None
 
@@ -104,7 +104,7 @@ class TestOllamaThinkingNonStream:
             "done": True,
         }).encode("utf-8")
 
-        messages = protocol.parse_response(response, stream=False)
+        messages, _stat = protocol.parse_response(response, stream=False)
         assert messages[0].thinking is None  # empty string → None
 
 
@@ -129,8 +129,8 @@ class TestOllamaThinkingStream:
         ]
         stream = self._make_stream(chunks)
 
-        runtime = Runtime(ModelRegistry(), ToolRegistry())
-        messages = list(runtime._parse_ollama_stream(stream))
+        protocol = OllamaProtocol()
+        messages = [m for m in protocol.parse_stream(stream) if m.role != 'usage']
 
         # Should have 2 thinking + 2 content messages
         thinking_msgs = [m for m in messages if m.thinking]
@@ -153,8 +153,8 @@ class TestOllamaThinkingStream:
         ]
         stream = self._make_stream(chunks)
 
-        runtime = Runtime(ModelRegistry(), ToolRegistry())
-        messages = list(runtime._parse_ollama_stream(stream))
+        protocol = OllamaProtocol()
+        messages = [m for m in protocol.parse_stream(stream) if m.role != 'usage']
 
         assert len(messages) == 1
         assert messages[0].content == "Hello"
@@ -179,7 +179,7 @@ class TestOpenAIThinkingNonStream:
             }],
         }).encode("utf-8")
 
-        messages = protocol.parse_response(response, stream=False)
+        messages, _stat = protocol.parse_response(response, stream=False)
         assert len(messages) == 1
         assert messages[0].content == "42"
         assert messages[0].thinking == "6 * 7 = 42"
@@ -190,7 +190,7 @@ class TestOpenAIThinkingNonStream:
             "choices": [{"message": {"role": "assistant", "content": "Hi"}}],
         }).encode("utf-8")
 
-        messages = protocol.parse_response(response, stream=False)
+        messages, _stat = protocol.parse_response(response, stream=False)
         assert messages[0].thinking is None
 
 
@@ -216,8 +216,8 @@ class TestOpenAIThinkingStream:
         ]
         stream = self._make_sse_stream(chunks)
 
-        runtime = Runtime(ModelRegistry(), ToolRegistry())
-        messages = list(runtime._parse_openai_stream(stream))
+        protocol = OpenAIProtocol()
+        messages = [m for m in protocol.parse_stream(stream) if m.role != 'usage']
 
         thinking_msgs = [m for m in messages if m.thinking]
         content_msgs = [m for m in messages if m.content]
@@ -236,8 +236,8 @@ class TestOpenAIThinkingStream:
         ]
         stream = self._make_sse_stream(chunks)
 
-        runtime = Runtime(ModelRegistry(), ToolRegistry())
-        messages = list(runtime._parse_openai_stream(stream))
+        protocol = OpenAIProtocol()
+        messages = [m for m in protocol.parse_stream(stream) if m.role != 'usage']
 
         assert len(messages) == 1
         assert messages[0].content == "Hello"
@@ -259,7 +259,7 @@ class TestOpenAIAccumulatedStreamThinking:
             'data: [DONE]\n\n'
         ).encode("utf-8")
 
-        messages = protocol.parse_response(sse, stream=True)
+        messages, _stat = protocol.parse_response(sse, stream=True)
         assert len(messages) == 1
         assert messages[0].content == "Result"
         assert messages[0].thinking == "Thinking"
@@ -271,7 +271,7 @@ class TestOpenAIAccumulatedStreamThinking:
             'data: [DONE]\n\n'
         ).encode("utf-8")
 
-        messages = protocol.parse_response(sse, stream=True)
+        messages, _stat = protocol.parse_response(sse, stream=True)
         assert messages[0].thinking is None
 
 
@@ -343,7 +343,7 @@ class TestInferStreamThinking:
         request = InferenceRequest(model_id="test", text="hi", stream=True)
 
         with patch("urllib.request.urlopen", side_effect=mock_urlopen):
-            messages = list(runtime.infer_stream(request))
+            messages = [m for m in runtime.infer_stream(request) if m.role != 'usage']
 
         thinking_msgs = [m for m in messages if m.thinking]
         content_msgs = [m for m in messages if m.content]

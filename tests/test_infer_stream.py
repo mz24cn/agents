@@ -299,3 +299,88 @@ def test_infer_stream_unsupported_protocol() -> None:
 
     assert len(messages) == 1
     assert "unsupported" in messages[0].content.lower()
+
+
+def _make_openai_tool_calls_sse(tool_name: str, tool_call_id: str) -> io.BytesIO:
+    """Build a fake OpenAI SSE stream containing a single tool_call delta."""
+    chunk_json = json.dumps({
+        "choices": [{
+            "delta": {
+                "role": "assistant",
+                "tool_calls": [{
+                    "index": 0,
+                    "id": tool_call_id,
+                    "type": "function",
+                    "function": {"name": tool_name, "arguments": "{}"},
+                }],
+            }
+        }]
+    })
+    lines = [f"data: {chunk_json}\n\n", "data: [DONE]\n\n"]
+    return io.BytesIO("".join(lines).encode("utf-8"))
+
+
+def test_infer_stream_max_rounds_yields_assistant_note_not_fake_tool() -> None:
+    """When max_tool_rounds is reached, infer_stream must yield a plain assistant
+    note (with the tool_calls_dropped marker) instead of a fabricated tool reply.
+
+    Regression test: the old code fabricated a role='tool' error message and
+    yielded it BEFORE the usage/stat message, which made merge_stream_messages
+    persist [tool, assistant] in the wrong order and 400 on the next request.
+    """
+    model_registry = _make_model_registry("openai")
+    tool_registry = ToolRegistry()
+
+    def dummy_tool() -> str:
+        return "tool_result"
+
+    tool_registry.register(
+        ToolConfig(
+            tool_id="dummy_tool",
+            tool_type="function",
+            name="dummy_tool",
+            description="A dummy tool",
+            parameters={"type": "object", "properties": {}, "required": []},
+        ),
+        callable_fn=dummy_tool,
+    )
+    runtime = Runtime(model_registry=model_registry, tool_registry=tool_registry)
+
+    request = InferenceRequest(
+        model_id="test-model",
+        tool_ids=["dummy_tool"],
+        text="hi",
+        stream=True,
+        max_tool_rounds=1,
+    )
+
+    call_count = [0]
+
+    def mock_urlopen(request, **kwargs):
+        call_count[0] += 1
+        stream = _make_openai_tool_calls_sse("dummy_tool", f"call_{call_count[0]}")
+        mock_resp = MagicMock()
+        mock_resp.__iter__ = lambda self: iter(stream.readlines())
+        mock_resp.read = stream.read
+        mock_resp.close = MagicMock()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        return mock_resp
+
+    with patch("urllib.request.urlopen", side_effect=mock_urlopen):
+        collected = list(runtime.infer_stream(request))
+
+    # Round 1 executed the tool (tool result), round 2 hit the limit.
+    assert call_count[0] == 2
+
+    # Only one real tool-role message (the executed result) — no fabricated
+    # "Error: maximum tool-call rounds" tool reply.
+    tool_msgs = [m for m in collected if m.role == "tool"]
+    assert len(tool_msgs) == 1
+    assert tool_msgs[0].content == "tool_result"
+
+    # The limit round ends with a plain assistant note carrying the marker.
+    note_msgs = [m for m in collected if getattr(m, "tool_calls_dropped", False)]
+    assert len(note_msgs) == 1
+    assert "maximum tool-call rounds" in note_msgs[0].content
+    assert note_msgs[0].role == "assistant"
