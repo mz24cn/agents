@@ -171,6 +171,14 @@ def test_delete_removes_key(env_dict: dict) -> None:
 # Validates: Requirements 1.3
 # ---------------------------------------------------------------------------
 
+def _is_json_object(content: str) -> bool:
+    """判断内容是否可解析为 JSON 对象（dict）。"""
+    try:
+        return isinstance(json.loads(content), dict)
+    except Exception:
+        return False
+
+
 # 生成非 JSON 对象内容的策略
 _invalid_json_object_strategy = st.one_of(
     # JSON 数组
@@ -183,8 +191,12 @@ _invalid_json_object_strategy = st.one_of(
     st.sampled_from(["true", "false"]),
     # null
     st.just("null"),
-    # 格式错误的 JSON（在合法 JSON 后追加垃圾字符）
-    st.text(min_size=1, max_size=20).map(lambda s: "{" + s),
+    # 格式错误的 JSON：'{' + 任意文本。
+    # 注意：'{' + '}' 恰好构成合法 JSON 对象 '{}'（空对象是合法的 env 内容，read() 不应报错），
+    # 因此必须过滤掉所有能解析为 JSON 对象的生成值。
+    st.text(min_size=1, max_size=20).map(lambda s: "{" + s).filter(
+        lambda s: not _is_json_object(s)
+    ),
     # 空文件
     st.just(""),
 )
@@ -208,6 +220,29 @@ def test_read_raises_value_error_for_invalid_json(invalid_content: str) -> None:
 
         with pytest.raises(ValueError):
             mgr.read()
+
+
+def test_read_accepts_empty_json_object() -> None:
+    """空 JSON 对象 '{}' 是合法的 env 内容，read() 应正常返回（不抛异常）。
+
+    **Validates: Requirements 1.3**
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        env_path = os.path.join(tmpdir, "env.json")
+
+        # 直接写入空对象（绕过 EnvManager.set()）
+        with open(env_path, "w", encoding="utf-8") as fh:
+            fh.write("{}")
+
+        mgr = EnvManager(env_path=env_path)
+        result = mgr.read()
+
+        # AGENT_WORKSPACE 可能由 read() 从 os.environ 自动注入
+        expected: dict = {}
+        ws = os.environ.get("AGENT_WORKSPACE", "")
+        if ws:
+            expected["AGENT_WORKSPACE"] = ws
+        assert result == expected
 
 
 # ---------------------------------------------------------------------------

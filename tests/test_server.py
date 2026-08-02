@@ -1227,6 +1227,28 @@ class TestSessionAPI:
         assert len(body["messages"]) == 1
         assert body["messages"][0]["role"] == "user"
 
+    def test_get_session_log_dir_returns_path(self, server_with_env):
+        """GET /v1/sessions/{session_id}/log-dir 返回 conversation.json 所在目录。"""
+        import json as _json
+        chats_dir = server_with_env._context_manager._chats_dir
+        session_id = "2026-01-02_12-30-00"
+        session_dir = os.path.join(chats_dir, session_id)
+        os.makedirs(session_dir, exist_ok=True)
+        conv_data = {"meta": {}, "messages": []}
+        with open(os.path.join(session_dir, "conversation.json"), "w", encoding="utf-8") as f:
+            _json.dump(conv_data, f)
+
+        status, body = _get(server_with_env, f"/v1/sessions/{session_id}/log-dir")
+        assert status == 200
+        assert body["session_id"] == session_id
+        assert os.path.realpath(body["path"]) == os.path.realpath(session_dir)
+
+    def test_get_session_log_dir_not_found(self, server_with_env):
+        """GET /v1/sessions/{session_id}/log-dir 会话不存在时返回 404。"""
+        status, body = _get(server_with_env, "/v1/sessions/nonexistent-session/log-dir")
+        assert status == 404
+        assert "error" in body
+
     def test_get_sessions_lists_created_sessions(self, server_with_env):
         """创建会话目录后，GET /v1/sessions 应返回该会话。"""
         import json as _json

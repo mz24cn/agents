@@ -33,20 +33,33 @@ from runtime.models import Message, InferenceRequest
 def build_agents_markdown(
     agent_ids: list[str],
     agent_manager,
+    *,
+    exclude_agent_id: Optional[str] = None,
+    include_user_row: bool = False,
 ) -> str:
-    """Build a markdown table listing all participants in a group chat.
+    """Build a markdown table listing participants in a group chat.
+
+    Two distinct scenarios:
+
+    * Group-chat roster (``include_user_row=True``): lists ALL participating
+      agents plus a fixed user row so agents know the user's role.
+    * talk_to scheduling roster (``exclude_agent_id=<self>``): lists every
+      agent EXCEPT the one whose prompt the table is injected into, so the
+      model only sees schedulable targets for ``talk_to``.
 
     Returns an empty string if no agents can be resolved.
     """
     rows = []
     for aid in agent_ids:
+        if exclude_agent_id and aid == exclude_agent_id:
+            continue
         agent = agent_manager.get(aid) if agent_manager else None
         if agent is None:
             continue
         nickname = agent.get("nickname", aid)
         desc = (agent.get("description") or "").replace("\n", " ")
         rows.append((nickname, aid, desc))
-    if not rows:
+    if not rows and not include_user_row:
         return ""
     lines = [
         "| Nickname | Agent ID | Description |",
@@ -54,6 +67,8 @@ def build_agents_markdown(
     ]
     for nick, aid, desc in rows:
         lines.append(f"| {nick} | {aid} | {desc} |")
+    if include_user_row:
+        lines.append("| 用户 | user | 在群聊中代表用户。在角色扮演中属于第三人视角 |")
     return "\n".join(lines)
 
 
@@ -177,6 +192,30 @@ def _message_from_turn(turn) -> Message:
         )
 
 
+# Marker used on the catch-up note user message so _normalize_for_model can
+# tell it apart from real user speech (it must NOT get a "**用户** (user): "
+# identity prefix).
+_CATCH_UP_TAG = "@catch_up"
+
+
+def _tool_call_name(tc) -> str:
+    """Extract the tool/function name from a tool-call dict.
+
+    Supports both the flat ``{"name": ...}`` shape used internally and the
+    OpenAI-style ``{"function": {"name": ...}}`` shape coming from protocol
+    parsers. Returns "" when the name cannot be resolved.
+    """
+    if not isinstance(tc, dict):
+        return ""
+    name = tc.get("name")
+    if name:
+        return str(name)
+    fn = tc.get("function")
+    if isinstance(fn, dict):
+        return str(fn.get("name", "") or "")
+    return ""
+
+
 def _normalize_for_model(messages: list[Message], agent_id: str) -> list[Message]:
     """Normalize messages from the perspective of *agent_id*.
 
@@ -197,8 +236,11 @@ def _normalize_for_model(messages: list[Message], agent_id: str) -> list[Message
     2. Assistant from *agent_id* → keep as ``assistant`` (merge consecutive).
     3. Assistant from OTHER agents → convert to ``user``, with
        ``**nickname** (agent_id): `` prefix.  If the message carries
-        *tool_calls* we append a brief ``(调用了: foo, bar)`` note
-       (purely from the assistant message, no tool results needed).
+        *tool_calls* we append a standalone line ``（调用了工具a,b,c）``
+       at the end of the content (purely from the assistant message,
+       no tool results needed).
+    6. Real user messages get a ``**用户** (user): `` identity prefix
+       (the catch-up note message is exempt).
     4. Tool messages → if the last assistant was another agent,
        fold into ``user``; otherwise pass through as ``tool``.
     5. User messages → merge consecutive.
@@ -268,17 +310,28 @@ def _normalize_for_model(messages: list[Message], agent_id: str) -> list[Message
                 prefix = f"**{agent_name}** ({orig_aid}): " if agent_name else ""
                 content = prefix + (msg.content or "")
 
-                # Append brief tool-call note if any
+                # Append tool-call note as a standalone line at the end
                 tool_calls = getattr(msg, "tool_calls", None)
                 if tool_calls:
-                    names = [tc.get("function", {}).get("name", "?")
-                             for tc in tool_calls]
-                    content += f" _(调用了: {', '.join(names)})_"
+                    names = [_tool_call_name(tc) for tc in tool_calls]
+                    names = [n for n in names if n]
+                    if names:
+                        content = content.rstrip()
+                        content += f"\n（调用了工具{', '.join(names)}）"
             elif raw_role == "tool":
                 # Tool result belonging to another agent — just the content
                 content = msg.content or ""
             else:
-                content = msg.content or ""
+                # Real user message — tag with the user identity declared in
+                # the AGENTS markdown (用户/user). The catch-up note is exempt.
+                if getattr(msg, "name", None) == _CATCH_UP_TAG:
+                    content = msg.content or ""
+                else:
+                    raw_content = (msg.content or "").strip()
+                    if raw_content and not raw_content.startswith("**用户** (user):"):
+                        content = f"**用户** (user): {raw_content}"
+                    else:
+                        content = msg.content or ""
 
             if normalized and normalized[-1].role == "user":
                 prev = normalized[-1]
@@ -384,29 +437,17 @@ def assemble_agent_context(
                 role="system", content=agents_markdown,
             ))
 
-    # 2. Catch-up note (if any) — merged into the first system message
-    #    so the model always receives exactly one system message.
+    # 2. Catch-up note (if any) — carried as a USER message (marked with
+    #    _CATCH_UP_TAG so _normalize_for_model skips the "**用户** (user): "
+    #    identity prefix). Placed before the historical turns; it gets merged
+    #    into the leading user message by _normalize_for_model.
     missed = _count_missed_rounds(agent_id, turns)
     if missed > 0:
         catch_up = (
             f"📢 群聊回溯：在你未 @ 参与期间共有 {missed} 轮对话。"
             f"以下为完整历史记录，其中标注 [群聊] 的消息并非 @ 你，供参考上下文。"
         )
-        if messages and messages[0].role == "system":
-            if messages[0].prompt_template:
-                # Template-based: inject via arguments so the template can render
-                # {{CATCH_UP}} if it chooses; otherwise merge into GC_FRAMING.
-                if messages[0].arguments is None:
-                    messages[0].arguments = {}
-                messages[0].arguments["CATCH_UP"] = catch_up
-                # Also append to GC_FRAMING as fallback in case template lacks {{CATCH_UP}}
-                existing_framing = messages[0].arguments.get("GC_FRAMING") or ""
-                messages[0].arguments["GC_FRAMING"] = existing_framing + "\n\n" + catch_up
-            else:
-                # Plain-text system prompt: direct content merge
-                messages[0].content = (messages[0].content or "") + "\n\n" + catch_up
-        else:
-            messages.insert(0, Message(role="system", content=catch_up))
+        messages.append(Message(role="user", content=catch_up, name=_CATCH_UP_TAG))
 
     # 3. Historical turns (all included, non-mentioned user messages marked)
     for turn in turns:
@@ -486,7 +527,9 @@ def run_group_chat_stream(
 
     _logger = logging.getLogger("runtime.group_chat")
 
-    agents_markdown = build_agents_markdown(all_agent_ids, agent_manager)
+    agents_markdown = build_agents_markdown(
+        all_agent_ids, agent_manager, include_user_row=True,
+    )
     max_workers_env = os.environ.get(
         "MAX_GROUP_CHAT_WORKERS",
         os.environ.get("MAX_TALK_TO_WORKERS", "10"),

@@ -633,10 +633,13 @@ def _make_talk_to_fn(runtime, thread_local):
             # 构建消息
             messages = []
             # 若子 agent 持有 talk_to 工具且外层提供了 all_agent_ids，
-            # 则将 AGENTS 表格注入系统提示词，确保子 agent 能正确使用 agent_id
+            # 则注入 AGENTS 调度清单（排除子 agent 自己，只列可 talk_to 的目标），
+            # 确保子 agent 能正确使用 agent_id
             agents_md = ""
             if "talk_to" in agent_tool_ids and all_agent_ids:
-                agents_md = build_agents_markdown(all_agent_ids, agent_manager)
+                agents_md = build_agents_markdown(
+                    all_agent_ids, agent_manager, exclude_agent_id=agent_id,
+                )
             if system_prompt:
                 if agents_md:
                     gc_prompt = _GC_DEFAULT_PROMPT.replace("{{AGENTS}}", agents_md)

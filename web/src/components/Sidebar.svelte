@@ -3,7 +3,7 @@
   import { router, navigate } from '../lib/router.svelte.js'
   import { t } from '../lib/i18n.svelte.js'
   import { sessions, subscribeSessionEvents } from '../lib/api.js'
-  import { sessionRestore, newSessionCreated, sessionDeleted, currentSession, newSessionRequest, terminalOpen } from '../lib/session-state.svelte.js'
+  import { sessionRestore, newSessionCreated, sessionDeleted, currentSession, newSessionRequest, terminalOpen, openSessionLogDir } from '../lib/session-state.svelte.js'
   import { sidebarWidth, setSidebarWidth, toggleSidebarCollapsed, collapseSidebar, SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH } from '../lib/sidebar-width.svelte.js'
 
   const SESSION_PAGE_SIZE = 100
@@ -24,6 +24,11 @@
   // 弹出菜单状态
   let menuOpenId = $state(null)   // 当前展开菜单的 session id
   let menuPos = $state({ x: 0, y: 0 })  // fixed 定位坐标
+
+  // hover 弹出菜单状态：鼠标悬停到 ... 按钮即弹出，悬停在菜单上保持显示
+  let hoverBtnId = $state(null)   // 当前鼠标悬停的 ... 按钮 session id
+  let hoverMenuId = $state(null)  // 当前鼠标悬停的弹出菜单 session id
+  let closeTimer = null           // 延迟关闭定时器（跨越按钮与菜单之间的缝隙）
 
   // 拖动状态
   let isDragging = $state(false)
@@ -210,12 +215,8 @@
     }
   }
 
-  function openMenu(e, sid) {
+  function openMenuAt(e, sid) {
     e.stopPropagation()
-    if (menuOpenId === sid) {
-      menuOpenId = null
-      return
-    }
     const btn = e.currentTarget
     const rect = btn.getBoundingClientRect()
     // 菜单出现在按钮右下角，用 fixed 定位浮于最顶层
@@ -223,8 +224,63 @@
     menuOpenId = sid
   }
 
+  function openMenu(e, sid) {
+    e.stopPropagation()
+    openMenuAt(e, sid)
+  }
+
   function closeMenu() {
     menuOpenId = null
+    hoverBtnId = null
+    hoverMenuId = null
+    if (closeTimer) {
+      clearTimeout(closeTimer)
+      closeTimer = null
+    }
+  }
+
+  // --- hover 弹出/关闭逻辑 ---
+  // 鼠标进入 ... 按钮：立即弹出菜单
+  function handleMenuBtnEnter(e, sid) {
+    hoverBtnId = sid
+    cancelClose()
+    openMenuAt(e, sid)
+  }
+
+  // 鼠标离开 ... 按钮：延迟关闭（给鼠标移入弹出菜单留出时间）
+  function handleMenuBtnLeave() {
+    hoverBtnId = null
+    scheduleClose()
+  }
+
+  // 鼠标进入弹出菜单：保持稳定显示，取消关闭
+  function handleMenuEnter() {
+    if (menuOpenId !== null) hoverMenuId = menuOpenId
+    cancelClose()
+  }
+
+  // 鼠标离开弹出菜单：延迟关闭
+  function handleMenuLeave() {
+    hoverMenuId = null
+    scheduleClose()
+  }
+
+  // 仅当鼠标既不在 ... 按钮上也不在弹出菜单上时才真正关闭
+  function scheduleClose() {
+    if (closeTimer) clearTimeout(closeTimer)
+    closeTimer = setTimeout(() => {
+      closeTimer = null
+      if (hoverBtnId === null && hoverMenuId === null) {
+        menuOpenId = null
+      }
+    }, 150)
+  }
+
+  function cancelClose() {
+    if (closeTimer) {
+      clearTimeout(closeTimer)
+      closeTimer = null
+    }
   }
 
   function handleOpenTerminal(e, sessionId) {
@@ -232,6 +288,21 @@
     closeMenu()
     terminalOpen.sessionId = sessionId
     terminalOpen.token++
+  }
+
+  // 打开会话日志目录：请求后端返回 conversation.json 所在目录，
+  // 通知 ChatPage 显示文件管理器面板并导航到该目录
+  async function handleOpenSessionLogDir(e, sessionId) {
+    e.stopPropagation()
+    closeMenu()
+    try {
+      const data = await sessions.logDir(sessionId)
+      if (!data?.path) throw new Error(t('openSessionLogDirFailed') || 'Failed to resolve log directory')
+      openSessionLogDir.path = data.path
+      openSessionLogDir.token++
+    } catch (err) {
+      restoreError = err.message || t('openSessionLogDirFailed')
+    }
   }
 
   // 移动端长按手势：长按会话条目 500ms 后弹出操作菜单
@@ -434,6 +505,8 @@
     role="menu"
     style="left:{menuPos.x}px; top:{menuPos.y}px;"
     onclick={(e) => e.stopPropagation()}
+    onmouseenter={handleMenuEnter}
+    onmouseleave={handleMenuLeave}
   >
     <button
       class="session-dropdown-item"
@@ -467,6 +540,17 @@
     >
       <span class="menu-emoji">💻</span>
       Open Terminal
+    </button>
+    <button
+      class="session-dropdown-item"
+      role="menuitem"
+      onclick={(e) => handleOpenSessionLogDir(e, menuOpenId)}
+    >
+      <svg class="menu-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+        <path d="M2 2.5h4l1.5 2H14a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1v-9a1 1 0 0 1 1-1z"/>
+        <path d="M2 8.5h12"/>
+      </svg>
+      {t('openSessionLogDir')}
     </button>
     <button
       class="session-dropdown-item session-dropdown-danger"
@@ -556,6 +640,8 @@
             <button
               class="session-menu-btn"
               onclick={(e) => openMenu(e, entry.session_id)}
+              onmouseenter={(e) => handleMenuBtnEnter(e, entry.session_id)}
+              onmouseleave={handleMenuBtnLeave}
               aria-label={t('deleteSession')}
             >···</button>
           </div>

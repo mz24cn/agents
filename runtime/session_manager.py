@@ -407,6 +407,28 @@ class SessionManager:
         except Exception as exc:
             logger.warning("delete_session: 更新 index.json 失败 (session=%s): %s", session_id, exc)
 
+    def session_dir(self, session_id: str) -> str:
+        """返回指定会话的目录路径（``DATA_DIR/chat_data/{session_id}``）。
+
+        Args:
+            session_id: 会话标识符（对应 chats_dir 下的子目录名）。
+
+        Returns:
+            该会话目录的绝对路径。
+
+        Raises:
+            ValueError: session_id 包含路径分隔符（防止路径穿越）时抛出。
+            FileNotFoundError: 会话目录不存在时抛出。
+        """
+        # 防止路径穿越攻击
+        if os.sep in session_id or (os.altsep and os.altsep in session_id) or ".." in session_id:
+            raise ValueError(f"非法的 session_id: {session_id}")
+
+        session_path = os.path.join(self._chats_dir, session_id)
+        if not os.path.isdir(session_path):
+            raise FileNotFoundError(f"会话目录不存在: {session_path}")
+        return session_path
+
     def get_session(self, session_id: str) -> dict:
         """读取指定会话的 conversation.json，返回完整数据。
 

@@ -405,6 +405,8 @@ const translations = {
     generateTitleFailed: '生成标题失败',
     regenerateSummary: '重新生成概要和记忆',
     regenerateSummaryFailed: '重新生成概要和记忆失败',
+    openSessionLogDir: '打开会话日志目录',
+    openSessionLogDirFailed: '打开会话日志目录失败',
     searchSessions: '搜索最近会话，回车执行；空白回车取消',
     searchSessionsTooltip: '搜索最近会话\n空格=AND，|=OR\n例: error timeout（同时包含）\n    error|timeout（包含任一）',
 
@@ -883,6 +885,8 @@ const translations = {
     generateTitleFailed: 'Failed to generate title',
     regenerateSummary: 'Regenerate Summary & Memory',
     regenerateSummaryFailed: 'Failed to regenerate summary & memory',
+    openSessionLogDir: 'Open session log directory',
+    openSessionLogDirFailed: 'Failed to open session log directory',
     searchSessions: 'Search recent sessions; Enter to run, blank to reset',
     searchSessionsTooltip: 'Search recent sessions\nSpace=AND, |=OR\nEg: error timeout (both)\n    error|timeout (either)',
 

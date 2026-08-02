@@ -15,7 +15,9 @@
   import ConfirmDialog from '../ConfirmDialog.svelte'
   import { extractPlaceholders } from '../../lib/placeholder.js'
   import { t } from '../../lib/i18n.svelte.js'
-  import { sessionRestore, newSessionCreated, sessionDeleted, currentSession, newSessionRequest, terminalOpen } from '../../lib/session-state.svelte.js'
+  import { navigate } from '../../lib/router.svelte.js'
+  import { sessionRestore, newSessionCreated, sessionDeleted, currentSession, newSessionRequest, terminalOpen, openSessionLogDir } from '../../lib/session-state.svelte.js'
+  import { collapseSidebar } from '../../lib/sidebar-width.svelte.js'
   import Terminal from '../Terminal.svelte'
 
   const STORAGE_MODEL_KEY = 'chat_selected_model'
@@ -73,6 +75,29 @@
   $effect(() => {
     if (terminalOpen.token > 0 && terminalOpen.sessionId) {
       openTerminal(terminalOpen.sessionId)
+    }
+  })
+
+  // Listen for "打开会话日志目录" requests from sidebar: show the file manager
+  // panel and navigate it to the session's conversation.json directory.
+  let lastOpenLogDirToken = 0
+  $effect(() => {
+    const req = openSessionLogDir
+    if (!req.token || req.token === lastOpenLogDirToken || !req.path) return
+    lastOpenLogDirToken = req.token
+    // 切换到聊天页，确保文件管理器面板可见
+    navigate('#/chat')
+    if (window.innerWidth < 1024) {
+      collapseSidebar()
+    }
+    workspacePanelOpen = true
+    // 若工作区路径尚未加载（首次打开），先拉取再导航
+    if (!workspacePath) {
+      fetchWorkspacePath().then(() => {
+        fileManagerNavigateTarget = { path: req.path, token: req.token }
+      })
+    } else {
+      fileManagerNavigateTarget = { path: req.path, token: req.token }
     }
   })
 
@@ -194,6 +219,8 @@
 
   // 工作区文件管理器面板状态
   let workspacePanelOpen = $state(false)
+  // 文件管理器外部导航目标：{ path, token }，由 Sidebar"打开会话日志目录"触发
+  let fileManagerNavigateTarget = $state(null)
   // 当前工作区路径（从环境变量获取）
   let workspacePath = $state('')
   let defaultWorkspacePath = $state('')
@@ -1349,6 +1376,7 @@
       <WorkspaceFileManager
         bind:open={workspacePanelOpen}
         bind:workspacePath={workspacePath}
+        bind:navigateTarget={fileManagerNavigateTarget}
         onWorkspaceChange={handleWorkspaceChange}
         onSelectFiles={handleSelectFiles}
         onClose={toggleWorkspacePanel}

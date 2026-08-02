@@ -836,6 +836,10 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self._handle_search_sessions()
         elif path == "/v1/sessions/events":
             self._handle_sessions_events()
+        elif re.match(r"^/v1/sessions/[^/]+/log-dir$", path):
+            # GET /v1/sessions/{session_id}/log-dir — 返回该会话日志目录的绝对路径
+            session_id = path[len("/v1/sessions/"):-len("/log-dir")]
+            self._handle_session_log_dir(urllib.parse.unquote(session_id))
         elif re.match(r"^/v1/sessions/[^/]+$", path):
             session_id = path[len("/v1/sessions/"):]
             self._handle_get_session(session_id)
@@ -1882,6 +1886,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                     agents_md = build_agents_markdown(
                         agent_ids,
                         self.server.agent_manager,  # type: ignore[attr-defined]
+                        include_user_row=True,
                     )
                     default_prompt = _GC_DEFAULT_PROMPT.replace("{{AGENTS}}", agents_md)
                     body["messages"] = [{"role": "system", "content": default_prompt}] + msgs
@@ -2032,37 +2037,25 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                         break
 
         # --- AGENTS 占位符（talk_to 专用）---
+        # 调度清单：排除请求主体自己，只列出可 talk_to 的目标 agent
         if has_talk_to and agent_ids:
+            from runtime.group_chat import build_agents_markdown
             agent_manager = self.server.agent_manager  # type: ignore[attr-defined]
-            if assembled_messages:
-                rows = []
-                for aid in agent_ids:
-                    agent = agent_manager.get(aid) if agent_manager else None
-                    if agent is None:
-                        continue
-                    nickname = agent.get("nickname", aid)
-                    desc = (agent.get("description") or "").replace("\n", " ")
-                    rows.append((nickname, aid, desc))
-
-                if rows:
-                    lines = [
-                        "| Nickname | Agent ID | Description |",
-                        "| --- | --- | --- |",
-                    ]
-                    for nick, aid, desc in rows:
-                        lines.append(f"| {nick} | {aid} | {desc} |")
-                    agents_markdown = "\n".join(lines)
-
-                    for msg in assembled_messages:
-                        if msg.role == "system":
-                            if "{{AGENTS}}" in (msg.content or ""):
-                                msg.content = msg.content.replace("{{AGENTS}}", agents_markdown)
-                            else:
-                                if msg.arguments is None:
-                                    msg.arguments = {}
-                                if not msg.arguments.get("AGENTS"):
-                                    msg.arguments["AGENTS"] = agents_markdown
-                            break
+            agents_markdown = build_agents_markdown(
+                agent_ids, agent_manager,
+                exclude_agent_id=primary_agent_id,
+            )
+            if agents_markdown and assembled_messages:
+                for msg in assembled_messages:
+                    if msg.role == "system":
+                        if "{{AGENTS}}" in (msg.content or ""):
+                            msg.content = msg.content.replace("{{AGENTS}}", agents_markdown)
+                        else:
+                            if msg.arguments is None:
+                                msg.arguments = {}
+                            if not msg.arguments.get("AGENTS"):
+                                msg.arguments["AGENTS"] = agents_markdown
+                        break
 
         request = InferenceRequest(
             model_id=body["model_id"],
@@ -3418,6 +3411,23 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self._send_json_error(400, f"Invalid conversation format: {exc}")
             return
         self._send_json_response(200, data)
+
+    def _handle_session_log_dir(self, session_id: str) -> None:
+        """GET /v1/sessions/{session_id}/log-dir — 返回该会话日志目录的绝对路径。
+
+        该路径即 conversation.json 所在目录（DATA_DIR/chat_data/{session_id}），
+        用于前端文件管理器直接定位到该目录。
+        """
+        session_manager = self.server.session_manager  # type: ignore[attr-defined]
+        try:
+            path = session_manager.session_dir(session_id)
+        except FileNotFoundError:
+            self._send_json_error(404, f"Session not found: {session_id}")
+            return
+        except ValueError as exc:
+            self._send_json_error(400, str(exc))
+            return
+        self._send_json_response(200, {"path": path, "session_id": session_id})
 
     def _handle_mark_session_read(self, session_id: str) -> None:
         """POST /v1/sessions/{session_id}/read — 将指定会话标记为已读。"""

@@ -20,6 +20,7 @@
   let { 
     open = $bindable(false),
     workspacePath = $bindable(''),
+    navigateTarget = $bindable(null),
     onWorkspaceChange,
     onSelectFiles,
     onClose
@@ -248,7 +249,7 @@
       }
       if (!treeInitialized) {
         treeInitialized = true
-        initTree(workspacePath)
+        ensureTreeInit(workspacePath)
       }
     }
 
@@ -267,8 +268,10 @@
     // 面板关闭时不再重置 treeInitialized，保留树状态以便再次打开时即时显示
   })
 
-  // 加载文件列表
+  // 加载文件列表（带请求序号守卫，避免快速导航时旧响应覆盖新目录）
+  let loadSeq = 0
   async function loadFiles(dirPath, append = false) {
+    const seq = ++loadSeq
     loading = true
     error = ''
     try {
@@ -276,6 +279,7 @@
         sort: getSortMode(),
         nameFilter: nameFilterQuery.trim(),
       })
+      if (seq !== loadSeq) return  // 过期响应，丢弃
       
       if (append) {
         files = [...files, ...data.files]
@@ -284,9 +288,10 @@
       }
       hasMore = data.has_more
     } catch (err) {
+      if (seq !== loadSeq) return
       error = err.message
     } finally {
-      loading = false
+      if (seq === loadSeq) loading = false
     }
   }
 
@@ -300,6 +305,7 @@
   }
 
   // 初始化目录树：从根节点逐级展开到工作区路径
+  let treeInitPromise = null
   async function initTree(wsPath) {
     treeNodes = []
     // 1. 加载根节点（Windows 下可能是多个盘符，Unix 下是 ['/']）
@@ -403,6 +409,20 @@
     })
   }
 
+  // 确保目录树已初始化（并发去重：同一批次多次触发只执行一次 initTree）
+  function ensureTreeInit(wsPath) {
+    if (treeInitialized && treeNodes.length > 0) return Promise.resolve()
+    if (treeInitPromise) return treeInitPromise
+    treeInitPromise = (async () => {
+      try {
+        await initTree(wsPath)
+      } finally {
+        treeInitPromise = null
+      }
+    })()
+    return treeInitPromise
+  }
+
   // 判断节点是否已有子节点（已加载过）
   function hasChildrenLoaded(nodeIdx) {
     if (nodeIdx >= treeNodes.length - 1) return false
@@ -417,7 +437,7 @@
   // 增量导航到新工作区路径：复用已加载的树节点，仅加载缺失的层级
   async function navigateTreeToPath(wsPath) {
     if (treeNodes.length === 0) {
-      return initTree(wsPath)
+      return ensureTreeInit(wsPath)
     }
 
     const normalizedWs = wsPath.replace(/\\/g, '/').toLowerCase()
@@ -498,6 +518,108 @@
     })
   }
 
+  // 展开目录树到任意目录（不改变 workspace 标记，仅展开路径节点）
+  // 用于从会话日志目录等外部路径进入时，让左侧列表与右侧树保持一致
+  async function expandTreeToPath(dirPath) {
+    if (!dirPath) return
+    if (treeNodes.length === 0) {
+      await ensureTreeInit(workspacePath)
+      if (treeNodes.length === 0) return
+    }
+
+    const normalizedDir = dirPath.replace(/\\/g, '/').toLowerCase()
+
+    // 找到包含目标路径的根节点
+    const rootIdx = treeNodes.findIndex(n => {
+      const normalizedRoot = n.path.replace(/\\/g, '/').toLowerCase().replace(/\/$/, '')
+      return normalizedDir === normalizedRoot || normalizedDir.startsWith(normalizedRoot + '/')
+    })
+    if (rootIdx === -1) return
+
+    // 确保根节点已展开且子节点已加载
+    const root = treeNodes[rootIdx]
+    root.expanded = true
+    if (!hasChildrenLoaded(rootIdx)) {
+      try {
+        const children = await workspaceApi.children(root.path)
+        insertChildren(rootIdx, root.path, children, workspacePath)
+      } catch { return }
+    }
+
+    const normalizedRootPath = root.path.replace(/\\/g, '/').replace(/\/$/, '')
+    const relative = normalizedDir.startsWith(normalizedRootPath.toLowerCase())
+      ? dirPath.replace(/\\/g, '/').slice(normalizedRootPath.length)
+      : dirPath.replace(/\\/g, '/')
+    const segments = relative.split('/').filter(Boolean)
+
+    let parentPath = root.path
+    let parentIdx = rootIdx
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i]
+      const segPath = childPath(parentPath, seg)
+
+      let nodeIdx = treeNodes.findIndex(n => pathsEqual(n.path, segPath))
+      if (nodeIdx === -1) {
+        // 节点不在树中，重新加载父节点的子节点
+        try {
+          const subChildren = await workspaceApi.children(parentPath)
+          insertChildren(parentIdx, parentPath, subChildren, workspacePath)
+        } catch { break }
+        nodeIdx = treeNodes.findIndex(n => pathsEqual(n.path, segPath))
+        if (nodeIdx === -1) break
+      }
+
+      treeNodes[nodeIdx].expanded = true
+
+      // 加载子节点（如果尚未加载）
+      if (!hasChildrenLoaded(nodeIdx)) {
+        try {
+          const subChildren = await workspaceApi.children(segPath)
+          insertChildren(nodeIdx, segPath, subChildren, workspacePath)
+        } catch { break }
+      }
+
+      parentPath = segPath
+      parentIdx = nodeIdx
+    }
+
+    treeNodes = [...treeNodes]
+
+    // 滚动到当前激活节点
+    requestAnimationFrame(() => {
+      const activeNode = document.querySelector('.tree-node.active')
+      if (activeNode) {
+        activeNode.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      }
+    })
+  }
+
+  // 导航到指定目录：切换左侧列表并展开右侧目录树
+  function navigateToDirectory(dirPath) {
+    if (!dirPath) return
+    closePreview()
+    searchMode = false
+    searchOpen = false
+    searchQuery = ''
+    searchResults = []
+    selectedFiles.clear()
+    selectedFiles = new Set(selectedFiles)
+    currentPath = dirPath
+    page = 1
+    hasMore = true
+    loadFiles(dirPath)
+    expandTreeToPath(dirPath)
+  }
+
+  // 外部导航请求：{ path, token }，token 变化时触发导航（支持重复打开同一目录）
+  let lastNavigateToken = 0
+  $effect(() => {
+    const target = navigateTarget
+    if (!target || !target.path || target.token === lastNavigateToken) return
+    lastNavigateToken = target.token
+    navigateToDirectory(target.path)
+  })
+
   // 在父节点后插入子节点
   function insertChildren(parentIdx, parentPath, children, wsPath) {
     const parentNode = treeNodes[parentIdx]
@@ -572,6 +694,7 @@
     loadFiles(dirPath)
     onWorkspaceChange?.(dirPath)
     // 重新初始化树
+    treeInitPromise = null
     treeInitialized = false
     treeNodes = []
   }

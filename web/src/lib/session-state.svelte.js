@@ -25,3 +25,8 @@ export const sessionDeleted = $state({ sessionId: null })
 export const terminalOpen = $state({ sessionId: null, token: 0 })
 // sessionId: string | null — 要打开终端的会话 ID
 // token: number — 每次点击递增，确保重复打开也能响应
+
+// 会话日志目录打开请求：Sidebar 菜单触发，ChatPage 监听并打开文件管理器导航到该目录
+export const openSessionLogDir = $state({ path: null, token: 0 })
+// path: string | null — 会话日志目录（conversation.json 所在目录）的绝对路径
+// token: number — 每次点击递增，确保重复打开也能响应
