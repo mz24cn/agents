@@ -12,14 +12,14 @@ description: 通过本地 Agent Service HTTP server 管理模型、工具、MCP�
 每次调用前先解析 base URL。支持以下环境变量：
 
 - `RUNTIME_SERVER_URL`：完整地址，优先级最高，例如 `http://127.0.0.1:7988`
-- `AGENT_SERVER_URL`：完整地址，次优先级
+- `AGENTS_URL`：完整地址，次优先级
 - `RUNTIME_SERVER_HOST`：host，默认 `127.0.0.1`
 - `RUNTIME_SERVER_PORT`：port，默认 `7988`
 
 推荐在命令行中使用：
 
 ```bash
-SERVER_URL="${RUNTIME_SERVER_URL:-${AGENT_SERVER_URL:-http://${RUNTIME_SERVER_HOST:-127.0.0.1}:${RUNTIME_SERVER_PORT:-7988}}}"
+SERVER_URL="${RUNTIME_SERVER_URL:-${AGENTS_URL:-http://${RUNTIME_SERVER_HOST:-127.0.0.1}:${RUNTIME_SERVER_PORT:-7988}}}"
 echo "SERVER_URL=$SERVER_URL"
 curl -fsS "$SERVER_URL/v1/models" | python -m json.tool
 ```
@@ -27,7 +27,7 @@ curl -fsS "$SERVER_URL/v1/models" | python -m json.tool
 如需复用，可定义 helper：
 
 ```bash
-SERVER_URL="${RUNTIME_SERVER_URL:-${AGENT_SERVER_URL:-http://${RUNTIME_SERVER_HOST:-127.0.0.1}:${RUNTIME_SERVER_PORT:-7988}}}"
+SERVER_URL="${RUNTIME_SERVER_URL:-${AGENTS_URL:-http://${RUNTIME_SERVER_HOST:-127.0.0.1}:${RUNTIME_SERVER_PORT:-7988}}}"
 api_get() { curl -fsS "$SERVER_URL$1"; }
 api_json() { method="$1"; path="$2"; data="$3"; curl -fsS -X "$method" "$SERVER_URL$path" -H 'Content-Type: application/json' -d "$data"; }
 ```
@@ -90,7 +90,7 @@ api_json() { method="$1"; path="$2"; data="$3"; curl -fsS -X "$method" "$SERVER_
 ### 列出模型
 
 ```bash
-SERVER_URL="${RUNTIME_SERVER_URL:-${AGENT_SERVER_URL:-http://${RUNTIME_SERVER_HOST:-127.0.0.1}:${RUNTIME_SERVER_PORT:-7988}}}"
+SERVER_URL="${RUNTIME_SERVER_URL:-${AGENTS_URL:-http://${RUNTIME_SERVER_HOST:-127.0.0.1}:${RUNTIME_SERVER_PORT:-7988}}}"
 curl -fsS "$SERVER_URL/v1/models" | python -m json.tool
 ```
 
@@ -99,7 +99,7 @@ curl -fsS "$SERVER_URL/v1/models" | python -m json.tool
 必需字段：`model_id`、`api_base`、`model_name`。可选字段：`api_key`、`api_protocol`（通常 `openai` 或 `ollama`）、`generate_params`、`labels`（如 `["vlm"]` 表示视觉语言模型）。
 
 ```bash
-SERVER_URL="${RUNTIME_SERVER_URL:-${AGENT_SERVER_URL:-http://${RUNTIME_SERVER_HOST:-127.0.0.1}:${RUNTIME_SERVER_PORT:-7988}}}"
+SERVER_URL="${RUNTIME_SERVER_URL:-${AGENTS_URL:-http://${RUNTIME_SERVER_HOST:-127.0.0.1}:${RUNTIME_SERVER_PORT:-7988}}}"
 curl -fsS -X POST "$SERVER_URL/v1/models" \
   -H 'Content-Type: application/json' \
   -d @- <<'JSON' | python -m json.tool
@@ -117,7 +117,7 @@ JSON
 ### 注册 Ollama 模型
 
 ```bash
-SERVER_URL="${RUNTIME_SERVER_URL:-${AGENT_SERVER_URL:-http://${RUNTIME_SERVER_HOST:-127.0.0.1}:${RUNTIME_SERVER_PORT:-7988}}}"
+SERVER_URL="${RUNTIME_SERVER_URL:-${AGENTS_URL:-http://${RUNTIME_SERVER_HOST:-127.0.0.1}:${RUNTIME_SERVER_PORT:-7988}}}"
 curl -fsS -X POST "$SERVER_URL/v1/models" \
   -H 'Content-Type: application/json' \
   -d @- <<'JSON' | python -m json.tool
@@ -515,7 +515,7 @@ curl -fsS -X DELETE "$SERVER_URL/v1/agents/<agent_id>" | python -m json.tool
 ### 任务：检查 server 是否可用
 
 ```bash
-SERVER_URL="${RUNTIME_SERVER_URL:-${AGENT_SERVER_URL:-http://${RUNTIME_SERVER_HOST:-127.0.0.1}:${RUNTIME_SERVER_PORT:-7988}}}"
+SERVER_URL="${RUNTIME_SERVER_URL:-${AGENTS_URL:-http://${RUNTIME_SERVER_HOST:-127.0.0.1}:${RUNTIME_SERVER_PORT:-7988}}}"
 if curl -fsS "$SERVER_URL/v1/models" >/tmp/runtime_models.json; then
   echo "OK: $SERVER_URL"
   python -m json.tool </tmp/runtime_models.json
@@ -528,7 +528,7 @@ fi
 ### 任务：注册当前 Skill
 
 ```bash
-SERVER_URL="${RUNTIME_SERVER_URL:-${AGENT_SERVER_URL:-http://${RUNTIME_SERVER_HOST:-127.0.0.1}:${RUNTIME_SERVER_PORT:-7988}}}"
+SERVER_URL="${RUNTIME_SERVER_URL:-${AGENTS_URL:-http://${RUNTIME_SERVER_HOST:-127.0.0.1}:${RUNTIME_SERVER_PORT:-7988}}}"
 SKILL_DIR="$(pwd)/examples/skill"
 python - <<PY | curl -fsS -X POST "$SERVER_URL/v1/tools/skill" -H 'Content-Type: application/json' -d @- | python -m json.tool
 import json, os
@@ -539,7 +539,7 @@ PY
 ### 任务：一次性查看所有可操作资源
 
 ```bash
-SERVER_URL="${RUNTIME_SERVER_URL:-${AGENT_SERVER_URL:-http://${RUNTIME_SERVER_HOST:-127.0.0.1}:${RUNTIME_SERVER_PORT:-7988}}}"
+SERVER_URL="${RUNTIME_SERVER_URL:-${AGENTS_URL:-http://${RUNTIME_SERVER_HOST:-127.0.0.1}:${RUNTIME_SERVER_PORT:-7988}}}"
 for path in /v1/models /v1/tools /v1/mcp-servers /v1/prompt-templates /v1/env /v1/sessions /v1/agents; do
   echo "===== $path ====="
   curl -fsS "$SERVER_URL$path" | python -m json.tool || true

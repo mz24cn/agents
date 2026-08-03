@@ -15,9 +15,9 @@ from runtime.builtin_tools import _read_file
 @pytest.fixture
 def workspace(tmp_path):
     """Create a temporary workspace directory."""
-    os.environ["AGENT_WORKSPACE"] = str(tmp_path)
+    os.environ["AGENTS_WORKSPACE"] = str(tmp_path)
     yield tmp_path
-    os.environ.pop("AGENT_WORKSPACE", None)
+    os.environ.pop("AGENTS_WORKSPACE", None)
 
 
 class TestReadFileOutputLimits:

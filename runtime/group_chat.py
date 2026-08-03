@@ -148,8 +148,9 @@ def _count_missed_rounds(agent_id: str, turns: list) -> int:
     """
     missed = 0
     for turn in turns:
-        if turn.role == "user":
-            mentions: Optional[list[str]] = getattr(turn, "mentions", None)
+        msg = _message_from_turn(turn)
+        if msg.role == "user":
+            mentions = msg.mentions
             if mentions and agent_id not in mentions:
                 missed += 1
     return missed
@@ -196,6 +197,30 @@ def _message_from_turn(turn) -> Message:
 # tell it apart from real user speech (it must NOT get a "**用户** (user): "
 # identity prefix).
 _CATCH_UP_TAG = "@catch_up"
+
+# Marker used on round-2+ trigger messages (the assistant @-mention replies
+# that pulled an agent into the conversation). They are re-presented as a
+# user message with the *mentioning agent's* identity prefix already baked in,
+# so _normalize_for_model must not prepend the "**用户** (user): " prefix.
+_TRIGGER_TAG = "@trigger"
+
+
+def _trigger_to_user_message(msgs: list[Message]) -> Message:
+    """Build the 'current message' for a round-2+ participant from the
+    assistant replies that @-mentioned it.
+
+    Mirrors how a user message that @-mentions an agent drives round 1: the
+    triggered agent sees exactly the replies that pulled it in, prefixed with
+    each author's identity (``**nickname** (agent_id): ...``). Tagged with
+    ``_TRIGGER_TAG`` so ``_normalize_for_model`` skips the user prefix.
+    """
+    parts = []
+    for m in msgs:
+        nick = getattr(m, "name", None) or getattr(m, "agent_id", "") or ""
+        aid = getattr(m, "agent_id", "") or ""
+        body = (m.content or "").strip()
+        parts.append(f"**{nick}** ({aid}): {body}")
+    return Message(role="user", content="\n\n".join(parts), name=_TRIGGER_TAG)
 
 
 def _tool_call_name(tc) -> str:
@@ -323,8 +348,10 @@ def _normalize_for_model(messages: list[Message], agent_id: str) -> list[Message
                 content = msg.content or ""
             else:
                 # Real user message — tag with the user identity declared in
-                # the AGENTS markdown (用户/user). The catch-up note is exempt.
-                if getattr(msg, "name", None) == _CATCH_UP_TAG:
+                # the AGENTS markdown (用户/user). The catch-up note and the
+                # round-2+ trigger message are exempt (they already carry
+                # their own identity, or none).
+                if getattr(msg, "name", None) in (_CATCH_UP_TAG, _TRIGGER_TAG):
                     content = msg.content or ""
                 else:
                     raw_content = (msg.content or "").strip()
@@ -463,7 +490,7 @@ def assemble_agent_context(
             continue
         # If this is a user message with explicit mentions that exclude this agent,
         # add a lightweight marker
-        turn_mentions: Optional[list[str]] = getattr(turn, "mentions", None)
+        turn_mentions: Optional[list[str]] = msg.mentions
         if turn_mentions and msg.role == "user" and agent_id not in turn_mentions:
             msg.content = f"[群聊] {msg.content}"
         messages.append(msg)
@@ -562,16 +589,12 @@ def run_group_chat_stream(
 
     while pending_mentioned and round_num < max_rounds:
         round_num += 1
+        # Populated at the END of each round: agent_id -> the assistant
+        # replies that @-mentioned it (drives round 2+ as the "current
+        # message", mirroring user @-mentions driving round 1).
+        trigger_msgs: dict[str, list[Message]] = {}
         for aid in pending_mentioned:
             processed_agent_ids.add(aid)
-
-        # --- current-user message for this round ---------------------------
-        cur_user_msg: Optional[Message]
-        if round_num == 1 and first_user_msg:
-            cur_user_msg = first_user_msg
-        else:
-            # Round 2+: the trigger is assistant @-mentions, no user message.
-            cur_user_msg = None
 
         # --- per-agent runner (closes over this round's state) -------------
         def _run_one(agent_id: str) -> tuple[str, list[Message]]:
@@ -590,8 +613,33 @@ def run_group_chat_stream(
             agent_model_id: str = agent.get("model_id", model_id)
             agent_tool_ids: list[str] = agent.get("tool_ids", tool_ids)
 
+            # --- current message for THIS agent ----------------------------
+            # Round 1: the user's message. Round 2+: the assistant replies
+            # that @-mentioned this agent (presented like a user message, so
+            # the agent knows exactly what pulled it in).
+            trigger_list = trigger_msgs.get(agent_id) if round_num > 1 else None
+            cur_user_msg: Optional[Message]
+            if round_num == 1:
+                cur_user_msg = first_user_msg
+            elif trigger_list:
+                cur_user_msg = _trigger_to_user_message(trigger_list)
+            else:
+                cur_user_msg = None
+
+            # Exclude the trigger replies from the replayed history — they are
+            # now the current message, so the agent must not see them twice.
+            agent_turns = existing_turns
+            if trigger_list:
+                trigger_pairs = {(m.agent_id, m.content or "") for m in trigger_list}
+                agent_turns = [
+                    t for t in existing_turns
+                    if not (t.get("role") == "assistant"
+                            and (t.get("agent_id"), t.get("content") or "")
+                            in trigger_pairs)
+                ]
+
             agent_messages = assemble_agent_context(
-                agent_id, agent, existing_turns, cur_user_msg,
+                agent_id, agent, agent_turns, cur_user_msg,
                 agents_markdown=agents_markdown,
             )
 
@@ -604,14 +652,83 @@ def run_group_chat_stream(
             )
 
             collected: list[Message] = []
+            asst_buf: list[Message] = []  # incremental assistant chunks
+
+            def _flush_asst() -> None:
+                """Merge buffered incremental assistant chunks into ONE
+                complete assistant Message (so @-mention parsing and the
+                in-memory turns see full text, not token deltas)."""
+                if not asst_buf:
+                    return
+                content = "".join(m.content or "" for m in asst_buf)
+                thinking = "".join(m.thinking or "" for m in asst_buf) or None
+                tool_calls: list[dict] = []
+                by_idx: dict[int, dict] = {}
+                for m in asst_buf:
+                    for tc in (m.tool_calls or []):
+                        if not isinstance(tc, dict):
+                            continue
+                        idx = tc.get("_index")
+                        if idx is None:
+                            tool_calls.append(dict(tc))
+                            continue
+                        target = by_idx.setdefault(
+                            int(idx), {"id": "", "name": "", "arguments": ""})
+                        if tc.get("id"):
+                            target["id"] = tc["id"]
+                        if tc.get("tool_use_id"):
+                            target["id"] = tc["tool_use_id"]
+                        if tc.get("name"):
+                            target["name"] = target.get("name", "") + tc["name"]
+                        if tc.get("arguments"):
+                            if isinstance(tc["arguments"], dict):
+                                target["arguments"] = tc["arguments"]
+                            else:
+                                target["arguments"] = (target.get("arguments", "")
+                                                       + tc["arguments"])
+                for idx in sorted(by_idx):
+                    tool_calls.append(by_idx[idx])
+                # Drop _index so merge_stream_messages treats them as complete.
+                for tc in tool_calls:
+                    tc.pop("_index", None)
+
+                ts = None
+                for m in asst_buf:
+                    if m.timestamp:
+                        ts = m.timestamp
+                        break
+                full = Message(
+                    role="assistant",
+                    content=content,
+                    thinking=thinking,
+                    tool_calls=tool_calls or None,
+                    timestamp=ts,
+                    agent_id=agent_id,
+                    name=nickname,
+                )
+                # Tag with valid @-mentions (same treatment as user messages:
+                # only mentions that resolve to a participant count).
+                if content:
+                    parsed = parse_mentions(content)
+                    if parsed:
+                        resolved = resolve_mentions(
+                            parsed, agent_manager, all_agent_ids)
+                        if resolved:
+                            full.mentions = resolved
+                collected.append(full)
+                asst_buf.clear()
+
             try:
                 for msg in runtime.infer_stream(request,
                                                 cancel_event=cancel_event):
                     msg.agent_id = agent_id
                     if msg.role == "assistant":
                         msg.name = nickname
-
-                    collected.append(msg)
+                        asst_buf.append(msg)
+                    else:
+                        # tool/usage messages flush the pending assistant text
+                        _flush_asst()
+                        collected.append(msg)
 
                     # SSE: skip delegate/talk_to tool frames (self-managing).
                     if msg.role == "tool" and msg.name in ("delegate",
@@ -635,6 +752,7 @@ def run_group_chat_stream(
                     name=nickname,
                 )
                 collected.append(error_msg)
+                asst_buf.clear()
                 if sse_callback:
                     try:
                         frame = error_msg.to_dict()
@@ -643,6 +761,7 @@ def run_group_chat_stream(
                     except Exception:
                         pass
 
+            _flush_asst()
             return (agent_id, collected)
 
         # --- parallel execution for this round ----------------------------
@@ -659,7 +778,11 @@ def run_group_chat_stream(
         all_collected.extend(round_collected)
 
         # Accumulate into in-memory turns so the next round sees them.
+        # usage/stat messages are excluded — they are metadata for
+        # merge_stream_messages, never conversation content.
         for msg in round_collected:
+            if msg.role == "usage":
+                continue
             existing_turns.append({
                 "role": msg.role,
                 "content": msg.content or "",
@@ -668,10 +791,13 @@ def run_group_chat_stream(
                 "agent_id": getattr(msg, "agent_id", None),
                 "thinking": getattr(msg, "thinking", None),
                 "stat": getattr(msg, "stat", None),
+                "mentions": getattr(msg, "mentions", None),
+                "tool_calls": getattr(msg, "tool_calls", None),
             })
 
-        # Scan assistant messages for @-mentions that target unprocessed agents.
-        new_mentions: list[str] = []
+        # Scan assistant messages (now complete, aggregated messages) for
+        # @-mentions that target unprocessed agents — exactly like user
+        # messages drive round 1.
         for msg in round_collected:
             if msg.role != "assistant" or not msg.content:
                 continue
@@ -681,8 +807,8 @@ def run_group_chat_stream(
             resolved = resolve_mentions(parsed, agent_manager, all_agent_ids)
             for aid in resolved:
                 if aid not in processed_agent_ids:
-                    new_mentions.append(aid)
+                    trigger_msgs.setdefault(aid, []).append(msg)
 
-        pending_mentioned = new_mentions
+        pending_mentioned = list(trigger_msgs.keys())
 
     return all_collected

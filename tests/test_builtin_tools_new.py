@@ -5,7 +5,7 @@ This file covers:
 
 Test infrastructure:
   - `workspace` fixture: temporary directory with git init + initial commit
-    and AGENT_WORKSPACE environment variable set.
+    and AGENTS_WORKSPACE environment variable set.
 """
 
 import json
@@ -37,7 +37,7 @@ def workspace(monkeypatch, tmp_path):
     2. Run `git init` inside it.
     3. Configure git user name and email (required for commits).
     4. Create an initial README commit so the repo has at least one commit.
-    5. Set the AGENT_WORKSPACE environment variable to the temp dir path.
+    5. Set the AGENTS_WORKSPACE environment variable to the temp dir path.
     6. Yield the Path object for use in tests.
     7. Cleanup is handled automatically by tmp_path.
     """
@@ -66,7 +66,7 @@ def workspace(monkeypatch, tmp_path):
     )
 
     # Expose the workspace path via environment variable
-    monkeypatch.setenv("AGENT_WORKSPACE", str(ws))
+    monkeypatch.setenv("AGENTS_WORKSPACE", str(ws))
 
     yield ws
 
@@ -1400,7 +1400,7 @@ class TestUndoUnit:
     """Unit tests for _undo()."""
 
     def test_no_session_journal_returns_error(self, monkeypatch, workspace):
-        monkeypatch.setenv("AGENT_WORKSPACE", str(workspace))
+        monkeypatch.setenv("AGENTS_WORKSPACE", str(workspace))
         monkeypatch.setattr(_thread_local, "session_dir", None, raising=False)
 
         result = _json.loads(_undo())

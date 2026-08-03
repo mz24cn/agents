@@ -62,7 +62,7 @@ def test_setup_payload_exports_auth_token_json(tmp_path) -> None:
 
 
 def test_setup_payload_exports_env_json_when_requested(tmp_path, monkeypatch) -> None:
-    monkeypatch.delenv("AGENT_WORKSPACE", raising=False)
+    monkeypatch.delenv("AGENTS_WORKSPACE", raising=False)
     payload, _auth_data, env_data = _build_payload(tmp_path, include_env=True)
 
     exported_env = _read_payload_file(payload, "agents_runtime/env.json")

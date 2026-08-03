@@ -418,7 +418,7 @@ def call_mcp_ocr_tool(tool_name: str, arguments: dict) -> dict:
     Returns:
         工具调用结果字典
     """
-    agent_service_url = os.getenv("AGENT_SERVICE_URL", "http://localhost:7988")
+    agent_service_url = os.getenv("AGENTS_URL", "http://localhost:7988")
     url = f"{agent_service_url}/v1/tools/call"
 
     payload = {

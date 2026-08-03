@@ -108,7 +108,7 @@ def call_mcp_ocr_tool(tool_name: str, arguments: dict) -> dict:
         工具调用结果字典
     """
     # 方式1: 通过 MCP 协议调用
-    agent_service_url = os.getenv("AGENT_SERVICE_URL", "http://localhost:7988")
+    agent_service_url = os.getenv("AGENTS_URL", "http://localhost:7988")
     
     # 尝试通过 Agent Service 的 MCP 代理调用
     url = f"{agent_service_url}/v1/tools/call"

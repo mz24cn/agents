@@ -66,7 +66,7 @@ def _get_infer_round_timeout() -> Optional[float]:
 # each protocol adapter to set its own UA. Protocol-level User-Agent
 # values, if any, take precedence (see setdefault below).
 _DEFAULT_USER_AGENT = os.environ.get(
-    "AGENT_SERVICE_USER_AGENT",
+    "AGENTS_USER_AGENT",
     "Mozilla/5.0 (compatible; AgentService/1.0)",
 )
 

@@ -538,14 +538,14 @@ def get_workspace() -> str:
 
     Resolution order:
     1. ``_thread_local.workspace`` (set per-request via ``set_request_context``)
-    2. ``AGENT_WORKSPACE`` environment variable
+    2. ``AGENTS_WORKSPACE`` environment variable
     3. ``os.getcwd()``
 
     The result is always ``os.path.realpath``'d.
     """
     raw = getattr(_thread_local, "workspace", "") or ""
     if not raw:
-        raw = os.environ.get("AGENT_WORKSPACE", "") or ""
+        raw = os.environ.get("AGENTS_WORKSPACE", "") or ""
     if not raw:
         raw = os.getcwd()
     return os.path.realpath(raw)

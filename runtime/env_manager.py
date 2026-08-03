@@ -47,9 +47,9 @@ class EnvManager:
         """
         if not os.path.isfile(self._env_path):
             result: dict[str, str] = {}
-            workspace = os.environ.get("AGENT_WORKSPACE", "")
+            workspace = os.environ.get("AGENTS_WORKSPACE", "")
             if workspace:
-                result["AGENT_WORKSPACE"] = workspace
+                result["AGENTS_WORKSPACE"] = workspace
             return result
         try:
             with open(self._env_path, "r", encoding="utf-8") as fh:
@@ -64,10 +64,10 @@ class EnvManager:
                 f"env.json 内容必须是 JSON 对象，实际类型: {type(data).__name__}"
             )
         result = {str(k): str(v) for k, v in data.items()}
-        if "AGENT_WORKSPACE" not in result:
-            workspace = os.environ.get("AGENT_WORKSPACE", "")
+        if "AGENTS_WORKSPACE" not in result:
+            workspace = os.environ.get("AGENTS_WORKSPACE", "")
             if workspace:
-                result["AGENT_WORKSPACE"] = workspace
+                result["AGENTS_WORKSPACE"] = workspace
         return result
 
     def set(self, key: str, value: str) -> dict[str, str]:
@@ -332,54 +332,63 @@ class EnvManager:
         return r"""#!/bin/sh
 set -eu
 
-AGENT_SERVICE_HOME="$PWD/agents"
+AGENTS_HOME="$PWD/agents"
 : "${AGENTS_RUNTIME_DIR:=$HOME/.agents_runtime}"
-: "${AGENT_SERVICE_PORT:=7988}"
-: "${START_AGENT_SERVICE:=background}"
+: "${AGENTS_PORT:=7988}"
+: "${START_AGENTS:=background}"
 
 TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/agent-service-setup.XXXXXX")
 cleanup() { rm -rf "$TMPDIR"; }
 trap cleanup EXIT INT TERM
 
 echo "Extracting agent service package..." >&2
-base64 -d > "$TMPDIR/payload.tar.gz" <<'__AGENT_SERVICE_TAR_GZ_BASE64__'
+base64 -d > "$TMPDIR/payload.tar.gz" <<'__AGENTS_TAR_GZ_BASE64__'
 """ + encoded_payload + """
-__AGENT_SERVICE_TAR_GZ_BASE64__
+__AGENTS_TAR_GZ_BASE64__
 mkdir -p "$TMPDIR/payload"
 tar -xzf "$TMPDIR/payload.tar.gz" -C "$TMPDIR/payload"
 find "$TMPDIR/payload" -type l -exec rm -f {} \\;
 
-mkdir -p "$AGENT_SERVICE_HOME" "$AGENTS_RUNTIME_DIR"
-rm -rf "$AGENT_SERVICE_HOME/web/dist"
-[ ! -d "$TMPDIR/payload/app" ] || tar -C "$TMPDIR/payload/app" -cf - . | tar -C "$AGENT_SERVICE_HOME" -xf -
+mkdir -p "$AGENTS_HOME" "$AGENTS_RUNTIME_DIR"
+rm -rf "$AGENTS_HOME/web/dist"
+[ ! -d "$TMPDIR/payload/app" ] || tar -C "$TMPDIR/payload/app" -cf - . | tar -C "$AGENTS_HOME" -xf -
 [ ! -d "$TMPDIR/payload/agents_runtime" ] || tar -C "$TMPDIR/payload/agents_runtime" -cf - . | tar -C "$AGENTS_RUNTIME_DIR" -xf -
 
 cat > "$PWD/start-agent-service.sh" <<'SH'
 #!/bin/sh
 set -eu
-: "${AGENT_SERVICE_PORT:=7988}"
+: "${AGENTS_PORT:=7988}"
 : "${AGENTS_RUNTIME_DIR:=$HOME/.agents_runtime}"
-: "${AGENT_SERVICE_LOG:=$AGENTS_RUNTIME_DIR/server.log}"
-: "${START_AGENT_SERVICE:=background}"
-export AGENTS_RUNTIME_DIR AGENT_SERVICE_LOG
+: "${AGENTS_LOG:=$AGENTS_RUNTIME_DIR/server.log}"
+: "${START_AGENTS:=background}"
+export AGENTS_RUNTIME_DIR AGENTS_LOG
 mkdir -p "$AGENTS_RUNTIME_DIR"
-AGENT_DIR="$(cd "$(dirname "$0")/agents" >/dev/null 2>&1 && pwd)"
+AGENTS_DIR="$(cd "$(dirname "$0")/agents" >/dev/null 2>&1 && pwd)"
 
-case "$START_AGENT_SERVICE" in
+case "$START_AGENTS" in
 background)
-  nohup python3 "$AGENT_DIR/app.py" "0.0.0.0:${AGENT_SERVICE_PORT}" >> "$AGENT_SERVICE_LOG" 2>&1 &
+  nohup python3 "$AGENTS_DIR/app.py" "0.0.0.0:${AGENTS_PORT}" >> "$AGENTS_LOG" 2>&1 &
   pid=$!
-  echo "$pid" > "$AGENTS_RUNTIME_DIR/server.pid"
+  # server.pid 由 app.py 在启动时写入（os.getpid()），这里等待其出现后读取，
+  # 确保返回的是 python 进程的真实 PID，且与 PID 文件内容一致。
+  _i=0
+  while [ ! -f "$AGENTS_RUNTIME_DIR/server.pid" ] && [ "$_i" -lt 60 ]; do
+    _i=$((_i + 1))
+    sleep 0.5 2>/dev/null || sleep 1
+  done
+  if [ -f "$AGENTS_RUNTIME_DIR/server.pid" ]; then
+    pid=$(cat "$AGENTS_RUNTIME_DIR/server.pid" 2>/dev/null || echo "$pid")
+  fi
   echo "$pid"
   ;;
 foreground)
-  exec python3 "$AGENT_DIR/app.py" "0.0.0.0:${AGENT_SERVICE_PORT}" 2>&1 | tee -a "$AGENT_SERVICE_LOG"
+  exec python3 "$AGENTS_DIR/app.py" "0.0.0.0:${AGENTS_PORT}" 2>&1 | tee -a "$AGENTS_LOG"
   ;;
 none)
   exit 0
   ;;
 *)
-  echo "Invalid START_AGENT_SERVICE=$START_AGENT_SERVICE. Expected: background, foreground, none" >&2
+  echo "Invalid START_AGENTS=$START_AGENTS. Expected: background, foreground, none" >&2
   exit 2
   ;;
 esac
@@ -415,40 +424,40 @@ rm -f "$pid_file"
 SH
 chmod +x "$PWD/stop-agent-service.sh"
 
-case "$START_AGENT_SERVICE" in
+case "$START_AGENTS" in
   background|foreground|none) ;;
-  true) START_AGENT_SERVICE=background ;;
-  false) START_AGENT_SERVICE=none ;;
+  true) START_AGENTS=background ;;
+  false) START_AGENTS=none ;;
   *)
-    echo "Invalid START_AGENT_SERVICE=$START_AGENT_SERVICE. Expected: background, foreground, none" >&2
+    echo "Invalid START_AGENTS=$START_AGENTS. Expected: background, foreground, none" >&2
     exit 2
     ;;
 esac
 
-AGENT_SERVICE_LOG="$AGENTS_RUNTIME_DIR/server.log"
-export AGENT_SERVICE_HOME AGENT_SERVICE_LOG
+AGENTS_LOG="$AGENTS_RUNTIME_DIR/server.log"
+export AGENTS_HOME AGENTS_LOG
 
 echo "Agent service installed:" >&2
-echo "  app:    $AGENT_SERVICE_HOME" >&2
+echo "  app:    $AGENTS_HOME" >&2
 echo "  config: $AGENTS_RUNTIME_DIR" >&2
-echo "  log:    $AGENT_SERVICE_LOG" >&2
+echo "  log:    $AGENTS_LOG" >&2
 
 if [ -d "$AGENTS_RUNTIME_DIR/patch" ]; then
   echo "Applying patch from $AGENTS_RUNTIME_DIR/patch..." >&2
-  cp -r "$AGENTS_RUNTIME_DIR/patch"/. "$AGENT_SERVICE_HOME"/ 2>/dev/null || true
+  cp -r "$AGENTS_RUNTIME_DIR/patch"/. "$AGENTS_HOME"/ 2>/dev/null || true
 fi
 
-case "$START_AGENT_SERVICE" in
+case "$START_AGENTS" in
   background)
     pid=$("$PWD/start-agent-service.sh")
     echo "Agent service started in background, pid: $pid" >&2
-    echo "Log: $AGENT_SERVICE_LOG" >&2
+    echo "Log: $AGENTS_LOG" >&2
     ;;
   foreground)
     "$PWD/start-agent-service.sh"
     ;;
   none)
-    echo "Agent service not started because START_AGENT_SERVICE=none" >&2
+    echo "Agent service not started because START_AGENTS=none" >&2
     ;;
 esac
 exit 0
@@ -463,39 +472,46 @@ exit 0
         - 文件拷贝用 robocopy 替代 tar 管道，Windows 兼容性更好
         """
         # ── start-agent-service.bat ──────────────────────────────
-        # 用 PowerShell Start-Process -PassThru 启动 cmd /c python，
-        # cmd.exe 负责 >> 重定向日志，Start-Process 返回 PID 写入 server.pid。
+        # 用 PowerShell Start-Process -PassThru 启动 cmd /c python（cmd 负责日志重定向），
+        # server.pid 由 app.py 在启动时写入 python 进程真实 PID，脚本等待其出现后读取。
         start_bat = (
             "@echo off\r\n"
             "setlocal enabledelayedexpansion\r\n"
-            "if not defined AGENT_SERVICE_PORT set AGENT_SERVICE_PORT=7988\r\n"
+            "if not defined AGENTS_PORT set AGENTS_PORT=7988\r\n"
             "if not defined AGENTS_RUNTIME_DIR set \"AGENTS_RUNTIME_DIR=%USERPROFILE%\\.agents_runtime\"\r\n"
-            "if not defined AGENT_SERVICE_LOG set \"AGENT_SERVICE_LOG=%AGENTS_RUNTIME_DIR%\\server.log\"\r\n"
-            "if not defined START_AGENT_SERVICE set START_AGENT_SERVICE=background\r\n"
-            "if not defined AGENT_SERVICE_HOME set \"AGENT_SERVICE_HOME=%~dp0agents\"\r\n"
+            "if not defined AGENTS_LOG set \"AGENTS_LOG=%AGENTS_RUNTIME_DIR%\\server.log\"\r\n"
+            "if not defined START_AGENTS set START_AGENTS=background\r\n"
+            "if not defined AGENTS_HOME set \"AGENTS_HOME=%~dp0agents\"\r\n"
             "\r\n"
             "mkdir \"%AGENTS_RUNTIME_DIR%\" 2>nul\r\n"
             "\r\n"
-            "if \"%START_AGENT_SERVICE%\"==\"background\" (\r\n"
+            "if \"%START_AGENTS%\"==\"background\" (\r\n"
             "    set \"PS_START=%TEMP%\\agent-start.ps1\"\r\n"
             "    > \"!PS_START!\" echo $ErrorActionPreference = 'Stop'\r\n"
-            "    >> \"!PS_START!\" echo $p = Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', 'python \"%AGENT_SERVICE_HOME%\\app.py\" 0.0.0.0:%AGENT_SERVICE_PORT% ^>^> \"%AGENT_SERVICE_LOG%\" 2^>^&1' -PassThru -WindowStyle Hidden\r\n"
+            "    >> \"!PS_START!\" echo $p = Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', 'python \"%AGENTS_HOME%\\app.py\" 0.0.0.0:%AGENTS_PORT% ^>^> \"%AGENTS_LOG%\" 2^>^&1' -PassThru -WindowStyle Hidden\r\n"
             "    >> \"!PS_START!\" echo $p.Id\r\n"
-            "    powershell -NoProfile -ExecutionPolicy Bypass -File \"!PS_START!\" > \"%AGENTS_RUNTIME_DIR%\\server.pid\" 2>nul\r\n"
+            "    powershell -NoProfile -ExecutionPolicy Bypass -File \"!PS_START!\" >nul 2>nul\r\n"
             "    del \"!PS_START!\" 2>nul\r\n"
-            "    set /p PID=<\"%AGENTS_RUNTIME_DIR%\\server.pid\"\r\n"
+            "    rem app.py 负责写入 server.pid（python 进程真实 PID），等待其出现后读取。\r\n"
+            "    for /l %%i in (1,1,60) do (\r\n"
+            "        if exist \"%AGENTS_RUNTIME_DIR%\\server.pid\" goto :bg_ready\r\n"
+            "        ping -n 1 -w 500 127.0.0.1 >nul\r\n"
+            "    )\r\n"
+            "    :bg_ready\r\n"
+            "    set \"PID=\"\r\n"
+            "    if exist \"%AGENTS_RUNTIME_DIR%\\server.pid\" set /p PID=<\"%AGENTS_RUNTIME_DIR%\\server.pid\"\r\n"
             "    if defined PID (\r\n"
             "        echo Agent service started in background, pid: !PID!\r\n"
             "    ) else (\r\n"
             "        echo Agent service started in background\r\n"
             "    )\r\n"
-            "    echo Log: %AGENT_SERVICE_LOG%\r\n"
-            ") else if \"%START_AGENT_SERVICE%\"==\"foreground\" (\r\n"
-            "    python \"%AGENT_SERVICE_HOME%\\app.py\" 0.0.0.0:%AGENT_SERVICE_PORT%\r\n"
-            ") else if \"%START_AGENT_SERVICE%\"==\"none\" (\r\n"
-            "    echo Agent service not started because START_AGENT_SERVICE=none\r\n"
+            "    echo Log: %AGENTS_LOG%\r\n"
+            ") else if \"%START_AGENTS%\"==\"foreground\" (\r\n"
+            "    python \"%AGENTS_HOME%\\app.py\" 0.0.0.0:%AGENTS_PORT%\r\n"
+            ") else if \"%START_AGENTS%\"==\"none\" (\r\n"
+            "    echo Agent service not started because START_AGENTS=none\r\n"
             ") else (\r\n"
-            "    echo Invalid START_AGENT_SERVICE=%START_AGENT_SERVICE%. Expected: background, foreground, none\r\n"
+            "    echo Invalid START_AGENTS=%START_AGENTS%. Expected: background, foreground, none\r\n"
             "    exit /b 2\r\n"
             ")\r\n"
             "endlocal\r\n"
@@ -530,8 +546,8 @@ exit 0
             "\n"
             "$AgentServiceHome = Join-Path $PWD 'agents'\n"
             "if (-not $env:AGENTS_RUNTIME_DIR) { $env:AGENTS_RUNTIME_DIR = Join-Path $HOME '.agents_runtime' }\n"
-            "if (-not $env:AGENT_SERVICE_PORT) { $env:AGENT_SERVICE_PORT = '7988' }\n"
-            "if (-not $env:START_AGENT_SERVICE) { $env:START_AGENT_SERVICE = 'background' }\n"
+            "if (-not $env:AGENTS_PORT) { $env:AGENTS_PORT = '7988' }\n"
+            "if (-not $env:START_AGENTS) { $env:START_AGENTS = 'background' }\n"
             "\n"
             "$tmpDir = Join-Path ([IO.Path]::GetTempPath()) ('agent-setup-' + [guid]::NewGuid().ToString('N').Substring(0,8))\n"
             "New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null\n"
@@ -575,7 +591,7 @@ exit 0
             "    Set-Content -Path (Join-Path $PWD 'start-agent-service.bat') -Value $startBat -Encoding ASCII\n"
             "    Set-Content -Path (Join-Path $PWD 'stop-agent-service.bat')  -Value $stopBat  -Encoding ASCII\n"
             "\n"
-            "    $logFile = if ($env:AGENT_SERVICE_LOG) { $env:AGENT_SERVICE_LOG } else { Join-Path $env:AGENTS_RUNTIME_DIR 'server.log' }\n"
+            "    $logFile = if ($env:AGENTS_LOG) { $env:AGENTS_LOG } else { Join-Path $env:AGENTS_RUNTIME_DIR 'server.log' }\n"
             "    Write-Host ''\n"
             "    Write-Host 'Agent service installed:' -ForegroundColor Green\n"
             "    Write-Host \"  app:    $AgentServiceHome\"\n"
@@ -588,14 +604,14 @@ exit 0
             "        Copy-Item -Path (Join-Path $patchDir '*') -Destination $AgentServiceHome -Recurse -Force -ErrorAction SilentlyContinue\n"
             "    }\n"
             "\n"
-            "    if ($env:START_AGENT_SERVICE -eq 'background') {\n"
+            "    if ($env:START_AGENTS -eq 'background') {\n"
             "        $proc = Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', 'start-agent-service.bat' -PassThru -WindowStyle Hidden\n"
             "        Write-Host \"Agent service started in background, pid: $($proc.Id)\" -ForegroundColor Green\n"
             "        Write-Host \"Log: $logFile\"\n"
-            "    } elseif ($env:START_AGENT_SERVICE -eq 'foreground') {\n"
+            "    } elseif ($env:START_AGENTS -eq 'foreground') {\n"
             "        & (Join-Path $PWD 'start-agent-service.bat')\n"
-            "    } elseif ($env:START_AGENT_SERVICE -eq 'none') {\n"
-            "        Write-Host 'Agent service not started because START_AGENT_SERVICE=none'\n"
+            "    } elseif ($env:START_AGENTS -eq 'none') {\n"
+            "        Write-Host 'Agent service not started because START_AGENTS=none'\n"
             "    }\n"
             "} finally {\n"
             "    Remove-Item -Path $tmpDir -Recurse -Force -ErrorAction SilentlyContinue\n"

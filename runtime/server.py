@@ -99,10 +99,13 @@ def merge_stream_messages(stream_messages: list) -> tuple[list, Optional[dict]]:
     # Agent identity tracking — carried over from stream Message objects
     current_agent_id: Optional[str] = None
     current_name: Optional[str] = None
+    # @-mention tracking: the last assistant chunk carrying mentions wins
+    # (group-chat aggregated assistant messages carry the full mentions list).
+    current_mentions: Optional[list] = None
 
     def _flush_assistant(stat=None):
         nonlocal assistant_text_buf, assistant_thinking_buf, pending_tool_calls
-        nonlocal current_agent_id, current_name
+        nonlocal current_agent_id, current_name, current_mentions
         if assistant_text_buf or pending_tool_calls or assistant_thinking_buf:
             # timestamp should be the inference completion time from stat
             # Fall back to now_iso() if stat doesn't have it
@@ -118,12 +121,14 @@ def merge_stream_messages(stream_messages: list) -> tuple[list, Optional[dict]]:
                 stat=stat,
                 agent_id=current_agent_id,
                 name=current_name,
+                mentions=current_mentions,
             ))
             assistant_text_buf = ""
             assistant_thinking_buf = ""
             pending_tool_calls = []
             current_agent_id = None
             current_name = None
+            current_mentions = None
 
     current_stat: Optional[dict] = None
 
@@ -147,6 +152,8 @@ def merge_stream_messages(stream_messages: list) -> tuple[list, Optional[dict]]:
                 current_agent_id = m.assistant_id
             if getattr(m, "name", None) and not current_name:
                 current_name = m.name
+            if getattr(m, "mentions", None):
+                current_mentions = m.mentions
             if getattr(m, "tool_calls_dropped", False):
                 # Max tool-call rounds reached: the tool_calls in this round were
                 # never executed.  Drop the accumulated (already-streamed) tool_call
@@ -468,7 +475,7 @@ def get_or_create_terminal(session_id: str, cols: int = 80, rows: int = 24) -> O
             shell = os.environ.get("SHELL", "/bin/bash")
             # Resolve the workspace directory for this terminal session.
             # Respects per-request workspace overrides (set_request_context)
-            # falling back to AGENT_WORKSPACE env var, then os.getcwd().
+            # falling back to AGENTS_WORKSPACE env var, then os.getcwd().
             from runtime.common import get_workspace as _get_ws
             workspace_dir = _get_ws()
             pid, master_fd = pty.fork()
@@ -481,7 +488,7 @@ def get_or_create_terminal(session_id: str, cols: int = 80, rows: int = 24) -> O
                 env = os.environ.copy()
                 env["TERM"] = "xterm-256color"
                 # Ensure the shell also knows the workspace
-                env["AGENT_WORKSPACE"] = workspace_dir
+                env["AGENTS_WORKSPACE"] = workspace_dir
                 os.execvpe(shell, [shell], env)
             
             # Set initial window size for the PTY

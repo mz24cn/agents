@@ -1096,6 +1096,45 @@ class TestMergeStreamMessages:
         assert turns[0].tool_calls[0]["id"] == "call_B"
         assert turns[1].tool_use_id == "call_B"
 
+    def test_mentions_persisted_from_aggregated_assistant_message(self):
+        """Group-chat assistant messages carry a resolved mentions list; it
+        must survive merge_stream_messages into the persisted ConversationTurn
+        (exactly like user messages' mentions are persisted)."""
+        from runtime.server import merge_stream_messages
+
+        stream = [
+            Message(
+                role="assistant",
+                content="我觉得@沙和尚 你怎么看？（完）",
+                agent_id="SunWuKong",
+                name="孙悟空",
+                mentions=["ShaWuJing"],
+            ),
+            Message(role="usage", content=json.dumps({"prompt_tokens": 1, "completion_tokens": 1})),
+        ]
+        turns, _ = merge_stream_messages(stream)
+        assert len(turns) == 1
+        assert turns[0].role == "assistant"
+        assert turns[0].mentions == ["ShaWuJing"]
+        assert turns[0].content == "我觉得@沙和尚 你怎么看？（完）"
+
+    def test_mentions_persisted_from_incremental_chunks(self):
+        """Even when an assistant message arrives as token deltas (real
+        streaming), mentions set on the final chunk survive into the merged
+        ConversationTurn."""
+        from runtime.server import merge_stream_messages
+
+        stream = [
+            Message(role="assistant", content="我觉得@沙"),
+            Message(role="assistant", content="和尚 你怎么看？",
+                    mentions=["ShaWuJing"]),
+            Message(role="usage", content=json.dumps({"prompt_tokens": 1, "completion_tokens": 1})),
+        ]
+        turns, _ = merge_stream_messages(stream)
+        assert len(turns) == 1
+        assert turns[0].mentions == ["ShaWuJing"]
+        assert turns[0].content == "我觉得@沙和尚 你怎么看？"
+
 
 # ------------------------------------------------------------------
 # Env & Session API tests
@@ -1126,14 +1165,14 @@ class TestEnvAPI:
 
     def test_get_env_empty_when_no_file(self, server_with_env):
         """GET /v1/env 返回空字典（env.json 不存在时），
-        但如果 os.environ 中有 AGENT_WORKSPACE 则会包含该键。"""
+        但如果 os.environ 中有 AGENTS_WORKSPACE 则会包含该键。"""
         status, body = _get(server_with_env, "/v1/env")
         assert status == 200
         env = body["env"]
         # env.json 不存在时，至少不应包含用户自定义的 key
-        # AGENT_WORKSPACE 可能从 os.environ 自动注入
+        # AGENTS_WORKSPACE 可能从 os.environ 自动注入
         for k in env:
-            assert k == "AGENT_WORKSPACE", f"Unexpected key in empty env: {k}"
+            assert k == "AGENTS_WORKSPACE", f"Unexpected key in empty env: {k}"
 
     def test_post_env_add_key_value(self, server_with_env):
         """POST /v1/env 成功新增键值对，返回 200 及完整列表。"""

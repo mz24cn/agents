@@ -75,13 +75,13 @@ def test_env_read_write_roundtrip(env_dict: dict) -> None:
 
         # 读取并验证内容一致
         result = mgr.read()
-        # AGENT_WORKSPACE 由 read() 从 os.environ 自动注入，
+        # AGENTS_WORKSPACE 由 read() 从 os.environ 自动注入，
         # 如果 env_dict 中没有该 key，则将其加入期望值中
         expected = dict(env_dict)
-        if "AGENT_WORKSPACE" not in expected:
-            ws = os.environ.get("AGENT_WORKSPACE", "")
+        if "AGENTS_WORKSPACE" not in expected:
+            ws = os.environ.get("AGENTS_WORKSPACE", "")
             if ws:
-                expected["AGENT_WORKSPACE"] = ws
+                expected["AGENTS_WORKSPACE"] = ws
         assert result == expected, (
             f"读写 round-trip 失败：写入 {env_dict!r}，期望 {expected!r}，读取到 {result!r}"
         )
@@ -155,12 +155,12 @@ def test_delete_removes_key(env_dict: dict) -> None:
         )
 
         # 验证其余键值对不变
-        # AGENT_WORKSPACE 由 read() 从 os.environ 自动注入
+        # AGENTS_WORKSPACE 由 read() 从 os.environ 自动注入
         expected_remaining = {k: v for k, v in env_dict.items() if k != key_to_delete}
-        if "AGENT_WORKSPACE" not in expected_remaining:
-            ws = os.environ.get("AGENT_WORKSPACE", "")
+        if "AGENTS_WORKSPACE" not in expected_remaining:
+            ws = os.environ.get("AGENTS_WORKSPACE", "")
             if ws:
-                expected_remaining["AGENT_WORKSPACE"] = ws
+                expected_remaining["AGENTS_WORKSPACE"] = ws
         assert result == expected_remaining, (
             f"删除后剩余键值对不一致：期望 {expected_remaining!r}，实际 {result!r}"
         )
@@ -237,11 +237,11 @@ def test_read_accepts_empty_json_object() -> None:
         mgr = EnvManager(env_path=env_path)
         result = mgr.read()
 
-        # AGENT_WORKSPACE 可能由 read() 从 os.environ 自动注入
+        # AGENTS_WORKSPACE 可能由 read() 从 os.environ 自动注入
         expected: dict = {}
-        ws = os.environ.get("AGENT_WORKSPACE", "")
+        ws = os.environ.get("AGENTS_WORKSPACE", "")
         if ws:
-            expected["AGENT_WORKSPACE"] = ws
+            expected["AGENTS_WORKSPACE"] = ws
         assert result == expected
 
 

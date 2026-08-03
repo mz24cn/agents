@@ -311,9 +311,9 @@
       // AppLogo 组件会自动处理 favicon 更新
       appLogoStore.set(logoConfig)
       
-      if (envMap.AGENT_WORKSPACE) {
-        defaultWorkspacePath = envMap.AGENT_WORKSPACE
-        workspacePath = envMap.AGENT_WORKSPACE
+      if (envMap.AGENTS_WORKSPACE) {
+        defaultWorkspacePath = envMap.AGENTS_WORKSPACE
+        workspacePath = envMap.AGENTS_WORKSPACE
       }
     } catch (err) {
       console.error('Failed to fetch workspace path:', err)
