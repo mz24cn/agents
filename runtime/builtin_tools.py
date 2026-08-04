@@ -851,7 +851,8 @@ def _validate_path(workspace: str, raw_path: str) -> str:
     if resolved == _REAL_TMP or resolved.startswith(_REAL_TMP + os.sep):
         return resolved
 
-    if not (resolved == workspace or resolved.startswith(workspace + os.sep)):
+    _workspace_prefix = workspace if workspace.endswith(os.sep) else workspace + os.sep
+    if not (resolved == workspace or resolved.startswith(_workspace_prefix)):
         if os.path.isabs(raw_path):
             err = ValueError("Absolute paths outside workspace are not permitted")
             err.error_code = "AbsolutePathDenied"  # type: ignore[attr-defined]

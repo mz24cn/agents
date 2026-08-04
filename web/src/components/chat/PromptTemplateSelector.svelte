@@ -7,6 +7,7 @@
    * 面板右侧：模板列表
    * selectedTemplateId: 当前选中的模板 ID（持久保留）
    * onSelect(result): result = null | { type: 'direct', content } | { type: 'template', template }
+   * 点击模板项为 toggle：再次点击已选中的模板会取消选中（selectedTemplateId 置为 null 并回调 onSelect(null)）
    */
   let { selectedTemplateId = $bindable(null), onSelect } = $props()
 
@@ -36,6 +37,12 @@
   })
 
   function handleSelect(tpl) {
+    // toggle：已选中则取消选中，未选中则选中
+    if (selectedTemplateId === tpl.template_id) {
+      selectedTemplateId = null
+      onSelect?.(null)
+      return
+    }
     selectedTemplateId = tpl.template_id
     const placeholders = extractPlaceholders(tpl.content)
     if (placeholders.length === 0) {
@@ -74,6 +81,7 @@
     <!-- 无标签的模板（默认组） -->
     {#each groupedTemplates.untagged as tpl (tpl.template_id)}
       <button
+        type="button"
         class="template-item"
         class:selected={selectedTemplateId === tpl.template_id}
         onclick={() => handleSelect(tpl)}
@@ -90,6 +98,7 @@
         </div>
         {#each templates as tpl (tpl.template_id)}
           <button
+            type="button"
             class="template-item"
             class:selected={selectedTemplateId === tpl.template_id}
             onclick={() => handleSelect(tpl)}

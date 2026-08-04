@@ -6,6 +6,7 @@
   import { highlight, escapeHtml, getFileLang, isMarkdownFile } from '../../lib/highlight.js'
   import { copyToClipboard } from '../../lib/clipboard.js'
   import ConfirmDialog from '../ConfirmDialog.svelte'
+  import DocumentPreview from './DocumentPreview.svelte'
 
   /**
    * 工作区文件管理器面板
@@ -56,6 +57,8 @@
   let treeNodes = $state([])
   // 加载状态
   let loading = $state(false)
+  // 手动刷新状态
+  let refreshing = $state(false)
   // 错误信息
   let error = $state('')
   // 搜索状态
@@ -170,6 +173,28 @@
 
   function isSelectableFile(file) {
     return !!file && !file.is_dir && isInsideWorkspacePath(file.path)
+  }
+
+  // PDF / DOCX 文件判断（按扩展名，无需后端支持）
+  function isPdfFile(filename) {
+    return /\.pdf$/i.test(filename || '')
+  }
+
+  function isDocxFile(filename) {
+    return /\.docx$/i.test(filename || '')
+  }
+
+  // 是否支持预览：文本/图片/音视频（后端标记）+ PDF/DOCX（前端扩展名）
+  function isPreviewable(file) {
+    if (!file || file.is_dir) return false
+    return (
+      file.is_text ||
+      file.is_image ||
+      file.is_audio ||
+      file.is_video ||
+      isPdfFile(file.name) ||
+      isDocxFile(file.name)
+    )
   }
 
   function getSortMode() {
@@ -699,11 +724,29 @@
     treeNodes = []
   }
 
-  function reloadCurrentDirectory() {
+  async function reloadCurrentDirectory() {
     if (!currentPath) return
     page = 1
     hasMore = true
-    loadFiles(currentPath)
+    await loadFiles(currentPath)
+  }
+
+  // 手动刷新左侧文件列表（外部修改文件后使用）
+  async function handleRefresh() {
+    if (refreshing) return
+    refreshing = true
+    try {
+      if (searchMode) {
+        // 搜索结果模式下，重新执行当前搜索（同时携带文件名过滤）
+        await handleSearch()
+      } else {
+        await reloadCurrentDirectory()
+      }
+      // 顺带刷新右侧目录树中当前目录的子节点（若已展开）
+      await refreshTreeNodeChildren(currentPath)
+    } finally {
+      refreshing = false
+    }
   }
 
   async function refreshTreeNodeChildren(dirPath) {
@@ -817,12 +860,16 @@
 
   // 预览文件
   async function previewFileContent(file) {
-    if (!file.is_text && !file.is_image && !file.is_audio && !file.is_video) {
+    if (!isPreviewable(file)) {
       return // 不支持预览的文件类型
     }
     
     previewReturnView = viewMode
-    previewFile = file
+    previewFile = {
+      ...file,
+      is_pdf: isPdfFile(file.name),
+      is_docx: isDocxFile(file.name),
+    }
     viewMode = 'preview'
     previewContent = ''
     
@@ -1656,7 +1703,7 @@
   function handleDoubleClick(file) {
     if (file.is_dir) {
       enterDirectory(file.path)
-    } else if (file.is_text || file.is_image || file.is_audio || file.is_video) {
+    } else if (isPreviewable(file)) {
       previewFileContent(file)
     }
   }
@@ -1668,6 +1715,8 @@
     if (file.is_image) return '🖼️'
     if (file.is_audio) return '🎵'
     if (file.is_video) return '🎬'
+    if (isPdfFile(file.name)) return '📕'
+    if (isDocxFile(file.name)) return '📘'
     if (file.is_text) return '📄'
     return '📎'
   }
@@ -1707,6 +1756,9 @@
         <span class="header-icon">📂</span>
         <span class="header-title">{t('workspaceFileManager')}</span>
         {#if currentPath}
+          <button class="header-btn refresh-btn" onclick={handleRefresh} disabled={refreshing} title={t('refreshCurrentTab')}>
+            {refreshing ? '⏳' : '🔄'}
+          </button>
           <span class="current-path">{currentPath}</span>
         {/if}
       </div>
@@ -1959,6 +2011,8 @@
           <div class="preview-content"><video src={workspaceApi.content(previewFile.path, false)} controls></video></div>
         {:else if previewFile.is_audio}
           <div class="preview-content"><audio src={workspaceApi.content(previewFile.path, false)} controls></audio></div>
+        {:else if previewFile.is_pdf || previewFile.is_docx}
+          <DocumentPreview file={previewFile} url={workspaceApi.content(previewFile.path, false)} />
         {:else if previewFile.is_text}
           <div class="text-preview">{@html renderPreviewHtml(previewContent, previewFile.name, previewFile.forcePlainText, previewFile.path)}</div>
         {/if}
@@ -1977,7 +2031,7 @@
     onmousedown={(e) => e.stopPropagation()}
   >
     <!-- 预览：多选时置灰 -->
-    {#if menuFile?.is_text || menuFile?.is_image || menuFile?.is_audio || menuFile?.is_video}
+    {#if isPreviewable(menuFile)}
       <button 
         disabled={isMulti}
         onmousedown={() => { if (!isMulti) { previewFileContent(menuFile); hideContextMenu() } }}
@@ -2101,6 +2155,35 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .refresh-btn {
+    width: 26px;
+    height: 24px;
+    padding: 0;
+    box-sizing: border-box;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+    cursor: pointer;
+    transition: all 0.15s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  .refresh-btn:hover:not(:disabled) {
+    background: var(--primary);
+    color: #fff;
+    border-color: var(--primary);
+  }
+
+  .refresh-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
 
   .header-actions {

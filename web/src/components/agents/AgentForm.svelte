@@ -52,7 +52,8 @@
     if (val) modelId = val
   }
 
-  const isTemplateSelected = $derived(templateId.trim() !== '')
+  // templateId 可能被 bind 为 null（PromptTemplateSelector toggle 取消时置 null），必须做 null 安全
+  const isTemplateSelected = $derived(!!templateId && templateId.trim() !== '')
 
   let errors = $state({})
   let submitError = $state('')
@@ -61,9 +62,27 @@
   $effect(() => { loadPromptTemplates().catch(() => {}) })
   $effect(() => { loadModels().catch(() => {}) })
 
+  function validateNickname(val = nickname) {
+    if (/\s/.test(val)) return t('agentNicknameNoSpaces')
+    if (!val.trim()) return t('agentNicknameRequired')
+    return ''
+  }
+
+  // 输入时实时校验昵称（空格会破坏 @mention 匹配）
+  function onNicknameInput(e) {
+    const msg = validateNickname(e.target.value)
+    if (msg) {
+      errors = { ...errors, nickname: msg }
+    } else if (errors.nickname) {
+      const { nickname: _omit, ...rest } = errors
+      errors = rest
+    }
+  }
+
   function validate() {
     const e = {}
-    if (!nickname.trim()) e.nickname = t('agentNicknameRequired')
+    const nickErr = validateNickname()
+    if (nickErr) e.nickname = nickErr
     if (!modelId.trim()) e.modelId = t('agentModelIdRequired')
     if (templateArguments.trim()) {
       try {
@@ -89,7 +108,7 @@
       nickname: nickname.trim(),
       model_id: modelId.trim(),
       tool_ids: selectedToolIds,
-      template_id: templateId.trim() || null,
+      template_id: (templateId || '').trim() || null,
       template_arguments: parsedArgs,
       system_prompt: systemPrompt.trim(),
       myself_view: myselfView.trim(),
@@ -125,7 +144,7 @@
 
   <div class="form-group">
     <label for="agent_nickname">{t('agentNickname')} <span class="required">{t('required')}</span></label>
-    <input id="agent_nickname" type="text" bind:value={nickname} placeholder={t('agentNicknamePlaceholder')} />
+    <input id="agent_nickname" type="text" bind:value={nickname} placeholder={t('agentNicknamePlaceholder')} oninput={onNicknameInput} />
     {#if errors.nickname}<span class="field-error">{errors.nickname}</span>{/if}
   </div>
 
@@ -164,11 +183,6 @@
   <div class="form-group">
     <label>{t('agentTemplateId')}</label>
     <div class="template-selector-wrapper">
-      {#if templateId}
-        <button type="button" class="template-clear-btn" onclick={() => templateId = ''}>
-          ✕ {t('clearSelection')}
-        </button>
-      {/if}
       <PromptTemplateSelector bind:selectedTemplateId={templateId} />
     </div>
   </div>
@@ -234,23 +248,6 @@
     max-height: 220px;
     overflow-y: auto;
     background: var(--bg-secondary);
-    position: relative;
-  }
-  .template-clear-btn {
-    display: block;
-    width: 100%;
-    text-align: left;
-    padding: 4px 10px;
-    border: none;
-    background: transparent;
-    color: var(--text-secondary);
-    font-size: 0.8rem;
-    cursor: pointer;
-    border-bottom: 1px solid var(--border);
-  }
-  .template-clear-btn:hover {
-    background: var(--bg);
-    color: var(--danger);
   }
   .json-editor:has(textarea:disabled) { opacity: 0.6; }
   .json-editor:has(textarea:disabled)::after { content: ''; position: absolute; inset: 0; cursor: not-allowed; }
