@@ -5,6 +5,7 @@ Supports dynamic composition of models and tools at runtime, with automatic
 tool call loop handling. Only uses Python standard library modules.
 """
 
+import concurrent.futures
 import json
 import logging
 import os
@@ -14,7 +15,7 @@ import urllib.request
 import urllib.error
 from typing import Iterator, Optional
 
-from runtime.common import now_iso as _now_iso, is_likely_base64
+from runtime.common import now_iso as _now_iso, is_likely_base64, snapshot_request_context, restore_request_context
 
 _logger = logging.getLogger("runtime.runtime")
 
@@ -26,9 +27,9 @@ _logger = logging.getLogger("runtime.runtime")
 def _get_model_api_timeout() -> int:
     """Return MODEL_API_TIMEOUT (seconds), read dynamically each call."""
     try:
-        return int(os.environ.get("MODEL_API_TIMEOUT", "600"))
+        return int(os.environ.get("MODEL_API_TIMEOUT", "300"))
     except (TypeError, ValueError):
-        return 600
+        return 300
 
 
 def _get_infer_round_timeout() -> Optional[float]:
@@ -40,16 +41,53 @@ def _get_infer_round_timeout() -> Optional[float]:
     non-streaming.
 
     Returns None when the guard is disabled (env var empty / unset / <= 0).
-    Default: 600 s (same as MODEL_API_TIMEOUT).
+    Default: 900 s -- deliberately longer than MODEL_API_TIMEOUT (300 s):
+    the socket timeout is the primary per-read guard, and the round guard is
+    the whole-request wall-clock cap that only fires on pathological stalls.
     """
-    raw = os.environ.get("MODEL_INFER_ROUND_TIMEOUT", "600").strip()
+    raw = os.environ.get("MODEL_INFER_ROUND_TIMEOUT", "900").strip()
     if not raw:
         return None
     try:
         val = float(raw)
     except (TypeError, ValueError):
         _logger.warning(
-            "invalid MODEL_INFER_ROUND_TIMEOUT=%r; using default 600s", raw,
+            "invalid MODEL_INFER_ROUND_TIMEOUT=%r; using default 900s", raw,
+        )
+        return 900.0
+    if val <= 0:
+        return None
+    return val
+
+
+def _get_tool_exec_timeout() -> Optional[float]:
+    """Return TOOL_EXEC_TIMEOUT (seconds), read dynamically each call.
+
+    Single wall-clock cap shared by EVERY tool-call path -- this is the
+    total, maximum execution time allowed for a tool call:
+
+      - function tools (in-process callables run on a worker thread),
+      - stdio MCP (whole request/response round),
+      - HTTP MCP (whole request/response round, including SSE reads and
+        session re-initialize retries).
+
+    When a tool exceeds the cap the caller proceeds with an error result
+    instead of blocking the inference worker indefinitely -- including
+    group-chat workers, whose hang cannot be reached by the model HTTP
+    timeouts.  A timed-out function tool keeps running on a daemon worker
+    thread in the background.
+
+    Returns None when the guard is disabled (env var empty / <= 0).
+    Default: 600 s.
+    """
+    raw = os.environ.get("TOOL_EXEC_TIMEOUT", "600").strip()
+    if not raw:
+        return None
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        _logger.warning(
+            "invalid TOOL_EXEC_TIMEOUT=%r; using default 600s", raw,
         )
         return 600.0
     if val <= 0:
@@ -926,8 +964,48 @@ class Runtime:
         if callable_fn is None:
             return f"Error: no callable registered for tool '{tool_config.tool_id}'"
 
+        timeout = _get_tool_exec_timeout()
         try:
-            result = callable_fn(**arguments)
+            if timeout is None:
+                # Guard disabled: run inline.
+                result = callable_fn(**arguments)
+            else:
+                # Run on a dedicated daemon worker so a hung callable cannot
+                # block this thread (group-chat worker / HTTP handler) forever.
+                # NOTE: never use `with ThreadPoolExecutor(...)` here -- its
+                # shutdown(wait=True) would block until the hung callable
+                # finishes, recreating the very hang we guard against.
+                #
+                # The worker is a brand-new thread, so `threading.local`
+                # request context (session_id / workspace / session_dir ...)
+                # is empty there.  Propagate the caller thread's snapshot
+                # before running, otherwise tools that depend on it (exec_cli
+                # persistent PTY, write_file per-session journal, undo) would
+                # silently degrade to a fresh subprocess / lost context.
+                caller_ctx = snapshot_request_context()
+
+                def _run_with_context() -> str:
+                    restore_request_context(caller_ctx)
+                    try:
+                        return callable_fn(**arguments)
+                    finally:
+                        # Do not leak this session's context into a reused
+                        # worker thread for the next tool call.
+                        _thread_local.__dict__.clear()
+
+                executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="fn-tool")
+                future = executor.submit(_run_with_context)
+                try:
+                    result = future.result(timeout=timeout)
+                except concurrent.futures.TimeoutError:
+                    future.cancel()
+                    return (f"Error: tool '{tool_config.name}' timed out "
+                            f"after {timeout:g}s")
+                finally:
+                    # wait=False: never block on a hung callable; the worker
+                    # is a daemon thread and keeps running in the background.
+                    executor.shutdown(wait=False, cancel_futures=True)
             return str(result) if result is not None else ""
         except Exception as exc:
             return f"Error: {type(exc).__name__}: {exc}"

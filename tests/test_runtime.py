@@ -975,3 +975,306 @@ def test_tool_instance_reuse_across_sessions(tool_id: str, num_sessions: int) ->
             f"Session {i}: get_callable returned a different object "
             f"(id={id(c)}) than session 0 (id={first_id}) for tool_id='{tool_id}'"
         )
+
+
+# ------------------------------------------------------------------
+# Tool execution guard (TOOL_EXEC_TIMEOUT)
+# ------------------------------------------------------------------
+
+def test_function_tool_hang_returns_timeout_error(monkeypatch) -> None:
+    """A hung function tool must not block the caller: _execute_function_tool
+    runs the callable on a daemon worker and returns an error after
+    TOOL_EXEC_TIMEOUT instead of hanging (group-chat workers included)."""
+    import time
+
+    from runtime.models import ToolConfig
+    from runtime.registry import ToolRegistry
+
+    monkeypatch.setenv("TOOL_EXEC_TIMEOUT", "0.2")
+
+    registry = ToolRegistry()
+
+    def hung_fn(x: str = "") -> str:
+        time.sleep(60)  # simulate a permanently stuck tool
+        return f"never_{x}"
+
+    tool_config = ToolConfig(
+        tool_id="hung_tool",
+        tool_type="function",
+        name="hung_tool",
+        description="A tool that hangs",
+        parameters={"type": "object", "properties": {}, "required": []},
+    )
+    registry.register(tool_config, callable_fn=hung_fn)
+
+    runtime = Runtime(model_registry=ModelRegistry(), tool_registry=registry)
+    start = time.monotonic()
+    result = runtime._execute_function_tool(tool_config, {"x": "hi"})
+    elapsed = time.monotonic() - start
+
+    assert "timed out" in result, result
+    assert elapsed < 5, f"tool guard did not fire; took {elapsed:.1f}s"
+
+
+def test_tool_exec_timeout_parsing(monkeypatch) -> None:
+    """TOOL_EXEC_TIMEOUT parsing: default 600 s, invalid -> 600 s,
+    empty / <= 0 -> guard disabled (None)."""
+    from runtime.runtime import _get_tool_exec_timeout
+
+    monkeypatch.delenv("TOOL_EXEC_TIMEOUT", raising=False)
+    assert _get_tool_exec_timeout() == 600.0
+
+    monkeypatch.setenv("TOOL_EXEC_TIMEOUT", "1.5")
+    assert _get_tool_exec_timeout() == 1.5
+
+    monkeypatch.setenv("TOOL_EXEC_TIMEOUT", "abc")
+    assert _get_tool_exec_timeout() == 600.0
+
+    monkeypatch.setenv("TOOL_EXEC_TIMEOUT", "")
+    assert _get_tool_exec_timeout() is None
+
+    monkeypatch.setenv("TOOL_EXEC_TIMEOUT", "0")
+    assert _get_tool_exec_timeout() is None
+
+
+def test_function_tool_normal_call_with_guard_enabled(monkeypatch) -> None:
+    """With the guard enabled, a normal fast tool still returns its result."""
+    import time
+
+    from runtime.models import ToolConfig
+    from runtime.registry import ToolRegistry
+
+    monkeypatch.setenv("TOOL_EXEC_TIMEOUT", "30")
+
+    registry = ToolRegistry()
+
+    def fast_fn(x: str = "") -> str:
+        return f"ok_{x}"
+
+    tool_config = ToolConfig(
+        tool_id="fast_tool",
+        tool_type="function",
+        name="fast_tool",
+        description="Fast tool",
+        parameters={"type": "object", "properties": {}, "required": []},
+    )
+    registry.register(tool_config, callable_fn=fast_fn)
+
+    runtime = Runtime(model_registry=ModelRegistry(), tool_registry=registry)
+    start = time.monotonic()
+    result = runtime._execute_function_tool(tool_config, {"x": "hi"})
+    assert result == "ok_hi"
+    assert time.monotonic() - start < 2
+
+
+def test_function_tool_guard_disabled_runs_inline(monkeypatch) -> None:
+    """TOOL_EXEC_TIMEOUT disabled -> callable runs inline (no worker)."""
+    from runtime.models import ToolConfig
+    from runtime.registry import ToolRegistry
+
+    monkeypatch.setenv("TOOL_EXEC_TIMEOUT", "")
+
+    registry = ToolRegistry()
+    called: list = []
+
+    def fast_fn(x: str = "") -> str:
+        called.append(x)
+        return f"ok_{x}"
+
+    tool_config = ToolConfig(
+        tool_id="fast_tool_inline",
+        tool_type="function",
+        name="fast_tool_inline",
+        description="Fast tool",
+        parameters={"type": "object", "properties": {}, "required": []},
+    )
+    registry.register(tool_config, callable_fn=fast_fn)
+
+    runtime = Runtime(model_registry=ModelRegistry(), tool_registry=registry)
+    result = runtime._execute_function_tool(tool_config, {"x": "hi"})
+    assert result == "ok_hi"
+    assert called == ["hi"]
+
+
+# ------------------------------------------------------------------
+# 场景化回归测试：工具调用必须继承请求线程的会话上下文
+# ------------------------------------------------------------------
+# 背景：TOOL_EXEC_TIMEOUT guard 默认启用，function 工具会在独立 worker
+# 线程执行。`threading.local` 是线程隔离的 —— worker 线程若没有重放请求线程
+# 的会话上下文（session_id / session_dir / workspace），exec_cli 会拿不到
+# session_id 从而每次新建 shell，write_file 的 journal 会退化为 stateless，
+# exec_shell 会在错误的目录执行。这些测试按"真实请求"复刻 server.py 的处理
+# 流程（先 set_request_context，再走 Runtime 执行工具），而不是只测函数内部
+# 机制，因此能真正捕获此类回归。
+
+import json
+import os
+
+import pytest
+
+import runtime.builtin_tools as _bt
+import runtime.server as _server
+
+
+def _set_session_context(session_id: str, workspace: str, session_dir: str) -> None:
+    """复刻 runtime/server.py 在处理推理请求前设置的请求上下文。"""
+    from runtime.common import set_request_context
+
+    set_request_context(
+        session_id=session_id,
+        session_dir=session_dir,
+        workspace=workspace,
+        user_message_timestamp="2025-06-01T12:00:00Z",
+        depth=0,
+        tool_scope=[],
+    )
+
+
+def _clear_session_context() -> None:
+    from runtime.common import clear_request_context
+
+    clear_request_context([
+        "session_id", "session_dir", "workspace", "user_message_timestamp",
+        "depth", "tool_scope",
+    ])
+
+
+@pytest.fixture
+def session_ctx(tmp_path):
+    """构造一个真实的会话上下文并保证测试后清理，返回 (workspace, session_dir)。"""
+    workspace = str(tmp_path / "workspace")
+    session_dir = str(tmp_path / "chat_data" / "sess-1")
+    os.makedirs(workspace, exist_ok=True)
+    os.makedirs(session_dir, exist_ok=True)
+    _set_session_context("sess-1", workspace, session_dir)
+    try:
+        yield workspace, session_dir
+    finally:
+        _clear_session_context()
+
+
+def test_exec_cli_reuses_persistent_terminal_across_calls(monkeypatch, session_ctx):
+    """实际场景：同一会话内连续调用 exec_cli 必须复用同一个持久终端。
+
+    复刻 server 请求上下文后，通过 Runtime 连续执行 exec_cli 两次。guard
+    启用（worker 线程执行）时，若 worker 丢失 session_id，_exec_cli 会绕过
+    get_or_create_terminal 走 subprocess 兜底 —— 每次都新建一个 shell
+    （即本回归）。测试断言持久终端路径被命中且只创建一次（第二次复用）。
+    """
+    from runtime.builtin_tools import CLI_TOOL_CONFIG, _exec_cli
+    from runtime.registry import ModelRegistry, ToolRegistry
+    from runtime.runtime import Runtime
+
+    workspace, _session_dir = session_ctx
+    monkeypatch.setenv("TOOL_EXEC_TIMEOUT", "30")  # 强制走 worker 线程路径
+
+    looked_up_sessions: list = []   # get_or_create_terminal 收到的 session_id
+    created_sessions: list = []     # 首次创建的终端
+
+    def fake_get_or_create_terminal(sid, cols=80, rows=24):
+        looked_up_sessions.append(sid)
+        if sid not in created_sessions:
+            created_sessions.append(sid)
+        return {"session_id": sid, "fake": True}
+
+    def fake_execute_command(sid, command, timeout=300, **kwargs):
+        looked_up_sessions.append(sid)
+        return "fake-terminal-output"
+
+    # 兜底 subprocess 路径绝不应被触发：worker 丢失 session_id 时会走到这里
+    def boom_run(*args, **kwargs):
+        raise AssertionError(
+            "exec_cli 走了 subprocess 兜底：worker 线程丢失了会话上下文，"
+            "持久终端未被复用")
+
+    import runtime.builtin_tools_misc as _bt_misc
+
+    monkeypatch.setattr(_server, "get_or_create_terminal", fake_get_or_create_terminal)
+    monkeypatch.setattr(_bt_misc, "execute_command_in_terminal", fake_execute_command)
+    monkeypatch.setattr(_bt.subprocess, "run", boom_run)
+
+    registry = ToolRegistry()
+    registry.register(CLI_TOOL_CONFIG, callable_fn=_exec_cli)
+    runtime = Runtime(model_registry=ModelRegistry(), tool_registry=registry)
+
+    for _ in range(2):
+        result = runtime._execute_function_tool(
+            CLI_TOOL_CONFIG, {"command": "echo hi"})
+        assert result == "fake-terminal-output", result
+
+    assert looked_up_sessions.count("sess-1") >= 2, (
+        f"exec_cli 未通过 session_id 定位持久终端: {looked_up_sessions!r}")
+    assert created_sessions == ["sess-1"], (
+        f"持久终端未按会话复用，每次调用都新建: {created_sessions!r}")
+
+
+def test_exec_shell_runs_in_session_workspace(monkeypatch, session_ctx, tmp_path):
+    """实际场景：exec_shell 必须在会话 workspace 下执行。
+
+    即使进程环境变量 AGENTS_WORKSPACE 指向别处，请求线程通过
+    set_request_context 指定的 workspace 也必须传到 worker 线程，
+    否则 exec_shell 会退化为在错误的目录执行。
+    """
+    from runtime.builtin_tools import EXEC_SHELL_TOOL_CONFIG, _exec_shell
+    from runtime.registry import ModelRegistry, ToolRegistry
+    from runtime.runtime import Runtime
+
+    workspace, _session_dir = session_ctx
+    monkeypatch.setenv("TOOL_EXEC_TIMEOUT", "30")
+    # 让环境变量指向一个"错误"的工作目录，若 worker 丢失上下文就会走到这里
+    monkeypatch.setenv("AGENTS_WORKSPACE", str(tmp_path / "wrong-env-ws"))
+
+    spawned_cwd: list = []
+
+    class FakeProc:
+        returncode = 0
+
+        def communicate(self, timeout=None):
+            return ("", "")
+
+    def fake_popen(*args, **kwargs):
+        spawned_cwd.append(kwargs.get("cwd"))
+        return FakeProc()
+
+    monkeypatch.setattr(_bt.subprocess, "Popen", fake_popen)
+
+    registry = ToolRegistry()
+    registry.register(EXEC_SHELL_TOOL_CONFIG, callable_fn=_exec_shell)
+    runtime = Runtime(model_registry=ModelRegistry(), tool_registry=registry)
+
+    result = runtime._execute_function_tool(
+        EXEC_SHELL_TOOL_CONFIG, {"command": "pwd"})
+    assert "error" not in json.loads(result), result
+
+    assert spawned_cwd == [workspace], (
+        f"exec_shell 未在会话 workspace 下执行: {spawned_cwd!r} (期望 {workspace!r})")
+
+
+def test_write_file_journal_scoped_to_session(monkeypatch, session_ctx, tmp_path):
+    """实际场景：write_file 的文件 journal 必须归属当前会话。
+
+    worker 若丢失 session_dir，journal 会退化为 stateless/no_session_dir，
+    undo 将无法按会话定位快照 —— 文件虽写入成功但失去了可恢复性。
+    """
+    from runtime.builtin_tools import WRITE_FILE_TOOL_CONFIG, _write_file
+    from runtime.registry import ModelRegistry, ToolRegistry
+    from runtime.runtime import Runtime
+
+    workspace, _session_dir = session_ctx
+    monkeypatch.setenv("TOOL_EXEC_TIMEOUT", "30")
+    monkeypatch.setenv("DISABLE_FILE_JOURNAL", "false")
+    # 防止退化为环境变量目录时污染真实 workspace / 仓库
+    monkeypatch.setenv("AGENTS_WORKSPACE", str(tmp_path / "wrong-env-ws"))
+
+    registry = ToolRegistry()
+    registry.register(WRITE_FILE_TOOL_CONFIG, callable_fn=_write_file)
+    runtime = Runtime(model_registry=ModelRegistry(), tool_registry=registry)
+
+    result = runtime._execute_function_tool(
+        WRITE_FILE_TOOL_CONFIG, {"path": "hello.txt", "content": "hi"})
+    payload = json.loads(result)
+    journal = payload.get("journal") or {}
+    assert journal.get("skipped") is not True, (
+        f"write_file journal 未归属会话（退化为 stateless）: {journal!r}")
+    assert str(payload.get("journal_id", "")).startswith("sess-1/"), (
+        f"journal 未绑定会话 session_id: {payload!r}")

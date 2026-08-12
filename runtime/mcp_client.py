@@ -28,14 +28,10 @@ from typing import Optional
 
 from runtime.models import ToolConfig
 from runtime.common import kill_process_group
+from runtime.runtime import _get_tool_exec_timeout
 
 # Default idle timeout in seconds before a stdio process is reaped.
 _DEFAULT_IDLE_TIMEOUT = 300
-
-# Execution timeout (seconds) for MCP tool calls — applies to both stdio and HTTP.
-# Long-running tools (e.g. read_verification_code with retries) may need minutes.
-# Override via the MCP_EXEC_TIMEOUT environment variable.
-_MCP_EXEC_TIMEOUT = int(os.environ.get("MCP_EXEC_TIMEOUT", 300))
 
 
 class MCPClientManager:
@@ -128,11 +124,28 @@ class MCPClientManager:
         await process.stdin.drain()
         # Some MCP servers emit non-JSON lines or JSON-RPC notifications before
         # the actual response.  Skip non-JSON lines and notifications (no "id").
-        # Each readline is guarded by asyncio.wait_for so that a hung server
-        # is detected; as long as lines keep arriving the timeout resets.
-        t = timeout if timeout is not None else _MCP_EXEC_TIMEOUT
+        # A hard wall-clock deadline caps the whole request/response exchange
+        # (TOOL_EXEC_TIMEOUT) so a server that keeps streaming progress lines
+        # forever cannot pin the worker; each individual readline is additionally
+        # guarded by asyncio.wait_for so a fully silent server is detected.
+        # When the guard is disabled (TOOL_EXEC_TIMEOUT empty / <= 0) the
+        # exchange is unbounded, matching the historical no-deadline behavior.
+        t = timeout if timeout is not None else _get_tool_exec_timeout()
+        if t is None:
+            deadline = None
+        else:
+            deadline = time.monotonic() + t
         while True:
-            line = await asyncio.wait_for(process.stdout.readline(), timeout=t)
+            if deadline is None:
+                remaining = None
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(
+                        f"MCP stdio tool call timed out after {t:.0f}s"
+                    )
+            line = await asyncio.wait_for(
+                process.stdout.readline(), timeout=remaining)
             if not line:
                 raise RuntimeError("MCP server closed stdout unexpectedly")
             stripped = line.decode("utf-8").strip()
@@ -165,7 +178,9 @@ class MCPClientManager:
     # HTTP Streamable HTTP transport helpers
     # ------------------------------------------------------------------
 
-    def _http_reinitialize_and_retry(self, conn: dict, body: bytes, reason: str) -> dict:
+    def _http_reinitialize_and_retry(
+        self, conn: dict, body: bytes, reason: str, socket_timeout: float | None,
+    ) -> dict:
         """Re-initialize the HTTP connection and retry the original request once.
 
         Called when the server returns 404 (session expired) or when a
@@ -193,7 +208,7 @@ class MCPClientManager:
                     headers2["mcp-session-id"] = new_sid
                 try:
                     req2 = urllib.request.Request(url, data=body, headers=headers2, method="POST")
-                    with urllib.request.urlopen(req2, timeout=_MCP_EXEC_TIMEOUT) as resp2:
+                    with urllib.request.urlopen(req2, timeout=socket_timeout) as resp2:
                         new_session_id2 = resp2.headers.get("mcp-session-id")
                         if new_session_id2:
                             conn["session_id"] = new_session_id2
@@ -215,7 +230,7 @@ class MCPClientManager:
                 if new_sid:
                     headers2["mcp-session-id"] = new_sid
                 req2 = urllib.request.Request(url, data=body, headers=headers2, method="POST")
-                with urllib.request.urlopen(req2, timeout=_MCP_EXEC_TIMEOUT) as resp2:
+                with urllib.request.urlopen(req2, timeout=socket_timeout) as resp2:
                     new_session_id2 = resp2.headers.get("mcp-session-id")
                     if new_session_id2:
                         conn["session_id"] = new_session_id2
@@ -229,8 +244,22 @@ class MCPClientManager:
                     f"MCP re-initialize after {reason} failed: {retry_exc}"
                 ) from retry_exc
 
-    def _http_send(self, conn: dict, request: dict) -> dict:
+    def _http_send(self, conn: dict, request: dict, timeout: float | None = None) -> dict:
         """Send a JSON-RPC request over Streamable HTTP and return the response.
+
+        Enforces the shared TOOL_EXEC_TIMEOUT as a HARD wall-clock deadline
+        for the ENTIRE exchange -- connect, read, SSE streaming and the
+        session re-initialize retry all count against it.  The request runs
+        on a dedicated worker thread and the caller waits at most
+        TOOL_EXEC_TIMEOUT seconds, so a server that keeps an SSE stream open
+        (progress lines) or trickles a plain JSON body forever can never pin
+        the calling thread indefinitely.  On timeout a RuntimeError is
+        raised; the orphaned worker is a daemon thread and dies at its next
+        socket timeout.
+
+        When the guard is disabled (TOOL_EXEC_TIMEOUT empty / <= 0) the
+        request runs inline without a deadline, matching the historical
+        plain-urlopen behavior.
 
         Handles both plain JSON responses and SSE streams.  For SSE, reads
         line-by-line so we return as soon as the first JSON-RPC response
@@ -245,6 +274,32 @@ class MCPClientManager:
         restart), the stale session is cleared and the request is retried
         after re-initialization.
         """
+        t = timeout if timeout is not None else _get_tool_exec_timeout()
+        if t is None:
+            return self._http_send_impl(conn, request, socket_timeout=None)
+        # NOTE: never use `with ThreadPoolExecutor(...)` here -- its
+        # shutdown(wait=True) would block until the hung exchange finishes,
+        # recreating the very hang we guard against.
+        executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="mcp-http")
+        future = executor.submit(self._http_send_impl, conn, request, socket_timeout=t)
+        try:
+            return future.result(timeout=t)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            raise RuntimeError(
+                f"MCP HTTP tool call timed out after {t:g}s"
+            ) from None
+        finally:
+            # wait=False: never block on a hung worker; it is a daemon thread
+            # and dies at its next socket timeout.
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    def _http_send_impl(
+        self, conn: dict, request: dict, socket_timeout: float | None,
+    ) -> dict:
+        """Actual HTTP exchange; runs on the caller thread when the deadline
+        guard is disabled, or on the deadline worker thread otherwise."""
         url = conn["url"]
         headers = dict(conn.get("headers") or {})
         headers.setdefault("Content-Type", "application/json")
@@ -256,7 +311,7 @@ class MCPClientManager:
         body = json.dumps(request).encode("utf-8")
         req = urllib.request.Request(url, data=body, headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=_MCP_EXEC_TIMEOUT) as resp:
+            with urllib.request.urlopen(req, timeout=socket_timeout) as resp:
                 # Capture session ID from response headers (set during initialize)
                 new_session_id = resp.headers.get("mcp-session-id")
                 if new_session_id:
@@ -270,12 +325,14 @@ class MCPClientManager:
             # session expired.  Clear the stale session and re-initialize,
             # then retry the original request exactly once.
             if exc.code == 404 and session_id:
-                return self._http_reinitialize_and_retry(conn, body, "session expired (404)")
+                return self._http_reinitialize_and_retry(
+                    conn, body, "session expired (404)", socket_timeout)
             raise RuntimeError(f"MCP HTTP error {exc.code}: {exc.reason}") from exc
         except urllib.error.URLError as exc:
             # Connection-level error (e.g. server restarted, connection reset).
             # Re-initialize once so subsequent calls transparently reconnect.
-            return self._http_reinitialize_and_retry(conn, body, f"connection error: {exc.reason}")
+            return self._http_reinitialize_and_retry(
+                conn, body, f"connection error: {exc.reason}", socket_timeout)
 
     def _read_sse_stream(self, resp) -> dict:
         """Read an SSE stream line-by-line and return the first JSON-RPC response.

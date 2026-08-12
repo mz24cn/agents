@@ -528,6 +528,30 @@ def clear_request_context(keys: list[str]) -> None:
             pass
 
 
+def snapshot_request_context() -> dict:
+    """Capture the current thread's request context as a plain dict.
+
+    ``threading.local`` storage is per-thread, so a context set on the
+    request/HTTP thread is invisible to any worker thread spawned by the
+    runtime (e.g. ``ThreadPoolExecutor``).  Snapshot the attrs so they can be
+    re-applied with :func:`restore_request_context` on the worker thread,
+    keeping tools like ``exec_cli`` (persistent PTY) and ``write_file``
+    (per-session file journal) pinned to the same session.
+    """
+    return dict(getattr(_thread_local, "__dict__", {}))
+
+
+def restore_request_context(ctx: dict) -> None:
+    """Replace the current thread's request context with *ctx*.
+
+    Intended for worker threads: clears whatever context (if any) this thread
+    already carries, then applies the snapshot captured on the caller thread.
+    """
+    attrs = getattr(_thread_local, "__dict__", {})
+    attrs.clear()
+    attrs.update(ctx)
+
+
 # ---------------------------------------------------------------------------
 # Workspace resolution
 # ---------------------------------------------------------------------------

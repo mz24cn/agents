@@ -4,7 +4,11 @@ Tests the singleton pattern, tool conversion, connection state management,
 and JSON-RPC message building. Does not require real MCP servers.
 """
 
+import http.server
 import json
+import threading
+import time
+
 import pytest
 from hypothesis import given, settings, strategies as st
 
@@ -508,3 +512,137 @@ class TestLoadConfig:
         mgr = MCPClientManager()
         with pytest.raises(ValueError, match="dict"):
             mgr.load_config({"mcpServers": "not_a_dict"})
+
+
+# ------------------------------------------------------------------
+# HTTP (URL) transport hard-deadline tests
+# ------------------------------------------------------------------
+
+class _SlowSSEHandler(http.server.BaseHTTPRequestHandler):
+    """Serves the initialize handshake normally, then answers every other
+    request with an endless SSE stream of progress notifications (no
+    JSON-RPC ``id``) -- exactly the server behaviour that would pin the
+    client forever without a hard wall-clock deadline."""
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length)
+        try:
+            req = json.loads(raw.decode("utf-8")) if raw else {}
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            req = {}
+        method = req.get("method")
+        if method == "initialize":
+            payload = json.dumps({
+                "jsonrpc": "2.0",
+                "id": req.get("id"),
+                "result": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "serverInfo": {"name": "slow"},
+                },
+            }).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+        elif method == "notifications/initialized":
+            self.send_response(202)
+            self.end_headers()
+        else:
+            # tools/call, tools/list, ...: endless SSE progress stream
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            try:
+                while True:
+                    self.wfile.write(
+                        b'data: {"jsonrpc":"2.0","method":"notifications/progress"}\n\n')
+                    self.wfile.flush()
+                    time.sleep(0.05)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+
+    def log_message(self, *args) -> None:  # silence request logging
+        pass
+
+
+class TestHTTPDeadline:
+    def test_http_call_tool_hard_deadline(self, monkeypatch) -> None:
+        """A URL-mode MCP server that streams SSE progress forever must be
+        cut off by the shared TOOL_EXEC_TIMEOUT (hard wall-clock), not pin
+        the calling thread."""
+        monkeypatch.setenv("TOOL_EXEC_TIMEOUT", "0.3")
+
+        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _SlowSSEHandler)
+        server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        server_thread.start()
+        url = f"http://127.0.0.1:{httpd.server_address[1]}/mcp"
+        try:
+            mgr = MCPClientManager()
+            mgr.connect_url("slow", url)
+            start = time.monotonic()
+            with pytest.raises(RuntimeError, match="timed out"):
+                mgr.call_tool("slow", "hang", {})
+            elapsed = time.monotonic() - start
+            assert elapsed < 5, f"HTTP deadline did not fire; took {elapsed:.1f}s"
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_http_call_tool_returns_when_server_responds(self, monkeypatch) -> None:
+        """A healthy URL-mode server still completes inside the deadline."""
+        monkeypatch.setenv("TOOL_EXEC_TIMEOUT", "5")
+
+        httpd = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), _FastEchoHandler)
+        server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        server_thread.start()
+        url = f"http://127.0.0.1:{httpd.server_address[1]}/mcp"
+        try:
+            mgr = MCPClientManager()
+            mgr.connect_url("echo", url)
+            result = mgr.call_tool("echo", "echo", {"text": "hi"})
+            assert "hi" in result
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+
+class _FastEchoHandler(http.server.BaseHTTPRequestHandler):
+    """Minimal MCP-over-HTTP echo server: initialize handshake plus a
+    tools/call response that returns the echoed text immediately."""
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length)
+        try:
+            req = json.loads(raw.decode("utf-8")) if raw else {}
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            req = {}
+        method = req.get("method")
+        if method == "initialize":
+            result = {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "serverInfo": {"name": "echo"},
+            }
+        elif method == "tools/call":
+            args = req.get("params", {}).get("arguments", {})
+            result = {"content": [{"type": "text", "text": f"echo:{args.get('text', '')}"}]}
+        else:
+            result = {}
+        payload = json.dumps({
+            "jsonrpc": "2.0",
+            "id": req.get("id"),
+            "result": result,
+        }).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *args) -> None:  # silence request logging
+        pass

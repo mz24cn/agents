@@ -17,13 +17,46 @@ Design:
 
 from __future__ import annotations
 
+import logging
 import os
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import Optional
 
 from runtime.common import set_request_context
 from runtime.models import Message, InferenceRequest
+from runtime.runtime import _get_infer_round_timeout
+
+_logger = logging.getLogger("runtime.group_chat")
+
+# SSE keep-alive interval for long group-chat waits. Gateways/proxies/
+# firewalls commonly drop idle connections; a periodic comment frame keeps
+# the stream alive so final frames (e.g. the timeout error) actually reach
+# the browser instead of being silently lost.
+_GROUP_CHAT_HEARTBEAT_INTERVAL = 25.0
+
+
+def _get_group_chat_timeout(num_agents: int) -> Optional[float]:
+    """Outer per-round deadline for a group-chat parallel wait.
+
+    MODEL_INFER_ROUND_TIMEOUT caps a SINGLE tool-call round inside
+    infer_stream (the cap resets per tool round), so one agent may
+    legitimately take far longer than that across multiple tool rounds.
+    Reusing the raw value as the outer group-chat deadline would kill
+    multi-tool-round agents while they are still making progress, so the
+    wait scales with the number of agents (excluding the user, who is
+    never part of all_agent_ids): N agents get N x MODEL_INFER_ROUND_TIMEOUT
+    per round.
+
+    Returns None when the round-timeout guard is disabled (empty/<=0 env),
+    mirroring _get_infer_round_timeout().
+    """
+    base = _get_infer_round_timeout()
+    if base is None or num_agents <= 1:
+        return base
+    return base * num_agents
+
 
 # ---------------------------------------------------------------------------
 # AGENTS markdown table builder (shared between persist & inference)
@@ -519,6 +552,7 @@ def run_group_chat_stream(
     base_request: InferenceRequest,
     cancel_event,
     sse_callback,
+    sse_heartbeat=None,
     context_manager,
     session_id: str,
     agent_manager,
@@ -540,6 +574,9 @@ def run_group_chat_stream(
             (used as template for per-agent requests).
         cancel_event: threading.Event for abort.
         sse_callback: SSE write callback (frame dict → writes to client).
+        sse_heartbeat: optional zero-argument callback emitting an SSE
+            keep-alive comment frame while waiting on slow agents, so
+            long-idle streams are not dropped by gateways/proxies.
         context_manager: ContextManager for loading conversation history.
         session_id: Group chat session ID.
         agent_manager: AgentManager for resolving agent configs.
@@ -550,10 +587,6 @@ def run_group_chat_stream(
         Collected Message objects from all agents, already tagged with
         ``agent_id`` and ``name``.
     """
-    import logging
-
-    _logger = logging.getLogger("runtime.group_chat")
-
     agents_markdown = build_agents_markdown(
         all_agent_ids, agent_manager, include_user_row=True,
     )
@@ -766,14 +799,98 @@ def run_group_chat_stream(
 
         # --- parallel execution for this round ----------------------------
         round_collected: list[Message] = []
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(_run_one, aid): aid
-                for aid in pending_mentioned
-            }
-            for future in as_completed(futures):
-                _aid, msgs = future.result()
-                round_collected.extend(msgs)
+
+        def _append_error(agent_id: str, message: str) -> None:
+            """Push an error assistant Message for a failed/timed-out agent,
+            mirroring the per-agent error handling inside _run_one."""
+            agent = agent_manager.get(agent_id)
+            nickname = agent.get("nickname", agent_id) if agent else agent_id
+            err = Message(
+                role="assistant",
+                content=f"Error: {message}",
+                agent_id=agent_id,
+                name=nickname,
+            )
+            round_collected.append(err)
+            if sse_callback:
+                try:
+                    frame = err.to_dict()
+                    frame["nickname"] = nickname
+                    sse_callback(frame)
+                except Exception:
+                    pass
+
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        futures = {
+            executor.submit(_run_one, aid): aid
+            for aid in pending_mentioned
+        }
+        try:
+            pending = set(futures)
+            future_timeout = _get_group_chat_timeout(len(all_agent_ids))
+            deadline = (time.monotonic() + future_timeout
+                        if future_timeout is not None else None)
+            while pending:
+                if deadline is None:
+                    wait_timeout = _GROUP_CHAT_HEARTBEAT_INTERVAL
+                else:
+                    wait_timeout = min(
+                        _GROUP_CHAT_HEARTBEAT_INTERVAL,
+                        max(0.0, deadline - time.monotonic()),
+                    )
+                done, pending = wait(
+                    pending, timeout=wait_timeout,
+                    return_when=FIRST_COMPLETED,
+                )
+                for future in done:
+                    aid = futures[future]
+                    try:
+                        _aid, msgs = future.result()
+                        round_collected.extend(msgs)
+                    except Exception as exc:
+                        _logger.error(
+                            "group chat agent %s inference failed: %s",
+                            aid, exc,
+                        )
+                        _append_error(aid, f"agent inference failed: {exc}")
+                if not pending:
+                    break
+                # Keep long-wait SSE streams alive: gateways/proxies/firewalls
+                # drop idle connections, which would silently lose the final
+                # timeout-error frames (they ARE persisted, so history replay
+                # shows them but the live view never does).
+                if deadline is None or time.monotonic() < deadline:
+                    if sse_heartbeat is not None:
+                        try:
+                            sse_heartbeat()
+                        except Exception:
+                            pass
+                if deadline is not None and time.monotonic() >= deadline:
+                    # At least one agent did not finish in time -- stop waiting
+                    # and report it as timed out instead of hanging the whole
+                    # group-chat round.  Signal cancellation so any orphaned
+                    # worker threads terminate promptly (infer_stream checks
+                    # cancel_event at each yield point).
+                    if cancel_event is not None:
+                        cancel_event.set()
+                    for future in pending:
+                        aid = futures[future]
+                        future.cancel()
+                        _logger.error(
+                            "group chat agent %s timed out after %ss",
+                            aid, f"{future_timeout:g}",
+                        )
+                        _append_error(
+                            aid,
+                            f"agent inference timed out after "
+                            f"{future_timeout:g}s",
+                        )
+                    break
+        finally:
+            # Never block on a still-running worker: pending futures are
+            # cancelled and running threads exit via cancel_event or their
+            # own internal timeouts (infer_stream is self-terminating).
+            executor.shutdown(wait=False, cancel_futures=True)
 
         all_collected.extend(round_collected)
 

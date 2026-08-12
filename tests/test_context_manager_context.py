@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+from dataclasses import asdict
 from types import SimpleNamespace
 from typing import Any, Optional
 
@@ -258,18 +259,25 @@ def test_token_budget_respected(state: dict, budget: int) -> None:
         cm, session_id = _build_cm_from_state(tmp_dir, state)
 
         # Compute the irreducible token cost: turns + new_messages only
-        # (memory and summary can be removed, but turns cannot per the spec)
+        # (memory and summary can be removed, but turns cannot per the spec).
+        # Estimate with the SAME asdict serialization assemble_context emits:
+        # the no-summary branch injects the full history verbatim (turns are
+        # never truncated), and the compression branch emits at most K recent
+        # turns — so counting all turns is conservative-safe for both branches.
         try:
             turns = cm.load_conversation(session_id)
         except (FileNotFoundError, ValueError):
             turns = []
-        k = cm._recent_turns_k
-        recent_turns = turns[-k:] if len(turns) > k else turns
-        turn_msgs = [{"role": t.role, "content": t.content} for t in recent_turns]
-        irreducible_tokens = sum(estimate_tokens(str(m)) for m in turn_msgs)
+        irreducible_tokens = sum(
+            estimate_tokens(
+                str({kk: vv for kk, vv in asdict(t).items() if vv is not None})
+            )
+            for t in turns
+        )
 
         # Only assert the budget constraint when the budget can actually be met.
-        # estimate_tokens on simplified dicts underestimates vs actual Message.__str__
+        # The 1.5x margin absorbs the merged system message overhead (summary
+        # and memory are trimmable, but their prefix text is not).
         if budget < irreducible_tokens * 1.5:
             return  # spec doesn't define turn truncation; skip this case
 
