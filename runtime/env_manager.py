@@ -194,7 +194,8 @@ class EnvManager:
     def _copy_project(self, src: str, dst: str) -> None:
         import shutil
         exclude_dirs = {".git", "__pycache__", ".pytest_cache", ".hypothesis", ".mypy_cache",
-                        ".ruff_cache", "node_modules", "dist", "build", ".venv", "venv"}
+                        ".ruff_cache", "node_modules", "dist", "build", ".venv", "venv",
+                        "workspace", "docs"}
         exclude_files = {".DS_Store"}
         src_real = os.path.realpath(src)
         web_dist_real = os.path.join(src_real, "web", "dist")

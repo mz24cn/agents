@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import difflib
 import gzip
+import logging
 import re
 import stat
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 class JournalConflictError(RuntimeError):
@@ -1998,6 +2001,13 @@ For each entry:
                 # Nothing to trim here beyond dropping oldest turns, but that
                 # would be lossy without a summary — leave as-is and let the
                 # caller handle overflow.
+                if total_tokens > effective_budget:
+                    logger.warning(
+                        "assemble_context(session=%s): no summary to trim; "
+                        "assembled %d tokens exceeds token_budget=%d — turns are "
+                        "never truncated per spec, caller must handle overflow",
+                        session_id, total_tokens, effective_budget,
+                    )
             return assembled
 
         # Compression is active — use a SINGLE merged system message plus
