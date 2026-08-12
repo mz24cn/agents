@@ -121,6 +121,45 @@ def parse_upload_max_threads(value: Optional[str], default: int = DEFAULT_UPLOAD
     return max(1, min(32, parsed))
 
 
+def get_paste_directory(workspace: str) -> str:
+    """Return the directory where clipboard-pasted files are stored.
+
+    The chat input uploads pasted files (images / PDF / DOCX ...) into this
+    directory, then references them with ``<file>`` tags.
+
+    - Linux / macOS: ``/tmp``.  This path was already handled specially by the
+      backend (file references under ``/tmp`` are always allowed, and uploads
+      into it work even though it normally lives outside the workspace).
+    - Windows: the OS temp directory via :func:`tempfile.gettempdir` (which
+      already resolves the per-drive temp location); falls back to
+      ``<workspace drive>:\\tmp`` when the temp dir is unavailable.
+
+    Returns:
+        Absolute path of the paste directory (may not exist yet on Windows
+        fallback; callers should ensure it is created before writing).
+    """
+    if os.name == "nt":
+        # Windows: multiple drive letters make a fixed "/tmp" meaningless, so
+        # prefer the OS temp dir (e.g. C:\\Users\\...\\AppData\\Local\\Temp).
+        try:
+            temp_dir = tempfile.gettempdir()
+            if temp_dir and os.path.isdir(temp_dir):
+                return temp_dir
+        except Exception:
+            pass
+        # Fallback: <workspace drive>:\tmp so the pasted files stay on the
+        # same drive as the workspace.
+        drive = os.path.splitdrive(os.path.realpath(workspace))[0]
+        if drive:
+            candidate = drive + os.sep + "tmp"
+            try:
+                os.makedirs(candidate, exist_ok=True)
+                return candidate
+            except OSError:
+                pass
+    return "/tmp"
+
+
 class WorkspaceManager:
     """Manages workspace files and directories."""
     
@@ -672,13 +711,33 @@ class WorkspaceManager:
         
         return {"copied": copied, "errors": errors}
 
+    def is_paste_directory(self, path: str) -> bool:
+        """Return True if *path* lies inside the clipboard paste directory.
+
+        The paste directory (``/tmp`` on Linux, OS temp dir on Windows) is
+        deliberately allowed for writes even when workspace restriction is
+        enabled, so files pasted into the chat input can always be uploaded.
+        """
+        try:
+            paste = get_paste_directory(self.workspace_path)
+        except Exception:
+            return False
+        real_paste = os.path.realpath(paste)
+        real_path = os.path.realpath(path)
+        return real_path == real_paste or real_path.startswith(real_paste + os.sep)
+
     def resolve_upload_dir(self, target_dir_path: str, restrict_workspace: bool = True) -> str:
         """Resolve an absolute selected upload directory inside the workspace."""
         if not isinstance(target_dir_path, str) or not target_dir_path.strip():
             raise ValueError("INVALID_TARGET_DIR: target_dir_path is required")
         target_dir = os.path.realpath(target_dir_path if os.path.isabs(target_dir_path) else os.path.join(self.workspace_path, target_dir_path))
-        if restrict_workspace and os.path.commonpath([self.workspace_path, target_dir]) != self.workspace_path:
-            raise ValueError("INVALID_TARGET_DIR: target directory is outside workspace")
+        if restrict_workspace:
+            try:
+                inside_workspace = os.path.commonpath([self.workspace_path, target_dir]) == self.workspace_path
+            except ValueError:
+                inside_workspace = False  # different drives on Windows
+            if not inside_workspace and not self.is_paste_directory(target_dir):
+                raise ValueError("INVALID_TARGET_DIR: target directory is outside workspace")
         if not os.path.isdir(target_dir):
             raise ValueError("INVALID_TARGET_DIR: target directory does not exist")
         return target_dir
@@ -698,10 +757,15 @@ class WorkspaceManager:
         # 始终以 base_dir（前端当前目录）为基准解析 target_path，目录合法性通过 resolve_upload_dir 保证
         base = base_dir if base_dir else self.workspace_path
         target_abs = os.path.realpath(os.path.join(base, *parts))
-        if restrict_workspace and os.path.commonpath([self.workspace_path, target_abs]) != self.workspace_path:
-            raise ValueError("INVALID_TARGET_PATH: target is outside workspace")
-        if restrict_workspace and target_abs == self.workspace_path:
-            raise ValueError("INVALID_TARGET_PATH: target cannot be workspace root")
+        if restrict_workspace:
+            try:
+                inside_workspace = os.path.commonpath([self.workspace_path, target_abs]) == self.workspace_path
+            except ValueError:
+                inside_workspace = False  # different drives on Windows
+            if not inside_workspace and not self.is_paste_directory(target_abs):
+                raise ValueError("INVALID_TARGET_PATH: target is outside workspace")
+            if inside_workspace and target_abs == self.workspace_path:
+                raise ValueError("INVALID_TARGET_PATH: target cannot be workspace root")
         return target_abs
 
     def create_upload_task(self, file_name: str, file_size: int, target_path: str, parallel_size: int, parallel_max_threads: int, target_dir_path: Optional[str] = None, restrict_workspace: bool = True) -> Dict[str, Any]:

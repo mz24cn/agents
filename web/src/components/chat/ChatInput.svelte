@@ -1,8 +1,10 @@
 <script>
   import { onDestroy, tick } from 'svelte'
   import { t } from '../../lib/i18n.svelte.js'
+  import { extractPastedFiles, buildFileRefs } from '../../lib/clipboard-paste.js'
+  import { uploadFilesToPasteDir } from '../../lib/workspace-upload.js'
 
-  let { disabled = false, onSend, onStop, onStopForce, onToggleTemplatePanel, onToggleWorkspacePanel, workspacePanelOpen = false, templatePanelOpen = false, text = $bindable(''), isStreaming = false, selectedAgentIds = [], agentList = [] } = $props()
+  let { disabled = false, onSend, onStop, onStopForce, onToggleTemplatePanel, onToggleWorkspacePanel, workspacePanelOpen = false, templatePanelOpen = false, text = $bindable(''), isStreaming = false, selectedAgentIds = [], agentList = [], onError = () => {}, continueMode = false, onContinue = () => {} } = $props()
 
   let editorEl = $state(null)
   let lastRenderedText = ''
@@ -33,7 +35,8 @@
   )
 
   // 输入框为空且不在流式状态时，显示"?"按钮（提示词模板入口）
-  let showTemplateBtn = $derived(!isStreaming && !text.trim())
+  // 继续推理模式下不显示模板入口（输入框被屏蔽，只能继续或撤回）
+  let showTemplateBtn = $derived(!isStreaming && !continueMode && !text.trim())
 
   function createFileChip(ref) {
     const chip = document.createElement('span')
@@ -242,11 +245,37 @@
     checkForMention()
   }
 
-  function handlePaste(e) {
+  /**
+   * Paste handling:
+   * - If the clipboard carries files (image / PDF / DOCX ...), upload them into
+   *   the backend paste directory (/tmp on Linux, OS temp dir on Windows) and
+   *   insert <file> references — equivalent to the workspace file manager's
+   *   "paste upload" + "select file" operations.
+   * - Otherwise insert the clipboard text at the caret (existing behaviour).
+   */
+  async function handlePaste(e) {
     e.preventDefault()
+    const pastedFiles = extractPastedFiles(e.clipboardData)
+    if (pastedFiles.length > 0) {
+      await handlePasteFiles(pastedFiles)
+      return
+    }
     const pasted = (e.clipboardData?.getData('text/plain') ?? '').replace(/\r\n/g, '\n').replace(/\r/g, '\n')
     document.execCommand('insertText', false, pasted)
     syncTextFromEditor()
+  }
+
+  async function handlePasteFiles(files) {
+    try {
+      const paths = await uploadFilesToPasteDir(files)
+      const refs = buildFileRefs(paths)
+      // Append the file references; the $effect below re-renders them as chips
+      // and moves the caret to the end (same UX as selecting files from the
+      // workspace file manager).
+      text = text && !text.endsWith(' ') ? `${text} ${refs}` : `${text || ''}${refs}`
+    } catch (err) {
+      onError?.(`${t('pasteUploadFailed')}: ${err.message || err}`)
+    }
   }
 
   // 外部更新 text（例如工作区选择文件、撤销重填、发送后清空）时，同步到富文本输入区。
@@ -285,6 +314,7 @@
   })
 
   function handleSend() {
+    if (continueMode) return
     syncTextFromEditor()
     const trimmed = text.trim()
     if (!trimmed || disabled) return
@@ -293,6 +323,7 @@
   }
 
   function handleKeydown(e) {
+    if (continueMode) return
     // 如果菜单打开，处理菜单导航
     if (mentionMenuOpen) {
       const agents = filteredAgents
@@ -338,12 +369,13 @@
       bind:this={editorEl}
       class="input-box"
       class:empty={!text.trim()}
-      contenteditable={!disabled}
+      class:continue-mode={continueMode}
+      contenteditable={!disabled && !continueMode}
       role="textbox"
-      tabindex={disabled ? -1 : 0}
+      tabindex={disabled || continueMode ? -1 : 0}
       aria-multiline="true"
-      aria-label={t('inputPlaceholder')}
-      data-placeholder={t('inputPlaceholder')}
+      aria-label={continueMode ? t('continueInterruptedPlaceholder') : t('inputPlaceholder')}
+      data-placeholder={continueMode ? t('continueInterruptedPlaceholder') : t('inputPlaceholder')}
       oninput={handleInput}
       onkeydown={handleKeydown}
       onpaste={handlePaste}
@@ -377,12 +409,23 @@
       class:active={workspacePanelOpen}
       onclick={() => onToggleWorkspacePanel?.()}
       title={t('workspaceFileManager')}
-      disabled={disabled}
+      disabled={disabled || continueMode}
     >
       {workspacePanelOpen ? '−' : '+'}
     </button>
     
-    {#if templatePanelOpen}
+    {#if continueMode}
+      <!-- 继续推理模式：屏蔽输入框，发送按钮改为"继续推理"。
+           用户也可以撤回最后一条用户消息以重新编辑。 -->
+      <button
+        class="send-btn continue-btn"
+        onclick={() => onContinue?.()}
+        disabled={disabled}
+        title={t('continueInference')}
+      >
+        {t('continueInference')}
+      </button>
+    {:else if templatePanelOpen}
       <!-- 提示词面板打开时显示叉号关闭按钮 -->
       <button
         class="send-btn template-btn active"
@@ -491,6 +534,14 @@
     opacity: 0.6;
     cursor: not-allowed;
   }
+  .input-box.continue-mode {
+    opacity: 0.75;
+    cursor: not-allowed;
+  }
+  .input-box.continue-mode.empty::before {
+    color: var(--primary);
+    opacity: 0.9;
+  }
   .input-box.empty::before {
     content: attr(data-placeholder);
     color: var(--text-secondary);
@@ -545,6 +596,21 @@
   .send-btn:disabled { opacity: 0.5; cursor: not-allowed; }
   .send-btn.stop { background: var(--danger, #e53e3e); }
   .send-btn.stop:hover { background: #c53030; }
+  /* 继续推理按钮：加宽以容纳"继续推理"文案 */
+  .send-btn.continue-btn {
+    width: auto;
+    height: auto;
+    min-height: 28px;
+    padding: 5px 12px;
+    font-size: 0.78rem;
+    white-space: nowrap;
+    border-radius: 6px;
+    background: var(--primary);
+    color: #fff;
+    border: none;
+    cursor: pointer;
+  }
+  .send-btn.continue-btn:hover:not(:disabled) { background: var(--primary-hover); }
   /* "+"工作区按钮样式：使用次要色调 */
   .send-btn.workspace-btn {
     background: var(--bg-secondary);

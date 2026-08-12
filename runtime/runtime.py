@@ -9,13 +9,20 @@ import concurrent.futures
 import json
 import logging
 import os
+import re
 import socket
 import time
 import urllib.request
 import urllib.error
 from typing import Iterator, Optional
 
-from runtime.common import now_iso as _now_iso, is_likely_base64, snapshot_request_context, restore_request_context
+from runtime.common import (
+    _thread_local,
+    now_iso as _now_iso,
+    is_likely_base64,
+    snapshot_request_context,
+    restore_request_context,
+)
 
 _logger = logging.getLogger("runtime.runtime")
 
@@ -185,6 +192,49 @@ def _normalize_tool_call_order(messages: list) -> list:
     return result
 
 
+# ---------------------------------------------------------------------------
+# VLM fallback helpers
+#
+# A model whose labels lack "vlm" cannot consume multimodal payloads.  When
+# such a model receives images, the images are transcribed to text through
+# the built-in read_image tool (single call, carrying the user's original
+# query), and the attachment is replaced with a text block that mirrors the
+# text-file attachment format used by expand_workspace_file_refs_in_message:
+#
+#     [Image file attached: <labels>]
+#     ```
+#     <transcription>
+#     ```
+# ---------------------------------------------------------------------------
+
+_IMAGE_ATTACHED_RE = re.compile(r"\[Image file attached: [^\]]*\]")
+
+
+def _image_attachment_label(img_data: str) -> str:
+    """Return a short human-readable label for an image source.
+
+    Base64 payloads are shown as "(inline image)" to avoid dumping huge
+    encoded strings into the prompt; URLs and local paths are shown as-is.
+    """
+    if img_data.startswith(("http://", "https://")):
+        return img_data
+    if is_likely_base64(img_data):
+        return "(inline image)"
+    return img_data
+
+
+def _strip_image_attached_lines(content: str) -> str:
+    """Strip ``[Image file attached: ...]`` placeholder lines from user content.
+
+    Used to recover the user's original query text before handing it to the
+    VLM transcription prompt, so the VLM is guided by what the user actually
+    asked (e.g. comparing two images) instead of the placeholder syntax.
+    """
+    if not content:
+        return ""
+    return _IMAGE_ATTACHED_RE.sub("", content).strip()
+
+
 class Runtime:
     """Core runtime engine that coordinates model inference and tool execution.
 
@@ -222,7 +272,7 @@ class Runtime:
     # Input normalization
     # ------------------------------------------------------------------
 
-    def _normalize_messages(self, request: InferenceRequest) -> list:
+    def _normalize_messages(self, request: InferenceRequest, model_config=None) -> list:
         """Normalize request input into a list of Message objects.
 
         If request.text is set, wraps it as a single user message.
@@ -234,8 +284,15 @@ class Runtime:
         {placeholder} variables are replaced using the message's arguments dict.
         The resolved text is written into the message's content field.
 
+        When ``model_config`` is provided and the model has no VLM capability
+        (its labels lack "vlm"), attached images are transcribed to text via
+        the built-in read_image tool before returning (see
+        ``_apply_vlm_image_fallback``).
+
         Args:
             request: The inference request to normalize.
+            model_config: Optional resolved ModelConfig for the target model.
+                When None (e.g. direct calls), no VLM fallback is applied.
 
         Returns:
             A list of Message objects ready for the protocol adapter.
@@ -257,10 +314,72 @@ class Runtime:
                             for key, value in msg.arguments.items():
                                 content = content.replace(f"{{{{{key}}}}}", str(value))
                         msg.content = content
-            return messages
+            return self._apply_vlm_image_fallback(model_config, messages)
         if request.text is not None:
-            return [Message(role="user", content=request.text, timestamp=_now_iso())]
+            messages = [Message(role="user", content=request.text, timestamp=_now_iso())]
+            return self._apply_vlm_image_fallback(model_config, messages)
         return []
+
+    def _apply_vlm_image_fallback(self, model_config, messages: list) -> list:
+        """Transcribe attached images into text when the model cannot see them.
+
+        A model whose labels do not include "vlm" cannot consume multimodal
+        payloads.  When any user message carries ``images``, this method hands
+        ALL of them (plus the user's original query, stripped of the
+        ``[Image file attached: ...]`` placeholders) to the built-in read_image
+        tool in a single call, then replaces the image attachment with a text
+        block mirroring the text-file attachment format:
+
+            [Image file attached: <labels>]
+            ```
+            <transcription>
+            ```
+
+        The transcription block is prepended to the message; the original
+        ``[Image file attached: ...]`` path lines (if any) are kept, exactly
+        like text-file path descriptions are kept next to their content block.
+
+        The message list is returned unchanged when model_config is None, when
+        the model supports VLM ("vlm" label), when no user message has images,
+        when already inside a fallback transcription (recursion guard), or when
+        the read_image tool is not registered.
+        """
+        if model_config is None or "vlm" in (model_config.labels or []):
+            return messages
+        image_msgs = [m for m in messages if m.role == "user" and getattr(m, "images", None)]
+        if not image_msgs:
+            return messages
+        if getattr(_thread_local, "_vlm_fallback_depth", 0) > 0:
+            _logger.warning(
+                "vlm fallback skipped: already inside a fallback transcription "
+                "(read-image model is probably missing the 'vlm' label)"
+            )
+            return messages
+        read_image_fn = None
+        if self._tool_registry is not None:
+            read_image_fn = self._tool_registry.get_callable("read_image")
+        if read_image_fn is None:
+            _logger.warning("vlm fallback skipped: read_image tool is not registered")
+            return messages
+
+        depth = getattr(_thread_local, "_vlm_fallback_depth", 0)
+        try:
+            _thread_local._vlm_fallback_depth = depth + 1
+            for msg in image_msgs:
+                images = list(msg.images)
+                prompt = _strip_image_attached_lines(msg.content)
+                try:
+                    result = read_image_fn(base64_contents=images, prompt=prompt)
+                except Exception as exc:
+                    _logger.error("vlm fallback: read_image failed: %s", exc)
+                    result = f"Error: VLM image transcription failed: {exc}"
+                labels = ", ".join(_image_attachment_label(img) for img in images)
+                block = f"[Image file attached: {labels}]\n```\n{result}\n```"
+                msg.content = block + "\n\n" + (msg.content or "").lstrip()
+                msg.images = None
+        finally:
+            _thread_local._vlm_fallback_depth = depth
+        return messages
 
     # ------------------------------------------------------------------
     # Core inference
@@ -381,7 +500,7 @@ class Runtime:
         protocol = protocol_cls()
 
         # 4. Normalize input messages
-        messages = self._normalize_messages(request)
+        messages = self._normalize_messages(request, model_config)
 
         # 5-7. Inference + tool call loop
         tool_round = 0
@@ -1226,7 +1345,7 @@ class Runtime:
             return
         protocol = protocol_cls()
 
-        messages = self._normalize_messages(request)
+        messages = self._normalize_messages(request, model_config)
 
         # 2. Streaming tool call loop
         tool_round = 0

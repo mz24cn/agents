@@ -383,6 +383,7 @@ export const workspace = {
   content:  (path, restrict = true) => `/v1/workspace/content?path=${encodeURIComponent(path)}&restrict=${restrict ? 1 : 0}`,
   download: (path, restrict = true) => `/v1/workspace/download?path=${encodeURIComponent(path)}&restrict=${restrict ? 1 : 0}`,
   thumbnail:(path, restrict = true) => `/v1/workspace/thumbnail?path=${encodeURIComponent(path)}&restrict=${restrict ? 1 : 0}`,
+  pasteDir: () => request('GET', '/v1/workspace/paste-dir'),
   rename:   (path, newName) => request('POST', '/v1/workspace/rename', { path, new_name: newName }),
   mkdir:    (parentPath, name) => request('POST', '/v1/workspace/mkdir', { parent_path: parentPath, name }),
   duplicate:(path) => request('POST', '/v1/workspace/duplicate', { path }),

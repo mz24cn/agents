@@ -136,6 +136,8 @@ const translations = {
     // ChatInput
     inputPlaceholder: '输入消息...',
     stopBtnTooltip: '单击=中止 | 双击=强制终止（杀掉卡住的工具进程）',
+    continueInference: '继续推理',
+    continueInterruptedPlaceholder: '会话中断：点击"继续推理"恢复，或撤回最后一条消息重新编辑',
     clearChat: '清除对话',
     newSession: '新建会话',
 
@@ -309,6 +311,7 @@ const translations = {
     retryUpload: '重试',
     clipboardEmpty: '剪贴板为空',
     clipboardUploadFailed: '剪贴板上传失败',
+    pasteUploadFailed: '粘贴文件上传失败',
     moveFiles: '移动文件',
     copyFiles: '复制文件',
     moveOrCopyConflict: '目标位置已存在同名文件',
@@ -620,6 +623,8 @@ const translations = {
     // ChatInput
     inputPlaceholder: 'Type a message...',
     stopBtnTooltip: 'Click = abort | Double-click = force kill (terminate stuck tool processes)',
+    continueInference: 'Continue',
+    continueInterruptedPlaceholder: 'Session interrupted: click "Continue" to resume, or revoke the last message to edit',
     clearChat: 'Clear chat',
     newSession: 'New session',
 
@@ -793,6 +798,7 @@ const translations = {
     retryUpload: 'Retry',
     clipboardEmpty: 'Clipboard is empty',
     clipboardUploadFailed: 'Clipboard upload failed',
+    pasteUploadFailed: 'Pasted file upload failed',
     moveFiles: 'Move Files',
     copyFiles: 'Copy Files',
     moveOrCopyConflict: 'File already exists at destination',

@@ -54,6 +54,21 @@
   let isStreaming = $derived(sessionStore[storeKey(sessionId)]?.isStreaming ?? false)
   let collapsedGroups = $derived(sessionStore[storeKey(sessionId)]?.collapsedGroups ?? new Set())
 
+  // 会话是否处于"可继续推理"状态：
+  //   最后一轮为 user / assistant(带 tool_calls) / tool → 会话中断，可继续
+  //   最后一轮为 assistant 且无 tool_calls（或会话为空）→ 已完成，不可继续
+  let canContinue = $derived.by(() => {
+    if (isStreaming) return false
+    const msgs = messages
+    if (!msgs || msgs.length === 0) return false
+    const last = msgs[msgs.length - 1]
+    if (!last) return false
+    if (last.role === 'user') return true
+    if (last.role === 'tool') return true
+    if (last.role === 'assistant' && last.tool_calls && last.tool_calls.length > 0) return true
+    return false
+  })
+
   let revokeConflict = $state(null)
   let revokeConfirm = $state(null)  // initial revoke confirmation dialog state
 
@@ -411,6 +426,14 @@
     _doSend(apiMessages, pendingUserMsg)
   }
 
+  // 继续推理：会话因中断停留在"可继续"状态（最后一轮是 user / 工具调用 /
+  // 工具结果）时，不追加新用户消息，直接基于既有上下文再跑一轮推理。
+  function handleContinue() {
+    if (!selectedModelId && selectedAgentIds.length === 0 || isStreaming || !sessionId) return
+    errorMsg = ''
+    _doSend([], null, true)
+  }
+
   function handleSendTemplate(templateId, args) {
     if (!selectedModelId && selectedAgentIds.length === 0 || isStreaming) return
     errorMsg = ''
@@ -428,7 +451,7 @@
     _doSend(apiMessages, pendingUserMsg)
   }
 
-  function _doSend(apiMessages, pendingUserMsg) {
+  function _doSend(apiMessages, pendingUserMsg, isContinue = false) {
     // Each stream writes to its own sessionStore entry via keyRef.
     // keyRef.key may change from '__new__' to the real session ID once the
     // backend assigns one (onInit / first onStreamMsg with session_id).
@@ -441,7 +464,12 @@
     shouldScrollToBottom = true
 
     let aIdxRef = { value: -1, groupMode: false, groupMap: {} }
-    const reqBody = { model_id: selectedModelId, tool_ids: selectedToolIds, messages: apiMessages, stream: true }
+    // 继续推理时不携带新用户消息（messages: [] + continue: true），
+    // 后端基于会话既有上下文再跑一轮推理。
+    const reqBody = { model_id: selectedModelId, tool_ids: selectedToolIds, messages: isContinue ? [] : apiMessages, stream: true }
+    if (isContinue) {
+      reqBody.continue = true
+    }
     if (selectedAgentIds.length > 0) {
       reqBody.agent_ids = selectedAgentIds
     }
@@ -1441,6 +1469,8 @@
     onSend={handleSend}
     onStop={handleStop}
     onStopForce={handleStopForce}
+    onContinue={handleContinue}
+    continueMode={canContinue}
     onToggleTemplatePanel={toggleTemplatePanel}
     onToggleWorkspacePanel={toggleWorkspacePanel}
     bind:workspacePanelOpen
@@ -1449,6 +1479,7 @@
     bind:text={inputText}
     {selectedAgentIds}
     {agentList}
+    onError={(msg) => errorMsg = msg}
   />
 </div>
 
