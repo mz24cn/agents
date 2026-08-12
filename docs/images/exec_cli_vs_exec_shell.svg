@@ -1,0 +1,100 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="1160" viewBox="0 0 1240 1160" role="img" aria-labelledby="title desc">
+<title id="title">一图看懂：exec_cli vs exec_shell</title>
+<desc id="desc">exec_cli 持久化终端与 exec_shell 单次进程在八个维度上的对比信息图。</desc>
+<defs><linearGradient id="grad_cli" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#34d399"/><stop offset="1" stop-color="#059669"/></linearGradient><linearGradient id="grad_shell" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#fbbf24"/><stop offset="1" stop-color="#ea580c"/></linearGradient><radialGradient id="grad_vs" cx="0.35" cy="0.3" r="1"><stop offset="0" stop-color="#64748b"/><stop offset="1" stop-color="#1e293b"/></radialGradient></defs>
+<rect x="0" y="0" width="1240" height="1160" fill="#ffffff"/>
+<text x="620.0" y="62" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="34" font-weight="800" fill="#0f172a">一图看懂：exec_cli vs exec_shell</text>
+<text x="620.0" y="100" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="17" fill="#64748b">持久化终端  vs  单次进程  ——  两个内置命令行工具的八维对比</text>
+<line x1="400.0" y1="120" x2="840.0" y2="120" stroke="#e2e8f0" stroke-width="2"/>
+<rect x="30" y="150" width="560" height="832" rx="16" fill="#f0fdf4" stroke="#86efac" stroke-width="2"/>
+<path d="M 30 166 a 16 16 0 0 1 16 -16 h 544 v 86 h -544 a 16 16 0 0 1 -16 16 z" fill="url(#grad_exec_cli)" opacity="0.12"/>
+<text x="58" y="194" font-family="'JetBrains Mono','SFMono-Regular','Consolas','Courier New',monospace" font-size="26" font-weight="700" fill="#0b7a53">exec_cli</text>
+<rect x="58" y="206" width="143" height="24" rx="12" fill="#0e9f6e" opacity="0.14"/>
+<text x="70" y="222" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="13" font-weight="600" fill="#0b7a53">持久化终端 · 有状态</text>
+<circle cx="50" cy="272" r="5" fill="#0e9f6e"/>
+<text x="64" y="277" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="17" font-weight="700" fill="#0b7a53">执行模型</text>
+<text x="64" y="302" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="15" fill="#374151">持久化 PTY 终端</text>
+<text x="64" y="326" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="15" fill="#374151">同一会话多次工具调用间保持存活</text>
+<line x1="52" y1="338" x2="568" y2="338" stroke="#86efac" stroke-width="1" opacity="0.6"/>
+<circle cx="50" cy="364" r="5" fill="#0e9f6e"/>
+<text x="64" y="369" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="17" font-weight="700" fill="#0b7a53">有无状态</text>
+<text x="64" y="394" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="15" fill="#374151">有状态：工作目录 / 环境变量 /</text>
+<text x="64" y="418" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="15" fill="#374151">SSH 登录态 / 容器上下文全部保留</text>
+<line x1="52" y1="430" x2="568" y2="430" stroke="#86efac" stroke-width="1" opacity="0.6"/>
+<circle cx="50" cy="456" r="5" fill="#0e9f6e"/>
+<text x="64" y="461" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="17" font-weight="700" fill="#0b7a53">交互能力</text>
+<text x="64" y="486" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="15" fill="#374151">真实 TTY，可与任意交互式程序对话</text>
+<text x="64" y="510" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="15" fill="#374151">ssh · mysql · 容器 · REPL</text>
+<line x1="52" y1="522" x2="568" y2="522" stroke="#86efac" stroke-width="1" opacity="0.6"/>
+<circle cx="50" cy="548" r="5" fill="#0e9f6e"/>
+<text x="64" y="553" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="17" font-weight="700" fill="#0b7a53">返回值</text>
+<text x="64" y="578" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="15" fill="#374151">终端可见屏幕输出</text>
+<text x="64" y="602" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="15" fill="#374151">（自动剥离控制字符噪声）</text>
+<line x1="52" y1="614" x2="568" y2="614" stroke="#86efac" stroke-width="1" opacity="0.6"/>
+<circle cx="50" cy="640" r="5" fill="#0e9f6e"/>
+<text x="64" y="645" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="17" font-weight="700" fill="#0b7a53">超时控制</text>
+<text x="64" y="670" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="15" fill="#374151">完成条件驱动 + CLI_EXEC_TIMEOUT</text>
+<text x="64" y="694" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="15" fill="#374151">硬性安全上限默认 300 秒</text>
+<line x1="52" y1="706" x2="568" y2="706" stroke="#86efac" stroke-width="1" opacity="0.6"/>
+<circle cx="50" cy="732" r="5" fill="#0e9f6e"/>
+<text x="64" y="737" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="17" font-weight="700" fill="#0b7a53">输出限制</text>
+<text x="64" y="762" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="15" fill="#374151">由完成条件驱动收集</text>
+<text x="64" y="786" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="15" fill="#374151">可滚动式读取</text>
+<line x1="52" y1="798" x2="568" y2="798" stroke="#86efac" stroke-width="1" opacity="0.6"/>
+<circle cx="50" cy="824" r="5" fill="#0e9f6e"/>
+<text x="64" y="829" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="17" font-weight="700" fill="#0b7a53">并发</text>
+<text x="64" y="854" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="15" fill="#374151">每会话支持多个并发终端</text>
+<text x="64" y="878" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="15" fill="#374151">长任务与其他命令互不阻塞</text>
+<line x1="52" y1="890" x2="568" y2="890" stroke="#86efac" stroke-width="1" opacity="0.6"/>
+<circle cx="50" cy="916" r="5" fill="#0e9f6e"/>
+<text x="64" y="921" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="17" font-weight="700" fill="#0b7a53">兜底机制</text>
+<text x="64" y="946" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="15" fill="#374151">终端不可用时自动回退</text>
+<text x="64" y="970" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="15" fill="#374151">为 subprocess 单次执行</text>
+<rect x="650" y="150" width="560" height="832" rx="16" fill="#fff7ed" stroke="#fcd34d" stroke-width="2"/>
+<path d="M 650 166 a 16 16 0 0 1 16 -16 h 544 v 86 h -544 a 16 16 0 0 1 -16 16 z" fill="url(#grad_exec_shell)" opacity="0.12"/>
+<text x="678" y="194" font-family="'JetBrains Mono','SFMono-Regular','Consolas','Courier New',monospace" font-size="26" font-weight="700" fill="#b45309">exec_shell</text>
+<rect x="678" y="206" width="130" height="24" rx="12" fill="#d97706" opacity="0.14"/>
+<text x="690" y="222" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="13" font-weight="600" fill="#b45309">单次进程 · 无状态</text>
+<circle cx="670" cy="272" r="5" fill="#d97706"/>
+<text x="684" y="277" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="17" font-weight="700" fill="#b45309">执行模型</text>
+<text x="684" y="302" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="15" fill="#374151">每次调用新建 subprocess.Popen</text>
+<text x="684" y="326" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="15" fill="#374151">单次执行即销毁</text>
+<line x1="672" y1="338" x2="1188" y2="338" stroke="#fcd34d" stroke-width="1" opacity="0.6"/>
+<circle cx="670" cy="364" r="5" fill="#d97706"/>
+<text x="684" y="369" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="17" font-weight="700" fill="#b45309">有无状态</text>
+<text x="684" y="394" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="15" fill="#374151">无状态：每次都是全新进程</text>
+<line x1="672" y1="430" x2="1188" y2="430" stroke="#fcd34d" stroke-width="1" opacity="0.6"/>
+<circle cx="670" cy="456" r="5" fill="#d97706"/>
+<text x="684" y="461" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="17" font-weight="700" fill="#b45309">交互能力</text>
+<text x="684" y="486" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="15" fill="#374151">无 TTY（TERM=dumb）</text>
+<text x="684" y="510" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="15" fill="#374151">无交互，无法“留在程序里”</text>
+<line x1="672" y1="522" x2="1188" y2="522" stroke="#fcd34d" stroke-width="1" opacity="0.6"/>
+<circle cx="670" cy="548" r="5" fill="#d97706"/>
+<text x="684" y="553" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="17" font-weight="700" fill="#b45309">返回值</text>
+<text x="684" y="578" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="15" fill="#374151">结构化 JSON</text>
+<text x="684" y="602" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="15" fill="#374151">{exit_code, stdout, stderr, truncated}</text>
+<line x1="672" y1="614" x2="1188" y2="614" stroke="#fcd34d" stroke-width="1" opacity="0.6"/>
+<circle cx="670" cy="640" r="5" fill="#d97706"/>
+<text x="684" y="645" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="17" font-weight="700" fill="#b45309">超时控制</text>
+<text x="684" y="670" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="15" fill="#374151">EXEC_DEFAULT_TIMEOUT 默认 30 秒</text>
+<text x="684" y="694" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="15" fill="#374151">超时即杀进程</text>
+<line x1="672" y1="706" x2="1188" y2="706" stroke="#fcd34d" stroke-width="1" opacity="0.6"/>
+<circle cx="670" cy="732" r="5" fill="#d97706"/>
+<text x="684" y="737" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="17" font-weight="700" fill="#b45309">输出限制</text>
+<text x="684" y="762" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="15" fill="#374151">硬截断 1000 行 / 每行 1000 列</text>
+<line x1="672" y1="798" x2="1188" y2="798" stroke="#fcd34d" stroke-width="1" opacity="0.6"/>
+<circle cx="670" cy="824" r="5" fill="#d97706"/>
+<text x="684" y="829" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="17" font-weight="700" fill="#b45309">并发</text>
+<text x="684" y="854" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="15" fill="#374151">单次调用，无并发概念</text>
+<line x1="672" y1="890" x2="1188" y2="890" stroke="#fcd34d" stroke-width="1" opacity="0.6"/>
+<circle cx="670" cy="916" r="5" fill="#d97706"/>
+<text x="684" y="921" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="17" font-weight="700" fill="#b45309">兜底机制</text>
+<text x="684" y="946" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="15" fill="#374151">—</text>
+<circle cx="610" cy="202" r="46" fill="url(#grad_vs)" stroke="#ffffff" stroke-width="5"/>
+<text x="610" y="214" text-anchor="middle" font-family="'JetBrains Mono','SFMono-Regular','Consolas','Courier New',monospace" font-size="34" font-weight="800" fill="#ffffff">VS</text>
+<text x="610" y="276" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" font-weight="700" fill="#475569">持久化 vs 单次</text>
+<rect x="60" y="1020" width="1120" height="118" rx="14" fill="#f8fafc" stroke="#e2e8f0" stroke-width="1.5"/>
+<text x="86" y="1052" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="16" font-weight="700" fill="#0f172a">一句话对比</text>
+<text x="86" y="1082" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="16" fill="#374151">exec_shell 是“发一枪就走的骑手” —— 每次调用都从零开始，命令跑完、进程销毁、不留痕迹；</text>
+<text x="86" y="1112" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="16" fill="#0e9f6e" font-weight="700">exec_cli  是“驻场、记得你刚才在哪个目录、登录了哪台机器的现场工程师” —— 待在里面，把事做完。</text>
+</svg>

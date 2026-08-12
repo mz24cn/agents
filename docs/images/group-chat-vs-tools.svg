@@ -1,0 +1,143 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="920" viewBox="0 0 1200 920" role="img" aria-labelledby="title desc">
+<title id="title">群聊 vs talk_to vs delegate</title>
+<desc id="desc">delegate、talk_to 与群聊三种多智能体协作方式在调度、参与者、可见性、持久化、多轮与场景上的对比。</desc>
+<defs>
+  <linearGradient id="grad_del" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#34d399"/><stop offset="1" stop-color="#059669"/></linearGradient>
+  <linearGradient id="grad_talk" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#fbbf24"/><stop offset="1" stop-color="#ea580c"/></linearGradient>
+  <linearGradient id="grad_gc" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#a78bfa"/><stop offset="1" stop-color="#7c3aed"/></linearGradient>
+</defs>
+<rect width="1200" height="920" fill="#ffffff"/>
+<text x="600" y="50" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="32" font-weight="800" fill="#0f172a">群聊 vs talk_to vs delegate</text>
+<text x="600" y="82" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="16" fill="#64748b">delegate / talk_to 是「模型自己派活」的工具调用；群聊是「请求级多参与者共享会话」的编排</text>
+
+<!-- ===== panel 1: delegate ===== -->
+<rect x="30" y="110" width="370" height="690" rx="16" fill="#f0fdf4" stroke="#86efac" stroke-width="2"/>
+<rect x="30" y="110" width="370" height="86" rx="16" fill="url(#grad_del)"/>
+<text x="58" y="150" font-family="'JetBrains Mono','SFMono-Regular','Consolas','Courier New',monospace" font-size="26" font-weight="700" fill="#ffffff">delegate</text>
+<rect x="58" y="160" width="150" height="22" rx="11" fill="#ffffff" opacity="0.25"/>
+<text x="66" y="176" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="13" font-weight="600" fill="#ffffff">任务委派 · 临时子代理</text>
+
+<circle cx="52" cy="230" r="5" fill="#059669"/>
+<text x="66" y="235" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="16" font-weight="700" fill="#065f46">调度方式</text>
+<text x="66" y="258" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#374151">模型显式调用工具</text>
+<text x="66" y="278" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#374151">depth 深度跟踪 · 可嵌套</text>
+<line x1="52" y1="292" x2="378" y2="292" stroke="#86efac" stroke-width="1" opacity="0.6"/>
+
+<circle cx="52" cy="322" r="5" fill="#059669"/>
+<text x="66" y="327" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="16" font-weight="700" fill="#065f46">参与者</text>
+<text x="66" y="350" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#374151">临时 SubAgent</text>
+<text x="66" y="370" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#374151">运行时以 model/tools/task 构造</text>
+<line x1="52" y1="384" x2="378" y2="384" stroke="#86efac" stroke-width="1" opacity="0.6"/>
+
+<circle cx="52" cy="414" r="5" fill="#059669"/>
+<text x="66" y="419" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="16" font-weight="700" fill="#065f46">可见性</text>
+<text x="66" y="442" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#374151">结果只回给调用方（父 Agent）</text>
+<text x="66" y="462" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#374151">子代理之间互不可见</text>
+<line x1="52" y1="476" x2="378" y2="476" stroke="#86efac" stroke-width="1" opacity="0.6"/>
+
+<circle cx="52" cy="506" r="5" fill="#059669"/>
+<text x="66" y="511" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="16" font-weight="700" fill="#065f46">状态与持久化</text>
+<text x="66" y="534" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="13" fill="#374151">{parent}-sub_{ts}</text>
+<text x="66" y="554" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#374151">独立 conversation.json</text>
+<line x1="52" y1="568" x2="378" y2="568" stroke="#86efac" stroke-width="1" opacity="0.6"/>
+
+<circle cx="52" cy="598" r="5" fill="#059669"/>
+<text x="66" y="603" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="16" font-weight="700" fill="#065f46">多轮能力</text>
+<text x="66" y="626" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#374151">单次任务式</text>
+<text x="66" y="646" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#374151">[continue] 可接续子会话</text>
+<line x1="52" y1="660" x2="378" y2="660" stroke="#86efac" stroke-width="1" opacity="0.6"/>
+
+<circle cx="52" cy="690" r="5" fill="#059669"/>
+<text x="66" y="695" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="16" font-weight="700" fill="#065f46">典型场景</text>
+<text x="66" y="718" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#374151">任务分解 · 专用模型调用</text>
+<text x="66" y="738" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#374151">并行子任务</text>
+
+<!-- ===== panel 2: talk_to ===== -->
+<rect x="415" y="110" width="370" height="690" rx="16" fill="#fffbeb" stroke="#fcd34d" stroke-width="2"/>
+<rect x="415" y="110" width="370" height="86" rx="16" fill="url(#grad_talk)"/>
+<text x="443" y="150" font-family="'JetBrains Mono','SFMono-Regular','Consolas','Courier New',monospace" font-size="26" font-weight="700" fill="#ffffff">talk_to</text>
+<rect x="443" y="160" width="150" height="22" rx="11" fill="#ffffff" opacity="0.25"/>
+<text x="451" y="176" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="13" font-weight="600" fill="#ffffff">定向私发 · 已注册代理</text>
+
+<circle cx="437" cy="230" r="5" fill="#c2410c"/>
+<text x="451" y="235" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="16" font-weight="700" fill="#9a3412">调度方式</text>
+<text x="451" y="258" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#374151">模型调用 talk_to 工具</text>
+<text x="451" y="278" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#374151">按 agents 并行（≤8）</text>
+<line x1="437" y1="292" x2="763" y2="292" stroke="#fcd34d" stroke-width="1" opacity="0.6"/>
+
+<circle cx="437" cy="322" r="5" fill="#c2410c"/>
+<text x="451" y="327" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="16" font-weight="700" fill="#9a3412">参与者</text>
+<text x="451" y="350" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#374151">已注册 Agent</text>
+<text x="451" y="370" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#374151">按昵称 / ID / 标签定位</text>
+<line x1="437" y1="384" x2="763" y2="384" stroke="#fcd34d" stroke-width="1" opacity="0.6"/>
+
+<circle cx="437" cy="414" r="5" fill="#c2410c"/>
+<text x="451" y="419" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="16" font-weight="700" fill="#9a3412">可见性</text>
+<text x="451" y="442" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#374151">私发：目标独立处理</text>
+<text x="451" y="462" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#374151">结果汇聚给调用方</text>
+<line x1="437" y1="476" x2="763" y2="476" stroke="#fcd34d" stroke-width="1" opacity="0.6"/>
+
+<circle cx="437" cy="506" r="5" fill="#c2410c"/>
+<text x="451" y="511" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="16" font-weight="700" fill="#9a3412">状态与持久化</text>
+<text x="451" y="534" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="13" fill="#374151">{parent}-talk_{ts}_{id}</text>
+<text x="451" y="554" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#374151">独立持久化</text>
+<line x1="437" y1="568" x2="763" y2="568" stroke="#fcd34d" stroke-width="1" opacity="0.6"/>
+
+<circle cx="437" cy="598" r="5" fill="#c2410c"/>
+<text x="451" y="603" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="16" font-weight="700" fill="#9a3412">多轮能力</text>
+<text x="451" y="626" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#374151">单次消息式</text>
+<text x="451" y="646" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#374151">每次调用一轮</text>
+<line x1="437" y1="660" x2="763" y2="660" stroke="#fcd34d" stroke-width="1" opacity="0.6"/>
+
+<circle cx="437" cy="690" r="5" fill="#c2410c"/>
+<text x="451" y="695" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="16" font-weight="700" fill="#9a3412">典型场景</text>
+<text x="451" y="718" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#374151">一对多私发沟通</text>
+<text x="451" y="738" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#374151">信息采集 · 编排调度</text>
+
+<!-- ===== panel 3: 群聊 ===== -->
+<rect x="800" y="110" width="370" height="690" rx="16" fill="#f5f3ff" stroke="#c4b5fd" stroke-width="2"/>
+<rect x="800" y="110" width="370" height="86" rx="16" fill="url(#grad_gc)"/>
+<text x="828" y="150" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="26" font-weight="700" fill="#ffffff">群聊 group chat</text>
+<rect x="828" y="160" width="150" height="22" rx="11" fill="#ffffff" opacity="0.25"/>
+<text x="836" y="176" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="13" font-weight="600" fill="#ffffff">共享会话 · @ 驱动</text>
+
+<circle cx="822" cy="230" r="5" fill="#6d28d9"/>
+<text x="836" y="235" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="16" font-weight="700" fill="#5b21b6">调度方式</text>
+<text x="836" y="258" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#374151">请求级路由（agent_ids&gt;1）</text>
+<text x="836" y="278" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#374151">@mention 自动并行 · 多轮循环</text>
+<line x1="822" y1="292" x2="1148" y2="292" stroke="#c4b5fd" stroke-width="1" opacity="0.6"/>
+
+<circle cx="822" cy="322" r="5" fill="#6d28d9"/>
+<text x="836" y="327" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="16" font-weight="700" fill="#5b21b6">参与者</text>
+<text x="836" y="350" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#374151">已注册且被选入群聊的</text>
+<text x="836" y="370" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#374151">多个 Agent（独立身份）</text>
+<line x1="822" y1="384" x2="1148" y2="384" stroke="#c4b5fd" stroke-width="1" opacity="0.6"/>
+
+<circle cx="822" cy="414" r="5" fill="#6d28d9"/>
+<text x="836" y="419" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="16" font-weight="700" fill="#5b21b6">可见性</text>
+<text x="836" y="442" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#374151">消息对全组可见</text>
+<text x="836" y="462" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#374151">@ 定向 + 历史全透明</text>
+<line x1="822" y1="476" x2="1148" y2="476" stroke="#c4b5fd" stroke-width="1" opacity="0.6"/>
+
+<circle cx="822" cy="506" r="5" fill="#6d28d9"/>
+<text x="836" y="511" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="16" font-weight="700" fill="#5b21b6">状态与持久化</text>
+<text x="836" y="534" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="13" fill="#374151">单一群聊会话</text>
+<text x="836" y="554" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#374151">含 agent_id / mentions</text>
+<line x1="822" y1="568" x2="1148" y2="568" stroke="#c4b5fd" stroke-width="1" opacity="0.6"/>
+
+<circle cx="822" cy="598" r="5" fill="#6d28d9"/>
+<text x="836" y="603" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="16" font-weight="700" fill="#5b21b6">多轮能力</text>
+<text x="836" y="626" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#374151">多轮（max_rounds=5）</text>
+<text x="836" y="646" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#374151">assistant @ 驱动 round 2+</text>
+<line x1="822" y1="660" x2="1148" y2="660" stroke="#c4b5fd" stroke-width="1" opacity="0.6"/>
+
+<circle cx="822" cy="690" r="5" fill="#6d28d9"/>
+<text x="836" y="695" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="16" font-weight="700" fill="#5b21b6">典型场景</text>
+<text x="836" y="718" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#374151">多专家会诊 · 多角色协作</text>
+<text x="836" y="738" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#374151">头脑风暴 · @all 并行分发</text>
+
+<!-- footer banner -->
+<rect x="30" y="820" width="1140" height="72" rx="14" fill="#eef2ff" stroke="#c7d2fe" stroke-width="2"/>
+<text x="600" y="848" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="17" font-weight="700" fill="#3730a3">一句话：delegate / talk_to 是「模型自己派活」的工具调用；群聊是「请求级多参与者共享会话」的编排</text>
+<text x="600" y="876" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="15" fill="#4f46e5">群聊无需模型调用任何工具，即可让多个 AI 并发、对等地「聊起来」</text>
+</svg>

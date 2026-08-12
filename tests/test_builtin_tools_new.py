@@ -94,8 +94,8 @@ def journal_context(monkeypatch, tmp_path):
 @pytest.fixture
 def no_tmp_bypass(monkeypatch):
     """Prevent /tmp bypass in _validate_path."""
-    import runtime.builtin_tools as _bt
-    monkeypatch.setattr(_bt, "_REAL_TMP", "/__nonexistent_tmp_bypass__")
+    import runtime.builtin_tools_coding as _bt_coding
+    monkeypatch.setattr(_bt_coding, "_REAL_TMP", "/__nonexistent_tmp_bypass__")
 
 
 class TestPathValidator:

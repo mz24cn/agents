@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="740" viewBox="0 0 1100 740" role="img" aria-labelledby="title desc">
+<title id="title">群聊多轮 @ 接力</title>
+<desc id="desc">用户 @ 点名多位成员并行响应，随后成员回复中的 @ 自动驱动下一轮接力，直到无人再被 @ 或达到轮次上限。</desc>
+<defs>
+  <linearGradient id="grad_user" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#64748b"/><stop offset="1" stop-color="#475569"/></linearGradient>
+  <linearGradient id="grad_agent" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#6366f1"/><stop offset="1" stop-color="#8b5cf6"/></linearGradient>
+  <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#6366f1"/></marker>
+</defs>
+<rect width="1100" height="740" fill="#ffffff"/>
+<text x="550" y="48" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="30" font-weight="800" fill="#0f172a">群聊多轮 @ 接力</text>
+<text x="550" y="80" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="16" fill="#64748b">Round 1 由用户消息的 @ 驱动；Round 2+ 由成员回复中的 @ 自动驱动，直到无人再被 @ 或达到 max_rounds=5</text>
+
+<!-- 用户 -->
+<rect x="300" y="100" width="500" height="64" rx="12" fill="url(#grad_user)"/>
+<text x="322" y="127" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="17" font-weight="700" fill="#ffffff">用户 (user)</text>
+<text x="322" y="151" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#e2e8f0">@产品 请先明确需求边界，再 @设计 给出方案，@工程 评估可行性</text>
+
+<!-- arrow 1 -->
+<line x1="550" y1="164" x2="550" y2="196" stroke="#6366f1" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="640" y="170" width="230" height="24" rx="12" fill="#eef2ff"/>
+<text x="755" y="187" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="13" font-weight="600" fill="#4338ca">Round 1 · 并行唤起 产品/设计/工程</text>
+
+<!-- 产品 -->
+<rect x="300" y="205" width="500" height="64" rx="12" fill="url(#grad_agent)"/>
+<text x="322" y="232" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="17" font-weight="700" fill="#ffffff">产品 (product)</text>
+<text x="322" y="256" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#ede9fe">需求边界已明确 → @设计 请给出方案</text>
+
+<!-- arrow 2 -->
+<line x1="550" y1="269" x2="550" y2="301" stroke="#6366f1" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="640" y="275" width="230" height="24" rx="12" fill="#eef2ff"/>
+<text x="755" y="292" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="13" font-weight="600" fill="#4338ca">Round 2 · 回复中 @ → 自动接力</text>
+
+<!-- 设计 -->
+<rect x="300" y="310" width="500" height="64" rx="12" fill="url(#grad_agent)"/>
+<text x="322" y="337" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="17" font-weight="700" fill="#ffffff">设计 (design)</text>
+<text x="322" y="361" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#ede9fe">方案已出 → @工程 请评估可行性</text>
+
+<!-- arrow 3 -->
+<line x1="550" y1="374" x2="550" y2="406" stroke="#6366f1" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="640" y="380" width="230" height="24" rx="12" fill="#eef2ff"/>
+<text x="755" y="397" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="13" font-weight="600" fill="#4338ca">Round 3 · 回复中 @ → 自动接力</text>
+
+<!-- 工程 -->
+<rect x="300" y="415" width="500" height="64" rx="12" fill="url(#grad_agent)"/>
+<text x="322" y="442" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="17" font-weight="700" fill="#ffffff">工程 (engineering)</text>
+<text x="322" y="466" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#ede9fe">可行性通过 → @测试 请补充用例</text>
+
+<!-- arrow 4 -->
+<line x1="550" y1="479" x2="550" y2="511" stroke="#6366f1" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="640" y="485" width="230" height="24" rx="12" fill="#eef2ff"/>
+<text x="755" y="502" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="13" font-weight="600" fill="#4338ca">Round 4 · 回复中 @ → 自动接力</text>
+
+<!-- 测试 -->
+<rect x="300" y="520" width="500" height="64" rx="12" fill="url(#grad_agent)"/>
+<text x="322" y="547" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="17" font-weight="700" fill="#ffffff">测试 (testing)</text>
+<text x="322" y="571" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14" fill="#ede9fe">用例已出 ✓ 流程闭环</text>
+
+<!-- arrow 5 -->
+<line x1="550" y1="584" x2="550" y2="616" stroke="#10b981" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="640" y="590" width="230" height="24" rx="12" fill="#ecfdf5"/>
+<text x="755" y="607" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="13" font-weight="600" fill="#047857">Round 5 · 无人再被 @ → 终止</text>
+
+<!-- footer -->
+<rect x="140" y="650" width="820" height="58" rx="12" fill="#f8fafc" stroke="#e2e8f0" stroke-width="1.5"/>
+<text x="550" y="676" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="15" fill="#334155">被 @ 的成员收到的是「多条回复折叠成的触发消息」，每条带作者身份前缀（**昵称** (id):）</text>
+<text x="550" y="699" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="15" fill="#334155">已参与的成员不会因再次被 @ 而重复拉起——这是防 ping-pong 的关键；整个循环在单次请求内自动完成</text>
+</svg>

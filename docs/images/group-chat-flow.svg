@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="860" viewBox="0 0 1100 860" role="img" aria-labelledby="title desc">
+<title id="title">群聊一轮执行流程</title>
+<desc id="desc">从用户消息的 @ 解析到并发唤起、各成员独立推理、按身份合并、扫描回复中的 @ 直至终止的一轮群聊执行流程。</desc>
+<defs>
+  <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#6366f1"/></marker>
+  <marker id="arrow_green" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#10b981"/></marker>
+</defs>
+<rect width="1100" height="860" fill="#ffffff"/>
+<text x="550" y="48" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="30" font-weight="800" fill="#0f172a">群聊一轮执行流程</text>
+<text x="550" y="78" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="15" fill="#64748b">以「用户发起一次请求」为粒度：并发唤起被 @ 成员 → 独立推理 → 身份合并 → 扫描 @ → 终止</text>
+
+<!-- step 1 -->
+<circle cx="90" cy="137" r="24" fill="#6366f1"/>
+<text x="90" y="144" text-anchor="middle" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="20" font-weight="700" fill="#ffffff">1</text>
+<rect x="170" y="95" width="760" height="84" rx="14" fill="#eef2ff" stroke="#c7d2fe" stroke-width="2"/>
+<text x="200" y="124" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="18" font-weight="700" fill="#3730a3">用户消息（@ 解析）</text>
+<text x="200" y="150" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14.5" fill="#374151">有 @ → 只唤起被点名成员；无 @（含 @all）→ 广播全体</text>
+<line x1="90" y1="161" x2="90" y2="219" stroke="#6366f1" stroke-width="2" marker-end="url(#arrow)"/>
+
+<!-- step 2 -->
+<circle cx="90" cy="261" r="24" fill="#6366f1"/>
+<text x="90" y="268" text-anchor="middle" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="20" font-weight="700" fill="#ffffff">2</text>
+<rect x="170" y="219" width="760" height="84" rx="14" fill="#eef2ff" stroke="#c7d2fe" stroke-width="2"/>
+<text x="200" y="248" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="18" font-weight="700" fill="#3730a3">并发唤起被 @ 成员</text>
+<text x="200" y="274" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14.5" fill="#374151">线程池并发，并发度 MAX_GROUP_CHAT_WORKERS（默认回退 10）</text>
+<line x1="90" y1="285" x2="90" y2="343" stroke="#6366f1" stroke-width="2" marker-end="url(#arrow)"/>
+
+<!-- step 3 -->
+<circle cx="90" cy="385" r="24" fill="#6366f1"/>
+<text x="90" y="392" text-anchor="middle" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="20" font-weight="700" fill="#ffffff">3</text>
+<rect x="170" y="343" width="760" height="84" rx="14" fill="#eef2ff" stroke="#c7d2fe" stroke-width="2"/>
+<text x="200" y="372" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="18" font-weight="700" fill="#3730a3">各成员独立推理</text>
+<text x="200" y="398" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14.5" fill="#374151">用自身 model_id / tool_ids 构造独立请求，流式输出</text>
+<text x="200" y="418" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14.5" fill="#374151">碎片先入缓存，聚合成完整消息后再做 @ 解析（跨 token 分片也能命中）</text>
+<line x1="90" y1="409" x2="90" y2="467" stroke="#6366f1" stroke-width="2" marker-end="url(#arrow)"/>
+
+<!-- step 4 -->
+<circle cx="90" cy="509" r="24" fill="#6366f1"/>
+<text x="90" y="516" text-anchor="middle" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="20" font-weight="700" fill="#ffffff">4</text>
+<rect x="170" y="467" width="760" height="84" rx="14" fill="#eef2ff" stroke="#c7d2fe" stroke-width="2"/>
+<text x="200" y="496" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="18" font-weight="700" fill="#3730a3">按身份合并</text>
+<text x="200" y="522" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14.5" fill="#374151">每条回复带 agent_id + 昵称，流式回前端</text>
+<text x="200" y="542" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14.5" fill="#374151">实时渲染「谁在说话」</text>
+<line x1="90" y1="533" x2="90" y2="591" stroke="#6366f1" stroke-width="2" marker-end="url(#arrow)"/>
+
+<!-- step 5 -->
+<circle cx="90" cy="633" r="24" fill="#6366f1"/>
+<text x="90" y="640" text-anchor="middle" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="20" font-weight="700" fill="#ffffff">5</text>
+<rect x="170" y="591" width="760" height="84" rx="14" fill="#eef2ff" stroke="#c7d2fe" stroke-width="2"/>
+<text x="200" y="620" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="18" font-weight="700" fill="#3730a3">扫描回复中的 @</text>
+<text x="200" y="646" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14.5" fill="#374151">指向「尚未参与」成员 → 进入下一轮</text>
+<text x="200" y="666" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14.5" fill="#374151">已参与者去重（防 ping-pong）</text>
+<line x1="90" y1="657" x2="90" y2="715" stroke="#10b981" stroke-width="2" marker-end="url(#arrow_green)"/>
+
+<!-- step 6: terminal -->
+<circle cx="90" cy="757" r="24" fill="#10b981"/>
+<text x="90" y="764" text-anchor="middle" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="20" font-weight="700" fill="#ffffff">6</text>
+<rect x="170" y="715" width="760" height="84" rx="14" fill="#ecfdf5" stroke="#6ee7b7" stroke-width="2"/>
+<text x="200" y="744" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="18" font-weight="700" fill="#047857">终止</text>
+<text x="200" y="770" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14.5" fill="#374151">无人再被 @，或达到 max_rounds（默认 5）</text>
+<text x="200" y="790" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="14.5" fill="#374151">返回全部带身份的消息</text>
+
+<rect x="170" y="815" width="760" height="30" rx="8" fill="#f1f5f9"/>
+<text x="550" y="835" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="13.5" fill="#64748b">Round 1 由用户消息的 @ 驱动；Round 2+ 由成员回复中的 @ 驱动，在单次请求内自动循环</text>
+</svg>
