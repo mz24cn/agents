@@ -90,8 +90,8 @@
     return themeState.current === 'dark' ? '#1e1e1e' : '#ffffff'
   }
 
-  async function renderPdf(pdfjs, data) {
-    const doc = await pdfjs.getDocument({ data }).promise
+  async function renderPdf(pdfjs, url) {
+    const doc = await pdfjs.getDocument({ url, rangeChunkSize: 65536 }).promise
     if (!container) {
       doc.destroy?.()
       return
@@ -149,17 +149,18 @@
 
     const run = async () => {
       try {
-        const res = await fetch(u)
-        if (!res.ok) throw new Error(`HTTP ${res.status}`)
-        if (seq !== loadSeq || !container) return
         if (isPdf(f.name)) {
           const pdfjs = await loadPdfjs()
           if (seq !== loadSeq || !container) return
-          const data = await res.arrayBuffer()
-          if (seq !== loadSeq || !container) return
-          await renderPdf(pdfjs, data)
+          // URL mode: pdf.js issues RFC 7233 Range requests (the server
+          // replies 206 + Content-Range) and fetches pages in parallel —
+          // much faster for large PDFs than one full ArrayBuffer download.
+          await renderPdf(pdfjs, u)
         } else if (isDocx(f.name)) {
           const docx = await loadDocxLibs()
+          if (seq !== loadSeq || !container) return
+          const res = await fetch(u)
+          if (!res.ok) throw new Error(`HTTP ${res.status}`)
           if (seq !== loadSeq || !container) return
           const blob = await res.blob()
           if (seq !== loadSeq || !container) return

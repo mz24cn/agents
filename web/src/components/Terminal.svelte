@@ -47,6 +47,7 @@
     notifyStatus();
 
     ws = new WebSocket(getWsUrl(sessionId));
+    const thisWs = ws;
     let terminalIdReceived = false;
 
     ws.onopen = () => {
@@ -76,7 +77,12 @@
       loading = false;
       connected = false;
       notifyStatus();
-      if (!destroyed) scheduleRetry();
+      // Only auto-retry if this is still the *active* websocket.  connect()
+      // deliberately closes the previous socket when opening a new one; that
+      // old socket must not schedule another retry, otherwise the 3s retry
+      // would fight with the fresh connection and create an endless
+      // connect/disconnect loop (visible as a flickering "Connecting...").
+      if (!destroyed && thisWs === ws) scheduleRetry();
     };
 
     ws.onerror = () => {};
