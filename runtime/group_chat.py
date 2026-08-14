@@ -412,6 +412,8 @@ def assemble_agent_context(
     turns: list,
     current_user_msg: Optional[Message] = None,
     agents_markdown: str = "",
+    summary_text: str = "",
+    memory_entries: Optional[list] = None,
 ) -> list[Message]:
     """Build the inference context for one agent in a group chat.
 
@@ -422,14 +424,21 @@ def assemble_agent_context(
       prefix so the agent can distinguish messages addressed to it from
       bystander conversation.
     * If the agent missed prior rounds, a catch-up system message is prepended.
+    * When a rolling summary exists (context compression active), the summary
+      and structured memory entries are injected into the system message so
+      the agent has access to compressed historical context.
 
     Args:
         agent_id: The agent this context is being built for.
         agent: Agent record dict (with system_prompt, template_id, etc.).
-        turns: ConversationTurn list from conversation.json.
+        turns: ConversationTurn list from conversation.json (already truncated
+            to recent K turns when compression is active).
         current_user_msg: The current user message that triggered this round.
         agents_markdown: AGENTS markdown table listing all participants in
             the group chat. Always injected for group-chat contexts.
+        summary_text: Rolling summary text (empty when compression has not
+            been triggered).
+        memory_entries: Optional list of structured MemoryEntry objects.
     """
     messages: list[Message] = []
 
@@ -497,18 +506,63 @@ def assemble_agent_context(
                 role="system", content=agents_markdown,
             ))
 
+    # 1c. Inject rolling summary and structured memory into the system message
+    #     when context compression has been triggered.  This mirrors what
+    #     ContextManager.assemble_context() does for single-agent sessions,
+    #     but adapted for group-chat system message structure.
+    has_summary = bool(summary_text.strip()) if summary_text else False
+    has_memory = bool(memory_entries) if memory_entries else False
+    if has_summary or has_memory:
+        extra_parts: list[str] = []
+        if has_summary:
+            extra_parts.append(f"## Summary\n{summary_text}")
+        if has_memory:
+            memory_lines = [
+                f"{entry.entry_type}: {entry.content}"
+                for entry in memory_entries
+            ]
+            extra_parts.append("## Memory\n" + "\n".join(memory_lines))
+        extra_block = "\n\n".join(extra_parts)
+
+        if messages and messages[-1].role == "system":
+            sys_msg = messages[-1]
+            if sys_msg.prompt_template:
+                # Template-based: inject via GC_FRAMING which is appended to the
+                # template content during rendering.
+                if sys_msg.arguments is None:
+                    sys_msg.arguments = {}
+                existing_framing = sys_msg.arguments.get("GC_FRAMING", "")
+                sys_msg.arguments["GC_FRAMING"] = (
+                    existing_framing + "\n\n" + extra_block
+                    if existing_framing else extra_block
+                )
+            else:
+                # Plain-text system message: append directly.
+                sys_msg.content = (sys_msg.content or "") + "\n\n" + extra_block
+        else:
+            # No system message exists — create one.
+            messages.insert(0, Message(role="system", content=extra_block))
+
     # 2. Catch-up note (if any) — carried as a USER message (marked with
     #    _CATCH_UP_TAG so _normalize_for_model skips the "**用户** (user): "
     #    identity prefix). Placed before the historical turns; it gets merged
     #    into the leading user message by _normalize_for_model.
-    missed = _count_missed_rounds(agent_id, turns)
-    if missed > 0:
-        catch_up = (
-            f"📢 群聊回溯：在你未 @ 参与期间共有 {missed} 轮对话。"
-            f"以下为完整历史记录，其中标注 [群聊] 的消息并非 @ 你，供参考上下文。"
-        )
+    #    When a rolling summary exists (compression active), the summary
+    #    already provides condensed historical context, so skip the catch-up
+    #    note to avoid redundancy.
+    if not has_summary:
+        missed = _count_missed_rounds(agent_id, turns)
+        if missed > 0:
+            catch_up = (
+                f"📢 群聊回追：在你未 @ 参与期间共有 {missed} 轮对话。"
+                f"以下为完整历史记录，其中标注 [群聊] 的消息并非 @ 你，供参考上下文。"
+            )
+            messages.append(Message(role="user", content=catch_up, name=_CATCH_UP_TAG))
+    else:
+        # Summary exists: catch-up info is covered by the summary text.
+        # Include a brief note so the agent knows some history was summarized.
+        catch_up = "📢 群聊回追：部分早期对话已被压缩为摘要，详见上方 Summary。"
         messages.append(Message(role="user", content=catch_up, name=_CATCH_UP_TAG))
-
     # 3. Historical turns (all included, non-mentioned user messages marked)
     for turn in turns:
         msg = _message_from_turn(turn)
@@ -607,11 +661,38 @@ def run_group_chat_stream(
 
     # Load initial conversation history from disk once.
     existing_turns = []
+    summary_text: str = ""
+    memory_entries: list = []
     if session_id:
         try:
             existing_turns = context_manager.load_conversation(session_id)
         except (FileNotFoundError, ValueError):
             pass
+
+        # --- Rolling summary & structured memory (context compression) ----
+        # If compression has been triggered (summary.md exists), truncate the
+        # historical turns to the most recent K turns and inject the summary
+        # into the system message.  This mirrors ContextManager.assemble_context().
+        summary_text, summary_fm = context_manager.get_summary(session_id)
+        if summary_text.strip():
+            memory_entries = context_manager.get_memory_entries(session_id)
+            k = getattr(context_manager, '_recent_turns_k', 10)
+            summarized_up_to = summary_fm.get("summarized_up_to_turn", -1)
+            if isinstance(summarized_up_to, int) and summarized_up_to >= 0:
+                # Truncate old turns that have been compressed into the summary.
+                recent_start = max(0, len(existing_turns) - k)
+                if recent_start <= summarized_up_to:
+                    recent_start = min(summarized_up_to + 1, len(existing_turns))
+                # Ensure we don't cut in the middle of a tool-call chain.
+                while (recent_start < len(existing_turns)
+                       and recent_start > 0
+                       and existing_turns[recent_start].role == "tool"):
+                    recent_start -= 1
+                while (recent_start < len(existing_turns)
+                       and recent_start > 0
+                       and existing_turns[recent_start].role not in ("user", "system")):
+                    recent_start -= 1
+                existing_turns = existing_turns[recent_start:]
 
     all_collected: list[Message] = []
     processed_agent_ids: set[str] = set()
@@ -674,6 +755,8 @@ def run_group_chat_stream(
             agent_messages = assemble_agent_context(
                 agent_id, agent, agent_turns, cur_user_msg,
                 agents_markdown=agents_markdown,
+                summary_text=summary_text,
+                memory_entries=memory_entries,
             )
 
             request = InferenceRequest(
