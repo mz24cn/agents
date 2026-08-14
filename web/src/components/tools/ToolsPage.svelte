@@ -26,6 +26,7 @@
   let detailTool = $state(null)
   let expandedGroups = $state(new Set())
   let mcpServerConfigs = $state({})
+  let mcpServerLabels = $state({})
 
   async function fetchTools({ force = false } = {}) {
     try {
@@ -34,10 +35,11 @@
     } catch {
       catalog.tools.error = catalog.tools.error || t('fetchToolListFailed')
     }
-    // Also load MCP server configs to show connection type
+    // Also load MCP server configs and labels
     try {
       const data = await mcpServers.list()
       mcpServerConfigs = data.mcpServers ?? {}
+      mcpServerLabels = data.labels ?? {}
     } catch { /* ignore */ }
   }
 
@@ -126,7 +128,13 @@
       : t('confirmDeleteTool', { id: deleteTarget?.tool?.tool_id ?? '' })
   )
 
-  $effect(() => { fetchTools() })
+  let mounted = $state(false)
+  $effect(() => {
+    if (!mounted) {
+      mounted = true
+      fetchTools()
+    }
+  })
 </script>
 
 <div class="tools-page">
@@ -160,6 +168,15 @@
                 <span class="group-count">{t('toolCount', { n: groupTools.length })}</span>
               </span>
               {#if isMcpGroup(key)}
+                {@const serverName = key.slice(4)}
+                {@const serverLabels = mcpServerLabels[serverName] ?? []}
+                {#if serverLabels.length}
+                  <div class="labels-wrap server-labels">
+                    {#each serverLabels as label}
+                      <span class="label-tag">{label}</span>
+                    {/each}
+                  </div>
+                {/if}
                 <span class="mcp-server-type" title={mcpServerType(key)}>{mcpServerType(key)}</span>
                 <button class="btn btn-sm" onclick={() => handleEditGroupClick(key)} title={t('editMcpServerTitle')}>{t('edit')}</button>
                 <button class="btn btn-sm btn-danger" onclick={() => handleDeleteGroupClick(key)} title={t('deleteMcpServerTitle')}>{t('delete')}</button>
@@ -273,6 +290,7 @@
   .ellipsis { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .btn-group { display: inline-flex; gap: 8px; }
   .labels-wrap { display: flex; flex-wrap: wrap; gap: 4px; }
+  .server-labels { margin-left: auto; }
   
   /* 滚动条样式：默认隐藏，悬停时显示 */
   .page-content::-webkit-scrollbar {

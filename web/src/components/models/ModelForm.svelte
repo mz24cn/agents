@@ -4,6 +4,7 @@
   import { t, i18n } from '../../lib/i18n.svelte.js'
   import JsonEditor from '../JsonEditor.svelte'
   import ConfirmDialog from '../ConfirmDialog.svelte'
+  import { parseLabels } from '../../lib/labels.js'
 
   let { model = null, onSuccess, onCancel } = $props()
 
@@ -67,7 +68,7 @@
       api_key: api_key.trim(),
       api_protocol,
       generate_params: generate_params_text.trim() ? JSON.parse(generate_params_text) : {},
-      labels: labelsText.split(',').map(s => s.trim()).filter(Boolean),
+      labels: parseLabels(labelsText),
     }
     try {
       if (isEdit) await models.update(originalModelId, config)
@@ -139,7 +140,10 @@
 </script>
 
 <form class="model-form" onsubmit={(e) => { e.preventDefault(); handleSubmit() }}>
-  <h3>{isEdit ? t('editModel') : t('registerModel')}</h3>
+  <div class="form-header">
+    <h3>{isEdit ? t('editModel') : t('registerModel')}</h3>
+    <button type="button" class="btn btn-back" onclick={onCancel} disabled={submitting} title={t('cancel')}>&larr; {t('cancel')}</button>
+  </div>
 
   {#if submitError}
     <div class="form-error">{submitError}</div>
@@ -213,8 +217,12 @@
 </form>
 
 <style>
-  .model-form { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 24px; margin-bottom: 20px; }
-  h3 { margin: 0 0 16px 0; color: var(--text); }
+.model-form { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 24px; margin-bottom: 20px; }
+  .form-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+  .form-header h3 { margin: 0; color: var(--text); }
+  .btn-back { background: transparent; color: var(--text-secondary); border: 1px solid var(--border); padding: 4px 12px; border-radius: 6px; cursor: pointer; font-size: 0.85rem; transition: all 0.15s; }
+  .btn-back:hover:not(:disabled) { background: var(--border); color: var(--text); }
+  .btn-back:disabled { opacity: 0.5; cursor: not-allowed; }
   .form-error { background: var(--danger); color: #fff; padding: 8px 12px; border-radius: 6px; margin-bottom: 16px; font-size: 0.9rem; }
   .form-group { margin-bottom: 14px; display: flex; flex-direction: column; }
   .form-row { display: flex; gap: 16px; }

@@ -3,6 +3,7 @@
   import { refreshPromptTemplates } from '../../lib/catalog-state.svelte.js'
   import { extractPlaceholders } from '../../lib/placeholder.js'
   import { t } from '../../lib/i18n.svelte.js'
+  import { parseLabels } from '../../lib/labels.js'
 
   let { template = null, onSuccess, onCancel } = $props()
 
@@ -40,7 +41,7 @@
     if (!validate()) return
     submitting = true
     submitError = ''
-    const payload = { template_id: templateId.trim(), content: content.trim(), labels: labelsText.split(',').map(s => s.trim()).filter(Boolean) }
+    const payload = { template_id: templateId.trim(), content: content.trim(), labels: parseLabels(labelsText) }
     try {
       if (isEdit) await promptTemplates.update(originalTemplateId, payload)
       else await promptTemplates.create(payload)
@@ -55,7 +56,10 @@
 </script>
 
 <form class="prompt-form" onsubmit={(e) => { e.preventDefault(); handleSubmit() }}>
-  <h3>{isEdit ? t('editTemplate') : t('newTemplate')}</h3>
+  <div class="form-header">
+    <h3>{isEdit ? t('editTemplate') : t('newTemplate')}</h3>
+    <button type="button" class="btn btn-back" onclick={onCancel} disabled={submitting} title={t('cancel')}>&larr; {t('cancel')}</button>
+  </div>
 
   {#if submitError}
     <div class="form-error">{submitError}</div>
@@ -96,8 +100,12 @@
 </form>
 
 <style>
-  .prompt-form { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 24px; margin-bottom: 20px; }
-  h3 { margin: 0 0 16px 0; color: var(--text); }
+.prompt-form { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 24px; margin-bottom: 20px; }
+  .form-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+  .form-header h3 { margin: 0; color: var(--text); }
+  .btn-back { background: transparent; color: var(--text-secondary); border: 1px solid var(--border); padding: 4px 12px; border-radius: 6px; cursor: pointer; font-size: 0.85rem; transition: all 0.15s; }
+  .btn-back:hover:not(:disabled) { background: var(--border); color: var(--text); }
+  .btn-back:disabled { opacity: 0.5; cursor: not-allowed; }
   .form-error { background: var(--danger); color: #fff; padding: 8px 12px; border-radius: 6px; margin-bottom: 16px; font-size: 0.9rem; }
   .form-group { margin-bottom: 14px; display: flex; flex-direction: column; }
   label { margin-bottom: 4px; font-size: 0.9rem; color: var(--text-secondary); }

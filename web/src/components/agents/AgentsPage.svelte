@@ -57,7 +57,13 @@
 
   function handleDeleteCancel() { deleteTarget = null }
 
-  $effect(() => { fetchAgents() })
+  let mounted = $state(false)
+  $effect(() => {
+    if (!mounted) {
+      mounted = true
+      fetchAgents()
+    }
+  })
 </script>
 
 <div class="agents-page">

@@ -57,7 +57,13 @@
 
   function handleDeleteCancel() { deleteTarget = null }
 
-  $effect(() => { fetchTemplates() })
+  let mounted = $state(false)
+  $effect(() => {
+    if (!mounted) {
+      mounted = true
+      fetchTemplates()
+    }
+  })
 </script>
 
 <div class="prompts-page">

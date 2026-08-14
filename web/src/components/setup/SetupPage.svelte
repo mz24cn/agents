@@ -41,6 +41,7 @@
   let envDetectTrigger = $state(0)
   let authRefreshTrigger = $state(0)
   let refreshing = $state(false)
+  let refreshTimer = null
 
   let sortByTimeDesc = $state(readLocalStorage(SORT_TIME_DESC_STORAGE_KEY, '0') === '1')
 
@@ -147,16 +148,32 @@
     return tab
   }
 
-  async function handleRefresh() {
+  function handleClick(e) {
+    // 双击：清除单击定时器，立即执行强制重载
+    if (e.detail === 2) {
+      if (refreshTimer) clearTimeout(refreshTimer)
+      refreshTimer = null
+      doRefresh(true)
+      return
+    }
+    // 单击：防抖等待，判断是否后续有双击
+    if (refreshTimer) clearTimeout(refreshTimer)
+    refreshTimer = setTimeout(() => {
+      refreshTimer = null
+      doRefresh(false)
+    }, 250)
+  }
+
+  async function doRefresh(from_disk = false) {
     if (refreshing) return
     refreshing = true
     const category = getBaseCategory(activeTab)
     try {
-      if (category === 'models') await refreshModels()
-      else if (category === 'tools') await refreshTools()
-      else if (category === 'prompts') await refreshPromptTemplates()
-      else if (category === 'agents') await refreshAgents()
-      else if (category === 'env') await refreshEnvVars()
+      if (category === 'models') await refreshModels(from_disk)
+      else if (category === 'tools') await refreshTools(from_disk)
+      else if (category === 'prompts') await refreshPromptTemplates(from_disk)
+      else if (category === 'agents') await refreshAgents(from_disk)
+      else if (category === 'env') await refreshEnvVars(from_disk)
       else if (category === 'auth') authRefreshTrigger += 1
     } catch { /* errors are shown in each page */ }
     refreshing = false
@@ -206,7 +223,9 @@
       mcpServers.list().then(data => {
         const config = data.mcpServers?.[serverName]
         if (config) {
-          editingTool = { ...tool, mcpServerConfig: config, mcpServerName: serverName }
+          // Grab server-level labels from the top-level "labels" key
+          const serverLabels = data.labels?.[serverName] ?? []
+          editingTool = { ...tool, mcpServerConfig: config, mcpServerName: serverName, labels: serverLabels }
           activeTab = 'tool-edit'
         }
       }).catch(() => {
@@ -290,9 +309,9 @@
         >{i18n.lang === 'zh' ? '中' : 'En'}</button>
         <button
           class="refresh-btn"
-          onclick={handleRefresh}
+          onclick={handleClick}
           disabled={refreshing}
-          title={t('refreshCurrentTab')}
+          title={t('refreshCurrentTab') + ' (双击强制重载)'}
         >
           {refreshing ? '⏳' : '🔄'}
         </button>

@@ -5,6 +5,7 @@
   import JsonEditor from '../JsonEditor.svelte'
   import ToolSelector from '../chat/ToolSelector.svelte'
   import PromptTemplateSelector from '../chat/PromptTemplateSelector.svelte'
+  import { parseLabels } from '../../lib/labels.js'
 
   let { agent = null, onSuccess, onCancel } = $props()
 
@@ -113,7 +114,7 @@
       system_prompt: systemPrompt.trim(),
       myself_view: myselfView.trim(),
       description: description.trim(),
-      labels: labelsText.split(',').map(s => s.trim()).filter(Boolean),
+      labels: parseLabels(labelsText),
       avatar: avatar.trim(),
     }
     try {
@@ -130,7 +131,10 @@
 </script>
 
 <form class="agent-form" onsubmit={(e) => { e.preventDefault(); handleSubmit() }}>
-  <h3>{isEdit ? t('editAgent') : t('createAgent')}</h3>
+  <div class="form-header">
+    <h3>{isEdit ? t('editAgent') : t('createAgent')}</h3>
+    <button type="button" class="btn btn-back" onclick={onCancel} disabled={submitting} title={t('cancel')}>&larr; {t('cancel')}</button>
+  </div>
 
   {#if submitError}
     <div class="form-error">{submitError}</div>
@@ -227,8 +231,12 @@
 </form>
 
 <style>
-  .agent-form { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 24px; margin-bottom: 20px; }
-  h3 { margin: 0 0 16px 0; color: var(--text); }
+.agent-form { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 24px; margin-bottom: 20px; }
+  .form-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+  .form-header h3 { margin: 0; color: var(--text); }
+  .btn-back { background: transparent; color: var(--text-secondary); border: 1px solid var(--border); padding: 4px 12px; border-radius: 6px; cursor: pointer; font-size: 0.85rem; transition: all 0.15s; }
+  .btn-back:hover:not(:disabled) { background: var(--border); color: var(--text); }
+  .btn-back:disabled { opacity: 0.5; cursor: not-allowed; }
   .form-error { background: var(--danger); color: #fff; padding: 8px 12px; border-radius: 6px; margin-bottom: 16px; font-size: 0.9rem; }
   .form-group { margin-bottom: 14px; display: flex; flex-direction: column; }
   label { margin-bottom: 4px; font-size: 0.9rem; color: var(--text-secondary); }

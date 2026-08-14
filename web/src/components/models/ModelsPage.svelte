@@ -56,7 +56,13 @@
 
   function handleDeleteCancel() { deleteTarget = null }
 
-  $effect(() => { fetchModels() })
+  let mounted = $state(false)
+  $effect(() => {
+    if (!mounted) {
+      mounted = true
+      fetchModels()
+    }
+  })
 </script>
 
 <div class="models-page">

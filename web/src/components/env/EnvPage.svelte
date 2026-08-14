@@ -163,9 +163,13 @@
     // showAddForm 变化时重置表单状态（由 SetupPage 驱动）
   })
 
-  // 初始加载（共享状态已加载则跳过）
+  // 初始加载（仅首次挂载时执行，共享状态已加载则跳过）
+  let envMounted = $state(false)
   $effect(() => {
-    fetchEnvVars()
+    if (!envMounted) {
+      envMounted = true
+      fetchEnvVars()
+    }
   })
 </script>
 
