@@ -138,6 +138,39 @@ def _round_final():
     ]
 
 
+def test_incremental_persist_saves_plain_assistant(tmp_path):
+    """Incremental persist must save a plain-text assistant message even when
+    no tool-call / tool-result round follows — otherwise refreshing the page
+    (killing the connection) loses the assistant's reply.
+
+    Use merge_stream_messages + persist_conversation(compress=False) to
+    simulate what the handler does after each completed round.
+    """
+    from runtime.server_state import persist_conversation, merge_stream_messages
+    from runtime.context_manager import ContextManager
+
+    cm = ContextManager(infer_fn=lambda req: None, chats_dir=str(tmp_path))
+    session_id = cm.create_session()
+
+    # Simulate collected_messages after a full assistant text round:
+    # merge_stream_messages receives [assistant_token, ..., usage] and
+    # produces [assistant_turn] where the turn carries the combined content.
+    msgs = [
+        Message(role="assistant", content="Hello ", timestamp="2026-08-12T15:00:01"),
+        Message(role="assistant", content="world!", timestamp="2026-08-12T15:00:02"),
+        Message(role="usage", timestamp="2026-08-12T15:00:03",
+                content=json.dumps({"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7})),
+    ]
+    turns, _ = merge_stream_messages(msgs)
+    exc = persist_conversation(cm, session_id, [], turns,
+                               agent_ids=[], agent_nickname="", model_id="m",
+                               tool_ids=[], workspace="", compress=False)
+    assert exc is None, f"persist failed: {exc}"
+    loaded = cm.load_conversation(session_id)
+    assert any(t.content == "Hello world!" for t in loaded), \
+        f"plain-text assistant not persisted: {[(t.role, t.content) for t in loaded]}"
+
+
 def test_merge_stream_messages_chunked_equals_full():
     """Merging collected_messages in completed-round chunks must equal merging
     the full list \u2014 the invariant that makes incremental persistence safe."""

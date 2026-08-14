@@ -719,10 +719,13 @@ class HandlerInferMixin:
                         msg.agent_id = agent_ids[0]
                         if agent_nickname:
                             msg.name = agent_nickname
-                    # 一轮工具调用完成（assistant + usage + tool 已收集完整）→ 增量持久化。
-                    # 放在 delegate/talk_to 的 continue 之前，保证这两种工具的
-                    # 最终结果消息也触发落盘。
-                    if msg.role == "tool":
+                    # 增量持久化触发点：
+                    #   usage 消息 → assistant 一轮结束（纯文本回复或 tool_calls 声明），
+                    #               merge_stream_messages 已将其 flush 为一个完整 turn
+                    #   tool 消息  → 工具调用结果配对完成 → 立即落盘
+                    #  放在 delegate/talk_to 的 continue 之前，保证这两种工具的
+                    #  最终结果消息也触发落盘。
+                    if msg.role in ("usage", "tool"):
                         _incremental_persist()
                     # delegate / talk_to 工具通过 sse_callback 自行管理流式帧和结束帧，跳过 infer_stream 的重复输出
                     if msg.role == "tool" and msg.name in ("delegate", "talk_to"):
