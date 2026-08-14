@@ -128,6 +128,9 @@ class SkillManager:
         # Persist the original user-provided path (may contain ~/) for portability;
         # store the expanded absolute path in memory for runtime use.
         now = datetime.datetime.now().isoformat()
+        # 保留用户通过编辑页面设置的标签（如 labels），不从 SKILL.md 解析
+        existing = self._tool_registry.get(f"skill-{skill_name}")
+        existing_labels = list(existing.labels) if (existing and existing.labels) else []
         skill_tool_config = ToolConfig(
             tool_id=f"skill-{skill_name}",
             tool_type="skill",
@@ -139,6 +142,7 @@ class SkillManager:
                 "required": [],
             },
             skill_dir=skill_dir,
+            labels=existing_labels,
             created_at=now,
             last_modified=now,
         )

@@ -15,16 +15,16 @@ export const catalog = $state({
 const pending = {}
 const sequence = { models: 0, tools: 0, promptTemplates: 0, agents: 0, envVars: 0 }
 
-async function loadResource(key, request, pickItems, { force = false } = {}) {
+async function loadResource(key, request, pickItems, { from_disk = false, skip_cache = false } = {}) {
   const state = catalog[key]
-  if (state.loaded && !force) return state.items
-  if (pending[key] && !force) return pending[key]
+  if (!skip_cache && !from_disk && state.loaded) return state.items
+  if (!skip_cache && !from_disk && pending[key]) return pending[key]
 
   const seq = ++sequence[key]
   state.loading = true
   state.error = ''
 
-  const promise = request()
+  const promise = request(from_disk)
     .then((data) => {
       const items = pickItems(data) ?? []
       // If a newer refresh has already started, do not let this older response
@@ -59,32 +59,33 @@ export function loadModels(options) {
   return loadResource('models', modelsApi.list, (data) => data.models, options)
 }
 
-export function refreshModels() {
-  return loadModels({ force: true })
+export function refreshModels(from_disk = false) {
+  // refreshXxx 总是跳过前端缓存，区别仅在于是否通知后端从磁盘重载
+  return loadModels({ skip_cache: true, from_disk })
 }
 
 export function loadTools(options) {
   return loadResource('tools', toolsApi.list, (data) => data.tools, options)
 }
 
-export function refreshTools() {
-  return loadTools({ force: true })
+export function refreshTools(from_disk = false) {
+  return loadTools({ skip_cache: true, from_disk })
 }
 
 export function loadPromptTemplates(options) {
   return loadResource('promptTemplates', promptTemplatesApi.list, (data) => data.templates, options)
 }
 
-export function refreshPromptTemplates() {
-  return loadPromptTemplates({ force: true })
+export function refreshPromptTemplates(from_disk = false) {
+  return loadPromptTemplates({ skip_cache: true, from_disk })
 }
 
 export function loadAgents(options) {
   return loadResource('agents', agentsApi.list, (data) => data.agents, options)
 }
 
-export function refreshAgents() {
-  return loadAgents({ force: true })
+export function refreshAgents(from_disk = false) {
+  return loadAgents({ skip_cache: true, from_disk })
 }
 
 export function loadEnvVars(options) {
@@ -94,6 +95,6 @@ export function loadEnvVars(options) {
   }, options)
 }
 
-export function refreshEnvVars() {
-  return loadEnvVars({ force: true })
+export function refreshEnvVars(from_disk = false) {
+  return loadEnvVars({ skip_cache: true, from_disk })
 }

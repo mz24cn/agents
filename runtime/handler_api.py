@@ -34,23 +34,67 @@ logger = logging.getLogger("runtime.server")
 
 
 class HandlerApiMixin:
+    def _get_query_param(self, name: str, default=None):
+        """Extract a query parameter value from the request URL."""
+        parsed = urllib.parse.urlparse(self.path)
+        params = urllib.parse.parse_qs(parsed.query)
+        return params.get(name, [default])[0]
+
     def _handle_list_models(self) -> None:
-        """GET /v1/models — list all registered model configurations."""
+        """GET /v1/models — list all registered model configurations.
+
+        Query params:
+            from_disk (bool): If true, reload from disk before listing.
+        """
         runtime = self._get_runtime()
+        if self._get_query_param('from_disk') == 'true':
+            path = getattr(self.server, 'models_path', None)
+            if path and os.path.isfile(path):
+                runtime._model_registry.load(path)
         models = runtime._model_registry.list_all()
         data = [m.to_dict() for m in models]
         self._send_json_response(200, {"models": data})
 
     def _handle_list_tools(self) -> None:
-        """GET /v1/tools — list all registered tool configurations."""
+        """GET /v1/tools — list all registered tool configurations.
+
+        Query params:
+            from_disk (bool): If true, reload from disk before listing,
+                          and restore SkillManager state for skill tools.
+        """
         runtime = self._get_runtime()
+        if self._get_query_param('from_disk') == 'true':
+            path = getattr(self.server, 'tools_path', None)
+            if path and os.path.isfile(path):
+                # load() clears all tools (including builtins) and reloads only
+                # persisted non-builtin tools, so we must re-register builtins.
+                from runtime.builtin_tools import register_builtin_tools
+                runtime._tool_registry.load(path)
+                register_builtin_tools(runtime._tool_registry, runtime=runtime)
+                # Restore SkillManager state for persisted skill tools
+                skill_manager = getattr(runtime, '_skill_manager', None)
+                if skill_manager is not None:
+                    for tc in runtime._tool_registry.list_by_type("skill"):
+                        if tc.skill_dir:
+                            try:
+                                skill_manager.load_skill(tc.skill_dir)
+                            except ValueError:
+                                pass
         tools = runtime._tool_registry.list_all()
         data = [t.to_dict() for t in tools]
         self._send_json_response(200, {"tools": data})
 
     def _handle_list_prompt_templates(self) -> None:
-        """GET /v1/prompt-templates — list all prompt templates."""
+        """GET /v1/prompt-templates — list all prompt templates.
+
+        Query params:
+            from_disk (bool): If true, reload from disk before listing.
+        """
         mgr = self.server.prompt_template_manager  # type: ignore[attr-defined]
+        if self._get_query_param('from_disk') == 'true':
+            path = getattr(self.server, 'prompt_templates_path', None)
+            if path and os.path.isfile(path):
+                mgr.load(path)
         templates = mgr.list_all()
         data = [t.to_dict() for t in templates]
         self._send_json_response(200, {"templates": data})
@@ -168,6 +212,17 @@ class HandlerApiMixin:
             saved_servers = saved.setdefault("mcpServers", {})
             for server_name in registered_servers:
                 saved_servers[server_name] = body["mcpServers"][server_name]
+            # Persist labels at the top level alongside mcpServers
+            if "labels" in body and isinstance(body["labels"], dict):
+                saved_labels = saved.setdefault("labels", {})
+                for server_name in registered_servers:
+                    if server_name in body["labels"] and body["labels"][server_name]:
+                        saved_labels[server_name] = body["labels"][server_name]
+                    elif server_name in saved.get("labels", {}):
+                        del saved["labels"][server_name]
+                # Remove empty labels dict
+                if "labels" in saved and not saved["labels"]:
+                    del saved["labels"]
             os.makedirs(self.server.data_dir, exist_ok=True)
             with open(self.server.mcp_servers_path, "w", encoding="utf-8") as f:
                 json.dump(saved, f, ensure_ascii=False, indent=2)
@@ -538,6 +593,10 @@ class HandlerApiMixin:
                 saved = json.load(f)
         saved_servers = saved.setdefault("mcpServers", {})
         saved_servers[server_name] = body
+        # Preserve labels if present in the old saved data
+        if "labels" in saved and server_name in saved["labels"]:
+            # Keep existing labels (they were set before the edit-delete cycle)
+            pass
         os.makedirs(self.server.data_dir, exist_ok=True)
         with open(self.server.mcp_servers_path, "w", encoding="utf-8") as f:
             json.dump(saved, f, ensure_ascii=False, indent=2)
@@ -572,6 +631,12 @@ class HandlerApiMixin:
             if server_name in servers:
                 del servers[server_name]
                 removed_from_config = True
+            # Also remove labels for this server
+            if "labels" in saved and server_name in saved["labels"]:
+                del saved["labels"][server_name]
+                if not saved["labels"]:
+                    del saved["labels"]
+            if removed_from_config:
                 with open(self.server.mcp_servers_path, "w", encoding="utf-8") as f:
                     json.dump(saved, f, ensure_ascii=False, indent=2)
 
@@ -615,8 +680,14 @@ class HandlerApiMixin:
     # ------------------------------------------------------------------
 
     def _handle_get_env(self) -> None:
-        """GET /v1/env — 返回所有环境变量键值对。"""
+        """GET /v1/env — 返回所有环境变量键值对。
+
+        Query params:
+            from_disk (bool): If true, re-read from disk before returning.
+        """
         env_manager = self.server.env_manager  # type: ignore[attr-defined]
+        if self._get_query_param('from_disk') == 'true':
+            env_manager._sync_to_environ(env_manager.read())
         try:
             env_map = env_manager.read()
         except ValueError as exc:
@@ -1020,8 +1091,15 @@ class HandlerApiMixin:
     # ------------------------------------------------------------------
 
     def _handle_list_agents(self) -> None:
-        """GET /v1/agents — list all agents."""
-        agents = self.server.agent_manager.list_all()  # type: ignore[attr-defined]
+        """GET /v1/agents — list all agents.
+
+        Query params:
+            from_disk (bool): If true, reload from disk before listing.
+        """
+        agent_manager = self.server.agent_manager  # type: ignore[attr-defined]
+        if self._get_query_param('from_disk') == 'true':
+            agent_manager.load()
+        agents = agent_manager.list_all()
         self._send_json_response(200, {"agents": agents})
 
     def _handle_get_agent(self, agent_id: str) -> None:

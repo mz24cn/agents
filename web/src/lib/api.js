@@ -59,7 +59,7 @@ async function request(method, path, body = null) {
 
 /** Model CRUD helpers. */
 export const models = {
-  list:   ()                  => request('GET',    '/v1/models'),
+  list:   (from_disk = false)    => request('GET',    '/v1/models' + (from_disk ? '?from_disk=true' : '')),
   create: (config)            => request('POST',   '/v1/models', config),
   update: (modelId, config)   => request('PUT',    `/v1/models/${modelId}`, config),
   delete: (modelId)           => request('DELETE', `/v1/models/${modelId}`),
@@ -67,7 +67,7 @@ export const models = {
 
 /** Tool CRUD helpers. */
 export const tools = {
-  list:        ()                  => request('GET',    '/v1/tools'),
+  list:        (from_disk = false)    => request('GET',    '/v1/tools' + (from_disk ? '?from_disk=true' : '')),
   create:      (config)            => request('POST',   '/v1/tools', config),
   createMcp:   (config)            => request('POST',   '/v1/tools/mcp', config),
   createSkill: (skillDir)          => request('POST',   '/v1/tools/skill', { skill_dir: skillDir }),
@@ -78,14 +78,14 @@ export const tools = {
 
 /** MCP server helpers. */
 export const mcpServers = {
-  list:    ()                          => request('GET',    '/v1/mcp-servers'),
+  list:    (from_disk = false)            => request('GET',    '/v1/mcp-servers' + (from_disk ? '?from_disk=true' : '')),
   delete:  (serverName)                => request('DELETE', `/v1/mcp-servers/${encodeURIComponent(serverName)}`),
   restore: (serverName, config)        => request('PUT',    `/v1/mcp-servers/${encodeURIComponent(serverName)}`, config),
 }
 
 /** Prompt template CRUD helpers. */
 export const promptTemplates = {
-  list:   ()                        => request('GET',    '/v1/prompt-templates'),
+  list:   (from_disk = false)           => request('GET',    '/v1/prompt-templates' + (from_disk ? '?from_disk=true' : '')),
   create: (data)                    => request('POST',   '/v1/prompt-templates', data),
   update: (templateId, data)        => request('PUT',    `/v1/prompt-templates/${encodeURIComponent(templateId)}`, data),
   delete: (templateId)              => request('DELETE', `/v1/prompt-templates/${encodeURIComponent(templateId)}`),
@@ -203,7 +203,7 @@ export async function abortInferStream(sessionId, forced = false) {
 
 /** 环境变量 API */
 export const env = {
-  list:   ()              => request('GET',    '/v1/env'),
+  list:   (from_disk = false) => request('GET',    '/v1/env' + (from_disk ? '?from_disk=true' : '')),
   set:    (key, value)    => request('POST',   '/v1/env', { key, value }),
   delete: (key)           => request('DELETE', `/v1/env/${encodeURIComponent(key)}`),
   detect: ()              => request('POST',   '/v1/env/detect'),
@@ -298,7 +298,7 @@ export const auth = {
 
 /** AI代理 API */
 export const agents = {
-  list:   ()              => request('GET',    '/v1/agents'),
+  list:   (from_disk = false) => request('GET',    '/v1/agents' + (from_disk ? '?from_disk=true' : '')),
   get:    (agentId)       => request('GET',    `/v1/agents/${encodeURIComponent(agentId)}`),
   create: (data)          => request('POST',   '/v1/agents', data),
   update: (agentId, data) => request('PUT',    `/v1/agents/${encodeURIComponent(agentId)}`, data),
