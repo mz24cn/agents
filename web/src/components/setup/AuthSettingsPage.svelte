@@ -1,8 +1,11 @@
 <script>
   import { onMount } from 'svelte'
-  import { auth } from '../../lib/api.js'
+  import { auth, build } from '../../lib/api.js'
   import { copyToClipboard } from '../../lib/clipboard.js'
   import { t } from '../../lib/i18n.svelte.js'
+
+  /** @type {string} Injected at build time by Vite (YYMMdd_HHmmss) */
+  const frontendBuild = typeof __BUILD_TIME__ !== 'undefined' ? __BUILD_TIME__ : ''
 
   const ttlOptions = [
     { value: 3600, labelKey: 'authTtl1Hour' },
@@ -26,6 +29,7 @@
   let apiKey = $state('')
   let setupToken = $state('')
   let setupTokenExpiresAt = $state('')
+  let backendBuild = $state('')
 
   let setupLink = $derived(`${window.location.origin}/v1/setup${setupToken ? `?token=${encodeURIComponent(setupToken)}` : ''}`)
   let windowsSetupCommand = $derived(`irm ${setupLink} | iex`)
@@ -68,7 +72,17 @@
 
   onMount(() => {
     loadConfig()
+    loadBuildInfo()
   })
+
+  async function loadBuildInfo() {
+    try {
+      const data = await build.info()
+      backendBuild = data.backend_build || ''
+    } catch {
+      // ignore \u2014 backendBuild stays empty
+    }
+  }
 
   async function loadConfig() {
     loading = true
@@ -196,6 +210,31 @@
       {/if}
 
       <div class="settings-stack">
+
+        {#if frontendBuild || backendBuild}
+          <section class="card build-card">
+            <div class="card-header compact">
+              <div>
+                <h3>Build version</h3>
+              </div>
+            </div>
+            <div class="build-versions">
+              {#if frontendBuild}
+                <div class="build-row">
+                  <span class="build-label">Frontend</span>
+                  <code class="build-value">{frontendBuild}</code>
+                </div>
+              {/if}
+              {#if backendBuild}
+                <div class="build-row">
+                  <span class="build-label">Backend</span>
+                  <code class="build-value">{backendBuild}</code>
+                </div>
+              {/if}
+            </div>
+          </section>
+        {/if}
+
         <section class="card main-card">
           <div class="card-header compact">
             <div>
@@ -543,5 +582,37 @@
       justify-content: flex-start;
       min-width: 0;
     }
+  }
+
+  .build-card {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--bg);
+    padding: 16px;
+    box-shadow: 0 1px 0 rgba(0,0,0,0.02);
+  }
+  .build-versions {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .build-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .build-label {
+    color: var(--text-secondary);
+    font-size: 0.88rem;
+    min-width: 72px;
+    font-weight: 600;
+  }
+  .build-value {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 0.88rem;
+    color: var(--text);
+    background: var(--bg-secondary);
+    padding: 3px 8px;
+    border-radius: 4px;
   }
 </style>

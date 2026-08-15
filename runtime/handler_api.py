@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import urllib.parse
+import uuid
 
 from runtime.common import session_timestamp
 from runtime.context_manager import JournalConflictError
@@ -175,12 +176,14 @@ class HandlerApiMixin:
                         command=server_cfg["command"],
                         args=server_cfg.get("args"),
                         env=server_cfg.get("env"),
+                        timeout=60.0,
                     )
                 elif "url" in server_cfg:
                     mcp_manager.connect_url(
                         server_name=server_name,
                         url=server_cfg["url"],
                         headers=server_cfg.get("headers"),
+                        timeout=60.0,
                     )
                 else:
                     errors.append(f"{server_name}: missing 'command' or 'url'")
@@ -649,6 +652,124 @@ class HandlerApiMixin:
             "server_name": server_name,
             "deleted_tools": tool_ids_to_remove,
         })
+
+    def _handle_test_tool(self) -> None:
+        """POST /v1/tools/test — validate a tool without persisting it.
+
+        Function tools are imported from the configured file, skill tools are
+        checked for a readable ``SKILL.md``, and MCP tools are connected using
+        isolated temporary connection names and queried with ``tools/list``.
+        Nothing is added to a registry or written to disk.
+        """
+        body = self._read_json_body()
+        if body is None:
+            return
+
+        tool_type = body.get("tool_type")
+        try:
+            if tool_type == "function":
+                file_path = str(body.get("function_file_path", "")).strip()
+                function_name = str(body.get("function_name", "")).strip()
+                if not file_path or not function_name:
+                    raise ValueError("function_file_path and function_name are required")
+                _load_function_from_file(os.path.expanduser(file_path), function_name)
+                result = {
+                    "status": "ok",
+                    "tool_type": "function",
+                    "function_name": function_name,
+                }
+
+            elif tool_type == "skill":
+                skill_dir = str(body.get("skill_dir", "")).strip()
+                if not skill_dir:
+                    raise ValueError("skill_dir is required")
+                expanded_dir = os.path.abspath(os.path.expanduser(skill_dir))
+                skill_md_path = os.path.join(expanded_dir, "SKILL.md")
+                if not os.path.isdir(expanded_dir):
+                    raise ValueError(f"Skill directory not found: {expanded_dir}")
+                if not os.path.isfile(skill_md_path):
+                    raise ValueError(f"SKILL.md not found in {expanded_dir}")
+                with open(skill_md_path, "r", encoding="utf-8") as f:
+                    f.read(1)
+                result = {
+                    "status": "ok",
+                    "tool_type": "skill",
+                    "skill_md_path": skill_md_path,
+                }
+
+            elif tool_type == "mcp":
+                mcp_config = body.get("mcp_config", {})
+                if not isinstance(mcp_config, dict):
+                    raise ValueError("mcp_config must be a JSON object")
+                servers = mcp_config.get("mcpServers")
+                if not isinstance(servers, dict) or not servers:
+                    raise ValueError('mcp_config must contain a non-empty "mcpServers" object')
+
+                runtime = self._get_runtime()
+                mcp_manager = runtime._mcp_manager
+                if mcp_manager is None:
+                    raise RuntimeError("MCPClientManager not available")
+
+                test_timeout = 30.0
+                server_results = []
+                for configured_name, config in servers.items():
+                    if not isinstance(config, dict):
+                        raise ValueError(f"{configured_name}: config must be a JSON object")
+                    temporary_name = f"__mcp_test_{uuid.uuid4().hex}"
+                    try:
+                        if "command" in config:
+                            mcp_manager.connect_stdio(
+                                server_name=temporary_name,
+                                command=config["command"],
+                                args=config.get("args"),
+                                env=config.get("env"),
+                                timeout=test_timeout,
+                            )
+                        elif "url" in config:
+                            mcp_manager.connect_url(
+                                server_name=temporary_name,
+                                url=config["url"],
+                                headers=config.get("headers"),
+                                timeout=test_timeout,
+                            )
+                        else:
+                            raise ValueError(
+                                f"{configured_name}: config must contain 'command' or 'url'"
+                            )
+                        discovered = mcp_manager.get_tools(
+                            temporary_name, timeout=test_timeout
+                        )
+                        server_results.append({
+                            "server_name": configured_name,
+                            "tools": [t.name for t in discovered],
+                        })
+                    finally:
+                        try:
+                            mcp_manager.disconnect(temporary_name)
+                        except Exception:
+                            pass
+
+                result = {
+                    "status": "ok",
+                    "tool_type": "mcp",
+                    "servers": server_results,
+                    "tools": [
+                        tool_name
+                        for server_result in server_results
+                        for tool_name in server_result["tools"]
+                    ],
+                }
+
+            else:
+                raise ValueError("tool_type must be function, skill, or mcp")
+
+            self._send_json_response(200, result)
+        except Exception as exc:
+            self._send_json_response(200, {
+                "status": "error",
+                "tool_type": tool_type,
+                "error": str(exc),
+            })
 
     def _handle_delete_tool(self, tool_id: str) -> None:
         """DELETE /v1/tools/{tool_id} — delete a tool configuration."""

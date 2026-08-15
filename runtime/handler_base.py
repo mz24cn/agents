@@ -89,6 +89,7 @@ _ROUTES: dict[str, list] = {
         (re.compile(r"^/v1/sessions/([^/]+)/file-journals/([^/]+)$"), "_handle_get_file_journal_diff", (urllib.parse.unquote, urllib.parse.unquote)),
         (re.compile(r"^/v1/sessions/([^/]+)/file-journals$"), "_handle_get_file_journals", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/terminals$"), "_handle_list_terminals", ()),
+        (re.compile(r"^/v1/build$"), "_handle_build", ()),
     ],
     "POST": [
         (re.compile(r"^/v1/auth/login$"), "_handle_auth_login", ()),
@@ -99,6 +100,7 @@ _ROUTES: dict[str, list] = {
         (re.compile(r"^/v1/infer/abort$"), "_handle_infer_abort", ()),
         (re.compile(r"^/v1/tools/call$"), "_handle_tool_call", ()),
         (re.compile(r"^/v1/tools/mcp$"), "_handle_register_mcp_servers", ()),
+        (re.compile(r"^/v1/tools/test$"), "_handle_test_tool", ()),
         (re.compile(r"^/v1/tools/skill$"), "_handle_register_skill", ()),
         (re.compile(r"^/v1/models$"), "_handle_register_model", ()),
         (re.compile(r"^/v1/tools$"), "_handle_register_tool", ()),
@@ -1183,6 +1185,42 @@ class HandlerBaseMixin:
             return
         if not self._dispatch_route("DELETE", path):
             self._send_json_error(404, f"Not found: {self.path}")
+
+    # ------------------------------------------------------------------
+    # Build info handler
+    # ------------------------------------------------------------------
+
+    def _handle_build(self) -> None:
+        """GET /v1/build \u2014\u2014 return backend build timestamp.
+
+        Scans all ``.py`` files under the ``runtime/`` directory and returns
+        the latest modification time in ``YYMMdd_HHmmss`` format (same as
+        session_id / session_timestamp).
+        """
+        import os
+        import datetime
+
+        runtime_dir = os.path.dirname(os.path.abspath(__file__))
+
+        latest_mtime: float = 0.0
+        for root, dirs, files in os.walk(runtime_dir):
+            for fn in files:
+                if fn.endswith(".py"):
+                    path = os.path.join(root, fn)
+                    try:
+                        mtime = os.stat(path).st_mtime
+                        if mtime > latest_mtime:
+                            latest_mtime = mtime
+                    except OSError:
+                        continue
+
+        if latest_mtime > 0:
+            build_dt = datetime.datetime.fromtimestamp(latest_mtime)
+            backend_build = build_dt.strftime("%y%m%d_%H%M%S")
+        else:
+            backend_build = ""
+
+        self._send_json_response(200, {"backend_build": backend_build})
 
     # ------------------------------------------------------------------
     # Auth handlers

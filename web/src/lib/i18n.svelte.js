@@ -349,6 +349,7 @@ const translations = {
     editModel: '编辑模型',
     registerModel: '注册模型',
     testModel: '测试模型',
+    testTool: '测试工具',
     testTitle: '模型测试结果',
     testSuccessTitle: '测试成功',
     testFailedTitle: '测试失败',
@@ -477,6 +478,11 @@ const translations = {
     skillDirPlaceholder: '例如: ~/skills/my_skill 或 /home/user/skills/my_skill 或 ./skills/my_skill',
     skillDirHint: '文件夹内须包含 SKILL.md（配置名称和描述），路径支持 ~/ 开头的用户目录',
     mcpConfigHint: '支持 stdio（command）和 HTTP（url）两种模式，可一次配置多个 MCP server，工具将在首次调用时自动启动',
+    toolConfigTestFailed: '工具测试失败',
+    mcpConfigTestFailed: 'MCP 服务器连接测试失败',
+    mcpTestSuccess: '连接成功！发现 {count} 个工具：{tools}',
+    skillTestSuccess: '测试成功，已找到并可读取：{path}',
+    functionTestSuccess: '测试成功，函数「{name}」可以正常导入',
 
     // ToolsPage
     toolsPageTitle: '工具管理',
@@ -836,6 +842,7 @@ const translations = {
     editModel: 'Edit Model',
     registerModel: 'Register Model',
     testModel: 'Test Model',
+    testTool: 'Test Tool',
     testTitle: 'Test Result',
     testSuccessTitle: 'Test Successful',
     testFailedTitle: 'Test Failed',
@@ -964,6 +971,11 @@ const translations = {
     skillDirPlaceholder: 'e.g. ~/skills/my_skill or /home/user/skills/my_skill or ./skills/my_skill',
     skillDirHint: 'Directory must contain SKILL.md; name and description are read from its front-matter. Supports ~/ home directory paths',
     mcpConfigHint: 'Supports stdio (command) and HTTP (url) modes; multiple servers can be configured at once and tools start automatically on first call',
+    toolConfigTestFailed: 'Tool test failed',
+    mcpConfigTestFailed: 'MCP server connection test failed',
+    mcpTestSuccess: 'Connection successful! Found {count} tools: {tools}',
+    skillTestSuccess: 'Test successful. Found and read: {path}',
+    functionTestSuccess: 'Test successful. Function "{name}" can be imported',
 
     // ToolsPage
     toolsPageTitle: 'Tools',

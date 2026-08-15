@@ -3,6 +3,7 @@
   import { refreshTools } from '../../lib/catalog-state.svelte.js'
   import { t } from '../../lib/i18n.svelte.js'
   import JsonEditor from '../JsonEditor.svelte'
+  import ConfirmDialog from '../ConfirmDialog.svelte'
   import { parseLabels } from '../../lib/labels.js'
 
   let { tool = null, mcpServer = null, onSuccess, onCancel } = $props()
@@ -37,6 +38,10 @@
   let errors = $state({})
   let submitError = $state('')
   let submitting = $state(false)
+  let testing = $state(false)
+  let testDialogOpen = $state(false)
+  let testDialogTitle = $state('')
+  let testDialogMessage = $state('')
 
   function validate() {
     const e = {}
@@ -70,20 +75,46 @@
     return Object.keys(e).length === 0
   }
 
+  function buildToolTestConfig() {
+    if (tool_type === 'mcp') {
+      return { tool_type: 'mcp', mcp_config: JSON.parse(mcp_config_text) }
+    }
+    if (tool_type === 'skill') {
+      return { tool_type: 'skill', skill_dir: skill_dir.trim() }
+    }
+    return {
+      tool_type: 'function',
+      function_file_path: function_file_path.trim(),
+      function_name: function_name.trim(),
+    }
+  }
+
+  async function testToolConfig() {
+    const result = await tools.test(buildToolTestConfig())
+    if (result.status === 'error') {
+      throw new Error(result.error || t('toolConfigTestFailed'))
+    }
+    return result
+  }
+
   async function handleSubmit() {
     if (!validate()) return
     submitting = true
     submitError = ''
     const parsedLabels = parseLabels(labelsText)
     try {
+      // Validate the candidate config before any registry or disk mutation.
+      await testToolConfig()
+
       if (tool_type === 'mcp') {
         const config = JSON.parse(mcp_config_text)
-        const serverName = mcpServer?.serverName ?? _init.mcpServerName
+        const configuredNames = Object.keys(config.mcpServers)
+        const serverName = mcpServer?.serverName ?? _init.mcpServerName ?? configuredNames[0]
         // Include labels at the top level for persistence in mcp_servers.json
         config.labels = { [serverName]: parsedLabels }
         let resp
         if (isMcpEdit && serverName) {
-          // Edit: delete old first, rollback if create fails
+          // Test has passed — now delete old and create new.
           const oldConfig = _mcpServerConfig
           await mcpServers.delete(serverName)
           try {
@@ -131,6 +162,39 @@
     } finally {
       submitting = false
     }
+  }
+
+  async function handleTest() {
+    if (!validate()) return
+    testing = true
+    try {
+      const result = await testToolConfig()
+      testDialogTitle = t('testSuccessTitle')
+      if (result.tool_type === 'mcp') {
+        const toolCount = result.tools?.length ?? 0
+        testDialogMessage = t('mcpTestSuccess', {
+          count: toolCount,
+          tools: result.tools?.join(', ') || '-',
+        })
+      } else if (result.tool_type === 'skill') {
+        testDialogMessage = t('skillTestSuccess', { path: result.skill_md_path })
+      } else {
+        testDialogMessage = t('functionTestSuccess', { name: result.function_name })
+      }
+      testDialogOpen = true
+    } catch (err) {
+      testDialogTitle = t('testFailedTitle')
+      testDialogMessage = err.message || 'Network error'
+      testDialogOpen = true
+    } finally {
+      testing = false
+    }
+  }
+
+  function closeTestDialog() {
+    testDialogOpen = false
+    testDialogTitle = ''
+    testDialogMessage = ''
   }
 </script>
 
@@ -210,12 +274,25 @@
   </div>
 
   <div class="form-actions">
-    <button type="button" class="btn btn-cancel" onclick={onCancel} disabled={submitting}>{t('cancel')}</button>
-    <button type="submit" class="btn btn-primary" disabled={submitting}>
+    <button type="button" class="btn btn-test" onclick={handleTest} disabled={testing || submitting}>
+      {testing ? t('submitting') : t('testTool')}
+    </button>
+    <button type="button" class="btn btn-cancel" onclick={onCancel} disabled={submitting || testing}>{t('cancel')}</button>
+    <button type="submit" class="btn btn-primary" disabled={submitting || testing}>
       {submitting ? t('submitting') : (isEdit || isMcpEdit ? t('save') : t('register'))}
     </button>
   </div>
 </form>
+
+<ConfirmDialog
+  open={testDialogOpen}
+  title={testDialogTitle}
+  message={testDialogMessage}
+  closeText={t('testClose')}
+  hideCancel={true}
+  onConfirm={closeTestDialog}
+  onCancel={closeTestDialog}
+/>
 
 <style>
 .tool-form { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 24px; margin-bottom: 20px; }
@@ -244,4 +321,6 @@
   .btn-cancel { background: var(--bg-secondary); color: var(--text); border: 1px solid var(--border); }
   .btn-primary { background: var(--primary); color: #fff; }
   .btn-primary:hover:not(:disabled) { background: var(--primary-hover); }
+  .btn-test { background: #e67e22; color: #fff; }
+  .btn-test:hover:not(:disabled) { background: #d35400; }
 </style>

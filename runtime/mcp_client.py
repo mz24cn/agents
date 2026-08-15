@@ -33,6 +33,9 @@ from runtime.runtime import _get_tool_exec_timeout
 # Default idle timeout in seconds before a stdio process is reaped.
 _DEFAULT_IDLE_TIMEOUT = 300
 
+# Default deadline for starting an MCP transport and completing initialize.
+_DEFAULT_CONNECT_TIMEOUT = 30.0
+
 
 class MCPClientManager:
     """Singleton MCP Client manager supporting stdio and Streamable HTTP transports."""
@@ -390,7 +393,7 @@ class MCPClientManager:
         except (urllib.error.HTTPError, urllib.error.URLError):
             pass  # notifications are fire-and-forget
 
-    def _http_initialize(self, conn: dict) -> None:
+    def _http_initialize(self, conn: dict, timeout: Optional[float] = None) -> None:
         # Ensure session_id starts empty so the first request has none
         conn.setdefault("session_id", None)
         request = self._build_jsonrpc("initialize", {
@@ -398,7 +401,7 @@ class MCPClientManager:
             "capabilities": {},
             "clientInfo": {"name": "runtime", "version": "1.0.0"},
         })
-        response = self._http_send(conn, request)
+        response = self._http_send(conn, request, timeout=timeout)
         if "error" in response:
             raise RuntimeError(f"MCP initialize failed: {response['error']}")
         conn["server_info"] = response.get("result", {})
@@ -415,16 +418,28 @@ class MCPClientManager:
         command: str,
         args: Optional[list] = None,
         env: Optional[dict] = None,
+        timeout: Optional[float] = _DEFAULT_CONNECT_TIMEOUT,
     ) -> None:
         """Connect to an MCP server via stdio subprocess.
 
         Launches the subprocess and performs the MCP initialize handshake.
         If the server is already connected, this is a no-op.
+
+        Args:
+            server_name: unique name for this server instance.
+            command: executable path.
+            args: command-line arguments.
+            env: extra environment variables.
+            timeout: max seconds to wait for subprocess startup + handshake.
+                     Defaults to 30 seconds; ``None`` disables the deadline.
         """
         if server_name in self._connections:
             if self._connections[server_name].get("connected"):
                 return
-        self._run_async(self._async_connect_stdio(server_name, command, args, env))
+        self._run_async(
+            self._async_connect_stdio(server_name, command, args, env),
+            timeout=timeout,
+        )
 
     async def _async_connect_stdio(
         self,
@@ -467,8 +482,12 @@ class MCPClientManager:
         self._connections[server_name] = conn
         try:
             await self._stdio_initialize(conn)
-        except Exception:
+        except BaseException:
+            # asyncio cancellation (used by the connection deadline) inherits
+            # from BaseException on supported Python versions. Always terminate
+            # the process group before propagating the failure/cancellation.
             await self._async_disconnect_stdio(conn)
+            conn["connected"] = False
             raise
 
     def connect_url(
@@ -476,12 +495,20 @@ class MCPClientManager:
         server_name: str,
         url: str,
         headers: Optional[dict] = None,
+        timeout: Optional[float] = _DEFAULT_CONNECT_TIMEOUT,
     ) -> None:
         """Connect to an MCP server via Streamable HTTP (MCP 2025-03-26).
 
         Performs the MCP initialize handshake immediately and captures the
         session ID returned by the server for use in subsequent requests.
         If the server is already connected, this is a no-op.
+
+        Args:
+            server_name: unique name for this server instance.
+            url: server endpoint (e.g. ``http://localhost:8000/mcp``).
+            headers: optional HTTP headers sent with every request.
+            timeout: max seconds to wait for the handshake (connect + read).
+                     Defaults to 30 seconds; ``None`` disables the deadline.
         """
         if server_name in self._connections:
             if self._connections[server_name].get("connected"):
@@ -499,7 +526,7 @@ class MCPClientManager:
         }
         self._connections[server_name] = conn
         try:
-            self._http_initialize(conn)
+            self._http_initialize(conn, timeout=timeout)
         except Exception:
             conn["connected"] = False
             raise
@@ -508,19 +535,23 @@ class MCPClientManager:
     # Public API: get_tools, call_tool
     # ------------------------------------------------------------------
 
-    def get_tools(self, server_name: str) -> list:
+    def get_tools(self, server_name: str, timeout: Optional[float] = None) -> list:
         """Retrieve the list of tools from an MCP server.
 
         Reconnects automatically if the process was reaped due to idle timeout.
+        When *timeout* is provided, it caps the tools/list exchange.
         """
         conn = self._ensure_connected(server_name)
         if conn.get("tools_cache") is not None:
             return list(conn["tools_cache"])
         request = self._build_jsonrpc("tools/list")
         if conn["type"] == "stdio":
-            response = self._run_async(self._stdio_send(conn, request))
+            response = self._run_async(
+                self._stdio_send(conn, request, timeout=timeout),
+                timeout=timeout,
+            )
         else:
-            response = self._http_send(conn, request)
+            response = self._http_send(conn, request, timeout=timeout)
         if "error" in response:
             raise RuntimeError(f"MCP tools/list failed: {response['error']}")
         raw_tools = response.get("result", {}).get("tools", [])

@@ -71,6 +71,7 @@ export const tools = {
   create:      (config)            => request('POST',   '/v1/tools', config),
   createMcp:   (config)            => request('POST',   '/v1/tools/mcp', config),
   createSkill: (skillDir)          => request('POST',   '/v1/tools/skill', { skill_dir: skillDir }),
+  test:        (config)            => request('POST',   '/v1/tools/test', config),
   update:      (toolId, config)    => request('PUT',    `/v1/tools/${toolId}`, config),
   delete:      (toolId)            => request('DELETE', `/v1/tools/${toolId}`),
   batchDelete: (toolIds)           => request('DELETE', '/v1/tools/batch', { tool_ids: toolIds }),
@@ -294,6 +295,11 @@ export const auth = {
   disable: () => request('POST', '/v1/auth/config', { disable_auth: true }),
   login: (password) => request('POST', '/v1/auth/login', { password }),
   logout: () => request('POST', '/v1/auth/logout', {}),
+}
+
+/** \u6784\u5efa\u4fe1\u606f API */
+export const build = {
+  info: () => request('GET', '/v1/build'),
 }
 
 /** AI代理 API */

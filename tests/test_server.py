@@ -202,6 +202,74 @@ class TestRegisterModel:
 # ------------------------------------------------------------------
 
 
+class TestToolTest:
+    def test_function_import_without_registration(self, server, runtime, tmp_path):
+        tool_file = tmp_path / "candidate_tool.py"
+        tool_file.write_text("def candidate(value=None):\n    return value\n", encoding="utf-8")
+
+        before = [t.tool_id for t in runtime._tool_registry.list_all()]
+        status, body = _post(server, "/v1/tools/test", {
+            "tool_type": "function",
+            "function_file_path": str(tool_file),
+            "function_name": "candidate",
+        })
+
+        assert status == 200
+        assert body["status"] == "ok"
+        assert body["function_name"] == "candidate"
+        assert [t.tool_id for t in runtime._tool_registry.list_all()] == before
+
+    def test_function_import_failure_without_registration(self, server, runtime, tmp_path):
+        tool_file = tmp_path / "candidate_tool.py"
+        tool_file.write_text("def other():\n    return None\n", encoding="utf-8")
+
+        before = [t.tool_id for t in runtime._tool_registry.list_all()]
+        status, body = _post(server, "/v1/tools/test", {
+            "tool_type": "function",
+            "function_file_path": str(tool_file),
+            "function_name": "missing",
+        })
+
+        assert status == 200
+        assert body["status"] == "error"
+        assert "missing" in body["error"]
+        assert [t.tool_id for t in runtime._tool_registry.list_all()] == before
+
+    def test_skill_md_exists_and_is_readable_without_registration(
+        self, server, runtime, tmp_path
+    ):
+        skill_dir = tmp_path / "candidate_skill"
+        skill_dir.mkdir()
+        skill_md = skill_dir / "SKILL.md"
+        skill_md.write_text("# Candidate skill\n", encoding="utf-8")
+
+        before = [t.tool_id for t in runtime._tool_registry.list_all()]
+        status, body = _post(server, "/v1/tools/test", {
+            "tool_type": "skill",
+            "skill_dir": str(skill_dir),
+        })
+
+        assert status == 200
+        assert body["status"] == "ok"
+        assert body["skill_md_path"] == str(skill_md)
+        assert [t.tool_id for t in runtime._tool_registry.list_all()] == before
+
+    def test_skill_md_missing_without_registration(self, server, runtime, tmp_path):
+        skill_dir = tmp_path / "candidate_skill"
+        skill_dir.mkdir()
+
+        before = [t.tool_id for t in runtime._tool_registry.list_all()]
+        status, body = _post(server, "/v1/tools/test", {
+            "tool_type": "skill",
+            "skill_dir": str(skill_dir),
+        })
+
+        assert status == 200
+        assert body["status"] == "error"
+        assert "SKILL.md" in body["error"]
+        assert [t.tool_id for t in runtime._tool_registry.list_all()] == before
+
+
 class TestRegisterTool:
     def test_register_tool(self, server, runtime):
         data = {
