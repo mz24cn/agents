@@ -57,7 +57,11 @@
   // 会话是否处于"可继续推理"状态：
   //   最后一轮为 user / assistant(带 tool_calls) / tool → 会话中断，可继续
   //   最后一轮为 assistant 且无 tool_calls（或会话为空）→ 已完成，不可继续
+  // 群聊模式不支持 "继续推理"（后端会返回 400）
+  let isGroupChat = $derived(selectedAgentIds.length > 1)
+
   let canContinue = $derived.by(() => {
+    if (isGroupChat) return false
     if (isStreaming) return false
     const msgs = messages
     if (!msgs || msgs.length === 0) return false
@@ -239,6 +243,9 @@
   // 当前工作区路径（从环境变量获取）
   let workspacePath = $state('')
   let defaultWorkspacePath = $state('')
+  // true: retain the original detailed per-message rendering;
+  // false/default: use the compact agent-block rendering.
+  let displayMessageDetails = $state(false)
   // 选中的文件列表（用于输入框）
   let selectedWorkspaceFiles = $state([])
   // 工作区是否为自定义路径（不等于默认路径，且默认路径已知）
@@ -318,6 +325,7 @@
       const resp = await envApi.list()
       const envMap = resp.env || {}
       document.title = envMap.APP_TITLE || t('appTitle')
+      displayMessageDetails = String(envMap.DISPLAY_MESSAGE_DETAILS ?? '').trim().toLowerCase() === 'true'
       
       // 处理 APP_LOGO 配置
       const logoConfig = envMap.APP_LOGO ?? ''  // 空字符串表示未配置
@@ -1399,7 +1407,9 @@
 
     <!-- Message list: hidden when terminal is visible -->
     <div class="message-list-container" class:hidden={terminalVisible}>
-      <MessageList {messages} {agentList} onRevoke={handleRevoke} onScrollAtBottom={handleScrollAtBottom} {shouldScrollToBottom} {collapsedGroups} onToggleCollapse={toggleCollapse} {fileJournalTurnKeys} {fileDiffCache} {fileDiffVisible} onToggleFileDiff={handleToggleFileDiff} />
+      {#key sessionId}
+        <MessageList {messages} {agentList} {displayMessageDetails} onRevoke={handleRevoke} onScrollAtBottom={handleScrollAtBottom} {shouldScrollToBottom} {collapsedGroups} onToggleCollapse={toggleCollapse} {fileJournalTurnKeys} {fileDiffCache} {fileDiffVisible} onToggleFileDiff={handleToggleFileDiff} />
+      {/key}
 
       <WorkspaceFileManager
         bind:open={workspacePanelOpen}

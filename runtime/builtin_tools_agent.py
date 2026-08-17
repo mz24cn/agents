@@ -210,6 +210,12 @@ def _make_delegate_fn(runtime, thread_local):
                             except Exception:
                                 pass  # SSE 写入失败不中断推理
             finally:
+                sub_journal_manager = getattr(thread_local, "file_journal_manager", None)
+                if sub_journal_manager is not None:
+                    try:
+                        sub_journal_manager.flush()
+                    except Exception as journal_err:
+                        logger.warning("delegate: failed to finalize file journal: %s", journal_err)
                 # 恢复 depth、tool_scope、session_id、session_dir 和用户消息时间戳
                 thread_local.depth = old_depth
                 thread_local.session_id = old_session_id
@@ -366,7 +372,28 @@ def _make_talk_to_fn(runtime, thread_local):
                 agents_md = build_agents_markdown(
                     all_agent_ids, agent_manager, exclude_agent_id=agent_id,
                 )
-            if system_prompt:
+
+            # 检查 template_id（提示词模板 ID+参数）
+            template_id = agent.get("template_id")
+            template_args = agent.get("template_arguments", {})
+
+            if template_id:
+                # 提示词模板方式：使用 prompt_template + arguments
+                sys_msg = Message(
+                    role="system", content="",
+                    prompt_template=template_id, arguments=template_args or {},
+                )
+                # 注入 AGENTS 和 GC_FRAMING 到 arguments 中，供模板渲染使用
+                if agents_md:
+                    if sys_msg.arguments is None:
+                        sys_msg.arguments = {}
+                    if not sys_msg.arguments.get("AGENTS"):
+                        sys_msg.arguments["AGENTS"] = agents_md
+                    _GC_FRAMING = "\n\n" + _GC_DEFAULT_PROMPT
+                    if not sys_msg.arguments.get("GC_FRAMING"):
+                        sys_msg.arguments["GC_FRAMING"] = _GC_FRAMING.replace("{{AGENTS}}\n\n", "")
+                messages.append(sys_msg)
+            elif system_prompt:
                 if agents_md:
                     gc_prompt = _GC_DEFAULT_PROMPT.replace("{{AGENTS}}", agents_md)
                     # 避免重复注入

@@ -15,7 +15,14 @@ import datetime
 import json
 import logging
 import os
+import shutil
+import sys
+import tarfile
+import tempfile
+import threading
+import urllib.error
 import urllib.parse
+import urllib.request
 import uuid
 
 from runtime.common import session_timestamp
@@ -858,9 +865,103 @@ class HandlerApiMixin:
         self._send_json_response(200, {"keys": keys})
 
     def _handle_setup_script(self) -> None:
-        """GET /v1/setup — 返回当前 agent service 的自解压安装脚本。"""
+        """GET /v1/setup -- multi-purpose endpoint.
+
+        Query parameters:
+          op=hello       Public: returns version info (frontend + backend build times).
+          op=update      Needs setup token: returns self-extracting setup script
+                         (same as when no op is given).
+          (no op)        Needs setup token: returns self-extracting setup script.
+          updated_since  Optional incremental-update parameter (any op).
+        """
+        import os
+        import datetime
+
+        # -- op=hello: public version info --
+        op = self._get_query_param("op", "")
+        if op == "hello":
+            script_dir = os.path.dirname(os.path.abspath(__file__))  # runtime/
+            project_root = os.path.dirname(script_dir)
+
+            frontend = ""
+            build_version_path = os.path.join(project_root, "web", "dist", "build_version")
+            try:
+                with open(build_version_path, "r") as f:
+                    frontend = f.read().strip()
+            except (OSError, IOError):
+                pass
+
+            runtime_dir = script_dir
+            latest_mtime: float = 0.0
+            for root, dirs, files in os.walk(runtime_dir):
+                for fn in files:
+                    if fn.endswith(".py"):
+                        path = os.path.join(root, fn)
+                        try:
+                            mtime = os.stat(path).st_mtime
+                            if mtime > latest_mtime:
+                                latest_mtime = mtime
+                        except OSError:
+                            continue
+
+            backend = ""
+            if latest_mtime > 0:
+                build_dt = datetime.datetime.fromtimestamp(latest_mtime)
+                backend = build_dt.strftime("%y%m%d_%H%M%S")
+
+            inference_active = bool(getattr(self.server, "active_streams", {})) or bool(
+                int(getattr(self.server, "active_inference_count", 0) or 0)
+            )
+            self._send_json_response(200, {
+                "frontend_build": frontend,
+                "backend_build": backend,
+                "inference_active": inference_active,
+            })
+            return
+
         env_manager = self.server.env_manager  # type: ignore[attr-defined]
         project_root = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
+        data_dir = self.server.data_dir
+
+        # ---- try parse updated_since parameter ----
+        updated_since_str = self._get_query_param("updated_since")
+        updated_since: float | None = None
+        if updated_since_str:
+            try:
+                updated_since = self._parse_updated_since(updated_since_str)
+                if updated_since <= 0:
+                    updated_since = None
+            except (ValueError, TypeError):
+                updated_since = None
+
+        # ---- incremental tar.gz branch ----
+        if updated_since is not None:
+            try:
+                tar_data = env_manager.build_incremental_tar(
+                    project_root=project_root,
+                    data_dir=data_dir,
+                    updated_since=updated_since,
+                )
+            except Exception as exc:
+                logger.exception("Failed to build incremental tar: %s", exc)
+                self._send_json_error(500, f"Failed to build incremental tar: {exc}")
+                return
+
+            if tar_data is None:
+                self.send_response(304)
+                self.end_headers()
+                return
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/gzip")
+            self.send_header("Content-Disposition", 'inline; filename="incremental.tar.gz"')
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(tar_data)))
+            self.end_headers()
+            self.wfile.write(tar_data)
+            return
+
+        # ---- full self-extracting script branch ----
         user_agent = self.headers.get("User-Agent", "")
         ua_lower = user_agent.lower()
         is_windows = "powershell" in ua_lower or "windows" in ua_lower or "pwsh" in ua_lower
@@ -868,7 +969,7 @@ class HandlerApiMixin:
         try:
             script = env_manager.build_setup_script(
                 project_root=project_root,
-                data_dir=self.server.data_dir,
+                data_dir=data_dir,
                 runtime=self.server.runtime,  # type: ignore[attr-defined]
                 prompt_template_manager=self.server.prompt_template_manager,  # type: ignore[attr-defined]
                 agent_manager=self.server.agent_manager,  # type: ignore[attr-defined]
@@ -889,6 +990,168 @@ class HandlerApiMixin:
         self.send_header("Content-Length", str(len(script)))
         self.end_headers()
         self.wfile.write(script)
+
+    def _handle_update(self) -> None:
+        """POST /v1/update -- download and apply an incremental setup package."""
+        body = self._read_json_body()
+        if body is None:
+            return
+
+        source = str(body.get("source", "")).strip()
+        updated_since = str(body.get("updated_since", "")).strip()
+        if not source:
+            self._send_json_error(400, "Missing required field: source")
+            return
+        try:
+            self._parse_updated_since(updated_since)
+        except (ValueError, TypeError):
+            self._send_json_error(400, "Invalid updated_since; expected YYMMdd_HHmmss")
+            return
+
+        # Atomically block new inference requests while checking/applying update.
+        update_lock = getattr(self.server, "inference_update_lock", None)
+        if update_lock is None:
+            self._send_json_error(500, "Update lock is unavailable")
+            return
+        with update_lock:
+            active_streams = getattr(self.server, "active_streams", {})
+            active_count = int(getattr(self.server, "active_inference_count", 0) or 0)
+            if active_streams or active_count > 0:
+                self._send_json_response(409, {
+                    "error": "inference_active",
+                    "message": "Cannot update while inference sessions are active",
+                })
+                return
+            if getattr(self.server, "update_in_progress", False):
+                self._send_json_response(409, {
+                    "error": "update_in_progress",
+                    "message": "Another update is already in progress",
+                })
+                return
+            self.server.update_in_progress = True
+
+        def release_update_lock() -> None:
+            with update_lock:
+                self.server.update_in_progress = False
+
+        parsed = urllib.parse.urlsplit(source)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            release_update_lock()
+            self._send_json_error(400, "SETUP_SOURCE must be an http(s) URL")
+            return
+
+        if "/v1/setup" in parsed.path:
+            setup_path = parsed.path
+        else:
+            setup_path = "/v1/setup"
+        query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        query = [(key, value) for key, value in query if key != "updated_since" and key != "op"]
+        query.extend([("op", "update"), ("updated_since", updated_since)])
+        update_url = urllib.parse.urlunsplit((
+            parsed.scheme,
+            parsed.netloc,
+            setup_path,
+            urllib.parse.urlencode(query),
+            "",
+        ))
+
+        project_root = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
+        try:
+            request = urllib.request.Request(update_url, headers={"User-Agent": "Agent-Service-Updater/1"})
+            with urllib.request.urlopen(request, timeout=120) as response:
+                tar_data = response.read()
+        except urllib.error.HTTPError as exc:
+            release_update_lock()
+            if exc.code == 304:
+                self._send_json_response(200, {"updated": False, "restart_backend": False})
+                return
+            self._send_json_error(502, f"Update source returned HTTP {exc.code}")
+            return
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            release_update_lock()
+            self._send_json_error(502, f"Failed to download update: {exc}")
+            return
+
+        restart_backend = False
+        updated_files: list[str] = []
+        try:
+            with tempfile.TemporaryDirectory(prefix="agent-update-") as tmp_dir:
+                archive_path = os.path.join(tmp_dir, "update.tar.gz")
+                extract_dir = os.path.join(tmp_dir, "extract")
+                os.makedirs(extract_dir, exist_ok=True)
+                with open(archive_path, "wb") as fh:
+                    fh.write(tar_data)
+
+                with tarfile.open(archive_path, mode="r:gz") as tar:
+                    members = tar.getmembers()
+                    for member in members:
+                        name = member.name.replace("\\", "/")
+                        normalized = os.path.normpath(name).replace("\\", "/")
+                        if (not name or name.startswith("/") or normalized == ".."
+                                or normalized.startswith("../") or member.issym() or member.islnk()
+                                or not (member.isdir() or member.isfile())):
+                            raise ValueError(f"Unsafe archive member: {member.name}")
+                        target = os.path.realpath(os.path.join(extract_dir, normalized))
+                        if os.path.commonpath([extract_dir, target]) != extract_dir:
+                            raise ValueError(f"Archive member escapes target: {member.name}")
+                    tar.extractall(extract_dir, members=members)
+
+                for dirpath, _dirnames, filenames in os.walk(extract_dir):
+                    for filename in filenames:
+                        source_path = os.path.join(dirpath, filename)
+                        relative = os.path.relpath(source_path, extract_dir)
+                        target_path = os.path.realpath(os.path.join(project_root, relative))
+                        if os.path.commonpath([project_root, target_path]) != project_root:
+                            raise ValueError(f"Update file escapes project root: {relative}")
+                        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                        shutil.copy2(source_path, target_path)
+                        relative_posix = relative.replace("\\", "/")
+                        updated_files.append(relative_posix)
+                        if relative_posix.endswith(".py"):
+                            restart_backend = True
+        except (OSError, tarfile.TarError, ValueError) as exc:
+            release_update_lock()
+            logger.exception("Failed to apply update: %s", exc)
+            self._send_json_error(500, f"Failed to apply update: {exc}")
+            return
+
+        # Frontend-only updates can immediately re-enable inference. If Python
+        # files changed, keep inference blocked until execv replaces the process.
+        if not restart_backend:
+            release_update_lock()
+        self._send_json_response(200, {
+            "updated": bool(updated_files),
+            "restart_backend": restart_backend,
+            "updated_files": updated_files,
+        })
+
+        if restart_backend:
+            app_path = os.path.join(project_root, "app.py")
+            argv = [sys.executable, app_path, *sys.argv[1:]]
+
+            def restart_process() -> None:
+                try:
+                    os.execv(sys.executable, argv)
+                except Exception:
+                    release_update_lock()
+                    logger.exception("Failed to restart backend after update")
+
+            timer = threading.Timer(3.0, restart_process)
+            timer.daemon = True
+            timer.start()
+
+    @staticmethod
+    def _parse_updated_since(value: str) -> float:
+        """解析 YYMMDD_hhmmss 格式为 Unix 时间戳（float）。
+
+        格式示例: 250101_120000 → 2025-01-01 12:00:00 UTC
+        """
+        value = value.strip()
+        if not value:
+            raise ValueError("empty value")
+        # 支持 YYMMDD_hhmmss 格式
+        dt = datetime.datetime.strptime(value, "%y%m%d_%H%M%S")
+        return dt.timestamp()
 
     # ------------------------------------------------------------------
     # Session handlers

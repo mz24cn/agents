@@ -10,7 +10,21 @@
   import { t } from '../../lib/i18n.svelte.js'
   import { highlight } from '../../lib/highlight.js'
 
-  let { msg, agentList = [], onRevoke, collapseButton = null, onCollapse, hasFileChanges = false, onToggleFileDiff, fileDiffData = null, fileDiffVisible = false } = $props()
+  let { msg, agentList = [], onRevoke, collapseButton = null, onCollapse, hasFileChanges = false, onToggleFileDiff, fileDiffData = null, fileDiffVisible = false, compact = false, replyDetailed = null, onToggleReplyMode } = $props()
+
+  // ── Compact mode helpers ──
+  /** Determine icon for tool result in compact mode */
+  let toolResultIcon = $derived.by(() => {
+    if (msg.role !== 'tool') return ''
+    const tc = toolContentSource
+    if (!tc) return '\u2714\uFE0F'  // empty = check mark
+    try {
+      const parsed = JSON.parse(tc)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && Object.prototype.hasOwnProperty.call(parsed, 'error')) return '\u2716\uFE0F'
+    } catch {}
+    if (/^Error:/i.test(tc.trim())) return '\u2716\uFE0F'
+    return '\u2714\uFE0F'
+  })
 
   /**
    * Detect the content type of a tool result.
@@ -109,10 +123,32 @@
   const toolResultLines = $derived((toolResultRender.displayContent ?? '').split('\n').length)
   const toolResultOverLimit = $derived(msg.role === 'tool' && toolResultLines > 5)
   // 流式期间始终展开；结束后根据行数决定
+  // 在 compact 模式下，工具结果默认折叠（只显示 ✔/✖）
   const isToolStreaming = $derived(msg.streaming === true)
-  let toolResultExpanded = $state(true)
+  let toolResultExpanded = $state(false)
+  let toolResultHoverExpanded = $state(false)
+  let toolResultHoverTimer = null
+
+  function startToolResultHover() {
+    if (toolResultExpanded || toolResultHoverTimer) return
+    toolResultHoverTimer = setTimeout(() => {
+      toolResultHoverTimer = null
+      toolResultHoverExpanded = true
+    }, 1000)
+  }
+
+  function stopToolResultHover() {
+    if (toolResultHoverTimer) clearTimeout(toolResultHoverTimer)
+    toolResultHoverTimer = null
+    toolResultHoverExpanded = false
+  }
+
+  const showToolResult = $derived(toolResultExpanded || toolResultHoverExpanded)
+
   $effect(() => {
-    if (!isToolStreaming) {
+    if (compact) {
+      toolResultExpanded = false
+    } else if (!isToolStreaming) {
       toolResultExpanded = !toolResultOverLimit
     }
   })
@@ -152,7 +188,67 @@
   }
 </script>
 
-<div class="message {msg.role}">
+<div class="message {msg.role}" class:compact>
+{#if compact}
+  <!-- ── Compact mode: lean display for reasoning-loop messages ── -->
+  {#if msg.role === 'assistant'}
+    {#if msg.thinking && typeof msg.thinking === 'string' && msg.thinking.trim().length > 0}
+      <ThinkingBlock thinking={msg.thinking} expanded={thinkingExpanded} />
+    {/if}
+    {#if msg.content}
+      <MarkdownRenderer content={msg.content} />
+    {/if}
+    {#if msg.tool_calls}
+      <ToolCallCard toolCalls={msg.tool_calls} compact={true} />
+    {/if}
+  {:else if msg.role === 'tool'}
+    {#if msg.sub_messages}
+      <!-- talk_to sub-agent messages: same rendering as normal mode -->
+      <div class="talk-to-subs">
+        {#each Object.values(msg.sub_messages) as sm}
+          <div class="talk-to-sub" class:streaming={sm.streaming}>
+            {#if sm.streaming}
+              <span class="talk-to-sub-badge">⏳</span>
+            {/if}
+            {#if sm.content}
+              {@const prefix = '**' + (sm.agent_nickname || sm.agent_id) + '** (' + sm.agent_id + '): '}
+              <MarkdownRenderer content={prefix + (sm.content || '')} />
+            {/if}
+          </div>
+        {/each}
+      </div>
+    {:else}
+    <!-- Tool result compact: show ✔/✖ click to expand -->
+    <div class="compact-tool-result-wrap" role="group" onmouseenter={startToolResultHover} onmouseleave={stopToolResultHover}>
+      <button class="compact-tool-result" title={toolResultExpanded ? t('collapseResult') : t('expandResult')} aria-label={toolResultExpanded ? t('collapseResult') : t('expandResult')} onclick={() => toolResultExpanded = !toolResultExpanded}>
+        <span class="compact-result-icon">{toolResultIcon}</span>
+      </button>
+      {#if showToolResult}
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <div class="tool-result-block" ondblclick={() => toolResultExpanded = !toolResultExpanded}>
+        {#if toolResultRender.html}
+          <div class="code-block tool-result-code">
+            {#if toolResultRender.lang}<span class="code-lang">{toolResultRender.lang.toUpperCase()}</span>{/if}
+            <pre><code class="language-{toolResultRender.lang}">{@html toolResultRender.html}</code></pre>
+          </div>
+        {:else}
+          <div class="tool-result-markdown"><MarkdownRenderer content={toolResultRender.displayContent} /></div>
+        {/if}
+        </div>
+      {/if}
+    </div>
+    {/if}
+  {:else}
+    <!-- fallback for other roles in compact mode -->
+    <div class="role-label">
+      <span>{msg.role}</span>
+    </div>
+    {#if msg.content}
+      <MarkdownRenderer content={msg.content} />
+    {/if}
+  {/if}
+{:else}
+  <!-- ── Normal (non-compact) display ── -->
   <div class="role-label">
     {#if msg.role === 'user'}
       <span>{t('roleUser')}</span>
@@ -191,6 +287,11 @@
           <span class="token-stats" title={buildStatTooltip(msg.stat)}>
             {msg.stat.prompt_tokens >= 10000 ? `${(msg.stat.prompt_tokens/1000).toFixed(1)}k` : msg.stat.prompt_tokens}/{msg.stat.completion_tokens >= 10000 ? `${(msg.stat.completion_tokens/1000).toFixed(1)}k` : msg.stat.completion_tokens} tokens
           </span>
+        {/if}
+        {#if onToggleReplyMode && replyDetailed !== null}
+          <button class="toggle-btn" onclick={onToggleReplyMode}>
+            {replyDetailed ? t('compactReply') : t('detailedReply')}
+          </button>
         {/if}
         {#if collapseButton === 'collapse' || collapseButton === 'expand'}
           <button class="toggle-btn" onclick={onCollapse}>
@@ -275,6 +376,7 @@
       {/if}
     {:else if msg.role === 'tool'}
       {#if !msg.sub_messages}
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div class="tool-result-block" ondblclick={() => toolResultExpanded = !toolResultExpanded}>
         {#if toolResultRender.html}
           {#if toolResultExpanded}
@@ -328,6 +430,7 @@
   {#if msg.audio}
     <AudioPlayer audio={msg.audio} />
   {/if}
+{/if}
 </div>
 
 {#if msg.role === 'user' && fileDiffVisible && fileDiffData?.files}
@@ -352,6 +455,13 @@
     border: 1px solid var(--border);
     color: var(--text);
   }
+  .message.assistant.compact {
+    display: contents;
+    background: none;
+    border: none;
+    padding: 0;
+    max-width: 100%;
+  }
   .message.system {
     align-self: center;
     background: var(--bg-secondary);
@@ -367,6 +477,36 @@
     color: var(--text);
     font-size: 0.85rem;
     width: 85%;
+  }
+  .message.tool.compact {
+    display: contents;
+    background: none;
+    border: none;
+    padding: 0;
+    width: auto;
+    font-size: 0.85rem;
+  }
+
+  /* Compact assistant messages participate in one inline text flow. Ordinary
+     paragraphs stay inline so a following tool badge/result can share the
+     same line; explicit paragraph boundaries still produce a line break. */
+  .message.compact :global(.markdown-content) {
+    display: inline;
+  }
+  .message.compact :global(.markdown-content p) {
+    display: inline;
+    margin: 0;
+  }
+  .message.compact :global(.markdown-content p + p)::before {
+    content: '\A';
+    white-space: pre;
+  }
+  .message.compact :global(.markdown-content ul),
+  .message.compact :global(.markdown-content ol),
+  .message.compact :global(.markdown-content blockquote),
+  .message.compact :global(.markdown-content table),
+  .message.compact :global(.markdown-content .code-block) {
+    display: block;
   }
   .role-label {
     display: flex;
@@ -480,6 +620,7 @@
     background: rgba(255,255,255,0.4);
     color: #fff;
   }
+  .reply-mode-btn,
   .revoke-btn {
     padding: 2px 8px;
     font-size: 0.75rem;
@@ -492,6 +633,10 @@
     line-height: 1.4;
     white-space: nowrap;
     transition: background 0.1s;
+  }
+  .reply-mode-btn:hover {
+    color: #fff;
+    background: rgba(255,255,255,0.25);
   }
   .revoke-btn:hover {
     color: #fff;
@@ -569,6 +714,35 @@
   .tool-result-markdown.preview-fade {
     -webkit-mask-image: linear-gradient(to bottom, black 60%, transparent 100%);
     mask-image: linear-gradient(to bottom, black 60%, transparent 100%);
+  }
+
+  /* Compact mode tool result */
+  .compact-tool-result-wrap {
+    display: inline;
+  }
+  .compact-tool-result {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 1px 8px;
+    font-size: 0.78rem;
+    background: var(--bg-tertiary, rgba(0,0,0,0.08));
+    border: 1px solid transparent;
+    border-radius: 12px;
+    cursor: pointer;
+    color: var(--text-secondary, #888);
+    transition: background 0.15s, border-color 0.15s;
+    line-height: 1.5;
+    font-family: inherit;
+    margin: 2px 4px 2px 0;
+  }
+  .compact-tool-result:hover {
+    background: var(--bg-secondary, rgba(0,0,0,0.12));
+    border-color: var(--border, rgba(128,128,128,0.3));
+    color: var(--text, #333);
+  }
+  .compact-result-icon {
+    font-size: 0.8rem;
   }
 
   /* Syntax highlighting for injected @html spans */

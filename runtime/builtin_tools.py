@@ -47,7 +47,7 @@ from runtime.builtin_tools_coding import (  # noqa: F401
     _search_code,
     _undo,
     _validate_path,
-    _was_terminated_by_signal,
+    _was_killed_by_abort_handler,
     _write_file,
     _write_gzip_blob,
     EDIT_FILE_TOOL_CONFIG,

@@ -4,10 +4,15 @@
   import { slide } from 'svelte/transition'
   import { getContext } from 'svelte'
   import AppLogo from '../../lib/components/AppLogo.svelte'
+  import IconDisplay from '../../lib/components/IconDisplay.svelte'
+  import CopyButton from './CopyButton.svelte'
 
-  let { messages = [], agentList = [], onRevoke, onScrollAtBottom, shouldScrollToBottom = false, collapsedGroups = new Set(), onToggleCollapse, fileJournalTurnKeys = new Set(), fileDiffVisible = new Set(), fileDiffCache = {}, onToggleFileDiff } = $props()
+  let { messages = [], agentList = [], displayMessageDetails = false, onRevoke, onScrollAtBottom, shouldScrollToBottom = false, collapsedGroups = new Set(), onToggleCollapse, fileJournalTurnKeys = new Set(), fileDiffVisible = new Set(), fileDiffCache = {}, onToggleFileDiff } = $props()
   let listEl = $state(null)
   let isAtBottom = $state(true)
+  // Ephemeral per-turn overrides. This state lives only in this keyed
+  // MessageList instance and is discarded when the session changes.
+  let replyModeOverrides = $state(new Set())
   
   // 获取 appLogoStore
   const appLogoStore = getContext('appLogoStore')
@@ -63,46 +68,140 @@
         // 是否存在中间消息（user 和 lastAssistant 之间的 tool/assistant）
         const hasIntermediate = lastAssistantIndex >= 0 && lastAssistantIndex > startIndex + 1
 
-        // 在 group 内部按 assistant_id 拆分为 agent-blocks
-        const agentBlocks = []
-        let blockStart = startIndex + 1
-        let currentAgentId = null
+        // Compact blocks: same-agent assistant/tool loops share one outer card.
+        const compactAgentBlocks = []
+        let compactStart = startIndex + 1
+        let compactAgentId = null
         for (let j = startIndex + 1; j <= endIndex; j++) {
           const m = messages[j]
-          // 获取消息所属 agent：统一使用 agent_id，向下兼容 assistant_id
+          const msgAgentId = m.agent_id || m.assistant_id || null
+          if (msgAgentId && compactAgentId && msgAgentId !== compactAgentId) {
+            compactAgentBlocks.push({ start: compactStart, end: j - 1, agentId: compactAgentId })
+            compactStart = j
+            compactAgentId = msgAgentId
+          } else if (!compactAgentId && msgAgentId) {
+            compactAgentId = msgAgentId
+          }
+        }
+        if (compactStart <= endIndex) {
+          compactAgentBlocks.push({ start: compactStart, end: endIndex, agentId: compactAgentId })
+        }
+
+        // Detailed blocks preserve the old behavior: each assistant message starts
+        // a new visual block and its following tool messages stay with it.
+        const detailedAgentBlocks = []
+        let detailedStart = startIndex + 1
+        let detailedAgentId = null
+        for (let j = startIndex + 1; j <= endIndex; j++) {
+          const m = messages[j]
           const msgAgentId = m.agent_id || m.assistant_id || null
           if (m.role === 'assistant') {
-            // 新的 assistant 消息开始一个新的 agent-block
-            if (blockStart < j) {
-              agentBlocks.push({ start: blockStart, end: j - 1, agentId: currentAgentId })
-            }
-            blockStart = j
-            currentAgentId = msgAgentId
+            if (detailedStart < j) detailedAgentBlocks.push({ start: detailedStart, end: j - 1, agentId: detailedAgentId })
+            detailedStart = j
+            detailedAgentId = msgAgentId
           } else if (m.role === 'tool') {
-            // tool 消息属于当前 agent-block；如果 agent_id 变了也切分
-            if (msgAgentId && currentAgentId && msgAgentId !== currentAgentId) {
-              agentBlocks.push({ start: blockStart, end: j - 1, agentId: currentAgentId })
-              blockStart = j
-              currentAgentId = msgAgentId
-            } else if (!currentAgentId && msgAgentId) {
-              currentAgentId = msgAgentId
+            if (msgAgentId && detailedAgentId && msgAgentId !== detailedAgentId) {
+              detailedAgentBlocks.push({ start: detailedStart, end: j - 1, agentId: detailedAgentId })
+              detailedStart = j
+              detailedAgentId = msgAgentId
+            } else if (!detailedAgentId && msgAgentId) {
+              detailedAgentId = msgAgentId
             }
           }
         }
-        if (blockStart <= endIndex) {
-          agentBlocks.push({ start: blockStart, end: endIndex, agentId: currentAgentId })
+        if (detailedStart <= endIndex) {
+          detailedAgentBlocks.push({ start: detailedStart, end: endIndex, agentId: detailedAgentId })
         }
 
-        result.push({ startIndex, endIndex, lastAssistantIndex, isCollapsed, hasIntermediate, agentBlocks })
+        result.push({ startIndex, endIndex, lastAssistantIndex, isCollapsed, hasIntermediate, compactAgentBlocks, detailedAgentBlocks })
         i = endIndex + 1
       } else {
         // 非 user 消息（如 system 消息）单独处理，不折叠
-        result.push({ startIndex: i, endIndex: i, lastAssistantIndex: -1, isCollapsed: false, hasIntermediate: false, ungrouped: true })
+        result.push({ startIndex: i, endIndex: i, lastAssistantIndex: -1, isCollapsed: false, hasIntermediate: false, compactAgentBlocks: [], detailedAgentBlocks: [], ungrouped: true })
         i++
       }
     }
     return result
   })
+
+  function isGroupDetailed(startIndex) {
+    return replyModeOverrides.has(startIndex) ? !displayMessageDetails : displayMessageDetails
+  }
+
+  function toggleReplyMode(startIndex) {
+    const targetDetailed = !isGroupDetailed(startIndex)
+    const next = new Set(replyModeOverrides)
+    if (next.has(startIndex)) next.delete(startIndex)
+    else next.add(startIndex)
+    replyModeOverrides = next
+    // Switching to detailed view should immediately reveal the whole turn,
+    // even if it had previously been auto-collapsed.
+    if (targetDetailed && collapsedGroups.has(startIndex) && onToggleCollapse) {
+      onToggleCollapse(startIndex)
+    }
+  }
+
+  function getBlockAgent(block) {
+    if (!block?.agentId) return null
+    return agentList.find(a => a.agent_id === block.agentId) || null
+  }
+
+  function getBlockName(block) {
+    const agent = getBlockAgent(block)
+    if (agent?.nickname) return agent.nickname
+    const firstAssistant = messages.slice(block.start, block.end + 1).find(m => m.role === 'assistant')
+    return firstAssistant?.agent_nickname || firstAssistant?.name || t('roleAssistant')
+  }
+
+  function getBlockStat(block) {
+    for (let i = block.end; i >= block.start; i--) {
+      if (messages[i]?.role === 'assistant' && messages[i]?.stat) return messages[i].stat
+    }
+    return null
+  }
+
+  function formatTokenCount(n) {
+    return n >= 10000 ? `${(n / 1000).toFixed(1)}k` : `${n ?? 0}`
+  }
+
+  function buildBlockStatTooltip(s) {
+    const fmtMs = (n) => n == null ? 'N/A' : n >= 10000 ? `${(n / 1000).toFixed(1)}s` : `${n}ms`
+    const lines = [
+      `${t('tokenIn')} ${formatTokenCount(s.prompt_tokens)}   ${t('tokenOut')} ${formatTokenCount(s.completion_tokens)}   ${t('tokenTotal')} ${formatTokenCount(s.total_tokens)}`
+    ]
+    if (s.total_prompt_tokens !== s.prompt_tokens || s.total_completion_tokens !== s.completion_tokens) {
+      lines.push(`${t('tokenCumIn')} ${formatTokenCount(s.total_prompt_tokens)}   ${t('tokenCumOut')} ${formatTokenCount(s.total_completion_tokens)}   ${t('tokenCumTotal')} ${formatTokenCount(s.total_all_tokens)}`)
+    }
+    if (s.ttft_ms != null) lines.push(`${t('statTtft')} ${fmtMs(s.ttft_ms)}`)
+    if (s.net_ms != null) lines.push(`${t('statNet')} ${fmtMs(s.net_ms)}`)
+    if (s.total_ms != null) lines.push(`${t('statRound')} ${fmtMs(s.total_ms)}`)
+    if (s.overall_ms != null) lines.push(`${t('statOverall')} ${fmtMs(s.overall_ms)}`)
+    return lines.join('\n')
+  }
+
+  function isToolError(content) {
+    const text = String(content ?? '')
+    try {
+      const parsed = JSON.parse(text)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && Object.prototype.hasOwnProperty.call(parsed, 'error')) return true
+    } catch {}
+    return /^Error:/i.test(text.trim())
+  }
+
+  function getBlockCopyText(block) {
+    const parts = []
+    for (let i = block.start; i <= block.end; i++) {
+      const msg = messages[i]
+      if (!msg) continue
+      if (msg.role === 'assistant') {
+        if (msg.content) parts.push(msg.content)
+        for (const tc of msg.tool_calls || []) parts.push(`🛠️${tc.name ?? t('unknownTool')}`)
+      } else if (msg.role === 'tool') {
+        parts.push(isToolError(msg.content) ? '✖️' : '✔️')
+      }
+    }
+    return parts.join(' ')
+  }
 
   function toggleCollapse(startIndex) {
     if (!listEl) {
@@ -165,6 +264,7 @@
         <MessageBubble msg={messages[group.startIndex]} {agentList} {onRevoke} />
       {:else}
         {@const userMsg = messages[group.startIndex]}
+        {@const groupDetailed = isGroupDetailed(group.startIndex)}
         <div class="group" class:collapsed={group.isCollapsed} data-start-index={group.startIndex}>
           <!-- user 消息始终显示 -->
           <MessageBubble
@@ -177,9 +277,10 @@
             onToggleFileDiff={userMsg.timestamp ? () => onToggleFileDiff(userMsg.timestamp) : undefined}
           />
 
-          {#if !group.isCollapsed}
-            {#each group.agentBlocks as block (block.start)}
-              <div class="agent-block">
+          {#if groupDetailed && !group.isCollapsed}
+            <!-- Detailed mode: preserve the original per-message cards and execution folding. -->
+            {#each group.detailedAgentBlocks as block (block.start)}
+              <div class="agent-block detailed">
                 {#each Array.from({ length: block.end - block.start + 1 }) as _, offset}
                   {@const msgIndex = block.start + offset}
                   {@const msg = messages[msgIndex]}
@@ -190,7 +291,9 @@
                         {msg}
                         {agentList}
                         {onRevoke}
-                        collapseButton={group.hasIntermediate ? (group.isCollapsed ? 'expand' : 'collapse') : null}
+                        replyDetailed={true}
+                        onToggleReplyMode={() => toggleReplyMode(group.startIndex)}
+                        collapseButton={group.hasIntermediate ? 'collapse' : null}
                         onCollapse={group.hasIntermediate ? () => toggleCollapse(group.startIndex) : undefined}
                       />
                     </div>
@@ -202,6 +305,37 @@
                 {/each}
               </div>
             {/each}
+          {:else if !groupDetailed}
+            <!-- Compact mode: one assistant-style card per continuous agent block. -->
+            {#each group.compactAgentBlocks as block (block.start)}
+              {@const blockAgent = getBlockAgent(block)}
+              {@const blockStat = getBlockStat(block)}
+              <div class="agent-block compact" data-anchor={group.startIndex}>
+                <div class="agent-block-label">
+                  {#if blockAgent}
+                    <IconDisplay value={blockAgent.avatar || '🤖'} size={18} />
+                  {/if}
+                  <span>{getBlockName(block)}</span>
+                  <div class="agent-block-actions">
+                    {#if blockStat}
+                      <span class="agent-block-tokens" title={buildBlockStatTooltip(blockStat)}>
+                        {formatTokenCount(blockStat.prompt_tokens)}/{formatTokenCount(blockStat.completion_tokens)} tokens
+                      </span>
+                    {/if}
+                    {#if block.end === group.endIndex}
+                      <button class="agent-block-mode-btn" onclick={() => toggleReplyMode(group.startIndex)}>{t('detailedReply')}</button>
+                    {/if}
+                    <CopyButton getText={() => getBlockCopyText(block)} />
+                  </div>
+                </div>
+                <div class="agent-block-content">
+                  {#each Array.from({ length: block.end - block.start + 1 }) as _, offset}
+                    {@const msg = messages[block.start + offset]}
+                    <MessageBubble {msg} {agentList} {onRevoke} compact={true} />
+                  {/each}
+                </div>
+              </div>
+            {/each}
           {:else}
             <!-- 折叠状态：只显示最后一条 assistant 消息 -->
             {#if group.lastAssistantIndex >= 0}
@@ -211,6 +345,8 @@
                   {msg}
                   {agentList}
                   {onRevoke}
+                  replyDetailed={true}
+                  onToggleReplyMode={() => toggleReplyMode(group.startIndex)}
                   collapseButton={group.hasIntermediate ? 'expand' : null}
                   onCollapse={group.hasIntermediate ? () => toggleCollapse(group.startIndex) : undefined}
                 />
@@ -266,10 +402,74 @@
     gap: 12px;
   }
 
-  /* Agent block: 逻辑分组容器（视觉不可见），将同一 agent 的 assistant + tool 消息聚拢 */
-  .agent-block {
+  /* Detailed mode keeps the original, visually invisible grouping container. */
+  .agent-block.detailed {
     display: flex;
     flex-direction: column;
     gap: 8px;
+  }
+
+  /* Compact mode: one assistant-style card for the complete continuous
+     assistant/tool loop of the same agent. */
+  .agent-block.compact {
+    align-self: flex-start;
+    box-sizing: border-box;
+    width: min(85%, 100%);
+    padding: 10px 14px;
+    border-radius: 8px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    color: var(--text);
+  }
+  .agent-block-label {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-bottom: 4px;
+    font-size: 0.9rem;
+    font-weight: 600;
+    opacity: 0.8;
+  }
+  .agent-block-actions {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: auto;
+  }
+  .agent-block-mode-btn {
+    padding: 2px 8px;
+    font-family: inherit;
+    font-size: 0.75rem;
+    font-weight: 400;
+    color: var(--text-secondary, #888);
+    background: var(--bg-tertiary, rgba(0,0,0,0.15));
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    letter-spacing: 0.05em;
+    line-height: 1.4;
+    white-space: nowrap;
+    transition: background 0.1s;
+  }
+  .agent-block-mode-btn:hover {
+    background: var(--bg-secondary, rgba(0,0,0,0.2));
+    color: var(--text, #333);
+  }
+  .agent-block-mode-btn:active {
+    background: var(--primary, #4a9eff);
+    color: #fff;
+  }
+  .agent-block-tokens {
+    color: var(--text-secondary, #888);
+    font-size: 0.75rem;
+    font-weight: 600;
+    white-space: nowrap;
+    letter-spacing: 0.02em;
+    opacity: 0.75;
+  }
+  .agent-block-content {
+    display: block;
+    min-width: 0;
+    line-height: 1.6;
   }
 </style>

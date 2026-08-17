@@ -1,11 +1,8 @@
 <script>
   import { onMount } from 'svelte'
-  import { auth, build } from '../../lib/api.js'
+  import { auth, build, env, subscribeSessionEvents } from '../../lib/api.js'
   import { copyToClipboard } from '../../lib/clipboard.js'
   import { t } from '../../lib/i18n.svelte.js'
-
-  /** @type {string} Injected at build time by Vite (YYMMdd_HHmmss) */
-  const frontendBuild = typeof __BUILD_TIME__ !== 'undefined' ? __BUILD_TIME__ : ''
 
   const ttlOptions = [
     { value: 3600, labelKey: 'authTtl1Hour' },
@@ -29,12 +26,24 @@
   let apiKey = $state('')
   let setupToken = $state('')
   let setupTokenExpiresAt = $state('')
-  let backendBuild = $state('')
+  let frontend = $state('')
+  let backend = $state('')
+  let setupSource = $state('')
+  let remoteFrontend = $state('')
+  let remoteBackend = $state('')
+  let updateTimestamp = $state('')
+  let inferenceActive = $state(false)
+  let checkingUpdate = $state(false)
+  let applyingUpdate = $state(false)
+  let updateMessage = $state('')
+  let updateError = $state('')
 
   let setupLink = $derived(`${window.location.origin}/v1/setup${setupToken ? `?token=${encodeURIComponent(setupToken)}` : ''}`)
   let windowsSetupCommand = $derived(`irm ${setupLink} | iex`)
   let linuxSetupCommand = $derived(`curl -fsSL ${setupLink} | sh`)
   let setupTokenExpiresDisplay = $derived(formatSetupTokenExpiresAt(setupTokenExpiresAt))
+  let canCheckUpdate = $derived(!!setupSource.trim() && !checkingUpdate && !applyingUpdate)
+  let canApplyUpdate = $derived(!!updateTimestamp && !inferenceActive && !checkingUpdate && !applyingUpdate)
 
   function pad2(value) {
     return String(value).padStart(2, '0')
@@ -73,14 +82,106 @@
   onMount(() => {
     loadConfig()
     loadBuildInfo()
+    loadSetupSource()
+    const unsubscribe = subscribeSessionEvents(
+      (event) => {
+        if (event.event === 'init') {
+          inferenceActive = Object.values(event.sessions || {}).some((status) => status === 'streaming')
+        } else if (event.event === 'message') {
+          if (event.status === 'streaming') {
+            inferenceActive = true
+          } else {
+            // Re-read authoritative state; another session may still be running.
+            loadBuildInfo()
+          }
+        }
+      },
+      () => {},
+    )
+    return unsubscribe
   })
 
   async function loadBuildInfo() {
     try {
       const data = await build.info()
-      backendBuild = data.backend_build || ''
+      frontend = data.frontend_build || ''
+      backend = data.backend_build || ''
+      inferenceActive = !!data.inference_active
     } catch {
-      // ignore \u2014 backendBuild stays empty
+      // ignore
+    }
+  }
+
+  async function loadSetupSource() {
+    try {
+      const data = await env.list()
+      setupSource = data?.env?.SETUP_SOURCE || ''
+    } catch {
+      // keep empty
+    }
+  }
+
+  function buildHelloUrl(source) {
+    const url = new URL(source.trim())
+    url.pathname = '/v1/setup'
+    url.search = ''
+    url.hash = ''
+    url.searchParams.set('op', 'hello')
+    return url.toString()
+  }
+
+  async function checkUpdate() {
+    checkingUpdate = true
+    updateError = ''
+    updateMessage = ''
+    remoteFrontend = ''
+    remoteBackend = ''
+    updateTimestamp = ''
+    try {
+      const response = await fetch(buildHelloUrl(setupSource), { cache: 'no-store' })
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      const data = await response.json()
+      remoteFrontend = data.frontend_build || ''
+      remoteBackend = data.backend_build || ''
+      const candidates = []
+      if (remoteFrontend && remoteFrontend > frontend) candidates.push(remoteFrontend)
+      if (remoteBackend && remoteBackend > backend) candidates.push(remoteBackend)
+      updateTimestamp = candidates.sort().at(-1) || ''
+      const current = await build.info()
+      inferenceActive = !!current.inference_active
+      if (!updateTimestamp) {
+        updateMessage = t('updateAlreadyLatest')
+      } else if (inferenceActive) {
+        updateMessage = t('updateAvailableButBusy')
+      } else {
+        updateMessage = t('updateAvailable', { version: updateTimestamp })
+      }
+    } catch (err) {
+      updateError = t('checkUpdateFailed', { error: err?.message || err })
+    } finally {
+      checkingUpdate = false
+    }
+  }
+
+  async function applyUpdate() {
+    applyingUpdate = true
+    updateError = ''
+    updateMessage = t('updateApplying')
+    try {
+      const data = await build.update(setupSource.trim(), updateTimestamp)
+      if (!data.updated) {
+        updateMessage = t('updateNoFiles')
+        return
+      }
+      updateMessage = data.restart_backend ? t('updateRestarting') : t('updateRefreshing')
+      window.setTimeout(() => window.location.reload(), data.restart_backend ? 10000 : 0)
+    } catch (err) {
+      updateError = err?.code === 'inference_active'
+        ? t('updateInferenceActive')
+        : t('updateFailed', { error: err?.message || err })
+      await loadBuildInfo()
+    } finally {
+      applyingUpdate = false
     }
   }
 
@@ -211,29 +312,59 @@
 
       <div class="settings-stack">
 
-        {#if frontendBuild || backendBuild}
-          <section class="card build-card">
-            <div class="card-header compact">
-              <div>
-                <h3>Build version</h3>
+        <section class="card build-card">
+          <div class="card-header compact">
+            <div>
+              <h3>{t('buildVersionTitle')}</h3>
+            </div>
+          </div>
+          <div class="build-content">
+            <div class="build-versions">
+              <div class="build-row">
+                <span class="build-label">{t('buildFrontend')}</span>
+                <code class="build-value">{frontend || '-'}</code>
+              </div>
+              <div class="build-row">
+                <span class="build-label">{t('buildBackend')}</span>
+                <code class="build-value">{backend || '-'}</code>
               </div>
             </div>
-            <div class="build-versions">
-              {#if frontendBuild}
-                <div class="build-row">
-                  <span class="build-label">Frontend</span>
-                  <code class="build-value">{frontendBuild}</code>
+            <div class="update-panel">
+              <div class="update-controls">
+                <input
+                  aria-label="SETUP_SOURCE"
+                  placeholder={t('setupSourcePlaceholder')}
+                  bind:value={setupSource}
+                  oninput={() => {
+                    remoteFrontend = ''
+                    remoteBackend = ''
+                    updateTimestamp = ''
+                    updateMessage = ''
+                    updateError = ''
+                  }}
+                />
+                <button class="btn btn-secondary" type="button" onclick={checkUpdate} disabled={!canCheckUpdate}>
+                  {checkingUpdate ? t('checkingUpdate') : t('checkUpdate')}
+                </button>
+                <button class="btn btn-primary" type="button" onclick={applyUpdate} disabled={!canApplyUpdate}>
+                  {applyingUpdate ? t('applyingUpdate') : t('applyUpdate')}
+                </button>
+              </div>
+              {#if remoteFrontend || remoteBackend}
+                <div class="remote-builds">
+                  <span>{t('remoteFrontend')} <code>{remoteFrontend || '-'}</code></span>
+                  <span>{t('remoteBackend')} <code>{remoteBackend || '-'}</code></span>
                 </div>
               {/if}
-              {#if backendBuild}
-                <div class="build-row">
-                  <span class="build-label">Backend</span>
-                  <code class="build-value">{backendBuild}</code>
-                </div>
+              {#if updateMessage}
+                <div class="hint">{updateMessage}</div>
+              {/if}
+              {#if updateError}
+                <div class="hint update-error">{updateError}</div>
               {/if}
             </div>
-          </section>
-        {/if}
+          </div>
+        </section>
 
         <section class="card main-card">
           <div class="card-header compact">
@@ -591,6 +722,12 @@
     padding: 16px;
     box-shadow: 0 1px 0 rgba(0,0,0,0.02);
   }
+  .build-content {
+    display: grid;
+    grid-template-columns: 190px minmax(0, 1fr);
+    gap: 18px;
+    align-items: start;
+  }
   .build-versions {
     display: flex;
     flex-direction: column;
@@ -614,5 +751,35 @@
     background: var(--bg-secondary);
     padding: 3px 8px;
     border-radius: 4px;
+  }
+  .update-panel {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .update-controls {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    gap: 8px;
+  }
+  .remote-builds {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 18px;
+    color: var(--text-secondary);
+    font-size: 0.84rem;
+  }
+  .remote-builds code {
+    color: var(--text);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  }
+  .update-error {
+    color: var(--danger);
+  }
+  @media (max-width: 720px) {
+    .build-content, .update-controls {
+      grid-template-columns: 1fr;
+    }
   }
 </style>

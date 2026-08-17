@@ -12,17 +12,22 @@ Design:
     resolve_mentions()   — map mention strings to agent_ids
     assemble_agent_context() — build per-agent inference context with
                                 delayed-visibility markers
-    run_group_chat_stream()  — parallel multi-agent orchestration
+    run_group_chat_stream()  — parallel multi-agent orchestration (returns list)
+    run_group_chat_stream_gen()  — generator version of the above (yields messages)
+
+The generator version (run_group_chat_stream_gen) is the future; the list
+version is kept for backward compatibility during the transition.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import queue
 import re
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from typing import Optional
+from typing import Generator, Optional
 
 from runtime.common import set_request_context
 from runtime.models import Message, InferenceRequest
@@ -312,7 +317,7 @@ def _normalize_for_model(messages: list[Message], agent_id: str) -> list[Message
     for msg in messages:
         raw_role = msg.role
 
-        # ── Resolve effective role ──────────────────────────────────
+        # ── Resolve effective role ────────────────────────────────────────
         if raw_role == "assistant":
             last_asst_self = (getattr(msg, "agent_id", None) == agent_id)
             if last_asst_self:
@@ -329,7 +334,7 @@ def _normalize_for_model(messages: list[Message], agent_id: str) -> list[Message
         else:
             effective_role = raw_role
 
-        # ── system ────────────────────────────────────────────────
+        # ── system ─────────────────────────────────────────────────────────
         if effective_role == "system":
             if normalized and normalized[-1].role == "system":
                 prev = normalized[-1]
@@ -345,7 +350,7 @@ def _normalize_for_model(messages: list[Message], agent_id: str) -> list[Message
             else:
                 normalized.append(msg)
 
-        # ── assistant (THIS agent only) ───────────────────────────
+        # ── assistant (THIS agent only) ───────────────────────────────────
         elif effective_role == "assistant":
             # Consecutive self-assistants are OK and get merged
             if normalized and normalized[-1].role == "assistant":
@@ -359,7 +364,7 @@ def _normalize_for_model(messages: list[Message], agent_id: str) -> list[Message
             else:
                 normalized.append(msg)
 
-        # ── user (real users + other-agent output + other-agent tools) ──
+        # ── user (real users + other-agent output + other-agent tools) ───
         elif effective_role == "user":
             if raw_role == "assistant":
                 # Other agent's output — tag with identity
@@ -399,11 +404,103 @@ def _normalize_for_model(messages: list[Message], agent_id: str) -> list[Message
             else:
                 normalized.append(Message(role="user", content=content))
 
-        # ── tool (THIS agent's own tool result) ───────────────────
+        # ── tool (THIS agent's own tool result) ─────────────────────────
         else:
             normalized.append(msg)
 
     return normalized
+
+
+def _build_agent_system_messages(
+    agent: dict,
+    agent_id: str,
+    agents_markdown: str,
+    promoted_turn: Optional[object],
+    summary_text: str,
+    memory_entries: Optional[list],
+) -> list[Message]:
+    """Build system messages for a single agent in a group chat.
+
+    Extracted from assemble_agent_context to support both list and generator
+    paths with the same logic.
+    """
+    messages: list[Message] = []
+
+    # Group-chat framing (prepend "\n\n" when merging with agent prompt).
+    _GC_FRAMING = "\n\n" + _GC_DEFAULT_PROMPT
+
+    sys_prompt: str = agent.get("system_prompt", "")
+    template_id = agent.get("template_id")
+    template_args = agent.get("template_arguments", {})
+
+    if template_id:
+        messages.append(Message(
+            role="system", content="",
+            prompt_template=template_id, arguments=template_args or {},
+        ))
+        if agents_markdown:
+            sys_msg = messages[-1]
+            if sys_msg.arguments is None:
+                sys_msg.arguments = {}
+            if not sys_msg.arguments.get("AGENTS"):
+                sys_msg.arguments["AGENTS"] = agents_markdown
+            if not sys_msg.arguments.get("GC_FRAMING"):
+                sys_msg.arguments["GC_FRAMING"] = _GC_FRAMING.replace("{{AGENTS}}\n\n", "")
+    elif sys_prompt:
+        if agents_markdown:
+            merged = sys_prompt + _GC_FRAMING
+            messages.append(Message(role="system", content=merged))
+        else:
+            messages.append(Message(role="system", content=sys_prompt))
+    elif promoted_turn is not None:
+        sys_content = _message_from_turn(promoted_turn).content
+        messages.append(Message(role="system", content=sys_content))
+    elif agents_markdown:
+        messages.append(Message(role="system", content=_GC_DEFAULT_PROMPT))
+
+    # 1b. Inject AGENTS table into the system message (plain-text path only)
+    if agents_markdown:
+        if messages and messages[-1].role == "system" and not messages[-1].prompt_template:
+            sys_msg = messages[-1]
+            content = sys_msg.content or ""
+            if "{{AGENTS}}" in content:
+                sys_msg.content = content.replace("{{AGENTS}}", agents_markdown)
+        elif not messages:
+            messages.append(Message(
+                role="system", content=agents_markdown,
+            ))
+
+    # 1c. Inject rolling summary and structured memory
+    has_summary = bool(summary_text.strip()) if summary_text else False
+    has_memory = bool(memory_entries) if memory_entries else False
+    if has_summary or has_memory:
+        extra_parts: list[str] = []
+        if has_summary:
+            extra_parts.append(f"## Summary\n{summary_text}")
+        if has_memory:
+            memory_lines = [
+                f"{entry.entry_type}: {entry.content}"
+                for entry in memory_entries
+            ]
+            extra_parts.append("## Memory\n" + "\n".join(memory_lines))
+        extra_block = "\n\n".join(extra_parts)
+
+        if messages and messages[-1].role == "system":
+            sys_msg = messages[-1]
+            if sys_msg.prompt_template:
+                if sys_msg.arguments is None:
+                    sys_msg.arguments = {}
+                existing_framing = sys_msg.arguments.get("GC_FRAMING", "")
+                sys_msg.arguments["GC_FRAMING"] = (
+                    existing_framing + "\n\n" + extra_block
+                    if existing_framing else extra_block
+                )
+            else:
+                sys_msg.content = (sys_msg.content or "") + "\n\n" + extra_block
+        else:
+            messages.insert(0, Message(role="system", content=extra_block))
+
+    return messages
 
 
 def assemble_agent_context(
@@ -442,9 +539,6 @@ def assemble_agent_context(
     """
     messages: list[Message] = []
 
-    # Group-chat framing (prepend "\n\n" when merging with agent prompt).
-    _GC_FRAMING = "\n\n" + _GC_DEFAULT_PROMPT
-
     # 0. Detect a persisted group-chat system message in the turns *before*
     #    we build the agent system prompt, so we can always skip it during
     #    turn replay regardless of whether the agent has its own system_prompt.
@@ -458,98 +552,13 @@ def assemble_agent_context(
                 break
 
     # 1. Agent's own system prompt (merged with group-chat framing when both exist)
-    sys_prompt: str = agent.get("system_prompt", "")
-    template_id = agent.get("template_id")
-    template_args = agent.get("template_arguments", {})
+    messages = _build_agent_system_messages(
+        agent, agent_id, agents_markdown, promoted_turn,
+        summary_text, memory_entries,
+    )
 
-    if template_id:
-        messages.append(Message(
-            role="system", content="",
-            prompt_template=template_id, arguments=template_args or {},
-        ))
-        # Template-based: inject AGENTS via arguments so {{AGENTS}} is rendered
-        if agents_markdown:
-            sys_msg = messages[-1]
-            if sys_msg.arguments is None:
-                sys_msg.arguments = {}
-            if not sys_msg.arguments.get("AGENTS"):
-                sys_msg.arguments["AGENTS"] = agents_markdown
-            # Also inject the framing text (minus {{AGENTS}} which goes via arguments)
-            if not sys_msg.arguments.get("GC_FRAMING"):
-                sys_msg.arguments["GC_FRAMING"] = _GC_FRAMING.replace("{{AGENTS}}\n\n", "")
-    elif sys_prompt:
-        # Merge agent prompt + group-chat framing ({{AGENTS}} replaced in step 1b)
-        if agents_markdown:
-            merged = sys_prompt + _GC_FRAMING
-            messages.append(Message(role="system", content=merged))
-        else:
-            messages.append(Message(role="system", content=sys_prompt))
-    elif promoted_turn is not None:
-        # Agent has no system prompt; promote the persisted group-chat prompt.
-        sys_content = _message_from_turn(promoted_turn).content
-        messages.append(Message(role="system", content=sys_content))
-    elif agents_markdown:
-        # No persisted prompt — generate the default with {{AGENTS}} placeholder.
-        messages.append(Message(role="system", content=_GC_DEFAULT_PROMPT))
-
-    # 1b. Inject AGENTS table into the system message (plain-text path only;
-    #     template-based is already handled above)
-    if agents_markdown:
-        if messages and messages[-1].role == "system" and not messages[-1].prompt_template:
-            sys_msg = messages[-1]
-            content = sys_msg.content or ""
-            if "{{AGENTS}}" in content:
-                sys_msg.content = content.replace("{{AGENTS}}", agents_markdown)
-        elif not messages:
-            # Safety net: no system message at all
-            messages.append(Message(
-                role="system", content=agents_markdown,
-            ))
-
-    # 1c. Inject rolling summary and structured memory into the system message
-    #     when context compression has been triggered.  This mirrors what
-    #     ContextManager.assemble_context() does for single-agent sessions,
-    #     but adapted for group-chat system message structure.
+    # 2. Catch-up note (if any)
     has_summary = bool(summary_text.strip()) if summary_text else False
-    has_memory = bool(memory_entries) if memory_entries else False
-    if has_summary or has_memory:
-        extra_parts: list[str] = []
-        if has_summary:
-            extra_parts.append(f"## Summary\n{summary_text}")
-        if has_memory:
-            memory_lines = [
-                f"{entry.entry_type}: {entry.content}"
-                for entry in memory_entries
-            ]
-            extra_parts.append("## Memory\n" + "\n".join(memory_lines))
-        extra_block = "\n\n".join(extra_parts)
-
-        if messages and messages[-1].role == "system":
-            sys_msg = messages[-1]
-            if sys_msg.prompt_template:
-                # Template-based: inject via GC_FRAMING which is appended to the
-                # template content during rendering.
-                if sys_msg.arguments is None:
-                    sys_msg.arguments = {}
-                existing_framing = sys_msg.arguments.get("GC_FRAMING", "")
-                sys_msg.arguments["GC_FRAMING"] = (
-                    existing_framing + "\n\n" + extra_block
-                    if existing_framing else extra_block
-                )
-            else:
-                # Plain-text system message: append directly.
-                sys_msg.content = (sys_msg.content or "") + "\n\n" + extra_block
-        else:
-            # No system message exists — create one.
-            messages.insert(0, Message(role="system", content=extra_block))
-
-    # 2. Catch-up note (if any) — carried as a USER message (marked with
-    #    _CATCH_UP_TAG so _normalize_for_model skips the "**用户** (user): "
-    #    identity prefix). Placed before the historical turns; it gets merged
-    #    into the leading user message by _normalize_for_model.
-    #    When a rolling summary exists (compression active), the summary
-    #    already provides condensed historical context, so skip the catch-up
-    #    note to avoid redundancy.
     if not has_summary:
         missed = _count_missed_rounds(agent_id, turns)
         if missed > 0:
@@ -559,42 +568,37 @@ def assemble_agent_context(
             )
             messages.append(Message(role="user", content=catch_up, name=_CATCH_UP_TAG))
     else:
-        # Summary exists: catch-up info is covered by the summary text.
-        # Include a brief note so the agent knows some history was summarized.
         catch_up = "📢 群聊回追：部分早期对话已被压缩为摘要，详见上方 Summary。"
         messages.append(Message(role="user", content=catch_up, name=_CATCH_UP_TAG))
+
     # 3. Historical turns (all included, non-mentioned user messages marked)
     for turn in turns:
         msg = _message_from_turn(turn)
-        # Skip the persisted group-chat system message if we already promoted
-        # it to the agent's system prompt.
         if promoted_turn is not None and turn is promoted_turn:
             continue
-        # Skip a user turn that duplicates current_user_msg (can happen when
-        # pre-persistence saves the current round before inference starts and
-        # run_group_chat_stream loads it back as existing_turns).
         if current_user_msg is not None and msg.role == "user" and msg.content == current_user_msg.content:
             continue
-        # If this is a user message with explicit mentions that exclude this agent,
-        # add a lightweight marker
         turn_mentions: Optional[list[str]] = msg.mentions
         if turn_mentions and msg.role == "user" and agent_id not in turn_mentions:
             msg.content = f"[群聊] {msg.content}"
         messages.append(msg)
 
-    # 4. Current user message (if any — always addressed, the agent was @-mentioned)
+    # 4. Current user message (if any)
     if current_user_msg is not None:
         messages.append(current_user_msg)
 
-    # 5. Normalize from *agent_id*'s perspective: only its own assistant
-    #    messages stay as assistant; other agents' output is re-roled to
-    #    user so the model sees clean user/assistant alternation.
+    # 5. Normalize from *agent_id*'s perspective
     return _normalize_for_model(messages, agent_id)
 
 
 # ---------------------------------------------------------------------------
-# Multi-agent parallel orchestration
+# Multi-agent parallel orchestration (list version — DEPRECATED)
 # ---------------------------------------------------------------------------
+
+# Keep the original run_group_chat_stream for backward compatibility until
+# run_group_chat_stream_gen is proven in production.
+# The generator version below is the future; this list version remains
+# available during transition and is used by the non-streaming handler path.
 
 
 def run_group_chat_stream(
@@ -614,9 +618,14 @@ def run_group_chat_stream(
     tool_ids: list[str],
     max_rounds: int = 5,
 ) -> list[Message]:
-    """Execute one round of group chat inference.
+    """Execute one round of group chat inference (returns list of Messages).
 
-    Called from ``_handle_infer_stream`` when group-chat routing is active.
+    DEPRECATED: Prefer run_group_chat_stream_gen() which behaves as a
+    generator and supports incremental persistence. This list version is
+    kept for the non-streaming handler path during the transition period.
+
+    Called from ``_handle_infer`` (non-streaming) when group-chat routing is
+    active, and from ``_handle_infer_stream`` as the legacy path.
 
     Parameters:
         runtime: Runtime instance for model inference.
@@ -641,6 +650,219 @@ def run_group_chat_stream(
         Collected Message objects from all agents, already tagged with
         ``agent_id`` and ``name``.
     """
+    # Delegate to the generator version and consume it into a list.
+    gen = _run_group_chat_stream_gen(
+        runtime=runtime,
+        mentioned_agent_ids=mentioned_agent_ids,
+        all_agent_ids=all_agent_ids,
+        original_messages=original_messages,
+        base_request=base_request,
+        cancel_event=cancel_event,
+        sse_callback=sse_callback,
+        sse_heartbeat=sse_heartbeat,
+        context_manager=context_manager,
+        session_id=session_id,
+        agent_manager=agent_manager,
+        model_id=model_id,
+        tool_ids=tool_ids,
+        max_rounds=max_rounds,
+        stream_chunks=False,
+    )
+    collected: list[Message] = []
+    for msg in gen:
+        collected.append(msg)
+    return collected
+
+
+# ---------------------------------------------------------------------------
+# Public generator interface (the unified future path)
+# ---------------------------------------------------------------------------
+
+
+def run_group_chat_stream_gen(
+    *,
+    runtime,
+    mentioned_agent_ids: list[str],
+    all_agent_ids: list[str],
+    original_messages: list[Message],
+    base_request: InferenceRequest,
+    cancel_event=None,
+    sse_callback=None,
+    sse_heartbeat=None,
+    context_manager,
+    session_id: str,
+    agent_manager,
+    model_id: str,
+    tool_ids: list[str],
+    max_rounds: int = 5,
+) -> Generator[Message, None, None]:
+    """Generator version of group chat inference.
+
+    Unlike the list-returning ``run_group_chat_stream``, this function
+    yields Messages incrementally as they are produced by each agent's
+    ``infer_stream``.  The caller (handler) can do unified SSE writing
+    and incremental persistence without needing callback/notification.
+
+    When ``len(all_agent_ids) <= 2`` (user + a single AI, or solo),
+    the group-chat machinery normally used for multi-agent scenarios
+    (AGENTS markdown, _normalize_for_model with role-rewriting, parallel
+    ThreadPoolExecutor) is bypassed.  The degenerate case is handled by
+    a direct single-agent inference path that behaves identically to
+    ``runtime.infer_stream`` — same system prompt, same tool loop, same
+    message normalization.
+
+    Args:
+        sse_callback: Optional callback retained for self-managing tools such
+            as delegate/talk_to, which emit nested stream frames directly.
+            Ordinary model messages are yielded and must be written by the
+            caller, so they are not duplicated through this callback.
+        sse_heartbeat: Optional zero-argument callback emitting an SSE
+            keep-alive comment frame while waiting on slow agents in
+            multi-agent mode (degenerate mode does not need it).
+            Ignored in degenerate mode.
+
+    Yields:
+        Message objects tagged with ``agent_id`` and ``name``.
+    """
+    yield from _run_group_chat_stream_gen(
+        runtime=runtime,
+        mentioned_agent_ids=mentioned_agent_ids,
+        all_agent_ids=all_agent_ids,
+        original_messages=original_messages,
+        base_request=base_request,
+        cancel_event=cancel_event,
+        sse_callback=sse_callback,
+        sse_heartbeat=sse_heartbeat,
+        context_manager=context_manager,
+        session_id=session_id,
+        agent_manager=agent_manager,
+        model_id=model_id,
+        tool_ids=tool_ids,
+        max_rounds=max_rounds,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Multi-agent parallel orchestration (generator version)
+# ---------------------------------------------------------------------------
+
+
+def _run_group_chat_stream_gen(
+    *,
+    runtime,
+    mentioned_agent_ids: list[str],
+    all_agent_ids: list[str],
+    original_messages: list[Message],
+    base_request: InferenceRequest,
+    cancel_event,
+    sse_callback,
+    sse_heartbeat=None,
+    context_manager,
+    session_id: str,
+    agent_manager,
+    model_id: str,
+    tool_ids: list[str],
+    max_rounds: int = 5,
+    stream_chunks: bool = True,
+) -> Generator[Message, None, None]:
+    """Execute group chat inference as a generator of Messages.
+
+    Generator version of ``run_group_chat_stream``. Yields each Message as
+    it becomes available from the parallel agent runners, allowing the
+    caller (handler) to do unified SSE writing and incremental persistence
+    without needing a callback.
+
+    When ``len(all_agent_ids) <= 2`` (i.e. just user + one AI, or solo),
+    the group-chat machinery is bypassed and the function behaves identically
+    to a direct call to ``runtime.infer_stream`` — the degenerate case.
+
+    Parameters (same as ``run_group_chat_stream``):
+
+    Yields:
+        Message objects as they are produced by each agent's infer_stream.
+        Each message is tagged with ``agent_id`` and ``name``.
+        The final yield is always a ``usage`` message if any exists.
+    """
+    # ── Load conversation history (needed by both degenerate and full paths) ──
+    existing_turns = []
+    summary_text: str = ""
+    memory_entries: list = []
+    if session_id:
+        try:
+            existing_turns = context_manager.load_conversation(session_id)
+        except (FileNotFoundError, ValueError):
+            pass
+
+        # Rolling summary & structured memory (context compression)
+        summary_text, summary_fm = context_manager.get_summary(session_id)
+        if summary_text.strip():
+            memory_entries = context_manager.get_memory_entries(session_id)
+            k = getattr(context_manager, '_recent_turns_k', 10)
+            summarized_up_to = summary_fm.get("summarized_up_to_turn", -1)
+            if isinstance(summarized_up_to, int) and summarized_up_to >= 0:
+                recent_start = max(0, len(existing_turns) - k)
+                if recent_start <= summarized_up_to:
+                    recent_start = min(summarized_up_to + 1, len(existing_turns))
+                while (recent_start < len(existing_turns)
+                       and recent_start > 0
+                       and existing_turns[recent_start].role == "tool"):
+                    recent_start -= 1
+                while (recent_start < len(existing_turns)
+                       and recent_start > 0
+                       and existing_turns[recent_start].role not in ("user", "system")):
+                    recent_start -= 1
+                existing_turns = existing_turns[recent_start:]
+
+    # ── Degenerate case: single participant (user + 1 AI, or solo) ─────
+    # When len(all_agent_ids) <= 2 (user + one AI), the group-chat
+    # machinery is unnecessary.  We route directly through a single
+    # infer_stream call (which already has its own tool loop) so the
+    # behavior is identical to a non-group-chat single-agent session.
+    # This ensures group_chat and infer_stream produce the same results
+    # for the 1- or 2-participant case.
+    if len(all_agent_ids) <= 2 and all_agent_ids:
+        agent_id = all_agent_ids[0]
+        agent = agent_manager.get(agent_id)
+        if agent is not None:
+            nickname: str = agent.get("nickname", agent_id)
+            agent_model_id: str = agent.get("model_id", model_id)
+            agent_tool_ids: list[str] = agent.get("tool_ids", tool_ids)
+
+            # Build context as a regular single-agent inference context
+            # (no AGENTS markdown, no group-chat framing, no catch-up).
+            # We reuse assemble_agent_context with agents_markdown="" to
+            # get the standard single-agent system prompt + history.
+            first_user_msg: Optional[Message] = None
+            for m in reversed(original_messages):
+                if m.role == "user":
+                    first_user_msg = m
+                    break
+            if first_user_msg is None and original_messages:
+                first_user_msg = Message(role="user", content="")
+
+            agent_messages = assemble_agent_context(
+                agent_id, agent, existing_turns, first_user_msg,
+                agents_markdown="",
+                summary_text=summary_text,
+                memory_entries=memory_entries,
+            )
+
+            degenerate_request = InferenceRequest(
+                model_id=agent_model_id,
+                tool_ids=agent_tool_ids,
+                messages=agent_messages,
+                stream=True,
+                max_tool_rounds=base_request.max_tool_rounds,
+            )
+
+            for msg in runtime.infer_stream(degenerate_request,
+                                            cancel_event=cancel_event):
+                msg.agent_id = agent_id
+                if msg.role == "assistant":
+                    msg.name = nickname
+                yield msg
+            return
+
     agents_markdown = build_agents_markdown(
         all_agent_ids, agent_manager, include_user_row=True,
     )
@@ -659,59 +881,33 @@ def run_group_chat_stream(
     if first_user_msg is None and original_messages:
         first_user_msg = Message(role="user", content="")
 
-    # Load initial conversation history from disk once.
-    existing_turns = []
-    summary_text: str = ""
-    memory_entries: list = []
-    if session_id:
-        try:
-            existing_turns = context_manager.load_conversation(session_id)
-        except (FileNotFoundError, ValueError):
-            pass
-
-        # --- Rolling summary & structured memory (context compression) ----
-        # If compression has been triggered (summary.md exists), truncate the
-        # historical turns to the most recent K turns and inject the summary
-        # into the system message.  This mirrors ContextManager.assemble_context().
-        summary_text, summary_fm = context_manager.get_summary(session_id)
-        if summary_text.strip():
-            memory_entries = context_manager.get_memory_entries(session_id)
-            k = getattr(context_manager, '_recent_turns_k', 10)
-            summarized_up_to = summary_fm.get("summarized_up_to_turn", -1)
-            if isinstance(summarized_up_to, int) and summarized_up_to >= 0:
-                # Truncate old turns that have been compressed into the summary.
-                recent_start = max(0, len(existing_turns) - k)
-                if recent_start <= summarized_up_to:
-                    recent_start = min(summarized_up_to + 1, len(existing_turns))
-                # Ensure we don't cut in the middle of a tool-call chain.
-                while (recent_start < len(existing_turns)
-                       and recent_start > 0
-                       and existing_turns[recent_start].role == "tool"):
-                    recent_start -= 1
-                while (recent_start < len(existing_turns)
-                       and recent_start > 0
-                       and existing_turns[recent_start].role not in ("user", "system")):
-                    recent_start -= 1
-                existing_turns = existing_turns[recent_start:]
-
     all_collected: list[Message] = []
     processed_agent_ids: set[str] = set()
     pending_mentioned: list[str] = [
         aid for aid in mentioned_agent_ids if aid not in processed_agent_ids
     ]
     round_num = 0
+    # Replies that triggered the agents participating in the current round.
+    # Round 1 is driven by the user's message, so this starts empty.  Each
+    # completed round builds a fresh dict for the following round.
+    trigger_msgs: dict[str, list[Message]] = {}
 
     while pending_mentioned and round_num < max_rounds:
         round_num += 1
-        # Populated at the END of each round: agent_id -> the assistant
-        # replies that @-mentioned it (drives round 2+ as the "current
-        # message", mirroring user @-mentions driving round 1).
-        trigger_msgs: dict[str, list[Message]] = {}
+        current_trigger_msgs = trigger_msgs
+        next_trigger_msgs: dict[str, list[Message]] = {}
         for aid in pending_mentioned:
             processed_agent_ids.add(aid)
 
-        # --- per-agent runner (closes over this round's state) -------------
-        def _run_one(agent_id: str) -> tuple[str, list[Message]]:
+        # --- per-agent runner (generator-based, feeds results through a queue) ---
+
+        def _run_one_gen(agent_id: str) -> Generator[Message, None, None]:
+            """Generator that yields messages for a single agent and appends
+            to existing_turns when done.  Also populates _round_trigger_msgs
+            with any @-mentions found in the *merged* (post-_flush_asst)
+            collected messages, so the main round loop can correctly detect
+            mentions across chunk boundaries."""
+            nonlocal existing_turns
             set_request_context(context_manager=context_manager,
                                 session_id=session_id,
                                 agent_manager=agent_manager,
@@ -721,17 +917,15 @@ def run_group_chat_stream(
                                 sse_callback=sse_callback)
             agent = agent_manager.get(agent_id)
             if agent is None:
-                return (agent_id, [])
+                return
 
             nickname: str = agent.get("nickname", agent_id)
             agent_model_id: str = agent.get("model_id", model_id)
             agent_tool_ids: list[str] = agent.get("tool_ids", tool_ids)
 
-            # --- current message for THIS agent ----------------------------
-            # Round 1: the user's message. Round 2+: the assistant replies
-            # that @-mentioned this agent (presented like a user message, so
-            # the agent knows exactly what pulled it in).
-            trigger_list = trigger_msgs.get(agent_id) if round_num > 1 else None
+            # Current message for THIS agent
+            trigger_list = (current_trigger_msgs.get(agent_id)
+                            if round_num > 1 else None)
             cur_user_msg: Optional[Message]
             if round_num == 1:
                 cur_user_msg = first_user_msg
@@ -740,8 +934,7 @@ def run_group_chat_stream(
             else:
                 cur_user_msg = None
 
-            # Exclude the trigger replies from the replayed history — they are
-            # now the current message, so the agent must not see them twice.
+            # Exclude trigger replies from replayed history
             agent_turns = existing_turns
             if trigger_list:
                 trigger_pairs = {(m.agent_id, m.content or "") for m in trigger_list}
@@ -767,13 +960,9 @@ def run_group_chat_stream(
                 max_tool_rounds=base_request.max_tool_rounds,
             )
 
-            collected: list[Message] = []
-            asst_buf: list[Message] = []  # incremental assistant chunks
+            asst_buf: list[Message] = []
 
-            def _flush_asst() -> None:
-                """Merge buffered incremental assistant chunks into ONE
-                complete assistant Message (so @-mention parsing and the
-                in-memory turns see full text, not token deltas)."""
+            def _flush_asst(collected: list[Message]) -> None:
                 if not asst_buf:
                     return
                 content = "".join(m.content or "" for m in asst_buf)
@@ -804,7 +993,6 @@ def run_group_chat_stream(
                                                        + tc["arguments"])
                 for idx in sorted(by_idx):
                     tool_calls.append(by_idx[idx])
-                # Drop _index so merge_stream_messages treats them as complete.
                 for tc in tool_calls:
                     tc.pop("_index", None)
 
@@ -822,8 +1010,7 @@ def run_group_chat_stream(
                     agent_id=agent_id,
                     name=nickname,
                 )
-                # Tag with valid @-mentions (same treatment as user messages:
-                # only mentions that resolve to a participant count).
+                # Tag with valid @-mentions
                 if content:
                     parsed = parse_mentions(content)
                     if parsed:
@@ -834,6 +1021,7 @@ def run_group_chat_stream(
                 collected.append(full)
                 asst_buf.clear()
 
+            collected: list[Message] = []
             try:
                 for msg in runtime.infer_stream(request,
                                                 cancel_event=cancel_event):
@@ -842,23 +1030,13 @@ def run_group_chat_stream(
                         msg.name = nickname
                         asst_buf.append(msg)
                     else:
-                        # tool/usage messages flush the pending assistant text
-                        _flush_asst()
+                        _flush_asst(collected)
                         collected.append(msg)
-
-                    # SSE: skip delegate/talk_to tool frames (self-managing).
-                    if msg.role == "tool" and msg.name in ("delegate",
-                                                            "talk_to"):
+                    # Skip delegate/talk_to tool frames (self-managing)
+                    if msg.role == "tool" and msg.name in ("delegate", "talk_to"):
                         continue
-
-                    if sse_callback:
-                        frame = msg.to_dict()
-                        frame["nickname"] = nickname
-                        try:
-                            sse_callback(frame)
-                        except Exception:
-                            pass
-
+                    if stream_chunks:
+                        yield msg
             except Exception as exc:
                 _logger.error("agent %s inference failed: %s", agent_id, exc)
                 error_msg = Message(
@@ -868,147 +1046,158 @@ def run_group_chat_stream(
                     name=nickname,
                 )
                 collected.append(error_msg)
+                if stream_chunks:
+                    yield error_msg
                 asst_buf.clear()
-                if sse_callback:
-                    try:
-                        frame = error_msg.to_dict()
-                        frame["nickname"] = nickname
-                        sse_callback(frame)
-                    except Exception:
-                        pass
 
-            _flush_asst()
-            return (agent_id, collected)
+            _flush_asst(collected)
+
+            # Append to in-memory turns (for next round's mention detection)
+            for msg in collected:
+                if msg.role == "usage":
+                    continue
+                existing_turns.append({
+                    "role": msg.role,
+                    "content": msg.content or "",
+                    "timestamp": msg.timestamp,
+                    "name": getattr(msg, "name", None),
+                    "agent_id": getattr(msg, "agent_id", None),
+                    "thinking": getattr(msg, "thinking", None),
+                    "stat": getattr(msg, "stat", None),
+                    "mentions": getattr(msg, "mentions", None),
+                    "tool_calls": getattr(msg, "tool_calls", None),
+                })
+
+            # Detect @-mentions in merged (post-_flush_asst) assistant messages.
+            # This must be done on `collected`, NOT on the fragmented chunks that
+            # were yielded to the main thread (a mention like "@沙和尚" can span
+            # multiple chunks and would be missed by chunk-level scanning).
+            for msg in collected:
+                if msg.role != "assistant" or not msg.content:
+                    continue
+                # _flush_asst has already parsed the complete content and
+                # resolved valid participant mentions.  Reuse that result so
+                # mentions split across streaming chunks remain detectable.
+                for aid in (msg.mentions or []):
+                    if aid not in processed_agent_ids:
+                        next_trigger_msgs.setdefault(aid, []).append(msg)
+
+            # The legacy list-returning API expects complete, merged turns;
+            # the streaming API instead yields raw deltas above.
+            if not stream_chunks:
+                yield from collected
 
         # --- parallel execution for this round ----------------------------
         round_collected: list[Message] = []
 
-        def _append_error(agent_id: str, message: str) -> None:
-            """Push an error assistant Message for a failed/timed-out agent,
-            mirroring the per-agent error handling inside _run_one."""
-            agent = agent_manager.get(agent_id)
-            nickname = agent.get("nickname", agent_id) if agent else agent_id
-            err = Message(
-                role="assistant",
-                content=f"Error: {message}",
-                agent_id=agent_id,
-                name=nickname,
-            )
-            round_collected.append(err)
-            if sse_callback:
-                try:
-                    frame = err.to_dict()
-                    frame["nickname"] = nickname
-                    sse_callback(frame)
-                except Exception:
-                    pass
-
         executor = ThreadPoolExecutor(max_workers=max_workers)
+        # Submit each agent's generator via a queue so the main thread can
+        # yield messages as they come in.  Include agent_id in every event so
+        # timeout handling can distinguish completed from still-running agents.
+        _msg_queue: "queue.Queue[tuple[str, Optional[Message]]]" = queue.Queue()
+        _agent_count = len(pending_mentioned)
+
+        def _agent_worker(agent_id: str) -> None:
+            """Run one agent's generator and feed its messages to the queue."""
+            try:
+                for msg in _run_one_gen(agent_id):
+                    _msg_queue.put((agent_id, msg))
+            except Exception as exc:
+                _logger.error("group chat agent_worker %s failed: %s", agent_id, exc)
+                err = Message(
+                    role="assistant",
+                    content=f"Error: agent inference failed: {exc}",
+                    agent_id=agent_id,
+                    name=agent_manager.get(agent_id).get("nickname", agent_id)
+                    if agent_manager.get(agent_id) else agent_id,
+                )
+                _msg_queue.put((agent_id, err))
+            finally:
+                _msg_queue.put((agent_id, None))  # sentinel: this agent is done
+
         futures = {
-            executor.submit(_run_one, aid): aid
+            executor.submit(_agent_worker, aid): aid
             for aid in pending_mentioned
         }
+
         try:
-            pending = set(futures)
+            remaining = _agent_count
+            completed_agent_ids: set[str] = set()
             future_timeout = _get_group_chat_timeout(len(all_agent_ids))
             deadline = (time.monotonic() + future_timeout
                         if future_timeout is not None else None)
-            while pending:
-                if deadline is None:
-                    wait_timeout = _GROUP_CHAT_HEARTBEAT_INTERVAL
-                else:
-                    wait_timeout = min(
-                        _GROUP_CHAT_HEARTBEAT_INTERVAL,
-                        max(0.0, deadline - time.monotonic()),
-                    )
-                done, pending = wait(
-                    pending, timeout=wait_timeout,
-                    return_when=FIRST_COMPLETED,
-                )
-                for future in done:
-                    aid = futures[future]
+
+            while remaining > 0:
+                # Collect messages from queue until an agent finishes or
+                # we hit the heartbeat interval (for keep-alive).
+                got_any = False
+                while True:
                     try:
-                        _aid, msgs = future.result()
-                        round_collected.extend(msgs)
-                    except Exception as exc:
-                        _logger.error(
-                            "group chat agent %s inference failed: %s",
-                            aid, exc,
-                        )
-                        _append_error(aid, f"agent inference failed: {exc}")
-                if not pending:
+                        wait_timeout = _GROUP_CHAT_HEARTBEAT_INTERVAL
+                        if deadline is not None:
+                            remaining_time = deadline - time.monotonic()
+                            if remaining_time <= 0:
+                                # Timeout: signal cancel, stop waiting
+                                if cancel_event is not None:
+                                    cancel_event.set()
+                                for future in futures:
+                                    aid = futures[future]
+                                    if aid in completed_agent_ids:
+                                        continue
+                                    future.cancel()
+                                    _logger.error(
+                                        "group chat agent %s timed out after %ss",
+                                        aid, f"{future_timeout:g}",
+                                    )
+                                    err_msg = Message(
+                                        role="assistant",
+                                        content=f"Error: agent inference timed out after {future_timeout:g}s",
+                                        agent_id=aid,
+                                        name=agent_manager.get(aid).get("nickname", aid)
+                                        if agent_manager.get(aid) else aid,
+                                    )
+                                    round_collected.append(err_msg)
+                                    yield err_msg
+                                remaining = 0
+                                break
+                            wait_timeout = min(wait_timeout, max(0.0, remaining_time))
+                        event_agent_id, msg = _msg_queue.get(timeout=wait_timeout)
+                    except queue.Empty:
+                        # Timeout or heartbeat interval reached
+                        if cancel_event is not None and cancel_event.is_set():
+                            remaining = 0
+                        else:
+                            if sse_heartbeat is not None:
+                                try:
+                                    sse_heartbeat()
+                                except Exception:
+                                    pass
+                        break
+                    else:
+                        if msg is None:
+                            if event_agent_id not in completed_agent_ids:
+                                completed_agent_ids.add(event_agent_id)
+                                remaining -= 1
+                            if remaining <= 0:
+                                got_any = True
+                            break
+                        got_any = True
+                        round_collected.append(msg)
+                        yield msg
+
+                if remaining <= 0:
                     break
-                # Keep long-wait SSE streams alive: gateways/proxies/firewalls
-                # drop idle connections, which would silently lose the final
-                # timeout-error frames (they ARE persisted, so history replay
-                # shows them but the live view never does).
-                if deadline is None or time.monotonic() < deadline:
-                    if sse_heartbeat is not None:
-                        try:
-                            sse_heartbeat()
-                        except Exception:
-                            pass
-                if deadline is not None and time.monotonic() >= deadline:
-                    # At least one agent did not finish in time -- stop waiting
-                    # and report it as timed out instead of hanging the whole
-                    # group-chat round.  Signal cancellation so any orphaned
-                    # worker threads terminate promptly (infer_stream checks
-                    # cancel_event at each yield point).
-                    if cancel_event is not None:
-                        cancel_event.set()
-                    for future in pending:
-                        aid = futures[future]
-                        future.cancel()
-                        _logger.error(
-                            "group chat agent %s timed out after %ss",
-                            aid, f"{future_timeout:g}",
-                        )
-                        _append_error(
-                            aid,
-                            f"agent inference timed out after "
-                            f"{future_timeout:g}s",
-                        )
-                    break
+
         finally:
-            # Never block on a still-running worker: pending futures are
-            # cancelled and running threads exit via cancel_event or their
-            # own internal timeouts (infer_stream is self-terminating).
             executor.shutdown(wait=False, cancel_futures=True)
 
         all_collected.extend(round_collected)
 
-        # Accumulate into in-memory turns so the next round sees them.
-        # usage/stat messages are excluded — they are metadata for
-        # merge_stream_messages, never conversation content.
-        for msg in round_collected:
-            if msg.role == "usage":
-                continue
-            existing_turns.append({
-                "role": msg.role,
-                "content": msg.content or "",
-                "timestamp": msg.timestamp,
-                "name": getattr(msg, "name", None),
-                "agent_id": getattr(msg, "agent_id", None),
-                "thinking": getattr(msg, "thinking", None),
-                "stat": getattr(msg, "stat", None),
-                "mentions": getattr(msg, "mentions", None),
-                "tool_calls": getattr(msg, "tool_calls", None),
-            })
-
-        # Scan assistant messages (now complete, aggregated messages) for
-        # @-mentions that target unprocessed agents — exactly like user
-        # messages drive round 1.
-        for msg in round_collected:
-            if msg.role != "assistant" or not msg.content:
-                continue
-            parsed = parse_mentions(msg.content)
-            if not parsed:
-                continue
-            resolved = resolve_mentions(parsed, agent_manager, all_agent_ids)
-            for aid in resolved:
-                if aid not in processed_agent_ids:
-                    trigger_msgs.setdefault(aid, []).append(msg)
-
+        # Trigger_msgs already populated by _run_one_gen from merged assistant
+        # messages (see the mention-detection block at the end of _run_one_gen).
+        # Do NOT scan round_collected here — the yield-to-main-thread messages
+        # are fragmented chunks that can miss cross-chunk @-mentions.
+        trigger_msgs = next_trigger_msgs
         pending_mentioned = list(trigger_msgs.keys())
 
-    return all_collected
+    # No additional yield needed; the queue already yielded everything.

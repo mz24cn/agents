@@ -372,19 +372,19 @@ class HandlerInferMixin:
         agent_nickname = agent.get("nickname") if agent else None
         return body, request, session_id, use_session, original_messages, context_manager, agent_ids, agent_nickname, body["model_id"], tool_ids, workspace
 
-    def _cleanup_thread_local(self):
-        from runtime.models import Message
-        import logging
-        logger = logging.getLogger("runtime.server")
-
+    def _finalize_file_journal(self) -> None:
+        """Best-effort turn-level reconciliation of registered file changes."""
         file_journal_manager = get_request_context("file_journal_manager")
-        if file_journal_manager is not None:
-            try:
-                file_journal_manager.flush()
-            except Exception as flush_err:
-                logger.warning("Error flushing file journal: %s", flush_err)
-            finally:
-                set_request_context(file_journal_manager=None)
+        if file_journal_manager is None:
+            return
+        try:
+            file_journal_manager.flush()
+        except Exception as flush_err:
+            logger.warning("Error finalizing file journal: %s", flush_err)
+
+    def _cleanup_thread_local(self):
+        self._finalize_file_journal()
+        set_request_context(file_journal_manager=None)
 
         clear_request_context([
             "sse_callback", "cancel_event", "session_id", "session_dir",
@@ -515,6 +515,8 @@ class HandlerInferMixin:
                 response_data["stat"] = stat_dict
 
             status = 200 if success else 500
+            # Make the journal final before the response becomes observable.
+            self._finalize_file_journal()
             self._send_json_response(status, response_data)
         finally:
             self._cleanup_thread_local()
@@ -661,10 +663,44 @@ class HandlerInferMixin:
 
             # === Group chat routing ===
             mentioned_agent_ids = get_request_context("mentioned_agent_ids") or []
-            if len(agent_ids) > 1:
-                # Multi-agent group chat: each @-mentioned agent runs in parallel
-                from runtime.group_chat import run_group_chat_stream
-                collected_messages = run_group_chat_stream(
+            is_group_chat = len(agent_ids) > 1
+
+            def _incremental_persist():
+                """将自上次落盘以来新收集的完整轮次写入 conversation.json。
+
+                仅在收到 role=tool 消息后调用——此时 assistant(tool_calls) +
+                usage + tool(result) 已配对完整，merge_stream_messages 能正确
+                合并，保证 conversation.json 中不会出现孤立 tool_calls。
+                compress=False：推理过程中不触发 LLM 摘要压缩（最终持久化才做）。
+                """
+                nonlocal persisted_until
+                if not use_session or session_id is None:
+                    persisted_until = len(collected_messages)
+                    return
+                if not self._is_active_stream(session_id, cancel_event):
+                    # 已被新请求接管：不再落盘，避免覆盖更新的会话状态
+                    persisted_until = len(collected_messages)
+                    return
+                new_msgs = collected_messages[persisted_until:]
+                if not new_msgs:
+                    return
+                exc = self._persist_conversation(
+                    context_manager, session_id, [], new_msgs,
+                    agent_ids, agent_nickname, model_id, tool_ids, workspace,
+                    compress=False,
+                )
+                if exc is not None:
+                    logger.error(
+                        "infer_stream: incremental persist failed for session %s: %s",
+                        session_id, exc,
+                    )
+                else:
+                    persisted_until = len(collected_messages)
+
+            # === 统一消息源 ===
+            if is_group_chat:
+                from runtime.group_chat import run_group_chat_stream_gen
+                msg_gen = run_group_chat_stream_gen(
                     runtime=runtime,
                     mentioned_agent_ids=mentioned_agent_ids,
                     all_agent_ids=agent_ids,
@@ -680,64 +716,40 @@ class HandlerInferMixin:
                     tool_ids=tool_ids,
                 )
             else:
-                # Single agent (existing path)
-                def _incremental_persist():
-                    """将自上次落盘以来新收集的完整轮次写入 conversation.json。
+                msg_gen = runtime.infer_stream(request, cancel_event=cancel_event)
 
-                    仅在收到 role=tool 消息后调用——此时 assistant(tool_calls) +
-                    usage + tool(result) 已配对完整，merge_stream_messages 能正确
-                    合并，保证 conversation.json 中不会出现孤立 tool_calls。
-                    compress=False：推理过程中不触发 LLM 摘要压缩（最终持久化才做）。
-                    """
-                    nonlocal persisted_until
-                    if not use_session or session_id is None:
-                        persisted_until = len(collected_messages)
-                        return
-                    if not self._is_active_stream(session_id, cancel_event):
-                        # 已被新请求接管：不再落盘，避免覆盖更新的会话状态
-                        persisted_until = len(collected_messages)
-                        return
-                    new_msgs = collected_messages[persisted_until:]
-                    if not new_msgs:
-                        return
-                    exc = self._persist_conversation(
-                        context_manager, session_id, [], new_msgs,
-                        agent_ids, agent_nickname, model_id, tool_ids, workspace,
-                        compress=False,
-                    )
-                    if exc is not None:
-                        logger.error(
-                            "infer_stream: incremental persist failed for session %s: %s",
-                            session_id, exc,
-                        )
-                    else:
-                        persisted_until = len(collected_messages)
-
-                for msg in runtime.infer_stream(request, cancel_event=cancel_event):
-                    collected_messages.append(msg)
-                    if msg.role == "assistant" and agent_ids:
-                        msg.agent_id = agent_ids[0]
-                        if agent_nickname:
-                            msg.name = agent_nickname
-                    # 增量持久化触发点：
-                    #   usage 消息 → assistant 一轮结束（纯文本回复或 tool_calls 声明），
-                    #               merge_stream_messages 已将其 flush 为一个完整 turn
-                    #   tool 消息  → 工具调用结果配对完成 → 立即落盘
-                    #  放在 delegate/talk_to 的 continue 之前，保证这两种工具的
-                    #  最终结果消息也触发落盘。
-                    if msg.role in ("usage", "tool"):
-                        _incremental_persist()
-                    # delegate / talk_to 工具通过 sse_callback 自行管理流式帧和结束帧，跳过 infer_stream 的重复输出
-                    if msg.role == "tool" and msg.name in ("delegate", "talk_to"):
-                        continue
-                    event_data = json.dumps(msg.to_dict(), ensure_ascii=False)
-                    self.wfile.write(f"data: {event_data}\n\n".encode("utf-8"))
-                    self.wfile.flush()
-                    if msg.role == "assistant" and msg.content and msg.content.startswith("Error:"):
-                        logger.error("infer_stream error event | model=%s %s", request.model_id, msg.content)
+            for msg in msg_gen:
+                collected_messages.append(msg)
+                # 单聊：手工设置 agent_id/name（群聊的 _run_one_gen 已设好）
+                if msg.role == "assistant" and not is_group_chat and agent_ids:
+                    msg.agent_id = agent_ids[0]
+                    if agent_nickname:
+                        msg.name = agent_nickname
+                # 增量持久化触发点：
+                #   usage 消息 → assistant 一轮结束（纯文本回复或 tool_calls 声明），
+                #               merge_stream_messages 已将其 flush 为一个完整 turn
+                #   tool 消息  → 工具调用结果配对完成 → 立即落盘
+                #  放在 delegate/talk_to 的 continue 之前，保证这两种工具的
+                #  最终结果消息也触发落盘。
+                if msg.role in ("usage", "tool"):
+                    _incremental_persist()
+                # delegate / talk_to 工具通过 sse_callback 自行管理流式帧和结束帧，跳过 infer_stream 的重复输出
+                # 群聊的 gen 版本已在 _run_one_gen 内部跳过这两种工具（不 yield），因此只有单聊需要判断。
+                if not is_group_chat and msg.role == "tool" and msg.name in ("delegate", "talk_to"):
+                    continue
+                event_data = json.dumps(msg.to_dict(), ensure_ascii=False)
+                self.wfile.write(f"data: {event_data}\n\n".encode("utf-8"))
+                self.wfile.flush()
+                if msg.role == "assistant" and msg.content and msg.content.startswith("Error:"):
+                    model_id_for_log = request.model_id if not is_group_chat else (getattr(msg, "agent_id", "group_chat") or "group_chat")
+                    logger.error("infer_stream error event | model=%s %s", model_id_for_log, msg.content)
 
             # 【已移除】尾部发送 session_id 的逻辑，已在第一条消息中发送
 
+            # Reconcile file snapshots before announcing completion so a
+            # client fetching the journal immediately after [DONE] sees the
+            # final workspace state rather than an intermediate tool snapshot.
+            self._finalize_file_journal()
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
 

@@ -141,6 +141,78 @@ class EnvManager:
             return self._render_setup_script_ps1(encoded).encode("utf-8")
         raise ValueError(f"Unsupported setup script format: {script_format}")
 
+    def build_incremental_tar(
+        self,
+        *,
+        project_root: str,
+        updated_since: float,
+        data_dir: str,
+    ) -> bytes | None:
+        """扫描 project_root，收集 updated_since 时间戳（Unix epoch）之后修改过的文件，
+        打包为 tar.gz 返回。若无变化返回 None。
+
+        Args:
+            project_root: 项目根目录（app 代码所在）。
+            updated_since: Unix epoch 秒数，仅包含 mtime >= 此值的文件。
+            data_dir: 运行时数据目录（用于补充配置文件变化检测）。
+        """
+        project_root = os.path.realpath(project_root)
+        # 排除目录（与 _copy_project 保持一致）
+        exclude_dirs = {".git", "__pycache__", ".pytest_cache", ".hypothesis", ".mypy_cache",
+                        ".ruff_cache", "node_modules", "dist", "build", ".venv", "venv",
+                        "workspace"}
+        web_dist_real = os.path.realpath(os.path.join(project_root, "web", "dist"))
+
+        def should_exclude(path_real: str, name: str) -> bool:
+            if path_real == web_dist_real:
+                return False
+            if name.startswith(".") and os.path.isdir(path_real):
+                return True
+            return name in exclude_dirs
+
+        collected: list[str] = []
+        # —— 扫描项目根目录 ——
+        for dirpath, dirnames, filenames in os.walk(project_root):
+            dir_real = os.path.realpath(dirpath)
+            # 剔除应排除的子目录（os.walk 会跳过被修改的 dirnames）
+            dirnames[:] = [
+                d for d in dirnames
+                if not should_exclude(os.path.join(dir_real, d), d)
+            ]
+            # 跳过根目录级别的排除目录（针对 dirpath 自身）
+            rel = os.path.relpath(dir_real, project_root)
+            if rel != ".":
+                segs = rel.replace("\\", "/").split("/")
+                base_seg = segs[0]
+                base_path = os.path.join(project_root, base_seg)
+                if should_exclude(os.path.realpath(base_path), base_seg):
+                    dirnames.clear()
+                    continue
+            for fname in filenames:
+                fpath = os.path.join(dir_real, fname)
+                try:
+                    mtime = os.path.getmtime(fpath)
+                except OSError:
+                    continue
+                if mtime >= updated_since:
+                    collected.append(fpath)
+
+        # —— 跳过 symbol link ——
+        collected = [p for p in collected if not os.path.islink(p)]
+
+        if not collected:
+            return None
+
+        bio = BytesIO()
+        with tarfile.open(fileobj=bio, mode="w:gz") as tar:
+            for fpath in collected:
+                arcname = os.path.relpath(fpath, project_root).replace("\\", "/")
+                try:
+                    tar.add(fpath, arcname=arcname, filter=self._setup_tar_filter)
+                except OSError as exc:
+                    logger.warning("增量打包跳过 %s: %s", fpath, exc)
+        return bio.getvalue()
+
     # ------------------------------------------------------------------
     # 私有方法
     # ------------------------------------------------------------------

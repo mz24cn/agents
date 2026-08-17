@@ -55,13 +55,26 @@ from runtime.models import ToolConfig
 _active_processes: dict[str, subprocess.Popen] = {}
 _active_processes_lock = threading.Lock()
 
+# Flag set by kill_active_process (called from the abort handler) so that
+# _exec_shell can distinguish a real user abort from a command that happened
+# to be killed by a signal on its own (e.g. ``pkill -f "xxx"`` suicides).
+_abort_was_called_for_session: dict[str, bool] = {}
+_abort_was_called_lock = threading.Lock()
 
-def _was_terminated_by_signal(proc: subprocess.Popen) -> bool:
-    signal_returncodes = {-signal.SIGTERM}
-    sigkill = getattr(signal, "SIGKILL", None)
-    if sigkill is not None:
-        signal_returncodes.add(-sigkill)
-    return proc.returncode in signal_returncodes
+
+def _was_killed_by_abort_handler(session_id: str | None, proc: subprocess.Popen) -> bool:
+    """Check if the process was killed by a deliberate user abort.
+
+    Uses the flag set by kill_active_process() rather than inspecting the
+    return code, because a command that kills itself (e.g. ``pkill -f x``
+    matching its own process) could terminate with any signal.  Only the
+    explicit abort-handler path is a true "user abort".
+    """
+    if session_id is None:
+        return False
+    with _abort_was_called_lock:
+        was_called = _abort_was_called_for_session.pop(session_id, False)
+    return was_called
 
 
 def kill_active_process(session_id: str) -> bool:
@@ -69,11 +82,21 @@ def kill_active_process(session_id: str) -> bool:
 
     Called from the abort handler in a different thread.  Returns True if a
     process was found and killed, False otherwise.
+
+    Sets the abort-flag for *session_id* so that _exec_shell can later
+    distinguish a deliberate user abort from a command that killed itself
+    (e.g. ``pkill -f "x"`` matching its own process).
     """
     with _active_processes_lock:
         proc = _active_processes.pop(session_id, None)
     if proc is None:
         return False
+
+    # Flag this session as a deliberate user abort *before* killing, so the
+    # flag is visible to _exec_shell even if this thread is preempted.
+    with _abort_was_called_lock:
+        _abort_was_called_for_session[session_id] = True
+
     try:
         # Kill the entire process group so child processes are also terminated.
         kill_process_group(proc)
@@ -185,6 +208,43 @@ def _capture_file_state(path: str) -> dict:
         "mode": "100755" if st.st_mode & stat.S_IXUSR else "100644",
         "is_symlink": is_symlink,
     }
+
+
+def _journal_ref_matches_state(blob_ref: object, state: dict) -> bool:
+    """Return whether a journal reference describes *state* exactly."""
+    if not isinstance(blob_ref, dict):
+        return False
+    ref_exists = bool(blob_ref.get("exists"))
+    state_exists = bool(state.get("exists"))
+    if ref_exists != state_exists:
+        return False
+    if not state_exists:
+        return True
+    data = state.get("data", b"")
+    return (
+        blob_ref.get("sha256") == _sha256_bytes(data)
+        and blob_ref.get("size") == len(data)
+        and blob_ref.get("mode", "100644") == state.get("mode", "100644")
+        and bool(blob_ref.get("is_symlink")) == bool(state.get("is_symlink"))
+    )
+
+
+def _journal_refs_equal(left: object, right: object) -> bool:
+    """Compare two journal references without reading their backing blobs."""
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    left_exists = bool(left.get("exists"))
+    right_exists = bool(right.get("exists"))
+    if left_exists != right_exists:
+        return False
+    if not left_exists:
+        return True
+    return (
+        left.get("sha256") == right.get("sha256")
+        and left.get("size") == right.get("size")
+        and left.get("mode", "100644") == right.get("mode", "100644")
+        and bool(left.get("is_symlink")) == bool(right.get("is_symlink"))
+    )
 
 
 def _restore_file_state(path: str, state: dict) -> None:
@@ -325,6 +385,10 @@ class _FileJournalManager:
             rel_path = _safe_rel_path(os.path.relpath(resolved_path, self.workspace))
             with _ManifestLock(self.lock_path):
                 manifest = self._load_manifest()
+                manifest["status"] = "active"
+                manifest["finalized"] = False
+                manifest.pop("finalized_at", None)
+                manifest.pop("finalize_errors", None)
                 files = manifest.setdefault("files", {})
                 entry = files.get(rel_path)
                 if entry is None:
@@ -350,6 +414,10 @@ class _FileJournalManager:
             rel_path = _safe_rel_path(os.path.relpath(resolved_path, self.workspace))
             with _ManifestLock(self.lock_path):
                 manifest = self._load_manifest()
+                manifest["status"] = "active"
+                manifest["finalized"] = False
+                manifest.pop("finalized_at", None)
+                manifest.pop("finalize_errors", None)
                 files = manifest.setdefault("files", {})
                 entry = files.setdefault(rel_path, {"path": rel_path, "tools": []})
                 if tool_name not in entry.setdefault("tools", []):
@@ -363,8 +431,72 @@ class _FileJournalManager:
             logger.warning("File journal after snapshot failed for %s: %s", file_path, exc)
             return {"error": "JournalFailed", "message": "Could not save after snapshot"}
 
+    def finalize(self) -> dict:
+        """Reconcile all registered files with their final workspace state.
+
+        Tool-level snapshots remain useful for live inspection, but arbitrary
+        shell commands may modify a registered file afterwards.  Finalization
+        is the turn-level consistency barrier: missing or stale ``after``
+        snapshots are refreshed, and entries whose final state equals their
+        baseline are removed as no-ops.  The operation is idempotent.
+        """
+        if self.disabled:
+            return self._skipped("disabled")
+        if not self.session_dir or not self.manifest_path or not self.journal_dir or not self.lock_path:
+            return self._skipped("no_session_dir")
+        if not os.path.isfile(self.manifest_path):
+            return self.response_metadata()
+
+        refreshed: list[str] = []
+        removed: list[str] = []
+        errors: list[dict] = []
+        with _ManifestLock(self.lock_path):
+            manifest = self._load_manifest()
+            files = manifest.setdefault("files", {})
+            if not isinstance(files, dict):
+                files = {}
+                manifest["files"] = files
+
+            for rel_path, entry in list(files.items()):
+                if not isinstance(entry, dict) or not isinstance(entry.get("baseline"), dict):
+                    errors.append({"path": rel_path, "error": "missing_baseline"})
+                    continue
+                try:
+                    safe_rel = _safe_rel_path(str(rel_path).replace("\\", "/"))
+                    resolved_path = _validate_path(self.workspace, safe_rel)
+                    current_state = _capture_file_state(resolved_path)
+                    if not _journal_ref_matches_state(entry.get("after"), current_state):
+                        entry["after"] = _blob_ref_from_state(
+                            current_state, self.journal_dir, safe_rel, "after"
+                        )
+                        refreshed.append(safe_rel)
+                    if _journal_refs_equal(entry["baseline"], entry["after"]):
+                        files.pop(rel_path, None)
+                        removed.append(safe_rel)
+                except Exception as exc:
+                    logger.warning("File journal finalize failed for %s: %s", rel_path, exc)
+                    errors.append({"path": str(rel_path), "error": str(exc)})
+
+            manifest["status"] = "finalized" if not errors else "finalize_failed"
+            manifest["finalized"] = not errors
+            manifest["finalized_at"] = _utc_now_iso()
+            if errors:
+                manifest["finalize_errors"] = errors
+            else:
+                manifest.pop("finalize_errors", None)
+            self._save_manifest(manifest)
+
+        return {
+            **self.response_metadata(),
+            "finalized": not errors,
+            "refreshed_files": refreshed,
+            "removed_files": removed,
+            "errors": errors,
+        }
+
     def flush(self) -> None:
-        return None
+        # Kept as the lifecycle hook used by inference cleanup.
+        self.finalize()
 
     def _load_manifest(self) -> dict:
         if self.manifest_path and os.path.isfile(self.manifest_path):
@@ -380,6 +512,8 @@ class _FileJournalManager:
             "workspace": self.workspace,
             "created_at": now,
             "updated_at": now,
+            "status": "active",
+            "finalized": False,
             "files": {},
         }
 
@@ -1813,8 +1947,10 @@ def _exec_shell(command: str, timeout: Optional[int] = None, background: bool = 
             with _active_processes_lock:
                 _active_processes.pop(session_id, None)
 
-    # Check if the process was killed externally (abort handler).
-    if _was_terminated_by_signal(proc):
+    # Check if the process was killed by a deliberate user abort (flag-based,
+    # not returncode-based — commands like ``pkill -f "xxx"`` may suicide and
+    # get any signal, which should NOT be reported as a user abort).
+    if _was_killed_by_abort_handler(session_id, proc):
         return json.dumps({
             "error": "Aborted",
             "message": "Command was aborted by user",

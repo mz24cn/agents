@@ -299,7 +299,11 @@ export const auth = {
 
 /** \u6784\u5efa\u4fe1\u606f API */
 export const build = {
-  info: () => request('GET', '/v1/build'),
+  info: () => request('GET', '/v1/setup?op=hello'),
+  update: (source, updatedSince) => request('POST', '/v1/update', {
+    source,
+    updated_since: updatedSince,
+  }),
 }
 
 /** AI代理 API */

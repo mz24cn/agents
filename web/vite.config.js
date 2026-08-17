@@ -1,5 +1,7 @@
 import { defineConfig } from 'vite'
 import { svelte } from '@sveltejs/vite-plugin-svelte'
+import { writeFileSync } from 'fs'
+import { resolve } from 'path'
 
 function pad2(v) {
   return String(v).padStart(2, '0')
@@ -16,11 +18,18 @@ function buildTimestamp() {
   return `${yy}${MM}${dd}_${hh}${mm}${ss}`
 }
 
+function buildVersionPlugin() {
+  return {
+    name: 'build-version',
+    closeBundle() {
+      const ts = buildTimestamp()
+      writeFileSync(resolve(__dirname, 'dist/build_version'), ts, 'utf-8')
+    }
+  }
+}
+
 export default defineConfig({
-  define: {
-    __BUILD_TIME__: JSON.stringify(buildTimestamp()),
-  },
-  plugins: [svelte()],
+  plugins: [svelte(), buildVersionPlugin()],
   server: {
     proxy: {
       '/v1': {

@@ -8,6 +8,7 @@ Test infrastructure:
     and AGENTS_WORKSPACE environment variable set.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -194,6 +195,73 @@ class TestFileJournalManager:
         manifest_path = journal_context / "file_journals" / "260511_102030" / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         assert manifest["files"]["dirty.txt"]["baseline"]["store"] == "sidecar"
+
+    def test_finalize_adds_missing_after_from_final_workspace_state(self, workspace, journal_context):
+        path = workspace / "changed.txt"
+        path.write_text("before\n", encoding="utf-8")
+        manager = _FileJournalManager(str(workspace), "session1", "2026-05-11T10:20:30", str(journal_context))
+        manager.ensure_baseline("edit_file", str(path))
+
+        # Simulate a later exec_shell/Python edit which bypasses record_after.
+        path.write_text("final state\n", encoding="utf-8")
+        result = manager.finalize()
+
+        manifest_path = journal_context / "file_journals" / "260511_102030" / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        entry = manifest["files"]["changed.txt"]
+        assert result["finalized"] is True
+        assert result["refreshed_files"] == ["changed.txt"]
+        assert entry["after"]["sha256"] != entry["baseline"]["sha256"]
+        assert manifest["status"] == "finalized"
+        assert manifest["finalized"] is True
+
+    def test_finalize_refreshes_stale_after(self, workspace, journal_context):
+        path = workspace / "changed.txt"
+        path.write_text("before\n", encoding="utf-8")
+        manager = _FileJournalManager(str(workspace), "session1", "2026-05-11T10:20:30", str(journal_context))
+        manager.ensure_baseline("edit_file", str(path))
+        path.write_text("intermediate\n", encoding="utf-8")
+        manager.record_after("edit_file", str(path))
+
+        path.write_text("final\n", encoding="utf-8")
+        manager.finalize()
+
+        manifest_path = journal_context / "file_journals" / "260511_102030" / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        entry = manifest["files"]["changed.txt"]
+        expected = hashlib.sha256(b"final\n").hexdigest()
+        assert entry["after"]["sha256"] == expected
+
+    def test_finalize_removes_noop_entry(self, workspace, journal_context):
+        path = workspace / "unchanged.txt"
+        path.write_text("same\n", encoding="utf-8")
+        manager = _FileJournalManager(str(workspace), "session1", "2026-05-11T10:20:30", str(journal_context))
+        manager.ensure_baseline("edit_file", str(path))
+
+        result = manager.finalize()
+
+        manifest_path = journal_context / "file_journals" / "260511_102030" / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert "unchanged.txt" not in manifest["files"]
+        assert result["removed_files"] == ["unchanged.txt"]
+
+    def test_new_snapshot_reopens_a_previously_finalized_manifest(self, workspace, journal_context):
+        path = workspace / "changed.txt"
+        path.write_text("before\n", encoding="utf-8")
+        manager = _FileJournalManager(str(workspace), "session1", "2026-05-11T10:20:30", str(journal_context))
+        manager.ensure_baseline("edit_file", str(path))
+        path.write_text("first\n", encoding="utf-8")
+        manager.record_after("edit_file", str(path))
+        manager.finalize()
+
+        path.write_text("second\n", encoding="utf-8")
+        manager.record_after("edit_file", str(path))
+
+        manifest_path = journal_context / "file_journals" / "260511_102030" / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert manifest["status"] == "active"
+        assert manifest["finalized"] is False
+        assert "finalized_at" not in manifest
 
 
 # ---------------------------------------------------------------------------
