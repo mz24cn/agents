@@ -10,7 +10,7 @@
   import { t } from '../../lib/i18n.svelte.js'
   import { highlight } from '../../lib/highlight.js'
 
-  let { msg, agentList = [], onRevoke, collapseButton = null, onCollapse, hasFileChanges = false, onToggleFileDiff, fileDiffData = null, fileDiffVisible = false, compact = false, replyDetailed = null, onToggleReplyMode } = $props()
+  let { msg, agentList = [], onRevoke, collapseButton = null, onCollapse, hasFileChanges = false, onToggleFileDiff, fileDiffData = null, fileDiffVisible = false, compact = false, replyDetailed = null, onToggleReplyMode, toolResultsById = {} } = $props()
 
   // ── Compact mode helpers ──
   /** Determine icon for tool result in compact mode */
@@ -199,7 +199,7 @@
       <MarkdownRenderer content={msg.content} />
     {/if}
     {#if msg.tool_calls}
-      <ToolCallCard toolCalls={msg.tool_calls} compact={true} />
+      <ToolCallCard toolCalls={msg.tool_calls} compact={true} {toolResultsById} />
     {/if}
   {:else if msg.role === 'tool'}
     {#if msg.sub_messages}

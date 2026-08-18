@@ -444,8 +444,8 @@ def test_continue_injects_interrupted_tool_result(continue_server, tmp_path):
     last_tool = sent["messages"][-1]
     assert last_tool["role"] == "tool"
     assert "interrupted" in last_tool["content"]
-    # the injected tool result references the dangling tool call id
-    assert last_tool.get("tool_use_id") == "call_1" or last_tool.get("tool_call_id") == "call_1"
+    # Internal Message uses tool_use_id; OpenAI wire format requires tool_call_id.
+    assert last_tool.get("tool_call_id") == "call_1"
 
 
 def test_continue_requires_existing_session(continue_server):

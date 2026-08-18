@@ -179,6 +179,35 @@
     return lines.join('\n')
   }
 
+  function getToolResultId(msg) {
+    return msg?.tool_use_id || null
+  }
+
+  function getCompactToolResults(block) {
+    const callIds = new Set()
+    for (let i = block.start; i <= block.end; i++) {
+      for (const tc of messages[i]?.tool_calls || []) {
+        const id = tc.id || tc.tool_use_id
+        if (id) callIds.add(id)
+      }
+    }
+    const results = {}
+    for (let i = block.start; i <= block.end; i++) {
+      const msg = messages[i]
+      // talk_to/sub-message results retain their existing standalone rendering.
+      const resultId = getToolResultId(msg)
+      if (msg?.role === 'tool' && !msg.sub_messages && resultId && callIds.has(resultId)) {
+        results[resultId] = msg
+      }
+    }
+    return results
+  }
+
+  function isMatchedToolResult(msg, toolResults) {
+    const resultId = getToolResultId(msg)
+    return msg?.role === 'tool' && resultId && toolResults[resultId]
+  }
+
   function isToolError(content) {
     const text = String(content ?? '')
     try {
@@ -310,6 +339,7 @@
             {#each group.compactAgentBlocks as block (block.start)}
               {@const blockAgent = getBlockAgent(block)}
               {@const blockStat = getBlockStat(block)}
+              {@const blockToolResults = getCompactToolResults(block)}
               <div class="agent-block compact" data-anchor={group.startIndex}>
                 <div class="agent-block-label">
                   {#if blockAgent}
@@ -331,7 +361,9 @@
                 <div class="agent-block-content">
                   {#each Array.from({ length: block.end - block.start + 1 }) as _, offset}
                     {@const msg = messages[block.start + offset]}
-                    <MessageBubble {msg} {agentList} {onRevoke} compact={true} />
+                    {#if !isMatchedToolResult(msg, blockToolResults)}
+                      <MessageBubble {msg} {agentList} {onRevoke} compact={true} toolResultsById={blockToolResults} />
+                    {/if}
                   {/each}
                 </div>
               </div>

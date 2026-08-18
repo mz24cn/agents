@@ -157,7 +157,7 @@ def _normalize_tool_call_order(messages: list) -> list:
     This is a defensive safety net on the request-serialization path; it is
     idempotent and a no-op for correctly ordered history.
     """
-    # Map tool_call_id -> index of the assistant message that declared it.
+    # Map tool_use_id -> index of the assistant message that declared it.
     assistant_idx_by_call_id: dict[str, int] = {}
     for i, m in enumerate(messages):
         if m.role != "assistant" or not m.tool_calls:

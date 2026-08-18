@@ -229,7 +229,7 @@ const translations = {
     collapseResult: '▾ 收起结果',
     expandResult: '▸ 展开结果',
     revoke: '撤回',
-    compactReply: '简洁回复',
+    compactReply: '紧凑回复',
     detailedReply: '详细回复',
     fileChanges: '变更文件',
     fileAdded: '新增',

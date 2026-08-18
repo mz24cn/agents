@@ -139,7 +139,7 @@ def _make_delegate_fn(runtime, thread_local):
         delegate 可调用函数
     """
     def delegate(model_id: str, tools: list[str], task: str, context: str = "", images: list[str] | None = None) -> str:
-        tool_call_id = "call_" + uuid.uuid4().hex[:8]
+        tool_use_id = "call_" + uuid.uuid4().hex[:8]
         session_id = getattr(thread_local, "session_id", None)
         current_depth = getattr(thread_local, "depth", 0)
         sse_callback = getattr(thread_local, "sse_callback", None)
@@ -202,7 +202,7 @@ def _make_delegate_fn(runtime, thread_local):
                                 sse_callback({
                                     "role": "tool",
                                     "name": "delegate",
-                                    "tool_call_id": tool_call_id,
+                                    "tool_use_id": tool_use_id,
                                     "streaming": True,
                                     "delta": msg.content,
                                     "depth": current_depth + 1,
@@ -235,7 +235,7 @@ def _make_delegate_fn(runtime, thread_local):
                     sse_callback({
                         "role": "tool",
                         "name": "delegate",
-                        "tool_call_id": tool_call_id,
+                        "tool_use_id": tool_use_id,
                         "streaming": False,
                     })
                 except Exception:
@@ -307,7 +307,7 @@ def _make_talk_to_fn(runtime, thread_local):
         talk_to 可调用函数
     """
     def talk_to(agents: list[str], message: str) -> str:
-        tool_call_id = "call_" + uuid.uuid4().hex[:8]
+        tool_use_id = "call_" + uuid.uuid4().hex[:8]
 
         # 捕获父线程上下文（子线程中 thread_local 是隔离的，需要显式传递）
         parent_session_id = getattr(thread_local, "session_id", None)
@@ -431,7 +431,7 @@ def _make_talk_to_fn(runtime, thread_local):
                                 parent_sse_callback({
                                     "role": "tool",
                                     "name": "talk_to",
-                                    "tool_call_id": tool_call_id,
+                                    "tool_use_id": tool_use_id,
                                     "streaming": True,
                                     "delta": msg.content,
                                     "depth": parent_depth + 1,
@@ -511,7 +511,7 @@ def _make_talk_to_fn(runtime, thread_local):
                 parent_sse_callback({
                     "role": "tool",
                     "name": "talk_to",
-                    "tool_call_id": tool_call_id,
+                    "tool_use_id": tool_use_id,
                     "streaming": False,
                     "agent_id": caller_agent_id,
                 })

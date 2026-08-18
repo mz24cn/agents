@@ -615,6 +615,19 @@
     return merged
   }
 
+  function getToolUseId(msg) {
+    return msg?.tool_use_id || null
+  }
+
+  function normalizeToolMessage(msg, overrides = {}) {
+    const toolUseId = getToolUseId(msg) || getToolUseId(overrides)
+    return {
+      ...msg,
+      ...overrides,
+      ...(toolUseId ? { tool_use_id: toolUseId } : {}),
+    }
+  }
+
   function onStreamMsg(msg, aIdxRef, pendingFirstUserMsg, keyRef) {
     if (msg.session_id && !msg.role) {
       // Migrate store key if backend assigns a new session ID mid-stream
@@ -683,10 +696,10 @@
     } else if (msg.role === 'tool') {
       if (msg.streaming === true) {
         const delta = msg.delta || ''
-        const tcId = msg.tool_call_id
+        const tcId = getToolUseId(msg)
         const isTalkTo = msg.name === 'talk_to'
         const existingIdx = tcId
-          ? msgs.findLastIndex(m => m.role === 'tool' && m.tool_call_id === tcId)
+          ? msgs.findLastIndex(m => m.role === 'tool' && getToolUseId(m) === tcId)
           : -1
 
         if (isTalkTo && msg.agent_id) {
@@ -703,12 +716,11 @@
               content: (prev?.content || '') + delta,
               streaming: true,
             }
-            arr[existingIdx] = {
+            arr[existingIdx] = normalizeToolMessage(msg, {
               ...existing,
-              ...msg,
               content: (existing.content || '') + delta,
               sub_messages: subMsgs,
-            }
+            })
             store.messages = arr
           } else {
             const subMsgs = {}
@@ -719,44 +731,40 @@
               content: delta,
               streaming: true,
             }
-            store.messages = [...msgs, {
+            store.messages = [...msgs, normalizeToolMessage(msg, {
               role: 'tool',
               name: msg.name || '',
               content: delta,
-              tool_call_id: tcId,
               streaming: true,
               sub_messages: subMsgs,
-              ...msg,
-            }]
+            })]
           }
         } else if (existingIdx >= 0) {
           // delegate / legacy tool streaming: concatenate to content
           const arr = [...msgs]
-          const newMsg = { ...arr[existingIdx], ...msg }
+          const newMsg = normalizeToolMessage(msg, { ...arr[existingIdx] })
           newMsg.content = (arr[existingIdx].content || '') + delta
           arr[existingIdx] = newMsg
           store.messages = arr
         } else {
-          store.messages = [...msgs, {
+          store.messages = [...msgs, normalizeToolMessage(msg, {
             role: 'tool',
             name: msg.name || '',
             content: delta,
-            tool_call_id: tcId,
             streaming: true,
-            ...msg
-          }]
+          })]
         }
         // 流式帧不重置 aIdxRef，让 assistant 消息继续累积
       } else if (msg.streaming === false) {
         // delegate / talk_to 结束帧：标记流式消息框已完成
-        const tcId = msg.tool_call_id
+        const tcId = getToolUseId(msg)
         const existingIdx = tcId
-          ? msgs.findLastIndex(m => m.role === 'tool' && m.tool_call_id === tcId)
+          ? msgs.findLastIndex(m => m.role === 'tool' && getToolUseId(m) === tcId)
           : -1
         if (existingIdx >= 0) {
           const arr = [...msgs]
           const existing = arr[existingIdx]
-          const newMsg = { ...existing, ...msg, streaming: false }
+          const newMsg = normalizeToolMessage(msg, { ...existing, streaming: false })
           if (msg.content) {
             newMsg.content = msg.content
           }
@@ -771,7 +779,7 @@
           arr[existingIdx] = newMsg
           store.messages = arr
         } else if (msg.content) {
-          store.messages = [...msgs, { role: 'tool', ...msg }]
+          store.messages = [...msgs, normalizeToolMessage(msg, { role: 'tool' })]
         }
         aIdxRef.value = -1
         // Group-chat: reset per-agent index so next assistant frame creates new bubble
@@ -781,7 +789,7 @@
         }
       } else {
         // 普通工具结果帧（write_file、exec_shell 等）
-        store.messages = [...msgs, { role: 'tool', ...msg }]
+        store.messages = [...msgs, normalizeToolMessage(msg, { role: 'tool' })]
         aIdxRef.value = -1
         // Group-chat: reset per-agent index
         if (aIdxRef.groupMode) {

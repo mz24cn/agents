@@ -23,21 +23,21 @@ def test_exception_isolation_property(error_message):
     assert "Error" in result, "异常时返回值应包含 'Error'"
 
 
-# Feature: multi-agent-collaboration, Property 6: tool_call_id 的唯一性
+# Feature: multi-agent-collaboration, Property 6: tool_use_id 的唯一性
 # Validates: Requirements 3.5
 @given(st.integers(min_value=2, max_value=20))
 @settings(max_examples=100)
-def test_tool_call_id_uniqueness_property(call_count):
-    """多次调用生成的 tool_call_id 互不相同。"""
+def test_tool_use_id_uniqueness_property(call_count):
+    """多次调用生成的 tool_use_id 互不相同。"""
     import uuid
 
     generated_ids = set()
     for _ in range(call_count):
-        tool_call_id = "call_" + uuid.uuid4().hex[:8]
-        generated_ids.add(tool_call_id)
+        tool_use_id = "call_" + uuid.uuid4().hex[:8]
+        generated_ids.add(tool_use_id)
 
     # 由于 UUID 随机性，生成的 ID 数量应等于调用次数（极低概率碰撞）
-    assert len(generated_ids) == call_count, "每次调用生成的 tool_call_id 应互不相同"
+    assert len(generated_ids) == call_count, "每次调用生成的 tool_use_id 应互不相同"
 
 
 # Feature: multi-agent-collaboration, Property 7: Subagent Session 路径在父目录下

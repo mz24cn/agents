@@ -17,6 +17,7 @@
 - **群聊（Group Chat）** — 多个已注册 AI 代理共享同一会话；支持 `@昵称`/`@AgentID`/`@all` 定向唤起与广播；成员回复中的 `@` 自动驱动下一轮（round 2+，已参与者去重防 ping-pong，轮次上限 `max_rounds` 默认 5）；每个成员使用自身模型与工具独立并行推理；消息携带身份（昵称/agent_id）在单一会话中持久化。详见 [群聊机制介绍](docs/introduce-group-chat.md)
 - **AI代理管理** — 将当前模型、工具和系统提示词配置保存为可复用的AI代理；在聊天界面中快速切换已保存的AI代理
 - **Web UI 管理控制台** — Svelte 5 SPA，支持模型、工具、提示词模板、AI代理管理和对话
+- **紧凑消息显示** — 对多 Agent 协作和长工具链对话按 Agent 回复块紧凑展示，并将工具调用与对应执行结果配对为可交互胶囊；参数和结果可分别点击或悬停展开，支持 JSON、Python、Shell 语法高亮与 Markdown 结果渲染，在保留完整执行细节的同时减少长会话的视觉占用
 - **服务级授权系统** — 面向单租户场景的可选授权机制，保护所有 `/v1/*` API；脚本/SDK 使用 Bearer API Key，Web UI 使用 HttpOnly Session Cookie；凭据以哈希形式保存在本地 `~/.agents_runtime/auth_token.json`，`/v1/setup` 导出链接使用短有效期 setup token
 - **HTTP API 服务** — 基于 `http.server` 的轻量 REST API，无需 FastAPI/uvicorn
 - **多模态** — 支持图片（base64）和音频输入，适配 VLM 模型；非 VLM 模型收到图片时，自动通过 `read_image` 工具调用 VLM 模型将图片转述为文本（需注册 `model_id` 或 `labels` 含 `read-image` 的 VLM 模型）

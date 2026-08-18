@@ -315,10 +315,11 @@ class OpenAIProtocol(BaseProtocol):
         # Handle tool result messages:
         # OpenAI API requires role="tool" with a tool_call_id
         if msg.role == "tool":
-            tool_call_id = msg.tool_use_id or "call_" + uuid.uuid4().hex[:8]
+            tool_use_id = msg.tool_use_id or "call_" + uuid.uuid4().hex[:8]
             return {
                 "role": "tool",
-                "tool_call_id": tool_call_id,
+                # OpenAI wire format requires this external field name.
+                "tool_call_id": tool_use_id,
                 "content": msg.content or "",
             }
 

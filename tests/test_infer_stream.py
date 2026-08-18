@@ -301,7 +301,7 @@ def test_infer_stream_unsupported_protocol() -> None:
     assert "unsupported" in messages[0].content.lower()
 
 
-def _make_openai_tool_calls_sse(tool_name: str, tool_call_id: str) -> io.BytesIO:
+def _make_openai_tool_calls_sse(tool_name: str, tool_use_id: str) -> io.BytesIO:
     """Build a fake OpenAI SSE stream containing a single tool_call delta."""
     chunk_json = json.dumps({
         "choices": [{
@@ -309,7 +309,7 @@ def _make_openai_tool_calls_sse(tool_name: str, tool_call_id: str) -> io.BytesIO
                 "role": "assistant",
                 "tool_calls": [{
                     "index": 0,
-                    "id": tool_call_id,
+                    "id": tool_use_id,
                     "type": "function",
                     "function": {"name": tool_name, "arguments": "{}"},
                 }],
