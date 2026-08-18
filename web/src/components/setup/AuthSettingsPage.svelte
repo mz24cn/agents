@@ -28,10 +28,12 @@
   let setupTokenExpiresAt = $state('')
   let frontend = $state('')
   let backend = $state('')
+  let lastConfig = $state('')
   let setupSource = $state('')
   let remoteFrontend = $state('')
   let remoteBackend = $state('')
-  let updateTimestamp = $state('')
+  let remoteConfig = $state('')
+  let updateAvailable = $state(false)
   let inferenceActive = $state(false)
   let checkingUpdate = $state(false)
   let applyingUpdate = $state(false)
@@ -43,7 +45,7 @@
   let linuxSetupCommand = $derived(`curl -fsSL ${setupLink} | sh`)
   let setupTokenExpiresDisplay = $derived(formatSetupTokenExpiresAt(setupTokenExpiresAt))
   let canCheckUpdate = $derived(!!setupSource.trim() && !checkingUpdate && !applyingUpdate)
-  let canApplyUpdate = $derived(!!updateTimestamp && !inferenceActive && !checkingUpdate && !applyingUpdate)
+  let canApplyUpdate = $derived(updateAvailable && !inferenceActive && !checkingUpdate && !applyingUpdate)
 
   function pad2(value) {
     return String(value).padStart(2, '0')
@@ -106,6 +108,7 @@
       const data = await build.info()
       frontend = data.frontend_build || ''
       backend = data.backend_build || ''
+      lastConfig = data.last_config || ''
       inferenceActive = !!data.inference_active
     } catch {
       // ignore
@@ -136,25 +139,31 @@
     updateMessage = ''
     remoteFrontend = ''
     remoteBackend = ''
-    updateTimestamp = ''
+    remoteConfig = ''
+    updateAvailable = false
     try {
       const response = await fetch(buildHelloUrl(setupSource), { cache: 'no-store' })
       if (!response.ok) throw new Error(`HTTP ${response.status}`)
       const data = await response.json()
       remoteFrontend = data.frontend_build || ''
       remoteBackend = data.backend_build || ''
-      const candidates = []
-      if (remoteFrontend && remoteFrontend > frontend) candidates.push(remoteFrontend)
-      if (remoteBackend && remoteBackend > backend) candidates.push(remoteBackend)
-      updateTimestamp = candidates.sort().at(-1) || ''
+      remoteConfig = data.last_config || ''
+      const hasUpdate = (
+        (remoteFrontend && remoteFrontend > frontend)
+        || (remoteBackend && remoteBackend > backend)
+        || (remoteConfig && remoteConfig > lastConfig)
+      )
+      updateAvailable = !!hasUpdate
+      const remoteVersions = [remoteFrontend, remoteBackend, remoteConfig].filter(Boolean).sort()
+      const remoteLatest = remoteVersions.at(-1) || ''
       const current = await build.info()
       inferenceActive = !!current.inference_active
-      if (!updateTimestamp) {
+      if (!hasUpdate) {
         updateMessage = t('updateAlreadyLatest')
       } else if (inferenceActive) {
         updateMessage = t('updateAvailableButBusy')
       } else {
-        updateMessage = t('updateAvailable', { version: updateTimestamp })
+        updateMessage = t('updateAvailable', { version: remoteLatest })
       }
     } catch (err) {
       updateError = t('checkUpdateFailed', { error: err?.message || err })
@@ -168,7 +177,7 @@
     updateError = ''
     updateMessage = t('updateApplying')
     try {
-      const data = await build.update(setupSource.trim(), updateTimestamp)
+      const data = await build.update(setupSource.trim(), frontend, backend, lastConfig)
       if (!data.updated) {
         updateMessage = t('updateNoFiles')
         return
@@ -328,6 +337,10 @@
                 <span class="build-label">{t('buildBackend')}</span>
                 <code class="build-value">{backend || '-'}</code>
               </div>
+              <div class="build-row">
+                <span class="build-label">{t('buildConfig')}</span>
+                <code class="build-value">{lastConfig || '-'}</code>
+              </div>
             </div>
             <div class="update-panel">
               <div class="update-controls">
@@ -338,7 +351,8 @@
                   oninput={() => {
                     remoteFrontend = ''
                     remoteBackend = ''
-                    updateTimestamp = ''
+                    remoteConfig = ''
+                    updateAvailable = false
                     updateMessage = ''
                     updateError = ''
                   }}
@@ -350,17 +364,19 @@
                   {applyingUpdate ? t('applyingUpdate') : t('applyUpdate')}
                 </button>
               </div>
-              {#if remoteFrontend || remoteBackend}
-                <div class="remote-builds">
-                  <span>{t('remoteFrontend')} <code>{remoteFrontend || '-'}</code></span>
-                  <span>{t('remoteBackend')} <code>{remoteBackend || '-'}</code></span>
+              {#if remoteFrontend || remoteBackend || remoteConfig || updateMessage || updateError}
+                <div class="update-result-line" class:update-error={!!updateError}>
+                  {#if remoteFrontend || remoteBackend || remoteConfig}
+                    <span>{t('remoteFrontend')} <code>{remoteFrontend || '-'}</code></span>
+                    <span>{t('remoteBackend')} <code>{remoteBackend || '-'}</code></span>
+                    <span>{t('remoteConfig')} <code>{remoteConfig || '-'}</code></span>
+                  {/if}
+                  {#if updateError}
+                    <span>{updateError}</span>
+                  {:else if updateMessage}
+                    <span>{updateMessage}</span>
+                  {/if}
                 </div>
-              {/if}
-              {#if updateMessage}
-                <div class="hint">{updateMessage}</div>
-              {/if}
-              {#if updateError}
-                <div class="hint update-error">{updateError}</div>
               {/if}
             </div>
           </div>
@@ -763,18 +779,21 @@
     grid-template-columns: minmax(0, 1fr) auto auto;
     gap: 8px;
   }
-  .remote-builds {
+  .update-result-line {
     display: flex;
+    align-items: center;
     flex-wrap: wrap;
-    gap: 8px 18px;
+    gap: 6px 16px;
+    min-height: 24px;
     color: var(--text-secondary);
     font-size: 0.84rem;
+    line-height: 1.35;
   }
-  .remote-builds code {
+  .update-result-line code {
     color: var(--text);
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   }
-  .update-error {
+  .update-result-line.update-error {
     color: var(--danger);
   }
   @media (max-width: 720px) {

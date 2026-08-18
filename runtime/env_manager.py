@@ -141,27 +141,22 @@ class EnvManager:
             return self._render_setup_script_ps1(encoded).encode("utf-8")
         raise ValueError(f"Unsupported setup script format: {script_format}")
 
-    def build_incremental_tar(
+    def build_delta_tar(
         self,
         *,
         project_root: str,
-        updated_since: float,
         data_dir: str,
+        frontend_since: float,
+        backend_since: float,
+        config_since: float,
     ) -> bytes | None:
-        """扫描 project_root，收集 updated_since 时间戳（Unix epoch）之后修改过的文件，
-        打包为 tar.gz 返回。若无变化返回 None。
-
-        Args:
-            project_root: 项目根目录（app 代码所在）。
-            updated_since: Unix epoch 秒数，仅包含 mtime >= 此值的文件。
-            data_dir: 运行时数据目录（用于补充配置文件变化检测）。
-        """
+        """Build a minimal tar.gz delta using independent version thresholds."""
         project_root = os.path.realpath(project_root)
-        # 排除目录（与 _copy_project 保持一致）
+        data_dir = os.path.realpath(data_dir)
+        web_dist_real = os.path.realpath(os.path.join(project_root, "web", "dist"))
         exclude_dirs = {".git", "__pycache__", ".pytest_cache", ".hypothesis", ".mypy_cache",
                         ".ruff_cache", "node_modules", "dist", "build", ".venv", "venv",
                         "workspace"}
-        web_dist_real = os.path.realpath(os.path.join(project_root, "web", "dist"))
 
         def should_exclude(path_real: str, name: str) -> bool:
             if path_real == web_dist_real:
@@ -170,43 +165,73 @@ class EnvManager:
                 return True
             return name in exclude_dirs
 
-        collected: list[str] = []
-        # —— 扫描项目根目录 ——
+        collected: dict[str, str] = {}
+
+        # Project files: web/dist uses frontend threshold; all other included
+        # project files use the backend threshold.
+        web_root_real = os.path.realpath(os.path.join(project_root, "web"))
         for dirpath, dirnames, filenames in os.walk(project_root):
             dir_real = os.path.realpath(dirpath)
-            # 剔除应排除的子目录（os.walk 会跳过被修改的 dirnames）
-            dirnames[:] = [
-                d for d in dirnames
-                if not should_exclude(os.path.join(dir_real, d), d)
-            ]
-            # 跳过根目录级别的排除目录（针对 dirpath 自身）
-            rel = os.path.relpath(dir_real, project_root)
-            if rel != ".":
-                segs = rel.replace("\\", "/").split("/")
-                base_seg = segs[0]
-                base_path = os.path.join(project_root, base_seg)
-                if should_exclude(os.path.realpath(base_path), base_seg):
+            if dir_real == web_root_real:
+                # Only compiled frontend output is deployable delta content.
+                dirnames[:] = [d for d in dirnames if d == "dist"]
+                filenames = []
+            else:
+                dirnames[:] = [
+                    d for d in dirnames
+                    if not should_exclude(os.path.realpath(os.path.join(dir_real, d)), d)
+                ]
+            rel_dir = os.path.relpath(dir_real, project_root)
+            if rel_dir != ".":
+                first = rel_dir.replace("\\", "/").split("/")[0]
+                first_path = os.path.realpath(os.path.join(project_root, first))
+                if should_exclude(first_path, first):
                     dirnames.clear()
                     continue
-            for fname in filenames:
-                fpath = os.path.join(dir_real, fname)
+            in_web_dist = os.path.commonpath([web_dist_real, dir_real]) == web_dist_real
+            threshold = frontend_since if in_web_dist else backend_since
+            for filename in filenames:
+                fpath = os.path.join(dir_real, filename)
                 try:
-                    mtime = os.path.getmtime(fpath)
+                    if os.path.islink(fpath) or int(os.path.getmtime(fpath)) <= int(threshold):
+                        continue
                 except OSError:
                     continue
-                if mtime >= updated_since:
-                    collected.append(fpath)
+                arcname = os.path.relpath(fpath, project_root).replace("\\", "/")
+                collected[arcname] = fpath
 
-        # —— 跳过 symbol link ——
-        collected = [p for p in collected if not os.path.islink(p)]
+        # Runtime configuration files use their own independent threshold.
+        for filename in ("models.json", "tools.json", "mcp_servers.json", "prompt_templates.json"):
+            fpath = os.path.join(data_dir, filename)
+            try:
+                if (os.path.isfile(fpath) and not os.path.islink(fpath)
+                        and int(os.path.getmtime(fpath)) > int(config_since)):
+                    collected[f"agents_runtime/{filename}"] = fpath
+            except OSError:
+                continue
+
+        agents_dir = os.path.join(data_dir, "agents")
+        if os.path.isdir(agents_dir):
+            for dirpath, dirnames, filenames in os.walk(agents_dir):
+                dirnames[:] = [d for d in dirnames if not os.path.islink(os.path.join(dirpath, d))]
+                for filename in filenames:
+                    if not filename.endswith(".json"):
+                        continue
+                    fpath = os.path.join(dirpath, filename)
+                    try:
+                        if os.path.islink(fpath) or int(os.path.getmtime(fpath)) <= int(config_since):
+                            continue
+                    except OSError:
+                        continue
+                    relative = os.path.relpath(fpath, agents_dir).replace("\\", "/")
+                    collected[f"agents_runtime/agents/{relative}"] = fpath
 
         if not collected:
             return None
 
         bio = BytesIO()
         with tarfile.open(fileobj=bio, mode="w:gz") as tar:
-            for fpath in collected:
-                arcname = os.path.relpath(fpath, project_root).replace("\\", "/")
+            for arcname, fpath in sorted(collected.items()):
                 try:
                     tar.add(fpath, arcname=arcname, filter=self._setup_tar_filter)
                 except OSError as exc:

@@ -300,10 +300,16 @@ export const auth = {
 /** \u6784\u5efa\u4fe1\u606f API */
 export const build = {
   info: () => request('GET', '/v1/setup?op=hello'),
-  update: (source, updatedSince) => request('POST', '/v1/update', {
-    source,
-    updated_since: updatedSince,
-  }),
+  update: (source, frontendBuild, backendBuild, lastConfig) => {
+    const params = new URLSearchParams({
+      op: 'update',
+      source,
+      frontend_build: frontendBuild,
+      backend_build: backendBuild,
+      last_config: lastConfig,
+    })
+    return request('GET', `/v1/setup?${params.toString()}`)
+  },
 }
 
 /** AI代理 API */

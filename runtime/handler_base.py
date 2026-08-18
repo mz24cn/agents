@@ -94,7 +94,6 @@ _ROUTES: dict[str, list] = {
         (re.compile(r"^/v1/auth/login$"), "_handle_auth_login", ()),
         (re.compile(r"^/v1/auth/logout$"), "_handle_auth_logout", ()),
         (re.compile(r"^/v1/auth/config$"), "_handle_auth_config_post", ()),
-        (re.compile(r"^/v1/update$"), "_handle_update", ()),
         (re.compile(r"^/v1/infer$"), "_handle_infer", ()),
         (re.compile(r"^/v1/infer/stream$"), "_handle_infer_stream", ()),
         (re.compile(r"^/v1/infer/abort$"), "_handle_infer_abort", ()),
@@ -305,12 +304,12 @@ class HandlerBaseMixin:
         if not auth_manager.is_enabled():
             return True
 
-        # Short-lived setup token grants access only to /v1/setup.
+        # /v1/setup is public only for GET op=hello. All other setup
+        # operations follow normal authorization and may use a setup token.
         if method == "GET" and path == "/v1/setup":
             parsed = urllib.parse.urlparse(self.path)
             params = urllib.parse.parse_qs(parsed.query)
-            # op=hello is public (no auth required), same as static files.
-            if params.get("op", [""])[0] == "hello":
+            if method == "GET" and params.get("op", [""])[0] == "hello":
                 return True
             token = params.get("token", [""])[0]
             if token and auth_manager.verify_setup_token(token):

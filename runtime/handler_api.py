@@ -25,6 +25,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
+from runtime.agent_manager import validate_agent_id
 from runtime.common import session_timestamp
 from runtime.context_manager import JournalConflictError
 from runtime.models import ModelConfig, ToolConfig
@@ -867,12 +868,11 @@ class HandlerApiMixin:
     def _handle_setup_script(self) -> None:
         """GET /v1/setup -- multi-purpose endpoint.
 
-        Query parameters:
-          op=hello       Public: returns version info (frontend + backend build times).
-          op=update      Needs setup token: returns self-extracting setup script
-                         (same as when no op is given).
-          (no op)        Needs setup token: returns self-extracting setup script.
-          updated_since  Optional incremental-update parameter (any op).
+        Operations:
+          GET  op=hello   Public version and inference status query.
+          GET  op=delta   Authorized minimal tar.gz delta using three version thresholds.
+          GET  op=update  Authorized: download remote delta and apply it locally.
+          GET  no op      Authorized full self-extracting setup script.
         """
         import os
         import datetime
@@ -909,12 +909,39 @@ class HandlerApiMixin:
                 build_dt = datetime.datetime.fromtimestamp(latest_mtime)
                 backend = build_dt.strftime("%y%m%d_%H%M%S")
 
+            config_mtime: float = 0.0
+            data_dir = self.server.data_dir
+            config_paths = [
+                os.path.join(data_dir, "models.json"),
+                os.path.join(data_dir, "tools.json"),
+                os.path.join(data_dir, "mcp_servers.json"),
+                os.path.join(data_dir, "prompt_templates.json"),
+            ]
+            agents_dir = os.path.join(data_dir, "agents")
+            if os.path.isdir(agents_dir):
+                for root, _dirs, files in os.walk(agents_dir):
+                    config_paths.extend(
+                        os.path.join(root, filename)
+                        for filename in files
+                        if filename.endswith(".json")
+                    )
+            for path in config_paths:
+                try:
+                    if os.path.isfile(path):
+                        config_mtime = max(config_mtime, os.path.getmtime(path))
+                except OSError:
+                    continue
+            last_config = ""
+            if config_mtime > 0:
+                last_config = datetime.datetime.fromtimestamp(config_mtime).strftime("%y%m%d_%H%M%S")
+
             inference_active = bool(getattr(self.server, "active_streams", {})) or bool(
                 int(getattr(self.server, "active_inference_count", 0) or 0)
             )
             self._send_json_response(200, {
                 "frontend_build": frontend,
                 "backend_build": backend,
+                "last_config": last_config,
                 "inference_active": inference_active,
             })
             return
@@ -923,42 +950,51 @@ class HandlerApiMixin:
         project_root = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
         data_dir = self.server.data_dir
 
-        # ---- try parse updated_since parameter ----
-        updated_since_str = self._get_query_param("updated_since")
-        updated_since: float | None = None
-        if updated_since_str:
-            try:
-                updated_since = self._parse_updated_since(updated_since_str)
-                if updated_since <= 0:
-                    updated_since = None
-            except (ValueError, TypeError):
-                updated_since = None
+        if op == "update":
+            self._handle_setup_update()
+            return
 
-        # ---- incremental tar.gz branch ----
-        if updated_since is not None:
+        if op == "delta":
+            if self.command != "GET":
+                self._send_json_error(405, "op=delta requires GET")
+                return
             try:
-                tar_data = env_manager.build_incremental_tar(
+                frontend_since = self._parse_build_version(
+                    self._get_query_param("frontend_build", ""), allow_empty=True)
+                backend_since = self._parse_build_version(
+                    self._get_query_param("backend_build", ""), allow_empty=True)
+                config_since = self._parse_build_version(
+                    self._get_query_param("last_config", ""), allow_empty=True)
+            except (ValueError, TypeError):
+                self._send_json_error(400, "Invalid or missing build version parameter")
+                return
+            try:
+                tar_data = env_manager.build_delta_tar(
                     project_root=project_root,
                     data_dir=data_dir,
-                    updated_since=updated_since,
+                    frontend_since=frontend_since,
+                    backend_since=backend_since,
+                    config_since=config_since,
                 )
             except Exception as exc:
-                logger.exception("Failed to build incremental tar: %s", exc)
-                self._send_json_error(500, f"Failed to build incremental tar: {exc}")
+                logger.exception("Failed to build delta tar: %s", exc)
+                self._send_json_error(500, f"Failed to build delta tar: {exc}")
                 return
-
             if tar_data is None:
                 self.send_response(304)
                 self.end_headers()
                 return
-
             self.send_response(200)
             self.send_header("Content-Type", "application/gzip")
-            self.send_header("Content-Disposition", 'inline; filename="incremental.tar.gz"')
+            self.send_header("Content-Disposition", 'inline; filename="delta.tar.gz"')
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(tar_data)))
             self.end_headers()
             self.wfile.write(tar_data)
+            return
+
+        if op:
+            self._send_json_error(400, f"Unsupported setup op: {op}")
             return
 
         # ---- full self-extracting script branch ----
@@ -991,21 +1027,21 @@ class HandlerApiMixin:
         self.end_headers()
         self.wfile.write(script)
 
-    def _handle_update(self) -> None:
-        """POST /v1/update -- download and apply an incremental setup package."""
-        body = self._read_json_body()
-        if body is None:
-            return
-
-        source = str(body.get("source", "")).strip()
-        updated_since = str(body.get("updated_since", "")).strip()
+    def _handle_setup_update(self) -> None:
+        """Download a remote setup delta and apply it to the local environment."""
+        source = str(self._get_query_param("source", "")).strip()
+        frontend_build = str(self._get_query_param("frontend_build", "")).strip()
+        backend_build = str(self._get_query_param("backend_build", "")).strip()
+        last_config = str(self._get_query_param("last_config", "")).strip()
         if not source:
             self._send_json_error(400, "Missing required field: source")
             return
         try:
-            self._parse_updated_since(updated_since)
+            self._parse_build_version(frontend_build, allow_empty=True)
+            self._parse_build_version(backend_build, allow_empty=True)
+            self._parse_build_version(last_config, allow_empty=True)
         except (ValueError, TypeError):
-            self._send_json_error(400, "Invalid updated_since; expected YYMMdd_HHmmss")
+            self._send_json_error(400, "Invalid or missing local build version")
             return
 
         # Atomically block new inference requests while checking/applying update.
@@ -1045,8 +1081,14 @@ class HandlerApiMixin:
         else:
             setup_path = "/v1/setup"
         query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-        query = [(key, value) for key, value in query if key != "updated_since" and key != "op"]
-        query.extend([("op", "update"), ("updated_since", updated_since)])
+        managed_keys = {"op", "frontend_build", "backend_build", "last_config"}
+        query = [(key, value) for key, value in query if key not in managed_keys]
+        query.extend([
+            ("op", "delta"),
+            ("frontend_build", frontend_build),
+            ("backend_build", backend_build),
+            ("last_config", last_config),
+        ])
         update_url = urllib.parse.urlunsplit((
             parsed.scheme,
             parsed.netloc,
@@ -1073,6 +1115,7 @@ class HandlerApiMixin:
             return
 
         restart_backend = False
+        config_updated = False
         updated_files: list[str] = []
         try:
             with tempfile.TemporaryDirectory(prefix="agent-update-") as tmp_dir:
@@ -1100,20 +1143,65 @@ class HandlerApiMixin:
                     for filename in filenames:
                         source_path = os.path.join(dirpath, filename)
                         relative = os.path.relpath(source_path, extract_dir)
-                        target_path = os.path.realpath(os.path.join(project_root, relative))
-                        if os.path.commonpath([project_root, target_path]) != project_root:
-                            raise ValueError(f"Update file escapes project root: {relative}")
+                        relative_posix = relative.replace("\\", "/")
+                        if relative_posix.startswith("agents_runtime/"):
+                            config_relative = relative_posix[len("agents_runtime/"):]
+                            target_root = os.path.realpath(self.server.data_dir)
+                            target_path = os.path.realpath(os.path.join(target_root, config_relative))
+                            if os.path.commonpath([target_root, target_path]) != target_root:
+                                raise ValueError(f"Update config escapes DATA_DIR: {relative}")
+                            config_updated = True
+                        else:
+                            target_root = project_root
+                            target_path = os.path.realpath(os.path.join(target_root, relative))
+                            if os.path.commonpath([target_root, target_path]) != target_root:
+                                raise ValueError(f"Update file escapes project root: {relative}")
                         os.makedirs(os.path.dirname(target_path), exist_ok=True)
                         shutil.copy2(source_path, target_path)
-                        relative_posix = relative.replace("\\", "/")
                         updated_files.append(relative_posix)
-                        if relative_posix.endswith(".py"):
+                        if not relative_posix.startswith("agents_runtime/") and relative_posix.endswith(".py"):
                             restart_backend = True
         except (OSError, tarfile.TarError, ValueError) as exc:
             release_update_lock()
             logger.exception("Failed to apply update: %s", exc)
             self._send_json_error(500, f"Failed to apply update: {exc}")
             return
+
+        if config_updated:
+            try:
+                runtime = self._get_runtime()
+                models_path = os.path.join(self.server.data_dir, "models.json")
+                tools_path = os.path.join(self.server.data_dir, "tools.json")
+                mcp_path = os.path.join(self.server.data_dir, "mcp_servers.json")
+                templates_path = os.path.join(self.server.data_dir, "prompt_templates.json")
+                if os.path.isfile(models_path):
+                    runtime._model_registry.load(models_path)
+                if os.path.isfile(tools_path):
+                    runtime._tool_registry.load(tools_path)
+                    from runtime.builtin_tools import register_builtin_tools
+                    register_builtin_tools(runtime._tool_registry, runtime=runtime)
+                    skill_manager = getattr(runtime, "_skill_manager", None)
+                    if skill_manager is not None:
+                        for tool_config in runtime._tool_registry.list_by_type("skill"):
+                            if tool_config.skill_dir:
+                                try:
+                                    skill_manager.load_skill(tool_config.skill_dir)
+                                except ValueError:
+                                    pass
+                if os.path.isfile(mcp_path):
+                    with open(mcp_path, "r", encoding="utf-8") as fh:
+                        mcp_config = json.load(fh)
+                    runtime._mcp_manager.disconnect_all()
+                    runtime._mcp_manager._connections.clear()
+                    runtime._mcp_manager.load_config(mcp_config, runtime._tool_registry)
+                if os.path.isfile(templates_path):
+                    self.server.prompt_template_manager.load(templates_path)
+                self.server.agent_manager.load()
+            except Exception as exc:
+                release_update_lock()
+                logger.exception("Updated configuration files but failed to reload them: %s", exc)
+                self._send_json_error(500, f"Configuration updated but reload failed: {exc}")
+                return
 
         # Frontend-only updates can immediately re-enable inference. If Python
         # files changed, keep inference blocked until execv replaces the process.
@@ -1141,15 +1229,13 @@ class HandlerApiMixin:
             timer.start()
 
     @staticmethod
-    def _parse_updated_since(value: str) -> float:
-        """解析 YYMMDD_hhmmss 格式为 Unix 时间戳（float）。
-
-        格式示例: 250101_120000 → 2025-01-01 12:00:00 UTC
-        """
+    def _parse_build_version(value: str, *, allow_empty: bool = False) -> float:
+        """Parse YYMMdd_HHmmss into local epoch seconds; empty may mean baseline 0."""
         value = value.strip()
         if not value:
+            if allow_empty:
+                return 0.0
             raise ValueError("empty value")
-        # 支持 YYMMDD_hhmmss 格式
         dt = datetime.datetime.strptime(value, "%y%m%d_%H%M%S")
         return dt.timestamp()
 
@@ -1505,6 +1591,11 @@ class HandlerApiMixin:
                 self._send_json_error(400, f"Missing required field: {field}")
                 return
         agent_id = body.get("agent_id") or session_timestamp()
+        try:
+            validate_agent_id(agent_id)
+        except ValueError as exc:
+            self._send_json_error(400, str(exc))
+            return
         self.server.agent_manager.create(  # type: ignore[attr-defined]
             agent_id=agent_id,
             model_id=body["model_id"],
@@ -1525,6 +1616,12 @@ class HandlerApiMixin:
         body = self._read_json_body()
         if body is None:
             return
+        if "agent_id" in body:
+            try:
+                validate_agent_id(body["agent_id"])
+            except ValueError as exc:
+                self._send_json_error(400, str(exc))
+                return
         updated = self.server.agent_manager.update(agent_id, body)  # type: ignore[attr-defined]
         if updated is None:
             self._send_json_error(404, f"Agent not found: {agent_id}")
