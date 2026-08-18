@@ -74,6 +74,21 @@
   let previewFile = $state(null)
   let previewContent = $state('')
   let previewReturnView = $state('list')
+  let previewSearchQuery = $state('')
+  let previewSearchCurrent = $state(-1)
+  let previewSearchTotal = $state(0)
+  let textPreviewEl = $state(null)
+  let previewSearchMatches = []
+  // 选中的文件文件名加粗，前面的目录部分保持普通字重
+  function getPreviewPathParts(file) {
+    const path = file?.path || file?.name || ''
+    const lastSeparator = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'))
+    if (lastSeparator < 0) return { directory: '', name: path }
+    return {
+      directory: path.slice(0, lastSeparator + 1),
+      name: path.slice(lastSeparator + 1),
+    }
+  }
   // 选中的文件
   let selectedFiles = $state(new Set())
   // 右键菜单
@@ -864,6 +879,7 @@
       return // 不支持预览的文件类型
     }
     
+    resetPreviewSearch()
     previewReturnView = viewMode
     previewFile = {
       ...file,
@@ -890,6 +906,7 @@
   async function openAsTextFile(file) {
     if (!file || file.is_dir) return
     
+    resetPreviewSearch()
     previewReturnView = viewMode
     previewFile = { ...file, is_text: true, is_image: false, is_audio: false, is_video: false, forcePlainText: true }
     viewMode = 'preview'
@@ -904,7 +921,95 @@
     }
   }
 
+  function clearPreviewSearchHighlights() {
+    if (!textPreviewEl) return
+    const marks = textPreviewEl.querySelectorAll('mark.preview-search-match')
+    for (const mark of marks) {
+      mark.replaceWith(document.createTextNode(mark.textContent || ''))
+    }
+    textPreviewEl.normalize()
+    previewSearchMatches = []
+    previewSearchCurrent = -1
+    previewSearchTotal = 0
+  }
+
+  async function updatePreviewSearch() {
+    await tick()
+    clearPreviewSearchHighlights()
+    const query = previewSearchQuery
+    if (!query || !textPreviewEl) return
+
+    const lowerQuery = query.toLocaleLowerCase()
+    const walker = document.createTreeWalker(textPreviewEl, NodeFilter.SHOW_TEXT)
+    const textNodes = []
+    let node
+    while ((node = walker.nextNode())) textNodes.push(node)
+
+    for (const textNode of textNodes) {
+      const text = textNode.nodeValue || ''
+      const lowerText = text.toLocaleLowerCase()
+      const indexes = []
+      let fromIndex = 0
+      while (fromIndex <= lowerText.length - lowerQuery.length) {
+        const index = lowerText.indexOf(lowerQuery, fromIndex)
+        if (index < 0) break
+        indexes.push(index)
+        fromIndex = index + Math.max(query.length, 1)
+      }
+      if (!indexes.length) continue
+
+      const fragment = document.createDocumentFragment()
+      let cursor = 0
+      for (const index of indexes) {
+        fragment.append(document.createTextNode(text.slice(cursor, index)))
+        const mark = document.createElement('mark')
+        mark.className = 'preview-search-match'
+        mark.textContent = text.slice(index, index + query.length)
+        fragment.append(mark)
+        previewSearchMatches.push(mark)
+        cursor = index + query.length
+      }
+      fragment.append(document.createTextNode(text.slice(cursor)))
+      textNode.replaceWith(fragment)
+    }
+
+    previewSearchTotal = previewSearchMatches.length
+    if (previewSearchTotal > 0) {
+      previewSearchCurrent = 0
+      focusPreviewSearchMatch()
+    }
+  }
+
+  function focusPreviewSearchMatch() {
+    for (const [index, match] of previewSearchMatches.entries()) {
+      match.classList.toggle('current', index === previewSearchCurrent)
+    }
+    previewSearchMatches[previewSearchCurrent]?.scrollIntoView({ block: 'center', inline: 'nearest' })
+  }
+
+  function movePreviewSearch(direction) {
+    if (!previewSearchTotal) return
+    previewSearchCurrent = (previewSearchCurrent + direction + previewSearchTotal) % previewSearchTotal
+    focusPreviewSearchMatch()
+  }
+
+  function handlePreviewSearchKeydown(event) {
+    if (event.key === 'Enter') {
+      event.preventDefault()
+      movePreviewSearch(event.shiftKey ? -1 : 1)
+    } else if (event.key === 'Escape') {
+      previewSearchQuery = ''
+      updatePreviewSearch()
+    }
+  }
+
+  function resetPreviewSearch() {
+    clearPreviewSearchHighlights()
+    previewSearchQuery = ''
+  }
+
   function closePreview() {
+    resetPreviewSearch()
     viewMode = previewReturnView
     previewFile = null
     previewContent = ''
@@ -1995,13 +2100,49 @@
 
     <!-- 预览模式 -->
     {#if previewFile}
+      {@const previewPathParts = getPreviewPathParts(previewFile)}
       <div class="preview-overlay">
         <div class="preview-header">
-          <span>{previewFile.name}</span>
+          <div class="preview-file-path" title={previewFile.path || previewFile.name}>
+            <span>{previewPathParts.directory}</span><strong>{previewPathParts.name}</strong>
+          </div>
           <div class="preview-header-actions">
             {#if previewFile.is_text}
+              <div class="preview-search-controls">
+                <button
+                  class="preview-search-nav"
+                  onclick={() => movePreviewSearch(-1)}
+                  disabled={!previewSearchTotal}
+                  title="上一个匹配项"
+                  aria-label="上一个匹配项"
+                >←</button>
+                <div class="preview-search-input-wrap">
+                  <input
+                    class="preview-search-input"
+                    type="text"
+                    placeholder={t('search')}
+                    bind:value={previewSearchQuery}
+                    oninput={updatePreviewSearch}
+                    onkeydown={handlePreviewSearchKeydown}
+                    aria-label="搜索预览内容"
+                  />
+                  {#if previewSearchQuery}
+                    <span class="preview-search-count">
+                      {previewSearchTotal ? previewSearchCurrent + 1 : 0}/{previewSearchTotal}
+                    </span>
+                  {/if}
+                </div>
+                <button
+                  class="preview-search-nav"
+                  onclick={() => movePreviewSearch(1)}
+                  disabled={!previewSearchTotal}
+                  title="下一个匹配项"
+                  aria-label="下一个匹配项"
+                >→</button>
+              </div>
               <button class="preview-copy-btn" onclick={() => copyToClipboard(previewContent)} title={t('copy')}>📋</button>
             {/if}
+            <button class="preview-download-btn" onclick={() => downloadFile(previewFile)} title={t('download')} aria-label={t('download')}>⬇</button>
             <button onclick={() => closePreview()}>✕</button>
           </div>
         </div>
@@ -2014,7 +2155,7 @@
         {:else if previewFile.is_pdf || previewFile.is_docx}
           <DocumentPreview file={previewFile} url={workspaceApi.content(previewFile.path, false)} />
         {:else if previewFile.is_text}
-          <div class="text-preview">{@html renderPreviewHtml(previewContent, previewFile.name, previewFile.forcePlainText, previewFile.path)}</div>
+          <div class="text-preview" bind:this={textPreviewEl}>{@html renderPreviewHtml(previewContent, previewFile.name, previewFile.forcePlainText, previewFile.path)}</div>
         {/if}
       </div>
     {/if}
@@ -2681,6 +2822,22 @@
     background: var(--bg-secondary);
   }
 
+  .preview-file-path {
+    min-width: 0;
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-secondary);
+    font-family: 'Fira Code', 'Consolas', monospace;
+    font-size: 0.82rem;
+  }
+
+  .preview-file-path strong {
+    color: var(--text);
+    font-weight: 700;
+  }
+
   .preview-header button {
     background: none;
     border: none;
@@ -2689,19 +2846,79 @@
     color: var(--text);
   }
 
+  .preview-header button:disabled {
+    opacity: 0.35;
+    cursor: default;
+  }
+
   .preview-header-actions {
     display: flex;
     align-items: center;
     gap: 6px;
+    flex-shrink: 0;
+    margin-left: 12px;
   }
 
-  .preview-copy-btn {
+  .preview-search-controls {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+  }
+
+  .preview-search-input-wrap {
+    position: relative;
+    display: flex;
+    align-items: center;
+  }
+
+  .preview-search-input {
+    width: 180px;
+    height: 26px;
+    box-sizing: border-box;
+    padding: 3px 48px 3px 8px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 0.8rem;
+    outline: none;
+  }
+
+  .preview-search-input:focus {
+    border-color: var(--primary);
+    box-shadow: 0 0 0 1px var(--primary);
+  }
+
+  .preview-search-count {
+    position: absolute;
+    right: 7px;
+    color: var(--text-secondary);
+    font-size: 0.7rem;
+    pointer-events: none;
+  }
+
+  .preview-header .preview-search-nav {
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    border-radius: 4px;
+    font-size: 0.9rem;
+    line-height: 1;
+  }
+
+  .preview-header .preview-search-nav:hover:not(:disabled) {
+    background: var(--bg-tertiary, rgba(0,0,0,0.1));
+  }
+
+  .preview-copy-btn,
+  .preview-download-btn {
     font-size: 0.85rem !important;
     padding: 2px 6px;
     border-radius: 4px;
     transition: background 0.15s;
   }
-  .preview-copy-btn:hover {
+  .preview-copy-btn:hover,
+  .preview-download-btn:hover {
     background: var(--bg-tertiary, rgba(0,0,0,0.1));
   }
 
@@ -2734,6 +2951,19 @@
     font-size: 0.85rem;
     line-height: 1.5;
     word-break: break-word;
+  }
+
+  .text-preview :global(mark.preview-search-match) {
+    background: #ffe066;
+    color: #1f2328;
+    border-radius: 2px;
+    padding: 0;
+  }
+
+  .text-preview :global(mark.preview-search-match.current) {
+    background: #ff922b;
+    color: #111;
+    outline: 1px solid #e8590c;
   }
 
   /* Two-column code layout */
