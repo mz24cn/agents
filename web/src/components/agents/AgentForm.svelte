@@ -69,6 +69,21 @@
     return ''
   }
 
+  function validateAgentId(val = agentId) {
+    if (val.includes('-')) return t('agentIdNoHyphen')
+    return ''
+  }
+
+  function onAgentIdInput(e) {
+    const msg = validateAgentId(e.target.value)
+    if (msg) {
+      errors = { ...errors, agentId: msg }
+    } else if (errors.agentId) {
+      const { agentId: _omit, ...rest } = errors
+      errors = rest
+    }
+  }
+
   // 输入时实时校验昵称（空格会破坏 @mention 匹配）
   function onNicknameInput(e) {
     const msg = validateNickname(e.target.value)
@@ -82,6 +97,8 @@
 
   function validate() {
     const e = {}
+    const agentIdErr = validateAgentId()
+    if (agentIdErr) e.agentId = agentIdErr
     const nickErr = validateNickname()
     if (nickErr) e.nickname = nickErr
     if (!modelId.trim()) e.modelId = t('agentModelIdRequired')
@@ -142,7 +159,8 @@
 
   <div class="form-group">
     <label for="agent_id">{t('agentId')}</label>
-    <input id="agent_id" type="text" bind:value={agentId} placeholder={t('agentIdPlaceholder')} />
+    <input id="agent_id" type="text" bind:value={agentId} placeholder={t('agentIdPlaceholder')} oninput={onAgentIdInput} aria-invalid={errors.agentId ? 'true' : undefined} />
+    {#if errors.agentId}<span class="field-error">{errors.agentId}</span>{/if}
     <span class="field-hint">{t('agentIdHint')}</span>
   </div>
 

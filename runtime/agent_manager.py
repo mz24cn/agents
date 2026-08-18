@@ -14,6 +14,14 @@ from typing import Optional
 from runtime.common import parse_labels
 
 
+def validate_agent_id(agent_id: str) -> None:
+    """Reject IDs that would corrupt talk_to session directory paths."""
+    if not isinstance(agent_id, str):
+        raise ValueError("Agent ID must be a string")
+    if "-" in agent_id:
+        raise ValueError("Agent ID cannot contain '-'")
+
+
 class AgentManager:
     """Manages agents with CRUD operations and JSON persistence.
 
@@ -97,6 +105,7 @@ class AgentManager:
         labels: Optional[list] = None,
     ) -> dict:
         """Create a new agent."""
+        validate_agent_id(agent_id)
         agent = {
             "agent_id": agent_id,
             "model_id": model_id,
@@ -130,6 +139,8 @@ class AgentManager:
         """
         if agent_id not in self._agents:
             return None
+        if "agent_id" in updates:
+            validate_agent_id(updates["agent_id"])
         agent = self._agents[agent_id]
         old_labels = agent.get("labels", [])
 
