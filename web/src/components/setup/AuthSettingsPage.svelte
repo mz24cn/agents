@@ -34,6 +34,7 @@
   let remoteBackend = $state('')
   let remoteConfig = $state('')
   let updateAvailable = $state(false)
+  let updateDetails = $state('')
   let inferenceActive = $state(false)
   let checkingUpdate = $state(false)
   let applyingUpdate = $state(false)
@@ -81,6 +82,13 @@
     return err?.status ? t(fallbackKey) : (err?.message || t(fallbackKey))
   }
 
+  function refreshUpdateMessage() {
+    if (!updateAvailable) return
+    updateMessage = inferenceActive
+      ? t('updateAvailableButBusy', { versions: updateDetails })
+      : t('updateAvailable', { versions: updateDetails })
+  }
+
   onMount(() => {
     loadConfig()
     loadBuildInfo()
@@ -89,9 +97,11 @@
       (event) => {
         if (event.event === 'init') {
           inferenceActive = Object.values(event.sessions || {}).some((status) => status === 'streaming')
+          refreshUpdateMessage()
         } else if (event.event === 'message') {
           if (event.status === 'streaming') {
             inferenceActive = true
+            refreshUpdateMessage()
           } else {
             // Re-read authoritative state; another session may still be running.
             loadBuildInfo()
@@ -110,6 +120,7 @@
       backend = data.backend_build || ''
       lastConfig = data.last_config || ''
       inferenceActive = !!data.inference_active
+      refreshUpdateMessage()
     } catch {
       // ignore
     }
@@ -141,6 +152,7 @@
     remoteBackend = ''
     remoteConfig = ''
     updateAvailable = false
+    updateDetails = ''
     try {
       const response = await fetch(buildHelloUrl(setupSource), { cache: 'no-store' })
       if (!response.ok) throw new Error(`HTTP ${response.status}`)
@@ -148,22 +160,25 @@
       remoteFrontend = data.frontend_build || ''
       remoteBackend = data.backend_build || ''
       remoteConfig = data.last_config || ''
-      const hasUpdate = (
-        (remoteFrontend && remoteFrontend > frontend)
-        || (remoteBackend && remoteBackend > backend)
-        || (remoteConfig && remoteConfig > lastConfig)
-      )
-      updateAvailable = !!hasUpdate
-      const remoteVersions = [remoteFrontend, remoteBackend, remoteConfig].filter(Boolean).sort()
-      const remoteLatest = remoteVersions.at(-1) || ''
+      const updatedParts = []
+      if (remoteFrontend && remoteFrontend > frontend) {
+        updatedParts.push(`${t('buildFrontend')} ${remoteFrontend}`)
+      }
+      if (remoteBackend && remoteBackend > backend) {
+        updatedParts.push(`${t('buildBackend')} ${remoteBackend}`)
+      }
+      if (remoteConfig && remoteConfig > lastConfig) {
+        updatedParts.push(`${t('buildConfig')} ${remoteConfig}`)
+      }
+      const hasUpdate = updatedParts.length > 0
+      updateAvailable = hasUpdate
+      updateDetails = updatedParts.join(t('updateVersionSeparator'))
       const current = await build.info()
       inferenceActive = !!current.inference_active
       if (!hasUpdate) {
         updateMessage = t('updateAlreadyLatest')
-      } else if (inferenceActive) {
-        updateMessage = t('updateAvailableButBusy')
       } else {
-        updateMessage = t('updateAvailable', { version: remoteLatest })
+        refreshUpdateMessage()
       }
     } catch (err) {
       updateError = t('checkUpdateFailed', { error: err?.message || err })
@@ -173,8 +188,21 @@
   }
 
   async function applyUpdate() {
-    applyingUpdate = true
+    if (!updateAvailable || checkingUpdate || applyingUpdate) return
     updateError = ''
+    try {
+      // Re-check immediately before update. The button state may have been
+      // rendered just before an inference request started in another tab.
+      const current = await build.info()
+      inferenceActive = !!current.inference_active
+      refreshUpdateMessage()
+      if (inferenceActive) return
+    } catch (err) {
+      updateError = t('updateFailed', { error: err?.message || err })
+      return
+    }
+
+    applyingUpdate = true
     updateMessage = t('updateApplying')
     try {
       const data = await build.update(setupSource.trim(), frontend, backend, lastConfig)
@@ -353,6 +381,7 @@
                     remoteBackend = ''
                     remoteConfig = ''
                     updateAvailable = false
+                    updateDetails = ''
                     updateMessage = ''
                     updateError = ''
                   }}

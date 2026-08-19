@@ -1015,6 +1015,13 @@ class HandlerApiMixin:
             logger.exception("Failed to build setup script: %s", exc)
             self._send_json_error(500, f"Failed to build setup script: {exc}")
             return
+
+        # Inject SETUP_SOURCE URL into the script (replace placeholder)
+        scheme = "https" if self.headers.get("X-Forwarded-Proto", "").lower() == "https" else "http"
+        host = self.headers.get("Host", "localhost:7988")
+        setup_url = f"{scheme}://{host}{self.path}"
+        script = script.replace(b"__SETUP_SOURCE_URL__", setup_url.encode("utf-8"))
+
         self.send_response(200)
         if script_format == "ps1":
             self.send_header("Content-Type", "application/x-powershell; charset=utf-8")
@@ -1139,6 +1146,25 @@ class HandlerApiMixin:
                             raise ValueError(f"Archive member escapes target: {member.name}")
                     tar.extractall(extract_dir, members=members)
 
+                # A frontend build produces content-hashed assets. Merging a
+                # delta into the existing web/dist would leave obsolete hashes
+                # behind indefinitely, so replace the whole compiled frontend
+                # directory whenever this delta contains frontend output.
+                frontend_delta_dir = os.path.join(extract_dir, "web", "dist")
+                has_frontend_update = False
+                if os.path.isdir(frontend_delta_dir):
+                    for _root, _dirs, files in os.walk(frontend_delta_dir):
+                        if files:
+                            has_frontend_update = True
+                            break
+                if has_frontend_update:
+                    target_web_dist = os.path.realpath(os.path.join(project_root, "web", "dist"))
+                    if (os.path.commonpath([project_root, target_web_dist]) != project_root
+                            or os.path.relpath(target_web_dist, project_root).replace("\\", "/") != "web/dist"):
+                        raise ValueError("Invalid frontend target directory")
+                    if os.path.isdir(target_web_dist):
+                        shutil.rmtree(target_web_dist)
+
                 for dirpath, _dirnames, filenames in os.walk(extract_dir):
                     for filename in filenames:
                         source_path = os.path.join(dirpath, filename)
@@ -1161,6 +1187,38 @@ class HandlerApiMixin:
                         updated_files.append(relative_posix)
                         if not relative_posix.startswith("agents_runtime/") and relative_posix.endswith(".py"):
                             restart_backend = True
+
+                # Match the self-extracting install order: after replacing
+                # web/dist and copying the downloaded frontend, re-apply the
+                # persistent local patch directory so patched frontend files
+                # are not lost by the cleanup above.
+                if has_frontend_update:
+                    patch_root = os.path.realpath(os.path.join(self.server.data_dir, "patch"))
+                    data_root = os.path.realpath(self.server.data_dir)
+                    if (os.path.commonpath([data_root, patch_root]) != data_root
+                            or os.path.relpath(patch_root, data_root).replace("\\", "/") != "patch"):
+                        raise ValueError("Invalid patch directory")
+                    if os.path.isdir(patch_root):
+                        for patch_dirpath, patch_dirnames, patch_filenames in os.walk(patch_root):
+                            patch_dirnames[:] = [
+                                dirname for dirname in patch_dirnames
+                                if not os.path.islink(os.path.join(patch_dirpath, dirname))
+                            ]
+                            for patch_filename in patch_filenames:
+                                patch_source = os.path.join(patch_dirpath, patch_filename)
+                                if os.path.islink(patch_source):
+                                    continue
+                                patch_relative = os.path.relpath(patch_source, patch_root)
+                                patch_relative_posix = patch_relative.replace("\\", "/")
+                                patch_target = os.path.realpath(os.path.join(project_root, patch_relative))
+                                if os.path.commonpath([project_root, patch_target]) != project_root:
+                                    raise ValueError(f"Patch file escapes project root: {patch_relative}")
+                                os.makedirs(os.path.dirname(patch_target), exist_ok=True)
+                                shutil.copy2(patch_source, patch_target)
+                                if patch_relative_posix not in updated_files:
+                                    updated_files.append(patch_relative_posix)
+                                if patch_relative_posix.endswith(".py"):
+                                    restart_backend = True
         except (OSError, tarfile.TarError, ValueError) as exc:
             release_update_lock()
             logger.exception("Failed to apply update: %s", exc)

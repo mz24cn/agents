@@ -545,6 +545,25 @@ if [ -d "$AGENTS_RUNTIME_DIR/patch" ]; then
   cp -r "$AGENTS_RUNTIME_DIR/patch"/. "$AGENTS_HOME"/ 2>/dev/null || true
 fi
 
+# Record SETUP_SOURCE into env.json
+_SETUP_SOURCE='__SETUP_SOURCE_URL__'
+if [ -n "$_SETUP_SOURCE" ]; then
+  _ENV_JSON="$AGENTS_RUNTIME_DIR/env.json"
+  python3 -c "
+import json, os
+path = '$_ENV_JSON'
+url = '$_SETUP_SOURCE'
+if os.path.isfile(path):
+    with open(path, 'r') as f:
+        data = json.load(f)
+else:
+    data = {}
+data['SETUP_SOURCE'] = url
+with open(path, 'w') as f:
+    json.dump(data, f, indent=2, ensure_ascii=False)
+" 2>&1 || echo "Warning: failed to write SETUP_SOURCE to env.json" >&2
+fi
+
 case "$START_AGENTS" in
   background)
     pid=$("$PWD/start-agent-service.sh")
@@ -700,6 +719,26 @@ exit 0
             "    if (Test-Path $patchDir) {\n"
             "        Write-Host \"Applying patch from $patchDir...\"\n"
             "        Copy-Item -Path (Join-Path $patchDir '*') -Destination $AgentServiceHome -Recurse -Force -ErrorAction SilentlyContinue\n"
+            "    }\n"
+            "\n"
+            "    # Record SETUP_SOURCE into env.json\n"
+            "    $setupSource = '__SETUP_SOURCE_URL__'\n"
+            "    if ($setupSource) {\n"
+            "        $envJson = Join-Path $env:AGENTS_RUNTIME_DIR 'env.json'\n"
+            "        try {\n"
+            "            if (Test-Path $envJson) {\n"
+            "                $data = Get-Content $envJson -Raw -Encoding UTF8 | ConvertFrom-Json\n"
+            "                if ($data -is [PSCustomObject]) {\n"
+            "                    $data = @{} + $data.PSObject.Properties | ForEach-Object { @{$_.Name = $_.Value} }\n"
+            "                }\n"
+            "            } else {\n"
+            "                $data = @{}\n"
+            "            }\n"
+            "            $data['SETUP_SOURCE'] = $setupSource\n"
+            "            $data | ConvertTo-Json -Depth 10 | Set-Content -Path $envJson -Encoding UTF8\n"
+            "        } catch {\n"
+            "            Write-Warning \"Failed to write SETUP_SOURCE to env.json: $_\"\n"
+            "        }\n"
             "    }\n"
             "\n"
             "    if ($env:START_AGENTS -eq 'background') {\n"
