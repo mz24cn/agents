@@ -687,7 +687,12 @@ class Runtime:
                     arguments = {}
 
                 # Execute tool and get result
-                tool_result, tool_config = self._execute_tool_call(tool_name, arguments, tool_scope=tools)
+                tool_result, tool_config = self._execute_tool_call(
+                    tool_name,
+                    arguments,
+                    tool_scope=tools,
+                    tool_use_id=fn_call.get("id") or fn_call.get("tool_use_id"),
+                )
 
                 # Add tool result as tool role message
                 messages.append(
@@ -745,7 +750,11 @@ class Runtime:
     # ------------------------------------------------------------------
 
     def _execute_tool_call(
-        self, tool_name: str, arguments: dict, tool_scope: Optional[list] = None
+        self,
+        tool_name: str,
+        arguments: dict,
+        tool_scope: Optional[list] = None,
+        tool_use_id: Optional[str] = None,
     ) -> tuple[str, Optional[ToolConfig]]:
         """Execute a tool call by name.
 
@@ -766,6 +775,9 @@ class Runtime:
             tool_scope: The list of ToolConfig objects that were included in the
                 current inference request. When provided, name lookup is
                 restricted to this set before falling back to the registry.
+            tool_use_id: Protocol-level ID of the current model tool call. It is
+                exposed through the request context while the callable runs so
+                self-streaming built-ins can use the canonical call ID.
 
         Returns:
             A tuple of (result_str, tool_config). tool_config is None if tool not found.
@@ -781,29 +793,41 @@ class Runtime:
             # _normalize_argument_names returned error -> arguments is the error string
             return arguments, tool_config
 
-        if tool_config.tool_type == "function":
-            result_str = self._execute_function_tool(tool_config, arguments)
-        elif tool_config.tool_type == "mcp":
-            # --- Base64 file path auto-conversion (for file transfer MCP) ---
-            # 检测参数中的 base64_content 等字段，如果值看起来是文件路径（非 base64），
-            # 则自动读取文件并转换为 base64，避免大模型处理长 base64 字符串。
-            from runtime.tools import process_tool_arguments_for_base64
-            arguments = process_tool_arguments_for_base64(arguments)
+        had_tool_use_id = hasattr(_thread_local, "tool_use_id")
+        previous_tool_use_id = getattr(_thread_local, "tool_use_id", None)
+        _thread_local.tool_use_id = tool_use_id
+        try:
+            if tool_config.tool_type == "function":
+                result_str = self._execute_function_tool(tool_config, arguments)
+            elif tool_config.tool_type == "mcp":
+                # --- Base64 file path auto-conversion (for file transfer MCP) ---
+                # 检测参数中的 base64_content 等字段，如果值看起来是文件路径（非 base64），
+                # 则自动读取文件并转换为 base64，避免大模型处理长 base64 字符串。
+                from runtime.tools import process_tool_arguments_for_base64
+                arguments = process_tool_arguments_for_base64(arguments)
             
-            result_str = self._execute_mcp_tool(tool_config, arguments)
+                result_str = self._execute_mcp_tool(tool_config, arguments)
 
-            # --- Base64 image interception (inference loop only) ---
-            # Long base64 payloads (e.g. screenshots from windows-mcp / chrome-devtools)
-            # are harmful to the model context. Replace them with saved file paths.
-            if len(result_str) > int(os.environ.get("BASE64_CHECK_THRESHOLD", "1024")):
-                if is_likely_base64(result_str):
-                    result_str = '{"data":"' + result_str + '"}'
-                from runtime.tools import save_and_replace_base64
-                result_str = save_and_replace_base64(result_str)
-        elif tool_config.tool_type == "skill":
-            result_str = f"Error: skill '{tool_name}' should be triggered via progressive disclosure, not direct execution"
-        else:
-            result_str = f"Error: unsupported tool_type '{tool_config.tool_type}' for tool '{tool_name}'"
+                # --- Base64 image interception (inference loop only) ---
+                # Long base64 payloads (e.g. screenshots from windows-mcp / chrome-devtools)
+                # are harmful to the model context. Replace them with saved file paths.
+                if len(result_str) > int(os.environ.get("BASE64_CHECK_THRESHOLD", "1024")):
+                    if is_likely_base64(result_str):
+                        result_str = '{"data":"' + result_str + '"}'
+                    from runtime.tools import save_and_replace_base64
+                    result_str = save_and_replace_base64(result_str)
+            elif tool_config.tool_type == "skill":
+                result_str = f"Error: skill '{tool_name}' should be triggered via progressive disclosure, not direct execution"
+            else:
+                result_str = f"Error: unsupported tool_type '{tool_config.tool_type}' for tool '{tool_name}'"
+        finally:
+            if had_tool_use_id:
+                _thread_local.tool_use_id = previous_tool_use_id
+            else:
+                try:
+                    delattr(_thread_local, "tool_use_id")
+                except AttributeError:
+                    pass
 
         # Append compatibility notes if any argument names were corrected
         if compat_notes:
@@ -1670,7 +1694,12 @@ class Runtime:
                 except (json.JSONDecodeError, ValueError):
                     arguments = {}
 
-                tool_result, tool_config = self._execute_tool_call(tool_name, arguments, tool_scope=tools)
+                tool_result, tool_config = self._execute_tool_call(
+                    tool_name,
+                    arguments,
+                    tool_scope=tools,
+                    tool_use_id=fn_call.get("id") or fn_call.get("tool_use_id"),
+                )
 
                 tool_msg = Message(
                     role="tool",

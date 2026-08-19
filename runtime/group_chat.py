@@ -1032,9 +1032,6 @@ def _run_group_chat_stream_gen(
                     else:
                         _flush_asst(collected)
                         collected.append(msg)
-                    # Skip delegate/talk_to tool frames (self-managing)
-                    if msg.role == "tool" and msg.name in ("delegate", "talk_to"):
-                        continue
                     if stream_chunks:
                         yield msg
             except Exception as exc:
@@ -1066,6 +1063,8 @@ def _run_group_chat_stream_gen(
                     "stat": getattr(msg, "stat", None),
                     "mentions": getattr(msg, "mentions", None),
                     "tool_calls": getattr(msg, "tool_calls", None),
+                    "tool_id": getattr(msg, "tool_id", None),
+                    "tool_use_id": getattr(msg, "tool_use_id", None),
                 })
 
             # Detect @-mentions in merged (post-_flush_asst) assistant messages.

@@ -13,7 +13,6 @@ The tool configs and factory functions are consumed by
 import logging
 import os
 import re
-import uuid
 
 from runtime.models import InferenceRequest, Message, ToolConfig
 from runtime.common import session_timestamp
@@ -139,7 +138,7 @@ def _make_delegate_fn(runtime, thread_local):
         delegate 可调用函数
     """
     def delegate(model_id: str, tools: list[str], task: str, context: str = "", images: list[str] | None = None) -> str:
-        tool_use_id = "call_" + uuid.uuid4().hex[:8]
+        tool_use_id = getattr(thread_local, "tool_use_id", None)
         session_id = getattr(thread_local, "session_id", None)
         current_depth = getattr(thread_local, "depth", 0)
         sse_callback = getattr(thread_local, "sse_callback", None)
@@ -307,7 +306,7 @@ def _make_talk_to_fn(runtime, thread_local):
         talk_to 可调用函数
     """
     def talk_to(agents: list[str], message: str) -> str:
-        tool_use_id = "call_" + uuid.uuid4().hex[:8]
+        tool_use_id = getattr(thread_local, "tool_use_id", None)
 
         # 捕获父线程上下文（子线程中 thread_local 是隔离的，需要显式传递）
         parent_session_id = getattr(thread_local, "session_id", None)

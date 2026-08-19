@@ -729,14 +729,8 @@ class HandlerInferMixin:
                 #   usage 消息 → assistant 一轮结束（纯文本回复或 tool_calls 声明），
                 #               merge_stream_messages 已将其 flush 为一个完整 turn
                 #   tool 消息  → 工具调用结果配对完成 → 立即落盘
-                #  放在 delegate/talk_to 的 continue 之前，保证这两种工具的
-                #  最终结果消息也触发落盘。
                 if msg.role in ("usage", "tool"):
                     _incremental_persist()
-                # delegate / talk_to 工具通过 sse_callback 自行管理流式帧和结束帧，跳过 infer_stream 的重复输出
-                # 群聊的 gen 版本已在 _run_one_gen 内部跳过这两种工具（不 yield），因此只有单聊需要判断。
-                if not is_group_chat and msg.role == "tool" and msg.name in ("delegate", "talk_to"):
-                    continue
                 event_data = json.dumps(msg.to_dict(), ensure_ascii=False)
                 self.wfile.write(f"data: {event_data}\n\n".encode("utf-8"))
                 self.wfile.flush()

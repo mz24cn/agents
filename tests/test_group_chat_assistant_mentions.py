@@ -18,7 +18,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import pytest
 
 from runtime.models import Message, InferenceRequest
-from runtime.group_chat import run_group_chat_stream, parse_mentions, resolve_mentions
+from runtime.group_chat import (
+    run_group_chat_stream,
+    run_group_chat_stream_gen,
+    parse_mentions,
+    resolve_mentions,
+)
 
 
 class FakeAgentManager:
@@ -52,6 +57,33 @@ class FakeRuntime:
         else:
             content = "（无更多回复）"
         yield Message(role="assistant", content=content)
+
+
+class ToolRoundRuntime:
+    """One complete assistant(tool_calls) + usage + tool + final reply round."""
+
+    def __init__(self, tool_name: str):
+        self.tool_name = tool_name
+
+    def infer_stream(self, request: InferenceRequest, cancel_event=None):
+        yield Message(
+            role="assistant",
+            tool_calls=[{
+                "id": "call_talk_1",
+                "name": self.tool_name,
+                "arguments": "{}",
+            }],
+        )
+        yield Message(role="usage", name="round", content="{}")
+        yield Message(
+            role="tool",
+            name=self.tool_name,
+            tool_id=self.tool_name,
+            tool_use_id="call_talk_1",
+            content="ShaWuJing replied",
+        )
+        yield Message(role="assistant", content="done")
+        yield Message(role="usage", name="round", content="{}")
 
 
 class ChunkedRuntime:
@@ -109,6 +141,34 @@ def _make_req(first_user: str, mentioned: list[str]) -> InferenceRequest:
         messages=[Message(role="user", content=first_user, mentions=mentioned)],
         stream=True,
     )
+
+
+@pytest.mark.parametrize("tool_name", ["talk_to", "delegate"])
+def test_group_chat_generator_yields_self_streaming_tool_result_with_canonical_id(tool_name):
+    am = FakeAgentManager(AGENTS)
+    runtime = ToolRoundRuntime(tool_name)
+
+    messages = list(run_group_chat_stream_gen(
+        runtime=runtime,
+        mentioned_agent_ids=["SunWuKong"],
+        all_agent_ids=["SunWuKong", "ShaWuJing", "ZhuBaJie"],
+        original_messages=[Message(role="user", content="@SunWuKong ask")],
+        base_request=_make_req("@SunWuKong ask", ["SunWuKong"]),
+        cancel_event=None,
+        sse_callback=None,
+        context_manager=None,
+        session_id=None,
+        agent_manager=am,
+        model_id="m1",
+        tool_ids=[],
+        max_rounds=1,
+    ))
+
+    tool_messages = [m for m in messages if m.role == "tool"]
+    assert len(tool_messages) == 1
+    assert tool_messages[0].name == tool_name
+    assert tool_messages[0].tool_id == tool_name
+    assert tool_messages[0].tool_use_id == "call_talk_1"
 
 
 def test_parse_mentions_supports_chinese_nicknames_and_ids():
