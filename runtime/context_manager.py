@@ -1143,11 +1143,16 @@ class ContextManager:
 
         # Preserve created_at from existing file when available.
         existing_created_at: Optional[str] = None
+        existing_last_total_tokens: Optional[int] = None
         if os.path.isfile(conv_path):
             try:
                 with open(conv_path, "r", encoding="utf-8") as fh:
                     existing = json.load(fh)
-                existing_created_at = existing.get("meta", {}).get("created_at")
+                existing_meta = existing.get("meta", {})
+                existing_created_at = existing_meta.get("created_at")
+                previous_tokens = existing_meta.get("last_total_tokens")
+                if isinstance(previous_tokens, int):
+                    existing_last_total_tokens = previous_tokens
             except (ValueError, OSError, KeyError):
                 pass
 
@@ -1158,8 +1163,17 @@ class ContextManager:
             "updated_at": now,
             "turn_count": len(turns),
         }
-        if last_total_tokens is not None:
-            meta["last_total_tokens"] = last_total_tokens
+        # Incremental persistence may have already written the usage stats,
+        # while the final persistence receives an empty message slice and thus
+        # has no new ``last_total_tokens`` value.  Do not erase the latest token
+        # count in that case: compression uses this field as its trigger.
+        effective_last_total_tokens = (
+            last_total_tokens
+            if last_total_tokens is not None
+            else existing_last_total_tokens
+        )
+        if effective_last_total_tokens is not None:
+            meta["last_total_tokens"] = effective_last_total_tokens
         if extra_meta:
             meta.update(extra_meta)
 

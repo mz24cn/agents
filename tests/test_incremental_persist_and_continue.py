@@ -102,6 +102,52 @@ def test_persist_conversation_default_compresses():
     cm.compress_context.assert_called_once()
 
 
+def test_final_empty_persist_preserves_incremental_usage_and_triggers_compression(tmp_path):
+    """A final empty persistence must not erase usage saved incrementally.
+
+    The stream handler persists the completed ``assistant + usage`` round with
+    ``compress=False`` and advances ``persisted_until``.  Its final persistence
+    therefore receives an empty slice.  Compression must still see the usage
+    count from the incremental save.
+    """
+    cm = ContextManager(
+        infer_fn=lambda req: None,
+        chats_dir=str(tmp_path),
+        max_tokens_in_context=100,
+    )
+    session_id = cm.create_session()
+    usage_round = [
+        Message(role="assistant", content="done"),
+        Message(
+            role="usage",
+            content=json.dumps({
+                "prompt_tokens": 120,
+                "completion_tokens": 5,
+                "total_tokens": 125,
+            }),
+        ),
+    ]
+
+    assert persist_conversation(
+        cm,
+        session_id,
+        [Message(role="user", content="do work")],
+        usage_round,
+        compress=False,
+    ) is None
+    assert cm.get_last_total_tokens(session_id) == 125
+
+    with patch.object(cm, "compress_context", wraps=cm.compress_context) as compress:
+        assert persist_conversation(
+            cm, session_id, [], [], compress=True,
+        ) is None
+
+    assert cm.get_last_total_tokens(session_id) == 125
+    compress.assert_called_once()
+    assert compress.call_args.kwargs["last_total_tokens"] is None
+    assert (tmp_path / session_id / "summary.md").is_file()
+
+
 # ---------------------------------------------------------------------------
 # 2. Incremental chunk merge == full merge
 # ---------------------------------------------------------------------------
