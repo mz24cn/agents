@@ -181,16 +181,26 @@
     word-break: break-all;
   }
 
-  .compact-tool-pair,
   .compact-tool-zone,
-  .compact-result-zone {
+  .compact-result-zone,
+  .compact-tool-pair {
     display: inline;
   }
   .compact-tool-pair {
-    margin: 2px 4px 2px 0;
+    position: relative;
+    /* The badge's 0.78rem text/1.3em control box sits about 6px above the
+       surrounding markdown glyph box. Shift the complete call/result pair as
+       one unit instead of mixing a pixel offset with baseline alignment. */
+    top: 6px;
+    margin: 0 4px 0 0;
+    vertical-align: baseline;
     /* Remove the HTML inline whitespace between the independently clickable
        call and result zones so they render as one continuous capsule. */
     font-size: 0;
+  }
+  .compact-tool-zone,
+  .compact-result-zone {
+    vertical-align: top;
   }
   .compact-tool-call,
   .compact-tool-result {
@@ -198,9 +208,9 @@
     align-items: center;
     justify-content: center;
     box-sizing: border-box;
-    height: 24px;
-    padding: 0 10px;
-    vertical-align: middle;
+    height: 1.3em;
+    padding: 0 7px;
+    vertical-align: top;
     font-family: inherit;
     font-size: 0.78rem;
     line-height: 1;
@@ -215,13 +225,13 @@
     border-radius: 12px;
   }
   .compact-tool-call.has-result {
-    padding-right: 4px;
+    padding-right: 3px;
     border-radius: 12px 0 0 12px;
     border-right: none;
   }
   .compact-tool-result {
-    padding-left: 3px;
-    padding-right: 8px;
+    padding-left: 2px;
+    padding-right: 6px;
     border-radius: 0 12px 12px 0;
     border-left: none;
   }
@@ -251,11 +261,34 @@
   .tool-detail {
     display: block;
     position: relative;
-    margin: 2px 0 4px;
+    box-sizing: border-box;
+    width: 100%;
+    margin: 4px 0 6px;
     padding: 6px 8px;
     font-size: 0.8rem;
+    line-height: 1.5;
+    white-space: normal;
     background: rgba(0,0,0,0.05);
     border-radius: 4px;
+  }
+  /* Force the expanded detail onto its own full-width line in the assistant
+     text flow. The zero-width break consumes the remainder of the current
+     line, so all following text/tools continue below the detail block. */
+  .tool-detail::before {
+    content: '';
+    display: block;
+  }
+  .tool-detail::after {
+    content: '';
+    display: block;
+    clear: both;
+  }
+  .tool-detail :global(.markdown-content) {
+    line-height: 1.5;
+  }
+  .tool-detail pre,
+  .tool-detail code {
+    line-height: 1.5;
   }
   .detail-lang {
     position: absolute;
