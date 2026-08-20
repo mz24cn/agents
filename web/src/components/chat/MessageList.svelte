@@ -2,12 +2,15 @@
   import MessageBubble from './MessageBubble.svelte'
   import { t } from '../../lib/i18n.svelte.js'
   import { slide } from 'svelte/transition'
-  import { getContext } from 'svelte'
+  import { getContext, onDestroy } from 'svelte'
   import AppLogo from '../../lib/components/AppLogo.svelte'
   import IconDisplay from '../../lib/components/IconDisplay.svelte'
   import CopyButton from './CopyButton.svelte'
 
-  let { messages = [], agentList = [], displayMessageDetails = false, onRevoke, onScrollAtBottom, shouldScrollToBottom = false, collapsedGroups = new Set(), onToggleCollapse, fileJournalTurnKeys = new Set(), fileDiffVisible = new Set(), fileDiffCache = {}, onToggleFileDiff } = $props()
+  import { resolveFileJournalTurnKey } from '../../lib/file-journals.js'
+  import { currentSession, messageScrollRequest } from '../../lib/session-state.svelte.js'
+
+  let { messages = [], agentList = [], displayMessageDetails = false, onRevoke, onScrollAtBottom, shouldScrollToBottom = false, collapsedGroups = new Set(), onToggleCollapse, fileJournalTurnKeyMap = {}, fileDiffVisible = new Set(), fileDiffCache = {}, onToggleFileDiff } = $props()
   let listEl = $state(null)
   let isAtBottom = $state(true)
   // Ephemeral per-turn overrides. This state lives only in this keyed
@@ -46,6 +49,57 @@
     if (listEl && (isAtBottom || shouldScrollToBottom)) {
       scrollToBottom()
     }
+  })
+
+  let handledScrollToken = 0
+  let scrollCorrectionTimer = null
+
+  function targetScrollTop(target) {
+    const listRect = listEl.getBoundingClientRect()
+    const targetRect = target.getBoundingClientRect()
+    const targetTop = listEl.scrollTop + targetRect.top - listRect.top
+    const centeredTop = targetTop - Math.max(0, (listEl.clientHeight - targetRect.height) / 2)
+    return Math.max(0, Math.min(centeredTop, listEl.scrollHeight - listEl.clientHeight))
+  }
+
+  function scrollToUserMessage(targetIndex, token) {
+    if (!listEl || token !== messageScrollRequest.token) return
+    const target = listEl.querySelector(`[data-user-message-index="${targetIndex}"]`)
+    if (!target) return
+
+    // scrollIntoView may choose an outer scroll container and its final position
+    // is easily invalidated while restored message cards finish laying out. Scroll
+    // the actual message list explicitly, then correct once after the animation.
+    isAtBottom = false
+    listEl.scrollTo({ top: targetScrollTop(target), behavior: 'smooth' })
+
+    if (scrollCorrectionTimer) clearTimeout(scrollCorrectionTimer)
+    scrollCorrectionTimer = setTimeout(() => {
+      if (!listEl || token !== messageScrollRequest.token) return
+      const settledTarget = listEl.querySelector(`[data-user-message-index="${targetIndex}"]`)
+      if (settledTarget) listEl.scrollTop = targetScrollTop(settledTarget)
+      scrollCorrectionTimer = null
+    }, 550)
+  }
+
+  $effect(() => {
+    const token = messageScrollRequest.token
+    const targetSessionId = messageScrollRequest.sessionId
+    const targetIndex = messageScrollRequest.messageIndex
+    // A cross-session request may arrive before restoration has populated this
+    // keyed list. Tracking the message count retries after the target DOM exists.
+    messages.length
+    if (!token || token === handledScrollToken || targetSessionId !== currentSession.sessionId || !Number.isInteger(targetIndex)) return
+    if (messages[targetIndex]?.role !== 'user') return
+
+    handledScrollToken = token
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => scrollToUserMessage(targetIndex, token))
+    })
+  })
+
+  onDestroy(() => {
+    if (scrollCorrectionTimer) clearTimeout(scrollCorrectionTimer)
   })
 
   // 计算消息分组：每个 user 消息及其后的 assistant/tool 消息为一组
@@ -293,6 +347,7 @@
         <MessageBubble msg={messages[group.startIndex]} {agentList} {onRevoke} />
       {:else}
         {@const userMsg = messages[group.startIndex]}
+        {@const fileJournalTurnKey = resolveFileJournalTurnKey(fileJournalTurnKeyMap, userMsg.timestamp)}
         {@const groupDetailed = isGroupDetailed(group.startIndex)}
         <div class="group" class:collapsed={group.isCollapsed} data-start-index={group.startIndex}>
           <!-- user 消息始终显示 -->
@@ -300,10 +355,11 @@
             msg={userMsg}
             {agentList}
             {onRevoke}
-            hasFileChanges={fileJournalTurnKeys.has(userMsg.timestamp)}
-            fileDiffData={fileDiffCache[userMsg.timestamp] || null}
-            fileDiffVisible={fileDiffVisible.has(userMsg.timestamp)}
-            onToggleFileDiff={userMsg.timestamp ? () => onToggleFileDiff(userMsg.timestamp) : undefined}
+            scrollTargetIndex={group.startIndex}
+            hasFileChanges={fileJournalTurnKey !== null}
+            fileDiffData={fileJournalTurnKey ? (fileDiffCache[fileJournalTurnKey] || null) : null}
+            fileDiffVisible={fileJournalTurnKey ? fileDiffVisible.has(fileJournalTurnKey) : false}
+            onToggleFileDiff={fileJournalTurnKey && onToggleFileDiff ? () => onToggleFileDiff(fileJournalTurnKey) : undefined}
           />
 
           {#if groupDetailed && !group.isCollapsed}

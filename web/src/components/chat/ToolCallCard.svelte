@@ -68,15 +68,24 @@
   }
 
   function toggleExpanded(index) {
+    // A pending/active hover preview must not outlive a click toggle. Otherwise
+    // the click state closes while the hover state keeps the detail visible.
+    const wasClickExpanded = expandedIndexes.has(index)
+    stopHoverPreview(index)
+
     const next = new Set(expandedIndexes)
-    if (next.has(index)) next.delete(index)
+    if (wasClickExpanded) next.delete(index)
     else next.add(index)
     expandedIndexes = next
   }
 
   function toggleResultExpanded(index) {
+    // Keep result-detail clicks independent from their hover-preview state too.
+    const wasClickExpanded = resultExpandedIndexes.has(index)
+    stopResultHoverPreview(index)
+
     const next = new Set(resultExpandedIndexes)
-    if (next.has(index)) next.delete(index)
+    if (wasClickExpanded) next.delete(index)
     else next.add(index)
     resultExpandedIndexes = next
   }

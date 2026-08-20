@@ -228,6 +228,12 @@ def persist_conversation(
             existing_turns = context_manager.load_conversation(session_id)
         except (FileNotFoundError, ValueError):
             existing_turns = []
+        # Model-request repair is a defensive last line, not permanent storage
+        # policy.  Before appending this persistence operation's turns, remove
+        # malformed history loaded from the prior conversation.json.  Newly
+        # failed stream output remains available for the Continue action, then
+        # is removed either by Continue itself or by the following persistence.
+        context_manager.prune_invalid_persisted_turns(session_id, existing_turns)
         new_turns = list(existing_turns)
         for m in (original_messages or []):
             # 复用 Message 自带的时间戳，无则 fallback 为当前时间

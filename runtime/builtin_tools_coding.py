@@ -106,9 +106,17 @@ def kill_active_process(session_id: str) -> bool:
 
 
 def _get_file_journal_manager(workspace: str) -> '_FileJournalManager':
-    session_id = get_request_context("session_id")
-    user_message_timestamp = get_request_context("user_message_timestamp")
-    session_dir = get_request_context("session_dir")
+    # Nested agents may keep an independent conversation session while their
+    # file changes still belong to the initiating user turn.  Explicit journal
+    # overrides decouple those two concerns without changing normal requests.
+    session_id = get_request_context(
+        "file_journal_session_id", get_request_context("session_id"))
+    user_message_timestamp = get_request_context(
+        "file_journal_user_message_timestamp",
+        get_request_context("user_message_timestamp"),
+    )
+    session_dir = get_request_context(
+        "file_journal_session_dir", get_request_context("session_dir"))
 
     journal_manager = get_request_context("file_journal_manager")
     if (

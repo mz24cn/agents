@@ -3,7 +3,7 @@
   import { router, navigate } from '../lib/router.svelte.js'
   import { t } from '../lib/i18n.svelte.js'
   import { sessions, subscribeSessionEvents } from '../lib/api.js'
-  import { sessionRestore, newSessionCreated, sessionDeleted, currentSession, newSessionRequest, terminalOpen, openSessionLogDir } from '../lib/session-state.svelte.js'
+  import { sessionRestore, newSessionCreated, sessionDeleted, currentSession, newSessionRequest, terminalOpen, openSessionLogDir, messageScrollRequest } from '../lib/session-state.svelte.js'
   import { sidebarWidth, setSidebarWidth, toggleSidebarCollapsed, collapseSidebar, SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH } from '../lib/sidebar-width.svelte.js'
 
   const SESSION_PAGE_SIZE = 100
@@ -24,6 +24,11 @@
   // 弹出菜单状态
   let menuOpenId = $state(null)   // 当前展开菜单的 session id
   let menuPos = $state({ x: 0, y: 0 })  // fixed 定位坐标
+  let userMessageMenuOpen = $state(false)
+  let userMessageMenuLoading = $state(false)
+  let userMessageMenuError = $state('')
+  let menuUserMessages = $state([])
+  let menuSessionData = $state(null)
 
   // hover 弹出菜单状态：鼠标悬停到 ... 按钮即弹出，悬停在菜单上保持显示
   let hoverBtnId = $state(null)   // 当前鼠标悬停的 ... 按钮 session id
@@ -221,6 +226,13 @@
     const rect = btn.getBoundingClientRect()
     // 菜单出现在按钮右下角，用 fixed 定位浮于最顶层
     menuPos = { x: rect.right + 4, y: rect.top }
+    if (menuOpenId !== sid) {
+      userMessageMenuOpen = false
+      userMessageMenuLoading = false
+      userMessageMenuError = ''
+      menuUserMessages = []
+      menuSessionData = null
+    }
     menuOpenId = sid
   }
 
@@ -231,6 +243,11 @@
 
   function closeMenu() {
     menuOpenId = null
+    userMessageMenuOpen = false
+    userMessageMenuLoading = false
+    userMessageMenuError = ''
+    menuUserMessages = []
+    menuSessionData = null
     hoverBtnId = null
     hoverMenuId = null
     if (closeTimer) {
@@ -281,6 +298,65 @@
       clearTimeout(closeTimer)
       closeTimer = null
     }
+  }
+
+  function userMessageMenuWidth() {
+    if (typeof window === 'undefined') return 600
+    const chatAreaWidth = Math.max(320, window.innerWidth - sidebarWidth.current)
+    const availableWidth = Math.max(220, window.innerWidth - menuPos.x - 210)
+    return Math.min(chatAreaWidth * 0.85, availableWidth)
+  }
+
+  function userMessageText(content) {
+    if (typeof content === 'string') return content.replace(/\s+/g, ' ').trim()
+    if (Array.isArray(content)) {
+      return content.map(part => typeof part === 'string' ? part : (part?.text || '')).join(' ').replace(/\s+/g, ' ').trim()
+    }
+    return content == null ? '' : String(content).replace(/\s+/g, ' ').trim()
+  }
+
+  async function openUserMessageMenu(e, sessionId) {
+    e.stopPropagation()
+    cancelClose()
+    if (userMessageMenuOpen) return
+
+    userMessageMenuOpen = true
+    userMessageMenuLoading = true
+    userMessageMenuError = ''
+    menuUserMessages = []
+    menuSessionData = null
+    const requestedSessionId = sessionId
+    try {
+      const data = await sessions.get(sessionId)
+      if (menuOpenId !== requestedSessionId || !userMessageMenuOpen) return
+      const messages = (data.messages ?? []).map(m => ({ ...m }))
+      menuSessionData = { messages, meta: data.meta ?? null }
+      menuUserMessages = messages
+        .map((message, index) => ({ index, text: userMessageText(message.content) }))
+        .filter(item => messages[item.index]?.role === 'user')
+    } catch (err) {
+      if (menuOpenId === requestedSessionId) {
+        userMessageMenuError = err.message || t('restoreSessionFailed')
+      }
+    } finally {
+      if (menuOpenId === requestedSessionId) userMessageMenuLoading = false
+    }
+  }
+
+  function handleUserMessageClick(e, sessionId, messageIndex) {
+    e.stopPropagation()
+    const data = menuSessionData
+    if (!data) return
+
+    if (currentSession.sessionId !== sessionId) {
+      sessionRestore.pending = { sessionId, messages: data.messages, meta: data.meta }
+    }
+    messageScrollRequest.sessionId = sessionId
+    messageScrollRequest.messageIndex = messageIndex
+    messageScrollRequest.token++
+    closeMenu()
+    navigate('#/chat')
+    if (window.innerWidth < 1024) collapseSidebar()
   }
 
   function handleOpenTerminal(e, sessionId) {
@@ -508,6 +584,49 @@
     onmouseenter={handleMenuEnter}
     onmouseleave={handleMenuLeave}
   >
+    <div class="session-dropdown-submenu-row" class:active={userMessageMenuOpen}>
+      <div class="session-dropdown-item session-dropdown-submenu-label">
+        <svg class="menu-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="M2.5 3.5h11v7h-7l-3.5 3v-3h-.5z"/>
+          <path d="M5 6h6M5 8h4"/>
+        </svg>
+        <span>{t('userMessages')}</span>
+      </div>
+      <button
+        class="submenu-more-btn"
+        aria-label={t('userMessages')}
+        aria-haspopup="menu"
+        aria-expanded={userMessageMenuOpen}
+        onclick={(e) => openUserMessageMenu(e, menuOpenId)}
+        onmouseenter={(e) => openUserMessageMenu(e, menuOpenId)}
+      >···</button>
+    </div>
+    {#if userMessageMenuOpen}
+      <div
+        class="user-message-submenu"
+        role="menu"
+        style="width:{userMessageMenuWidth()}px;"
+      >
+        {#if userMessageMenuLoading}
+          <div class="user-message-submenu-status">{t('loading')}</div>
+        {:else if userMessageMenuError}
+          <div class="user-message-submenu-status error">{userMessageMenuError}</div>
+        {:else if menuUserMessages.length === 0}
+          <div class="user-message-submenu-status">{t('noUserMessages')}</div>
+        {:else}
+          <div class="user-message-list">
+            {#each menuUserMessages as item (item.index)}
+              <button
+                class="user-message-item"
+                role="menuitem"
+                title={item.text || t('emptyUserMessage')}
+                onclick={(e) => handleUserMessageClick(e, menuOpenId, item.index)}
+              >{item.text || t('emptyUserMessage')}</button>
+            {/each}
+          </div>
+        {/if}
+      </div>
+    {/if}
     <button
       class="session-dropdown-item"
       role="menuitem"
@@ -892,13 +1011,13 @@
   .session-dropdown {
     position: fixed;
     z-index: 9999;
-    min-width: 130px;
+    min-width: 180px;
     background: var(--bg);
     border: 1px solid var(--border);
     border-radius: 8px;
     box-shadow: 0 6px 20px rgba(0,0,0,0.15);
     padding: 4px 0;
-    overflow: hidden;
+    overflow: visible;
   }
   .session-dropdown-item {
     display: flex;
@@ -914,8 +1033,94 @@
     transition: background-color 0.15s;
     color: var(--text);
   }
-  .session-dropdown-item:hover {
+  .session-dropdown-item:hover,
+  .session-dropdown-item.active {
     background-color: var(--border);
+  }
+  .session-dropdown-submenu-row {
+    position: relative;
+    display: flex;
+    align-items: center;
+  }
+  .session-dropdown-submenu-row:hover,
+  .session-dropdown-submenu-row.active {
+    background-color: var(--border);
+  }
+  .session-dropdown-submenu-label {
+    flex: 1;
+    min-width: 0;
+    padding-right: 4px;
+    cursor: default;
+  }
+  .session-dropdown-submenu-label:hover {
+    background: transparent;
+  }
+  .session-dropdown-submenu-label span {
+    min-width: 0;
+  }
+  .submenu-more-btn {
+    flex-shrink: 0;
+    width: 30px;
+    height: 26px;
+    margin-right: 6px;
+    padding: 0;
+    border: none;
+    border-radius: 5px;
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    cursor: pointer;
+  }
+  .submenu-more-btn:hover {
+    background: var(--bg);
+    color: var(--text);
+  }
+  .user-message-submenu {
+    position: absolute;
+    left: calc(100% + 6px);
+    top: 0;
+    max-height: min(60vh, 480px);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.15);
+  }
+  .user-message-list {
+    min-height: 0;
+    overflow-y: auto;
+    padding: 4px 0;
+  }
+  .user-message-item {
+    display: block;
+    width: 100%;
+    padding: 8px 12px;
+    overflow: hidden;
+    border: none;
+    background: none;
+    color: var(--text);
+    font: inherit;
+    font-size: 0.84rem;
+    line-height: 1.25;
+    text-align: left;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  .user-message-item:hover {
+    background: var(--border);
+  }
+  .user-message-submenu-status {
+    padding: 14px 12px;
+    color: var(--text-secondary);
+    font-size: 0.82rem;
+  }
+  .user-message-submenu-status.error {
+    color: var(--danger, #e53e3e);
   }
   .session-dropdown-danger {
     color: var(--danger, #e53e3e);

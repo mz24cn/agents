@@ -14,6 +14,36 @@ from runtime.runtime import Runtime
 from runtime.registry import ModelRegistry, ToolRegistry
 
 
+def test_ensure_tool_call_results_repairs_dangling_and_malformed_call():
+    from runtime.runtime import _ensure_tool_call_results
+
+    messages = [
+        Message(role="user", content="inspect"),
+        Message(role="assistant", tool_calls=[{
+            "id": "call-1",
+            "name": "read_image",
+            "arguments": "{\"path\": \"partial",
+        }]),
+    ]
+
+    repaired = _ensure_tool_call_results(messages)
+    assert [message.role for message in repaired] == ["user", "assistant", "tool"]
+    assert repaired[1].tool_calls[0]["arguments"] == "{}"
+    assert repaired[2].tool_use_id == "call-1"
+    assert "[interrupted]" in repaired[2].content
+
+
+def test_ensure_tool_call_results_drops_orphan_tool_result():
+    from runtime.runtime import _ensure_tool_call_results
+
+    repaired = _ensure_tool_call_results([
+        Message(role="user", content="hello"),
+        Message(role="tool", name="read_file", tool_use_id="orphan", content="x"),
+        Message(role="assistant", content="done"),
+    ])
+    assert [message.role for message in repaired] == ["user", "assistant"]
+
+
 # --- Hypothesis strategies ---
 
 # Strategy for non-empty text strings (plain text input)

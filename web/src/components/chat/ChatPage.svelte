@@ -14,6 +14,7 @@
   import WorkspaceFileManager from './WorkspaceFileManager.svelte'
   import ConfirmDialog from '../ConfirmDialog.svelte'
   import { extractPlaceholders } from '../../lib/placeholder.js'
+  import { buildFileJournalTurnKeyMap } from '../../lib/file-journals.js'
   import { t } from '../../lib/i18n.svelte.js'
   import { navigate } from '../../lib/router.svelte.js'
   import { sessionRestore, newSessionCreated, sessionDeleted, currentSession, newSessionRequest, terminalOpen, openSessionLogDir } from '../../lib/session-state.svelte.js'
@@ -55,10 +56,28 @@
   let collapsedGroups = $derived(sessionStore[storeKey(sessionId)]?.collapsedGroups ?? new Set())
 
   // 会话是否处于"可继续推理"状态：
-  //   最后一轮为 user / assistant(带 tool_calls) / tool → 会话中断，可继续
+  //   最后一轮为 user / assistant(带 tool_calls 或 Error) / tool → 会话中断，可继续
   //   最后一轮为 assistant 且无 tool_calls（或会话为空）→ 已完成，不可继续
   // 群聊模式不支持 "继续推理"（后端会返回 400）
   let isGroupChat = $derived(selectedAgentIds.length > 1)
+
+  function hasIncompleteToolCalls(message) {
+    if (message?.role !== 'assistant' || !Object.prototype.hasOwnProperty.call(message, 'tool_calls')) return false
+    if (!Array.isArray(message.tool_calls) || message.tool_calls.length === 0) return true
+    return message.tool_calls.some(call => {
+      if (!call || typeof call !== 'object') return true
+      if (!(call.id || call.tool_use_id) || !call.name) return true
+      const args = call.arguments ?? '{}'
+      if (args && typeof args === 'object' && !Array.isArray(args)) return false
+      if (typeof args !== 'string') return true
+      try {
+        const parsed = JSON.parse(args)
+        return !parsed || typeof parsed !== 'object' || Array.isArray(parsed)
+      } catch {
+        return true
+      }
+    })
+  }
 
   let canContinue = $derived.by(() => {
     if (isGroupChat) return false
@@ -69,6 +88,8 @@
     if (!last) return false
     if (last.role === 'user') return true
     if (last.role === 'tool') return true
+    if (last.role === 'assistant' && typeof last.content === 'string' && last.content.trimStart().startsWith('Error:')) return true
+    if (hasIncompleteToolCalls(last)) return true
     if (last.role === 'assistant' && last.tool_calls && last.tool_calls.length > 0) return true
     return false
   })
@@ -77,9 +98,10 @@
   let revokeConfirm = $state(null)  // initial revoke confirmation dialog state
 
   // File journal / diff viewer state
-  let fileJournalTurnKeys = $state(new Set())    // turn keys that have file journals
+  let fileJournalTurnKeyMap = $state({})         // message timestamp alias -> exact backend journal key
   let fileDiffCache = $state({})                 // turnKey -> { turn_key, files: [...] }
   let fileDiffVisible = $state(new Set())        // turnKeys currently showing diff
+  let fileJournalLoadVersion = 0                 // prevents stale session/list responses from winning
 
   // Terminal state: sessionId -> { ref, status }
   // Terminal sessionId == Chat sessionId
@@ -513,6 +535,17 @@
       }
       const store = sessionStore[keyRef.key]
       if (!store) return
+      // 后端在继续推理前已删除末尾失败的 assistant Error 消息；
+      // 同步移除前端旧气泡，随后再创建本轮新的 assistant 占位消息。
+      if (initData.removed_trailing_incomplete_assistant || initData.removed_trailing_assistant_error) {
+        const last = store.messages[store.messages.length - 1]
+        if (last?.role === 'assistant' && (
+          (typeof last.content === 'string' && last.content.trimStart().startsWith('Error:')) ||
+          hasIncompleteToolCalls(last)
+        )) {
+          store.messages = store.messages.slice(0, -1)
+        }
+      }
       // 创建用户消息（带服务端返回的时间戳）
       if (initData.user_message_timestamp) {
         const userMsg = { ...pendingUserMsg }
@@ -702,41 +735,40 @@
           ? msgs.findLastIndex(m => m.role === 'tool' && getToolUseId(m) === tcId)
           : -1
 
-        if (isTalkTo && msg.agent_id) {
-          // talk_to sub-agent delta: route to per-agent sub_message
+        if (isTalkTo && msg.target_agent_id) {
+          // talk_to delta: the outer tool message belongs to the caller
+          // (msg.agent_id), while each streamed child reply is keyed by its
+          // explicit target_agent_id.
+          const agentKey = msg.target_agent_id
+          const subMessage = {
+            agent_id: agentKey,
+            agent_nickname: msg.target_agent_nickname || agentKey,
+            content: delta,
+            streaming: true,
+          }
           if (existingIdx >= 0) {
             const arr = [...msgs]
             const existing = arr[existingIdx]
             const subMsgs = { ...(existing.sub_messages || {}) }
-            const agentKey = msg.agent_id
             const prev = subMsgs[agentKey]
             subMsgs[agentKey] = {
-              agent_id: msg.agent_id,
-              agent_nickname: msg.agent_nickname || agentKey,
+              ...subMessage,
               content: (prev?.content || '') + delta,
-              streaming: true,
             }
             arr[existingIdx] = normalizeToolMessage(msg, {
               ...existing,
               content: (existing.content || '') + delta,
+              streaming: true,
               sub_messages: subMsgs,
             })
             store.messages = arr
           } else {
-            const subMsgs = {}
-            const agentKey = msg.agent_id
-            subMsgs[agentKey] = {
-              agent_id: msg.agent_id,
-              agent_nickname: msg.agent_nickname || agentKey,
-              content: delta,
-              streaming: true,
-            }
             store.messages = [...msgs, normalizeToolMessage(msg, {
               role: 'tool',
               name: msg.name || '',
               content: delta,
               streaming: true,
-              sub_messages: subMsgs,
+              sub_messages: { [agentKey]: subMessage },
             })]
           }
         } else if (existingIdx >= 0) {
@@ -788,8 +820,32 @@
           if (agId) delete aIdxRef.groupMap[agId]
         }
       } else {
-        // 普通工具结果帧（write_file、exec_shell 等）
-        store.messages = [...msgs, normalizeToolMessage(msg, { role: 'tool' })]
+        // Formal tool result. Self-streaming tools already have a temporary
+        // message with this tool_use_id, so finalize it in place.
+        const tcId = getToolUseId(msg)
+        const existingIdx = tcId
+          ? msgs.findLastIndex(m => m.role === 'tool' && getToolUseId(m) === tcId)
+          : -1
+        if (existingIdx >= 0) {
+          const arr = [...msgs]
+          const existing = arr[existingIdx]
+          let subMessages = existing.sub_messages
+          if (subMessages) {
+            subMessages = Object.fromEntries(
+              Object.entries(subMessages).map(([key, value]) => [key, { ...value, streaming: false }])
+            )
+          }
+          arr[existingIdx] = normalizeToolMessage(msg, {
+            ...existing,
+            ...msg,
+            role: 'tool',
+            streaming: false,
+            ...(subMessages ? { sub_messages: subMessages } : {}),
+          })
+          store.messages = arr
+        } else {
+          store.messages = [...msgs, normalizeToolMessage(msg, { role: 'tool' })]
+        }
         aIdxRef.value = -1
         // Group-chat: reset per-agent index
         if (aIdxRef.groupMode) {
@@ -1045,14 +1101,17 @@
   // Fetch file journals list when a session is restored
   async function loadFileJournals(sid) {
     if (!sid) return
+    const loadVersion = ++fileJournalLoadVersion
     try {
       const data = await sessionsApi.fileJournals(sid)
-      fileJournalTurnKeys = new Set(data.turn_keys || [])
+      if (loadVersion !== fileJournalLoadVersion || sid !== sessionId) return
+      fileJournalTurnKeyMap = buildFileJournalTurnKeyMap(data.turn_keys || [])
       // Reset diff state for new session
       fileDiffCache = {}
       fileDiffVisible = new Set()
     } catch {
-      fileJournalTurnKeys = new Set()
+      if (loadVersion !== fileJournalLoadVersion || sid !== sessionId) return
+      fileJournalTurnKeyMap = {}
     }
   }
 
@@ -1141,7 +1200,8 @@
     currentSession.sessionId = null
     shouldScrollToBottom = false
     workspacePath = defaultWorkspacePath
-    fileJournalTurnKeys = new Set()
+    fileJournalLoadVersion += 1
+    fileJournalTurnKeyMap = {}
     fileDiffCache = {}
     fileDiffVisible = new Set()
   }
@@ -1416,7 +1476,7 @@
     <!-- Message list: hidden when terminal is visible -->
     <div class="message-list-container" class:hidden={terminalVisible}>
       {#key sessionId}
-        <MessageList {messages} {agentList} {displayMessageDetails} onRevoke={handleRevoke} onScrollAtBottom={handleScrollAtBottom} {shouldScrollToBottom} {collapsedGroups} onToggleCollapse={toggleCollapse} {fileJournalTurnKeys} {fileDiffCache} {fileDiffVisible} onToggleFileDiff={handleToggleFileDiff} />
+        <MessageList {messages} {agentList} {displayMessageDetails} onRevoke={handleRevoke} onScrollAtBottom={handleScrollAtBottom} {shouldScrollToBottom} {collapsedGroups} onToggleCollapse={toggleCollapse} {fileJournalTurnKeyMap} {fileDiffCache} {fileDiffVisible} onToggleFileDiff={handleToggleFileDiff} />
       {/key}
 
       <WorkspaceFileManager

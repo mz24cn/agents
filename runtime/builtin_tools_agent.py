@@ -15,10 +15,23 @@ import os
 import re
 
 from runtime.models import InferenceRequest, Message, ToolConfig
-from runtime.common import session_timestamp
+from runtime.common import session_timestamp, snapshot_request_context, restore_request_context
 from runtime.group_chat import build_agents_markdown, _GC_DEFAULT_PROMPT
 
 logger = logging.getLogger("runtime.builtin_tools")
+
+_MISSING = object()
+
+
+def _restore_thread_attr(thread_local, name: str, previous) -> None:
+    """Restore a thread-local attribute, including its prior absence."""
+    if previous is _MISSING:
+        try:
+            delattr(thread_local, name)
+        except AttributeError:
+            pass
+    else:
+        setattr(thread_local, name, previous)
 
 DELEGATE_TOOL_CONFIG = ToolConfig(
     tool_id="delegate",
@@ -178,6 +191,15 @@ def _make_delegate_fn(runtime, thread_local):
             old_session_dir = getattr(thread_local, "session_dir", None)
             old_file_journal_manager = getattr(thread_local, "file_journal_manager", None)
             old_user_message_timestamp = getattr(thread_local, "user_message_timestamp", None)
+            old_journal_session_id = getattr(thread_local, "file_journal_session_id", _MISSING)
+            old_journal_session_dir = getattr(thread_local, "file_journal_session_dir", _MISSING)
+            old_journal_timestamp = getattr(thread_local, "file_journal_user_message_timestamp", _MISSING)
+            journal_session_id = (session_id if old_journal_session_id is _MISSING
+                                  else old_journal_session_id)
+            journal_session_dir = (old_session_dir if old_journal_session_dir is _MISSING
+                                   else old_journal_session_dir)
+            journal_timestamp = (old_user_message_timestamp if old_journal_timestamp is _MISSING
+                                 else old_journal_timestamp)
             thread_local.depth = current_depth + 1
             if sub_session_id is not None:
                 thread_local.session_id = sub_session_id
@@ -186,6 +208,11 @@ def _make_delegate_fn(runtime, thread_local):
                 else:
                     thread_local.session_dir = None
                 thread_local.file_journal_manager = None
+                # Keep delegate's conversation isolated in the sub-session, but
+                # attribute all file changes to the initiating parent user turn.
+                thread_local.file_journal_session_id = journal_session_id
+                thread_local.file_journal_session_dir = journal_session_dir
+                thread_local.file_journal_user_message_timestamp = journal_timestamp
 
             chunks = []
             collected_msgs = []
@@ -221,6 +248,9 @@ def _make_delegate_fn(runtime, thread_local):
                 thread_local.session_dir = old_session_dir
                 thread_local.file_journal_manager = old_file_journal_manager
                 thread_local.user_message_timestamp = old_user_message_timestamp
+                _restore_thread_attr(thread_local, "file_journal_session_id", old_journal_session_id)
+                _restore_thread_attr(thread_local, "file_journal_session_dir", old_journal_session_dir)
+                _restore_thread_attr(thread_local, "file_journal_user_message_timestamp", old_journal_timestamp)
                 if sub_session_id is not None:
                     thread_local.last_session_id = sub_session_id
 
@@ -317,6 +347,15 @@ def _make_talk_to_fn(runtime, thread_local):
         cancel_event = getattr(thread_local, "cancel_event", None)
         all_agent_ids: list[str] = getattr(thread_local, "all_agent_ids", None) or []
         caller_agent_id: str = getattr(thread_local, "agent_id", None) or ""
+        parent_request_context = snapshot_request_context()
+        journal_session_id = parent_request_context.get(
+            "file_journal_session_id", parent_session_id)
+        journal_session_dir = parent_request_context.get(
+            "file_journal_session_dir", parent_request_context.get("session_dir"))
+        journal_timestamp = parent_request_context.get(
+            "file_journal_user_message_timestamp",
+            parent_request_context.get("user_message_timestamp"),
+        )
 
         if agent_manager is None:
             return "Error: talk_to requires an AgentManager. Ensure agent_manager is set in the request context."
@@ -347,12 +386,23 @@ def _make_talk_to_fn(runtime, thread_local):
                 sub_ts = session_timestamp()
                 sub_session_id = f"{parent_session_id}-talk_{sub_ts}_{agent_id}"
 
-            # 在子线程中设置 thread_local 上下文
-            thread_local.depth = parent_depth + 1
-            thread_local.session_id = sub_session_id
-            thread_local.session_dir = None
-            thread_local.file_journal_manager = None
-            thread_local.user_message_timestamp = None
+            # Inherit the parent's complete request context.  In particular,
+            # keep session_dir and the parent's user_message_timestamp so file
+            # changes made by talk_to are journaled on the visible parent turn.
+            # Conversation persistence still uses the independent sub_session_id
+            # below; only the file journal belongs to the initiating user turn.
+            child_context = dict(parent_request_context)
+            child_context.update({
+                "depth": parent_depth + 1,
+                "session_id": sub_session_id,
+                "session_dir": None,
+                "file_journal_manager": None,
+                "user_message_timestamp": None,
+                "file_journal_session_id": journal_session_id,
+                "file_journal_session_dir": journal_session_dir,
+                "file_journal_user_message_timestamp": journal_timestamp,
+            })
+            restore_request_context(child_context)
             # 子线程中 tool_scope 和 agent_manager 继承父线程
             thread_local.tool_scope = getattr(thread_local, "tool_scope", [])
             thread_local.agent_manager = agent_manager
@@ -434,13 +484,21 @@ def _make_talk_to_fn(runtime, thread_local):
                                     "streaming": True,
                                     "delta": msg.content,
                                     "depth": parent_depth + 1,
-                                    "agent_id": agent_id,
-                                    "agent_nickname": nickname,
+                                    "agent_id": caller_agent_id,
+                                    "target_agent_id": agent_id,
+                                    "target_agent_nickname": nickname,
                                 })
                             except Exception:
                                 pass
             except Exception as exc:
                 return (agent_id, nickname, f"Error: {exc}", None)
+            finally:
+                journal_manager = getattr(thread_local, "file_journal_manager", None)
+                if journal_manager is not None:
+                    try:
+                        journal_manager.flush()
+                    except Exception as journal_err:
+                        logger.warning("talk_to: failed to finalize file journal: %s", journal_err)
 
             result = "".join(chunks)
 

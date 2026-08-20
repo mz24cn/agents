@@ -52,7 +52,7 @@ class EnvManager:
                 result["AGENTS_WORKSPACE"] = workspace
             return result
         try:
-            with open(self._env_path, "r", encoding="utf-8") as fh:
+            with open(self._env_path, "r", encoding="utf-8-sig") as fh:
                 data = json.load(fh)
         except json.JSONDecodeError as exc:
             raise ValueError(f"env.json 格式异常: {exc}") from exc
@@ -549,10 +549,10 @@ fi
 _SETUP_SOURCE='__SETUP_SOURCE_URL__'
 if [ -n "$_SETUP_SOURCE" ]; then
   _ENV_JSON="$AGENTS_RUNTIME_DIR/env.json"
-  python3 -c "
-import json, os
-path = '$_ENV_JSON'
-url = '$_SETUP_SOURCE'
+  _PY="${PYTHON:-python3}"
+  $_PY -c "
+import json, os, sys
+path, url = sys.argv[1], sys.argv[2]
 if os.path.isfile(path):
     with open(path, 'r') as f:
         data = json.load(f)
@@ -561,7 +561,7 @@ else:
 data['SETUP_SOURCE'] = url
 with open(path, 'w') as f:
     json.dump(data, f, indent=2, ensure_ascii=False)
-" 2>&1 || echo "Warning: failed to write SETUP_SOURCE to env.json" >&2
+" "$_ENV_JSON" "$_SETUP_SOURCE" 2>&1 || echo "Warning: failed to write SETUP_SOURCE to env.json" >&2
 fi
 
 case "$START_AGENTS" in
@@ -598,40 +598,60 @@ exit 0
             "if not defined AGENTS_RUNTIME_DIR set \"AGENTS_RUNTIME_DIR=%USERPROFILE%\\.agents_runtime\"\r\n"
             "if not defined AGENTS_LOG set \"AGENTS_LOG=%AGENTS_RUNTIME_DIR%\\server.log\"\r\n"
             "if not defined START_AGENTS set START_AGENTS=background\r\n"
-            "if not defined AGENTS_HOME set \"AGENTS_HOME=%~dp0agents\"\r\n"
+            "rem Always use the agents directory next to this script; do not inherit a stale AGENTS_HOME.\r\n"
+            "set \"AGENTS_HOME=%~dp0agents\"\r\n"
             "\r\n"
             "mkdir \"%AGENTS_RUNTIME_DIR%\" 2>nul\r\n"
             "\r\n"
-            "if \"%START_AGENTS%\"==\"background\" (\r\n"
-            "    set \"PS_START=%TEMP%\\agent-start.ps1\"\r\n"
-            "    > \"!PS_START!\" echo $ErrorActionPreference = 'Stop'\r\n"
-            "    >> \"!PS_START!\" echo $p = Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', 'python \"%AGENTS_HOME%\\app.py\" 0.0.0.0:%AGENTS_PORT% ^>^> \"%AGENTS_LOG%\" 2^>^&1' -PassThru -WindowStyle Hidden\r\n"
-            "    >> \"!PS_START!\" echo $p.Id\r\n"
-            "    powershell -NoProfile -ExecutionPolicy Bypass -File \"!PS_START!\" >nul 2>nul\r\n"
-            "    del \"!PS_START!\" 2>nul\r\n"
-            "    rem app.py 负责写入 server.pid（python 进程真实 PID），等待其出现后读取。\r\n"
-            "    for /l %%i in (1,1,60) do (\r\n"
-            "        if exist \"%AGENTS_RUNTIME_DIR%\\server.pid\" goto :bg_ready\r\n"
-            "        ping -n 1 -w 500 127.0.0.1 >nul\r\n"
-            "    )\r\n"
-            "    :bg_ready\r\n"
-            "    set \"PID=\"\r\n"
-            "    if exist \"%AGENTS_RUNTIME_DIR%\\server.pid\" set /p PID=<\"%AGENTS_RUNTIME_DIR%\\server.pid\"\r\n"
-            "    if defined PID (\r\n"
-            "        echo Agent service started in background, pid: !PID!\r\n"
-            "    ) else (\r\n"
-            "        echo Agent service started in background\r\n"
-            "    )\r\n"
-            "    echo Log: %AGENTS_LOG%\r\n"
-            ") else if \"%START_AGENTS%\"==\"foreground\" (\r\n"
-            "    python \"%AGENTS_HOME%\\app.py\" 0.0.0.0:%AGENTS_PORT%\r\n"
-            ") else if \"%START_AGENTS%\"==\"none\" (\r\n"
-            "    echo Agent service not started because START_AGENTS=none\r\n"
-            ") else (\r\n"
-            "    echo Invalid START_AGENTS=%START_AGENTS%. Expected: background, foreground, none\r\n"
-            "    exit /b 2\r\n"
+            "if /i \"%START_AGENTS%\"==\"background\" goto :background\r\n"
+            "if /i \"%START_AGENTS%\"==\"foreground\" goto :foreground\r\n"
+            "if /i \"%START_AGENTS%\"==\"none\" goto :none\r\n"
+            "echo Invalid START_AGENTS=%START_AGENTS%. Expected: background, foreground, none 1>&2\r\n"
+            "exit /b 2\r\n"
+            "\r\n"
+            ":foreground\r\n"
+            "python \"%AGENTS_HOME%\\app.py\" 0.0.0.0:%AGENTS_PORT%\r\n"
+            "exit /b %ERRORLEVEL%\r\n"
+            "\r\n"
+            ":none\r\n"
+            "echo Agent service not started because START_AGENTS=none\r\n"
+            "exit /b 0\r\n"
+            "\r\n"
+            ":background\r\n"
+            "rem Remove a stale PID so startup success cannot be reported from an old process.\r\n"
+            "del \"%AGENTS_RUNTIME_DIR%\\server.pid\" 2>nul\r\n"
+            "set \"PS_START=%TEMP%\\agent-start-%RANDOM%-%RANDOM%.ps1\"\r\n"
+            "> \"%PS_START%\" echo $ErrorActionPreference = 'Stop'\r\n"
+            ">> \"%PS_START%\" echo $p = Start-Process -FilePath 'python' -ArgumentList '\"%AGENTS_HOME%\\app.py\"','0.0.0.0:%AGENTS_PORT%' -RedirectStandardOutput '%AGENTS_LOG%' -RedirectStandardError '%AGENTS_LOG%.err' -PassThru -WindowStyle Hidden\r\n"
+            ">> \"%PS_START%\" echo $p.Id\r\n"
+            "powershell -NoProfile -ExecutionPolicy Bypass -File \"%PS_START%\"\r\n"
+            "set \"START_RC=%ERRORLEVEL%\"\r\n"
+            "del \"%PS_START%\" 2>nul\r\n"
+            "if not \"%START_RC%\"==\"0\" (\r\n"
+            "    echo Failed to create background process, PowerShell exit code: %START_RC% 1>&2\r\n"
+            "    exit /b %START_RC%\r\n"
             ")\r\n"
-            "endlocal\r\n"
+            "for /l %%i in (1,1,60) do (\r\n"
+            "    if exist \"%AGENTS_RUNTIME_DIR%\\server.pid\" goto :check_process\r\n"
+            "    ping -n 1 -w 500 127.0.0.1 >nul\r\n"
+            ")\r\n"
+            "echo Agent service did not create %AGENTS_RUNTIME_DIR%\\server.pid 1>&2\r\n"
+            "echo Logs: %AGENTS_LOG% and %AGENTS_LOG%.err 1>&2\r\n"
+            "exit /b 1\r\n"
+            "\r\n"
+            ":check_process\r\n"
+            "set \"PID=\"\r\n"
+            "set /p PID=<\"%AGENTS_RUNTIME_DIR%\\server.pid\"\r\n"
+            "ping -n 2 -w 500 127.0.0.1 >nul\r\n"
+            "tasklist /FI \"PID eq %PID%\" /NH 2>nul | findstr /R /C:\"[ ]%PID%[ ]\" >nul\r\n"
+            "if errorlevel 1 (\r\n"
+            "    echo Agent service process %PID% exited during startup. 1>&2\r\n"
+            "    echo Logs: %AGENTS_LOG% and %AGENTS_LOG%.err 1>&2\r\n"
+            "    exit /b 1\r\n"
+            ")\r\n"
+            "echo Agent service started in background, pid: %PID%\r\n"
+            "echo Log: %AGENTS_LOG%\r\n"
+            "exit /b 0\r\n"
         )
         # ── stop-agent-service.bat ───────────────────────────────
         # 读取 server.pid，用 taskkill /T (tree) 终止整个进程树（cmd.exe + python）。
@@ -725,20 +745,13 @@ exit 0
             "    $setupSource = '__SETUP_SOURCE_URL__'\n"
             "    if ($setupSource) {\n"
             "        $envJson = Join-Path $env:AGENTS_RUNTIME_DIR 'env.json'\n"
-            "        try {\n"
-            "            if (Test-Path $envJson) {\n"
-            "                $data = Get-Content $envJson -Raw -Encoding UTF8 | ConvertFrom-Json\n"
-            "                if ($data -is [PSCustomObject]) {\n"
-            "                    $data = @{} + $data.PSObject.Properties | ForEach-Object { @{$_.Name = $_.Value} }\n"
-            "                }\n"
-            "            } else {\n"
-            "                $data = @{}\n"
-            "            }\n"
-            "            $data['SETUP_SOURCE'] = $setupSource\n"
-            "            $data | ConvertTo-Json -Depth 10 | Set-Content -Path $envJson -Encoding UTF8\n"
-            "        } catch {\n"
-            "            Write-Warning \"Failed to write SETUP_SOURCE to env.json: $_\"\n"
+            "        if (Test-Path $envJson) {\n"
+            "            $data = Get-Content $envJson -Raw | ConvertFrom-Json\n"
+            "        } else {\n"
+            "            $data = New-Object PSObject\n"
             "        }\n"
+            "        $data | Add-Member -NotePropertyName 'SETUP_SOURCE' -NotePropertyValue $setupSource -Force\n"
+            "        $data | ConvertTo-Json -Depth 10 | Set-Content $envJson -Encoding UTF8\n"
             "    }\n"
             "\n"
             "    if ($env:START_AGENTS -eq 'background') {\n"

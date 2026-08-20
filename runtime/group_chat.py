@@ -27,9 +27,15 @@ import queue
 import re
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from dataclasses import dataclass
 from typing import Generator, Optional
 
-from runtime.common import set_request_context
+from runtime.common import (
+    get_request_context,
+    restore_request_context,
+    set_request_context,
+    snapshot_request_context,
+)
 from runtime.models import Message, InferenceRequest
 from runtime.runtime import _get_infer_round_timeout
 
@@ -40,6 +46,17 @@ _logger = logging.getLogger("runtime.group_chat")
 # the stream alive so final frames (e.g. the timeout error) actually reach
 # the browser instead of being silently lost.
 _GROUP_CHAT_HEARTBEAT_INTERVAL = 25.0
+
+
+@dataclass(frozen=True)
+class _NestedStreamFrame:
+    """Ephemeral nested-tool UI frame transported through the round queue.
+
+    It is written to SSE in queue order but is never yielded, collected, or
+    persisted in conversation history.
+    """
+
+    frame: dict
 
 
 def _get_group_chat_timeout(num_agents: int) -> Optional[float]:
@@ -783,6 +800,12 @@ def _run_group_chat_stream_gen(
         Each message is tagged with ``agent_id`` and ``name``.
         The final yield is always a ``usage`` message if any exists.
     """
+    # Group-chat agents run in ThreadPoolExecutor workers.  Capture the HTTP
+    # thread's complete request context before entering those workers; otherwise
+    # session_dir / user_message_timestamp / workspace are absent and file tools
+    # silently create a stateless (non-visible) journal.
+    parent_request_context = snapshot_request_context()
+
     # ── Load conversation history (needed by both degenerate and full paths) ──
     existing_turns = []
     summary_text: str = ""
@@ -901,7 +924,10 @@ def _run_group_chat_stream_gen(
 
         # --- per-agent runner (generator-based, feeds results through a queue) ---
 
-        def _run_one_gen(agent_id: str) -> Generator[Message, None, None]:
+        def _run_one_gen(
+            agent_id: str,
+            nested_stream_callback=None,
+        ) -> Generator[Message, None, None]:
             """Generator that yields messages for a single agent and appends
             to existing_turns when done.  Also populates _round_trigger_msgs
             with any @-mentions found in the *merged* (post-_flush_asst)
@@ -914,7 +940,7 @@ def _run_group_chat_stream_gen(
                                 cancel_event=cancel_event,
                                 all_agent_ids=all_agent_ids,
                                 agent_id=agent_id,
-                                sse_callback=sse_callback)
+                                sse_callback=nested_stream_callback)
             agent = agent_manager.get(agent_id)
             if agent is None:
                 return
@@ -1093,13 +1119,32 @@ def _run_group_chat_stream_gen(
         # Submit each agent's generator via a queue so the main thread can
         # yield messages as they come in.  Include agent_id in every event so
         # timeout handling can distinguish completed from still-running agents.
-        _msg_queue: "queue.Queue[tuple[str, Optional[Message]]]" = queue.Queue()
+        _msg_queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
         _agent_count = len(pending_mentioned)
+
+        def _make_nested_stream_callback(owner_agent_id: str):
+            """Route self-streaming tool frames through the same ordered queue
+            as the owning agent's ordinary model/tool messages."""
+            def _callback(frame: dict) -> None:
+                normalized = dict(frame)
+                normalized.setdefault("agent_id", owner_agent_id)
+                _msg_queue.put((owner_agent_id, _NestedStreamFrame(normalized)))
+            return _callback
 
         def _agent_worker(agent_id: str) -> None:
             """Run one agent's generator and feed its messages to the queue."""
+            worker_context = dict(parent_request_context)
+            # A manager is turn/thread-local mutable state.  Each parallel agent
+            # gets its own instance, while all instances target the same parent
+            # session + user turn and merge through the manifest lock.
+            worker_context["file_journal_manager"] = None
+            restore_request_context(worker_context)
+            nested_stream_callback = _make_nested_stream_callback(agent_id)
             try:
-                for msg in _run_one_gen(agent_id):
+                for msg in _run_one_gen(
+                    agent_id,
+                    nested_stream_callback=nested_stream_callback,
+                ):
                     _msg_queue.put((agent_id, msg))
             except Exception as exc:
                 _logger.error("group chat agent_worker %s failed: %s", agent_id, exc)
@@ -1112,6 +1157,16 @@ def _run_group_chat_stream_gen(
                 )
                 _msg_queue.put((agent_id, err))
             finally:
+                journal_manager = get_request_context("file_journal_manager")
+                if journal_manager is not None:
+                    try:
+                        journal_manager.flush()
+                    except Exception as exc:
+                        _logger.warning(
+                            "group chat agent %s failed to finalize file journal: %s",
+                            agent_id, exc,
+                        )
+                restore_request_context({})
                 _msg_queue.put((agent_id, None))  # sentinel: this agent is done
 
         futures = {
@@ -1173,6 +1228,14 @@ def _run_group_chat_stream_gen(
                                     pass
                         break
                     else:
+                        if isinstance(msg, _NestedStreamFrame):
+                            got_any = True
+                            if sse_callback is not None:
+                                try:
+                                    sse_callback(msg.frame)
+                                except Exception:
+                                    pass
+                            continue
                         if msg is None:
                             if event_agent_id not in completed_agent_ids:
                                 completed_agent_ids.add(event_agent_id)

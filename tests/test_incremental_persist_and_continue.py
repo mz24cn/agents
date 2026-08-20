@@ -21,7 +21,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from runtime.context_manager import ContextManager
+from runtime.context_manager import ContextManager, ConversationTurn
 from runtime.models import InferenceRequest, Message, ModelConfig, ToolConfig
 from runtime.registry import ModelRegistry, ToolRegistry
 from runtime.runtime import Runtime
@@ -100,6 +100,35 @@ def test_persist_conversation_default_compresses():
     exc = persist_conversation(cm, "s1", [], [])
     assert exc is None
     cm.compress_context.assert_called_once()
+
+
+def test_next_persist_prunes_invalid_existing_history(tmp_path):
+    cm = ContextManager(infer_fn=lambda req: None, chats_dir=str(tmp_path))
+    session_id = cm.create_session()
+    cm.save_conversation(session_id, [
+        ConversationTurn(role="user", content="old user", timestamp="t1"),
+        ConversationTurn(
+            role="assistant", content="partial", timestamp="t2",
+            tool_calls=[{
+                "id": "broken", "name": "read_file", "arguments": "{\"path\":",
+            }],
+        ),
+    ])
+
+    assert persist_conversation(
+        cm,
+        session_id,
+        [Message(role="user", content="new user", timestamp="t3")],
+        [Message(role="assistant", content="new answer", timestamp="t4")],
+        compress=False,
+    ) is None
+
+    loaded = cm.load_conversation(session_id)
+    assert [(turn.role, turn.content) for turn in loaded] == [
+        ("user", "old user"),
+        ("user", "new user"),
+        ("assistant", "new answer"),
+    ]
 
 
 def test_final_empty_persist_preserves_incremental_usage_and_triggers_compression(tmp_path):

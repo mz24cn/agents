@@ -42,6 +42,153 @@ def _make_turn(role: str, content: str, ts: str = "2026-01-01T00:00:00") -> Conv
     return ConversationTurn(role=role, content=content, timestamp=ts)
 
 
+def test_remove_trailing_assistant_error_removes_entire_turn() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cm = _make_cm(tmp_dir)
+        session_id = cm.create_session()
+        turns = [
+            _make_turn("user", "continue from here"),
+            ConversationTurn(
+                role="assistant",
+                content="Error: stream parse: timed out",
+                timestamp="2026-01-01T00:00:01",
+                tool_calls=[{"id": "call-1", "name": "read_image", "arguments": "{\"path\":"}],
+            ),
+        ]
+        cm.save_conversation(session_id, turns, last_total_tokens=123)
+
+        assert cm.remove_trailing_assistant_error(session_id) is True
+        loaded = cm.load_conversation(session_id)
+        assert [(turn.role, turn.content) for turn in loaded] == [
+            ("user", "continue from here")
+        ]
+
+        with open(cm._conversation_path(session_id), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        assert data["meta"]["turn_count"] == 1
+        assert data["meta"]["last_total_tokens"] == 123
+
+
+def test_remove_trailing_assistant_error_preserves_tool_error() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cm = _make_cm(tmp_dir)
+        session_id = cm.create_session()
+        turns = [
+            _make_turn("assistant", "", "2026-01-01T00:00:00"),
+            _make_turn("tool", "Error: tool execution failed", "2026-01-01T00:00:01"),
+        ]
+        cm.save_conversation(session_id, turns)
+
+        assert cm.remove_trailing_assistant_error(session_id) is False
+        assert len(cm.load_conversation(session_id)) == 2
+
+
+def test_remove_trailing_incomplete_tool_call_without_error_text() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cm = _make_cm(tmp_dir)
+        session_id = cm.create_session()
+        turns = [
+            _make_turn("tool", "last complete result"),
+            ConversationTurn(
+                role="assistant",
+                content="I will inspect the image now.",
+                timestamp="2026-01-01T00:00:01",
+                tool_calls=[{
+                    "id": "call-partial",
+                    "name": "read_image",
+                    "arguments": "{\"path\": \"/tmp/incomplete",
+                }],
+            ),
+        ]
+        cm.save_conversation(session_id, turns)
+
+        assert cm.trailing_assistant_is_incomplete(session_id) is True
+        assert cm.remove_trailing_incomplete_assistant(session_id) is True
+        loaded = cm.load_conversation(session_id)
+        assert len(loaded) == 1
+        assert loaded[-1].role == "tool"
+
+
+def test_complete_trailing_tool_call_is_not_classified_as_partial_stream() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cm = _make_cm(tmp_dir)
+        session_id = cm.create_session()
+        cm.save_conversation(session_id, [ConversationTurn(
+            role="assistant",
+            content="",
+            timestamp="2026-01-01T00:00:01",
+            tool_calls=[{
+                "id": "call-complete",
+                "name": "read_file",
+                "arguments": "{\"path\": \"README.md\"}",
+            }],
+        )])
+
+        assert cm.trailing_assistant_is_incomplete(session_id) is False
+        assert cm.remove_trailing_incomplete_assistant(session_id) is False
+
+
+def test_prune_invalid_persisted_turns_removes_whole_bad_segments() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cm = _make_cm(tmp_dir)
+        session_id = cm.create_session()
+        turns = [
+            _make_turn("user", "keep"),
+            ConversationTurn(
+                role="assistant",
+                content="partial",
+                timestamp="2026-01-01T00:00:01",
+                tool_calls=[{
+                    "id": "bad-call",
+                    "name": "read_file",
+                    "arguments": "{\"path\":",
+                }],
+            ),
+            ConversationTurn(
+                role="tool", content="partial result",
+                timestamp="2026-01-01T00:00:02", tool_use_id="bad-call",
+            ),
+            ConversationTurn(
+                role="assistant", content="", timestamp="2026-01-01T00:00:03",
+                tool_calls=[{
+                    "id": "dangling-call", "name": "echo", "arguments": "{}",
+                }],
+            ),
+            _make_turn("assistant", "keep final", "2026-01-01T00:00:04"),
+            ConversationTurn(
+                role="tool", content="orphan",
+                timestamp="2026-01-01T00:00:05", tool_use_id="orphan-call",
+            ),
+        ]
+
+        assert cm.prune_invalid_persisted_turns(session_id, turns) == 4
+        assert [(turn.role, turn.content) for turn in turns] == [
+            ("user", "keep"),
+            ("assistant", "keep final"),
+        ]
+
+
+def test_prune_invalid_persisted_turns_preserves_complete_tool_segment() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cm = _make_cm(tmp_dir)
+        session_id = cm.create_session()
+        turns = [
+            ConversationTurn(
+                role="assistant", content="", timestamp="2026-01-01T00:00:01",
+                tool_calls=[{
+                    "id": "call-ok", "name": "echo", "arguments": "{}",
+                }],
+            ),
+            ConversationTurn(
+                role="tool", name="echo", content="ok",
+                timestamp="2026-01-01T00:00:02", tool_use_id="call-ok",
+            ),
+        ]
+
+        assert cm.prune_invalid_persisted_turns(session_id, turns) == 0
+        assert [turn.role for turn in turns] == ["assistant", "tool"]
+
+
 # ---------------------------------------------------------------------------
 # Property 7: Tool-call file naming convention (Task 2.1)
 # **Validates: Requirements 3.4**

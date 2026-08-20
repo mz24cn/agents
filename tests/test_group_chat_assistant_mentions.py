@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
 
+from runtime.common import get_request_context
 from runtime.models import Message, InferenceRequest
 from runtime.group_chat import (
     run_group_chat_stream,
@@ -84,6 +85,46 @@ class ToolRoundRuntime:
         )
         yield Message(role="assistant", content="done")
         yield Message(role="usage", name="round", content="{}")
+
+
+class NestedStreamingToolRuntime:
+    """Emits nested-tool UI frames through the request-context callback."""
+
+    def infer_stream(self, request: InferenceRequest, cancel_event=None):
+        yield Message(
+            role="assistant",
+            tool_calls=[{
+                "id": "call_nested_1",
+                "name": "talk_to",
+                "arguments": "{}",
+            }],
+        )
+        callback = get_request_context("sse_callback")
+        assert callback is not None
+        callback({
+            "role": "tool",
+            "name": "talk_to",
+            "tool_use_id": "call_nested_1",
+            "streaming": True,
+            "delta": "partial",
+            "agent_id": "SunWuKong",
+            "target_agent_id": "ShaWuJing",
+            "target_agent_nickname": "沙和尚",
+        })
+        callback({
+            "role": "tool",
+            "name": "talk_to",
+            "tool_use_id": "call_nested_1",
+            "streaming": False,
+            "agent_id": "SunWuKong",
+        })
+        yield Message(
+            role="tool",
+            name="talk_to",
+            tool_id="talk_to",
+            tool_use_id="call_nested_1",
+            content="formal result",
+        )
 
 
 class ChunkedRuntime:
@@ -169,6 +210,39 @@ def test_group_chat_generator_yields_self_streaming_tool_result_with_canonical_i
     assert tool_messages[0].name == tool_name
     assert tool_messages[0].tool_id == tool_name
     assert tool_messages[0].tool_use_id == "call_talk_1"
+
+
+def test_group_chat_nested_stream_frames_are_ordered_and_not_persisted():
+    am = FakeAgentManager(AGENTS)
+    events = []
+
+    messages = list(run_group_chat_stream_gen(
+        runtime=NestedStreamingToolRuntime(),
+        mentioned_agent_ids=["SunWuKong"],
+        all_agent_ids=["SunWuKong", "ShaWuJing", "ZhuBaJie"],
+        original_messages=[Message(role="user", content="@SunWuKong ask")],
+        base_request=_make_req("@SunWuKong ask", ["SunWuKong"]),
+        cancel_event=None,
+        sse_callback=lambda frame: events.append(frame),
+        context_manager=None,
+        session_id=None,
+        agent_manager=am,
+        model_id="m1",
+        tool_ids=[],
+        max_rounds=1,
+    ))
+
+    # Ephemeral frames reach the SSE callback in production order.
+    assert [event["streaming"] for event in events] == [True, False]
+    assert events[0]["target_agent_id"] == "ShaWuJing"
+    assert all(event["tool_use_id"] == "call_nested_1" for event in events)
+
+    # They never enter the canonical message stream/history. Only the formal
+    # result is yielded and eligible for persistence.
+    assert [message.role for message in messages] == ["assistant", "tool"]
+    assert messages[0].tool_calls[0]["id"] == "call_nested_1"
+    assert messages[1].tool_use_id == "call_nested_1"
+    assert messages[1].content == "formal result"
 
 
 def test_parse_mentions_supports_chinese_nicknames_and_ids():

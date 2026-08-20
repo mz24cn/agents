@@ -192,6 +192,93 @@ def _normalize_tool_call_order(messages: list) -> list:
     return result
 
 
+def _ensure_tool_call_results(messages: list) -> list:
+    """Return protocol-valid history with every tool call paired to a result.
+
+    Provider APIs reject dangling assistant ``tool_calls`` as well as orphan
+    ``tool`` messages.  Interrupted streams can leave either shape on disk,
+    and can also leave a truncated JSON argument string.  For the current model
+    request malformed arguments become ``{}``, missing IDs are assigned
+    deterministically, orphan results are dropped, and an explicit interrupted
+    result is inserted for each unmatched call.  The persistence layer separately
+    prunes the malformed source segment on the next conversation rewrite.
+    """
+    messages = _normalize_tool_call_order(messages)
+    result: list = []
+    pending: list[tuple[str, str]] = []
+
+    def _flush_pending() -> None:
+        nonlocal pending
+        for call_id, name in pending:
+            result.append(Message(
+                role="tool",
+                name=name,
+                tool_use_id=call_id,
+                content=(
+                    f"[interrupted] The tool call `{name}` did not produce a "
+                    "result. Continue from the available conversation context; "
+                    "only call the tool again if necessary."
+                ),
+            ))
+        pending = []
+
+    for message_index, msg in enumerate(messages):
+        if msg.role == "assistant" and msg.tool_calls:
+            _flush_pending()
+            repaired_calls: list[dict] = []
+            for call_index, raw_call in enumerate(msg.tool_calls):
+                tc = dict(raw_call) if isinstance(raw_call, dict) else {}
+                call_id = tc.get("id") or tc.get("tool_use_id")
+                if not call_id:
+                    call_id = f"call_recovered_{message_index}_{call_index}"
+                name = str(tc.get("name") or "__interrupted__")
+                arguments = tc.get("arguments", "{}")
+                if isinstance(arguments, str):
+                    try:
+                        json.loads(arguments)
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        arguments = "{}"
+                elif not isinstance(arguments, dict):
+                    arguments = {}
+                tc["id"] = call_id
+                tc["name"] = name
+                tc["arguments"] = arguments
+                repaired_calls.append(tc)
+                pending.append((call_id, name))
+            msg.tool_calls = repaired_calls
+            result.append(msg)
+            continue
+
+        if msg.role == "tool":
+            if not pending:
+                # Strict providers reject tool results without a preceding call.
+                continue
+            tool_id = getattr(msg, "tool_use_id", None)
+            match_index = next(
+                (i for i, (call_id, _) in enumerate(pending) if call_id == tool_id),
+                None,
+            ) if tool_id else None
+            if match_index is None and not tool_id:
+                # Legacy/Ollama histories may omit IDs; pair by tool name first,
+                # then by declaration order.
+                match_index = next(
+                    (i for i, (_, name) in enumerate(pending) if name == msg.name),
+                    0,
+                )
+                msg.tool_use_id = pending[match_index][0]
+            if match_index is None:
+                continue
+            pending.pop(match_index)
+            result.append(msg)
+            continue
+
+        _flush_pending()
+        result.append(msg)
+
+    _flush_pending()
+    return result
+
+
 # ---------------------------------------------------------------------------
 # VLM fallback helpers
 #
@@ -513,8 +600,8 @@ class Runtime:
             # next model API request, if MAX_INFER_PER_MINUTE is configured.
             self._maybe_throttle_inference_loop(overall_start, tool_round)
 
-            # Build HTTP request (normalize any out-of-order tool messages first)
-            messages = _normalize_tool_call_order(messages)
+            # Repair legacy/interrupted tool-call history before serialization.
+            messages = _ensure_tool_call_results(messages)
             url, headers, body_bytes = protocol.build_request(
                 config=model_config,
                 messages=messages,
@@ -1389,7 +1476,7 @@ class Runtime:
                 yield Message(role="assistant", timestamp=_now_iso(), content="Error: user interrupted.")
                 return
 
-            messages = _normalize_tool_call_order(messages)
+            messages = _ensure_tool_call_results(messages)
             url, headers, body_bytes = protocol.build_request(
                 config=model_config, messages=messages,
                 tools=tools if tools else None, stream=True,

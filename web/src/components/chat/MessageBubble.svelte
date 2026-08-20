@@ -10,12 +10,13 @@
   import { t } from '../../lib/i18n.svelte.js'
   import { highlight } from '../../lib/highlight.js'
 
-  let { msg, agentList = [], onRevoke, collapseButton = null, onCollapse, hasFileChanges = false, onToggleFileDiff, fileDiffData = null, fileDiffVisible = false, compact = false, replyDetailed = null, onToggleReplyMode, toolResultsById = {} } = $props()
+  let { msg, agentList = [], onRevoke, collapseButton = null, onCollapse, hasFileChanges = false, onToggleFileDiff, fileDiffData = null, fileDiffVisible = false, compact = false, replyDetailed = null, onToggleReplyMode, toolResultsById = {}, scrollTargetIndex = null } = $props()
 
   // ── Compact mode helpers ──
   /** Determine icon for tool result in compact mode */
   let toolResultIcon = $derived.by(() => {
     if (msg.role !== 'tool') return ''
+    if (msg.streaming === true || (msg.sub_messages && Object.values(msg.sub_messages).some(sm => sm.streaming))) return '⏳'
     const tc = toolContentSource
     if (!tc) return '\u2714\uFE0F'  // empty = check mark
     try {
@@ -188,7 +189,7 @@
   }
 </script>
 
-<div class="message {msg.role}" class:compact>
+<div class="message {msg.role}" class:compact data-user-message-index={scrollTargetIndex ?? undefined}>
 {#if compact}
   <!-- ── Compact mode: lean display for reasoning-loop messages ── -->
   {#if msg.role === 'assistant'}

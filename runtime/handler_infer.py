@@ -199,6 +199,44 @@ class HandlerInferMixin:
             last_turn = turns[-1] if turns else None
             last_role = getattr(last_turn, "role", None) if last_turn else None
             last_tool_calls = getattr(last_turn, "tool_calls", None) or [] if last_turn else []
+            try:
+                trailing_assistant_incomplete = (
+                    context_manager.trailing_assistant_is_incomplete(session_id)
+                )
+            except (OSError, ValueError) as exc:
+                self._send_json_error(
+                    500, f"Failed to inspect trailing assistant message: {exc}"
+                )
+                return None
+
+            # A trailing assistant Error or structurally incomplete tool call is
+            # an incomplete/failed model turn, not usable conversation history.
+            # Remove the whole turn before assembling context and retry from the
+            # last complete message. A tool execution failure remains role=tool
+            # and is intentionally preserved.
+            if trailing_assistant_incomplete:
+                try:
+                    removed = context_manager.remove_trailing_incomplete_assistant(session_id)
+                except (OSError, ValueError) as exc:
+                    self._send_json_error(
+                        500, f"Failed to remove trailing assistant error: {exc}"
+                    )
+                    return None
+                if not removed:
+                    self._send_json_error(
+                        409, "conversation changed before continue; please retry"
+                    )
+                    return None
+                turns = turns[:-1]
+                last_turn = turns[-1] if turns else None
+                last_role = getattr(last_turn, "role", None) if last_turn else None
+                last_tool_calls = getattr(last_turn, "tool_calls", None) or [] if last_turn else []
+                body["_removed_trailing_incomplete_assistant"] = True
+                logger.info(
+                    "continue: removed trailing incomplete assistant turn from session %s",
+                    session_id,
+                )
+
             if last_turn is None or (last_role == "assistant" and not last_tool_calls):
                 self._send_json_error(
                     400,
@@ -248,8 +286,8 @@ class HandlerInferMixin:
         # 继续推理时，若历史最后一条是"带 tool_calls 但未配对 tool 结果"的
         # assistant 消息（例如 revoke 切断了 tool 结果、或极端中断场景），
         # 为每个未执行的 tool call 注入一条"中断"tool 结果，避免模型 API
-        # 因缺少 tool 结果而报错。注入仅发生在本次推理的内存上下文中，
-        # 不会写入 conversation.json（下次 continue 会重新注入）。
+        # 因缺少 tool 结果而报错。注入仅用于本次模型请求；有问题的源消息
+        # 会在 Continue 删除，或在下一次 conversation.json 持久化前被剔除。
         if is_continue and assembled_messages:
             last_a = assembled_messages[-1]
             if last_a.role == "assistant" and getattr(last_a, "tool_calls", None):
@@ -364,7 +402,9 @@ class HandlerInferMixin:
             context_manager=context_manager,
             session_manager=self.server.session_manager,  # type: ignore[attr-defined]
             agent_manager=self.server.agent_manager,  # type: ignore[attr-defined]
+            agent_id=primary_agent_id,
             agent_ids=agent_ids,
+            all_agent_ids=agent_ids,
             mentioned_agent_ids=mentioned_agent_ids,
             model_id=body["model_id"],
         )
@@ -390,7 +430,9 @@ class HandlerInferMixin:
             "sse_callback", "cancel_event", "session_id", "session_dir",
             "user_message_timestamp", "depth", "tool_scope",
             "context_manager", "session_manager", "agent_manager", "workspace",
-            "mentioned_agent_ids",
+            "agent_id", "agent_ids", "all_agent_ids", "mentioned_agent_ids",
+            "file_journal_session_id", "file_journal_session_dir",
+            "file_journal_user_message_timestamp",
         ])
 
     def _persist_conversation(self, context_manager, session_id, original_messages, collected_messages, agent_ids=None, agent_nickname=None, model_id=None, tool_ids=None, workspace=None, compress=True):
@@ -590,6 +632,10 @@ class HandlerInferMixin:
             "agent_nickname": None if is_group_chat else agent_nickname,
             "title": session_title,
         }
+        if _body.get("_removed_trailing_incomplete_assistant") is True:
+            init_payload["removed_trailing_incomplete_assistant"] = True
+            # Retain the old flag for already-deployed frontends.
+            init_payload["removed_trailing_assistant_error"] = True
         if is_group_chat:
             init_payload["group_chat"] = True
             init_payload["mentioned_agent_ids"] = mentioned_for_init
@@ -601,12 +647,21 @@ class HandlerInferMixin:
         cancel_event = threading.Event()
         runtime = self._get_runtime()
         collected_messages: list[Message] = []
+        # A single SSE connection may receive frames from nested-tool worker
+        # threads as well as the HTTP handler thread.  Serialize every write so
+        # JSON events and heartbeat comments can never interleave on wfile.
+        sse_write_lock = threading.Lock()
 
-        def _sse_write(frame: dict) -> None:
+        def _write_sse_payload(payload: bytes) -> None:
+            with sse_write_lock:
+                self.wfile.write(payload)
+                self.wfile.flush()
+
+        def _sse_write(frame: dict) -> bool:
             try:
                 event_data = json.dumps(frame, ensure_ascii=False)
-                self.wfile.write(f"data: {event_data}\n\n".encode("utf-8"))
-                self.wfile.flush()
+                _write_sse_payload(f"data: {event_data}\n\n".encode("utf-8"))
+                return True
             except Exception as exc:
                 # The client connection is likely gone (navigated away, or an
                 # intermediary idle-timeout dropped the SSE stream). Log the
@@ -617,6 +672,7 @@ class HandlerInferMixin:
                     "infer_stream: SSE write failed, frame dropped: %s: %s",
                     type(exc).__name__, exc,
                 )
+                return False
 
         def _sse_heartbeat() -> None:
             """Keep long group-chat waits alive: SSE comment frames are
@@ -624,8 +680,7 @@ class HandlerInferMixin:
             timers, so final frames (e.g. the timeout error) survive the
             wait instead of being silently lost to an idle-timeout drop."""
             try:
-                self.wfile.write(b": keepalive\n\n")
-                self.wfile.flush()
+                _write_sse_payload(b": keepalive\n\n")
             except Exception as exc:
                 logger.warning(
                     "infer_stream: SSE heartbeat write failed: %s: %s",
@@ -731,9 +786,8 @@ class HandlerInferMixin:
                 #   tool 消息  → 工具调用结果配对完成 → 立即落盘
                 if msg.role in ("usage", "tool"):
                     _incremental_persist()
-                event_data = json.dumps(msg.to_dict(), ensure_ascii=False)
-                self.wfile.write(f"data: {event_data}\n\n".encode("utf-8"))
-                self.wfile.flush()
+                if not _sse_write(msg.to_dict()):
+                    raise BrokenPipeError("SSE client disconnected")
                 if msg.role == "assistant" and msg.content and msg.content.startswith("Error:"):
                     model_id_for_log = request.model_id if not is_group_chat else (getattr(msg, "agent_id", "group_chat") or "group_chat")
                     logger.error("infer_stream error event | model=%s %s", model_id_for_log, msg.content)
@@ -744,8 +798,7 @@ class HandlerInferMixin:
             # client fetching the journal immediately after [DONE] sees the
             # final workspace state rather than an intermediate tool snapshot.
             self._finalize_file_journal()
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
+            _write_sse_payload(b"data: [DONE]\n\n")
 
             if use_session and self._is_active_stream(session_id, cancel_event):
                 # original_messages already saved in pre-inference step, pass [] to avoid duplication.

@@ -4,6 +4,9 @@
 export const sessionRestore = $state({ pending: null })
 // pending: { sessionId: string, messages: Array<{role, content}>, meta?: object } | null
 
+// 用户消息定位请求：Sidebar 选择历史用户输入后，由 MessageList 在目标会话渲染完成后消费。
+export const messageScrollRequest = $state({ sessionId: null, messageIndex: null, token: 0 })
+
 // 当前活跃的会话 ID（用于侧边栏高亮）
 export const currentSession = $state({ sessionId: null })
 

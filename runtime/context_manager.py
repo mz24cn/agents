@@ -758,7 +758,11 @@ def _journal_dirs(session_dir: str) -> list[str]:
         dirs.append(parent)
     try:
         for entry in os.listdir(session_dir):
-            if entry.startswith("sub_") and os.path.isdir(os.path.join(session_dir, entry)):
+            # ``delegate`` uses sub_* and ``talk_to`` uses talk_* child
+            # conversation directories.  New code journals nested changes on
+            # the parent turn, but scan both forms for backward compatibility.
+            if (entry.startswith(("sub_", "talk_"))
+                    and os.path.isdir(os.path.join(session_dir, entry))):
                 sub = os.path.join(session_dir, entry, "file_journals")
                 if os.path.isdir(sub):
                     dirs.append(sub)
@@ -809,9 +813,8 @@ def get_file_journals_list(session_dir: str) -> list[str]:
     Only returns timestamps whose manifest is not revoked and contains at least
     one file entry with both baseline and after.
 
-    Also scans sub-session directories (``sub_*``) so that file changes made
-    by delegate / child agents are visible alongside the parent session's own
-    changes.
+    Also scans legacy nested-session directories (``sub_*`` / ``talk_*``) so
+    delegate and talk_to changes remain visible alongside the parent session.
     """
     journals_dirs = _journal_dirs(session_dir)
     if not journals_dirs:
@@ -851,8 +854,8 @@ def get_file_journals_list(session_dir: str) -> list[str]:
 def _find_journal_turn_dir(session_dir: str, timestamp: str) -> Optional[str]:
     """Find the journal turn directory whose manifest has the given timestamp.
 
-    Also searches sub-session directories (``sub_*``) so that diffs for
-    delegate / child-agent file changes can be retrieved.
+    Also searches legacy nested-session directories (``sub_*`` / ``talk_*``)
+    so delegate and talk_to diffs can be retrieved.
     """
     for journals_dir in _journal_dirs(session_dir):
         for entry in os.listdir(journals_dir):
@@ -1220,6 +1223,208 @@ class ContextManager:
                 mentions=msg.get("mentions"),
             ))
         return turns
+
+    @staticmethod
+    def _is_incomplete_assistant_message(message: dict) -> bool:
+        """Whether a persisted assistant turn is a failed partial stream.
+
+        Besides explicit ``Error:`` turns, a stream may disconnect after only
+        part of a tool declaration was received.  In that case no Error text is
+        guaranteed to be appended, but the tool call itself is structurally
+        unusable (missing id/name or truncated JSON arguments).
+        """
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            return False
+        content = message.get("content", "")
+        if isinstance(content, str) and content.lstrip().startswith("Error:"):
+            return True
+        if "tool_calls" not in message:
+            return False
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list) or not tool_calls:
+            return True
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                return True
+            if not (call.get("id") or call.get("tool_use_id")) or not call.get("name"):
+                return True
+            arguments = call.get("arguments", "{}")
+            if isinstance(arguments, str):
+                try:
+                    parsed = json.loads(arguments)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    return True
+                if not isinstance(parsed, dict):
+                    return True
+            elif not isinstance(arguments, dict):
+                return True
+        return False
+
+    def trailing_assistant_is_incomplete(self, session_id: str) -> bool:
+        """Inspect the final persisted message without rewriting the session."""
+        conv_path = self._conversation_path(session_id)
+        with open(conv_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        messages = data.get("messages", [])
+        return bool(
+            isinstance(messages, list)
+            and messages
+            and self._is_incomplete_assistant_message(messages[-1])
+        )
+
+    def prune_invalid_persisted_turns(
+        self,
+        session_id: str,
+        turns: list[ConversationTurn],
+    ) -> int:
+        """Remove invalid existing history before the next persistence write.
+
+        The runtime can defensively repair malformed history in memory before a
+        model request, but those synthetic repairs must not allow the bad source
+        turns to live forever in ``conversation.json``.  This method mutates
+        *turns* in place and removes whole invalid protocol segments:
+
+        * assistant ``Error:`` turns;
+        * structurally malformed assistant tool declarations;
+        * assistant tool-call turns without a complete set of results; and
+        * orphan/duplicate tool results.
+
+        A valid assistant(tool_calls) + tool-results segment is preserved.  Old
+        tool results without IDs are linked by name/declaration order when that
+        produces a complete segment.  Compression artifacts are discarded when
+        anything is removed because their source indexes/content may no longer
+        describe the repaired history; normal persistence may rebuild them.
+        """
+        cleaned: list[ConversationTurn] = []
+        removed = 0
+        i = 0
+
+        while i < len(turns):
+            turn = turns[i]
+
+            if turn.role == "tool":
+                # A tool result is legal only inside the immediately preceding
+                # assistant(tool_calls) segment, handled below.
+                removed += 1
+                i += 1
+                continue
+
+            if turn.role != "assistant":
+                cleaned.append(turn)
+                i += 1
+                continue
+
+            turn_dict = {k: v for k, v in asdict(turn).items() if v is not None}
+            if self._is_incomplete_assistant_message(turn_dict):
+                removed += 1
+                i += 1
+                # Results attached to a malformed declaration cannot safely be
+                # retained after the declaration itself is removed.
+                while i < len(turns) and turns[i].role == "tool":
+                    removed += 1
+                    i += 1
+                continue
+
+            if not turn.tool_calls:
+                cleaned.append(turn)
+                i += 1
+                continue
+
+            declarations = [
+                (call.get("id") or call.get("tool_use_id"), call.get("name"))
+                for call in turn.tool_calls
+            ]
+            pending = list(declarations)
+            matched_tools: list[ConversationTurn] = []
+            i += 1
+
+            while i < len(turns) and turns[i].role == "tool":
+                tool_turn = turns[i]
+                tool_id = tool_turn.tool_use_id
+                match_index = next(
+                    (idx for idx, (call_id, _) in enumerate(pending) if call_id == tool_id),
+                    None,
+                ) if tool_id else None
+                if match_index is None and not tool_id and pending:
+                    match_index = next(
+                        (idx for idx, (_, name) in enumerate(pending) if name == tool_turn.name),
+                        0,
+                    )
+                    tool_turn.tool_use_id = pending[match_index][0]
+                if match_index is None:
+                    removed += 1
+                else:
+                    pending.pop(match_index)
+                    matched_tools.append(tool_turn)
+                i += 1
+
+            if pending:
+                # Keep the tool-call turn atomic.  Retaining only its successful
+                # subset would still leave an invalid provider message sequence.
+                removed += 1 + len(matched_tools)
+                continue
+
+            cleaned.append(turn)
+            cleaned.extend(matched_tools)
+
+        if removed:
+            turns[:] = cleaned
+            self._remove_session_file(self._summary_path(session_id))
+            self._remove_session_file(self._memory_path(session_id))
+            self._memory_store.pop(session_id, None)
+            logger.warning(
+                "pruned %d invalid persisted conversation turn(s) from session %s",
+                removed,
+                session_id,
+            )
+        return removed
+
+    def remove_trailing_incomplete_assistant(self, session_id: str) -> bool:
+        """Remove a trailing failed/incomplete assistant turn.
+
+        A failed turn is either an explicit assistant ``Error:`` message or an
+        assistant message containing a structurally incomplete tool declaration
+        (for example truncated JSON arguments). Such a turn is not a completed
+        model response and is removed as one atomic conversation turn.
+
+        The existing metadata is preserved and the rewrite is atomic.  Returns
+        ``True`` only when a matching final turn was removed.
+        """
+        conv_path = self._conversation_path(session_id)
+        if not os.path.isfile(conv_path):
+            raise FileNotFoundError(f"Conversation file not found: {conv_path}")
+
+        with open(conv_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+
+        messages = data.get("messages", [])
+        if not isinstance(messages, list) or not messages:
+            return False
+
+        last = messages[-1]
+        if not self._is_incomplete_assistant_message(last):
+            return False
+
+        new_messages = messages[:-1]
+        self._reconcile_compression_after_revoke(
+            session_id, len(messages) - 1, len(new_messages)
+        )
+
+        meta = data.get("meta", {})
+        if not isinstance(meta, dict):
+            meta = {}
+        meta["updated_at"] = now_iso()
+        meta["turn_count"] = len(new_messages)
+        data["meta"] = meta
+        data["messages"] = new_messages
+        self._atomic_write(
+            conv_path, json.dumps(data, ensure_ascii=False, indent=2)
+        )
+        return True
+
+    def remove_trailing_assistant_error(self, session_id: str) -> bool:
+        """Backward-compatible alias for the broader incomplete-turn repair."""
+        return self.remove_trailing_incomplete_assistant(session_id)
 
     def _remove_session_file(self, path: str) -> None:
         try:
