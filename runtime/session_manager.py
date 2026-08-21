@@ -109,16 +109,26 @@ class SessionManager:
                 "last_inference_at": now,
                 "turn_count": 0,
                 "last_total_tokens": None,
+                "title_generated": False,
             }
             self._write_index(index)
         except Exception as exc:
             logger.warning("on_session_created: 写入 index.json 失败 (session=%s): %s", session_id, exc)
 
-    def update_index(self, session_id: str, last_total_tokens: Optional[int] = None) -> None:
+    def update_index(
+        self,
+        session_id: str,
+        last_total_tokens: Optional[int] = None,
+        *,
+        generate_title: bool = True,
+        compression_updated: bool = False,
+    ) -> None:
         """推理完成后调用，更新 index.json 中对应条目的元信息。
 
         读取对应 conversation.json 的 meta.turn_count，更新 last_inference_at、
-        turn_count、last_total_tokens，写入成功后调用 generate_title()。
+        turn_count、last_total_tokens。仅当 ``generate_title`` 为 True 时才
+        检查标题生成：首次完整推理后生成一次；之后仅在上下文压缩实际更新
+        summary/memory 时再生成一次。
 
         Args:
             session_id: 会话 ID。
@@ -135,6 +145,7 @@ class SessionManager:
                 "last_inference_at": now,
                 "turn_count": 0,
                 "last_total_tokens": None,
+                "title_generated": False,
             })
 
             # 读取 conversation.json 的 meta.turn_count
@@ -157,23 +168,31 @@ class SessionManager:
             logger.warning("update_index: 写入 index.json 失败 (session=%s): %s", session_id, exc)
             return
 
-        # 写入成功后调用 generate_title
-        self.generate_title(session_id, last_total_tokens)
+        if generate_title:
+            self.generate_title(
+                session_id,
+                last_total_tokens,
+                compression_updated=compression_updated,
+            )
 
-    def generate_title(self, session_id: str, last_total_tokens: Optional[int]) -> None:
+    def generate_title(
+        self,
+        session_id: str,
+        last_total_tokens: Optional[int],
+        *,
+        compression_updated: bool = False,
+    ) -> None:
         """当满足条件时，使用推理函数为会话生成标题。
 
-        条件：
-        - last_total_tokens > 1000
-        - SUMMARY_MODEL_ID 环境变量解析出的模型已注册（默认标签 "summary"）
-        - self._infer_fn 不为 None
-        - index 中该会话的 title 为空（避免重复生成）
+        自动生成时机：首次完整推理结束后一次；之后只有上下文压缩实际更新
+        summary/memory 时一次。增量持久化不会调用这里。
 
         Args:
             session_id: 会话 ID。
             last_total_tokens: 本次推理的总 token 数。
         """
-        if last_total_tokens is None or last_total_tokens <= 10000:
+        entry = self._read_index().get(session_id) or {}
+        if entry.get("title_generated") and not compression_updated:
             return
         self._do_generate_title(session_id)
 
@@ -274,6 +293,7 @@ class SessionManager:
             index = self._read_index()
             if session_id in index:
                 index[session_id]["title"] = title
+                index[session_id]["title_generated"] = True
                 self._write_index(index)
                 logger.info("generate_title: 成功生成标题 (session=%s): %s", session_id, title)
                 # 广播标题更新事件

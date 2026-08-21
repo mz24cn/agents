@@ -193,7 +193,7 @@
 {{AGENTS}}
 
 在消息中使用 @ 符号提及某位AI代理时，可以使用它的昵称；
-在 `talk_to` 工具中向某几位AI代理发送消息时，`agents` 须使用他们的 Agent ID。
+在 `talk_to` 工具中向某几位AI代理发送消息时，`agents` 须使用他们的 Agent ID。请勿通过 `talk_to` 工具给你自己发送消息。
 ```
 
 3. **参与成员表（AGENTS）**：一张 `| Nickname | Agent ID | Description |` 表格，包含全部参与者与一个固定的用户行（示意）：

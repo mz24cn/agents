@@ -10,7 +10,7 @@
   import { resolveFileJournalTurnKey } from '../../lib/file-journals.js'
   import { currentSession, messageScrollRequest } from '../../lib/session-state.svelte.js'
 
-  let { messages = [], agentList = [], displayMessageDetails = false, onRevoke, onScrollAtBottom, shouldScrollToBottom = false, collapsedGroups = new Set(), onToggleCollapse, fileJournalTurnKeyMap = {}, fileDiffVisible = new Set(), fileDiffCache = {}, onToggleFileDiff } = $props()
+  let { messages = [], agentList = [], displayMessageDetails = false, onRevoke, onScrollAtBottom, shouldScrollToBottom = false, collapsedGroups = new Set(), onToggleCollapse, fileJournalTurnKeyMap = {}, fileDiffVisible = new Set(), fileDiffCache = {}, onToggleFileDiff, retryAssistantIndex = -1, onRetryLastInference, retryDisabled = false } = $props()
   let listEl = $state(null)
   let isAtBottom = $state(true)
   // Ephemeral per-turn overrides. This state lives only in this keyed
@@ -248,9 +248,11 @@
     const results = {}
     for (let i = block.start; i <= block.end; i++) {
       const msg = messages[i]
-      // talk_to/sub-message results retain their existing standalone rendering.
+      // Match every result frame to its originating call, including temporary
+      // streaming results.  The call card owns the status icon and detail area;
+      // standalone tool bubbles are only a fallback for unmatched results.
       const resultId = getToolResultId(msg)
-      if (msg?.role === 'tool' && !msg.sub_messages && resultId && callIds.has(resultId)) {
+      if (msg?.role === 'tool' && resultId && callIds.has(resultId)) {
         results[resultId] = msg
       }
     }
@@ -380,6 +382,9 @@
                         onToggleReplyMode={() => toggleReplyMode(group.startIndex)}
                         collapseButton={group.hasIntermediate ? 'collapse' : null}
                         onCollapse={group.hasIntermediate ? () => toggleCollapse(group.startIndex) : undefined}
+                        showRetry={msgIndex === retryAssistantIndex}
+                        onRetry={msgIndex === retryAssistantIndex ? onRetryLastInference : undefined}
+                        {retryDisabled}
                       />
                     </div>
                   {:else}
@@ -407,6 +412,9 @@
                       <span class="agent-block-tokens" title={buildBlockStatTooltip(blockStat)}>
                         {formatTokenCount(blockStat.prompt_tokens)}/{formatTokenCount(blockStat.completion_tokens)} tokens
                       </span>
+                    {/if}
+                    {#if retryAssistantIndex >= block.start && retryAssistantIndex <= block.end && onRetryLastInference}
+                      <button class="agent-block-retry-btn" onclick={onRetryLastInference} disabled={retryDisabled}>{t('retryLastInference')}</button>
                     {/if}
                     {#if block.end === group.endIndex}
                       <button class="agent-block-mode-btn" onclick={() => toggleReplyMode(group.startIndex)}>{t('detailedReply')}</button>
@@ -437,6 +445,9 @@
                   onToggleReplyMode={() => toggleReplyMode(group.startIndex)}
                   collapseButton={group.hasIntermediate ? 'expand' : null}
                   onCollapse={group.hasIntermediate ? () => toggleCollapse(group.startIndex) : undefined}
+                  showRetry={group.lastAssistantIndex === retryAssistantIndex}
+                  onRetry={group.lastAssistantIndex === retryAssistantIndex ? onRetryLastInference : undefined}
+                  {retryDisabled}
                 />
               </div>
             {/if}
@@ -543,6 +554,20 @@
     background: var(--bg-secondary, rgba(0,0,0,0.2));
     color: var(--text, #333);
   }
+  .agent-block-retry-btn {
+    padding: 2px 8px;
+    font-family: inherit;
+    font-size: 0.75rem;
+    font-weight: 400;
+    color: var(--text-secondary, #666);
+    background: transparent;
+    border: 1px solid var(--border, #ddd);
+    border-radius: 4px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .agent-block-retry-btn:hover:not(:disabled) { background: var(--bg-secondary, rgba(0,0,0,0.06)); color: var(--text, #333); }
+  .agent-block-retry-btn:disabled { opacity: 0.5; cursor: not-allowed; }
   .agent-block-mode-btn:active {
     background: var(--primary, #4a9eff);
     color: #fff;

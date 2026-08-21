@@ -1224,171 +1224,16 @@ class ContextManager:
             ))
         return turns
 
-    @staticmethod
-    def _is_incomplete_assistant_message(message: dict) -> bool:
-        """Whether a persisted assistant turn is a failed partial stream.
-
-        Besides explicit ``Error:`` turns, a stream may disconnect after only
-        part of a tool declaration was received.  In that case no Error text is
-        guaranteed to be appended, but the tool call itself is structurally
-        unusable (missing id/name or truncated JSON arguments).
-        """
-        if not isinstance(message, dict) or message.get("role") != "assistant":
-            return False
-        content = message.get("content", "")
-        if isinstance(content, str) and content.lstrip().startswith("Error:"):
-            return True
-        if "tool_calls" not in message:
-            return False
-        tool_calls = message.get("tool_calls")
-        if not isinstance(tool_calls, list) or not tool_calls:
-            return True
-        for call in tool_calls:
-            if not isinstance(call, dict):
-                return True
-            if not (call.get("id") or call.get("tool_use_id")) or not call.get("name"):
-                return True
-            arguments = call.get("arguments", "{}")
-            if isinstance(arguments, str):
-                try:
-                    parsed = json.loads(arguments)
-                except (json.JSONDecodeError, TypeError, ValueError):
-                    return True
-                if not isinstance(parsed, dict):
-                    return True
-            elif not isinstance(arguments, dict):
-                return True
-        return False
-
-    def trailing_assistant_is_incomplete(self, session_id: str) -> bool:
-        """Inspect the final persisted message without rewriting the session."""
-        conv_path = self._conversation_path(session_id)
-        with open(conv_path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        messages = data.get("messages", [])
-        return bool(
-            isinstance(messages, list)
-            and messages
-            and self._is_incomplete_assistant_message(messages[-1])
-        )
-
-    def prune_invalid_persisted_turns(
+    def remove_trailing_assistant_message(
         self,
         session_id: str,
-        turns: list[ConversationTurn],
-    ) -> int:
-        """Remove invalid existing history before the next persistence write.
+        expected_agent_id: Optional[str] = None,
+    ) -> bool:
+        """Explicitly remove the final assistant message for a Continue request.
 
-        The runtime can defensively repair malformed history in memory before a
-        model request, but those synthetic repairs must not allow the bad source
-        turns to live forever in ``conversation.json``.  This method mutates
-        *turns* in place and removes whole invalid protocol segments:
-
-        * assistant ``Error:`` turns;
-        * structurally malformed assistant tool declarations;
-        * assistant tool-call turns without a complete set of results; and
-        * orphan/duplicate tool results.
-
-        A valid assistant(tool_calls) + tool-results segment is preserved.  Old
-        tool results without IDs are linked by name/declaration order when that
-        produces a complete segment.  Compression artifacts are discarded when
-        anything is removed because their source indexes/content may no longer
-        describe the repaired history; normal persistence may rebuild them.
-        """
-        cleaned: list[ConversationTurn] = []
-        removed = 0
-        i = 0
-
-        while i < len(turns):
-            turn = turns[i]
-
-            if turn.role == "tool":
-                # A tool result is legal only inside the immediately preceding
-                # assistant(tool_calls) segment, handled below.
-                removed += 1
-                i += 1
-                continue
-
-            if turn.role != "assistant":
-                cleaned.append(turn)
-                i += 1
-                continue
-
-            turn_dict = {k: v for k, v in asdict(turn).items() if v is not None}
-            if self._is_incomplete_assistant_message(turn_dict):
-                removed += 1
-                i += 1
-                # Results attached to a malformed declaration cannot safely be
-                # retained after the declaration itself is removed.
-                while i < len(turns) and turns[i].role == "tool":
-                    removed += 1
-                    i += 1
-                continue
-
-            if not turn.tool_calls:
-                cleaned.append(turn)
-                i += 1
-                continue
-
-            declarations = [
-                (call.get("id") or call.get("tool_use_id"), call.get("name"))
-                for call in turn.tool_calls
-            ]
-            pending = list(declarations)
-            matched_tools: list[ConversationTurn] = []
-            i += 1
-
-            while i < len(turns) and turns[i].role == "tool":
-                tool_turn = turns[i]
-                tool_id = tool_turn.tool_use_id
-                match_index = next(
-                    (idx for idx, (call_id, _) in enumerate(pending) if call_id == tool_id),
-                    None,
-                ) if tool_id else None
-                if match_index is None and not tool_id and pending:
-                    match_index = next(
-                        (idx for idx, (_, name) in enumerate(pending) if name == tool_turn.name),
-                        0,
-                    )
-                    tool_turn.tool_use_id = pending[match_index][0]
-                if match_index is None:
-                    removed += 1
-                else:
-                    pending.pop(match_index)
-                    matched_tools.append(tool_turn)
-                i += 1
-
-            if pending:
-                # Keep the tool-call turn atomic.  Retaining only its successful
-                # subset would still leave an invalid provider message sequence.
-                removed += 1 + len(matched_tools)
-                continue
-
-            cleaned.append(turn)
-            cleaned.extend(matched_tools)
-
-        if removed:
-            turns[:] = cleaned
-            self._remove_session_file(self._summary_path(session_id))
-            self._remove_session_file(self._memory_path(session_id))
-            self._memory_store.pop(session_id, None)
-            logger.warning(
-                "pruned %d invalid persisted conversation turn(s) from session %s",
-                removed,
-                session_id,
-            )
-        return removed
-
-    def remove_trailing_incomplete_assistant(self, session_id: str) -> bool:
-        """Remove a trailing failed/incomplete assistant turn.
-
-        A failed turn is either an explicit assistant ``Error:`` message or an
-        assistant message containing a structurally incomplete tool declaration
-        (for example truncated JSON arguments). Such a turn is not a completed
-        model response and is removed as one atomic conversation turn.
-
-        The existing metadata is preserved and the rewrite is atomic.  Returns
-        ``True`` only when a matching final turn was removed.
+        No completeness or content inference is performed. The caller must have
+        received an explicit user action requesting this destructive operation.
+        Metadata is preserved and the rewrite is atomic.
         """
         conv_path = self._conversation_path(session_id)
         if not os.path.isfile(conv_path):
@@ -1402,8 +1247,12 @@ class ContextManager:
             return False
 
         last = messages[-1]
-        if not self._is_incomplete_assistant_message(last):
+        if not isinstance(last, dict) or last.get("role") != "assistant":
             return False
+        if expected_agent_id:
+            actual_agent_id = last.get("agent_id") or last.get("assistant_id")
+            if actual_agent_id and actual_agent_id != expected_agent_id:
+                return False
 
         new_messages = messages[:-1]
         self._reconcile_compression_after_revoke(
@@ -1421,10 +1270,6 @@ class ContextManager:
             conv_path, json.dumps(data, ensure_ascii=False, indent=2)
         )
         return True
-
-    def remove_trailing_assistant_error(self, session_id: str) -> bool:
-        """Backward-compatible alias for the broader incomplete-turn repair."""
-        return self.remove_trailing_incomplete_assistant(session_id)
 
     def _remove_session_file(self, path: str) -> None:
         try:

@@ -196,6 +196,7 @@ def persist_conversation(
     model_id: Optional[str] = None,
     workspace: Optional[str] = None,
     compress: bool = True,
+    update_title: bool = True,
 ) -> Optional[Exception]:
     """将一次推理的消息持久化到会话存储。
 
@@ -211,6 +212,8 @@ def persist_conversation(
             应传 False（避免每轮都触发一次 LLM 摘要压缩），仅在推理结束时传 True。
         session_manager: 可选的 SessionManager 实例，用于更新 index.json 和
             生成标题。为 None 时跳过 index 更新（适用于 sub-session 场景）。
+        update_title: 是否允许本次持久化触发自动标题生成。流式推理的前置和
+            工具轮次增量落盘应传 False；只有推理完成后的最终落盘传 True。
         tool_ids: 可选的工具 ID 列表，记录到会话 meta 中，便于回溯。
         extra_meta: 可选的额外 meta 字段（如 parent_session_id），与 tool_ids
             一并通过 save_conversation 的 extra_meta 参数一次写入。
@@ -228,12 +231,9 @@ def persist_conversation(
             existing_turns = context_manager.load_conversation(session_id)
         except (FileNotFoundError, ValueError):
             existing_turns = []
-        # Model-request repair is a defensive last line, not permanent storage
-        # policy.  Before appending this persistence operation's turns, remove
-        # malformed history loaded from the prior conversation.json.  Newly
-        # failed stream output remains available for the Continue action, then
-        # is removed either by Continue itself or by the following persistence.
-        context_manager.prune_invalid_persisted_turns(session_id, existing_turns)
+        # Existing history is immutable unless the client explicitly requests a
+        # destructive operation (Continue or revoke). Persistence must never
+        # classify and silently delete prior messages on its own.
         new_turns = list(existing_turns)
         for m in (original_messages or []):
             # 复用 Message 自带的时间戳，无则 fallback 为当前时间
@@ -293,10 +293,22 @@ def persist_conversation(
         # Trigger context compression exactly once per persistence operation.
         # Use the unified API directly to avoid accidental double-compression
         # through compatibility wrappers.
+        summary_version_before = context_manager.get_summary(session_id)[1].get(
+            "summary_version", 0
+        ) if compress else 0
         if compress:
             context_manager.compress_context(session_id, new_turns, last_total_tokens=last_total_tokens)
+        summary_version_after = context_manager.get_summary(session_id)[1].get(
+            "summary_version", 0
+        ) if compress else summary_version_before
+        compression_updated = summary_version_after != summary_version_before
         if session_manager is not None:
-            session_manager.update_index(session_id, last_total_tokens=last_total_tokens)
+            session_manager.update_index(
+                session_id,
+                last_total_tokens=last_total_tokens,
+                generate_title=update_title,
+                compression_updated=compression_updated,
+            )
     except Exception as exc:
         return exc
     return None

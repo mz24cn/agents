@@ -1180,6 +1180,35 @@ class Runtime:
         tool_config = self._find_tool_by_name(tool_name)
         return tool_config is not None and tool_config.tool_type == "skill"
 
+    @staticmethod
+    def _validate_talk_to_target(tool_config: ToolConfig, arguments: dict) -> Optional[str]:
+        """Reject ``talk_to`` calls that target the currently executing agent.
+
+        The built-in callable has its own guard, but generic execution must also
+        enforce this invariant before dispatching any registered callable.
+        """
+        if tool_config.tool_id != "talk_to" and tool_config.name != "talk_to":
+            return None
+
+        caller_agent_id = getattr(_thread_local, "agent_id", None)
+        if not caller_agent_id:
+            return None
+
+        targets = arguments.get("agents", []) if isinstance(arguments, dict) else []
+        if isinstance(targets, str):
+            targets = [targets]
+        if not isinstance(targets, (list, tuple)):
+            return None
+
+        agent_manager = getattr(_thread_local, "agent_manager", None)
+        for target in targets:
+            target_name = str(target)
+            resolved = agent_manager.get(target_name) if agent_manager is not None else None
+            target_agent_id = resolved.get("agent_id") if isinstance(resolved, dict) else target_name
+            if target_agent_id == caller_agent_id:
+                return "Error: talk_to cannot target the calling agent itself."
+        return None
+
     def _execute_function_tool(self, tool_config: ToolConfig, arguments: dict) -> str:
         """Execute a function-type tool.
 
@@ -1190,6 +1219,10 @@ class Runtime:
         Returns:
             The function result as a string, or an error message.
         """
+        validation_error = self._validate_talk_to_target(tool_config, arguments)
+        if validation_error is not None:
+            return validation_error
+
         callable_fn = self._tool_registry.get_callable(tool_config.tool_id)
         if callable_fn is None:
             return f"Error: no callable registered for tool '{tool_config.tool_id}'"

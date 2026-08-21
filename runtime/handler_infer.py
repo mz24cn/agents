@@ -31,23 +31,79 @@ from runtime.server_state import (
 logger = logging.getLogger("runtime.server")
 
 
+def _stream_batch_is_protocol_complete(messages: list[Message]) -> bool:
+    """Return whether an incremental stream slice is safe to persist.
+
+    A ``usage`` frame closes the provider's assistant response, but an
+    assistant response containing tool calls is not yet a complete conversation
+    segment.  Persisting it at that point creates a dangling assistant(tool_calls)
+    turn.  The next incremental write then quite correctly prunes that dangling
+    turn, after which the newly arrived tool result is orphaned and pruned too.
+
+    Plain-text assistant rounds are complete at ``usage``.  Tool-call rounds are
+    complete only after every declared call has a matching tool result.
+    """
+    turns, _ = merge_stream_messages(messages)
+    pending: list[tuple[Optional[str], Optional[str]]] = []
+
+    for turn in turns:
+        if turn.role == "assistant" and turn.tool_calls:
+            # A new assistant tool-call declaration cannot begin while the
+            # previous declaration is still waiting for results.
+            if pending:
+                return False
+            pending = [
+                (call.get("id") or call.get("tool_use_id"), call.get("name"))
+                for call in turn.tool_calls
+            ]
+            if any(not call_id or not name for call_id, name in pending):
+                return False
+        elif turn.role == "tool":
+            if not pending:
+                return False
+            tool_use_id = turn.tool_use_id
+            match_index = next(
+                (i for i, (call_id, _) in enumerate(pending) if tool_use_id and call_id == tool_use_id),
+                None,
+            )
+            # Backward-compatible fallback for providers/tools that omit the
+            # result ID: match by tool name, then declaration order.
+            if match_index is None and not tool_use_id:
+                match_index = next(
+                    (i for i, (_, name) in enumerate(pending) if name == turn.name),
+                    0,
+                )
+            if match_index is None:
+                return False
+            pending.pop(match_index)
+
+    return not pending
+
+
 class HandlerInferMixin:
     def _prepare_infer_request(self):
         body = self._read_json_body()
         if body is None:
             return None
 
-        # === "继续推理"模式（continue）===
-        # 前端在会话因中断而停留在"可继续"状态（最后一轮为用户消息 /
-        # 助手携带工具调用 / 工具结果）时，发送 { continue: true, messages: [] }，
-        # 后端基于会话既有上下文再跑一轮推理，不追加新用户消息。
+        # === Retry/continue mode ===
+        # Retry removes the final failed assistant turn, then starts inference
+        # from the remaining persisted context without appending a user message.
+        # retry_agent_id chooses who performs this retry; agent_ids is the
+        # participant roster to retain (and may replace the old roster).
         is_continue = body.get("continue") is True
+        retry_agent_id = body.get("retry_agent_id") or None
 
-        # Resolve agent_ids: support multi-select
-        # If agent_ids is provided, use the first one as the primary agent_id for processing
-        # but store the complete list for persistence
-        agent_ids = body.get("agent_ids") or []
-        primary_agent_id = agent_ids[0] if agent_ids else None
+        # Resolve agent_ids: support multi-select and retry takeover.
+        agent_ids = list(body.get("agent_ids") or [])
+        # A bare retry_agent_id means "retry as this one agent".  An explicit
+        # agent_ids value replaces the session roster but does not cause every
+        # participant to answer: mentioned_agent_ids below remains one agent.
+        if is_continue and retry_agent_id and "agent_ids" not in body:
+            agent_ids = [retry_agent_id]
+        if retry_agent_id and retry_agent_id not in agent_ids:
+            agent_ids.append(retry_agent_id)
+        primary_agent_id = retry_agent_id or (agent_ids[0] if agent_ids else None)
         agent = None
         if primary_agent_id:
             agent = self.server.agent_manager.get(primary_agent_id)  # type: ignore[attr-defined]
@@ -60,7 +116,9 @@ class HandlerInferMixin:
         # === @-mention parsing (before system prompt prepend, so we know
         #     whether this is group chat or single-agent) ===
         mentioned_agent_ids: list[str] = []
-        if len(agent_ids) > 1:
+        if is_continue and retry_agent_id:
+            mentioned_agent_ids = [retry_agent_id]
+        elif len(agent_ids) > 1:
             from runtime.group_chat import parse_mentions, resolve_mentions
             raw_messages = body.get("messages", [])
             for m in reversed(raw_messages):
@@ -177,7 +235,7 @@ class HandlerInferMixin:
                         raw_session_id,
                     )
 
-        # === 继续推理校验 ===
+        # === Retry validation ===
         if is_continue:
             if raw_session_id in (None, "new"):
                 self._send_json_error(400, "continue requires an existing session_id")
@@ -185,65 +243,36 @@ class HandlerInferMixin:
             if not use_session or session_id is None:
                 self._send_json_error(404, f"Session not found: {raw_session_id}")
                 return None
-            if len(agent_ids) > 1:
-                self._send_json_error(400, "group chat does not support continue")
+            if len(agent_ids) > 1 and not retry_agent_id:
+                self._send_json_error(400, "group-chat retry requires retry_agent_id")
                 return None
-            # 校验会话最后一条消息是否处于"可继续"状态：
-            #   可继续：user / assistant(带 tool_calls) / tool
-            #   已完成：assistant 且无 tool_calls（或会话为空）
-            try:
-                turns = context_manager.load_conversation(session_id)
-            except (FileNotFoundError, ValueError):
-                self._send_json_error(404, f"Session not found: {session_id}")
-                return None
-            last_turn = turns[-1] if turns else None
-            last_role = getattr(last_turn, "role", None) if last_turn else None
-            last_tool_calls = getattr(last_turn, "tool_calls", None) or [] if last_turn else []
-            try:
-                trailing_assistant_incomplete = (
-                    context_manager.trailing_assistant_is_incomplete(session_id)
+            if not retry_agent_id and not body.get("model_id"):
+                self._send_json_error(
+                    400, "retry requires retry_agent_id or model_id + tool_ids"
                 )
+                return None
+            # Continue is an explicit destructive user action. Do not infer
+            # whether the final response is failed or incomplete; remove exactly
+            # one final assistant message because the request asked us to.
+            try:
+                removed = context_manager.remove_trailing_assistant_message(session_id)
             except (OSError, ValueError) as exc:
                 self._send_json_error(
-                    500, f"Failed to inspect trailing assistant message: {exc}"
+                    500, f"Failed to remove trailing assistant message: {exc}"
                 )
                 return None
-
-            # A trailing assistant Error or structurally incomplete tool call is
-            # an incomplete/failed model turn, not usable conversation history.
-            # Remove the whole turn before assembling context and retry from the
-            # last complete message. A tool execution failure remains role=tool
-            # and is intentionally preserved.
-            if trailing_assistant_incomplete:
-                try:
-                    removed = context_manager.remove_trailing_incomplete_assistant(session_id)
-                except (OSError, ValueError) as exc:
-                    self._send_json_error(
-                        500, f"Failed to remove trailing assistant error: {exc}"
-                    )
-                    return None
-                if not removed:
-                    self._send_json_error(
-                        409, "conversation changed before continue; please retry"
-                    )
-                    return None
-                turns = turns[:-1]
-                last_turn = turns[-1] if turns else None
-                last_role = getattr(last_turn, "role", None) if last_turn else None
-                last_tool_calls = getattr(last_turn, "tool_calls", None) or [] if last_turn else []
-                body["_removed_trailing_incomplete_assistant"] = True
-                logger.info(
-                    "continue: removed trailing incomplete assistant turn from session %s",
-                    session_id,
-                )
-
-            if last_turn is None or (last_role == "assistant" and not last_tool_calls):
+            if not removed:
                 self._send_json_error(
-                    400,
-                    "conversation is complete; cannot continue inference "
-                    "(the last turn is an assistant response without tool calls)",
+                    400, "continue requires the final conversation turn to be an assistant message"
                 )
                 return None
+            body["_removed_trailing_assistant"] = True
+            logger.info(
+                "continue: explicitly removed trailing assistant turn from session %s; "
+                "retry_agent_id=%s agent_ids=%s model_id=%s tool_ids=%s",
+                session_id, retry_agent_id, agent_ids,
+                body.get("model_id"), body.get("tool_ids"),
+            )
 
         original_messages = None
         user_message_timestamp = None
@@ -282,30 +311,6 @@ class HandlerInferMixin:
             except OSError as exc:
                 self._send_json_error(500, f"Failed to assemble context: {exc}")
                 return None
-
-        # 继续推理时，若历史最后一条是"带 tool_calls 但未配对 tool 结果"的
-        # assistant 消息（例如 revoke 切断了 tool 结果、或极端中断场景），
-        # 为每个未执行的 tool call 注入一条"中断"tool 结果，避免模型 API
-        # 因缺少 tool 结果而报错。注入仅用于本次模型请求；有问题的源消息
-        # 会在 Continue 删除，或在下一次 conversation.json 持久化前被剔除。
-        if is_continue and assembled_messages:
-            last_a = assembled_messages[-1]
-            if last_a.role == "assistant" and getattr(last_a, "tool_calls", None):
-                from runtime.common import now_iso
-                for tc in last_a.tool_calls:
-                    tool_use_id = tc.get("id") or tc.get("tool_use_id")
-                    tc_name = tc.get("name") or "__interrupted__"
-                    assembled_messages.append(Message(
-                        role="tool",
-                        timestamp=now_iso(),
-                        name=tc_name,
-                        tool_use_id=tool_use_id,
-                        content=(
-                            f"[interrupted] The tool call `{tc_name}` was interrupted "
-                            f"before execution. Please continue based on the conversation "
-                            f"context; do not re-run the tool unless necessary."
-                        ),
-                    ))
 
         tool_ids = body.get("tool_ids", [])
         has_delegate = "delegate" in tool_ids
@@ -435,7 +440,7 @@ class HandlerInferMixin:
             "file_journal_user_message_timestamp",
         ])
 
-    def _persist_conversation(self, context_manager, session_id, original_messages, collected_messages, agent_ids=None, agent_nickname=None, model_id=None, tool_ids=None, workspace=None, compress=True):
+    def _persist_conversation(self, context_manager, session_id, original_messages, collected_messages, agent_ids=None, agent_nickname=None, model_id=None, tool_ids=None, workspace=None, compress=True, update_title=True):
         if session_id is None:
             return None
         exc = persist_conversation(
@@ -450,6 +455,7 @@ class HandlerInferMixin:
             tool_ids=tool_ids,
             workspace=workspace,
             compress=compress,
+            update_title=update_title,
         )
         return exc
 
@@ -632,10 +638,10 @@ class HandlerInferMixin:
             "agent_nickname": None if is_group_chat else agent_nickname,
             "title": session_title,
         }
-        if _body.get("_removed_trailing_incomplete_assistant") is True:
-            init_payload["removed_trailing_incomplete_assistant"] = True
-            # Retain the old flag for already-deployed frontends.
-            init_payload["removed_trailing_assistant_error"] = True
+        if _body.get("_removed_trailing_assistant") is True:
+            init_payload["removed_trailing_assistant"] = True
+        if _body.get("retry_agent_id"):
+            init_payload["retry_agent_id"] = _body["retry_agent_id"]
         if is_group_chat:
             init_payload["group_chat"] = True
             init_payload["mentioned_agent_ids"] = mentioned_for_init
@@ -707,6 +713,7 @@ class HandlerInferMixin:
             pre_exc = self._persist_conversation(
                 context_manager, session_id, original_messages, [],
                 agent_ids, agent_nickname, model_id, tool_ids, workspace,
+                compress=False, update_title=False,
             )
             if pre_exc is not None:
                 logger.error("infer_stream: failed to pre-persist conversation for session %s: %s", session_id, pre_exc)
@@ -739,10 +746,16 @@ class HandlerInferMixin:
                 new_msgs = collected_messages[persisted_until:]
                 if not new_msgs:
                     return
+                if not _stream_batch_is_protocol_complete(new_msgs):
+                    # A usage frame may have closed an assistant tool-call
+                    # declaration, but the declaration and all of its tool
+                    # results must be persisted atomically.  Keep the whole
+                    # slice pending until the final matching tool result arrives.
+                    return
                 exc = self._persist_conversation(
                     context_manager, session_id, [], new_msgs,
                     agent_ids, agent_nickname, model_id, tool_ids, workspace,
-                    compress=False,
+                    compress=False, update_title=False,
                 )
                 if exc is not None:
                     logger.error(

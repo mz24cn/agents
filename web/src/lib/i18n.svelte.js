@@ -159,8 +159,9 @@ const translations = {
     // ChatInput
     inputPlaceholder: '输入消息...',
     stopBtnTooltip: '单击=中止 | 双击=强制终止（杀掉卡住的工具进程）',
-    continueInference: '继续推理',
-    continueInterruptedPlaceholder: '会话中断：点击"继续推理"恢复，或撤回最后一条消息重新编辑',
+    retryInferenceRequest: '重新发送推理请求',
+    retryLastInference: '重新发送末次推理',
+    confirmRetryLastInference: '此操作将移除当前最后一条助手消息，然后重新发起推理请求。是否继续？',
     clearChat: '清除对话',
     newSession: '新建会话',
 
@@ -681,8 +682,9 @@ const translations = {
     // ChatInput
     inputPlaceholder: 'Type a message...',
     stopBtnTooltip: 'Click = abort | Double-click = force kill (terminate stuck tool processes)',
-    continueInference: 'Continue',
-    continueInterruptedPlaceholder: 'Session interrupted: click "Continue" to resume, or revoke the last message to edit',
+    retryInferenceRequest: 'Retry inference request',
+    retryLastInference: 'Retry last inference',
+    confirmRetryLastInference: 'This will remove the current final assistant message and then start a new inference request. Continue?',
     clearChat: 'Clear chat',
     newSession: 'New session',
 

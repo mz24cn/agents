@@ -135,7 +135,7 @@ _GC_DEFAULT_PROMPT = (
     "这是一场群聊对话，以下是参与本次对话的AI代理：\n"
     "{{AGENTS}}\n\n"
     "在消息中使用 @ 符号提及某位AI代理时，可以使用它的昵称；"
-    "在 `talk_to` 工具中向某几位AI代理发送消息时，`agents` 须使用他们的 Agent ID 。"
+    "在 `talk_to` 工具中向某几位AI代理发送消息时，`agents` 须使用他们的 Agent ID 。请勿通过 `talk_to` 工具给你自己发送消息。"
 )
 
 
@@ -843,8 +843,12 @@ def _run_group_chat_stream_gen(
     # behavior is identical to a non-group-chat single-agent session.
     # This ensures group_chat and infer_stream produce the same results
     # for the 1- or 2-participant case.
-    if len(all_agent_ids) <= 2 and all_agent_ids:
-        agent_id = all_agent_ids[0]
+    if len(all_agent_ids) <= 2 and all_agent_ids and len(mentioned_agent_ids) <= 1:
+        # In retry mode the retained roster may contain two agents while only
+        # retry_agent_id is selected to answer.  Prefer the explicit target;
+        # historical behavior for normal single-agent requests remains the
+        # first roster entry.
+        agent_id = mentioned_agent_ids[0] if mentioned_agent_ids else all_agent_ids[0]
         agent = agent_manager.get(agent_id)
         if agent is not None:
             nickname: str = agent.get("nickname", agent_id)
@@ -964,12 +968,23 @@ def _run_group_chat_stream_gen(
             agent_turns = existing_turns
             if trigger_list:
                 trigger_pairs = {(m.agent_id, m.content or "") for m in trigger_list}
-                agent_turns = [
-                    t for t in existing_turns
-                    if not (t.get("role") == "assistant"
-                            and (t.get("agent_id"), t.get("content") or "")
-                            in trigger_pairs)
-                ]
+                # ``existing_turns`` is loaded from ContextManager as
+                # ConversationTurn objects, then receives dict entries produced
+                # by earlier group-chat rounds.  Normalize both shapes before
+                # inspecting them; calling ``.get`` directly on a persisted
+                # ConversationTurn crashes every round-2+ participant.
+                filtered_turns = []
+                for turn in existing_turns:
+                    turn_msg = _message_from_turn(turn)
+                    is_trigger_reply = (
+                        turn_msg.role == "assistant"
+                        and (turn_msg.agent_id, turn_msg.content or "")
+                        in trigger_pairs
+                    )
+                    if not is_trigger_reply:
+                        filtered_turns.append(turn)
+                agent_turns = filtered_turns
+
 
             agent_messages = assemble_agent_context(
                 agent_id, agent, agent_turns, cur_user_msg,

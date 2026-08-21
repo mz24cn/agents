@@ -380,6 +380,18 @@ def _make_talk_to_fn(runtime, thread_local):
             system_prompt = agent.get("system_prompt", "")
             nickname = agent.get("nickname", agent_id)
 
+            # Never recurse into the calling agent itself. Prompt-side rosters
+            # normally exclude self, but group-chat framing lists all
+            # participants and models can still emit a self-targeting call.
+            # Enforce the invariant at execution time as the final guard.
+            if caller_agent_id and agent_id == caller_agent_id:
+                return (
+                    agent_id,
+                    nickname,
+                    "Error: talk_to cannot target the calling agent itself.",
+                    None,
+                )
+
             # 生成子 session_id（每个 agent 独立）
             sub_session_id = None
             if parent_session_id is not None:
@@ -398,6 +410,9 @@ def _make_talk_to_fn(runtime, thread_local):
                 "session_dir": None,
                 "file_journal_manager": None,
                 "user_message_timestamp": None,
+                # Nested tool calls belong to the target agent, not to the
+                # parent that initiated this talk_to call.
+                "agent_id": agent_id,
                 "file_journal_session_id": journal_session_id,
                 "file_journal_session_dir": journal_session_dir,
                 "file_journal_user_message_timestamp": journal_timestamp,

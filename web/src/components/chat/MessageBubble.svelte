@@ -10,7 +10,7 @@
   import { t } from '../../lib/i18n.svelte.js'
   import { highlight } from '../../lib/highlight.js'
 
-  let { msg, agentList = [], onRevoke, collapseButton = null, onCollapse, hasFileChanges = false, onToggleFileDiff, fileDiffData = null, fileDiffVisible = false, compact = false, replyDetailed = null, onToggleReplyMode, toolResultsById = {}, scrollTargetIndex = null } = $props()
+  let { msg, agentList = [], onRevoke, collapseButton = null, onCollapse, hasFileChanges = false, onToggleFileDiff, fileDiffData = null, fileDiffVisible = false, compact = false, replyDetailed = null, onToggleReplyMode, toolResultsById = {}, scrollTargetIndex = null, showRetry = false, onRetry, retryDisabled = false } = $props()
 
   // ── Compact mode helpers ──
   /** Determine icon for tool result in compact mode */
@@ -288,6 +288,9 @@
           <span class="token-stats" title={buildStatTooltip(msg.stat)}>
             {msg.stat.prompt_tokens >= 10000 ? `${(msg.stat.prompt_tokens/1000).toFixed(1)}k` : msg.stat.prompt_tokens}/{msg.stat.completion_tokens >= 10000 ? `${(msg.stat.completion_tokens/1000).toFixed(1)}k` : msg.stat.completion_tokens} tokens
           </span>
+        {/if}
+        {#if showRetry && onRetry}
+          <button class="retry-btn" onclick={onRetry} disabled={retryDisabled}>{t('retryInferenceRequest')}</button>
         {/if}
         {#if onToggleReplyMode && replyDetailed !== null}
           <button class="toggle-btn" onclick={onToggleReplyMode}>
@@ -568,6 +571,19 @@
     white-space: nowrap;
     letter-spacing: 0.02em;
   }
+  .retry-btn {
+    padding: 2px 8px;
+    font-family: inherit;
+    font-size: 0.75rem;
+    color: var(--text-secondary, #666);
+    background: transparent;
+    border: 1px solid var(--border, #ddd);
+    border-radius: 4px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .retry-btn:hover:not(:disabled) { background: var(--bg-secondary, rgba(0,0,0,0.06)); color: var(--text, #333); }
+  .retry-btn:disabled { opacity: 0.5; cursor: not-allowed; }
   .content {
     white-space: pre-wrap;
     line-height: 1.5;

@@ -27,6 +27,7 @@ from runtime.registry import ModelRegistry, ToolRegistry
 from runtime.runtime import Runtime
 from runtime.server import RuntimeHTTPServer
 from runtime.server_state import merge_stream_messages, persist_conversation
+from runtime.handler_infer import _stream_batch_is_protocol_complete
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -102,7 +103,26 @@ def test_persist_conversation_default_compresses():
     cm.compress_context.assert_called_once()
 
 
-def test_next_persist_prunes_invalid_existing_history(tmp_path):
+def test_incremental_persist_updates_index_without_generating_title():
+    cm = MagicMock(spec=ContextManager)
+    cm.load_conversation.return_value = []
+    sm = MagicMock()
+
+    exc = persist_conversation(
+        cm, "s1", [], [], session_manager=sm,
+        compress=False, update_title=False,
+    )
+
+    assert exc is None
+    sm.update_index.assert_called_once_with(
+        "s1",
+        last_total_tokens=None,
+        generate_title=False,
+        compression_updated=False,
+    )
+
+
+def test_next_persist_preserves_existing_history_without_explicit_removal(tmp_path):
     cm = ContextManager(infer_fn=lambda req: None, chats_dir=str(tmp_path))
     session_id = cm.create_session()
     cm.save_conversation(session_id, [
@@ -126,6 +146,7 @@ def test_next_persist_prunes_invalid_existing_history(tmp_path):
     loaded = cm.load_conversation(session_id)
     assert [(turn.role, turn.content) for turn in loaded] == [
         ("user", "old user"),
+        ("assistant", "partial"),
         ("user", "new user"),
         ("assistant", "new answer"),
     ]
@@ -274,6 +295,57 @@ def test_merge_stream_messages_chunked_equals_full():
     assert chunk2_stat == full_stat
 
 
+def test_incremental_tool_round_waits_for_result_before_persisting(tmp_path):
+    """A usage frame must not persist a dangling assistant(tool_calls) turn.
+
+    The handler retains the slice until the matching result has arrived so the
+    protocol segment is written atomically. Persistence itself must not repair
+    or delete existing messages.
+    """
+    cm = ContextManager(infer_fn=lambda req: None, chats_dir=str(tmp_path))
+    session_id = cm.create_session()
+    cm.save_conversation(session_id, [
+        ConversationTurn(role="user", content="run echo", timestamp="t0"),
+    ])
+
+    round_messages = _round_tool_call()
+    declaration_and_usage = round_messages[:2]
+    assert _stream_batch_is_protocol_complete(declaration_and_usage) is False
+
+    # Even if callers split the writes, persistence now preserves both halves.
+    assert persist_conversation(
+        cm, session_id, [], declaration_and_usage, compress=False,
+    ) is None
+    assert persist_conversation(
+        cm, session_id, [], round_messages[2:], compress=False,
+    ) is None
+    assert [(turn.role, turn.content) for turn in cm.load_conversation(session_id)] == [
+        ("user", "run echo"),
+        ("assistant", ""),
+        ("tool", "echo result"),
+    ]
+    assert persist_conversation(cm, session_id, [], [], compress=False) is None
+    assert [(turn.role, turn.content) for turn in cm.load_conversation(session_id)] == [
+        ("user", "run echo"),
+        ("assistant", ""),
+        ("tool", "echo result"),
+    ]
+
+    # Reset and persist the complete protocol segment atomically, as the
+    # handler now does.
+    cm.save_conversation(session_id, [
+        ConversationTurn(role="user", content="run echo", timestamp="t0"),
+    ])
+    assert _stream_batch_is_protocol_complete(round_messages) is True
+    assert persist_conversation(
+        cm, session_id, [], round_messages, compress=False,
+    ) is None
+    loaded = cm.load_conversation(session_id)
+    assert [turn.role for turn in loaded] == ["user", "assistant", "tool"]
+    assert loaded[1].tool_calls[0]["id"] == "call_1"
+    assert loaded[2].content == "echo result"
+
+
 # ---------------------------------------------------------------------------
 # 3. Continue-inference API
 # ---------------------------------------------------------------------------
@@ -411,23 +483,22 @@ def _turn(role, content="", timestamp="2026-08-12T15:00:00", tool_calls=None, na
     )
 
 
-def test_continue_inference_resumes_interrupted_session(continue_server, tmp_path):
-    """A session whose last stored turn is a tool result (i.e. inference was
-    interrupted after a completed tool round) can be resumed with
-    continue:true; after the final answer, continue is rejected."""
+def test_continue_explicitly_replaces_final_assistant_without_classification(continue_server, tmp_path):
+    """Continue removes the final assistant regardless of its content or status."""
     srv = continue_server
     cm = srv._context_manager
     session_id = cm.create_session()
 
-    # Simulate the persisted state after an interrupted inference:
-    # [user, assistant(tool_calls), tool] \u2014 the last completed round was
-    # incrementally persisted, but the process died before the final answer.
+    # A complete tool round was followed by an ordinary completed answer. The
+    # backend must not try to classify it before honoring explicit Continue.
     cm.save_conversation(session_id, [
         _turn("user", "do something", timestamp="2026-08-12T15:00:00"),
         _turn("assistant", "", timestamp="2026-08-12T15:00:01",
               tool_calls=[{"id": "call_1", "name": "echo", "arguments": "{}"}]),
         _turn("tool", "echo result", timestamp="2026-08-12T15:00:02",
               name="echo", tool_use_id="call_1"),
+        _turn("assistant", "A complete answer that the user chose to replace.",
+              timestamp="2026-08-12T15:00:03"),
     ])
 
     # --- continue resumes with the final answer ---
@@ -449,17 +520,6 @@ def test_continue_inference_resumes_interrupted_session(continue_server, tmp_pat
     assert roles == ["user", "assistant", "tool", "assistant"]
     assert sess["messages"][-1]["content"] == "All done."
 
-    # --- continue on a completed session must be rejected ---
-    status, err = _post_json(srv, "/v1/infer/stream", {
-        "session_id": session_id,
-        "model_id": "test-model",
-        "tool_ids": ["echo"],
-        "continue": True,
-        "messages": [],
-    })
-    assert status == 400, f"expected 400, got {status}: {err}"
-    assert "cannot continue" in err.get("error", "")
-
     # --- revoke the user message -> empty session is not continuable ---
     user_ts = sess["messages"][0]["timestamp"]
     status, rev = _post_json(srv, f"/v1/sessions/{session_id}/revoke", {"timestamp": user_ts})
@@ -473,24 +533,20 @@ def test_continue_inference_resumes_interrupted_session(continue_server, tmp_pat
         "messages": [],
     })
     assert status == 400
-    assert "cannot continue" in err2.get("error", "")
+    assert "final conversation turn" in err2.get("error", "")
 
 
-def test_continue_injects_interrupted_tool_result(continue_server, tmp_path):
-    """When the last stored turn is an assistant with dangling tool_calls
-    (e.g. corrupted/old data where the tool result was never persisted),
-    continue must inject an interrupted tool result so the model API does
-    not reject the request."""
+def test_continue_removes_malformed_tool_call_turn_before_retry(continue_server, tmp_path):
+    """A partial streamed tool declaration is removed rather than sent onward."""
     srv = continue_server
     cm = srv._context_manager
     session_id = cm.create_session()
 
-    # Simulate a conversation whose final stored turn is a dangling
-    # assistant tool-call (no paired tool result).
+    # Simulate a truncated tool-call delta with invalid JSON arguments.
     cm.save_conversation(session_id, [
         _turn("user", "start", timestamp="2026-08-12T15:00:00"),
         _turn("assistant", "", timestamp="2026-08-12T15:00:01",
-              tool_calls=[{"id": "call_1", "name": "echo", "arguments": "{}"}]),
+              tool_calls=[{"id": "call_1", "name": "echo", "arguments": "{\"x\":"}]),
     ])
 
     final_round = _openai_sse_text("Continuing after interruption.")
@@ -507,20 +563,50 @@ def test_continue_injects_interrupted_tool_result(continue_server, tmp_path):
         "continue": True,
         "messages": [],
     }, _capture_urlopen)
-    assert status == 200, f"continue with dangling tool_calls failed: {body[:500]}"
+    assert status == 200, f"retry with malformed tool_calls failed: {body[:500]}"
 
     assert captured_bodies, "expected the model API to be called"
     sent = captured_bodies[-1]
     sent_roles = [m["role"] for m in sent["messages"]]
-    # the injected interrupted-tool result must be the last message sent to the model
-    assert sent_roles[-1] == "tool", (
-        f"expected an injected tool result before the assistant request, roles={sent_roles}"
+    assert sent_roles[-1] == "user"
+    assert all(
+        not any(tc.get("id") == "call_1" for tc in (m.get("tool_calls") or []))
+        for m in sent["messages"]
     )
-    last_tool = sent["messages"][-1]
-    assert last_tool["role"] == "tool"
-    assert "interrupted" in last_tool["content"]
-    # Internal Message uses tool_use_id; OpenAI wire format requires tool_call_id.
-    assert last_tool.get("tool_call_id") == "call_1"
+
+
+def test_group_chat_continue_accepts_retry_agent_and_replacement_roster(continue_server):
+    srv = continue_server
+    cm = srv._context_manager
+    session_id = cm.create_session()
+    srv._agent_manager.create(
+        agent_id="RetryA", model_id="test-model", nickname="Retry A",
+        tool_ids=["echo"], system_prompt="You are Retry A.",
+    )
+    srv._agent_manager.create(
+        agent_id="RetryB", model_id="test-model", nickname="Retry B",
+        tool_ids=["echo"], system_prompt="You are Retry B.",
+    )
+    cm.save_conversation(session_id, [
+        _turn("user", "do something", timestamp="2026-08-12T15:00:00"),
+        _turn("assistant", "Error: stream parse: timed out",
+              timestamp="2026-08-12T15:00:01"),
+    ])
+
+    status, body = _post_stream(srv, {
+        "session_id": session_id,
+        "model_id": "test-model",
+        "tool_ids": ["echo"],
+        "continue": True,
+        "retry_agent_id": "RetryB",
+        "agent_ids": ["RetryA", "RetryB"],
+        "messages": [],
+    }, _scripted_urlopen([_openai_sse_text("taken over")]))
+    assert status == 200, body[:500]
+
+    _, sess = _get_session(srv, session_id)
+    assert sess["messages"][-1]["agent_id"] == "RetryB"
+    assert sess["meta"]["agent_ids"] == ["RetryA", "RetryB"]
 
 
 def test_continue_requires_existing_session(continue_server):

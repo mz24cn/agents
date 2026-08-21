@@ -184,6 +184,42 @@ def _make_req(first_user: str, mentioned: list[str]) -> InferenceRequest:
     )
 
 
+def test_group_chat_retry_targets_only_retry_agent(tmp_path):
+    """A retry roster may contain many agents, but only retry_agent_id runs."""
+    from runtime.context_manager import ContextManager, ConversationTurn
+
+    cm = ContextManager(infer_fn=lambda req: None, chats_dir=str(tmp_path))
+    session_id = cm.create_session()
+    cm.save_conversation(session_id, [
+        ConversationTurn(
+            role="system", content="group", timestamp="t0",
+        ),
+        ConversationTurn(
+            role="user", content="question", timestamp="t1",
+        ),
+    ])
+    runtime = FakeRuntime(["replacement"])
+    manager = FakeAgentManager(AGENTS)
+
+    output = list(run_group_chat_stream_gen(
+        runtime=runtime,
+        mentioned_agent_ids=["ShaWuJing"],
+        all_agent_ids=["SunWuKong", "ShaWuJing", "ZhuBaJie"],
+        original_messages=[],
+        base_request=InferenceRequest(model_id="m1", messages=[]),
+        context_manager=cm,
+        session_id=session_id,
+        agent_manager=manager,
+        model_id="m1",
+        tool_ids=[],
+    ))
+
+    assistant_output = [msg for msg in output if msg.role == "assistant"]
+    assert runtime.call_count == 1
+    assert assistant_output
+    assert {msg.agent_id for msg in assistant_output} == {"ShaWuJing"}
+
+
 @pytest.mark.parametrize("tool_name", ["talk_to", "delegate"])
 def test_group_chat_generator_yields_self_streaming_tool_result_with_canonical_id(tool_name):
     am = FakeAgentManager(AGENTS)
@@ -258,6 +294,53 @@ def test_resolve_mentions_by_nickname_and_id():
     assert resolve_mentions(["孙悟空", "猪八戒"], am, ids) == ["SunWuKong", "ZhuBaJie"]
     # unknown mention -> dropped
     assert resolve_mentions(["不存在的人"], am, ids) == []
+
+
+def test_round2_with_persisted_conversation_turns_does_not_assume_dict(tmp_path):
+    """Persisted history is loaded as ConversationTurn objects.
+
+    When a round-1 assistant reply @-mentions another agent, round 2 excludes
+    that trigger reply from replayed history.  The filtering path must support
+    ConversationTurn objects as well as the dicts appended during this run.
+    """
+    from runtime.context_manager import ContextManager, ConversationTurn
+
+    cm = ContextManager(infer_fn=lambda req: None, chats_dir=str(tmp_path))
+    session_id = cm.create_session()
+    cm.save_conversation(session_id, [
+        ConversationTurn(role="system", content="group", timestamp="t0"),
+        ConversationTurn(
+            role="user",
+            content="@SunWuKong 你好",
+            timestamp="t1",
+            mentions=["SunWuKong"],
+        ),
+    ])
+    am = FakeAgentManager(AGENTS)
+    runtime = FakeRuntime([
+        "@ShaWuJing 你怎么看？",
+        "我觉得有道理。",
+    ])
+
+    collected = run_group_chat_stream(
+        runtime=runtime,
+        mentioned_agent_ids=["SunWuKong"],
+        all_agent_ids=["SunWuKong", "ShaWuJing", "ZhuBaJie"],
+        original_messages=[Message(role="user", content="@SunWuKong 你好")],
+        base_request=_make_req("@SunWuKong 你好", ["SunWuKong"]),
+        cancel_event=None,
+        sse_callback=None,
+        context_manager=cm,
+        session_id=session_id,
+        agent_manager=am,
+        model_id="m1",
+        tool_ids=[],
+        max_rounds=5,
+    )
+
+    assistant_msgs = [m for m in collected if m.role == "assistant"]
+    assert [m.agent_id for m in assistant_msgs] == ["SunWuKong", "ShaWuJing"]
+    assert runtime.call_count == 2
 
 
 def test_assistant_mention_triggers_round2():

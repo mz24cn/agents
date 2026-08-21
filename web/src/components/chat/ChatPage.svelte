@@ -1,8 +1,8 @@
 <script>
   import { onMount, onDestroy, setContext, untrack } from 'svelte'
   import { writable } from 'svelte/store'
-  import { inferStream, abortInferStream, subscribeSessionEvents, agents as agentsApi, sessions as sessionsApi, env as envApi } from '../../lib/api.js'
-  import { catalog, loadAgents, loadTools, refreshAgents } from '../../lib/catalog-state.svelte.js'
+  import { inferStream, abortInferStream, subscribeSessionEvents, agents as agentsApi, sessions as sessionsApi } from '../../lib/api.js'
+  import { catalog, loadAgents, loadTools, loadEnvVars, refreshAgents } from '../../lib/catalog-state.svelte.js'
   import ModelSelector from './ModelSelector.svelte'
   import ToolSelector from './ToolSelector.svelte'
   import AgentSelector from './AgentSelector.svelte'
@@ -55,47 +55,16 @@
   let isStreaming = $derived(sessionStore[storeKey(sessionId)]?.isStreaming ?? false)
   let collapsedGroups = $derived(sessionStore[storeKey(sessionId)]?.collapsedGroups ?? new Set())
 
-  // 会话是否处于"可继续推理"状态：
-  //   最后一轮为 user / assistant(带 tool_calls 或 Error) / tool → 会话中断，可继续
-  //   最后一轮为 assistant 且无 tool_calls（或会话为空）→ 已完成，不可继续
-  // 群聊模式不支持 "继续推理"（后端会返回 400）
   let isGroupChat = $derived(selectedAgentIds.length > 1)
-
-  function hasIncompleteToolCalls(message) {
-    if (message?.role !== 'assistant' || !Object.prototype.hasOwnProperty.call(message, 'tool_calls')) return false
-    if (!Array.isArray(message.tool_calls) || message.tool_calls.length === 0) return true
-    return message.tool_calls.some(call => {
-      if (!call || typeof call !== 'object') return true
-      if (!(call.id || call.tool_use_id) || !call.name) return true
-      const args = call.arguments ?? '{}'
-      if (args && typeof args === 'object' && !Array.isArray(args)) return false
-      if (typeof args !== 'string') return true
-      try {
-        const parsed = JSON.parse(args)
-        return !parsed || typeof parsed !== 'object' || Array.isArray(parsed)
-      } catch {
-        return true
-      }
-    })
-  }
-
-  let canContinue = $derived.by(() => {
-    if (isGroupChat) return false
-    if (isStreaming) return false
-    const msgs = messages
-    if (!msgs || msgs.length === 0) return false
-    const last = msgs[msgs.length - 1]
-    if (!last) return false
-    if (last.role === 'user') return true
-    if (last.role === 'tool') return true
-    if (last.role === 'assistant' && typeof last.content === 'string' && last.content.trimStart().startsWith('Error:')) return true
-    if (hasIncompleteToolCalls(last)) return true
-    if (last.role === 'assistant' && last.tool_calls && last.tool_calls.length > 0) return true
-    return false
+  let retryAssistantIndex = $derived.by(() => {
+    if (isStreaming) return -1
+    const idx = messages.length - 1
+    return idx >= 0 && messages[idx]?.role === 'assistant' ? idx : -1
   })
 
   let revokeConflict = $state(null)
   let revokeConfirm = $state(null)  // initial revoke confirmation dialog state
+  let retryConfirm = $state(false)
 
   // File journal / diff viewer state
   let fileJournalTurnKeyMap = $state({})         // message timestamp alias -> exact backend journal key
@@ -344,8 +313,8 @@
 
   async function fetchWorkspacePath() {
     try {
-      const resp = await envApi.list()
-      const envMap = resp.env || {}
+      const envItems = await loadEnvVars()
+      const envMap = Object.fromEntries(envItems.map(item => [item.key, item.value]))
       document.title = envMap.APP_TITLE || t('appTitle')
       displayMessageDetails = String(envMap.DISPLAY_MESSAGE_DETAILS ?? '').trim().toLowerCase() === 'true'
       
@@ -456,12 +425,35 @@
     _doSend(apiMessages, pendingUserMsg)
   }
 
-  // 继续推理：会话因中断停留在"可继续"状态（最后一轮是 user / 工具调用 /
-  // 工具结果）时，不追加新用户消息，直接基于既有上下文再跑一轮推理。
-  function handleContinue() {
-    if (!selectedModelId && selectedAgentIds.length === 0 || isStreaming || !sessionId) return
+  // Continue is destructive: ask the user before removing the final assistant
+  // message and starting a replacement inference.
+  function handleRetryLastInference() {
+    if ((!selectedModelId && selectedAgentIds.length === 0) || isStreaming || !sessionId) return
+    if (retryAssistantIndex < 0) return
+    retryConfirm = true
+  }
+
+  function cancelRetryLastInference() {
+    retryConfirm = false
+  }
+
+  function confirmRetryLastInference() {
+    retryConfirm = false
+    const key = storeKey(sessionId)
+    const store = sessionStore[key]
+    const last = store?.messages?.[store.messages.length - 1]
+    if (!store || last?.role !== 'assistant') return
+    const previousAgentId = last.agent_id || last.assistant_id || null
+    // Default to the removed message's author when that agent is still selected.
+    // If the user changed the selection, the first selected agent takes over.
+    // With no selected agent, retry uses the selected model + tool combination.
+    const retryAgentId = selectedAgentIds.length === 0
+      ? null
+      : (previousAgentId && selectedAgentIds.includes(previousAgentId)
+          ? previousAgentId
+          : selectedAgentIds[0])
     errorMsg = ''
-    _doSend([], null, true)
+    _doSend([], null, true, retryAgentId)
   }
 
   function handleSendTemplate(templateId, args) {
@@ -481,7 +473,7 @@
     _doSend(apiMessages, pendingUserMsg)
   }
 
-  function _doSend(apiMessages, pendingUserMsg, isContinue = false) {
+  function _doSend(apiMessages, pendingUserMsg, isContinue = false, retryAgentId = null) {
     // Each stream writes to its own sessionStore entry via keyRef.
     // keyRef.key may change from '__new__' to the real session ID once the
     // backend assigns one (onInit / first onStreamMsg with session_id).
@@ -499,6 +491,7 @@
     const reqBody = { model_id: selectedModelId, tool_ids: selectedToolIds, messages: isContinue ? [] : apiMessages, stream: true }
     if (isContinue) {
       reqBody.continue = true
+      if (retryAgentId) reqBody.retry_agent_id = retryAgentId
     }
     if (selectedAgentIds.length > 0) {
       reqBody.agent_ids = selectedAgentIds
@@ -535,16 +528,9 @@
       }
       const store = sessionStore[keyRef.key]
       if (!store) return
-      // 后端在继续推理前已删除末尾失败的 assistant Error 消息；
-      // 同步移除前端旧气泡，随后再创建本轮新的 assistant 占位消息。
-      if (initData.removed_trailing_incomplete_assistant || initData.removed_trailing_assistant_error) {
-        const last = store.messages[store.messages.length - 1]
-        if (last?.role === 'assistant' && (
-          (typeof last.content === 'string' && last.content.trimStart().startsWith('Error:')) ||
-          hasIncompleteToolCalls(last)
-        )) {
-          store.messages = store.messages.slice(0, -1)
-        }
+      // Continue explicitly removed exactly the final assistant message on disk.
+      if (initData.removed_trailing_assistant && store.messages.at(-1)?.role === 'assistant') {
+        store.messages = store.messages.slice(0, -1)
       }
       // 创建用户消息（带服务端返回的时间戳）
       if (initData.user_message_timestamp) {
@@ -1459,6 +1445,15 @@
     onCancel={cancelForceRevoke}
   />
 
+  <ConfirmDialog
+    open={retryConfirm}
+    title={t('retryLastInference')}
+    message={t('confirmRetryLastInference')}
+    confirmText={t('retryLastInference')}
+    onConfirm={confirmRetryLastInference}
+    onCancel={cancelRetryLastInference}
+  />
+
   <div class="message-area">
     <!-- Terminals: render all instances, show only current session's if visible -->
     {#each Array.from(terminals.entries()) as [termId, termData] (termId)}
@@ -1476,7 +1471,7 @@
     <!-- Message list: hidden when terminal is visible -->
     <div class="message-list-container" class:hidden={terminalVisible}>
       {#key sessionId}
-        <MessageList {messages} {agentList} {displayMessageDetails} onRevoke={handleRevoke} onScrollAtBottom={handleScrollAtBottom} {shouldScrollToBottom} {collapsedGroups} onToggleCollapse={toggleCollapse} {fileJournalTurnKeyMap} {fileDiffCache} {fileDiffVisible} onToggleFileDiff={handleToggleFileDiff} />
+        <MessageList {messages} {agentList} {displayMessageDetails} onRevoke={handleRevoke} onScrollAtBottom={handleScrollAtBottom} {shouldScrollToBottom} {collapsedGroups} onToggleCollapse={toggleCollapse} {fileJournalTurnKeyMap} {fileDiffCache} {fileDiffVisible} onToggleFileDiff={handleToggleFileDiff} {retryAssistantIndex} onRetryLastInference={handleRetryLastInference} retryDisabled={isStreaming} />
       {/key}
 
       <WorkspaceFileManager
@@ -1547,8 +1542,6 @@
     onSend={handleSend}
     onStop={handleStop}
     onStopForce={handleStopForce}
-    onContinue={handleContinue}
-    continueMode={canContinue}
     onToggleTemplatePanel={toggleTemplatePanel}
     onToggleWorkspacePanel={toggleWorkspacePanel}
     bind:workspacePanelOpen

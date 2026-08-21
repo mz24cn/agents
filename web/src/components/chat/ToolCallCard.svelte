@@ -11,6 +11,40 @@
   let resultHoverExpandedIndexes = $state(new Set())
   const hoverTimers = new Map()
   const resultHoverTimers = new Map()
+  let previouslyStreamingIds = new Set()
+
+  $effect(() => {
+    const currentlyStreamingIds = new Set()
+    for (const tc of toolCalls || []) {
+      const id = getToolCallId(tc)
+      if (id && isResultStreaming(getToolResult(tc))) currentlyStreamingIds.add(id)
+    }
+
+    // A streaming detail is implicitly open.  On completion, remove any click
+    // or hover expansion accumulated while it was live so the result closes and
+    // returns to the exact same interaction model as every other tool result.
+    const completedIndexes = []
+    for (let index = 0; index < (toolCalls || []).length; index++) {
+      const id = getToolCallId(toolCalls[index])
+      if (id && previouslyStreamingIds.has(id) && !currentlyStreamingIds.has(id)) {
+        completedIndexes.push(index)
+      }
+    }
+    if (completedIndexes.length) {
+      const nextExpanded = new Set(resultExpandedIndexes)
+      const nextHover = new Set(resultHoverExpandedIndexes)
+      for (const index of completedIndexes) {
+        nextExpanded.delete(index)
+        nextHover.delete(index)
+        const timer = resultHoverTimers.get(index)
+        if (timer) clearTimeout(timer)
+        resultHoverTimers.delete(index)
+      }
+      resultExpandedIndexes = nextExpanded
+      resultHoverExpandedIndexes = nextHover
+    }
+    previouslyStreamingIds = currentlyStreamingIds
+  })
 
   function getToolCallId(tc) {
     return tc?.id || tc?.tool_use_id || null
@@ -25,8 +59,16 @@
     return expandedIndexes.has(index) || hoverExpandedIndexes.has(index)
   }
 
-  function isResultExpanded(index) {
-    return resultExpandedIndexes.has(index) || resultHoverExpandedIndexes.has(index)
+  function isResultStreaming(result) {
+    return result?.streaming === true || !!(result?.sub_messages && Object.values(result.sub_messages).some(sm => sm.streaming))
+  }
+
+  function isResultExpanded(index, result) {
+    // Any tool that supplies streaming result frames reveals them in the normal
+    // result detail area.  Today this is used by talk_to/delegate; the same UI
+    // path will work for streaming MCP results once their transport emits the
+    // shared `streaming` state.
+    return isResultStreaming(result) || resultExpandedIndexes.has(index) || resultHoverExpandedIndexes.has(index)
   }
 
   function startHoverPreview(index) {
@@ -101,6 +143,16 @@
   }
 
   function resultContent(result) {
+    if (result?.sub_messages) {
+      return Object.values(result.sub_messages)
+        .map(sm => {
+          const name = sm.agent_nickname || sm.agent_id || ''
+          const id = sm.agent_id || ''
+          const prefix = id ? `**${name}** (${id}): ` : (name ? `**${name}**: ` : '')
+          return prefix + (sm.content || '')
+        })
+        .join('\n\n')
+    }
     return result?.content ?? ''
   }
 
@@ -132,10 +184,11 @@
   {#if compact}
     {#each toolCalls as tc, index}
       {@const result = getToolResult(tc)}
+      {@const resultStreaming = isResultStreaming(result)}
       {@const renderedResult = result ? renderResult(result) : null}
       <span class="compact-tool-pair" role="group">
         <span class="compact-tool-zone" role="group" onmouseenter={() => startHoverPreview(index)} onmouseleave={() => stopHoverPreview(index)}>
-          <button class="compact-tool-call" class:has-result={!!result} aria-expanded={isExpanded(index)} onclick={() => toggleExpanded(index)}>
+          <button class="compact-tool-call has-result" aria-expanded={isExpanded(index)} onclick={() => toggleExpanded(index)}>
             <span class="compact-tc-icon">🛠️</span>
             <span class="compact-tc-name">{tc.name ?? t('unknownTool')}</span>
           </button>
@@ -145,23 +198,23 @@
             </span>
           {/if}
         </span>
-        {#if result}
-          <span class="compact-result-zone" role="group" onmouseenter={() => startResultHoverPreview(index)} onmouseleave={() => stopResultHoverPreview(index)}>
-            <button class="compact-tool-result" aria-expanded={isResultExpanded(index)} onclick={() => toggleResultExpanded(index)}>
-              {isToolError(result) ? '✖️' : '✔️'}
-            </button>
-            {#if isResultExpanded(index)}
-              <span class="tool-detail result-expanded">
-                {#if renderedResult.html}
-                  <span class="detail-lang">{renderedResult.lang}</span>
-                  <pre><code>{@html renderedResult.html}</code></pre>
-                {:else}
-                  <MarkdownRenderer content={renderedResult.markdown} />
-                {/if}
-              </span>
-            {/if}
-          </span>
-        {/if}
+        <span class="compact-result-zone" role="group" onmouseenter={() => result && startResultHoverPreview(index)} onmouseleave={() => stopResultHoverPreview(index)}>
+          <button class="compact-tool-result" class:pending={!result || resultStreaming} aria-expanded={isResultExpanded(index, result)} disabled={!result} onclick={() => result && toggleResultExpanded(index)}>
+            {!result || resultStreaming ? '⏳' : isToolError(result) ? '✖️' : '✔️'}
+          </button>
+          {#if result && isResultExpanded(index, result)}
+            <span class="tool-detail result-expanded" class:streaming={resultStreaming}>
+              {#if renderedResult.html}
+                <span class="detail-lang">{renderedResult.lang}</span>
+                <pre><code>{@html renderedResult.html}</code></pre>
+              {:else if renderedResult.markdown}
+                <MarkdownRenderer content={renderedResult.markdown} />
+              {:else if resultStreaming}
+                <span class="stream-placeholder">⏳</span>
+              {/if}
+            </span>
+          {/if}
+        </span>
       </span>
     {/each}
   {:else}
@@ -255,6 +308,24 @@
   }
   .compact-tool-result:hover {
     border-left: none;
+  }
+  .compact-tool-result:disabled {
+    cursor: default;
+    opacity: 1;
+  }
+  .compact-tool-result.pending {
+    animation: tool-pending-pulse 1.2s ease-in-out infinite;
+  }
+  .tool-detail.streaming {
+    min-height: 1.5em;
+  }
+  .stream-placeholder {
+    display: inline-block;
+    animation: tool-pending-pulse 1.2s ease-in-out infinite;
+  }
+  @keyframes tool-pending-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.45; }
   }
   .compact-tc-icon,
   .compact-tool-result {
