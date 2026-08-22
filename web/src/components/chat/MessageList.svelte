@@ -8,6 +8,7 @@
   import CopyButton from './CopyButton.svelte'
 
   import { resolveFileJournalTurnKey } from '../../lib/file-journals.js'
+  import { isToolErrorContent } from '../../lib/tool-result.js'
   import { currentSession, messageScrollRequest } from '../../lib/session-state.svelte.js'
 
   let { messages = [], agentList = [], displayMessageDetails = false, onRevoke, onScrollAtBottom, shouldScrollToBottom = false, collapsedGroups = new Set(), onToggleCollapse, fileJournalTurnKeyMap = {}, fileDiffVisible = new Set(), fileDiffCache = {}, onToggleFileDiff, retryAssistantIndex = -1, onRetryLastInference, retryDisabled = false } = $props()
@@ -265,12 +266,7 @@
   }
 
   function isToolError(content) {
-    const text = String(content ?? '')
-    try {
-      const parsed = JSON.parse(text)
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && Object.prototype.hasOwnProperty.call(parsed, 'error')) return true
-    } catch {}
-    return /^Error:/i.test(text.trim())
+    return isToolErrorContent(content)
   }
 
   function getBlockCopyText(block) {

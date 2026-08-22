@@ -3,7 +3,7 @@
   import { router, navigate } from '../lib/router.svelte.js'
   import { t } from '../lib/i18n.svelte.js'
   import { sessions, subscribeSessionEvents } from '../lib/api.js'
-  import { sessionRestore, newSessionCreated, sessionDeleted, currentSession, newSessionRequest, terminalOpen, openSessionLogDir, messageScrollRequest } from '../lib/session-state.svelte.js'
+  import { sessionRestore, sessionDownload, newSessionCreated, sessionDeleted, currentSession, newSessionRequest, terminalOpen, openSessionLogDir, messageScrollRequest } from '../lib/session-state.svelte.js'
   import { sidebarWidth, setSidebarWidth, toggleSidebarCollapsed, collapseSidebar, SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH } from '../lib/sidebar-width.svelte.js'
 
   const SESSION_PAGE_SIZE = 100
@@ -205,18 +205,45 @@
     if (window.innerWidth < 1024) {
       collapseSidebar()
     }
+    // 先进入 ChatPage，再开始下载。这样从 Setup 等页面切换会话时，
+    // 500ms 后出现的下载进度条也有可见的挂载区域。
+    navigate('#/chat')
+    const downloadToken = sessionDownload.token + 1
+    sessionDownload.token = downloadToken
+    sessionDownload.loading = true
+    sessionDownload.visible = false
+    sessionDownload.received = 0
+    sessionDownload.total = 0
+    const progressDelay = setTimeout(() => {
+      if (sessionDownload.loading && sessionDownload.token === downloadToken) {
+        sessionDownload.visible = true
+      }
+    }, 500)
     try {
-      const data = await sessions.get(sessionId)
+      const data = await sessions.get(sessionId, ({ received, total }) => {
+        if (sessionDownload.token !== downloadToken) return
+        sessionDownload.received = received
+        sessionDownload.total = total
+      })
+      // A newer click owns the UI now; do not let this response replace it.
+      if (sessionDownload.token !== downloadToken) return
       // 直接展开所有字段，保持与后端数据一致
       const msgs = (data.messages ?? []).map(m => ({ ...m }))
       const meta = data.meta ?? null
       sessionRestore.pending = { sessionId, messages: msgs, meta }
-      // 恢复会话后跳转到对话页，同时同步浏览器 hash
-      navigate('#/chat')
     } catch (err) {
+      if (sessionDownload.token !== downloadToken) return
       restoreError = err.message || t('restoreSessionFailed')
       // 后端在 session not found 时会删除该记录，前端同步移除
       sessionList = sessionList.filter(s => s.session_id !== sessionId)
+    } finally {
+      clearTimeout(progressDelay)
+      if (sessionDownload.token === downloadToken) {
+        sessionDownload.loading = false
+        sessionDownload.visible = false
+        sessionDownload.received = 0
+        sessionDownload.total = 0
+      }
     }
   }
 

@@ -32,6 +32,19 @@ async function readJsonMaybe(res) {
  * @param {object|null} body  JSON body (omitted for GET/DELETE)
  * @returns {Promise<any>} Parsed JSON response
  */
+function throwResponseError(res, data) {
+  // Support both single "error" string and "errors" array
+  const msg = data?.message
+    || data?.error
+    || (Array.isArray(data?.errors) ? data.errors.join('\n') : null)
+    || `Request failed: ${res.status}`
+  const err = new Error(msg)
+  err.status = res.status
+  err.data = data
+  err.code = data?.error
+  throw err
+}
+
 async function request(method, path, body = null) {
   const opts = {
     method,
@@ -42,17 +55,53 @@ async function request(method, path, body = null) {
   }
   const res = await apiFetch(path, opts)
   const data = await readJsonMaybe(res)
-  if (!res.ok) {
-    // Support both single "error" string and "errors" array
-    const msg = data?.message
-      || data?.error
-      || (Array.isArray(data?.errors) ? data.errors.join('\n') : null)
-      || `Request failed: ${res.status}`
-    const err = new Error(msg)
-    err.status = res.status
-    err.data = data
-    err.code = data?.error
-    throw err
+  if (!res.ok) throwResponseError(res, data)
+  return data
+}
+
+/**
+ * Download and parse a JSON response while reporting actual response bytes.
+ * The backend sends Content-Length for JSON responses, so progress is
+ * calculated from bytes read from the response stream rather than estimated.
+ */
+async function requestWithDownloadProgress(path, onProgress) {
+  const res = await apiFetch(path, {
+    method: 'GET',
+    headers: { 'Content-Type': 'application/json' },
+  })
+
+  const total = Number.parseInt(res.headers?.get?.('Content-Length') || '0', 10) || 0
+  let received = 0
+  onProgress?.({ received, total })
+
+  // Keep compatibility with environments/mocks that do not expose a stream.
+  if (!res.body?.getReader) {
+    const data = await readJsonMaybe(res)
+    if (!res.ok) throwResponseError(res, data)
+    return data
+  }
+
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let text = ''
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    received += value.byteLength
+    text += decoder.decode(value, { stream: true })
+    onProgress?.({ received, total })
+  }
+  text += decoder.decode()
+
+  let data = null
+  try {
+    data = text ? JSON.parse(text) : null
+  } catch {
+    data = null
+  }
+  if (!res.ok) throwResponseError(res, data)
+  if (data === null && text) {
+    throw new Error('Invalid JSON response')
   }
   return data
 }
@@ -214,7 +263,9 @@ export const env = {
 export const sessions = {
   list:          (page = 1, pageSize = 100) => request('GET', `/v1/sessions?page=${encodeURIComponent(page)}&page_size=${encodeURIComponent(pageSize)}`),
   search:        (query, page = 1, pageSize = 100) => request('GET', `/v1/sessions/search?q=${encodeURIComponent(query)}&page=${encodeURIComponent(page)}&page_size=${encodeURIComponent(pageSize)}`),
-  get:           (sessionId)     => request('GET',    `/v1/sessions/${encodeURIComponent(sessionId)}`),
+  get:           (sessionId, onProgress = null) => onProgress
+    ? requestWithDownloadProgress(`/v1/sessions/${encodeURIComponent(sessionId)}`, onProgress)
+    : request('GET', `/v1/sessions/${encodeURIComponent(sessionId)}`),
   logDir:        (sessionId)     => request('GET',    `/v1/sessions/${encodeURIComponent(sessionId)}/log-dir`),
   delete:        (sessionId)     => request('DELETE', `/v1/sessions/${encodeURIComponent(sessionId)}`),
   generateTitle: (sessionId)     => request('POST',   `/v1/sessions/${encodeURIComponent(sessionId)}/generate-title`),

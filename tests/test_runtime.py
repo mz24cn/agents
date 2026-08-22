@@ -9,7 +9,7 @@ messages list.
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from runtime.models import InferenceRequest, Message
+from runtime.models import InferenceRequest, Message, ModelConfig
 from runtime.runtime import Runtime
 from runtime.registry import ModelRegistry, ToolRegistry
 
@@ -42,6 +42,73 @@ def test_ensure_tool_call_results_drops_orphan_tool_result():
         Message(role="assistant", content="done"),
     ])
     assert [message.role for message in repaired] == ["user", "assistant"]
+
+
+def test_prepare_reasoning_for_tool_rounds_repairs_request_copy_only():
+    from runtime.runtime import _prepare_reasoning_for_tool_rounds
+
+    original = Message(role="assistant", content="", tool_calls=[{
+        "id": "call-1", "name": "lookup", "arguments": "{}",
+    }])
+    messages = [
+        Message(role="assistant", content="old answer"),
+        Message(role="user", content="look it up"),
+        original,
+        Message(role="tool", content="result", name="lookup", tool_use_id="call-1"),
+    ]
+    config = ModelConfig(
+        model_id="deepseek",
+        api_base="https://example.test",
+        model_name="deepseek",
+        labels=["require-reasoning-for-tool-rounds"],
+    )
+
+    prepared = _prepare_reasoning_for_tool_rounds(messages, config)
+
+    assert prepared is not messages
+    assert prepared[0] is messages[0]  # before the latest user: out of scope
+    assert prepared[2] is not original
+    assert prepared[2].thinking
+    assert original.thinking is None  # synthetic reasoning must not leak to persistence
+
+
+def test_prepare_reasoning_for_tool_rounds_preserves_real_reasoning():
+    from runtime.runtime import _prepare_reasoning_for_tool_rounds
+
+    assistant = Message(role="assistant", thinking="real reasoning")
+    messages = [
+        Message(role="user", content="question"),
+        assistant,
+        Message(role="tool", content="result"),
+    ]
+    config = ModelConfig(
+        model_id="deepseek",
+        api_base="https://example.test",
+        model_name="deepseek",
+        labels=["require-reasoning-for-tool-rounds"],
+    )
+
+    prepared = _prepare_reasoning_for_tool_rounds(messages, config)
+
+    assert prepared is messages
+    assert prepared[1].thinking == "real reasoning"
+
+
+def test_prepare_reasoning_for_tool_rounds_requires_label_and_trailing_tool():
+    from runtime.runtime import _prepare_reasoning_for_tool_rounds
+
+    assistant = Message(role="assistant", content="answer")
+    trailing_assistant = [Message(role="user", content="q"), assistant]
+    unlabeled_tool_round = trailing_assistant + [Message(role="tool", content="result")]
+    unlabeled = ModelConfig("plain", "https://example.test", "plain")
+    labeled = ModelConfig(
+        "deepseek", "https://example.test", "deepseek",
+        labels=["require-reasoning-for-tool-rounds"],
+    )
+
+    assert _prepare_reasoning_for_tool_rounds(unlabeled_tool_round, unlabeled) is unlabeled_tool_round
+    assert _prepare_reasoning_for_tool_rounds(trailing_assistant, labeled) is trailing_assistant
+    assert assistant.thinking is None
 
 
 # --- Hypothesis strategies ---

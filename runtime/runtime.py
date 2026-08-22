@@ -14,6 +14,7 @@ import socket
 import time
 import urllib.request
 import urllib.error
+from dataclasses import replace
 from typing import Iterator, Optional
 
 from runtime.common import (
@@ -277,6 +278,50 @@ def _ensure_tool_call_results(messages: list) -> list:
 
     _flush_pending()
     return result
+
+
+def _prepare_reasoning_for_tool_rounds(
+    messages: list,
+    model_config,
+) -> list:
+    """Return request-only messages with missing tool-round reasoning repaired.
+
+    Some thinking-mode providers require every assistant message in the active
+    tool round to carry its reasoning field when tool results are submitted.
+    Apply that compatibility repair only when the model opts in through the
+    ``require-reasoning-for-tool-rounds`` label and the current history ends in
+    a tool result.
+
+    Repaired assistant messages are shallow copies.  The conversation's source
+    Message objects remain unchanged, so synthetic reasoning is never returned
+    as model output or persisted to conversation.json.
+    """
+    if (
+        not messages
+        or messages[-1].role != "tool"
+        or "require-reasoning-for-tool-rounds" not in (model_config.labels or [])
+    ):
+        return messages
+
+    last_user_index = -1
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].role == "user":
+            last_user_index = index
+            break
+
+    repaired = None
+    for index in range(last_user_index + 1, len(messages)):
+        msg = messages[index]
+        if msg.role != "assistant" or msg.thinking:
+            continue
+        if repaired is None:
+            repaired = list(messages)
+        repaired[index] = replace(
+            msg,
+            thinking="Reasoning content was unavailable in the stored conversation.",
+        )
+
+    return repaired if repaired is not None else messages
 
 
 # ---------------------------------------------------------------------------
@@ -602,9 +647,10 @@ class Runtime:
 
             # Repair legacy/interrupted tool-call history before serialization.
             messages = _ensure_tool_call_results(messages)
+            request_messages = _prepare_reasoning_for_tool_rounds(messages, model_config)
             url, headers, body_bytes = protocol.build_request(
                 config=model_config,
-                messages=messages,
+                messages=request_messages,
                 tools=tools if tools else None,
                 stream=False,
             )
@@ -1510,8 +1556,9 @@ class Runtime:
                 return
 
             messages = _ensure_tool_call_results(messages)
+            request_messages = _prepare_reasoning_for_tool_rounds(messages, model_config)
             url, headers, body_bytes = protocol.build_request(
-                config=model_config, messages=messages,
+                config=model_config, messages=request_messages,
                 tools=tools if tools else None, stream=True,
             )
 

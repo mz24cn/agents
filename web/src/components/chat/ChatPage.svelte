@@ -17,7 +17,7 @@
   import { buildFileJournalTurnKeyMap } from '../../lib/file-journals.js'
   import { t } from '../../lib/i18n.svelte.js'
   import { navigate } from '../../lib/router.svelte.js'
-  import { sessionRestore, newSessionCreated, sessionDeleted, currentSession, newSessionRequest, terminalOpen, openSessionLogDir } from '../../lib/session-state.svelte.js'
+  import { sessionRestore, sessionDownload, newSessionCreated, sessionDeleted, currentSession, newSessionRequest, terminalOpen, openSessionLogDir } from '../../lib/session-state.svelte.js'
   import { collapseSidebar } from '../../lib/sidebar-width.svelte.js'
   import Terminal from '../Terminal.svelte'
 
@@ -1455,6 +1455,21 @@
   />
 
   <div class="message-area">
+    {#if sessionDownload.visible && sessionDownload.loading && sessionDownload.total > 0}
+      <div
+        class="session-download-progress"
+        role="progressbar"
+        aria-label="Loading session"
+        aria-valuemin="0"
+        aria-valuemax="100"
+        aria-valuenow={Math.min(100, Math.round(sessionDownload.received / sessionDownload.total * 100))}
+      >
+        <div
+          class="session-download-progress-fill"
+          style:width={`${Math.min(100, sessionDownload.received / sessionDownload.total * 100)}%`}
+        ></div>
+      </div>
+    {/if}
     <!-- Terminals: render all instances, show only current session's if visible -->
     {#each Array.from(terminals.entries()) as [termId, termData] (termId)}
       <div class="terminal-view" class:visible={terminalVisible && termId === sessionId}>
@@ -1753,6 +1768,26 @@
     overflow: hidden;
     display: flex;
     flex-direction: column;
+  }
+
+  .session-download-progress {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 30;
+    width: 100%;
+    height: 4px;
+    overflow: hidden;
+    background: color-mix(in srgb, var(--primary) 15%, transparent);
+    pointer-events: none;
+  }
+
+  .session-download-progress-fill {
+    height: 100%;
+    background: linear-gradient(90deg, #22c55e 0%, #06b6d4 45%, #6366f1 100%);
+    box-shadow: 0 0 8px color-mix(in srgb, var(--primary) 65%, transparent);
+    transition: width 80ms linear;
   }
 
   /* Terminal view styles moved to terminal-control section */

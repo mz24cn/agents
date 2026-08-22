@@ -1,6 +1,7 @@
 <script>
   import { t } from '../../lib/i18n.svelte.js'
   import { highlight } from '../../lib/highlight.js'
+  import { isToolErrorContent } from '../../lib/tool-result.js'
   import MarkdownRenderer from './MarkdownRenderer.svelte'
 
   let { toolCalls = null, compact = false, toolResultsById = {} } = $props()
@@ -157,12 +158,7 @@
   }
 
   function isToolError(result) {
-    const content = String(resultContent(result))
-    try {
-      const parsed = JSON.parse(content)
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && Object.prototype.hasOwnProperty.call(parsed, 'error')) return true
-    } catch {}
-    return /^Error:/i.test(content.trim())
+    return isToolErrorContent(resultContent(result))
   }
 
   function renderResult(result) {

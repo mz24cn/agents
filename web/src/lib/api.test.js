@@ -225,6 +225,29 @@ describe('sessions.get', () => {
     expect(url).not.toContain(' ')
   })
 
+  it('reports real downloaded bytes and Content-Length when a progress callback is provided', async () => {
+    const json = JSON.stringify({ meta: {}, messages: [{ role: 'user', content: 'hello' }] })
+    const bytes = new TextEncoder().encode(json)
+    const splitAt = Math.floor(bytes.length / 2)
+    const progress = vi.fn()
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(bytes.slice(0, splitAt))
+        controller.enqueue(bytes.slice(splitAt))
+        controller.close()
+      },
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json', 'Content-Length': String(bytes.length) },
+    })))
+
+    const result = await sessions.get('session-1', progress)
+
+    expect(result.messages[0].content).toBe('hello')
+    expect(progress).toHaveBeenLastCalledWith({ received: bytes.length, total: bytes.length })
+    expect(progress.mock.calls.some(([value]) => value.received > 0 && value.received < value.total)).toBe(true)
+  })
+
   it('throws Error when session not found (404)', async () => {
     vi.stubGlobal('fetch', mockFetch({ error: 'Session not found: bad-id' }, 404))
 

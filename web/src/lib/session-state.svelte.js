@@ -4,6 +4,9 @@
 export const sessionRestore = $state({ pending: null })
 // pending: { sessionId: string, messages: Array<{role, content}>, meta?: object } | null
 
+// 会话文件下载进度。500ms 内完成时不显示；进度值只使用实际已下载字节和 Content-Length。
+export const sessionDownload = $state({ loading: false, visible: false, received: 0, total: 0, token: 0 })
+
 // 用户消息定位请求：Sidebar 选择历史用户输入后，由 MessageList 在目标会话渲染完成后消费。
 export const messageScrollRequest = $state({ sessionId: null, messageIndex: null, token: 0 })
 

@@ -9,6 +9,7 @@
   import IconDisplay from '../../lib/components/IconDisplay.svelte'
   import { t } from '../../lib/i18n.svelte.js'
   import { highlight } from '../../lib/highlight.js'
+  import { isToolErrorContent } from '../../lib/tool-result.js'
 
   let { msg, agentList = [], onRevoke, collapseButton = null, onCollapse, hasFileChanges = false, onToggleFileDiff, fileDiffData = null, fileDiffVisible = false, compact = false, replyDetailed = null, onToggleReplyMode, toolResultsById = {}, scrollTargetIndex = null, showRetry = false, onRetry, retryDisabled = false } = $props()
 
@@ -19,11 +20,7 @@
     if (msg.streaming === true || (msg.sub_messages && Object.values(msg.sub_messages).some(sm => sm.streaming))) return '⏳'
     const tc = toolContentSource
     if (!tc) return '\u2714\uFE0F'  // empty = check mark
-    try {
-      const parsed = JSON.parse(tc)
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && Object.prototype.hasOwnProperty.call(parsed, 'error')) return '\u2716\uFE0F'
-    } catch {}
-    if (/^Error:/i.test(tc.trim())) return '\u2716\uFE0F'
+    if (isToolErrorContent(tc)) return '\u2716\uFE0F'
     return '\u2714\uFE0F'
   })
 
