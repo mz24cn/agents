@@ -30,6 +30,10 @@ from runtime.common import session_timestamp
 from runtime.context_manager import JournalConflictError
 from runtime.models import ModelConfig, ToolConfig
 from runtime.skill_manager import SkillManager
+
+_SERVER_STARTED_AT = datetime.datetime.now(datetime.timezone.utc).isoformat()
+_SERVER_INSTANCE_ID = uuid.uuid4().hex
+
 from runtime.server_state import (
     _broadcast_session_status,
     _load_function_from_file,
@@ -943,6 +947,8 @@ class HandlerApiMixin:
                 "backend_build": backend,
                 "last_config": last_config,
                 "inference_active": inference_active,
+                "server_started_at": _SERVER_STARTED_AT,
+                "server_instance_id": _SERVER_INSTANCE_ID,
             })
             return
 
@@ -1282,7 +1288,10 @@ class HandlerApiMixin:
                     release_update_lock()
                     logger.exception("Failed to restart backend after update")
 
-            timer = threading.Timer(3.0, restart_process)
+            # The response has already been written. Restart promptly; the
+            # frontend watches server_instance_id and refreshes as soon as the
+            # replacement process answers instead of sleeping a fixed period.
+            timer = threading.Timer(0.5, restart_process)
             timer.daemon = True
             timer.start()
 
@@ -1290,7 +1299,7 @@ class HandlerApiMixin:
     def _parse_build_version(value: str, *, allow_empty: bool = False) -> float:
         """Parse YYMMdd_HHmmss into local epoch seconds; empty may mean baseline 0."""
         value = value.strip()
-        if not value:
+        if not value or value == "0":
             if allow_empty:
                 return 0.0
             raise ValueError("empty value")

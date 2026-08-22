@@ -33,9 +33,12 @@
   let remoteFrontend = $state('')
   let remoteBackend = $state('')
   let remoteConfig = $state('')
+  let frontendSync = $state('')
+  let backendSync = $state('')
+  let configSync = $state('')
   let updateAvailable = $state(false)
-  let updateDetails = $state('')
   let inferenceActive = $state(false)
+  let serverInstanceId = $state('')
   let checkingUpdate = $state(false)
   let applyingUpdate = $state(false)
   let updateMessage = $state('')
@@ -45,8 +48,10 @@
   let windowsSetupCommand = $derived(`irm ${setupLink} | iex`)
   let linuxSetupCommand = $derived(`curl -fsSL ${setupLink} | sh`)
   let setupTokenExpiresDisplay = $derived(formatSetupTokenExpiresAt(setupTokenExpiresAt))
+  let downgradeAvailable = $derived(frontendSync === 'downgrade' || backendSync === 'downgrade' || configSync === 'downgrade')
   let canCheckUpdate = $derived(!!setupSource.trim() && !checkingUpdate && !applyingUpdate)
   let canApplyUpdate = $derived(updateAvailable && !inferenceActive && !checkingUpdate && !applyingUpdate)
+  let canApplyDowngrade = $derived(downgradeAvailable && !inferenceActive && !checkingUpdate && !applyingUpdate)
 
   function pad2(value) {
     return String(value).padStart(2, '0')
@@ -83,16 +88,33 @@
   }
 
   function refreshUpdateMessage() {
-    if (!updateAvailable) return
-    updateMessage = inferenceActive
-      ? t('updateAvailableButBusy', { versions: updateDetails })
-      : t('updateAvailable', { versions: updateDetails })
+    if (updateAvailable) {
+      updateMessage = inferenceActive ? t('updateAvailableButBusy') : ''
+    } else if (downgradeAvailable) {
+      updateMessage = inferenceActive ? t('downgradeAvailableButBusy') : ''
+    }
+  }
+
+  function resetUpdateState() {
+    remoteFrontend = ''
+    remoteBackend = ''
+    remoteConfig = ''
+    frontendSync = ''
+    backendSync = ''
+    configSync = ''
+    updateAvailable = false
+    updateMessage = ''
+    updateError = ''
+  }
+
+  function compareVersion(remote, local) {
+    if (!remote || remote === local) return ''
+    return remote > local ? 'upgrade' : 'downgrade'
   }
 
   onMount(() => {
     loadConfig()
-    loadBuildInfo()
-    loadSetupSource()
+    loadBuildInfo().then(loadSetupSource)
     const unsubscribe = subscribeSessionEvents(
       (event) => {
         if (event.event === 'init') {
@@ -120,6 +142,7 @@
       backend = data.backend_build || ''
       lastConfig = data.last_config || ''
       inferenceActive = !!data.inference_active
+      serverInstanceId = data.server_instance_id || serverInstanceId
       refreshUpdateMessage()
     } catch {
       // ignore
@@ -130,6 +153,7 @@
     try {
       const data = await env.list()
       setupSource = data?.env?.SETUP_SOURCE || ''
+      if (setupSource.trim()) await checkUpdate()
     } catch {
       // keep empty
     }
@@ -148,11 +172,7 @@
     checkingUpdate = true
     updateError = ''
     updateMessage = ''
-    remoteFrontend = ''
-    remoteBackend = ''
-    remoteConfig = ''
-    updateAvailable = false
-    updateDetails = ''
+    resetUpdateState()
     try {
       const response = await fetch(buildHelloUrl(setupSource), { cache: 'no-store' })
       if (!response.ok) throw new Error(`HTTP ${response.status}`)
@@ -160,25 +180,20 @@
       remoteFrontend = data.frontend_build || ''
       remoteBackend = data.backend_build || ''
       remoteConfig = data.last_config || ''
-      const updatedParts = []
-      if (remoteFrontend && remoteFrontend > frontend) {
-        updatedParts.push(`${t('buildFrontend')} ${remoteFrontend}`)
-      }
-      if (remoteBackend && remoteBackend > backend) {
-        updatedParts.push(`${t('buildBackend')} ${remoteBackend}`)
-      }
-      if (remoteConfig && remoteConfig > lastConfig) {
-        updatedParts.push(`${t('buildConfig')} ${remoteConfig}`)
-      }
-      const hasUpdate = updatedParts.length > 0
-      updateAvailable = hasUpdate
-      updateDetails = updatedParts.join(t('updateVersionSeparator'))
+      frontendSync = compareVersion(remoteFrontend, frontend)
+      backendSync = compareVersion(remoteBackend, backend)
+      configSync = compareVersion(remoteConfig, lastConfig)
+      const hasUpgrade = frontendSync === 'upgrade' || backendSync === 'upgrade' || configSync === 'upgrade'
+      const hasDowngrade = frontendSync === 'downgrade' || backendSync === 'downgrade' || configSync === 'downgrade'
+      updateAvailable = hasUpgrade
       const current = await build.info()
       inferenceActive = !!current.inference_active
-      if (!hasUpdate) {
+      if (!hasUpgrade && !hasDowngrade) {
         updateMessage = t('updateAlreadyLatest')
-      } else {
+      } else if (hasUpgrade) {
         refreshUpdateMessage()
+      } else {
+        updateMessage = inferenceActive ? t('downgradeAvailableButBusy') : ''
       }
     } catch (err) {
       updateError = t('checkUpdateFailed', { error: err?.message || err })
@@ -187,12 +202,38 @@
     }
   }
 
-  async function applyUpdate() {
-    if (!updateAvailable || checkingUpdate || applyingUpdate) return
+  async function waitForBackendRestart(previousInstanceId) {
+    const deadline = Date.now() + 30000
+    let sawUnavailable = false
+    while (Date.now() < deadline) {
+      try {
+        const response = await fetch(`/v1/setup?op=hello&_=${Date.now()}`, { cache: 'no-store' })
+        if (response.ok) {
+          const data = await response.json()
+          const currentInstanceId = data.server_instance_id || ''
+          if ((previousInstanceId && currentInstanceId && currentInstanceId !== previousInstanceId)
+              || (!previousInstanceId && sawUnavailable)) {
+            window.location.reload()
+            return
+          }
+        } else {
+          sawUnavailable = true
+        }
+      } catch {
+        sawUnavailable = true
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 300))
+    }
+    // A proxy may hide the brief connection outage. Do one final reload so
+    // older backends that do not expose server_instance_id still recover.
+    window.location.reload()
+  }
+
+  async function applySync(frontendBuild, backendBuild, configBuild, applyingMessage) {
     updateError = ''
     try {
-      // Re-check immediately before update. The button state may have been
-      // rendered just before an inference request started in another tab.
+      // Re-check immediately before changing files. The displayed state may
+      // have been rendered just before inference started in another tab.
       const current = await build.info()
       inferenceActive = !!current.inference_active
       refreshUpdateMessage()
@@ -203,15 +244,25 @@
     }
 
     applyingUpdate = true
-    updateMessage = t('updateApplying')
+    updateMessage = applyingMessage
     try {
-      const data = await build.update(setupSource.trim(), frontend, backend, lastConfig)
+      const previousInstanceId = serverInstanceId
+      const data = await build.update(
+        setupSource.trim(),
+        frontendBuild,
+        backendBuild,
+        configBuild,
+      )
       if (!data.updated) {
         updateMessage = t('updateNoFiles')
         return
       }
       updateMessage = data.restart_backend ? t('updateRestarting') : t('updateRefreshing')
-      window.setTimeout(() => window.location.reload(), data.restart_backend ? 10000 : 0)
+      if (data.restart_backend) {
+        await waitForBackendRestart(previousInstanceId)
+      } else {
+        window.location.reload()
+      }
     } catch (err) {
       updateError = err?.code === 'inference_active'
         ? t('updateInferenceActive')
@@ -220,6 +271,26 @@
     } finally {
       applyingUpdate = false
     }
+  }
+
+  async function applyUpdate() {
+    if (!canApplyUpdate) return
+    await applySync(frontend, backend, lastConfig, t('updateApplying'))
+  }
+
+  async function applyDowngrade(category) {
+    if (!canApplyDowngrade) return
+    const syncState = category === 'frontend' ? frontendSync : category === 'backend' ? backendSync : configSync
+    if (syncState !== 'downgrade') return
+
+    // Only the selected category gets a zero baseline (full transfer). The
+    // other thresholds use the remote versions so their delta stays empty.
+    await applySync(
+      category === 'frontend' ? '0' : (remoteFrontend || frontend),
+      category === 'backend' ? '0' : (remoteBackend || backend),
+      category === 'config' ? '0' : (remoteConfig || lastConfig),
+      t('downgradeApplying'),
+    )
   }
 
   async function loadConfig() {
@@ -358,15 +429,36 @@
           <div class="build-content">
             <div class="build-versions">
               <div class="build-row">
-                <span class="build-label">{t('buildFrontend')}</span>
+                <span class="build-label">
+                  {t('buildFrontend')}
+                  {#if frontendSync === 'upgrade'}
+                    <span class="sync-up" title={t('updateUpgradeMark')}>⏫</span>
+                  {:else if frontendSync === 'downgrade'}
+                    <button class="sync-down" type="button" title={t('updateDowngradeMark')} aria-label={t('downgradeFrontend')} onclick={() => applyDowngrade('frontend')} disabled={!canApplyDowngrade}>⏬</button>
+                  {/if}
+                </span>
                 <code class="build-value">{frontend || '-'}</code>
               </div>
               <div class="build-row">
-                <span class="build-label">{t('buildBackend')}</span>
+                <span class="build-label">
+                  {t('buildBackend')}
+                  {#if backendSync === 'upgrade'}
+                    <span class="sync-up" title={t('updateUpgradeMark')}>⏫</span>
+                  {:else if backendSync === 'downgrade'}
+                    <button class="sync-down" type="button" title={t('updateDowngradeMark')} aria-label={t('downgradeBackend')} onclick={() => applyDowngrade('backend')} disabled={!canApplyDowngrade}>⏬</button>
+                  {/if}
+                </span>
                 <code class="build-value">{backend || '-'}</code>
               </div>
               <div class="build-row">
-                <span class="build-label">{t('buildConfig')}</span>
+                <span class="build-label">
+                  {t('buildConfig')}
+                  {#if configSync === 'upgrade'}
+                    <span class="sync-up" title={t('updateUpgradeMark')}>⏫</span>
+                  {:else if configSync === 'downgrade'}
+                    <button class="sync-down" type="button" title={t('updateDowngradeMark')} aria-label={t('downgradeConfig')} onclick={() => applyDowngrade('config')} disabled={!canApplyDowngrade}>⏬</button>
+                  {/if}
+                </span>
                 <code class="build-value">{lastConfig || '-'}</code>
               </div>
             </div>
@@ -376,15 +468,7 @@
                   aria-label="SETUP_SOURCE"
                   placeholder={t('setupSourcePlaceholder')}
                   bind:value={setupSource}
-                  oninput={() => {
-                    remoteFrontend = ''
-                    remoteBackend = ''
-                    remoteConfig = ''
-                    updateAvailable = false
-                    updateDetails = ''
-                    updateMessage = ''
-                    updateError = ''
-                  }}
+                  oninput={resetUpdateState}
                 />
                 <button class="btn btn-secondary" type="button" onclick={checkUpdate} disabled={!canCheckUpdate}>
                   {checkingUpdate ? t('checkingUpdate') : t('checkUpdate')}
@@ -789,6 +873,23 @@
     min-width: 72px;
     font-weight: 600;
   }
+  .sync-up, .sync-down {
+    margin-left: 4px;
+    font-size: 1.05rem;
+    line-height: 1;
+    vertical-align: middle;
+  }
+  .sync-down {
+    appearance: none;
+    border: 0;
+    padding: 1px 2px;
+    background: transparent;
+    cursor: pointer;
+    border-radius: 4px;
+  }
+  .sync-down:hover:not(:disabled) { background: var(--bg-secondary); }
+  .sync-down:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
+  .sync-down:disabled { cursor: not-allowed; opacity: 0.45; }
   .build-value {
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
     font-size: 0.88rem;
