@@ -2,6 +2,8 @@
 
 极简、零第三方运行时依赖的 Agent Service，基于 Python 标准库构建：可基于项目上下文自举编码 Agent，运行时动态连接大模型、工具、提示词模板与 Subagent，并内置 Web UI 管理控制台、群聊与完整的 HTTP API。
 
+<img src="resources/screenshot_chat_compact.jpg" alt="Linglong Agent Service 紧凑对话界面" width="100%">
+
 **开源地址：** <https://github.com/mz24cn/agents>
 
 [📚 中文文档](README_zh.md) · [🌐 English](README_en.md) · [License](LICENSE)
