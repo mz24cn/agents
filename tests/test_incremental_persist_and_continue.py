@@ -17,6 +17,7 @@ Covers three things introduced for the persistence hardening:
 """
 
 import json
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -369,7 +370,12 @@ def continue_server(tmp_path):
     )
     runtime = Runtime(model_registry=model_reg, tool_registry=tool_reg)
 
-    with patch("runtime.server._MODELS_PATH", str(tmp_path / "models.json")), \
+    # AgentManager does not use runtime.server._DATA_DIR; it resolves its
+    # persistence directory from AGENTS_RUNTIME_DIR.  Keep it inside tmp_path
+    # as well, otherwise tests that create agents leak RetryA/RetryB into the
+    # user's real ~/.agents_runtime/agents directory.
+    with patch.dict(os.environ, {"AGENTS_RUNTIME_DIR": str(tmp_path)}), \
+         patch("runtime.server._MODELS_PATH", str(tmp_path / "models.json")), \
          patch("runtime.server._TOOLS_PATH", str(tmp_path / "tools.json")), \
          patch("runtime.server._PROMPT_TEMPLATES_PATH", str(tmp_path / "prompt_templates.json")), \
          patch("runtime.server._DATA_DIR", str(tmp_path)):

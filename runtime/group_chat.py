@@ -25,7 +25,6 @@ import logging
 import os
 import queue
 import re
-import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from typing import Generator, Optional
@@ -37,7 +36,6 @@ from runtime.common import (
     snapshot_request_context,
 )
 from runtime.models import Message, InferenceRequest
-from runtime.runtime import _get_infer_round_timeout
 
 _logger = logging.getLogger("runtime.group_chat")
 
@@ -57,27 +55,6 @@ class _NestedStreamFrame:
     """
 
     frame: dict
-
-
-def _get_group_chat_timeout(num_agents: int) -> Optional[float]:
-    """Outer per-round deadline for a group-chat parallel wait.
-
-    MODEL_INFER_ROUND_TIMEOUT caps a SINGLE tool-call round inside
-    infer_stream (the cap resets per tool round), so one agent may
-    legitimately take far longer than that across multiple tool rounds.
-    Reusing the raw value as the outer group-chat deadline would kill
-    multi-tool-round agents while they are still making progress, so the
-    wait scales with the number of agents (excluding the user, who is
-    never part of all_agent_ids): N agents get N x MODEL_INFER_ROUND_TIMEOUT
-    per round.
-
-    Returns None when the round-timeout guard is disabled (empty/<=0 env),
-    mirroring _get_infer_round_timeout().
-    """
-    base = _get_infer_round_timeout()
-    if base is None or num_agents <= 1:
-        return base
-    return base * num_agents
 
 
 # ---------------------------------------------------------------------------
@@ -1192,45 +1169,14 @@ def _run_group_chat_stream_gen(
         try:
             remaining = _agent_count
             completed_agent_ids: set[str] = set()
-            future_timeout = _get_group_chat_timeout(len(all_agent_ids))
-            deadline = (time.monotonic() + future_timeout
-                        if future_timeout is not None else None)
-
             while remaining > 0:
                 # Collect messages from queue until an agent finishes or
                 # we hit the heartbeat interval (for keep-alive).
                 got_any = False
                 while True:
                     try:
-                        wait_timeout = _GROUP_CHAT_HEARTBEAT_INTERVAL
-                        if deadline is not None:
-                            remaining_time = deadline - time.monotonic()
-                            if remaining_time <= 0:
-                                # Timeout: signal cancel, stop waiting
-                                if cancel_event is not None:
-                                    cancel_event.set()
-                                for future in futures:
-                                    aid = futures[future]
-                                    if aid in completed_agent_ids:
-                                        continue
-                                    future.cancel()
-                                    _logger.error(
-                                        "group chat agent %s timed out after %ss",
-                                        aid, f"{future_timeout:g}",
-                                    )
-                                    err_msg = Message(
-                                        role="assistant",
-                                        content=f"Error: agent inference timed out after {future_timeout:g}s",
-                                        agent_id=aid,
-                                        name=agent_manager.get(aid).get("nickname", aid)
-                                        if agent_manager.get(aid) else aid,
-                                    )
-                                    round_collected.append(err_msg)
-                                    yield err_msg
-                                remaining = 0
-                                break
-                            wait_timeout = min(wait_timeout, max(0.0, remaining_time))
-                        event_agent_id, msg = _msg_queue.get(timeout=wait_timeout)
+                        event_agent_id, msg = _msg_queue.get(
+                            timeout=_GROUP_CHAT_HEARTBEAT_INTERVAL)
                     except queue.Empty:
                         # Timeout or heartbeat interval reached
                         if cancel_event is not None and cancel_event.is_set():

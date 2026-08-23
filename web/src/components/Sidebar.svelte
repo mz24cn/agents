@@ -43,6 +43,7 @@
   // --- Session Status Stream ---
   // Maps session_id -> status string from SSE events
   let sessionStatuses = $state({})
+  let flightSessions = $state(new Set())
 
   function _applyStatusToSessionList(sid, status) {
     sessionStatuses[sid] = status
@@ -70,11 +71,17 @@
         if (data.event === 'init') {
           // Merge all statuses from init snapshot
           const sids = data.sessions || {}
+          flightSessions = new Set(data.flight_sessions || [])
           for (const [sid, status] of Object.entries(sids)) {
             _applyStatusToSessionList(sid, status)
           }
         } else if (data.event === 'message') {
           _applyStatusToSessionList(data.session_id, data.status)
+        } else if (data.event === 'flight_mode') {
+          const next = new Set(flightSessions)
+          if (data.enabled) next.add(data.session_id)
+          else next.delete(data.session_id)
+          flightSessions = next
         } else if (data.event === 'title_update') {
           const sid = data.session_id
           const newTitle = data.title
@@ -137,8 +144,30 @@
       const data = activeSearchQuery
         ? await sessions.search(activeSearchQuery, nextPage, SESSION_PAGE_SIZE)
         : await sessions.list(nextPage, SESSION_PAGE_SIZE)
-      const incoming = data.sessions ?? []
-      sessionList = append ? mergeSessionLists(sessionList, incoming) : incoming
+      // A list response contains persisted metadata but no live inference
+      // status. Preserve the SSE snapshot/events that may have arrived while
+      // this request was in flight; otherwise replacing sessionList briefly or
+      // permanently drops the streaming style.
+      const incoming = (data.sessions ?? []).map(entry => ({
+        ...entry,
+        _status: sessionStatuses[entry.session_id]
+          || sessionList.find(current => current.session_id === entry.session_id)?._status
+          || entry._status,
+      }))
+      if (append) {
+        sessionList = mergeSessionLists(sessionList, incoming)
+      } else {
+        // A just-created inference is announced as streaming before its initial
+        // user message has necessarily reached conversation.json/session index.
+        // Keep those SSE-only rows until a later list response can supply the
+        // persisted title and metadata.
+        const incomingIds = new Set(incoming.map(entry => entry.session_id))
+        const liveOnly = sessionList.filter(entry =>
+          !incomingIds.has(entry.session_id)
+          && (sessionStatuses[entry.session_id] === 'streaming' || entry._status === 'streaming')
+        )
+        sessionList = [...liveOnly, ...incoming]
+      }
       sessionPage = data.page ?? nextPage
       sessionHasMore = Boolean(data.has_more)
     } catch (err) {
@@ -465,6 +494,21 @@
     }
   }
 
+  async function handleToggleFlight(e, sid) {
+    e.stopPropagation()
+    const enabled = !flightSessions.has(sid)
+    closeMenu()
+    try {
+      await sessions.setFlightMode(sid, enabled)
+      const next = new Set(flightSessions)
+      if (enabled) next.add(sid)
+      else next.delete(sid)
+      flightSessions = next
+    } catch (err) {
+      restoreError = err.message || t('flightModeFailed')
+    }
+  }
+
   async function handleDeleteSession(e, sid) {
     e.stopPropagation()
     closeMenu()
@@ -699,6 +743,16 @@
       {t('openSessionLogDir')}
     </button>
     <button
+      class="session-dropdown-item"
+      role="menuitemcheckbox"
+      aria-checked={flightSessions.has(menuOpenId)}
+      onclick={(e) => handleToggleFlight(e, menuOpenId)}
+    >
+      <span class="menu-emoji">✈️</span>
+      <span>{t('flightMode')}</span>
+      {#if flightSessions.has(menuOpenId)}<span class="menu-check">✓</span>{/if}
+    </button>
+    <button
       class="session-dropdown-item session-dropdown-danger"
       role="menuitem"
       onclick={(e) => handleDeleteSession(e, menuOpenId)}
@@ -782,6 +836,7 @@
               title={getSessionDisplay(entry).tooltip}
             >
               {getSessionDisplay(entry).display}
+              {#if flightSessions.has(entry.session_id)}<span class="session-flight-check">✓</span>{/if}
             </button>
             <button
               class="session-menu-btn"
@@ -1160,6 +1215,9 @@
     height: 14px;
     flex-shrink: 0;
   }
+  .menu-check { margin-left: auto; font-weight: 700; color: #22c55e; }
+  .session-flight-check { margin-left: .35rem; color: #22c55e; font-weight: 700; }
+
   .menu-emoji {
     font-size: 14px;
     margin-right: 2px;

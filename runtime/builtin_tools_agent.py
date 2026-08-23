@@ -75,6 +75,7 @@ DELEGATE_TOOL_CONFIG = ToolConfig(
         "required": ["model_id", "task"],
     },
     builtin=True,
+    labels=["long-execution"],
 )
 
 TALK_TO_TOOL_CONFIG = ToolConfig(
@@ -102,6 +103,7 @@ TALK_TO_TOOL_CONFIG = ToolConfig(
         "required": ["agents", "message"],
     },
     builtin=True,
+    labels=["long-execution"],
 )
 def resolve_tool_ids(tools: list[str] | str, scope: list) -> list[str]:
     """将工具 name 列表解析为 tool_id 列表，仅在 scope 内查找。
@@ -182,7 +184,7 @@ def _make_delegate_fn(runtime, thread_local):
                 model_id=model_id,
                 tool_ids=resolved_ids,
                 messages=messages,
-                max_tool_rounds=int(os.environ.get("MAX_TOOL_ROUNDS", 100))
+                max_tool_rounds=int(os.environ.get("MAX_TOOL_ROUNDS", 200))
             )
 
             # 保存旧值，切换到子 session 上下文
@@ -480,7 +482,7 @@ def _make_talk_to_fn(runtime, thread_local):
                 model_id=model_id,
                 tool_ids=agent_tool_ids,
                 messages=messages,
-                max_tool_rounds=int(os.environ.get("MAX_TOOL_ROUNDS", 100))
+                max_tool_rounds=int(os.environ.get("MAX_TOOL_ROUNDS", 200))
             )
 
             chunks = []

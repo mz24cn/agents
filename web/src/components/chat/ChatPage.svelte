@@ -1,7 +1,7 @@
 <script>
   import { onMount, onDestroy, setContext, untrack } from 'svelte'
   import { writable } from 'svelte/store'
-  import { inferStream, abortInferStream, subscribeSessionEvents, agents as agentsApi, sessions as sessionsApi } from '../../lib/api.js'
+  import { inferStream, abortInferStream, subscribeSessionEvents, subscribeSessionStream, agents as agentsApi, sessions as sessionsApi } from '../../lib/api.js'
   import { catalog, loadAgents, loadTools, loadEnvVars, refreshAgents } from '../../lib/catalog-state.svelte.js'
   import ModelSelector from './ModelSelector.svelte'
   import ToolSelector from './ToolSelector.svelte'
@@ -18,6 +18,7 @@
   import { t } from '../../lib/i18n.svelte.js'
   import { navigate } from '../../lib/router.svelte.js'
   import { sessionRestore, sessionDownload, newSessionCreated, sessionDeleted, currentSession, newSessionRequest, terminalOpen, openSessionLogDir } from '../../lib/session-state.svelte.js'
+  import DownloadProgress from './DownloadProgress.svelte'
   import { collapseSidebar } from '../../lib/sidebar-width.svelte.js'
   import Terminal from '../Terminal.svelte'
 
@@ -40,7 +41,60 @@
   // Key = session ID (or '__new__' before backend assigns one).
   // Stream callbacks write to their own key; switching sessions just changes which key is displayed.
   let sessionStore = $state({})
+  let sessionStreamSubscriptions = {}
+  // Sessions whose inference stream is already consumed by this page through
+  // the original POST /v1/infer/stream connection. They must not also get a
+  // retained GET /v1/sessions/{id}/stream subscription, otherwise every frame
+  // is applied twice with two independent aIdxRef instances.
+  let directlyConsumedSessions = new Set()
+  let backendStreamingSessions = new Set()
   function storeKey(sid) { return sid || '__new__' }
+
+  function markSessionDirectlyConsumed(sid) {
+    if (!sid) return
+    directlyConsumedSessions.add(sid)
+    // Defensive race handling: a status event may have opened the retained
+    // subscription just before the POST stream's init frame assigned/confirmed
+    // the session ID. The POST stream is authoritative in this page.
+    const unsubscribe = sessionStreamSubscriptions[sid]
+    if (unsubscribe) {
+      unsubscribe()
+      delete sessionStreamSubscriptions[sid]
+    }
+  }
+
+  function subscribeToExistingSession(sid) {
+    if (!sid || directlyConsumedSessions.has(sid) || sessionStreamSubscriptions[sid]) return
+    const keyRef = { key: sid }
+    const aIdxRef = { value: -1, groupMode: false, groupMap: {} }
+    const existing = sessionStore[sid]
+    const agentIds = new Set((existing?.messages || []).filter(m => m.role === 'assistant').map(m => m.agent_id).filter(Boolean))
+    aIdxRef.groupMode = agentIds.size > 1
+    sessionStreamSubscriptions[sid] = subscribeSessionStream(
+      sid,
+      (msg) => onStreamMsg(msg, aIdxRef, null, keyRef),
+      () => {
+        onStreamDone(keyRef)
+        sessionStreamSubscriptions[sid]?.()
+        delete sessionStreamSubscriptions[sid]
+      },
+      (err) => {
+        delete sessionStreamSubscriptions[sid]
+        // Keep backend streaming state intact; status SSE will decide completion.
+        const store = sessionStore[sid]
+        if (store) store.streamConnection = 'disconnected'
+        errorMsg = err?.message || t('streamError')
+      },
+      (init) => {
+        const store = sessionStore[sid]
+        if (store) {
+          store.isStreaming = !!init.active
+          store.streamConnection = init.active ? 'connected' : 'done'
+        }
+      },
+      -1,
+    )
+  }
 
   function migrateSessionStoreKey(oldKey, newKey) {
     if (!newKey || oldKey === newKey) return oldKey
@@ -515,6 +569,7 @@
       // 同步 sessionId
       if (initData.session_id) {
         migrateKey(initData.session_id)
+        markSessionDirectlyConsumed(initData.session_id)
         sessionId = initData.session_id
         currentSession.sessionId = initData.session_id
       }
@@ -561,9 +616,18 @@
       }
     }
 
+    // Existing sessions already have a concrete ID before the POST stream's
+    // init event. Mark them now so a concurrent status event cannot attach the
+    // retained session stream in the meantime.
+    if (sessionId) markSessionDirectlyConsumed(sessionId)
+
     inferStream(
       reqBody,
       (msg) => onStreamMsg(msg, aIdxRef, pendingFirstUserMsg, keyRef),
+      // Keep direct ownership until the authoritative done_* status event.
+      // [DONE] is sent before the backend has necessarily finished persistence,
+      // broker shutdown, and status broadcasting; releasing here can make the
+      // still-"streaming" status handler subscribe and replay tail frames.
       () => onStreamDone(keyRef),
       (err) => onStreamErr(err, keyRef),
       onInit,
@@ -663,6 +727,41 @@
     const store = sessionStore[keyRef.key]
     if (!store) return  // session store was cleaned up
     const msgs = store.messages
+
+    if (msg.type === 'remove_trailing_assistant') {
+      // Continue/retry is destructive on disk. Reproduce that mutation in all
+      // retained-stream consumers before routing the replacement inference.
+      // Prefer the persisted timestamp identity; fall back to the final message
+      // for compatibility with sessions whose old assistant lacked a timestamp.
+      let removeIndex = -1
+      if (msg.removed_timestamp) {
+        removeIndex = msgs.findLastIndex(existing =>
+          existing.role === 'assistant'
+          && existing.timestamp === msg.removed_timestamp
+          && (!msg.removed_agent_id || (existing.agent_id || existing.assistant_id) === msg.removed_agent_id)
+        )
+      }
+      if (removeIndex < 0 && msgs.at(-1)?.role === 'assistant') removeIndex = msgs.length - 1
+      if (removeIndex >= 0) store.messages = msgs.filter((_, index) => index !== removeIndex)
+      aIdxRef.value = -1
+      aIdxRef.groupMap = {}
+      return
+    }
+
+    if (msg.role === 'user') {
+      // User turns are brokered as complete frames so browsers that did not
+      // initiate the POST can render the prompt immediately, before the first
+      // assistant token and before conversation.json is incrementally saved.
+      // Timestamp is the stable identity used to suppress a replay duplicate
+      // when the persisted baseline already contains this turn.
+      const duplicate = msgs.some(existing =>
+        existing.role === 'user'
+        && msg.timestamp
+        && existing.timestamp === msg.timestamp
+      )
+      if (!duplicate) store.messages = [...msgs, { ...msg, role: 'user' }]
+      return
+    }
 
     if (msg.role === 'assistant') {
       if (aIdxRef.groupMode) {
@@ -1111,18 +1210,40 @@
       // Hide terminal when switching sessions
       terminalVisible = false
       
-      // If the target session is not currently streaming, use fresh backend data.
-      // If it IS streaming, keep the live data — don't overwrite with stale backend data.
-      if (!sessionStore[sid]?.isStreaming) {
-        // 计算所有 user 消息的索引，用于默认折叠
-        const userIndices = new Set()
-        for (let i = 0; i < msgs.length; i++) {
-          if (msgs[i].role === 'user') {
-            userIndices.add(i)
-          }
-        }
-        sessionStore[sid] = { messages: msgs, isStreaming: false, collapsedGroups: userIndices }
+      // While inference is active, the in-memory store is newer than
+      // conversation.json: it contains the current, not-yet-persisted turn.
+      // Never replace that live object when switching away and back. Both the
+      // original POST stream and an attached retained stream resolve the store
+      // by session ID for every frame, so preserving it also preserves their
+      // routing state and the stop-button state.
+      const userIndices = new Set()
+      for (let i = 0; i < msgs.length; i++) {
+        if (msgs[i].role === 'user') userIndices.add(i)
       }
+      const existing = sessionStore[sid]
+      const wasStreaming = !!(
+        existing?.isStreaming
+        || backendStreamingSessions.has(sid)
+        || directlyConsumedSessions.has(sid)
+      )
+      if (wasStreaming && existing) {
+        sessionStore[sid] = {
+          ...existing,
+          isStreaming: true,
+          streamConnection: directlyConsumedSessions.has(sid)
+            ? (existing.streamConnection || 'connected')
+            : (existing.streamConnection || 'connecting'),
+          collapsedGroups: existing.collapsedGroups ?? userIndices,
+        }
+      } else {
+        sessionStore[sid] = {
+          messages: msgs,
+          isStreaming: wasStreaming,
+          streamConnection: wasStreaming ? 'connecting' : 'idle',
+          collapsedGroups: userIndices,
+        }
+      }
+      if (wasStreaming) subscribeToExistingSession(sid)
       sessionId = sid
       currentSession.sessionId = sid
       errorMsg = ''
@@ -1308,9 +1429,27 @@
     fetchWorkspacePath()
     _unsubscribeSessionEvents = subscribeSessionEvents(
       (data) => {
-        if (data.event === 'message' && data.session_id && data.status) {
-          const s = sessionStore[storeKey(data.session_id)]
-          if (s && s.isStreaming && data.status.startsWith('done_')) {
+        if (data.event === 'init') {
+          for (const [sid, status] of Object.entries(data.sessions || {})) {
+            if (status === 'streaming') backendStreamingSessions.add(sid)
+            const s = sessionStore[storeKey(sid)]
+            if (s && status === 'streaming') {
+              s.isStreaming = true
+              subscribeToExistingSession(sid)
+            }
+          }
+        } else if (data.event === 'message' && data.session_id && data.status) {
+          const sid = data.session_id
+          const s = sessionStore[storeKey(sid)]
+          if (data.status === 'streaming') backendStreamingSessions.add(sid)
+          else if (data.status.startsWith('done_')) {
+            backendStreamingSessions.delete(sid)
+            directlyConsumedSessions.delete(sid)
+          }
+          if (s && data.status === 'streaming') {
+            s.isStreaming = true
+            subscribeToExistingSession(sid)
+          } else if (s && data.status.startsWith('done_')) {
             s.isStreaming = false
           }
         }
@@ -1323,6 +1462,8 @@
       _unsubscribeSessionEvents()
       _unsubscribeSessionEvents = null
     }
+    for (const unsubscribe of Object.values(sessionStreamSubscriptions)) unsubscribe?.()
+    sessionStreamSubscriptions = {}
   })
 </script>
 
@@ -1455,21 +1596,13 @@
   />
 
   <div class="message-area">
-    {#if sessionDownload.visible && sessionDownload.loading && sessionDownload.total > 0}
-      <div
-        class="session-download-progress"
-        role="progressbar"
-        aria-label="Loading session"
-        aria-valuemin="0"
-        aria-valuemax="100"
-        aria-valuenow={Math.min(100, Math.round(sessionDownload.received / sessionDownload.total * 100))}
-      >
-        <div
-          class="session-download-progress-fill"
-          style:width={`${Math.min(100, sessionDownload.received / sessionDownload.total * 100)}%`}
-        ></div>
-      </div>
-    {/if}
+    <DownloadProgress
+      visible={sessionDownload.visible}
+      loading={sessionDownload.loading}
+      received={sessionDownload.received}
+      total={sessionDownload.total}
+      ariaLabel="Loading session"
+    />
     <!-- Terminals: render all instances, show only current session's if visible -->
     {#each Array.from(terminals.entries()) as [termId, termData] (termId)}
       <div class="terminal-view" class:visible={terminalVisible && termId === sessionId}>
@@ -1768,26 +1901,6 @@
     overflow: hidden;
     display: flex;
     flex-direction: column;
-  }
-
-  .session-download-progress {
-    position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
-    z-index: 30;
-    width: 100%;
-    height: 4px;
-    overflow: hidden;
-    background: color-mix(in srgb, var(--primary) 15%, transparent);
-    pointer-events: none;
-  }
-
-  .session-download-progress-fill {
-    height: 100%;
-    background: linear-gradient(90deg, #22c55e 0%, #06b6d4 45%, #6366f1 100%);
-    box-shadow: 0 0 8px color-mix(in srgb, var(--primary) 65%, transparent);
-    transition: width 80ms linear;
   }
 
   /* Terminal view styles moved to terminal-control section */

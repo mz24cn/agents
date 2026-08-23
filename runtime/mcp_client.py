@@ -560,7 +560,10 @@ class MCPClientManager:
         self._touch(conn)
         return list(tools)
 
-    def call_tool(self, server_name: str, tool_name: str, arguments: Optional[dict] = None) -> str:
+    def call_tool(
+        self, server_name: str, tool_name: str,
+        arguments: Optional[dict] = None, timeout: Optional[float] = None,
+    ) -> str:
         """Invoke a tool on an MCP server.
 
         Reconnects automatically if the process was reaped due to idle timeout.
@@ -571,9 +574,10 @@ class MCPClientManager:
             params["arguments"] = arguments
         request = self._build_jsonrpc("tools/call", params)
         if conn["type"] == "stdio":
-            response = self._run_async(self._stdio_send(conn, request))
+            response = self._run_async(
+                self._stdio_send(conn, request, timeout=timeout), timeout=timeout)
         else:
-            response = self._http_send(conn, request)
+            response = self._http_send(conn, request, timeout=timeout)
         self._touch(conn)
         if "error" in response:
             error = response["error"]

@@ -581,55 +581,8 @@ class HungRuntime:
         yield Message(role="assistant", content="\u6211\u8fd9\u8fb9\u4e00\u5207\u6b63\u5e38\u3002")
 
 
-def test_group_chat_hung_agent_has_outer_timeout(monkeypatch):
-    """A worker stuck outside infer_stream's built-in timeouts must NOT hang
-    the whole group chat: run_group_chat_stream bounds the parallel round with
-    (number of agents) x MODEL_INFER_ROUND_TIMEOUT, reports the stuck agent as
-    timed out, and keeps the replies of the agents that did finish."""
-    import threading
-
-    monkeypatch.setattr(
-        "runtime.group_chat._get_infer_round_timeout", lambda: 1.0)
-    am = FakeAgentManager(AGENTS)
-    runtime = HungRuntime(hang_marker="\u4f60\u662f\u5b59\u609f\u7a7a\u3002")  # SunWuKong hangs
-
-    start = time.monotonic()
-    collected = run_group_chat_stream(
-        runtime=runtime,
-        mentioned_agent_ids=["SunWuKong", "ShaWuJing"],
-        all_agent_ids=["SunWuKong", "ShaWuJing", "ZhuBaJie"],  # N = 3 agents
-        original_messages=[
-            Message(role="user", content="@SunWuKong @ShaWuJing \u4f60\u4eec\u597d")],
-        base_request=_make_req("@SunWuKong @ShaWuJing \u4f60\u4eec\u597d",
-                               ["SunWuKong", "ShaWuJing"]),
-        cancel_event=threading.Event(),  # set on timeout so the hung thread exits
-        sse_callback=None,
-        context_manager=None,
-        session_id=None,
-        agent_manager=am,
-        model_id="m1",
-        tool_ids=[],
-        max_rounds=5,
-    )
-    elapsed = time.monotonic() - start
-
-    # Must return quickly (outer timeout) instead of hanging forever.
-    # Deadline is scaled by agent count: 3 agents x 1.0s = 3s.
-    assert elapsed < 30, f"group chat hung for {elapsed:.1f}s"
-
-    by_agent = {
-        getattr(m, "agent_id", None): (m.content or "")
-        for m in collected if m.role == "assistant"
-    }
-    # Error message carries the SCALED timeout value (3 agents x 1.0s).
-    assert "timed out after 3s" in by_agent.get("SunWuKong", ""), by_agent
-    assert "\u4e00\u5207\u6b63\u5e38" in by_agent.get("ShaWuJing", ""), by_agent
-
-
 class SlowRuntime:
-    """Simulates an agent whose inference takes longer than one
-    MODEL_INFER_ROUND_TIMEOUT (e.g. multiple tool-call rounds) but still
-    finishes within the SCALED group-chat deadline (N agents x base)."""
+    """Simulates a slow agent that eventually completes."""
 
     def __init__(self, sleep_s: float):
         self.sleep_s = sleep_s
@@ -639,16 +592,12 @@ class SlowRuntime:
         yield Message(role="assistant", content="\u7ec8\u4e8e\u5b8c\u6210\u4e86\u3002")
 
 
-def test_group_chat_outer_timeout_scales_with_agent_count(monkeypatch):
-    """The outer group-chat wait must scale with the number of agents:
-    an agent finishing after one MODEL_INFER_ROUND_TIMEOUT (1.0s) but before
-    N x 1.0s (3 agents -> 3s) must NOT be killed as 'timed out'."""
+def test_group_chat_waits_for_slow_agents_without_infer_round_deadline():
+    """Group chat has no independent model-inference wall-clock deadline."""
     import threading
 
-    monkeypatch.setattr(
-        "runtime.group_chat._get_infer_round_timeout", lambda: 1.0)
     am = FakeAgentManager(AGENTS)
-    runtime = SlowRuntime(sleep_s=1.5)  # > base 1.0s, < scaled 3.0s
+    runtime = SlowRuntime(sleep_s=0.15)
 
     start = time.monotonic()
     collected = run_group_chat_stream(
@@ -670,9 +619,7 @@ def test_group_chat_outer_timeout_scales_with_agent_count(monkeypatch):
     )
     elapsed = time.monotonic() - start
 
-    # Ran to completion (~1.5s, both agents in parallel), well under the
-    # 3s scaled deadline -- proving the 1.0s base was NOT applied as-is.
-    assert 1.0 <= elapsed < 3.0, f"elapsed={elapsed:.2f}s"
+    assert 0.1 <= elapsed < 3.0, f"elapsed={elapsed:.2f}s"
 
     by_agent = {
         getattr(m, "agent_id", None): (m.content or "")
@@ -684,17 +631,13 @@ def test_group_chat_outer_timeout_scales_with_agent_count(monkeypatch):
 
 
 def test_group_chat_sse_heartbeat_during_long_wait(monkeypatch):
-    """While waiting on a hung agent, the group chat periodically emits SSE
-    keep-alive frames so gateways/proxies don't drop the idle connection
-    (which would silently lose the final timeout-error frame)."""
+    """Slow agents still produce keep-alives while group chat waits."""
     import threading
 
     monkeypatch.setattr(
-        "runtime.group_chat._get_infer_round_timeout", lambda: 1.0)
-    monkeypatch.setattr(
         "runtime.group_chat._GROUP_CHAT_HEARTBEAT_INTERVAL", 0.05)
     am = FakeAgentManager(AGENTS)
-    runtime = HungRuntime(hang_marker="\u4f60\u662f\u5b59\u609f\u7a7a\u3002")  # SunWuKong hangs
+    runtime = SlowRuntime(sleep_s=0.2)
     heartbeats: list[float] = []
 
     collected = run_group_chat_stream(
@@ -715,34 +658,18 @@ def test_group_chat_sse_heartbeat_during_long_wait(monkeypatch):
         tool_ids=[],
         max_rounds=5,
     )
-    # Hung agent waited until the 3s scaled deadline, heartbeating every 0.05s.
     assert len(heartbeats) >= 2, f"only {len(heartbeats)} heartbeats"
 
     by_agent = {
         getattr(m, "agent_id", None): (m.content or "")
         for m in collected if m.role == "assistant"
     }
-    assert "timed out after 3s" in by_agent.get("SunWuKong", ""), by_agent
+    assert "\u7ec8\u4e8e\u5b8c\u6210" in by_agent.get("SunWuKong", ""), by_agent
 
 
-def test_timeout_defaults_api_shorter_than_round(monkeypatch):
-    """MODEL_API_TIMEOUT (socket-level, 300 s) must be shorter than
-    MODEL_INFER_ROUND_TIMEOUT (whole-round wall clock, 900 s): the socket
-    timeout is the primary per-read guard, and the round guard is the
-    whole-request cap that encompasses the API wait."""
-    from runtime.runtime import _get_infer_round_timeout, _get_model_api_timeout
+def test_model_api_timeout_default(monkeypatch):
+    """MODEL_API_TIMEOUT is the model-call timeout; no round timeout remains."""
+    from runtime.runtime import _get_model_api_timeout
 
-    # Defaults: API 300 s, ROUND 900 s (no env overrides).
     monkeypatch.delenv("MODEL_API_TIMEOUT", raising=False)
-    monkeypatch.delenv("MODEL_INFER_ROUND_TIMEOUT", raising=False)
-    api = _get_model_api_timeout()
-    round_ = _get_infer_round_timeout()
-    assert api == 300
-    assert round_ == 900.0
-    assert round_ > api
-
-    # ROUND disabled (empty / <= 0) -> guard off, group-chat wait unbounded.
-    monkeypatch.setenv("MODEL_INFER_ROUND_TIMEOUT", "")
-    assert _get_infer_round_timeout() is None
-    monkeypatch.setenv("MODEL_INFER_ROUND_TIMEOUT", "0")
-    assert _get_infer_round_timeout() is None
+    assert _get_model_api_timeout() == 180

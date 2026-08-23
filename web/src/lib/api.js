@@ -274,6 +274,44 @@ export const sessions = {
   markRead:      (sessionId)     => request('POST',   `/v1/sessions/${encodeURIComponent(sessionId)}/read`),
   fileJournals:  (sessionId)     => request('GET',    `/v1/sessions/${encodeURIComponent(sessionId)}/file-journals`),
   fileJournalDiff: (sessionId, turnKey) => request('GET', `/v1/sessions/${encodeURIComponent(sessionId)}/file-journals/${encodeURIComponent(turnKey)}`),
+  setFlightMode: (sessionId, enabled) => request('POST', `/v1/sessions/${encodeURIComponent(sessionId)}/flight`, { enabled }),
+}
+
+/** Subscribe to the retained/live inference stream for an existing session. */
+export function subscribeSessionStream(sessionId, onMessage, onDone, onError, onInit = null, after = -1) {
+  const controller = new AbortController()
+  const url = `/v1/sessions/${encodeURIComponent(sessionId)}/stream?after=${encodeURIComponent(after)}`
+  apiFetch(url, { signal: controller.signal }).then((res) => {
+    if (!res.ok) throw new Error(`Session stream request failed: ${res.status}`)
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    let currentEvent = 'message'
+    const pump = () => reader.read().then(({ done, value }) => {
+      if (done) { onDone?.(); return }
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() || ''
+      for (const line of lines) {
+        const trimmed = line.trim()
+        if (trimmed.startsWith('event:')) currentEvent = trimmed.slice(6).trim()
+        else if (trimmed.startsWith('data:')) {
+          const payload = trimmed.slice(5).trim()
+          if (payload === '[DONE]') { onDone?.(); return }
+          try {
+            const data = JSON.parse(payload)
+            if (currentEvent === 'init') onInit?.(data)
+            else onMessage?.(data)
+          } catch { /* ignore malformed frame */ }
+        } else if (!trimmed) currentEvent = 'message'
+      }
+      return pump()
+    })
+    return pump()
+  }).catch((err) => {
+    if (err.name !== 'AbortError') onError?.(err)
+  })
+  return () => controller.abort()
 }
 
 /**
@@ -287,23 +325,31 @@ export const sessions = {
  * @returns {function}        Call to close/abort the SSE connection.
  */
 export function subscribeSessionEvents(onEvent, onError) {
-  const controller = new AbortController()
+  let stopped = false
+  let controller = null
+  let reconnectTimer = null
 
-  apiFetch('/v1/sessions/events', {
-    signal: controller.signal,
-  })
-    .then((res) => {
-      if (!res.ok) {
-        throw new Error(`Session events request failed: ${res.status}`)
-      }
-      const reader = res.body.getReader()
-      const decoder = new TextDecoder()
-      let buffer = ''
+  const scheduleReconnect = () => {
+    if (stopped || reconnectTimer) return
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null
+      connect()
+    }, 1000)
+  }
 
-      function pump() {
-        reader.read().then(({ done, value }) => {
+  const connect = () => {
+    if (stopped) return
+    controller = new AbortController()
+    apiFetch('/v1/sessions/events', { signal: controller.signal })
+      .then((res) => {
+        if (!res.ok) throw new Error(`Session events request failed: ${res.status}`)
+        const reader = res.body.getReader()
+        const decoder = new TextDecoder()
+        let buffer = ''
+
+        const pump = () => reader.read().then(({ done, value }) => {
           if (done) {
-            // Stream closed cleanly — reconnect is left to the caller
+            scheduleReconnect()
             return
           }
           buffer += decoder.decode(value, { stream: true })
@@ -314,30 +360,31 @@ export function subscribeSessionEvents(onEvent, onError) {
             if (trimmed.startsWith('data: ')) {
               const payload = trimmed.slice(6).trim()
               try {
-                const data = JSON.parse(payload)
-                onEvent(data)
+                onEvent(JSON.parse(payload))
               } catch {
                 // skip malformed JSON
               }
             }
           }
-          pump()
-        }).catch((err) => {
-          if (err.name !== 'AbortError') {
-            onError(err)
-          }
+          return pump()
         })
-      }
 
-      pump()
-    })
-    .catch((err) => {
-      if (err.name !== 'AbortError') {
-        onError(err)
-      }
-    })
+        return pump()
+      })
+      .catch((err) => {
+        if (err.name === 'AbortError' || stopped) return
+        onError?.(err)
+        scheduleReconnect()
+      })
+  }
 
-  return () => controller.abort()
+  connect()
+  return () => {
+    stopped = true
+    if (reconnectTimer) clearTimeout(reconnectTimer)
+    reconnectTimer = null
+    controller?.abort()
+  }
 }
 
 export const auth = {
@@ -351,6 +398,7 @@ export const auth = {
 /** \u6784\u5efa\u4fe1\u606f API */
 export const build = {
   info: () => request('GET', '/v1/setup?op=hello'),
+  restartBackend: () => request('GET', '/v1/setup?op=restart_backend'),
   update: (source, frontendBuild, backendBuild, lastConfig) => {
     const params = new URLSearchParams({
       op: 'update',

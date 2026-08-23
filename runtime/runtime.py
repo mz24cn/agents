@@ -6,6 +6,7 @@ tool call loop handling. Only uses Python standard library modules.
 """
 
 import concurrent.futures
+import datetime
 import json
 import logging
 import os
@@ -35,37 +36,9 @@ _logger = logging.getLogger("runtime.runtime")
 def _get_model_api_timeout() -> int:
     """Return MODEL_API_TIMEOUT (seconds), read dynamically each call."""
     try:
-        return int(os.environ.get("MODEL_API_TIMEOUT", "300"))
+        return int(os.environ.get("MODEL_API_TIMEOUT", "180"))
     except (TypeError, ValueError):
         return 300
-
-
-def _get_infer_round_timeout() -> Optional[float]:
-    """Return MODEL_INFER_ROUND_TIMEOUT (seconds), read dynamically each call.
-
-    Caps the wall-clock duration of a single model API request within the
-    inference loop.  When exceeded the runtime aborts the request, closing
-    the HTTP stream for streaming or relying on the socket timeout for
-    non-streaming.
-
-    Returns None when the guard is disabled (env var empty / unset / <= 0).
-    Default: 900 s -- deliberately longer than MODEL_API_TIMEOUT (300 s):
-    the socket timeout is the primary per-read guard, and the round guard is
-    the whole-request wall-clock cap that only fires on pathological stalls.
-    """
-    raw = os.environ.get("MODEL_INFER_ROUND_TIMEOUT", "900").strip()
-    if not raw:
-        return None
-    try:
-        val = float(raw)
-    except (TypeError, ValueError):
-        _logger.warning(
-            "invalid MODEL_INFER_ROUND_TIMEOUT=%r; using default 900s", raw,
-        )
-        return 900.0
-    if val <= 0:
-        return None
-    return val
 
 
 def _get_tool_exec_timeout() -> Optional[float]:
@@ -86,21 +59,50 @@ def _get_tool_exec_timeout() -> Optional[float]:
     thread in the background.
 
     Returns None when the guard is disabled (env var empty / <= 0).
-    Default: 600 s.
+    Default: 120 s.
     """
-    raw = os.environ.get("TOOL_EXEC_TIMEOUT", "600").strip()
+    raw = os.environ.get("TOOL_EXEC_TIMEOUT", "120").strip()
     if not raw:
         return None
     try:
         val = float(raw)
     except (TypeError, ValueError):
         _logger.warning(
-            "invalid TOOL_EXEC_TIMEOUT=%r; using default 600s", raw,
+            "invalid TOOL_EXEC_TIMEOUT=%r; using default 120s", raw,
         )
-        return 600.0
+        return 120.0
     if val <= 0:
         return None
     return val
+
+
+def _get_effective_tool_exec_timeout(
+    tool_config: "ToolConfig", arguments: Optional[dict] = None,
+) -> Optional[float]:
+    """Return the hard deadline for one concrete tool invocation.
+
+    Normal tools get the configured base timeout plus an optional timeout
+    requested in their arguments.  Argument values >= 5000 are interpreted as
+    milliseconds; smaller values are seconds.  Tools tagged ``long-execution``
+    instead get 200 times the base timeout, because these tools commonly run
+    their own model/tool inference loops.
+    """
+    base = _get_tool_exec_timeout()
+    if base is None:
+        return None
+    if "long-execution" in (tool_config.labels or []):
+        return base * 200
+    if not isinstance(arguments, dict) or "timeout" not in arguments:
+        return base
+    try:
+        requested = float(arguments["timeout"])
+    except (TypeError, ValueError):
+        return base
+    if requested < 0:
+        return base
+    if requested >= 5000:
+        requested /= 1000
+    return base + requested
 
 
 # Default User-Agent for outbound model API requests.
@@ -658,16 +660,12 @@ class Runtime:
             # Send HTTP request
             round_start = time.monotonic()
             api_timeout = _get_model_api_timeout()
-            round_timeout = _get_infer_round_timeout()
-            effective_timeout = api_timeout
-            if round_timeout is not None:
-                effective_timeout = min(api_timeout, round_timeout)
             try:
                 headers.setdefault("User-Agent", _DEFAULT_USER_AGENT)
                 http_req = urllib.request.Request(
                     url, data=body_bytes, headers=headers, method="POST"
                 )
-                with urllib.request.urlopen(http_req, timeout=effective_timeout) as http_resp:
+                with urllib.request.urlopen(http_req, timeout=api_timeout) as http_resp:
                     response_data = http_resp.read()
             except urllib.error.HTTPError as exc:
                 error_body = ""
@@ -689,11 +687,11 @@ class Runtime:
                 reason = getattr(exc, "reason", exc)
                 is_timeout = isinstance(reason, socket.timeout) or "timed out" in str(reason).lower()
                 if is_timeout:
-                    _logger.error("infer timeout | url=%s timeout=%ds", url, effective_timeout)
+                    _logger.error("infer timeout | url=%s timeout=%ds", url, api_timeout)
                     return InferenceResult(
                         success=False,
                         messages=messages,
-                        error=f"Model API request timed out after {effective_timeout}s",
+                        error=f"Model API request timed out after {api_timeout}s",
                         error_code="TIMEOUT",
                     )
                 return InferenceResult(
@@ -1273,7 +1271,7 @@ class Runtime:
         if callable_fn is None:
             return f"Error: no callable registered for tool '{tool_config.tool_id}'"
 
-        timeout = _get_tool_exec_timeout()
+        timeout = _get_effective_tool_exec_timeout(tool_config, arguments)
         try:
             if timeout is None:
                 # Guard disabled: run inline.
@@ -1339,7 +1337,9 @@ class Runtime:
             return f"Error: mcp_server_name not set for tool '{tool_config.name}'"
 
         try:
-            result = self._mcp_manager.call_tool(server_name, mcp_tool_name, arguments)
+            timeout = _get_effective_tool_exec_timeout(tool_config, arguments)
+            result = self._mcp_manager.call_tool(
+                server_name, mcp_tool_name, arguments, timeout=timeout)
             return str(result) if result is not None else ""
         except Exception as exc:
             return f"Error: {type(exc).__name__}: {exc}"
@@ -1541,6 +1541,9 @@ class Runtime:
         tool_round = 0
         total_prompt = 0
         total_completion = 0
+        # overall_ms is measured from entry into the inference/tool loop until
+        # the final model round completes. It therefore includes every model
+        # request, tool execution, and inter-round throttle delay.
         overall_start = time.monotonic()
         while True:
             # Check cancel_event before each round (including before model API call)
@@ -1562,17 +1565,18 @@ class Runtime:
                 tools=tools if tools else None, stream=True,
             )
 
-            round_start = time.monotonic()
             api_timeout = _get_model_api_timeout()
-            round_timeout = _get_infer_round_timeout()
-            effective_timeout = api_timeout
-            if round_timeout is not None:
-                effective_timeout = min(api_timeout, round_timeout)
             try:
                 headers.setdefault("User-Agent", _DEFAULT_USER_AGENT)
                 http_req = urllib.request.Request(
                     url, data=body_bytes, headers=headers, method="POST")
-                http_resp = urllib.request.urlopen(http_req, timeout=effective_timeout)
+                # Capture monotonic and wall-clock values immediately before
+                # sending the HTTP request. Duration math uses monotonic time;
+                # wall time is persisted for clients and conversation history.
+                round_start = time.monotonic()
+                request_started_datetime = datetime.datetime.now()
+                request_started_at = request_started_datetime.isoformat(timespec="microseconds")
+                http_resp = urllib.request.urlopen(http_req, timeout=api_timeout)
             except urllib.error.HTTPError as exc:
                 error_body = ""
                 try:
@@ -1593,9 +1597,9 @@ class Runtime:
                 reason = getattr(exc, "reason", exc)
                 is_timeout = isinstance(reason, socket.timeout) or "timed out" in str(reason).lower()
                 if is_timeout:
-                    _logger.error("infer_stream timeout | url=%s timeout=%ds", url, effective_timeout)
+                    _logger.error("infer_stream timeout | url=%s timeout=%ds", url, api_timeout)
                     yield Message(role="assistant", timestamp=_now_iso(),
-                                  content=f"Error: model API request timed out after {effective_timeout}s")
+                                  content=f"Error: model API request timed out after {api_timeout}s")
                 else:
                     _logger.error("infer_stream connection error | url=%s err=%s", url, reason)
                     yield Message(role="assistant", timestamp=_now_iso(), content=f"Error: {exc}")
@@ -1625,30 +1629,6 @@ class Runtime:
                         yield Message(role="assistant", timestamp=_now_iso(), content="Error: user interrupted.")
                         return
 
-                    # Per-round wall-clock guard (MODEL_INFER_ROUND_TIMEOUT).
-                    # Prevents runaway streaming loops where the model keeps
-                    # emitting tokens indefinitely without the socket ever
-                    # being idle long enough for the read timeout to fire.
-                    if round_timeout is not None:
-                        elapsed_round = time.monotonic() - round_start
-                        if elapsed_round > round_timeout:
-                            http_resp.close()
-                            _logger.error(
-                                "infer_stream round timeout | url=%s "
-                                "elapsed=%.1fs limit=%.1fs",
-                                url, elapsed_round, round_timeout,
-                            )
-                            yield Message(
-                                role="assistant",
-                                timestamp=_now_iso(),
-                                content=(
-                                    f"Error: model inference round timed out "
-                                    f"after {elapsed_round:.1f}s "
-                                    f"(limit: {round_timeout:.1f}s)"
-                                ),
-                            )
-                            return
-
                     # Intercept usage messages — accumulate, don't yield raw
                     if msg.role == "usage":
                         try:
@@ -1659,10 +1639,14 @@ class Runtime:
                             pass
                         continue
 
-                    # Record first-token time
-                    if first_token_time is None and (msg.content or msg.thinking):
+                    # Record this model request's first output. Tool-call-only
+                    # rounds count too, because they are complete assistant
+                    # inference rounds even when no text token is emitted.
+                    if first_token_time is None and (msg.content or msg.thinking or msg.tool_calls):
                         first_token_time = time.monotonic()
-                        first_token_timestamp = _now_iso()
+                        first_token_datetime = request_started_datetime + datetime.timedelta(
+                            seconds=first_token_time - round_start)
+                        first_token_timestamp = first_token_datetime.isoformat(timespec="microseconds")
 
                     # Set timestamp before yielding
                     if msg.role == "assistant":
@@ -1750,6 +1734,7 @@ class Runtime:
                     "net_ms": round(net_ms, 1),
                     "total_ms": round(net_ms, 1),  # no tool calls, total == net
                     "overall_ms": round((time.monotonic() - overall_start) * 1000, 1),
+                    "request_started_at": request_started_at,
                     "completed_at": _now_iso(),
                 }
                 if first_token_timestamp:
@@ -1790,6 +1775,7 @@ class Runtime:
                     "net_ms": round(net_ms, 1),
                     "total_ms": round(net_ms, 1),
                     "overall_ms": round((time.monotonic() - overall_start) * 1000, 1),
+                    "request_started_at": request_started_at,
                     "completed_at": _now_iso(),
                 }
                 if first_token_timestamp:
@@ -1810,6 +1796,7 @@ class Runtime:
                 "total_all_tokens": total_prompt + total_completion,
                 "net_ms": round(net_ms, 1),
                 "total_ms": round(net_ms, 1),  # inference-only for tool-call rounds
+                "request_started_at": request_started_at,
                 "completed_at": _now_iso(),
             }
             if first_token_timestamp:

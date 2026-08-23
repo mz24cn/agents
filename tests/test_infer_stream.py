@@ -4,6 +4,7 @@ Verifies that infer_stream() correctly yields Message objects incrementally
 for both OpenAI SSE and Ollama newline-delimited JSON streaming protocols.
 """
 
+import datetime
 import io
 import json
 from unittest.mock import patch, MagicMock
@@ -125,9 +126,13 @@ def test_infer_stream_openai_yields_messages() -> None:
         assert msg.content == expected_content
     # 4th is the usage stat message
     assert messages[3].role == "usage"
-    # usage stat should contain first_token_timestamp
+    # Every inference round records both request and first-output wall times.
     stat = json.loads(messages[3].content)
+    assert "request_started_at" in stat
     assert "first_token_timestamp" in stat
+    request_started = datetime.datetime.fromisoformat(stat["request_started_at"])
+    first_token = datetime.datetime.fromisoformat(stat["first_token_timestamp"])
+    assert abs((first_token - request_started).total_seconds() * 1000 - stat["ttft_ms"]) < 0.2
 
 
 def test_infer_stream_openai_empty_stream() -> None:
@@ -151,8 +156,10 @@ def test_infer_stream_openai_empty_stream() -> None:
     # usage stat message
     assert messages[0].role == "usage"
     stat = json.loads(messages[0].content)
-    # Empty stream has no first token, so first_token_timestamp should not be present
+    # The request time exists even when the stream emits no model output.
+    assert "request_started_at" in stat
     assert "first_token_timestamp" not in stat
+    assert "ttft_ms" not in stat
 
 
 # ---------------------------------------------------------------------------
@@ -372,6 +379,22 @@ def test_infer_stream_max_rounds_yields_assistant_note_not_fake_tool() -> None:
 
     # Round 1 executed the tool (tool result), round 2 hit the limit.
     assert call_count[0] == 2
+
+    # Each assistant inference round has its own complete timing record. The
+    # client can use the first round's first_token_timestamp as the loop output
+    # start, and the last round's completed_at as the loop completion time.
+    usage_stats = [json.loads(m.content) for m in collected if m.role == "usage"]
+    assert len(usage_stats) == 2
+    assert all("request_started_at" in s for s in usage_stats)
+    assert all("first_token_timestamp" in s for s in usage_stats)
+    assert all("ttft_ms" in s for s in usage_stats)
+    assert all("completed_at" in s for s in usage_stats)
+    assert "overall_ms" not in usage_stats[0]
+    assert "overall_ms" in usage_stats[1]
+    for stat in usage_stats:
+        request_started = datetime.datetime.fromisoformat(stat["request_started_at"])
+        first_token = datetime.datetime.fromisoformat(stat["first_token_timestamp"])
+        assert abs((first_token - request_started).total_seconds() * 1000 - stat["ttft_ms"]) < 0.2
 
     # Only one real tool-role message (the executed result) — no fabricated
     # "Error: maximum tool-call rounds" tool reply.

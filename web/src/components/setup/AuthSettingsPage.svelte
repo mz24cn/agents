@@ -41,6 +41,7 @@
   let serverInstanceId = $state('')
   let checkingUpdate = $state(false)
   let applyingUpdate = $state(false)
+  let restartingBackend = $state(false)
   let updateMessage = $state('')
   let updateError = $state('')
 
@@ -49,9 +50,10 @@
   let linuxSetupCommand = $derived(`curl -fsSL ${setupLink} | sh`)
   let setupTokenExpiresDisplay = $derived(formatSetupTokenExpiresAt(setupTokenExpiresAt))
   let downgradeAvailable = $derived(frontendSync === 'downgrade' || backendSync === 'downgrade' || configSync === 'downgrade')
-  let canCheckUpdate = $derived(!!setupSource.trim() && !checkingUpdate && !applyingUpdate)
-  let canApplyUpdate = $derived(updateAvailable && !inferenceActive && !checkingUpdate && !applyingUpdate)
-  let canApplyDowngrade = $derived(downgradeAvailable && !inferenceActive && !checkingUpdate && !applyingUpdate)
+  let canCheckUpdate = $derived(!!setupSource.trim() && !checkingUpdate && !applyingUpdate && !restartingBackend)
+  let canApplyUpdate = $derived(updateAvailable && !inferenceActive && !checkingUpdate && !applyingUpdate && !restartingBackend)
+  let canApplyDowngrade = $derived(downgradeAvailable && !inferenceActive && !checkingUpdate && !applyingUpdate && !restartingBackend)
+  let canRestartBackend = $derived(!restartingBackend)
 
   function pad2(value) {
     return String(value).padStart(2, '0')
@@ -293,6 +295,29 @@
     )
   }
 
+  async function confirmRestartBackend() {
+    if (!canRestartBackend) return
+    if (!window.confirm(t('restartBackendConfirm'))) return
+    await restartBackendOnly()
+  }
+
+  async function restartBackendOnly() {
+    if (!canRestartBackend) return
+    updateError = ''
+    restartingBackend = true
+    updateMessage = t('restartBackendStarting')
+    try {
+      await build.restartBackend()
+      // Intentionally do not poll, reload, or navigate. The page remains as-is
+      // while the backend process is replaced in the background.
+      updateMessage = t('restartBackendStarted')
+      restartingBackend = false
+    } catch (err) {
+      updateError = t('restartBackendFailed', { error: err?.message || err })
+      restartingBackend = false
+    }
+  }
+
   async function loadConfig() {
     loading = true
     error = ''
@@ -477,7 +502,7 @@
                   {applyingUpdate ? t('applyingUpdate') : t('applyUpdate')}
                 </button>
               </div>
-              {#if remoteFrontend || remoteBackend || remoteConfig || updateMessage || updateError}
+              <div class="update-footer-line">
                 <div class="update-result-line" class:update-error={!!updateError}>
                   {#if remoteFrontend || remoteBackend || remoteConfig}
                     <span>{t('remoteFrontend')} <code>{remoteFrontend || '-'}</code></span>
@@ -490,7 +515,15 @@
                     <span>{updateMessage}</span>
                   {/if}
                 </div>
-              {/if}
+                <button
+                  class="restart-backend-link"
+                  type="button"
+                  title={t('restartBackendHint')}
+                  aria-label={t('restartBackendHint')}
+                  ondblclick={confirmRestartBackend}
+                  disabled={!canRestartBackend}
+                >{t('restartBackendOnly')}</button>
+              </div>
             </div>
           </div>
         </section>
@@ -909,12 +942,19 @@
     grid-template-columns: minmax(0, 1fr) auto auto;
     gap: 8px;
   }
+  .update-footer-line {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-height: 24px;
+  }
   .update-result-line {
     display: flex;
     align-items: center;
+    flex: 1 1 auto;
     flex-wrap: wrap;
     gap: 6px 16px;
-    min-height: 24px;
+    min-width: 0;
     color: var(--text-secondary);
     font-size: 0.84rem;
     line-height: 1.35;
@@ -922,6 +962,35 @@
   .update-result-line code {
     color: var(--text);
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  }
+  .restart-backend-link {
+    appearance: none;
+    border: 0;
+    padding: 0;
+    background: transparent;
+    color: var(--text-secondary);
+    opacity: 0.62;
+    font: inherit;
+    font-size: 0.78rem;
+    line-height: 1.35;
+    margin-left: auto;
+    flex: 0 0 auto;
+    white-space: nowrap;
+    text-decoration: underline;
+    text-decoration-color: transparent;
+    cursor: default;
+  }
+  .restart-backend-link:hover:not(:disabled) {
+    opacity: 0.82;
+    text-decoration-color: currentColor;
+  }
+  .restart-backend-link:focus-visible {
+    outline: 1px solid var(--text-secondary);
+    outline-offset: 3px;
+  }
+  .restart-backend-link:disabled {
+    opacity: 0.32;
+    cursor: not-allowed;
   }
   .update-result-line.update-error {
     color: var(--danger);

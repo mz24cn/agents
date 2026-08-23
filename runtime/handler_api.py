@@ -41,6 +41,10 @@ from runtime.server_state import (
     _session_state_lock,
     _session_statuses,
     _unread_sessions,
+    flight_sessions_snapshot,
+    register_session_stream_with_snapshot,
+    set_session_flight_mode,
+    unsubscribe_session_stream,
 )
 
 logger = logging.getLogger("runtime.server")
@@ -875,8 +879,9 @@ class HandlerApiMixin:
         Operations:
           GET  op=hello   Public version and inference status query.
           GET  op=delta   Authorized minimal tar.gz delta using three version thresholds.
-          GET  op=update  Authorized: download remote delta and apply it locally.
-          GET  no op      Authorized full self-extracting setup script.
+          GET  op=update           Authorized: download remote delta and apply it locally.
+          GET  op=restart_backend  Authorized: restart the backend without updating files.
+          GET  no op               Authorized full self-extracting setup script.
         """
         import os
         import datetime
@@ -960,6 +965,10 @@ class HandlerApiMixin:
             self._handle_setup_update()
             return
 
+        if op == "restart_backend":
+            self._handle_setup_restart_backend()
+            return
+
         if op == "delta":
             if self.command != "GET":
                 self._send_json_error(405, "op=delta requires GET")
@@ -1039,6 +1048,32 @@ class HandlerApiMixin:
         self.send_header("Content-Length", str(len(script)))
         self.end_headers()
         self.wfile.write(script)
+
+    def _handle_setup_restart_backend(self) -> None:
+        """Restart this backend process without downloading or changing files."""
+        if self.command != "GET":
+            self._send_json_error(405, "op=restart_backend requires GET")
+            return
+
+        # This is an unconditional emergency restart. It deliberately bypasses
+        # inference, update, and restart state checks, including their locks.
+
+        project_root = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
+        app_path = os.path.join(project_root, "app.py")
+        argv = [sys.executable, app_path, *sys.argv[1:]]
+
+        def restart_process() -> None:
+            try:
+                os.execv(sys.executable, argv)
+            except Exception:
+                logger.exception("Failed to restart backend on request")
+
+        # Complete the HTTP response first. Unlike online update, the caller
+        # deliberately does not reload or poll the page after this response.
+        self._send_json_response(200, {"restarting": True})
+        timer = threading.Timer(0.5, restart_process)
+        timer.daemon = True
+        timer.start()
 
     def _handle_setup_update(self) -> None:
         """Download a remote setup delta and apply it to the local environment."""
@@ -1329,29 +1364,10 @@ class HandlerApiMixin:
         # the stream ends instead of letting the HTTP/1.1 loop read more.
         self.close_connection = True
 
-        # Build snapshot under lock
-        with _session_state_lock:
-            snapshot: dict[str, str] = {}
-            # Active / streaming sessions
-            for sid, st in _session_statuses.items():
-                snapshot[sid] = st
-            # Unread sessions (may overlap with active – prefer active)
-            for sid, st in _unread_sessions.items():
-                if sid not in snapshot:
-                    snapshot[sid] = st
-
-        # Send init event
-        init_payload = json.dumps({
-            "event": "init",
-            "sessions": snapshot,
-        }, ensure_ascii=False)
-        try:
-            self.wfile.write(f"data: {init_payload}\n\n".encode("utf-8"))
-            self.wfile.flush()
-        except Exception:
-            return
-
-        # Register this connection's write function
+        # Register and snapshot under the same lock. Previously the init
+        # snapshot was taken first and the subscriber was registered later, so
+        # a session entering "streaming" in that gap was invisible to a newly
+        # opened browser for the entire inference.
         import queue as _queue
         event_q: _queue.Queue = _queue.Queue()
 
@@ -1364,7 +1380,33 @@ class HandlerApiMixin:
                 return False
 
         with _session_state_lock:
+            snapshot: dict[str, str] = {}
+            # Active / streaming sessions
+            for sid, st in _session_statuses.items():
+                snapshot[sid] = st
+            # Unread sessions (may overlap with active – prefer active)
+            for sid, st in _unread_sessions.items():
+                if sid not in snapshot:
+                    snapshot[sid] = st
             _session_event_subscribers.append(_send)
+
+        # Events broadcast after the snapshot are now already queued. Send the
+        # baseline first, then drain the queue in normal order.
+        init_payload = json.dumps({
+            "event": "init",
+            "sessions": snapshot,
+            "flight_sessions": flight_sessions_snapshot(),
+        }, ensure_ascii=False)
+        try:
+            self.wfile.write(f"data: {init_payload}\n\n".encode("utf-8"))
+            self.wfile.flush()
+        except Exception:
+            with _session_state_lock:
+                try:
+                    _session_event_subscribers.remove(_send)
+                except ValueError:
+                    pass
+            return
 
         try:
             while True:
@@ -1384,6 +1426,78 @@ class HandlerApiMixin:
                     _session_event_subscribers.remove(_send)
                 except ValueError:
                     pass
+
+    def _handle_session_stream(self, session_id: str) -> None:
+        """GET /v1/sessions/{id}/stream — replay retained inference frames,
+        then subscribe to live frames from the same producer."""
+        try:
+            after_seq = int(self._get_query_param("after", "-1") or -1)
+        except (TypeError, ValueError):
+            after_seq = 0
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+        import queue as _queue
+        event_q: _queue.Queue = _queue.Queue(maxsize=4096)
+
+        def _send(envelope) -> bool:
+            try:
+                event_q.put_nowait(envelope)
+                return True
+            except _queue.Full:
+                return False
+
+        # Register and snapshot under one lock so no frame can fall into the
+        # replay/live hand-off gap. Duplicates are suppressed by sequence.
+        registered, snapshot = register_session_stream_with_snapshot(session_id, _send, after_seq)
+        replay_latest = snapshot["latest_seq"]
+        init = {
+            "session_id": session_id,
+            "active": snapshot["active"],
+            "persisted_seq": snapshot["persisted_seq"],
+            "latest_seq": snapshot["latest_seq"],
+        }
+        try:
+            self.wfile.write(f"event: init\ndata: {json.dumps(init, ensure_ascii=False)}\n\n".encode("utf-8"))
+            for item in snapshot["frames"]:
+                self.wfile.write(f"id: {item['seq']}\ndata: {json.dumps(item['frame'], ensure_ascii=False)}\n\n".encode("utf-8"))
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            if registered:
+                unsubscribe_session_stream(session_id, _send)
+            return
+
+        if not snapshot["active"] or not registered:
+            try:
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            except Exception:
+                pass
+            return
+        try:
+            while True:
+                try:
+                    item = event_q.get(timeout=15)
+                except _queue.Empty:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    continue
+                if item is None:
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                    break
+                if item["seq"] <= replay_latest:
+                    continue
+                self.wfile.write(f"id: {item['seq']}\ndata: {json.dumps(item['frame'], ensure_ascii=False)}\n\n".encode("utf-8"))
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            unsubscribe_session_stream(session_id, _send)
 
     def _session_search_max_results(self) -> int:
         """Read SEARCH_MAX_RESULTS at request time as the max session page size.
@@ -1484,6 +1598,15 @@ class HandlerApiMixin:
             self._send_json_error(400, str(exc))
             return
         self._send_json_response(200, {"path": path, "session_id": session_id})
+
+    def _handle_session_flight(self, session_id: str) -> None:
+        body = self._read_json_body()
+        if body is None:
+            return
+        enabled = set_session_flight_mode(session_id, bool(body.get("enabled")))
+        from runtime.server_state import _broadcast_session_event
+        _broadcast_session_event(session_id, "flight_mode", {"enabled": enabled})
+        self._send_json_response(200, {"session_id": session_id, "enabled": enabled})
 
     def _handle_mark_session_read(self, session_id: str) -> None:
         """POST /v1/sessions/{session_id}/read — 将指定会话标记为已读。"""

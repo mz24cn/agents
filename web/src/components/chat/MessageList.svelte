@@ -219,7 +219,35 @@
     return n >= 10000 ? `${(n / 1000).toFixed(1)}k` : `${n ?? 0}`
   }
 
-  function buildBlockStatTooltip(s) {
+  function formatTimestamp(timestamp) {
+    if (!timestamp) return ''
+    const date = new Date(timestamp)
+    if (Number.isNaN(date.getTime())) return ''
+    const month = String(date.getMonth() + 1).padStart(2, '0')
+    const day = String(date.getDate()).padStart(2, '0')
+    const hours = String(date.getHours()).padStart(2, '0')
+    const minutes = String(date.getMinutes()).padStart(2, '0')
+    const seconds = String(date.getSeconds()).padStart(2, '0')
+    return `${month}/${day} ${hours}:${minutes}:${seconds}`
+  }
+
+  function getBlockInferenceTimes(block) {
+    let outputStartedAt = ''
+    let loopCompletedAt = ''
+    for (let i = block.start; i <= block.end; i++) {
+      const msg = messages[i]
+      if (msg?.role !== 'assistant') continue
+      if (!outputStartedAt && msg.stat?.first_token_timestamp) {
+        outputStartedAt = msg.stat.first_token_timestamp
+      }
+      if (msg.stat) {
+        loopCompletedAt = msg.stat.completed_at || msg.timestamp || loopCompletedAt
+      }
+    }
+    return { outputStartedAt, loopCompletedAt }
+  }
+
+  function buildBlockStatTooltip(s, block) {
     const fmtMs = (n) => n == null ? 'N/A' : n >= 10000 ? `${(n / 1000).toFixed(1)}s` : `${n}ms`
     const lines = [
       `${t('tokenIn')} ${formatTokenCount(s.prompt_tokens)}   ${t('tokenOut')} ${formatTokenCount(s.completion_tokens)}   ${t('tokenTotal')} ${formatTokenCount(s.total_tokens)}`
@@ -231,6 +259,11 @@
     if (s.net_ms != null) lines.push(`${t('statNet')} ${fmtMs(s.net_ms)}`)
     if (s.total_ms != null) lines.push(`${t('statRound')} ${fmtMs(s.total_ms)}`)
     if (s.overall_ms != null) lines.push(`${t('statOverall')} ${fmtMs(s.overall_ms)}`)
+    const { outputStartedAt, loopCompletedAt } = getBlockInferenceTimes(block)
+    const outputStartedTime = formatTimestamp(outputStartedAt)
+    const loopCompletedTime = formatTimestamp(loopCompletedAt)
+    if (outputStartedTime) lines.push(`${t('statOutputStartedTime')} ${outputStartedTime}`)
+    if (loopCompletedTime) lines.push(`${t('statLoopCompletedTime')} ${loopCompletedTime}`)
     return lines.join('\n')
   }
 
@@ -405,7 +438,7 @@
                   <span>{getBlockName(block)}</span>
                   <div class="agent-block-actions">
                     {#if blockStat}
-                      <span class="agent-block-tokens" title={buildBlockStatTooltip(blockStat)}>
+                      <span class="agent-block-tokens" title={buildBlockStatTooltip(blockStat, block)}>
                         {formatTokenCount(blockStat.prompt_tokens)}/{formatTokenCount(blockStat.completion_tokens)} tokens
                       </span>
                     {/if}
@@ -555,14 +588,24 @@
     font-family: inherit;
     font-size: 0.75rem;
     font-weight: 400;
-    color: var(--text-secondary, #666);
-    background: transparent;
-    border: 1px solid var(--border, #ddd);
+    color: var(--text-secondary, #888);
+    background: var(--bg-tertiary, rgba(0,0,0,0.15));
+    border: none;
     border-radius: 4px;
     cursor: pointer;
+    letter-spacing: 0.05em;
+    line-height: 1.4;
     white-space: nowrap;
+    transition: background 0.1s;
   }
-  .agent-block-retry-btn:hover:not(:disabled) { background: var(--bg-secondary, rgba(0,0,0,0.06)); color: var(--text, #333); }
+  .agent-block-retry-btn:hover:not(:disabled) {
+    background: var(--bg-secondary, rgba(0,0,0,0.2));
+    color: var(--text, #333);
+  }
+  .agent-block-retry-btn:active:not(:disabled) {
+    background: var(--primary, #4a9eff);
+    color: #fff;
+  }
   .agent-block-retry-btn:disabled { opacity: 0.5; cursor: not-allowed; }
   .agent-block-mode-btn:active {
     background: var(--primary, #4a9eff);

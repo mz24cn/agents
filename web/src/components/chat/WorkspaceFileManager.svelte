@@ -7,6 +7,7 @@
   import { copyToClipboard } from '../../lib/clipboard.js'
   import ConfirmDialog from '../ConfirmDialog.svelte'
   import DocumentPreview from './DocumentPreview.svelte'
+  import DownloadProgress from './DownloadProgress.svelte'
 
   /**
    * 工作区文件管理器面板
@@ -79,6 +80,9 @@
   let previewSearchTotal = $state(0)
   let textPreviewEl = $state(null)
   let previewSearchMatches = []
+  let previewDownload = $state({ loading: false, visible: false, received: 0, total: 0, token: 0 })
+  let previewObjectUrl = $state('')
+  let previewAbortController = null
   // 选中的文件文件名加粗，前面的目录部分保持普通字重
   function getPreviewPathParts(file) {
     const path = file?.path || file?.name || ''
@@ -302,6 +306,9 @@
           wsNode.scrollIntoView({ behavior: 'smooth', block: 'start' })
         }
       })
+    }
+    if (!open && prevOpen && previewFile) {
+      closePreview()
     }
     prevOpen = open
 
@@ -873,6 +880,88 @@
     enterDirectory(parentPath)
   }
 
+  function clearPreviewObjectUrl() {
+    if (previewObjectUrl) {
+      URL.revokeObjectURL(previewObjectUrl)
+      previewObjectUrl = ''
+    }
+  }
+
+  function cancelPreviewDownload() {
+    previewAbortController?.abort()
+    previewAbortController = null
+    previewDownload.token += 1
+    previewDownload.loading = false
+    previewDownload.visible = false
+    previewDownload.received = 0
+    previewDownload.total = 0
+  }
+
+  async function downloadPreviewContent(file, responseType = 'text') {
+    cancelPreviewDownload()
+    clearPreviewObjectUrl()
+
+    const token = previewDownload.token + 1
+    const controller = new AbortController()
+    previewAbortController = controller
+    previewDownload.token = token
+    previewDownload.loading = true
+    previewDownload.visible = false
+    previewDownload.received = 0
+    previewDownload.total = 0
+
+    const progressDelay = setTimeout(() => {
+      if (previewDownload.loading && previewDownload.token === token) {
+        previewDownload.visible = true
+      }
+    }, 500)
+
+    try {
+      const response = await fetch(workspaceApi.content(file.path, false), { signal: controller.signal })
+      if (!response.ok) throw new Error('Failed to load file content')
+
+      const total = Number.parseInt(response.headers.get('Content-Length') || '0', 10) || 0
+      previewDownload.total = total
+
+      if (!response.body?.getReader) {
+        const result = responseType === 'blob' ? await response.blob() : await response.text()
+        if (previewDownload.token !== token) return null
+        previewDownload.received = responseType === 'blob' ? result.size : new TextEncoder().encode(result).byteLength
+        return result
+      }
+
+      const reader = response.body.getReader()
+      const chunks = []
+      const decoder = responseType === 'text' ? new TextDecoder() : null
+      let text = ''
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        if (previewDownload.token !== token) {
+          await reader.cancel()
+          return null
+        }
+        previewDownload.received += value.byteLength
+        if (decoder) text += decoder.decode(value, { stream: true })
+        else chunks.push(value)
+      }
+
+      if (previewDownload.token !== token) return null
+      if (decoder) return text + decoder.decode()
+      return new Blob(chunks, { type: response.headers.get('Content-Type') || 'application/octet-stream' })
+    } catch (err) {
+      if (err?.name !== 'AbortError' && previewDownload.token === token) throw err
+      return null
+    } finally {
+      clearTimeout(progressDelay)
+      if (previewDownload.token === token) {
+        previewAbortController = null
+        previewDownload.loading = false
+        previewDownload.visible = false
+      }
+    }
+  }
+
   // 预览文件
   async function previewFileContent(file) {
     if (!isPreviewable(file)) {
@@ -891,9 +980,17 @@
     
     if (file.is_text) {
       try {
-        const response = await fetch(workspaceApi.content(file.path, false))
-        if (!response.ok) throw new Error('Failed to load file content')
-        previewContent = await response.text()
+        const content = await downloadPreviewContent(file, 'text')
+        if (content !== null) previewContent = content
+      } catch (err) {
+        error = err.message
+      }
+    } else if (file.is_video) {
+      try {
+        const blob = await downloadPreviewContent(file, 'blob')
+        if (blob !== null) {
+          previewObjectUrl = URL.createObjectURL(blob)
+        }
       } catch (err) {
         error = err.message
       }
@@ -913,9 +1010,8 @@
     previewContent = ''
     
     try {
-      const response = await fetch(workspaceApi.content(file.path, false))
-      if (!response.ok) throw new Error('Failed to load file content')
-      previewContent = await response.text()
+      const content = await downloadPreviewContent(file, 'text')
+      if (content !== null) previewContent = content
     } catch (err) {
       error = err.message
     }
@@ -1010,6 +1106,8 @@
 
   function closePreview() {
     resetPreviewSearch()
+    cancelPreviewDownload()
+    clearPreviewObjectUrl()
     viewMode = previewReturnView
     previewFile = null
     previewContent = ''
@@ -2102,6 +2200,13 @@
     {#if previewFile}
       {@const previewPathParts = getPreviewPathParts(previewFile)}
       <div class="preview-overlay">
+        <DownloadProgress
+          visible={previewDownload.visible}
+          loading={previewDownload.loading}
+          received={previewDownload.received}
+          total={previewDownload.total}
+          ariaLabel="Loading file preview"
+        />
         <div class="preview-header">
           <div class="preview-file-path" title={previewFile.path || previewFile.name}>
             <span>{previewPathParts.directory}</span><strong>{previewPathParts.name}</strong>
@@ -2149,7 +2254,11 @@
         {#if previewFile.is_image}
           <div class="preview-content"><img src={workspaceApi.content(previewFile.path, false)} alt={previewFile.name} /></div>
         {:else if previewFile.is_video}
-          <div class="preview-content"><video src={workspaceApi.content(previewFile.path, false)} controls></video></div>
+          <div class="preview-content">
+            {#if previewObjectUrl}
+              <video src={previewObjectUrl} controls></video>
+            {/if}
+          </div>
         {:else if previewFile.is_audio}
           <div class="preview-content"><audio src={workspaceApi.content(previewFile.path, false)} controls></audio></div>
         {:else if previewFile.is_pdf || previewFile.is_docx}

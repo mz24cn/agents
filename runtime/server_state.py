@@ -355,6 +355,188 @@ _session_event_subscribers: list = []
 # Lock protecting all the above shared state.
 _session_state_lock = threading.Lock()
 
+# Per-session inference message broker. Frames are retained for the lifetime of
+# the inference and fanned out to every browser that has opened the session.
+# Outside flight mode, however, the producer may run only while at least one
+# such browser connection (including the starter SSE) remains alive.
+_session_stream_lock = threading.RLock()
+_session_streams: dict[str, dict] = {}
+# "Flight mode" is shared by all browsers and explicitly permits inference to
+# continue with zero browser connections.
+_flight_sessions: set[str] = set()
+
+
+def _cancel_unobserved_stream_locked(session_id: str, stream: dict) -> bool:
+    """Cancel an active non-flight stream after its last browser disconnects.
+
+    Must be called with ``_session_stream_lock`` held. The starter inference SSE
+    counts as one session-specific connection, as does every retained/live
+    subscriber created after a browser opens the session.
+    """
+    if stream["done"] or session_id in _flight_sessions:
+        return False
+    if stream["starter_connected"] or stream["subscribers"]:
+        return False
+    cancel_event = stream.get("cancel_event")
+    if cancel_event is None:
+        return False
+    cancel_event.set()
+    return True
+
+
+def begin_session_stream(session_id: str, cancel_event=None) -> None:
+    with _session_stream_lock:
+        _session_streams[session_id] = {
+            "next_seq": 1,
+            "persisted_seq": 0,
+            "frames": [],
+            "subscribers": [],
+            "starter_connected": True,
+            "cancel_event": cancel_event,
+            "done": False,
+        }
+
+
+def publish_session_stream_frame(session_id: Optional[str], frame: dict) -> int:
+    if not session_id:
+        return 0
+    with _session_stream_lock:
+        stream = _session_streams.get(session_id)
+        if stream is None:
+            begin_session_stream(session_id)
+            stream = _session_streams[session_id]
+        seq = stream["next_seq"]
+        stream["next_seq"] += 1
+        envelope = {"seq": seq, "frame": frame}
+        stream["frames"].append(envelope)
+        subscribers = list(stream["subscribers"])
+    dead = []
+    for send_fn in subscribers:
+        try:
+            if send_fn(envelope) is False:
+                dead.append(send_fn)
+        except Exception:
+            dead.append(send_fn)
+    if dead:
+        with _session_stream_lock:
+            current = _session_streams.get(session_id)
+            if current:
+                previous_count = len(current["subscribers"])
+                current["subscribers"] = [fn for fn in current["subscribers"] if fn not in dead]
+                if len(current["subscribers"]) != previous_count:
+                    _cancel_unobserved_stream_locked(session_id, current)
+    return seq
+
+
+def mark_session_stream_persisted(session_id: str, seq: int) -> None:
+    with _session_stream_lock:
+        stream = _session_streams.get(session_id)
+        if stream is not None:
+            stream["persisted_seq"] = max(stream["persisted_seq"], seq)
+
+
+def finish_session_stream(session_id: str) -> None:
+    with _session_stream_lock:
+        stream = _session_streams.get(session_id)
+        if stream is None:
+            return
+        stream["done"] = True
+        subscribers = list(stream["subscribers"])
+    for send_fn in subscribers:
+        try:
+            send_fn(None)
+        except Exception:
+            pass
+
+
+def get_session_stream_snapshot(session_id: str, after_seq: int = -1) -> dict:
+    with _session_stream_lock:
+        stream = _session_streams.get(session_id)
+        if stream is None:
+            return {"active": False, "done": True, "persisted_seq": 0, "latest_seq": 0, "frames": []}
+        # Negative means "conversation.json is the baseline": replay only frames
+        # produced after the latest successful incremental persistence.
+        effective_after = stream["persisted_seq"] if after_seq < 0 else after_seq
+        return {
+            "active": not stream["done"],
+            "done": stream["done"],
+            "persisted_seq": stream["persisted_seq"],
+            "latest_seq": stream["next_seq"] - 1,
+            "frames": [item.copy() for item in stream["frames"] if item["seq"] > effective_after],
+        }
+
+
+def subscribe_session_stream(session_id: str, send_fn) -> bool:
+    with _session_stream_lock:
+        stream = _session_streams.get(session_id)
+        if stream is None or stream["done"]:
+            return False
+        stream["subscribers"].append(send_fn)
+        return True
+
+
+def unsubscribe_session_stream(session_id: str, send_fn) -> None:
+    with _session_stream_lock:
+        stream = _session_streams.get(session_id)
+        if stream is not None:
+            try:
+                stream["subscribers"].remove(send_fn)
+            except ValueError:
+                return
+            _cancel_unobserved_stream_locked(session_id, stream)
+
+
+def disconnect_session_stream_starter(session_id: str) -> bool:
+    """Mark the inference-starting browser connection as disconnected."""
+    with _session_stream_lock:
+        stream = _session_streams.get(session_id)
+        if stream is None:
+            return False
+        stream["starter_connected"] = False
+        return _cancel_unobserved_stream_locked(session_id, stream)
+
+
+def set_session_flight_mode(session_id: str, enabled: bool) -> bool:
+    with _session_stream_lock:
+        if enabled:
+            _flight_sessions.add(session_id)
+        else:
+            _flight_sessions.discard(session_id)
+            stream = _session_streams.get(session_id)
+            if stream is not None:
+                _cancel_unobserved_stream_locked(session_id, stream)
+        return session_id in _flight_sessions
+
+
+def is_session_flight_mode(session_id: str) -> bool:
+    with _session_stream_lock:
+        return session_id in _flight_sessions
+
+
+def flight_sessions_snapshot() -> list[str]:
+    with _session_stream_lock:
+        return sorted(_flight_sessions)
+
+
+def register_session_stream_with_snapshot(session_id: str, send_fn, after_seq: int = -1) -> tuple[bool, dict]:
+    """Atomically register a subscriber and take its replay snapshot."""
+    with _session_stream_lock:
+        stream = _session_streams.get(session_id)
+        if stream is None:
+            return False, {"active": False, "done": True, "persisted_seq": 0, "latest_seq": 0, "frames": []}
+        registered = not stream["done"]
+        if registered:
+            stream["subscribers"].append(send_fn)
+        effective_after = stream["persisted_seq"] if after_seq < 0 else after_seq
+        snapshot = {
+            "active": registered,
+            "done": stream["done"],
+            "persisted_seq": stream["persisted_seq"],
+            "latest_seq": stream["next_seq"] - 1,
+            "frames": [item.copy() for item in stream["frames"] if item["seq"] > effective_after],
+        }
+        return registered, snapshot
+
 
 # ---------------------------------------------------------------------------
 # Terminal Sessions – in-memory state

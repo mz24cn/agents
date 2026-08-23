@@ -24,7 +24,12 @@ from runtime.server_state import (
     _session_state_lock,
     _session_statuses,
     _unread_sessions,
+    begin_session_stream,
+    disconnect_session_stream_starter,
+    finish_session_stream,
+    mark_session_stream_persisted,
     merge_stream_messages,
+    publish_session_stream_frame,
     persist_conversation,
 )
 
@@ -254,7 +259,14 @@ class HandlerInferMixin:
             # Continue is an explicit destructive user action. Do not infer
             # whether the final response is failed or incomplete; remove exactly
             # one final assistant message because the request asked us to.
+            removed_message = None
             try:
+                # Capture the identity before the atomic rewrite. The removal is
+                # later published as a retained control frame so other browsers
+                # can apply the same destructive mutation to their live stores.
+                turns = context_manager.load_conversation(session_id)
+                if turns and turns[-1].role == "assistant":
+                    removed_message = turns[-1]
                 removed = context_manager.remove_trailing_assistant_message(session_id)
             except (OSError, ValueError) as exc:
                 self._send_json_error(
@@ -267,6 +279,9 @@ class HandlerInferMixin:
                 )
                 return None
             body["_removed_trailing_assistant"] = True
+            if removed_message is not None:
+                body["_removed_trailing_assistant_timestamp"] = removed_message.timestamp
+                body["_removed_trailing_assistant_agent_id"] = removed_message.agent_id
             logger.info(
                 "continue: explicitly removed trailing assistant turn from session %s; "
                 "retry_agent_id=%s agent_ids=%s model_id=%s tool_ids=%s",
@@ -391,7 +406,7 @@ class HandlerInferMixin:
             messages=assembled_messages,
             text=body.get("text"),
             stream=True,
-            max_tool_rounds=body.get("max_tool_rounds") or int(os.environ.get("MAX_TOOL_ROUNDS", 100)),
+            max_tool_rounds=body.get("max_tool_rounds") or int(os.environ.get("MAX_TOOL_ROUNDS", 200)),
         )
 
         session_dir = None
@@ -657,41 +672,82 @@ class HandlerInferMixin:
         # threads as well as the HTTP handler thread.  Serialize every write so
         # JSON events and heartbeat comments can never interleave on wfile.
         sse_write_lock = threading.Lock()
+        client_connected = True
+        latest_stream_seq = 0
+        if session_id is not None:
+            begin_session_stream(session_id, cancel_event)
+            # Continue has already removed the persisted final assistant turn.
+            # Retain a control frame before status broadcast so every other
+            # browser applies the same mutation before replacement output starts.
+            if _body.get("_removed_trailing_assistant") is True:
+                remove_frame = {
+                    "type": "remove_trailing_assistant",
+                    "removed_timestamp": _body.get("_removed_trailing_assistant_timestamp"),
+                    "removed_agent_id": _body.get("_removed_trailing_assistant_agent_id"),
+                }
+                latest_stream_seq = publish_session_stream_frame(session_id, remove_frame)
+            # The initiating browser renders the submitted user turn from the
+            # POST stream's init event, but other browsers only consume the
+            # retained session stream. Publish the user turn into that broker
+            # before announcing "streaming" so a newly attached browser sees
+            # the prompt before any assistant/tool frames. Use the request body
+            # rather than expanded workspace content to preserve exactly what
+            # the user submitted in the UI.
+            raw_user_messages = [
+                raw for raw in (_body.get("messages") or [])
+                if isinstance(raw, dict) and raw.get("role") == "user"
+            ]
+            for raw_user in raw_user_messages:
+                user_frame = dict(raw_user)
+                user_frame["role"] = "user"
+                if not user_frame.get("timestamp") and user_message_ts:
+                    user_frame["timestamp"] = user_message_ts
+                if mentioned_for_init and not user_frame.get("mentions"):
+                    user_frame["mentions"] = mentioned_for_init
+                latest_stream_seq = publish_session_stream_frame(session_id, user_frame)
 
         def _write_sse_payload(payload: bytes) -> None:
             with sse_write_lock:
                 self.wfile.write(payload)
                 self.wfile.flush()
 
+        def _mark_starter_disconnected(exc: Exception) -> None:
+            nonlocal client_connected
+            if not client_connected:
+                return
+            client_connected = False
+            cancelled = bool(session_id) and disconnect_session_stream_starter(session_id)
+            logger.warning(
+                "infer_stream: starter SSE disconnected%s: %s: %s",
+                "; cancelling unobserved non-flight inference" if cancelled else "",
+                type(exc).__name__, exc,
+            )
+
         def _sse_write(frame: dict) -> bool:
+            """Publish once, then best-effort mirror to the starter browser.
+
+            Losing the starter cancels a non-flight inference only when no other
+            browser has opened and is still subscribed to this session.
+            """
+            nonlocal latest_stream_seq
+            latest_stream_seq = publish_session_stream_frame(session_id, frame)
+            if not client_connected:
+                return True
             try:
                 event_data = json.dumps(frame, ensure_ascii=False)
                 _write_sse_payload(f"data: {event_data}\n\n".encode("utf-8"))
-                return True
             except Exception as exc:
-                # The client connection is likely gone (navigated away, or an
-                # intermediary idle-timeout dropped the SSE stream). Log the
-                # drop so silently-vanishing frames -- e.g. the group-chat
-                # timeout error, which IS persisted but never reaches the
-                # live view -- become diagnosable.
-                logger.warning(
-                    "infer_stream: SSE write failed, frame dropped: %s: %s",
-                    type(exc).__name__, exc,
-                )
-                return False
+                _mark_starter_disconnected(exc)
+            return True
 
         def _sse_heartbeat() -> None:
-            """Keep long group-chat waits alive: SSE comment frames are
-            ignored by the frontend parser but reset intermediary idle
-            timers, so final frames (e.g. the timeout error) survive the
-            wait instead of being silently lost to an idle-timeout drop."""
+            """Best-effort heartbeat for the starter connection."""
+            if not client_connected:
+                return
             try:
                 _write_sse_payload(b": keepalive\n\n")
             except Exception as exc:
-                logger.warning(
-                    "infer_stream: SSE heartbeat write failed: %s: %s",
-                    type(exc).__name__, exc,
-                )
+                _mark_starter_disconnected(exc)
 
         set_request_context(sse_callback=_sse_write, cancel_event=cancel_event)
 
@@ -764,6 +820,8 @@ class HandlerInferMixin:
                     )
                 else:
                     persisted_until = len(collected_messages)
+                    if session_id is not None:
+                        mark_session_stream_persisted(session_id, latest_stream_seq)
 
             # === 统一消息源 ===
             if is_group_chat:
@@ -797,10 +855,9 @@ class HandlerInferMixin:
                 #   usage 消息 → assistant 一轮结束（纯文本回复或 tool_calls 声明），
                 #               merge_stream_messages 已将其 flush 为一个完整 turn
                 #   tool 消息  → 工具调用结果配对完成 → 立即落盘
+                _sse_write(msg.to_dict())
                 if msg.role in ("usage", "tool"):
                     _incremental_persist()
-                if not _sse_write(msg.to_dict()):
-                    raise BrokenPipeError("SSE client disconnected")
                 if msg.role == "assistant" and msg.content and msg.content.startswith("Error:"):
                     model_id_for_log = request.model_id if not is_group_chat else (getattr(msg, "agent_id", "group_chat") or "group_chat")
                     logger.error("infer_stream error event | model=%s %s", model_id_for_log, msg.content)
@@ -811,7 +868,11 @@ class HandlerInferMixin:
             # client fetching the journal immediately after [DONE] sees the
             # final workspace state rather than an intermediate tool snapshot.
             self._finalize_file_journal()
-            _write_sse_payload(b"data: [DONE]\n\n")
+            if client_connected:
+                try:
+                    _write_sse_payload(b"data: [DONE]\n\n")
+                except Exception:
+                    client_connected = False
 
             if use_session and self._is_active_stream(session_id, cancel_event):
                 # original_messages already saved in pre-inference step, pass [] to avoid duplication.
@@ -874,6 +935,8 @@ class HandlerInferMixin:
                     _unread_sessions[session_id] = "done_error_unread"
                 _broadcast_session_status(session_id, "done_error_unread")
         finally:
+            if session_id is not None:
+                finish_session_stream(session_id)
             # Only unregister from active_streams if we are still the active stream
             # for this session. A newer inference may have replaced our cancel_event.
             if active_streams is not None and session_id is not None:

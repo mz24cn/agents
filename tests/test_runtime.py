@@ -1114,18 +1114,18 @@ def test_function_tool_hang_returns_timeout_error(monkeypatch) -> None:
 
 
 def test_tool_exec_timeout_parsing(monkeypatch) -> None:
-    """TOOL_EXEC_TIMEOUT parsing: default 600 s, invalid -> 600 s,
+    """TOOL_EXEC_TIMEOUT parsing: default 120 s, invalid -> 120 s,
     empty / <= 0 -> guard disabled (None)."""
     from runtime.runtime import _get_tool_exec_timeout
 
     monkeypatch.delenv("TOOL_EXEC_TIMEOUT", raising=False)
-    assert _get_tool_exec_timeout() == 600.0
+    assert _get_tool_exec_timeout() == 120.0
 
     monkeypatch.setenv("TOOL_EXEC_TIMEOUT", "1.5")
     assert _get_tool_exec_timeout() == 1.5
 
     monkeypatch.setenv("TOOL_EXEC_TIMEOUT", "abc")
-    assert _get_tool_exec_timeout() == 600.0
+    assert _get_tool_exec_timeout() == 120.0
 
     monkeypatch.setenv("TOOL_EXEC_TIMEOUT", "")
     assert _get_tool_exec_timeout() is None
@@ -1133,6 +1133,22 @@ def test_tool_exec_timeout_parsing(monkeypatch) -> None:
     monkeypatch.setenv("TOOL_EXEC_TIMEOUT", "0")
     assert _get_tool_exec_timeout() is None
 
+
+def test_effective_tool_timeout_uses_argument_units_and_label(monkeypatch) -> None:
+    from runtime.models import ToolConfig
+    from runtime.runtime import _get_effective_tool_exec_timeout
+
+    monkeypatch.setenv("TOOL_EXEC_TIMEOUT", "120")
+    normal = ToolConfig("t", "function", "t", "", {})
+    long_running = ToolConfig(
+        "long", "function", "long", "", {}, labels=["long-execution"])
+
+    assert _get_effective_tool_exec_timeout(normal, {}) == 120
+    assert _get_effective_tool_exec_timeout(normal, {"timeout": 30}) == 150
+    assert _get_effective_tool_exec_timeout(normal, {"timeout": 5000}) == 125
+    assert _get_effective_tool_exec_timeout(normal, {"timeout": "10000"}) == 130
+    assert _get_effective_tool_exec_timeout(normal, {"timeout": "bad"}) == 120
+    assert _get_effective_tool_exec_timeout(long_running, {"timeout": 30}) == 24000
 
 def test_function_tool_normal_call_with_guard_enabled(monkeypatch) -> None:
     """With the guard enabled, a normal fast tool still returns its result."""

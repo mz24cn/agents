@@ -221,15 +221,7 @@
 
 ### 6.4 超时与连接保活
 
-群聊每轮并行等待的外部 deadline 不是固定的 `MODEL_INFER_ROUND_TIMEOUT`（默认 900s），而是**按群聊人数放大**：
-
-```
-群聊每轮 deadline = len(all_agent_ids) × MODEL_INFER_ROUND_TIMEOUT
-```
-
-- `all_agent_ids` 只包含 AI 成员（用户是固定的 `**用户** (user):` 行，不在其中）——正好是"去除用户外的 agent 数"。
-- 为什么要放大：`MODEL_INFER_ROUND_TIMEOUT` 在 `infer_stream` 内部是"**每一轮工具调用**"的 wall-clock 上限、每轮重置；一个 Agent 做多轮工具调用时，总时长可以合法地超过单轮上限。若群聊外层也卡死在同一个值，做多轮工具调用的 Agent 会被误杀，报 `Error: agent inference timed out after ...`。
-- 超时守卫仍可通过把 `MODEL_INFER_ROUND_TIMEOUT` 置空/≤0 整体关闭（此时群聊等待不受限）。
+群聊不再设置独立的模型推理 wall-clock deadline。每次模型 API 调用由 `MODEL_API_TIMEOUT` 限制，工具调用由统一的工具超时机制限制，推理循环则由 `MAX_TOOL_ROUNDS` 限制。因此，多轮工具调用或长时间 Agent 任务不会被一个混合计算模型与工具执行时间的外层 deadline 误杀。
 
 另外，群聊等待期间（健康成员已回复完、只剩慢成员时）SSE 连接会长时间没有数据，容易被网关/代理/防火墙的 idle timeout 掐断——断连后后端写错误帧会静默失败，错误只在历史回放中出现。因此群聊等待循环会**每 ~25s 发送一条 SSE 注释帧（`: keepalive`）保活**；注释帧被前端解析器天然忽略，前端无需任何改动。
 

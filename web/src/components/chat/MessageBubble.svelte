@@ -99,9 +99,11 @@
     if (s.net_ms != null)  lines.push(`${t('statNet')} ${fmtMs(s.net_ms)}`)
     if (s.total_ms != null) lines.push(`${t('statRound')} ${fmtMs(s.total_ms)}`)
     if (s.overall_ms != null) lines.push(`${t('statOverall')} ${fmtMs(s.overall_ms)}`)
-    // Add first token time and completed time if available
+    // Add this inference request's wall-clock timeline if available.
+    const requestStartedTime = formatTimestamp(s.request_started_at)
     const firstTokenTime = formatTimestamp(s.first_token_timestamp)
-    const completedTime = formatTimestamp(msg.timestamp)
+    const completedTime = formatTimestamp(s.completed_at || msg.timestamp)
+    if (requestStartedTime) lines.push(`${t('statRequestStartedTime')} ${requestStartedTime}`)
     if (firstTokenTime) lines.push(`${t('statFirstTokenTime')} ${firstTokenTime}`)
     if (completedTime) lines.push(`${t('statCompletedTime')} ${completedTime}`)
     return lines.join('\n')
@@ -572,14 +574,24 @@
     padding: 2px 8px;
     font-family: inherit;
     font-size: 0.75rem;
-    color: var(--text-secondary, #666);
-    background: transparent;
-    border: 1px solid var(--border, #ddd);
+    color: var(--text-secondary, #888);
+    background: var(--bg-tertiary, rgba(0,0,0,0.15));
+    border: none;
     border-radius: 4px;
     cursor: pointer;
+    letter-spacing: 0.05em;
+    line-height: 1.4;
     white-space: nowrap;
+    transition: background 0.1s;
   }
-  .retry-btn:hover:not(:disabled) { background: var(--bg-secondary, rgba(0,0,0,0.06)); color: var(--text, #333); }
+  .retry-btn:hover:not(:disabled) {
+    background: var(--bg-secondary, rgba(0,0,0,0.2));
+    color: var(--text, #333);
+  }
+  .retry-btn:active:not(:disabled) {
+    background: var(--primary, #4a9eff);
+    color: #fff;
+  }
   .retry-btn:disabled { opacity: 0.5; cursor: not-allowed; }
   .content {
     white-space: pre-wrap;
