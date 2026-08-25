@@ -4,7 +4,9 @@ The core principle mimics human WeChat groups:
 - @ mentions deliver immediately to the mentioned agent(s)
 - Non-mentioned agents see messages later (delayed visibility — full history
   available when they are next @-mentioned)
-- @all or no @ broadcast to all agents in the group
+- @all broadcasts to all agents in the group
+- Without @, continue with the most recent responding agent; if nobody has
+  responded yet, prefer participants labelled ``leader``, then fall back to all
 - All messages are transparently stored in conversation.json
 
 Design:
@@ -166,6 +168,46 @@ def resolve_mentions(
             seen.add(agent["agent_id"])
             resolved.append(agent["agent_id"])
     return resolved
+
+
+def route_group_chat_user_message(
+    text: str,
+    agent_manager,
+    all_agent_ids: list[str],
+    prior_turns: list,
+) -> list[str]:
+    """Choose the agents that should answer a group-chat user message.
+
+    Routing priority is intentionally simple and conversational:
+
+    1. An explicit valid ``@`` mention wins (including ``@all``).
+    2. With no ``@``, route to the most recent participating assistant that
+       responded in the existing conversation.
+    3. If no participant has responded yet, route to every participant whose
+       agent labels contain ``leader``.
+    4. If there is no leader, retain the legacy fallback and broadcast to all.
+
+    ``prior_turns`` may contain either persisted ``ConversationTurn`` objects
+    or message dictionaries.  Unknown explicit mentions preserve the existing
+    behavior: they resolve to no target here and are handled by the caller's
+    compatibility fallback.
+    """
+    mentions = parse_mentions(text or "")
+    if mentions:
+        return resolve_mentions(mentions, agent_manager, all_agent_ids)
+
+    participants = set(all_agent_ids)
+    for turn in reversed(prior_turns or []):
+        msg = _message_from_turn(turn)
+        if msg.role == "assistant" and msg.agent_id in participants:
+            return [msg.agent_id]
+
+    leaders: list[str] = []
+    for agent_id in all_agent_ids:
+        agent = agent_manager.get(agent_id) if agent_manager else None
+        if agent and "leader" in (agent.get("labels") or []):
+            leaders.append(agent_id)
+    return leaders or list(all_agent_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -929,6 +971,14 @@ def _run_group_chat_stream_gen(
             nickname: str = agent.get("nickname", agent_id)
             agent_model_id: str = agent.get("model_id", model_id)
             agent_tool_ids: list[str] = agent.get("tool_ids", tool_ids)
+            agent_tool_scope = [
+                tc for tid in agent_tool_ids
+                if (tc := runtime._tool_registry.get(tid)) is not None
+            ]
+            set_request_context(
+                tool_scope=agent_tool_scope,
+                available_tool_ids=agent_tool_ids,
+            )
 
             # Current message for THIS agent
             trigger_list = (current_trigger_msgs.get(agent_id)

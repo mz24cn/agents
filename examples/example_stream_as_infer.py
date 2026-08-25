@@ -11,9 +11,11 @@
   在本地拼装成与 /v1/infer 完全相同的 JSON 结构。
 
 SSE 协议说明：
-  - 每个事件格式：  data: <json>\n\n
+  - 事件可包含 event: / id: / data: 等标准 SSE 字段
+  - 首条控制事件：  event: init\ndata: <json>\n\n（不属于推理 messages）
+  - 消息事件示例：  id: <seq>\ndata: <message-json>\n\n
   - 最后一条事件：  data: [DONE]\n\n
-  - 每条 data 是一个 Message.to_dict() 序列化的 JSON 对象
+  - 消息 data 是一个 Message.to_dict() 序列化的 JSON 对象
   - 错误事件：      data: {"error": "..."}\n\n
 
 运行方式：
@@ -48,15 +50,9 @@ def infer_via_stream(
     verbose: bool = False,
 ) -> dict:
     """
-    调用 /v1/infer/stream，收集所有 SSE 事件后拼装成与 /v1/infer 相同的结果。
-
-    返回值格式（与 /v1/infer 完全一致）：
-        {
-            "success": bool,
-            "messages": [ {role, content, ...}, ... ],
-            "error": str | None,       # 仅失败时存在
-            "error_code": str | None,  # 仅失败时存在
-        }
+    调用 /v1/infer/stream，收集 SSE 事件并按服务端 /v1/infer 的合并规则
+    还原结果。这里的“一致”指返回 JSON 的结构和语义一致；如果分别调用两次
+    模型，生成文本仍可能因为采样而不同。
     """
     payload = {
         "model_id": model_id,
@@ -76,117 +72,215 @@ def infer_via_stream(
         method="POST",
     )
 
-    # 最终拼装好的消息列表（与 /v1/infer 结构一致）
     merged_messages: list[dict] = []
-    # 当前正在累积的 assistant chunk（None 表示没有未完成的 assistant 消息）
     pending_assistant: Optional[dict] = None
     stream_error: Optional[str] = None
-    # Token stat 累计
-    total_stat: dict = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    last_stat: Optional[dict] = None
 
-    def flush_assistant() -> None:
-        """将累积完毕的 assistant 消息写入 merged_messages。"""
-        if pending_assistant is not None:
-            merged_messages.append(pending_assistant)
+    def flush_assistant(stat: Optional[dict] = None) -> None:
+        """按 merge_stream_messages() 的规则结束当前 assistant turn。"""
+        nonlocal pending_assistant
+        if pending_assistant is None:
+            return
+
+        content = pending_assistant["content"]
+        thinking = pending_assistant["thinking"]
+        tool_calls = pending_assistant["tool_calls"]
+        if not content and not thinking and not tool_calls:
+            pending_assistant = None
+            return
+
+        msg: dict = {
+            "role": "assistant",
+            "content": content,
+            # /v1/infer 使用 usage.completed_at 作为 assistant 完成时间。
+            "timestamp": (stat or {}).get("completed_at")
+                         or pending_assistant.get("timestamp"),
+        }
+        if tool_calls:
+            msg["tool_calls"] = tool_calls
+        if thinking:
+            msg["thinking"] = thinking
+        if stat is not None:
+            msg["stat"] = stat
+        for key in ("agent_id", "name", "mentions"):
+            value = pending_assistant.get(key)
+            if value is not None:
+                msg[key] = value
+        if msg["timestamp"] is None:
+            msg.pop("timestamp")
+
+        merged_messages.append(msg)
+        pending_assistant = None
+
+    def merge_assistant_delta(event: dict) -> None:
+        """合并 assistant 的文本、思考、身份信息和 tool_calls delta。"""
+        nonlocal pending_assistant
+        if pending_assistant is None:
+            pending_assistant = {
+                "content": "",
+                "thinking": "",
+                "tool_calls": [],
+                "timestamp": None,
+                "agent_id": None,
+                "name": None,
+                "mentions": None,
+            }
+
+        pending_assistant["content"] += event.get("content") or ""
+        pending_assistant["thinking"] += event.get("thinking") or ""
+        if event.get("timestamp"):
+            pending_assistant["timestamp"] = event["timestamp"]
+        if event.get("agent_id") and not pending_assistant["agent_id"]:
+            pending_assistant["agent_id"] = event["agent_id"]
+        if event.get("assistant_id") and not pending_assistant["agent_id"]:
+            pending_assistant["agent_id"] = event["assistant_id"]
+        if event.get("name") and not pending_assistant["name"]:
+            pending_assistant["name"] = event["name"]
+        if event.get("mentions") is not None:
+            pending_assistant["mentions"] = event["mentions"]
+
+        # 与服务端 merge_stream_messages() 保持相同的 tool_calls 合并规则。
+        for tc_delta in event.get("tool_calls") or []:
+            idx = tc_delta.get("_index")
+            if idx is None:
+                pending_assistant["tool_calls"].append(dict(tc_delta))
+                continue
+
+            while len(pending_assistant["tool_calls"]) <= idx:
+                pending_assistant["tool_calls"].append(
+                    {"id": "", "name": "", "arguments": ""}
+                )
+            target = pending_assistant["tool_calls"][idx]
+            if tc_delta.get("id"):
+                target["id"] = tc_delta["id"]
+            if tc_delta.get("tool_use_id"):
+                target["id"] = tc_delta["tool_use_id"]
+            if tc_delta.get("name"):
+                target["name"] = target.get("name", "") + tc_delta["name"]
+            if tc_delta.get("arguments"):
+                if isinstance(tc_delta["arguments"], dict):
+                    target["arguments"] = tc_delta["arguments"]
+                else:
+                    target["arguments"] = (
+                        target.get("arguments", "") + tc_delta["arguments"]
+                    )
 
     with urllib.request.urlopen(req) as resp:
-        buffer = b""
-        while True:
-            chunk = resp.read(1)
-            if not chunk:
-                break
-            buffer += chunk
+        # 标准 SSE 事件可以同时包含 event:/id:/data:，不能假设事件以 data: 开头。
+        event_lines: list[str] = []
+        stream_done = False
 
-            # SSE 事件以 \n\n 结尾
-            if not buffer.endswith(b"\n\n"):
-                continue
+        def handle_sse_event(lines: list[str]) -> bool:
+            """处理一个 SSE 事件；收到 [DONE] 或错误时返回 True。"""
+            nonlocal stream_error, last_stat
 
-            raw_event = buffer.decode("utf-8").strip()
-            buffer = b""
+            event_name = ""
+            data_lines: list[str] = []
+            for line in lines:
+                if not line or line.startswith(":"):
+                    continue
+                field, separator, value = line.partition(":")
+                if not separator:
+                    value = ""
+                elif value.startswith(" "):
+                    value = value[1:]
+                if field == "event":
+                    event_name = value
+                elif field == "data":
+                    data_lines.append(value)
+                # id: / retry: 是 SSE 元数据，不属于 JSON payload。
 
-            if not raw_event.startswith("data:"):
-                continue
+            if not data_lines:
+                return False
 
-            data_str = raw_event[len("data:"):].strip()
-
-            if data_str == "[DONE]":
-                break
+            data_str = "\n".join(data_lines)
+            if data_str.strip() == "[DONE]":
+                return True
 
             try:
                 event = json.loads(data_str)
             except json.JSONDecodeError:
-                continue
+                if verbose:
+                    print(f"  [stream] 忽略无法解析的 SSE data: {data_str[:120]!r}")
+                return False
 
-            # 服务端推送了错误事件
+            # init 是控制事件，不属于 /v1/infer 的 messages。
+            if event_name == "init" or event.get("type") == "init":
+                if verbose:
+                    print(f"  [stream] event=init  session_id={event.get('session_id')!r}")
+                return False
+
             if "error" in event and len(event) == 1:
-                stream_error = event["error"]
-                break
+                stream_error = str(event["error"])
+                return True
 
             role = event.get("role", "")
-
             if verbose:
-                content_preview = str(event.get("content", "") or event.get("thinking", ""))[:60]
-                print(f"  [stream] role={role}  {content_preview!r}")
+                preview = str(event.get("content", "") or event.get("thinking", ""))[:60]
+                print(f"  [stream] role={role}  {preview!r}")
 
             if role == "usage":
-                # Per-round stat event — keep the last one (it has overall_ms if last round)
                 try:
-                    s = json.loads(event.get("content", "{}"))
-                    total_stat = s  # last round's stat has cumulative totals + overall_ms
-                except (json.JSONDecodeError, ValueError):
-                    pass
-                continue
+                    last_stat = json.loads(event.get("content", "{}"))
+                except (json.JSONDecodeError, ValueError, TypeError):
+                    last_stat = None
+                # usage 同时是当前 assistant round 的结束边界。
+                flush_assistant(last_stat)
+            elif role == "assistant":
+                merge_assistant_delta(event)
+            elif role == "tool":
+                # 正常情况下 usage 已先 flush；异常流中仍保证 assistant 在 tool 前。
+                flush_assistant(last_stat)
+                tool_msg: dict = {
+                    "role": "tool",
+                    "content": event.get("content") or "",
+                    "timestamp": event.get("timestamp"),
+                    "name": event.get("name") or "",
+                }
+                for key in ("tool_id", "tool_use_id", "agent_id"):
+                    if event.get(key) is not None:
+                        tool_msg[key] = event[key]
+                if tool_msg["timestamp"] is None:
+                    tool_msg.pop("timestamp")
+                merged_messages.append(tool_msg)
+            # system、无 role 控制帧等不会生成 /v1/infer ConversationTurn。
+            return False
 
-            if role == "assistant":
-                # assistant 消息是逐 token 的增量，需要合并
-                if pending_assistant is None:
-                    # 新的 assistant 消息开始
-                    pending_assistant = {"role": "assistant", "content": "", "tool_calls": None, "thinking": None}
-
-                pending_assistant["content"] += event.get("content") or ""
-                pending_assistant["thinking"] = (pending_assistant["thinking"] or "") + (event.get("thinking") or "") or None
-
-                # tool_calls 增量：每个 chunk 里的 tool_calls 是 delta，需要按 index 合并
-                for tc_delta in (event.get("tool_calls") or []):
-                    idx = tc_delta.pop("_index", None)
-                    if pending_assistant["tool_calls"] is None:
-                        pending_assistant["tool_calls"] = []
-                    # 找到对应 index 的槽位（或新建）
-                    while len(pending_assistant["tool_calls"]) <= (idx if idx is not None else 0):
-                        pending_assistant["tool_calls"].append({"name": "", "arguments": ""})
-                    slot = pending_assistant["tool_calls"][idx if idx is not None else 0]
-                    slot["name"] += tc_delta.get("name") or ""
-                    slot["arguments"] += tc_delta.get("arguments") or ""
-
+        for raw_line in resp:
+            line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+            if line == "":
+                if event_lines and handle_sse_event(event_lines):
+                    stream_done = True
+                    break
+                event_lines = []
             else:
-                # 非 assistant 消息（function / system / user）是完整的一条
-                # 先把之前累积的 assistant 消息落地
-                flush_assistant()
-                pending_assistant = None
-                merged_messages.append(event)
+                event_lines.append(line)
 
-    # 流结束后，把最后一条 assistant 消息落地
-    flush_assistant()
+        # 兼容最后一个事件后没有空行便关闭连接的服务端。
+        if not stream_done and event_lines:
+            handle_sse_event(event_lines)
 
-    # 清理空字段，保持与 /v1/infer 一致
-    for msg in merged_messages:
-        if msg.get("thinking") == "":
-            msg["thinking"] = None
-        if msg.get("tool_calls") == []:
-            msg["tool_calls"] = None
-        # 去掉值为 None 的 key（与 Message.to_dict() 行为一致）
-        for k in ["thinking", "tool_calls", "name"]:
-            if msg.get(k) is None:
-                msg.pop(k, None)
+    flush_assistant(last_stat)
 
     if stream_error:
         return {"success": False, "messages": merged_messages, "error": stream_error}
 
-    result: dict = {"success": True, "messages": merged_messages}
-    if total_stat.get("total_tokens", 0) > 0 or total_stat.get("prompt_tokens", 0) > 0:
-        result["stat"] = total_stat
+    error_message = next(
+        (
+            msg.get("content", "")
+            for msg in merged_messages
+            if msg.get("role") == "assistant"
+            and msg.get("content", "").startswith("Error:")
+        ),
+        None,
+    )
+    result: dict = {"success": error_message is None, "messages": merged_messages}
+    if error_message is not None:
+        result["error"] = error_message
+    if last_stat is not None:
+        result["stat"] = last_stat
     return result
-
 
 def infer_direct(
     server_url: str,
@@ -287,19 +381,28 @@ def main():
         )
         print_result(direct_result, label="/v1/infer 直接结果")
 
-        # 对比最终 assistant 回复是否一致
+        # 这是两次独立推理：若模型启用了采样，生成文本不同是正常现象。
+        # --compare 主要用于人工核对两种接口的返回结构和字段；它不能直接
+        # 证明同一次模型输出经流式拼装后与非流式结果逐字相同。
         def last_assistant(result):
             for msg in reversed(result["messages"]):
                 if msg.get("role") == "assistant" and msg.get("content"):
                     return msg["content"]
             return ""
 
+        def message_shape(result):
+            return [
+                (msg.get("role"), tuple(sorted(msg.keys())))
+                for msg in result.get("messages", [])
+            ]
+
         s = last_assistant(stream_result)
         d = last_assistant(direct_result)
         print(f"\n{'─' * 50}")
         print(f"stream 最终回复 : {s[:100]!r}")
         print(f"direct 最终回复 : {d[:100]!r}")
-        print(f"内容一致        : {s == d}")
+        print(f"结构一致        : {message_shape(stream_result) == message_shape(direct_result)}")
+        print(f"内容一致（仅供参考，两次独立采样）: {s == d}")
 
 
 if __name__ == "__main__":

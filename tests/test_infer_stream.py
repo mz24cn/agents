@@ -257,11 +257,114 @@ def test_infer_stream_connection_error() -> None:
 
     request = InferenceRequest(model_id="test-model", text="hi", stream=True)
 
-    with patch("urllib.request.urlopen", side_effect=mock_urlopen):
+    with patch.dict("os.environ", {"MODEL_API_RETRY_DELAY": "0"}), \
+         patch("urllib.request.urlopen", side_effect=mock_urlopen):
         messages = list(runtime.infer_stream(request))
 
     assert len(messages) == 1
     assert "connection refused" in messages[0].content.lower()
+
+
+def test_infer_stream_retries_502_before_output() -> None:
+    """A transient gateway error is retried before any stream output."""
+    import urllib.error
+
+    runtime = Runtime(
+        model_registry=_make_model_registry("openai"),
+        tool_registry=ToolRegistry(),
+    )
+    success_stream = _make_openai_sse_response(["recovered"])
+    calls = 0
+
+    def mock_urlopen(request, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise urllib.error.HTTPError(
+                url=request.full_url, code=502, msg="Bad Gateway",
+                hdrs={}, fp=io.BytesIO(b"temporary gateway failure"),
+            )
+        return _mock_urlopen_with_stream(success_stream)(request, **kwargs)
+
+    request = InferenceRequest(model_id="test-model", text="hi", stream=True)
+    with patch.dict("os.environ", {
+        "MODEL_API_MAX_RETRIES": "2", "MODEL_API_RETRY_DELAY": "0",
+    }), patch("urllib.request.urlopen", side_effect=mock_urlopen):
+        messages = list(runtime.infer_stream(request))
+
+    assert calls == 2
+    assert [m.content for m in messages if m.role == "assistant"] == ["recovered"]
+
+
+def test_infer_stream_retries_read_timeout_before_first_output() -> None:
+    """A connected stream that times out before its first item is reopened."""
+    import socket
+
+    runtime = Runtime(
+        model_registry=_make_model_registry("openai"),
+        tool_registry=ToolRegistry(),
+    )
+    calls = 0
+
+    class TimeoutBeforeOutput:
+        def __iter__(self):
+            raise socket.timeout("timed out waiting for first token")
+
+        def close(self):
+            pass
+
+    def mock_urlopen(request, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return TimeoutBeforeOutput()
+        return _mock_urlopen_with_stream(
+            _make_openai_sse_response(["second connection"])
+        )(request, **kwargs)
+
+    request = InferenceRequest(model_id="test-model", text="hi", stream=True)
+    with patch.dict("os.environ", {
+        "MODEL_API_MAX_RETRIES": "2", "MODEL_API_RETRY_DELAY": "0",
+    }), patch("urllib.request.urlopen", side_effect=mock_urlopen):
+        messages = list(runtime.infer_stream(request))
+
+    assert calls == 2
+    assert [m.content for m in messages if m.role == "assistant"] == ["second connection"]
+
+
+def test_infer_stream_does_not_retry_after_first_output() -> None:
+    """Once output is visible, a read failure is returned without replay."""
+    import socket
+
+    runtime = Runtime(
+        model_registry=_make_model_registry("openai"),
+        tool_registry=ToolRegistry(),
+    )
+    calls = 0
+    first_chunk = json.dumps({"choices": [{"delta": {"content": "partial"}}]})
+
+    class PartialThenTimeout:
+        def __iter__(self):
+            yield f"data: {first_chunk}\n\n".encode()
+            raise socket.timeout("timed out mid-stream")
+
+        def close(self):
+            pass
+
+    def mock_urlopen(request, **kwargs):
+        nonlocal calls
+        calls += 1
+        return PartialThenTimeout()
+
+    request = InferenceRequest(model_id="test-model", text="hi", stream=True)
+    with patch.dict("os.environ", {
+        "MODEL_API_MAX_RETRIES": "2", "MODEL_API_RETRY_DELAY": "0",
+    }), patch("urllib.request.urlopen", side_effect=mock_urlopen):
+        messages = list(runtime.infer_stream(request))
+
+    assert calls == 1
+    assert messages[0].content == "partial"
+    assert "stream parse" in messages[1].content.lower()
 
 
 def test_infer_stream_returns_iterator() -> None:

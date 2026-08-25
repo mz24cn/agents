@@ -60,7 +60,7 @@ def test_prepare_reasoning_for_tool_rounds_repairs_request_copy_only():
         model_id="deepseek",
         api_base="https://example.test",
         model_name="deepseek",
-        labels=["require-reasoning-for-tool-rounds"],
+        labels=["require-thinking"],
     )
 
     prepared = _prepare_reasoning_for_tool_rounds(messages, config)
@@ -85,7 +85,7 @@ def test_prepare_reasoning_for_tool_rounds_preserves_real_reasoning():
         model_id="deepseek",
         api_base="https://example.test",
         model_name="deepseek",
-        labels=["require-reasoning-for-tool-rounds"],
+        labels=["require-thinking"],
     )
 
     prepared = _prepare_reasoning_for_tool_rounds(messages, config)
@@ -103,7 +103,7 @@ def test_prepare_reasoning_for_tool_rounds_requires_label_and_trailing_tool():
     unlabeled = ModelConfig("plain", "https://example.test", "plain")
     labeled = ModelConfig(
         "deepseek", "https://example.test", "deepseek",
-        labels=["require-reasoning-for-tool-rounds"],
+        labels=["require-thinking"],
     )
 
     assert _prepare_reasoning_for_tool_rounds(unlabeled_tool_round, unlabeled) is unlabeled_tool_round
@@ -971,6 +971,44 @@ def test_tool_error_exception(exc_msg: str) -> None:
 # --- Scenario (c): HTTP call failure ---
 
 
+def test_infer_retries_transient_502_and_succeeds(monkeypatch) -> None:
+    """Non-streaming inference retries a transient 502 at transport level."""
+    import io
+    import json
+    import urllib.error
+    from unittest.mock import MagicMock, patch
+
+    model_registry = _setup_model_registry()
+    runtime = Runtime(model_registry=model_registry, tool_registry=ToolRegistry())
+    calls = 0
+    response = json.dumps({
+        "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    }).encode()
+
+    def mock_urlopen(request, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise urllib.error.HTTPError(
+                request.full_url, 502, "Bad Gateway", {}, io.BytesIO(b"temporary"),
+            )
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = response
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        return mock_resp
+
+    monkeypatch.setenv("MODEL_API_MAX_RETRIES", "2")
+    monkeypatch.setenv("MODEL_API_RETRY_DELAY", "0")
+    with patch("urllib.request.urlopen", side_effect=mock_urlopen):
+        result = runtime.infer(InferenceRequest(model_id="test-model", text="hello"))
+
+    assert calls == 2
+    assert result.success is True
+    assert result.messages[-1].content == "ok"
+
+
 @given(http_code=_http_error_code_st)
 @settings(max_examples=34)
 def test_tool_error_http_failure(http_code: int) -> None:
@@ -994,7 +1032,8 @@ def test_tool_error_http_failure(http_code: int) -> None:
         text="hello",
     )
 
-    with patch("urllib.request.urlopen", side_effect=mock_urlopen):
+    with patch.dict("os.environ", {"MODEL_API_RETRY_DELAY": "0"}), \
+         patch("urllib.request.urlopen", side_effect=mock_urlopen):
         result = runtime.infer(request)
 
     assert result.success is False, "Expected success=False for HTTP error"

@@ -366,6 +366,10 @@ def _make_talk_to_fn(runtime, thread_local):
         resolved: list[tuple[str, dict | None]] = []
         for name in agents:
             agent = agent_manager.get(name)
+            if agent is not None:
+                resolved_agent_id = agent.get("agent_id")
+                if all_agent_ids and resolved_agent_id not in all_agent_ids:
+                    agent = None
             resolved.append((name, agent))
 
         # 用于收集并行结果
@@ -374,7 +378,13 @@ def _make_talk_to_fn(runtime, thread_local):
         def run_one(agent_name: str, agent: dict | None):
             """在子线程中运行单个 agent 的推理，完成后持久化。"""
             if agent is None:
-                return (agent_name, agent_name, f"Error: Agent not found.", None)
+                return (
+                    agent_name,
+                    agent_name,
+                    "Error: specified agent does not exist in the current "
+                    "conversation or has left.",
+                    None,
+                )
 
             agent_id = agent["agent_id"]
             model_id = agent.get("model_id", "default")
@@ -406,6 +416,15 @@ def _make_talk_to_fn(runtime, thread_local):
             # Conversation persistence still uses the independent sub_session_id
             # below; only the file journal belongs to the initiating user turn.
             child_context = dict(parent_request_context)
+            tool_registry = getattr(runtime, "_tool_registry", None)
+            target_tool_scope = (
+                [
+                    tc for tid in agent_tool_ids
+                    if (tc := tool_registry.get(tid)) is not None
+                ]
+                if tool_registry is not None
+                else []
+            )
             child_context.update({
                 "depth": parent_depth + 1,
                 "session_id": sub_session_id,
@@ -415,13 +434,15 @@ def _make_talk_to_fn(runtime, thread_local):
                 # Nested tool calls belong to the target agent, not to the
                 # parent that initiated this talk_to call.
                 "agent_id": agent_id,
+                "tool_scope": target_tool_scope,
+                "available_tool_ids": list(agent_tool_ids),
                 "file_journal_session_id": journal_session_id,
                 "file_journal_session_dir": journal_session_dir,
                 "file_journal_user_message_timestamp": journal_timestamp,
             })
             restore_request_context(child_context)
-            # 子线程中 tool_scope 和 agent_manager 继承父线程
-            thread_local.tool_scope = getattr(thread_local, "tool_scope", [])
+            # tool_scope comes from the target agent's current tool list in the
+            # restored child context; only shared managers/callbacks are copied.
             thread_local.agent_manager = agent_manager
             thread_local.context_manager = context_manager
             thread_local.sse_callback = parent_sse_callback

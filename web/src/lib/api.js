@@ -7,6 +7,25 @@
 
 import { ensureAuthenticated } from './auth-state.svelte.js'
 
+function streamDebug(event, details = {}) {
+  try {
+    if (localStorage.getItem('session_stream_debug') !== '1') return
+    console.warn(`[session-stream] ${event}`, {
+      at: new Date().toISOString(),
+      ...details,
+    })
+  } catch { /* diagnostics must never affect streaming */ }
+}
+
+function shouldLogStreamFrame(seq, data) {
+  // Logging every one-character token can itself freeze DevTools and make the
+  // stream appear stalled. Always log structural/final frames, but sample noisy
+  // content/delta frames so diagnostics remain usable during long talk_to runs.
+  if (data?.streaming === false || data?.role === 'usage' || data?.role === 'system' || data?.role === 'user') return true
+  if (data?.tool_calls) return true
+  return Number.isFinite(seq) && seq % 100 === 0
+}
+
 function isAuthFailure(res) {
   return res && res.status === 401
 }
@@ -150,7 +169,7 @@ export const promptTemplates = {
  * @param {function} onError    Called on fetch or parse errors
  * @returns {function}          Call to abort the stream
  */
-export function inferStream(body, onMessage, onDone, onError, onInit = null) {
+export function inferStream(body, onMessage, onDone, onError, onInit = null, onSequence = null) {
   const controller = new AbortController()
 
   apiFetch('/v1/infer/stream', {
@@ -169,11 +188,12 @@ export function inferStream(body, onMessage, onDone, onError, onInit = null) {
       const decoder = new TextDecoder()
       let buffer = ''
       let currentEvent = 'message'
+      let currentId = null
 
       function pump() {
         reader.read().then(({ done, value }) => {
           if (done) {
-            onDone()
+            onError(new Error('Inference stream ended before [DONE]'))
             return
           }
           buffer += decoder.decode(value, { stream: true })
@@ -184,6 +204,9 @@ export function inferStream(body, onMessage, onDone, onError, onInit = null) {
             const trimmed = line.trim()
             if (trimmed.startsWith('event: ')) {
               currentEvent = trimmed.slice(7).trim()
+            } else if (trimmed.startsWith('id:')) {
+              const parsed = Number.parseInt(trimmed.slice(3).trim(), 10)
+              currentId = Number.isFinite(parsed) ? parsed : null
             } else if (trimmed.startsWith('data: ')) {
               const payload = trimmed.slice(6).trim()
               if (payload === '[DONE]') {
@@ -196,12 +219,17 @@ export function inferStream(body, onMessage, onDone, onError, onInit = null) {
                   onInit(data)
                 } else if (currentEvent !== 'init') {
                   onMessage(data)
+                  if (currentId !== null) onSequence?.(currentId)
+                  if (shouldLogStreamFrame(currentId, data)) {
+                    streamDebug('direct_frame', { seq: currentId, role: data?.role, name: data?.name, streaming: data?.streaming })
+                  }
                 }
               } catch {
                 // skip malformed JSON chunks
               }
             } else if (trimmed === '') {
               currentEvent = 'message'  // Reset to default event type after blank line
+              currentId = null
             }
           }
           pump()
@@ -277,41 +305,135 @@ export const sessions = {
   setFlightMode: (sessionId, enabled) => request('POST', `/v1/sessions/${encodeURIComponent(sessionId)}/flight`, { enabled }),
 }
 
-/** Subscribe to the retained/live inference stream for an existing session. */
+/**
+ * Subscribe to the retained/live inference stream for an existing session.
+ *
+ * Unexpected EOF and network/read errors are retried automatically.  Every
+ * inference frame has a monotonically increasing SSE `id`; reconnects pass the
+ * last successfully applied id back as `after`, so the backend replays only the
+ * missing frames and then resumes the live stream.
+ */
 export function subscribeSessionStream(sessionId, onMessage, onDone, onError, onInit = null, after = -1) {
-  const controller = new AbortController()
-  const url = `/v1/sessions/${encodeURIComponent(sessionId)}/stream?after=${encodeURIComponent(after)}`
-  apiFetch(url, { signal: controller.signal }).then((res) => {
-    if (!res.ok) throw new Error(`Session stream request failed: ${res.status}`)
-    const reader = res.body.getReader()
-    const decoder = new TextDecoder()
-    let buffer = ''
-    let currentEvent = 'message'
-    const pump = () => reader.read().then(({ done, value }) => {
-      if (done) { onDone?.(); return }
-      buffer += decoder.decode(value, { stream: true })
-      const lines = buffer.split('\n')
-      buffer = lines.pop() || ''
-      for (const line of lines) {
+  let stopped = false
+  let completed = false
+  let controller = null
+  let reconnectTimer = null
+  let lastSeq = Number.isFinite(Number(after)) ? Number(after) : -1
+  let baselineInitialized = lastSeq >= 0
+
+  const finish = () => {
+    if (completed || stopped) return
+    completed = true
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer)
+      reconnectTimer = null
+    }
+    onDone?.()
+  }
+
+  const scheduleReconnect = () => {
+    if (stopped || completed || reconnectTimer) return
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null
+      connect()
+    }, 1000)
+  }
+
+  const connect = () => {
+    if (stopped || completed) return
+    controller = new AbortController()
+    streamDebug('retained_connect', { sessionId, after: lastSeq })
+    const url = `/v1/sessions/${encodeURIComponent(sessionId)}/stream?after=${encodeURIComponent(lastSeq)}`
+    apiFetch(url, { signal: controller.signal }).then((res) => {
+      if (!res.ok) throw new Error(`Session stream request failed: ${res.status}`)
+      if (!res.body?.getReader) throw new Error('Session stream response body is unavailable')
+
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      let currentEvent = 'message'
+      let currentId = null
+
+      const processLine = (line) => {
         const trimmed = line.trim()
-        if (trimmed.startsWith('event:')) currentEvent = trimmed.slice(6).trim()
-        else if (trimmed.startsWith('data:')) {
+        if (trimmed.startsWith('event:')) {
+          currentEvent = trimmed.slice(6).trim()
+        } else if (trimmed.startsWith('id:')) {
+          const parsed = Number.parseInt(trimmed.slice(3).trim(), 10)
+          currentId = Number.isFinite(parsed) ? parsed : null
+        } else if (trimmed.startsWith('data:')) {
           const payload = trimmed.slice(5).trim()
-          if (payload === '[DONE]') { onDone?.(); return }
+          if (payload === '[DONE]') {
+            finish()
+            return
+          }
           try {
             const data = JSON.parse(payload)
-            if (currentEvent === 'init') onInit?.(data)
-            else onMessage?.(data)
-          } catch { /* ignore malformed frame */ }
-        } else if (!trimmed) currentEvent = 'message'
+            if (currentEvent === 'init') {
+              // On the first connection, conversation.json is the local
+              // baseline. Remember the matching persisted sequence before any
+              // replay frames arrive, so even an immediate disconnect can
+              // resume without losing frames persisted in the meantime.
+              if (!baselineInitialized) {
+                const persistedSeq = Number(data?.persisted_seq)
+                if (Number.isFinite(persistedSeq)) lastSeq = Math.max(lastSeq, persistedSeq)
+                baselineInitialized = true
+              }
+              streamDebug('retained_init', { sessionId, lastSeq, ...data })
+              onInit?.(data)
+            } else {
+              onMessage?.(data)
+              if (currentId !== null) lastSeq = Math.max(lastSeq, currentId)
+              if (shouldLogStreamFrame(currentId, data)) {
+                streamDebug('retained_frame', { sessionId, seq: currentId, lastSeq, role: data?.role, name: data?.name, streaming: data?.streaming })
+              }
+            }
+          } catch {
+            // Do not advance lastSeq for malformed/unapplied frames; a later
+            // reconnect can replay them instead of silently creating a gap.
+          }
+        } else if (!trimmed) {
+          currentEvent = 'message'
+          currentId = null
+        }
       }
+
+      const pump = () => reader.read().then(({ done, value }) => {
+        if (done) {
+          // A valid terminal stream sends [DONE]. Plain EOF is treated as a
+          // dropped connection and resumed from lastSeq.
+          streamDebug('retained_eof', { sessionId, lastSeq })
+          scheduleReconnect()
+          return
+        }
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() || ''
+        for (const line of lines) {
+          processLine(line)
+          if (completed || stopped) return
+        }
+        return pump()
+      })
+
       return pump()
+    }).catch((err) => {
+      if (err.name === 'AbortError' || stopped || completed) return
+      streamDebug('retained_error', { sessionId, lastSeq, error: String(err) })
+      onError?.(err)
+      scheduleReconnect()
     })
-    return pump()
-  }).catch((err) => {
-    if (err.name !== 'AbortError') onError?.(err)
-  })
-  return () => controller.abort()
+  }
+
+  connect()
+  return () => {
+    stopped = true
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer)
+      reconnectTimer = null
+    }
+    controller?.abort()
+  }
 }
 
 /**
@@ -328,6 +450,24 @@ export function subscribeSessionEvents(onEvent, onError) {
   let stopped = false
   let controller = null
   let reconnectTimer = null
+  let watchdogTimer = null
+  let connectionGeneration = 0
+  const WATCHDOG_MS = 45_000
+
+  const clearWatchdog = () => {
+    if (watchdogTimer) clearTimeout(watchdogTimer)
+    watchdogTimer = null
+  }
+
+  const armWatchdog = (generation) => {
+    clearWatchdog()
+    watchdogTimer = setTimeout(() => {
+      if (stopped || generation !== connectionGeneration) return
+      streamDebug('events_watchdog', { generation })
+      controller?.abort()
+      scheduleReconnect()
+    }, WATCHDOG_MS)
+  }
 
   const scheduleReconnect = () => {
     if (stopped || reconnectTimer) return
@@ -339,7 +479,10 @@ export function subscribeSessionEvents(onEvent, onError) {
 
   const connect = () => {
     if (stopped) return
+    const generation = ++connectionGeneration
     controller = new AbortController()
+    streamDebug('events_connect', { generation })
+    armWatchdog(generation)
     apiFetch('/v1/sessions/events', { signal: controller.signal })
       .then((res) => {
         if (!res.ok) throw new Error(`Session events request failed: ${res.status}`)
@@ -348,10 +491,16 @@ export function subscribeSessionEvents(onEvent, onError) {
         let buffer = ''
 
         const pump = () => reader.read().then(({ done, value }) => {
+          if (generation !== connectionGeneration) return
           if (done) {
+            clearWatchdog()
+            streamDebug('events_eof', { generation })
             scheduleReconnect()
             return
           }
+          // Includes SSE comment heartbeats. Any bytes prove that this
+          // connection is still delivering data through the proxy/browser.
+          armWatchdog(generation)
           buffer += decoder.decode(value, { stream: true })
           const lines = buffer.split('\n')
           buffer = lines.pop() || ''
@@ -360,7 +509,15 @@ export function subscribeSessionEvents(onEvent, onError) {
             if (trimmed.startsWith('data: ')) {
               const payload = trimmed.slice(6).trim()
               try {
-                onEvent(JSON.parse(payload))
+                const event = JSON.parse(payload)
+                streamDebug('events_event', {
+                  generation,
+                  event: event?.event,
+                  sessionId: event?.session_id,
+                  status: event?.status,
+                  sessions: event?.event === 'init' ? Object.keys(event?.sessions || {}).length : undefined,
+                })
+                onEvent(event)
               } catch {
                 // skip malformed JSON
               }
@@ -372,8 +529,12 @@ export function subscribeSessionEvents(onEvent, onError) {
         return pump()
       })
       .catch((err) => {
-        if (err.name === 'AbortError' || stopped) return
-        onError?.(err)
+        if (generation !== connectionGeneration || stopped) return
+        clearWatchdog()
+        if (err.name !== 'AbortError') {
+          streamDebug('events_error', { generation, error: String(err) })
+          onError?.(err)
+        }
         scheduleReconnect()
       })
   }
@@ -381,6 +542,8 @@ export function subscribeSessionEvents(onEvent, onError) {
   connect()
   return () => {
     stopped = true
+    connectionGeneration += 1
+    clearWatchdog()
     if (reconnectTimer) clearTimeout(reconnectTimer)
     reconnectTimer = null
     controller?.abort()

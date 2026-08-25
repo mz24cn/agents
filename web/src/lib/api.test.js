@@ -3,7 +3,7 @@
  * Validates: Requirements 6.1–6.6, 4.1, 5.5, 5.6
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { env, sessions } from './api.js'
+import { env, sessions, subscribeSessionStream } from './api.js'
 
 // ---------------------------------------------------------------------------
 // Helper: create a mock fetch that returns the given data with the given status
@@ -52,6 +52,90 @@ describe('env.list', () => {
     vi.stubGlobal('fetch', mockFetch({ error: 'Internal Server Error' }, 500))
 
     await expect(env.list()).rejects.toThrow('Internal Server Error')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// subscribeSessionStream — reconnect and resume by SSE frame id
+// ---------------------------------------------------------------------------
+
+function sseResponse(chunks) {
+  const encoder = new TextEncoder()
+  return new Response(new ReadableStream({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(encoder.encode(chunk))
+      controller.close()
+    },
+  }), { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+}
+
+async function flushPromises() {
+  await Promise.resolve()
+  await Promise.resolve()
+  await Promise.resolve()
+}
+
+describe('subscribeSessionStream', () => {
+  it('reconnects after unexpected EOF and resumes after the last applied frame id', async () => {
+    vi.useFakeTimers()
+    const first = sseResponse([
+      'event: init\ndata: {"active":true,"persisted_seq":4,"latest_seq":5}\n\n',
+      'id: 5\ndata: {"role":"assistant","content":"first"}\n\n',
+    ])
+    const second = sseResponse([
+      'event: init\ndata: {"active":true,"persisted_seq":5,"latest_seq":6}\n\n',
+      'id: 6\ndata: {"role":"assistant","content":"second"}\n\n',
+      'data: [DONE]\n\n',
+    ])
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce(first)
+      .mockResolvedValueOnce(second))
+    const messages = []
+    const done = vi.fn()
+
+    const unsubscribe = subscribeSessionStream('session 1', (msg) => messages.push(msg.content), done, vi.fn())
+    await flushPromises()
+    expect(fetch.mock.calls[0][0]).toBe('/v1/sessions/session%201/stream?after=-1')
+
+    await vi.advanceTimersByTimeAsync(1000)
+    await flushPromises()
+
+    expect(fetch.mock.calls[1][0]).toBe('/v1/sessions/session%201/stream?after=5')
+    expect(messages).toEqual(['first', 'second'])
+    expect(done).toHaveBeenCalledOnce()
+    unsubscribe()
+    vi.useRealTimers()
+  })
+
+  it('uses persisted_seq as the resume baseline if the first connection drops after init', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce(sseResponse([
+        'event: init\ndata: {"active":true,"persisted_seq":9,"latest_seq":9}\n\n',
+      ]))
+      .mockResolvedValueOnce(sseResponse(['data: [DONE]\n\n'])))
+
+    const unsubscribe = subscribeSessionStream('session-2', vi.fn(), vi.fn(), vi.fn())
+    await flushPromises()
+    await vi.advanceTimersByTimeAsync(1000)
+    await flushPromises()
+
+    expect(fetch.mock.calls[1][0]).toBe('/v1/sessions/session-2/stream?after=9')
+    unsubscribe()
+    vi.useRealTimers()
+  })
+
+  it('cancels a pending reconnect when unsubscribed', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(sseResponse([])))
+
+    const unsubscribe = subscribeSessionStream('session-3', vi.fn(), vi.fn(), vi.fn())
+    await flushPromises()
+    unsubscribe()
+    await vi.advanceTimersByTimeAsync(1000)
+
+    expect(fetch).toHaveBeenCalledOnce()
+    vi.useRealTimers()
   })
 })
 

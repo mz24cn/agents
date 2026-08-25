@@ -366,6 +366,25 @@ _session_streams: dict[str, dict] = {}
 _flight_sessions: set[str] = set()
 
 
+def _session_stream_debug_enabled() -> bool:
+    return os.environ.get("SESSION_STREAM_DEBUG", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _session_stream_frame_summary(frame: dict) -> str:
+    """Compact description for stream diagnostics without logging payloads."""
+    tool_calls = frame.get("tool_calls") or []
+    return (
+        f"role={frame.get('role')} type={frame.get('type')} name={frame.get('name')} "
+        f"streaming={frame.get('streaming')} tool_use_id={frame.get('tool_use_id')} "
+        f"agent={frame.get('agent_id') or frame.get('assistant_id')} "
+        f"target={frame.get('target_agent_id')} content={len(frame.get('content') or '')} "
+        f"delta={len(frame.get('delta') or '')} thinking={len(frame.get('thinking') or '')} "
+        f"tool_calls={len(tool_calls)}"
+    )
+
+
 def _cancel_unobserved_stream_locked(session_id: str, stream: dict) -> bool:
     """Cancel an active non-flight stream after its last browser disconnects.
 
@@ -410,6 +429,12 @@ def publish_session_stream_frame(session_id: Optional[str], frame: dict) -> int:
         envelope = {"seq": seq, "frame": frame}
         stream["frames"].append(envelope)
         subscribers = list(stream["subscribers"])
+        if _session_stream_debug_enabled():
+            logging.getLogger("runtime.server").warning(
+                "session_stream publish sid=%s seq=%s persisted=%s subscribers=%s starter=%s %s",
+                session_id, seq, stream["persisted_seq"], len(subscribers),
+                stream["starter_connected"], _session_stream_frame_summary(frame),
+            )
     dead = []
     for send_fn in subscribers:
         try:
@@ -425,6 +450,11 @@ def publish_session_stream_frame(session_id: Optional[str], frame: dict) -> int:
                 current["subscribers"] = [fn for fn in current["subscribers"] if fn not in dead]
                 if len(current["subscribers"]) != previous_count:
                     _cancel_unobserved_stream_locked(session_id, current)
+                    if _session_stream_debug_enabled():
+                        logging.getLogger("runtime.server").warning(
+                            "session_stream removed_dead sid=%s dead=%s subscribers=%s",
+                            session_id, len(dead), len(current["subscribers"]),
+                        )
     return seq
 
 
@@ -535,6 +565,13 @@ def register_session_stream_with_snapshot(session_id: str, send_fn, after_seq: i
             "latest_seq": stream["next_seq"] - 1,
             "frames": [item.copy() for item in stream["frames"] if item["seq"] > effective_after],
         }
+        if _session_stream_debug_enabled():
+            logging.getLogger("runtime.server").warning(
+                "session_stream register sid=%s requested_after=%s effective_after=%s active=%s "
+                "persisted=%s latest=%s replay=%s subscribers=%s",
+                session_id, after_seq, effective_after, registered, stream["persisted_seq"],
+                snapshot["latest_seq"], len(snapshot["frames"]), len(stream["subscribers"]),
+            )
         return registered, snapshot
 
 
@@ -807,6 +844,11 @@ def _broadcast_session_event(session_id: str, event_type: str, data: dict) -> No
     # Take snapshot of subscriber list under lock
     with _session_state_lock:
         subscribers_snapshot = list(_session_event_subscribers)
+    if _session_stream_debug_enabled():
+        logging.getLogger("runtime.server").warning(
+            "session_events publish sid=%s event=%s status=%s subscribers=%s",
+            session_id, event_type, data.get("status"), len(subscribers_snapshot),
+        )
 
     dead: list = []
     for send_fn in subscribers_snapshot:

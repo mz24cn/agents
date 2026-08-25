@@ -1353,11 +1353,13 @@ class HandlerApiMixin:
              active (streaming) sessions and all unread sessions combined.
           2. Subsequently send `message` events for every status change.
 
-        No heartbeat. Write failure removes the subscriber.
+        A periodic heartbeat keeps proxies from silently dropping this otherwise
+        idle control stream. Write failure removes the subscriber.
         """
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Cache-Control", "no-cache, no-transform")
+        self.send_header("X-Accel-Buffering", "no")
         self.send_header("Connection", "close")
         self.end_headers()
         # SSE streams are not keep-alive compatible: close the connection when
@@ -1389,6 +1391,14 @@ class HandlerApiMixin:
                 if sid not in snapshot:
                     snapshot[sid] = st
             _session_event_subscribers.append(_send)
+            event_subscriber_count = len(_session_event_subscribers)
+        if os.environ.get("SESSION_STREAM_DEBUG", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }:
+            logger.warning(
+                "session_events http_open subscribers=%s snapshot=%s",
+                event_subscriber_count, len(snapshot),
+            )
 
         # Events broadcast after the snapshot are now already queued. Send the
         # baseline first, then drain the queue in normal order.
@@ -1413,8 +1423,10 @@ class HandlerApiMixin:
                 try:
                     frame = event_q.get(timeout=30)  # block up to 30s
                 except _queue.Empty:
-                    # No events for 30s — just loop; no heartbeat per spec
-                    continue
+                    # The global status stream can be idle for a long time. A
+                    # comment heartbeat both prevents proxy idle eviction and
+                    # makes a dead browser detectable before the next status.
+                    frame = ": keepalive\n\n"
                 try:
                     self.wfile.write(frame.encode("utf-8") if isinstance(frame, str) else frame)
                     self.wfile.flush()
@@ -1441,6 +1453,10 @@ class HandlerApiMixin:
         self.end_headers()
         self.close_connection = True
 
+        stream_debug = os.environ.get("SESSION_STREAM_DEBUG", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        connection_id = uuid.uuid4().hex[:8]
         import queue as _queue
         event_q: _queue.Queue = _queue.Queue(maxsize=4096)
 
@@ -1449,6 +1465,10 @@ class HandlerApiMixin:
                 event_q.put_nowait(envelope)
                 return True
             except _queue.Full:
+                logger.warning(
+                    "session_stream queue_full conn=%s sid=%s qsize=%s",
+                    connection_id, session_id, event_q.qsize(),
+                )
                 return False
 
         # Register and snapshot under one lock so no frame can fall into the
@@ -1461,6 +1481,12 @@ class HandlerApiMixin:
             "persisted_seq": snapshot["persisted_seq"],
             "latest_seq": snapshot["latest_seq"],
         }
+        if stream_debug:
+            logger.warning(
+                "session_stream http_open conn=%s sid=%s after=%s active=%s persisted=%s latest=%s replay=%s",
+                connection_id, session_id, after_seq, snapshot["active"],
+                snapshot["persisted_seq"], snapshot["latest_seq"], len(snapshot["frames"]),
+            )
         try:
             self.wfile.write(f"event: init\ndata: {json.dumps(init, ensure_ascii=False)}\n\n".encode("utf-8"))
             for item in snapshot["frames"]:
@@ -1493,6 +1519,11 @@ class HandlerApiMixin:
                 if item["seq"] <= replay_latest:
                     continue
                 self.wfile.write(f"id: {item['seq']}\ndata: {json.dumps(item['frame'], ensure_ascii=False)}\n\n".encode("utf-8"))
+                if stream_debug:
+                    logger.warning(
+                        "session_stream http_write conn=%s sid=%s seq=%s qsize=%s",
+                        connection_id, session_id, item["seq"], event_q.qsize(),
+                    )
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass

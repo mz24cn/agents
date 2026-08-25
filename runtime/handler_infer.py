@@ -5,6 +5,7 @@ Part of the ``_RuntimeRequestHandler`` decomposition in ``runtime.server``.
 Zero third-party dependencies — only Python standard library.
 """
 
+import copy
 import json
 import logging
 import os
@@ -27,6 +28,7 @@ from runtime.server_state import (
     begin_session_stream,
     disconnect_session_stream_starter,
     finish_session_stream,
+    get_terminal_for_session,
     mark_session_stream_persisted,
     merge_stream_messages,
     publish_session_stream_frame,
@@ -34,6 +36,24 @@ from runtime.server_state import (
 )
 
 logger = logging.getLogger("runtime.server")
+
+
+def _add_exec_cli_for_open_terminal(
+    tool_ids: list[str],
+    session_id: Optional[str],
+    is_group_chat: bool,
+) -> list[str]:
+    """Expose exec_cli when a single-agent session already has an open terminal.
+
+    The terminal must already exist: inference preparation must not create one.
+    Preserve the caller's tool selection unchanged when exec_cli is already
+    present, and never auto-enable it for group chats.
+    """
+    if is_group_chat or not session_id or "exec_cli" in tool_ids:
+        return tool_ids
+    if get_terminal_for_session(session_id) is None:
+        return tool_ids
+    return [*tool_ids, "exec_cli"]
 
 
 def _stream_batch_is_protocol_complete(messages: list[Message]) -> bool:
@@ -118,28 +138,35 @@ class HandlerInferMixin:
             body["model_id"] = agent["model_id"]
             body["tool_ids"] = agent.get("tool_ids", [])
 
-        # === @-mention parsing (before system prompt prepend, so we know
+        # === Group-chat routing (before system prompt prepend, so we know
         #     whether this is group chat or single-agent) ===
         mentioned_agent_ids: list[str] = []
         if is_continue and retry_agent_id:
             mentioned_agent_ids = [retry_agent_id]
         elif len(agent_ids) > 1:
-            from runtime.group_chat import parse_mentions, resolve_mentions
+            from runtime.group_chat import route_group_chat_user_message
             raw_messages = body.get("messages", [])
-            for m in reversed(raw_messages):
+            for index in range(len(raw_messages) - 1, -1, -1):
+                m = raw_messages[index]
                 if m.get("role") == "user":
-                    mentions = parse_mentions(m.get("content", ""))
-                    if mentions:
-                        resolved = resolve_mentions(
-                            mentions,
-                            self.server.agent_manager,  # type: ignore[attr-defined]
-                            agent_ids,
-                        )
-                        mentioned_agent_ids = resolved
-                    else:
-                        # No @ → broadcast to all agents
-                        mentioned_agent_ids = list(agent_ids)
+                    prior_turns = raw_messages[:index]
+                    raw_sid = body.get("session_id") or None
+                    if raw_sid not in (None, "new"):
+                        try:
+                            prior_turns = self.server.context_manager.load_conversation(  # type: ignore[attr-defined]
+                                raw_sid
+                            )
+                        except (FileNotFoundError, OSError, ValueError):
+                            pass
+                    mentioned_agent_ids = route_group_chat_user_message(
+                        m.get("content", ""),
+                        self.server.agent_manager,  # type: ignore[attr-defined]
+                        agent_ids,
+                        prior_turns,
+                    )
                     break
+            # Compatibility fallback for malformed requests without a user
+            # message, or explicit @mentions that resolve to no participant.
             if not mentioned_agent_ids:
                 mentioned_agent_ids = list(agent_ids)
 
@@ -327,13 +354,26 @@ class HandlerInferMixin:
                 self._send_json_error(500, f"Failed to assemble context: {exc}")
                 return None
 
-        tool_ids = body.get("tool_ids", [])
+        # Render request-scoped AGENTS/TOOLS values on an inference-only copy.
+        # The unmodified messages remain suitable for conversation persistence.
+        if assembled_messages is not None:
+            assembled_messages = copy.deepcopy(assembled_messages)
+
+        tool_ids = list(body.get("tool_ids", []))
+        tool_ids = _add_exec_cli_for_open_terminal(
+            tool_ids,
+            session_id,
+            is_group_chat,
+        )
+        # Keep the normalized/augmented selection on the request body so retry
+        # logging and conversation metadata reflect the actual inference tools.
+        body["tool_ids"] = tool_ids
         has_delegate = "delegate" in tool_ids
         has_talk_to = "talk_to" in tool_ids
 
         tool_scope: list = []
         # --- TOOLS 占位符（delegate 专用）---
-        if has_delegate and len(tool_ids) > 1:
+        if has_delegate:
             runtime = self._get_runtime()
             mcp_by_server: dict[str, list[str]] = {}
             non_mcp_rows: list[tuple[str, str]] = []
@@ -362,7 +402,7 @@ class HandlerInferMixin:
             else:
                 tools_markdown = ""
 
-            if tools_markdown and assembled_messages:
+            if assembled_messages:
                 for msg in assembled_messages:
                     if msg.role == "system":
                         # Merged system messages already carry resolved
@@ -374,8 +414,9 @@ class HandlerInferMixin:
                         else:
                             if msg.arguments is None:
                                 msg.arguments = {}
-                            if not msg.arguments.get("TOOLS"):
-                                msg.arguments["TOOLS"] = tools_markdown
+                            # The frontend's current selection is authoritative;
+                            # overwrite arguments persisted from an older turn.
+                            msg.arguments["TOOLS"] = tools_markdown
                         break
 
         # --- AGENTS 占位符（talk_to 专用）---
@@ -395,8 +436,9 @@ class HandlerInferMixin:
                         else:
                             if msg.arguments is None:
                                 msg.arguments = {}
-                            if not msg.arguments.get("AGENTS"):
-                                msg.arguments["AGENTS"] = agents_markdown
+                            # The frontend's current roster is authoritative;
+                            # overwrite arguments persisted from an older turn.
+                            msg.arguments["AGENTS"] = agents_markdown
                         break
 
         request = InferenceRequest(
@@ -419,6 +461,7 @@ class HandlerInferMixin:
             user_message_timestamp=user_message_timestamp,
             depth=0,
             tool_scope=tool_scope,
+            available_tool_ids=tool_ids,
             context_manager=context_manager,
             session_manager=self.server.session_manager,  # type: ignore[attr-defined]
             agent_manager=self.server.agent_manager,  # type: ignore[attr-defined]
@@ -449,6 +492,7 @@ class HandlerInferMixin:
         clear_request_context([
             "sse_callback", "cancel_event", "session_id", "session_dir",
             "user_message_timestamp", "depth", "tool_scope",
+            "available_tool_ids",
             "context_manager", "session_manager", "agent_manager", "workspace",
             "agent_id", "agent_ids", "all_agent_ids", "mentioned_agent_ids",
             "file_journal_session_id", "file_journal_session_dir",
@@ -660,11 +704,6 @@ class HandlerInferMixin:
         if is_group_chat:
             init_payload["group_chat"] = True
             init_payload["mentioned_agent_ids"] = mentioned_for_init
-        # 发送 event: init 帧
-        self.wfile.write(f"event: init\ndata: {json.dumps(init_payload, ensure_ascii=False)}\n\n".encode("utf-8"))
-        self.wfile.flush()
-        # ================================
-
         cancel_event = threading.Event()
         runtime = self._get_runtime()
         collected_messages: list[Message] = []
@@ -674,6 +713,9 @@ class HandlerInferMixin:
         sse_write_lock = threading.Lock()
         client_connected = True
         latest_stream_seq = 0
+        stream_debug = os.environ.get("SESSION_STREAM_DEBUG", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
         if session_id is not None:
             begin_session_stream(session_id, cancel_event)
             # Continue has already removed the persisted final assistant turn.
@@ -706,6 +748,14 @@ class HandlerInferMixin:
                     user_frame["mentions"] = mentioned_for_init
                 latest_stream_seq = publish_session_stream_frame(session_id, user_frame)
 
+        # The starter consumes the same retained sequence space as every GET
+        # subscriber. Expose the baseline before the first mirrored frame so it
+        # can hand off to GET /sessions/{id}/stream without duplicates.
+        init_payload["stream_seq"] = latest_stream_seq
+        self.wfile.write(f"event: init\ndata: {json.dumps(init_payload, ensure_ascii=False)}\n\n".encode("utf-8"))
+        self.wfile.flush()
+        # ================================
+
         def _write_sse_payload(payload: bytes) -> None:
             with sse_write_lock:
                 self.wfile.write(payload)
@@ -734,8 +784,19 @@ class HandlerInferMixin:
             if not client_connected:
                 return True
             try:
+                if stream_debug:
+                    logger.warning(
+                        "session_stream starter_write_begin sid=%s seq=%s role=%s name=%s streaming=%s tool_use_id=%s",
+                        session_id, latest_stream_seq, frame.get("role"), frame.get("name"),
+                        frame.get("streaming"), frame.get("tool_use_id"),
+                    )
                 event_data = json.dumps(frame, ensure_ascii=False)
-                _write_sse_payload(f"data: {event_data}\n\n".encode("utf-8"))
+                _write_sse_payload(f"id: {latest_stream_seq}\ndata: {event_data}\n\n".encode("utf-8"))
+                if stream_debug:
+                    logger.warning(
+                        "session_stream starter_write_end sid=%s seq=%s",
+                        session_id, latest_stream_seq,
+                    )
             except Exception as exc:
                 _mark_starter_disconnected(exc)
             return True

@@ -112,6 +112,37 @@ def test_runtime_execution_layer_allows_talk_to_other_agent():
     assert calls == [(["coder"], "help")]
 
 
+def test_runtime_execution_layer_rejects_agent_removed_from_current_roster():
+    manager = FakeAgentManager([
+        _agent("dev-manager", "DevManager"),
+        _agent("coder", "Coder"),
+        _agent("removed", "Removed"),
+    ])
+    calls = []
+    registry = ToolRegistry()
+    registry.register(
+        TALK_TO_TOOL_CONFIG,
+        callable_fn=lambda agents, message: calls.append((agents, message)) or "called",
+    )
+    runtime = Runtime(ModelRegistry(), registry)
+    set_request_context(
+        agent_manager=manager,
+        agent_id="dev-manager",
+        all_agent_ids=["dev-manager", "coder"],
+    )
+    try:
+        result, _ = runtime._execute_tool_call(
+            "talk_to",
+            {"agents": ["Removed"], "message": "help"},
+            tool_scope=[TALK_TO_TOOL_CONFIG],
+        )
+    finally:
+        clear_request_context(list(_thread_local.__dict__.keys()))
+
+    assert calls == []
+    assert "does not exist in the current conversation or has left" in result
+
+
 def test_talk_to_child_context_uses_target_identity_and_excludes_target_from_roster():
     runtime = RecordingRuntime()
     manager = FakeAgentManager([

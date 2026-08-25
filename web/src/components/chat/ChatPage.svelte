@@ -47,8 +47,93 @@
   // retained GET /v1/sessions/{id}/stream subscription, otherwise every frame
   // is applied twice with two independent aIdxRef instances.
   let directlyConsumedSessions = new Set()
+  let directStreamLastSeq = new Map()
   let backendStreamingSessions = new Set()
   function storeKey(sid) { return sid || '__new__' }
+
+  function streamUiDebug(event, details = {}) {
+    try {
+      if (localStorage.getItem('session_stream_debug') !== '1') return
+      const structural = details.streaming === false
+        || details.role === 'usage'
+        || details.role === 'system'
+        || details.role === 'user'
+      if (!structural) return
+      console.warn(`[session-stream-ui] ${event}`, {
+        at: new Date().toISOString(),
+        viewedSessionId: sessionId,
+        ...details,
+      })
+    } catch { /* diagnostics must never affect rendering */ }
+  }
+
+  function canMergeStreamFrames(previous, next) {
+    if (!previous || !next || previous.role !== next.role) return false
+    if (next.role === 'assistant') {
+      return !previous.tool_calls && !next.tool_calls
+        && (previous.agent_id || previous.assistant_id || '') === (next.agent_id || next.assistant_id || '')
+    }
+    if (next.role === 'tool' && previous.streaming === true && next.streaming === true) {
+      return previous.name === next.name
+        && getToolUseId(previous) === getToolUseId(next)
+        && (previous.agent_id || '') === (next.agent_id || '')
+        && (previous.target_agent_id || '') === (next.target_agent_id || '')
+    }
+    return false
+  }
+
+  function mergeStreamFrame(previous, next) {
+    if (next.role === 'assistant') {
+      return {
+        ...previous,
+        ...next,
+        content: (previous.content || '') + (next.content || ''),
+        thinking: (previous.thinking || '') + (next.thinking || ''),
+      }
+    }
+    return {
+      ...previous,
+      ...next,
+      delta: (previous.delta || '') + (next.delta || ''),
+    }
+  }
+
+  // Network readers can deliver thousands of one-character frames faster than
+  // Svelte/Markdown can render them. Apply at most once per animation frame so
+  // the browser remains responsive and commits one DOM update for each batch.
+  function createStreamFrameBatcher(onFrame) {
+    let queue = []
+    let scheduled = false
+    let afterDrain = []
+    const schedule = () => {
+      if (scheduled) return
+      scheduled = true
+      if (typeof requestAnimationFrame === 'function') requestAnimationFrame(flush)
+      else setTimeout(flush, 0)
+    }
+    const flush = () => {
+      scheduled = false
+      const pending = queue
+      queue = []
+      const merged = []
+      for (const frame of pending) {
+        const last = merged.at(-1)
+        if (canMergeStreamFrames(last, frame)) merged[merged.length - 1] = mergeStreamFrame(last, frame)
+        else merged.push(frame)
+      }
+      for (const frame of merged) onFrame(frame)
+      if (queue.length) schedule()
+      else {
+        const callbacks = afterDrain
+        afterDrain = []
+        for (const callback of callbacks) callback()
+      }
+    }
+    return {
+      push(frame) { queue.push(frame); schedule() },
+      then(callback) { afterDrain.push(callback); schedule() },
+    }
+  }
 
   function markSessionDirectlyConsumed(sid) {
     if (!sid) return
@@ -63,26 +148,52 @@
     }
   }
 
-  function subscribeToExistingSession(sid) {
-    if (!sid || directlyConsumedSessions.has(sid) || sessionStreamSubscriptions[sid]) return
+  function subscribeToExistingSession(sid, { handoff = false } = {}) {
+    if (!sid || (!handoff && directlyConsumedSessions.has(sid)) || sessionStreamSubscriptions[sid]) return
+    if (handoff) directlyConsumedSessions.delete(sid)
     const keyRef = { key: sid }
     const aIdxRef = { value: -1, groupMode: false, groupMap: {} }
+    const frameBatcher = createStreamFrameBatcher((msg) => onStreamMsg(msg, aIdxRef, null, keyRef))
     const existing = sessionStore[sid]
     const agentIds = new Set((existing?.messages || []).filter(m => m.role === 'assistant').map(m => m.agent_id).filter(Boolean))
     aIdxRef.groupMode = agentIds.size > 1
-    sessionStreamSubscriptions[sid] = subscribeSessionStream(
+    let unsubscribe = null
+    unsubscribe = subscribeSessionStream(
       sid,
-      (msg) => onStreamMsg(msg, aIdxRef, null, keyRef),
+      (msg) => frameBatcher.push(msg),
       () => {
-        onStreamDone(keyRef)
-        sessionStreamSubscriptions[sid]?.()
-        delete sessionStreamSubscriptions[sid]
+        frameBatcher.then(() => {
+          // A retained GET can legitimately observe an inactive snapshot and
+          // receive [DONE] immediately. If inference starts before this queued
+          // callback runs, the status event sees the still-registered old
+          // subscription and cannot open the live one. Remove only this exact
+          // subscription, then re-check authoritative backend status.
+          if (sessionStreamSubscriptions[sid] === unsubscribe) {
+            unsubscribe?.()
+            delete sessionStreamSubscriptions[sid]
+          }
+          if (backendStreamingSessions.has(sid)) {
+            const store = sessionStore[sid]
+            if (store) {
+              store.isStreaming = true
+              store.streamConnection = 'connecting'
+            }
+            setTimeout(() => {
+              if (backendStreamingSessions.has(sid) && !sessionStreamSubscriptions[sid]) {
+                subscribeToExistingSession(sid)
+              }
+            }, 0)
+          } else {
+            onStreamDone(keyRef)
+          }
+        })
       },
       (err) => {
-        delete sessionStreamSubscriptions[sid]
-        // Keep backend streaming state intact; status SSE will decide completion.
+        // subscribeSessionStream retries recoverable EOF/read/network errors and
+        // resumes from the last applied frame sequence. Keep this subscription
+        // registered so status events cannot create a duplicate consumer.
         const store = sessionStore[sid]
-        if (store) store.streamConnection = 'disconnected'
+        if (store) store.streamConnection = 'reconnecting'
         errorMsg = err?.message || t('streamError')
       },
       (init) => {
@@ -91,9 +202,11 @@
           store.isStreaming = !!init.active
           store.streamConnection = init.active ? 'connected' : 'done'
         }
+        errorMsg = ''
       },
-      -1,
+      handoff ? (directStreamLastSeq.get(sid) ?? -1) : -1,
     )
+    sessionStreamSubscriptions[sid] = unsubscribe
   }
 
   function migrateSessionStoreKey(oldKey, newKey) {
@@ -570,6 +683,8 @@
       if (initData.session_id) {
         migrateKey(initData.session_id)
         markSessionDirectlyConsumed(initData.session_id)
+        const seq = Number(initData.stream_seq)
+        if (Number.isFinite(seq)) directStreamLastSeq.set(initData.session_id, seq)
         sessionId = initData.session_id
         currentSession.sessionId = initData.session_id
       }
@@ -621,16 +736,21 @@
     // retained session stream in the meantime.
     if (sessionId) markSessionDirectlyConsumed(sessionId)
 
+    const frameBatcher = createStreamFrameBatcher((msg) => onStreamMsg(msg, aIdxRef, pendingFirstUserMsg, keyRef))
     inferStream(
       reqBody,
-      (msg) => onStreamMsg(msg, aIdxRef, pendingFirstUserMsg, keyRef),
+      (msg) => frameBatcher.push(msg),
       // Keep direct ownership until the authoritative done_* status event.
       // [DONE] is sent before the backend has necessarily finished persistence,
       // broker shutdown, and status broadcasting; releasing here can make the
       // still-"streaming" status handler subscribe and replay tail frames.
-      () => onStreamDone(keyRef),
-      (err) => onStreamErr(err, keyRef),
+      () => frameBatcher.then(() => onStreamDone(keyRef)),
+      (err) => frameBatcher.then(() => onStreamErr(err, keyRef)),
       onInit,
+      (seq) => {
+        const sid = keyRef.key === '__new__' ? null : keyRef.key
+        if (sid) directStreamLastSeq.set(sid, seq)
+      },
     )
   }
 
@@ -712,6 +832,16 @@
   }
 
   function onStreamMsg(msg, aIdxRef, pendingFirstUserMsg, keyRef) {
+    streamUiDebug('apply_begin', {
+      storeKey: keyRef.key,
+      role: msg?.role,
+      name: msg?.name,
+      streaming: msg?.streaming,
+      toolUseId: msg?.tool_use_id,
+      targetAgentId: msg?.target_agent_id,
+      currentMessages: sessionStore[keyRef.key]?.messages?.length,
+      aIdx: aIdxRef.value,
+    })
     if (msg.session_id && !msg.role) {
       // Migrate store key if backend assigns a new session ID mid-stream
       keyRef.key = migrateSessionStoreKey(keyRef.key, msg.session_id)
@@ -968,6 +1098,13 @@
         }
       } catch (_) {}
     }
+    streamUiDebug('apply_end', {
+      storeKey: keyRef.key,
+      role: msg?.role,
+      name: msg?.name,
+      messages: sessionStore[keyRef.key]?.messages?.length,
+      aIdx: aIdxRef.value,
+    })
   }
 
   function onStreamDone(keyRef) {
@@ -1052,19 +1189,22 @@
   }
 
   function onStreamErr(err, keyRef) {
+    const sid = keyRef.key === '__new__' ? null : keyRef.key
     const store = sessionStore[keyRef.key]
+    if (sid) {
+      // POST is only the initiator transport. If it drops after init, hand the
+      // first browser over to the resumable retained GET stream. GET will send
+      // [DONE] immediately when the conversation already finished meanwhile.
+      if (store) {
+        store.isStreaming = true
+        store.streamConnection = 'reconnecting'
+      }
+      errorMsg = ''
+      subscribeToExistingSession(sid, { handoff: true })
+      return
+    }
     if (store) store.isStreaming = false
     errorMsg = err?.message || t('streamError')
-    // If the errored stream belongs to the currently viewed session:
-    // - at bottom → mark read immediately
-    // - not at bottom → set needsRead so it gets marked when user scrolls down
-    if (keyRef.key === sessionId) {
-      if (isAtBottom) {
-        markSessionRead(sessionId)
-      } else {
-        needsRead = true
-      }
-    }
   }
 
   function applyRevokeSuccess(timestamp) {
@@ -1445,6 +1585,7 @@
           else if (data.status.startsWith('done_')) {
             backendStreamingSessions.delete(sid)
             directlyConsumedSessions.delete(sid)
+            directStreamLastSeq.delete(sid)
           }
           if (s && data.status === 'streaming') {
             s.isStreaming = true

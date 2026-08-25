@@ -41,6 +41,66 @@ def _get_model_api_timeout() -> int:
         return 300
 
 
+# Model transport retries are deliberately implemented below the inference/tool
+# loop.  A retry therefore re-sends only the current model request and never
+# repeats an already executed tool call.  MODEL_API_MAX_RETRIES is the number
+# of additional attempts after the first request.
+def _get_model_api_max_retries() -> int:
+    """Return the number of transient model API retries (default: 2)."""
+    try:
+        return max(0, int(os.environ.get("MODEL_API_MAX_RETRIES", "2")))
+    except (TypeError, ValueError):
+        return 2
+
+
+def _get_model_api_retry_delay() -> float:
+    """Return the initial exponential-backoff delay in seconds (default: 1)."""
+    try:
+        return max(0.0, float(os.environ.get("MODEL_API_RETRY_DELAY", "1")))
+    except (TypeError, ValueError):
+        return 1.0
+
+
+_RETRYABLE_MODEL_HTTP_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+
+def _is_timeout_error(exc: BaseException) -> bool:
+    """Recognize direct and urllib-wrapped socket timeout failures."""
+    reason = getattr(exc, "reason", exc)
+    return (
+        isinstance(exc, (socket.timeout, TimeoutError))
+        or isinstance(reason, (socket.timeout, TimeoutError))
+        or "timed out" in str(reason).lower()
+        or "timeout" in str(reason).lower()
+    )
+
+
+def _is_retryable_model_error(exc: BaseException) -> bool:
+    """Whether a model transport failure is safe to retry before output."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in _RETRYABLE_MODEL_HTTP_CODES
+    if isinstance(exc, (urllib.error.URLError, ConnectionError, socket.timeout, TimeoutError)):
+        return True
+    return _is_timeout_error(exc)
+
+
+def _wait_model_retry(attempt: int, cancel_event: Optional[object] = None) -> bool:
+    """Wait before retrying; return False if cancellation was requested.
+
+    ``attempt`` is 1 for the first retry, producing delays of base, 2*base,
+    4*base, ... .  The short polling interval keeps streaming abort responsive.
+    """
+    delay = _get_model_api_retry_delay() * (2 ** max(0, attempt - 1))
+    deadline = time.monotonic() + delay
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return True
+        time.sleep(min(remaining, 0.2))
+
+
 def _get_tool_exec_timeout() -> Optional[float]:
     """Return TOOL_EXEC_TIMEOUT (seconds), read dynamically each call.
 
@@ -90,6 +150,8 @@ def _get_effective_tool_exec_timeout(
     base = _get_tool_exec_timeout()
     if base is None:
         return None
+    if "slow-execution" in (tool_config.labels or []):
+        return base * 5
     if "long-execution" in (tool_config.labels or []):
         return base * 200
     if not isinstance(arguments, dict) or "timeout" not in arguments:
@@ -291,7 +353,7 @@ def _prepare_reasoning_for_tool_rounds(
     Some thinking-mode providers require every assistant message in the active
     tool round to carry its reasoning field when tool results are submitted.
     Apply that compatibility repair only when the model opts in through the
-    ``require-reasoning-for-tool-rounds`` label and the current history ends in
+    ``require-thinking`` label and the current history ends in
     a tool result.
 
     Repaired assistant messages are shallow copies.  The conversation's source
@@ -301,7 +363,7 @@ def _prepare_reasoning_for_tool_rounds(
     if (
         not messages
         or messages[-1].role != "tool"
-        or "require-reasoning-for-tool-rounds" not in (model_config.labels or [])
+        or "require-thinking" not in (model_config.labels or [])
     ):
         return messages
 
@@ -437,12 +499,16 @@ class Runtime:
                 if msg.timestamp is None:
                     msg.timestamp = _now_iso()
                 if (
-                    not msg.content
-                    and msg.prompt_template is not None
+                    msg.prompt_template is not None
                     and self._prompt_template_manager is not None
                 ):
                     template = self._prompt_template_manager.get(msg.prompt_template)
                     if template is not None:
+                        # Re-render template-backed messages on every inference.
+                        # A persisted message may still contain content rendered
+                        # with the previous turn's AGENTS/TOOLS arguments.  The
+                        # current request is authoritative for those dynamic
+                        # placeholders, so cached rendered content must not win.
                         content = template.content
                         if msg.arguments:
                             for key, value in msg.arguments.items():
@@ -657,56 +723,85 @@ class Runtime:
                 stream=False,
             )
 
-            # Send HTTP request
+            # Send HTTP request. Transient failures are retried here, below
+            # the tool loop, so an already completed tool invocation is never
+            # repeated. Non-streaming calls cannot have exposed model output
+            # before urlopen/read completes, making the whole request retry-safe.
             round_start = time.monotonic()
             api_timeout = _get_model_api_timeout()
-            try:
-                headers.setdefault("User-Agent", _DEFAULT_USER_AGENT)
-                http_req = urllib.request.Request(
-                    url, data=body_bytes, headers=headers, method="POST"
-                )
-                with urllib.request.urlopen(http_req, timeout=api_timeout) as http_resp:
-                    response_data = http_resp.read()
-            except urllib.error.HTTPError as exc:
-                error_body = ""
+            max_retries = _get_model_api_max_retries()
+            headers.setdefault("User-Agent", _DEFAULT_USER_AGENT)
+            http_req = urllib.request.Request(
+                url, data=body_bytes, headers=headers, method="POST"
+            )
+            for attempt in range(max_retries + 1):
                 try:
-                    error_body = exc.read().decode("utf-8", errors="replace")
-                except Exception:
-                    pass
-                _logger.error(
-                    "infer HTTP error | url=%s code=%s reason=%s body=%s",
-                    url, exc.code, exc.reason, error_body[:2000],
-                )
-                return InferenceResult(
-                    success=False,
-                    messages=messages,
-                    error=f"HTTP {exc.code}: {exc.reason}. {error_body}".strip(),
-                    error_code=str(exc.code),
-                )
-            except urllib.error.URLError as exc:
-                reason = getattr(exc, "reason", exc)
-                is_timeout = isinstance(reason, socket.timeout) or "timed out" in str(reason).lower()
-                if is_timeout:
-                    _logger.error("infer timeout | url=%s timeout=%ds", url, api_timeout)
+                    with urllib.request.urlopen(http_req, timeout=api_timeout) as http_resp:
+                        response_data = http_resp.read()
+                    break
+                except urllib.error.HTTPError as exc:
+                    error_body = ""
+                    try:
+                        error_body = exc.read().decode("utf-8", errors="replace")
+                    except Exception:
+                        pass
+                    if _is_retryable_model_error(exc) and attempt < max_retries:
+                        _logger.warning(
+                            "infer transient HTTP error; retrying | url=%s code=%s "
+                            "attempt=%d/%d body=%s",
+                            url, exc.code, attempt + 1, max_retries, error_body[:500],
+                        )
+                        _wait_model_retry(attempt + 1)
+                        continue
+                    _logger.error(
+                        "infer HTTP error | url=%s code=%s reason=%s body=%s",
+                        url, exc.code, exc.reason, error_body[:2000],
+                    )
                     return InferenceResult(
                         success=False,
                         messages=messages,
-                        error=f"Model API request timed out after {api_timeout}s",
-                        error_code="TIMEOUT",
+                        error=f"HTTP {exc.code}: {exc.reason}. {error_body}".strip(),
+                        error_code=str(exc.code),
                     )
-                return InferenceResult(
-                    success=False,
-                    messages=messages,
-                    error=f"Connection error: {exc.reason}",
-                    error_code="CONNECTION_ERROR",
-                )
-            except Exception as exc:
-                return InferenceResult(
-                    success=False,
-                    messages=messages,
-                    error=f"Request failed: {exc}",
-                    error_code="REQUEST_ERROR",
-                )
+                except (socket.timeout, urllib.error.URLError) as exc:
+                    if _is_retryable_model_error(exc) and attempt < max_retries:
+                        _logger.warning(
+                            "infer transient connection error; retrying | url=%s "
+                            "attempt=%d/%d err=%s",
+                            url, attempt + 1, max_retries, getattr(exc, "reason", exc),
+                        )
+                        _wait_model_retry(attempt + 1)
+                        continue
+                    reason = getattr(exc, "reason", exc)
+                    if _is_timeout_error(exc):
+                        _logger.error("infer timeout | url=%s timeout=%ds", url, api_timeout)
+                        return InferenceResult(
+                            success=False,
+                            messages=messages,
+                            error=f"Model API request timed out after {api_timeout}s",
+                            error_code="TIMEOUT",
+                        )
+                    return InferenceResult(
+                        success=False,
+                        messages=messages,
+                        error=f"Connection error: {reason}",
+                        error_code="CONNECTION_ERROR",
+                    )
+                except Exception as exc:
+                    if _is_retryable_model_error(exc) and attempt < max_retries:
+                        _logger.warning(
+                            "infer transient request error; retrying | url=%s "
+                            "attempt=%d/%d err=%s",
+                            url, attempt + 1, max_retries, exc,
+                        )
+                        _wait_model_retry(attempt + 1)
+                        continue
+                    return InferenceResult(
+                        success=False,
+                        messages=messages,
+                        error=f"Request failed: {exc}",
+                        error_code="REQUEST_ERROR",
+                    )
             net_ms = (time.monotonic() - round_start) * 1000
 
             # Parse response
@@ -916,6 +1011,12 @@ class Runtime:
         tool_config = self._find_tool_by_name(tool_name, scope=tool_scope)
 
         if tool_config is None:
+            if tool_scope is not None:
+                return (
+                    f"Error: specified tool '{tool_name}' is temporarily unavailable "
+                    "(not found in the current tool list).",
+                    None,
+                )
             return f"Error: tool '{tool_name}' not found in registry", None
 
         # --- Compatible argument name correction ---
@@ -1135,10 +1236,14 @@ class Runtime:
             The matching ToolConfig, or None if not found.
         """
         # Search within the request scope first
-        if scope:
+        if scope is not None:
             for tc in scope:
                 if tc.name == tool_name or tc.tool_id == tool_name:
                     return tc
+            # An explicit request scope is an allow-list.  Do not fall back to
+            # the global registry: a model can repeat a tool call seen in old
+            # conversation history after the user has removed that tool.
+            return None
 
         # Fall back: try direct lookup by tool_id in registry
         config = self._tool_registry.get(tool_name)
@@ -1245,12 +1350,22 @@ class Runtime:
             return None
 
         agent_manager = getattr(_thread_local, "agent_manager", None)
+        available_agent_ids = set(
+            getattr(_thread_local, "all_agent_ids", None)
+            or getattr(_thread_local, "agent_ids", None)
+            or []
+        )
         for target in targets:
             target_name = str(target)
             resolved = agent_manager.get(target_name) if agent_manager is not None else None
             target_agent_id = resolved.get("agent_id") if isinstance(resolved, dict) else target_name
             if target_agent_id == caller_agent_id:
                 return "Error: talk_to cannot target the calling agent itself."
+            if available_agent_ids and target_agent_id not in available_agent_ids:
+                return (
+                    f"Error: specified agent '{target_name}' does not exist "
+                    "in the current conversation or has left."
+                )
         return None
 
     def _execute_function_tool(self, tool_config: ToolConfig, arguments: dict) -> str:
@@ -1545,6 +1660,10 @@ class Runtime:
         # the final model round completes. It therefore includes every model
         # request, tool execution, and inter-round throttle delay.
         overall_start = time.monotonic()
+        # Shared retry budget for connection and read/parse failures before the
+        # protocol emits its first model output. It is reset after a model round
+        # completes successfully.
+        pre_output_retry_count = 0
         while True:
             # Check cancel_event before each round (including before model API call)
             # so we don't block on a long urlopen timeout after a forced abort.
@@ -1566,46 +1685,67 @@ class Runtime:
             )
 
             api_timeout = _get_model_api_timeout()
-            try:
-                headers.setdefault("User-Agent", _DEFAULT_USER_AGENT)
-                http_req = urllib.request.Request(
-                    url, data=body_bytes, headers=headers, method="POST")
+            max_retries = _get_model_api_max_retries()
+            headers.setdefault("User-Agent", _DEFAULT_USER_AGENT)
+            http_req = urllib.request.Request(
+                url, data=body_bytes, headers=headers, method="POST")
+            http_resp = None
+            connect_error = None
+            while True:
                 # Capture monotonic and wall-clock values immediately before
-                # sending the HTTP request. Duration math uses monotonic time;
-                # wall time is persisted for clients and conversation history.
+                # each actual send. Retry timing therefore describes the
+                # successful attempt rather than including earlier failures.
                 round_start = time.monotonic()
                 request_started_datetime = datetime.datetime.now()
                 request_started_at = request_started_datetime.isoformat(timespec="microseconds")
-                http_resp = urllib.request.urlopen(http_req, timeout=api_timeout)
-            except urllib.error.HTTPError as exc:
-                error_body = ""
                 try:
-                    error_body = exc.read().decode("utf-8", errors="replace")
-                except Exception:
-                    pass
-                _logger.error(
-                    "infer_stream HTTP error | url=%s code=%s reason=%s body=%s",
-                    url, exc.code, exc.reason, error_body[:2000],
-                )
-                detail = f"HTTP {exc.code}: {exc.reason}"
-                if error_body:
-                    detail += f" | body: {error_body[:500]}"
-                yield Message(role="assistant", timestamp=_now_iso(), content=f"Error: {detail}")
-                return
-            except (socket.timeout, urllib.error.URLError) as exc:
-                # URLError wraps socket.timeout when the underlying socket times out.
-                reason = getattr(exc, "reason", exc)
-                is_timeout = isinstance(reason, socket.timeout) or "timed out" in str(reason).lower()
-                if is_timeout:
+                    http_resp = urllib.request.urlopen(http_req, timeout=api_timeout)
+                    connect_error = None
+                    break
+                except Exception as exc:
+                    connect_error = exc
+                    if (
+                        _is_retryable_model_error(exc)
+                        and pre_output_retry_count < max_retries
+                    ):
+                        pre_output_retry_count += 1
+                        _logger.warning(
+                            "infer_stream transient connection error; retrying | "
+                            "url=%s attempt=%d/%d err=%s",
+                            url, pre_output_retry_count, max_retries,
+                            getattr(exc, "reason", exc),
+                        )
+                        if not _wait_model_retry(pre_output_retry_count, cancel_event):
+                            yield Message(role="assistant", timestamp=_now_iso(),
+                                          content="Error: user interrupted.")
+                            return
+                        continue
+                    break
+
+            if connect_error is not None:
+                exc = connect_error
+                if isinstance(exc, urllib.error.HTTPError):
+                    error_body = ""
+                    try:
+                        error_body = exc.read().decode("utf-8", errors="replace")
+                    except Exception:
+                        pass
+                    _logger.error(
+                        "infer_stream HTTP error | url=%s code=%s reason=%s body=%s",
+                        url, exc.code, exc.reason, error_body[:2000],
+                    )
+                    detail = f"HTTP {exc.code}: {exc.reason}"
+                    if error_body:
+                        detail += f" | body: {error_body[:500]}"
+                    yield Message(role="assistant", timestamp=_now_iso(), content=f"Error: {detail}")
+                elif _is_timeout_error(exc):
                     _logger.error("infer_stream timeout | url=%s timeout=%ds", url, api_timeout)
                     yield Message(role="assistant", timestamp=_now_iso(),
                                   content=f"Error: model API request timed out after {api_timeout}s")
                 else:
+                    reason = getattr(exc, "reason", exc)
                     _logger.error("infer_stream connection error | url=%s err=%s", url, reason)
                     yield Message(role="assistant", timestamp=_now_iso(), content=f"Error: {exc}")
-                return
-            except Exception as exc:
-                yield Message(role="assistant", timestamp=_now_iso(), content=f"Error: {exc}")
                 return
 
             # Stream this round and collect the full assistant message
@@ -1690,11 +1830,40 @@ class Runtime:
                                 else:
                                     accumulated_tool_calls[idx]["arguments"] += tc["arguments"]
             except Exception as exc:
-                yield Message(role="assistant", timestamp=_now_iso(), content=f"Error: stream parse: {exc}")
+                # A streaming request may connect successfully and then fail
+                # while waiting for its first SSE/NDJSON item. Retry only when
+                # absolutely no content, thinking, or tool-call output has been
+                # observed; after first output, replaying could duplicate text
+                # or repeat a model-generated tool call.
+                no_model_output = first_token_time is None
+                if (
+                    no_model_output
+                    and _is_retryable_model_error(exc)
+                    and pre_output_retry_count < max_retries
+                ):
+                    pre_output_retry_count += 1
+                    _logger.warning(
+                        "infer_stream failed before first output; retrying | "
+                        "url=%s attempt=%d/%d err=%s",
+                        url, pre_output_retry_count, max_retries, exc,
+                    )
+                    if not _wait_model_retry(pre_output_retry_count, cancel_event):
+                        yield Message(role="assistant", timestamp=_now_iso(),
+                                      content="Error: user interrupted.")
+                        return
+                    continue
+                if no_model_output and _is_timeout_error(exc):
+                    yield Message(role="assistant", timestamp=_now_iso(),
+                                  content=f"Error: model API request timed out after {api_timeout}s")
+                else:
+                    yield Message(role="assistant", timestamp=_now_iso(),
+                                  content=f"Error: stream parse: {exc}")
                 return
             finally:
                 stream_end_time = time.monotonic()
                 http_resp.close()
+
+            pre_output_retry_count = 0
 
             # net_ms = time from request start to stream fully received
             net_ms = (stream_end_time - round_start) * 1000

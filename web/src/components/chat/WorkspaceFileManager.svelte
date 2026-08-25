@@ -1847,10 +1847,21 @@
     if (!canWriteCurrentDirectory()) return
     const targetDirPath = currentPath
     try {
-      if (navigator.clipboard.read) {
-        const clipboardItems = await navigator.clipboard.read()
+      // navigator.clipboard is unavailable in non-secure contexts (for example
+      // when the UI is opened over plain HTTP on another host). Guard the
+      // object itself before checking read/readText so the action reports a
+      // useful capability error instead of throwing while reading `.read`.
+      const clipboard = typeof navigator !== 'undefined' ? navigator.clipboard : null
+      if (!clipboard) {
+        error = t('clipboardUnavailable')
+        return
+      }
+
+      let textFromItems = ''
+      if (typeof clipboard.read === 'function') {
+        const clipboardItems = await clipboard.read()
         for (const item of clipboardItems) {
-          for (const type of item.types) {
+          for (const type of item.types || []) {
             if (type.startsWith('image/')) {
               const blob = await item.getType(type)
               const ext = type.split('/')[1] || 'png'
@@ -1860,10 +1871,24 @@
             }
           }
         }
+
+        // Some browsers expose read() but not readText(). Reuse a text/plain
+        // clipboard item in that case instead of rejecting a supported paste.
+        for (const item of clipboardItems) {
+          if ((item.types || []).includes('text/plain')) {
+            textFromItems = await (await item.getType('text/plain')).text()
+            if (textFromItems) break
+          }
+        }
       }
-      const text = await navigator.clipboard.readText()
+
+      const text = textFromItems || (
+        typeof clipboard.readText === 'function' ? await clipboard.readText() : ''
+      )
       if (!text) {
-        error = t('clipboardEmpty')
+        error = typeof clipboard.read === 'function' || typeof clipboard.readText === 'function'
+          ? t('clipboardEmpty')
+          : t('clipboardUnavailable')
         return
       }
       const file = new File([text], `pasted-text-${Date.now()}.txt`, { type: 'text/plain' })

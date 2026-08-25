@@ -24,6 +24,7 @@ from runtime.group_chat import (
     run_group_chat_stream_gen,
     parse_mentions,
     resolve_mentions,
+    route_group_chat_user_message,
 )
 
 
@@ -294,6 +295,54 @@ def test_resolve_mentions_by_nickname_and_id():
     assert resolve_mentions(["孙悟空", "猪八戒"], am, ids) == ["SunWuKong", "ZhuBaJie"]
     # unknown mention -> dropped
     assert resolve_mentions(["不存在的人"], am, ids) == []
+
+
+def test_no_mention_routes_to_most_recent_responding_agent():
+    am = FakeAgentManager(AGENTS)
+    ids = ["SunWuKong", "ShaWuJing", "ZhuBaJie"]
+    prior_turns = [
+        Message(role="user", content="@all 都说说"),
+        Message(role="assistant", content="俺老孙先说", agent_id="SunWuKong"),
+        Message(role="assistant", content="我补充一下", agent_id="ShaWuJing"),
+    ]
+
+    assert route_group_chat_user_message(
+        "继续说", am, ids, prior_turns
+    ) == ["ShaWuJing"]
+
+
+def test_explicit_mention_switches_away_from_previous_agent():
+    am = FakeAgentManager(AGENTS)
+    ids = ["SunWuKong", "ShaWuJing", "ZhuBaJie"]
+    prior_turns = [
+        Message(role="assistant", content="我在回答", agent_id="ShaWuJing"),
+    ]
+
+    assert route_group_chat_user_message(
+        "@猪八戒 你来回答", am, ids, prior_turns
+    ) == ["ZhuBaJie"]
+
+
+def test_first_no_mention_routes_only_to_all_leaders():
+    agents = [dict(agent) for agent in AGENTS]
+    agents[0]["labels"] = ["leader"]
+    agents[1]["labels"] = ["reviewer", "leader"]
+    agents[2]["labels"] = []
+    am = FakeAgentManager(agents)
+    ids = ["SunWuKong", "ShaWuJing", "ZhuBaJie"]
+
+    assert route_group_chat_user_message(
+        "大家好", am, ids, []
+    ) == ["SunWuKong", "ShaWuJing"]
+
+
+def test_first_no_mention_without_leader_falls_back_to_all_agents():
+    am = FakeAgentManager(AGENTS)
+    ids = ["SunWuKong", "ShaWuJing", "ZhuBaJie"]
+
+    assert route_group_chat_user_message(
+        "大家好", am, ids, []
+    ) == ids
 
 
 def test_round2_with_persisted_conversation_turns_does_not_assume_dict(tmp_path):
