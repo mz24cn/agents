@@ -15,6 +15,7 @@ import socket
 import time
 import urllib.request
 import urllib.error
+from collections import deque
 from dataclasses import replace
 from typing import Iterator, Optional
 
@@ -41,6 +42,60 @@ def _get_model_api_timeout() -> int:
         return 300
 
 
+# MODEL_INFER_TIMEOUT (seconds) caps one continuous streaming inference output:
+# a single model round. It does NOT span tool-call rounds; each round restarts
+# the clock. 0/empty/unset disables the guard (the default), and invalid values
+# log a warning and leave the guard disabled.
+def _get_model_infer_timeout() -> Optional[float]:
+    """Return MODEL_INFER_TIMEOUT (seconds), read dynamically each call."""
+    raw = os.environ.get("MODEL_INFER_TIMEOUT", "0").strip()
+    if not raw:
+        return None
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        _logger.warning(
+            "invalid MODEL_INFER_TIMEOUT=%r; inference timeout disabled", raw,
+        )
+        return None
+    if val <= 0:
+        return None
+    return val
+
+
+# Experimental repetitive-output detection. The final 100 chars are used as a
+# fingerprint and searched backwards for two earlier complete matches. Both
+# visible content and hidden thinking are checked independently. This is
+# observation-only: the runtime logs a warning but keeps streaming.
+_LOOP_FINGERPRINT_CHARS = 100
+
+# Window used by timeout diagnostics to distinguish active generation from a
+# stream which produced output earlier and then went idle.
+_INFER_RATE_WINDOW_SECONDS = 10.0
+
+
+def _find_repetitive_output_tail(full_content: str) -> Optional[str]:
+    """Return content from the second-last repeated tail occurrence onward.
+
+    The final occurrence of the last 100 chars is the live tail itself and is
+    excluded from the first backwards search. When a second earlier complete
+    match is also found, the returned text spans from that match to the end so
+    operators can inspect exactly what the model kept repeating.
+    """
+    if len(full_content) < _LOOP_FINGERPRINT_CHARS:
+        return None
+    tail = full_content[-_LOOP_FINGERPRINT_CHARS:]
+    # Search once in everything except the final 100 chars.
+    first = full_content.rfind(tail, 0, len(full_content) - _LOOP_FINGERPRINT_CHARS)
+    if first < 0:
+        return None
+    # Search again strictly before the first match.
+    second = full_content.rfind(tail, 0, first)
+    if second < 0:
+        return None
+    return full_content[second:]
+
+
 # Model transport retries are deliberately implemented below the inference/tool
 # loop.  A retry therefore re-sends only the current model request and never
 # repeats an already executed tool call.  MODEL_API_MAX_RETRIES is the number
@@ -61,7 +116,7 @@ def _get_model_api_retry_delay() -> float:
         return 1.0
 
 
-_RETRYABLE_MODEL_HTTP_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
+_RETRYABLE_MODEL_HTTP_CODES = frozenset({408, 425, 429, 500, 502, 503, 504, 524})
 
 
 def _is_timeout_error(exc: BaseException) -> bool:
@@ -680,6 +735,9 @@ class Runtime:
                 error=f"Model '{request.model_id}' not found in registry",
                 error_code="MODEL_NOT_FOUND",
             )
+        # Resolve endpoint placeholders only for the live inference request.
+        # The registry/override object retains its original placeholder text.
+        inference_model_config = model_config.resolved_for_inference()
 
         # 2. Get tool configs
         tools: list[ToolConfig] = []
@@ -717,7 +775,7 @@ class Runtime:
             messages = _ensure_tool_call_results(messages)
             request_messages = _prepare_reasoning_for_tool_rounds(messages, model_config)
             url, headers, body_bytes = protocol.build_request(
-                config=model_config,
+                config=inference_model_config,
                 messages=request_messages,
                 tools=tools if tools else None,
                 stream=False,
@@ -1635,6 +1693,9 @@ class Runtime:
             yield Message(role="assistant", timestamp=_now_iso(),
                           content=f"Error: Model '{request.model_id}' not found")
             return
+        # Resolve endpoint placeholders only for the live inference request.
+        # The registry/override object retains its original placeholder text.
+        inference_model_config = model_config.resolved_for_inference()
 
         tools: list[ToolConfig] = []
         for tool_id in request.tool_ids:
@@ -1680,11 +1741,19 @@ class Runtime:
             messages = _ensure_tool_call_results(messages)
             request_messages = _prepare_reasoning_for_tool_rounds(messages, model_config)
             url, headers, body_bytes = protocol.build_request(
-                config=model_config, messages=request_messages,
+                config=inference_model_config, messages=request_messages,
                 tools=tools if tools else None, stream=True,
             )
 
             api_timeout = _get_model_api_timeout()
+            infer_timeout = _get_model_infer_timeout()
+            # MODEL_INFER_TIMEOUT is a per-round wall-clock cap, while
+            # MODEL_API_TIMEOUT remains the socket-level connect/read timeout.
+            # For urlopen we use the smaller of the two so a stream that goes
+            # idle can still be interrupted before a per-round guard would fire.
+            effective_timeout = (
+                api_timeout if infer_timeout is None else min(api_timeout, infer_timeout)
+            )
             max_retries = _get_model_api_max_retries()
             headers.setdefault("User-Agent", _DEFAULT_USER_AGENT)
             http_req = urllib.request.Request(
@@ -1699,7 +1768,7 @@ class Runtime:
                 request_started_datetime = datetime.datetime.now()
                 request_started_at = request_started_datetime.isoformat(timespec="microseconds")
                 try:
-                    http_resp = urllib.request.urlopen(http_req, timeout=api_timeout)
+                    http_resp = urllib.request.urlopen(http_req, timeout=effective_timeout)
                     connect_error = None
                     break
                 except Exception as exc:
@@ -1739,9 +1808,9 @@ class Runtime:
                         detail += f" | body: {error_body[:500]}"
                     yield Message(role="assistant", timestamp=_now_iso(), content=f"Error: {detail}")
                 elif _is_timeout_error(exc):
-                    _logger.error("infer_stream timeout | url=%s timeout=%ds", url, api_timeout)
+                    _logger.error("infer_stream timeout | url=%s timeout=%ss", url, effective_timeout)
                     yield Message(role="assistant", timestamp=_now_iso(),
-                                  content=f"Error: model API request timed out after {api_timeout}s")
+                                  content=f"Error: model API request timed out after {effective_timeout}s")
                 else:
                     reason = getattr(exc, "reason", exc)
                     _logger.error("infer_stream connection error | url=%s err=%s", url, reason)
@@ -1758,6 +1827,50 @@ class Runtime:
             first_token_time: Optional[float] = None
             first_token_timestamp: Optional[str] = None  # ISO timestamp of first token
             tool_calls_first_ts: Optional[str] = None  # Reset for each round
+            content_loop_detected = False
+            thinking_loop_detected = False
+
+            # Per-round stream activity diagnostics. These counters include
+            # content, thinking, and tool-call chunks. Character rates count
+            # content + thinking because tool calls are structured output.
+            output_chunk_count = 0
+            last_output_time: Optional[float] = None
+            max_output_gap = 0.0
+            recent_output: deque[tuple[float, int]] = deque()
+
+            def _timeout_diagnostics(now: float) -> str:
+                while (
+                    recent_output
+                    and now - recent_output[0][0] > _INFER_RATE_WINDOW_SECONDS
+                ):
+                    recent_output.popleft()
+                recent_chars = sum(chars for _, chars in recent_output)
+                first_output_s = (
+                    first_token_time - round_start
+                    if first_token_time is not None else -1.0
+                )
+                last_output_gap_s = (
+                    now - last_output_time
+                    if last_output_time is not None else -1.0
+                )
+                last_output_s = (
+                    last_output_time - round_start
+                    if last_output_time is not None else -1.0
+                )
+                return (
+                    f"first_output={first_output_s:.3f}s "
+                    f"last_output={last_output_s:.3f}s "
+                    f"last_output_gap={last_output_gap_s:.3f}s "
+                    f"max_output_gap={max_output_gap:.3f}s "
+                    f"chunks={output_chunk_count} "
+                    f"content_chars={len(full_content)} "
+                    f"thinking_chars={len(full_thinking)} "
+                    f"recent_{_INFER_RATE_WINDOW_SECONDS:g}s_chars={recent_chars} "
+                    f"recent_chars_per_sec="
+                    f"{recent_chars / _INFER_RATE_WINDOW_SECONDS:.1f} "
+                    f"repetitive_content={content_loop_detected} "
+                    f"repetitive_thinking={thinking_loop_detected}"
+                )
 
             try:
                 stream_iter = protocol.parse_stream(http_resp)
@@ -1769,6 +1882,81 @@ class Runtime:
                         yield Message(role="assistant", timestamp=_now_iso(), content="Error: user interrupted.")
                         return
 
+                    # Observe this item before enforcing the wall-clock limit.
+                    # A model chunk arriving just beyond the deadline is not
+                    # yielded, but is still useful timeout diagnostic evidence.
+                    guard_now = time.monotonic()
+                    if msg.role != "usage" and (msg.content or msg.thinking or msg.tool_calls):
+                        if first_token_time is None:
+                            first_token_time = guard_now
+                            first_token_datetime = request_started_datetime + datetime.timedelta(
+                                seconds=first_token_time - round_start)
+                            first_token_timestamp = first_token_datetime.isoformat(timespec="microseconds")
+                        if last_output_time is not None:
+                            max_output_gap = max(max_output_gap, guard_now - last_output_time)
+                        output_chunk_count += 1
+                        last_output_time = guard_now
+                        recent_output.append((
+                            guard_now, len(msg.content or "") + len(msg.thinking or ""),
+                        ))
+                        while (
+                            recent_output
+                            and guard_now - recent_output[0][0] > _INFER_RATE_WINDOW_SECONDS
+                        ):
+                            recent_output.popleft()
+
+                        if msg.thinking:
+                            full_thinking += msg.thinking
+                            if not thinking_loop_detected:
+                                repeated = _find_repetitive_output_tail(full_thinking)
+                                if repeated is not None:
+                                    thinking_loop_detected = True
+                                    second_match_pos = len(full_thinking) - len(repeated)
+                                    _logger.warning(
+                                        "infer_stream repetitive output detected | "
+                                        "round=%d channel=thinking output_len=%d "
+                                        "second_match_pos=%d repeated_content=%r",
+                                        tool_round, len(full_thinking), second_match_pos,
+                                        repeated,
+                                    )
+                        if msg.content:
+                            full_content += msg.content
+                            if not content_loop_detected:
+                                repeated = _find_repetitive_output_tail(full_content)
+                                if repeated is not None:
+                                    content_loop_detected = True
+                                    second_match_pos = len(full_content) - len(repeated)
+                                    _logger.warning(
+                                        "infer_stream repetitive output detected | "
+                                        "round=%d channel=content output_len=%d "
+                                        "second_match_pos=%d repeated_content=%r",
+                                        tool_round, len(full_content), second_match_pos,
+                                        repeated,
+                                    )
+
+                    # Per-round continuous-output guard (MODEL_INFER_TIMEOUT).
+                    # The clock restarts on every model round and is separate
+                    # from the socket-level MODEL_API_TIMEOUT.
+                    if infer_timeout is not None:
+                        elapsed_round = guard_now - round_start
+                        if elapsed_round > infer_timeout:
+                            http_resp.close()
+                            _logger.error(
+                                "infer_stream inference timeout | url=%s "
+                                "round=%d elapsed=%.3fs limit=%.3fs %s",
+                                url, tool_round, elapsed_round, infer_timeout,
+                                _timeout_diagnostics(guard_now),
+                            )
+                            yield Message(
+                                role="assistant",
+                                timestamp=_now_iso(),
+                                content=(
+                                    f"Error: model inference timed out after "
+                                    f"{elapsed_round:.1f}s (limit: {infer_timeout:.1f}s)"
+                                ),
+                            )
+                            return
+
                     # Intercept usage messages — accumulate, don't yield raw
                     if msg.role == "usage":
                         try:
@@ -1778,15 +1966,6 @@ class Runtime:
                         except (json.JSONDecodeError, ValueError, AttributeError):
                             pass
                         continue
-
-                    # Record this model request's first output. Tool-call-only
-                    # rounds count too, because they are complete assistant
-                    # inference rounds even when no text token is emitted.
-                    if first_token_time is None and (msg.content or msg.thinking or msg.tool_calls):
-                        first_token_time = time.monotonic()
-                        first_token_datetime = request_started_datetime + datetime.timedelta(
-                            seconds=first_token_time - round_start)
-                        first_token_timestamp = first_token_datetime.isoformat(timespec="microseconds")
 
                     # Set timestamp before yielding
                     if msg.role == "assistant":
@@ -1802,11 +1981,6 @@ class Runtime:
                     # Yield each chunk to the caller for real-time display
                     yield msg
 
-                    # Accumulate for the conversation history
-                    if msg.thinking:
-                        full_thinking += msg.thinking
-                    if msg.content:
-                        full_content += msg.content
                     if msg.tool_calls:
                         # Tool calls arrive as a complete list (Ollama) or
                         # as individual delta dicts with _index (OpenAI)
@@ -1852,9 +2026,31 @@ class Runtime:
                                       content="Error: user interrupted.")
                         return
                     continue
+                if (
+                    infer_timeout is not None
+                    and _is_timeout_error(exc)
+                    and (time.monotonic() - round_start) >= infer_timeout
+                ):
+                    timeout_now = time.monotonic()
+                    elapsed_round = timeout_now - round_start
+                    _logger.error(
+                        "infer_stream inference timeout during stream | url=%s "
+                        "round=%d elapsed=%.3fs limit=%.3fs %s",
+                        url, tool_round, elapsed_round, infer_timeout,
+                        _timeout_diagnostics(timeout_now),
+                    )
+                    yield Message(
+                        role="assistant",
+                        timestamp=_now_iso(),
+                        content=(
+                            f"Error: model inference timed out after "
+                            f"{elapsed_round:.1f}s (limit: {infer_timeout:.1f}s)"
+                        ),
+                    )
+                    return
                 if no_model_output and _is_timeout_error(exc):
                     yield Message(role="assistant", timestamp=_now_iso(),
-                                  content=f"Error: model API request timed out after {api_timeout}s")
+                                  content=f"Error: model API request timed out after {effective_timeout}s")
                 else:
                     yield Message(role="assistant", timestamp=_now_iso(),
                                   content=f"Error: stream parse: {exc}")

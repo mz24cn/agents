@@ -900,18 +900,11 @@ class HandlerApiMixin:
             except (OSError, IOError):
                 pass
 
-            runtime_dir = script_dir
-            latest_mtime: float = 0.0
-            for root, dirs, files in os.walk(runtime_dir):
-                for fn in files:
-                    if fn.endswith(".py"):
-                        path = os.path.join(root, fn)
-                        try:
-                            mtime = os.stat(path).st_mtime
-                            if mtime > latest_mtime:
-                                latest_mtime = mtime
-                        except OSError:
-                            continue
+            # Backend version covers every deployable non-web project file,
+            # including accessories extensions and skill assets.  Otherwise an
+            # accessories-only change would never be advertised to online update.
+            env_manager = self.server.env_manager  # type: ignore[attr-defined]
+            latest_mtime = env_manager.get_backend_build_mtime(project_root)
 
             backend = ""
             if latest_mtime > 0:

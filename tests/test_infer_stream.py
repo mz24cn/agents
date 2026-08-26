@@ -7,6 +7,7 @@ for both OpenAI SSE and Ollama newline-delimited JSON streaming protocols.
 import datetime
 import io
 import json
+import logging
 from unittest.mock import patch, MagicMock
 
 from runtime.models import (
@@ -38,11 +39,14 @@ def _make_model_registry(protocol: str = "openai") -> ModelRegistry:
     return registry
 
 
-def _make_openai_sse_response(chunks: list[str]) -> io.BytesIO:
-    """Build a fake OpenAI SSE response from a list of content strings.
+def _make_openai_sse_response(
+    chunks: list[str], *, field: str = "content",
+) -> io.BytesIO:
+    """Build a fake OpenAI SSE response from content or thinking strings.
 
-    Each string becomes a separate SSE data line with a delta content chunk.
-    A final 'data: [DONE]' line is appended.
+    Each string becomes a separate SSE data line with a delta chunk. A final
+    ``data: [DONE]`` line is appended. ``field`` may be ``content`` or an
+    OpenAI-compatible reasoning field such as ``reasoning_content``.
     """
     lines = []
     for content in chunks:
@@ -50,7 +54,7 @@ def _make_openai_sse_response(chunks: list[str]) -> io.BytesIO:
             {
                 "choices": [
                     {
-                        "delta": {"role": "assistant", "content": content},
+                        "delta": {"role": "assistant", field: content},
                     }
                 ]
             }
@@ -263,6 +267,149 @@ def test_infer_stream_connection_error() -> None:
 
     assert len(messages) == 1
     assert "connection refused" in messages[0].content.lower()
+
+
+def test_model_infer_timeout_defaults_disabled(monkeypatch) -> None:
+    """MODEL_INFER_TIMEOUT defaults to 0, which disables the per-round guard."""
+    from runtime.runtime import _get_model_infer_timeout
+
+    monkeypatch.delenv("MODEL_INFER_TIMEOUT", raising=False)
+    assert _get_model_infer_timeout() is None
+
+
+def test_model_infer_timeout_parses_seconds(monkeypatch) -> None:
+    """MODEL_INFER_TIMEOUT accepts fractional seconds."""
+    from runtime.runtime import _get_model_infer_timeout
+
+    monkeypatch.setenv("MODEL_INFER_TIMEOUT", "15.5")
+    assert _get_model_infer_timeout() == 15.5
+
+
+def test_model_infer_timeout_zero_and_invalid_disable(monkeypatch) -> None:
+    """Zero and invalid MODEL_INFER_TIMEOUT values disable the guard."""
+    from runtime.runtime import _get_model_infer_timeout
+
+    monkeypatch.setenv("MODEL_INFER_TIMEOUT", "0")
+    assert _get_model_infer_timeout() is None
+
+    monkeypatch.setenv("MODEL_INFER_TIMEOUT", "not-a-number")
+    assert _get_model_infer_timeout() is None
+
+
+def test_find_repetitive_output_tail_requires_three_occurrences() -> None:
+    """Loop detection needs two earlier matches of the final 100 chars."""
+    from runtime.runtime import _find_repetitive_output_tail
+
+    # Only two occurrences total: the live tail plus one previous block.
+    block = "A" * 100
+    assert _find_repetitive_output_tail(block * 2) is None
+
+    # Three occurrences total: the second-last match starts at index 0.
+    repeated = _find_repetitive_output_tail(block * 3)
+    assert repeated == block * 3
+
+    # Different text should not be classified as a loop.
+    assert _find_repetitive_output_tail(("A" * 99) + "B" + ("C" * 100)) is None
+
+
+def test_infer_stream_model_infer_timeout_aborts_round(caplog) -> None:
+    """A continuous stream longer than MODEL_INFER_TIMEOUT logs diagnostics."""
+    model_registry = _make_model_registry("openai")
+    tool_registry = ToolRegistry()
+    runtime = Runtime(model_registry=model_registry, tool_registry=tool_registry)
+
+    stream = _make_openai_sse_response(["Hello"])
+    request = InferenceRequest(model_id="test-model", text="hi", stream=True)
+
+    # monotonic is used for: overall_start, round_start, the round guard, and
+    # finally the stream-end measurement after abort.
+    with caplog.at_level(logging.ERROR, logger="runtime.runtime"), patch.dict(
+        "os.environ", {
+            "MODEL_INFER_TIMEOUT": "10",
+            "MODEL_API_MAX_RETRIES": "0",
+        },
+    ), patch(
+        "runtime.runtime.time.monotonic",
+        side_effect=[0.0, 1.0, 20.0, 30.0],
+    ), patch(
+        "urllib.request.urlopen",
+        side_effect=_mock_urlopen_with_stream(stream),
+    ):
+        messages = list(runtime.infer_stream(request))
+
+    assert len(messages) == 1
+    assert messages[0].role == "assistant"
+    assert "model inference timed out" in messages[0].content
+    assert "limit: 10.0s" in messages[0].content
+    timeout_logs = [
+        record.message for record in caplog.records
+        if "infer_stream inference timeout" in record.message
+    ]
+    assert len(timeout_logs) == 1
+    assert "first_output=19.000s" in timeout_logs[0]
+    assert "last_output=19.000s" in timeout_logs[0]
+    assert "last_output_gap=0.000s" in timeout_logs[0]
+    assert "chunks=1" in timeout_logs[0]
+    assert "content_chars=5" in timeout_logs[0]
+    assert "thinking_chars=0" in timeout_logs[0]
+    assert "recent_10s_chars=5" in timeout_logs[0]
+    assert "repetitive_content=False" in timeout_logs[0]
+    assert "repetitive_thinking=False" in timeout_logs[0]
+
+
+def test_infer_stream_repetitive_output_logs_warning_once(caplog) -> None:
+    """Repetitive content logs one observation warning and keeps streaming."""
+    model_registry = _make_model_registry("openai")
+    tool_registry = ToolRegistry()
+    runtime = Runtime(model_registry=model_registry, tool_registry=tool_registry)
+
+    repeated_block = "A" * 100
+    content = repeated_block * 3
+    stream = _make_openai_sse_response([content])
+    request = InferenceRequest(model_id="test-model", text="hi", stream=True)
+
+    with caplog.at_level(logging.WARNING, logger="runtime.runtime"), \
+         patch("urllib.request.urlopen", side_effect=_mock_urlopen_with_stream(stream)):
+        messages = list(runtime.infer_stream(request))
+
+    assert [m.content for m in messages if m.role == "assistant"] == [content]
+    assert len(messages) == 2  # assistant content + usage stat
+    loop_warnings = [
+        record for record in caplog.records
+        if "repetitive output detected" in record.message
+    ]
+    assert len(loop_warnings) == 1
+    assert "channel=content" in loop_warnings[0].message
+    assert "repeated_content=" in loop_warnings[0].message
+
+
+def test_infer_stream_repetitive_thinking_logs_warning_once(caplog) -> None:
+    """Repetitive hidden reasoning is detected independently of content."""
+    runtime = Runtime(
+        model_registry=_make_model_registry("openai"),
+        tool_registry=ToolRegistry(),
+    )
+
+    repeated_block = "think-step-" * 10  # exactly 100 characters
+    thinking = repeated_block * 3
+    stream = _make_openai_sse_response(
+        [thinking], field="reasoning_content",
+    )
+    request = InferenceRequest(model_id="test-model", text="hi", stream=True)
+
+    with caplog.at_level(logging.WARNING, logger="runtime.runtime"), \
+         patch("urllib.request.urlopen", side_effect=_mock_urlopen_with_stream(stream)):
+        messages = list(runtime.infer_stream(request))
+
+    thinking_messages = [m for m in messages if m.thinking]
+    assert [m.thinking for m in thinking_messages] == [thinking]
+    loop_warnings = [
+        record for record in caplog.records
+        if "repetitive output detected" in record.message
+    ]
+    assert len(loop_warnings) == 1
+    assert "channel=thinking" in loop_warnings[0].message
+    assert "repeated_content=" in loop_warnings[0].message
 
 
 def test_infer_stream_retries_502_before_output() -> None:

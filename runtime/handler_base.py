@@ -982,6 +982,7 @@ class HandlerBaseMixin:
                 session_id,
                 cols=initial_cols or 80,
                 rows=initial_rows or 24,
+                send_output=lambda data: self._ws_send_frame(sock, data),
             )
         else:
             terminal_info = None
@@ -990,16 +991,13 @@ class HandlerBaseMixin:
             self._ws_send_frame(sock, '{"error": "Failed to create terminal"}')
             return
         
-        # Attach socket to terminal
+        # Attach the browser to the terminal's persistent WinPTY reader.
+        # Do not start/stop readers here: concurrent proc.read() calls split
+        # PowerShell VT redraw sequences and produce duplicated/wrapped input.
         with _terminal_sessions_lock:
-            terminal_info["active"] = False  # Signal old read_pty to stop
             terminal_info["sock"] = sock
             terminal_info["disconnected_at"] = None
-        
-        time.sleep(0.1)
-        
-        with _terminal_sessions_lock:
-            terminal_info["active"] = True
+            terminal_info["send_output"] = lambda data: self._ws_send_frame(sock, data)
         
         proc = terminal_info.get("proc")
         
@@ -1014,28 +1012,6 @@ class HandlerBaseMixin:
         if terminal_id:
             self._ws_send_frame(sock, json.dumps({"__terminal_id": terminal_id}))
         
-        def read_pty():
-            """Read from PTY and send to WebSocket."""
-            while terminal_info.get("active", True):
-                try:
-                    data = proc.read(1024)
-                    if data:
-                        current_sock = terminal_info.get("sock")
-                        if current_sock:
-                            try:
-                                self._ws_send_frame(current_sock, data)
-                            except Exception:
-                                pass
-                        if "buffer_lock" in terminal_info:
-                            with terminal_info["buffer_lock"]:
-                                terminal_info["output_buffer"].append(data)
-                    else:
-                        break
-                except EOFError:
-                    break
-
-        threading.Thread(target=read_pty, daemon=True).start()
-
         try:
             while True:
                 user_input = self._ws_recv_frame(sock)
@@ -1056,8 +1032,10 @@ class HandlerBaseMixin:
             # Mark session as disconnected but don't terminate
             if terminal_info:
                 with _terminal_sessions_lock:
-                    terminal_info["active"] = False
-                    terminal_info["disconnected_at"] = time.time()
+                    if terminal_info.get("sock") is sock:
+                        terminal_info["disconnected_at"] = time.monotonic()
+                        terminal_info["sock"] = None
+                        terminal_info["send_output"] = None
             sock.close()
 
     def _start_pty_session_unix(self, sock, terminal_id: Optional[str] = None,

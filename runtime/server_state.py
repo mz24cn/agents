@@ -45,8 +45,10 @@ logger = logging.getLogger("runtime.server")
 # Conversation formatting helpers
 # ---------------------------------------------------------------------------
 
-def merge_stream_messages(stream_messages: list) -> tuple[list, Optional[dict]]:
-    """将流式推理产生的原始 Message 列表合并为 ConversationTurn 列表。
+def _merge_single_agent_stream_messages(
+    stream_messages: list,
+) -> tuple[list, Optional[dict]]:
+    """将单个 Agent 的流式推理消息合并为 ConversationTurn 列表。
 
     流式推理中每个 token 都是一条独立的 Message，本函数将它们按语义合并：
     - 连续的 assistant content/thinking/tool_calls 合并为一条 assistant turn
@@ -180,6 +182,95 @@ def merge_stream_messages(stream_messages: list) -> tuple[list, Optional[dict]]:
     # Flush 剩余 assistant 内容（最后一条，无 tool calls）
     _flush_assistant(stat=current_stat or last_stat)
 
+    return turns, last_stat
+
+
+def merge_stream_messages(stream_messages: list) -> tuple[list, Optional[dict]]:
+    """Merge streamed messages without mixing concurrent agent buffers.
+
+    Group-chat workers publish into one queue, so raw frames can arrive as
+    ``A-token, B-token, A-token, B-usage``.  The single-agent merger owns one
+    assistant/tool-call buffer and would concatenate that interleaving under
+    whichever agent arrived first.  Partition true multi-agent streams by
+    ``agent_id`` first, then merge each independent inference loop.
+
+    Agent groups are emitted in first-seen order.  Within each group the
+    assistant/tool chronology is preserved.  The ordinary zero/one-agent path
+    remains exactly the historical single-buffer implementation.
+    """
+    import json as _json
+
+    agent_order: list[str] = []
+    explicit_agents: set[str] = set()
+    for message in stream_messages:
+        agent_id = (
+            getattr(message, "agent_id", None)
+            or getattr(message, "assistant_id", None)
+        )
+        if agent_id and agent_id not in explicit_agents:
+            explicit_agents.add(agent_id)
+            agent_order.append(agent_id)
+
+    if len(agent_order) <= 1:
+        return _merge_single_agent_stream_messages(stream_messages)
+
+    by_agent: dict[str, list] = {agent_id: [] for agent_id in agent_order}
+    unscoped: list = []
+    call_owner: dict[str, str] = {}
+
+    # Learn tool-call ownership first so a legacy result without agent_id can
+    # still follow the assistant declaration that created it.
+    for message in stream_messages:
+        agent_id = (
+            getattr(message, "agent_id", None)
+            or getattr(message, "assistant_id", None)
+        )
+        if not agent_id or message.role != "assistant":
+            continue
+        for call in (message.tool_calls or []):
+            call_id = call.get("id") or call.get("tool_use_id")
+            if call_id:
+                call_owner.setdefault(str(call_id), agent_id)
+
+    for message in stream_messages:
+        agent_id = (
+            getattr(message, "agent_id", None)
+            or getattr(message, "assistant_id", None)
+        )
+        if not agent_id and message.role == "tool":
+            tool_use_id = getattr(message, "tool_use_id", None)
+            if tool_use_id:
+                agent_id = call_owner.get(str(tool_use_id))
+        if agent_id in by_agent:
+            if not getattr(message, "agent_id", None):
+                # Preserve recovered ownership in the persisted turn without
+                # mutating the raw frame retained for replay/debugging.
+                import copy as _copy
+                message = _copy.copy(message)
+                message.agent_id = agent_id
+            by_agent[agent_id].append(message)
+        else:
+            unscoped.append(message)
+
+    turns: list = []
+    for agent_id in agent_order:
+        agent_turns, _ = _merge_single_agent_stream_messages(by_agent[agent_id])
+        turns.extend(agent_turns)
+
+    # Do not silently discard old/unscoped frames. Current group-chat producers
+    # tag assistant, usage, and tool messages, so this is mainly compatibility.
+    if unscoped:
+        unscoped_turns, _ = _merge_single_agent_stream_messages(unscoped)
+        turns.extend(unscoped_turns)
+
+    last_stat: Optional[dict] = None
+    for message in stream_messages:
+        if message.role != "usage":
+            continue
+        try:
+            last_stat = _json.loads(message.content)
+        except (ValueError, TypeError, AttributeError):
+            pass
     return turns, last_stat
 
 
@@ -605,19 +696,27 @@ def register_terminal_session(terminal_id: str, master_fd, pid, sock, session_id
         }
 
 
-def get_or_create_terminal(session_id: str, cols: int = 80, rows: int = 24) -> Optional[dict]:
+def get_or_create_terminal(
+    session_id: str,
+    cols: int = 80,
+    rows: int = 24,
+    send_output: Optional[Callable[[str], None]] = None,
+) -> Optional[dict]:
     """Get existing terminal session for session_id, or create a new one.
     
     Args:
         session_id: Session identifier
         cols: Initial terminal columns (used only when creating a new PTY)
         rows: Initial terminal rows (used only when creating a new PTY)
+        send_output: Optional output callback installed before a new PTY starts
     
     Returns terminal_info dict, or None if creation failed.
     """
     # Try to find existing terminal
     terminal_info = get_terminal_for_session(session_id)
     if terminal_info:
+        if send_output is not None:
+            terminal_info["send_output"] = send_output
         return terminal_info
     
     # Create new terminal session
@@ -648,6 +747,7 @@ def get_or_create_terminal(session_id: str, cols: int = 80, rows: int = 24) -> O
                     "output_buffer": [],
                     "buffer_lock": threading.Lock(),
                     "shell_kind": "powershell",
+                    "send_output": send_output,
                 }
             
             # Start background thread to drain PTY output into buffer
@@ -659,6 +759,18 @@ def get_or_create_terminal(session_id: str, cols: int = 80, rows: int = 24) -> O
                         try:
                             data = proc.read(4096)
                             if data:
+                                # WinPTY reads are blocking, so this must remain the
+                                # sole reader for the process.  Fan the same stream
+                                # out to the attached browser and exec_cli buffer;
+                                # starting another reader on WebSocket attach can
+                                # split PowerShell's VT redraw sequences between
+                                # consumers and corrupt the displayed command line.
+                                send_output = terminal_info.get("send_output")
+                                if send_output:
+                                    try:
+                                        send_output(data)
+                                    except Exception:
+                                        pass
                                 with terminal_info["buffer_lock"]:
                                     terminal_info["output_buffer"].append(data)
                             else:

@@ -123,6 +123,26 @@
     return t('fileModified') || 'modified'
   }
 
+  function formatModified(value) {
+    if (value == null) return '\u2014'
+    const date = new Date(value)
+    if (Number.isNaN(date.getTime())) return '\u2014'
+    const year = date.getFullYear()
+    const month = String(date.getMonth() + 1).padStart(2, '0')
+    const day = String(date.getDate()).padStart(2, '0')
+    const hours = String(date.getHours()).padStart(2, '0')
+    const minutes = String(date.getMinutes()).padStart(2, '0')
+    const seconds = String(date.getSeconds()).padStart(2, '0')
+    return `${year}/${month}/${day} ${hours}:${minutes}:${seconds}`
+  }
+
+  function formatSize(value) {
+    const size = Number(value)
+    return Number.isFinite(size) && size >= 0
+      ? `${Math.trunc(size).toLocaleString('en-US')} B`
+      : '\u2014'
+  }
+
   let allExpanded = $derived(Object.keys(expandedFiles).length === 0 ? false :
     files.length > 0 && files.every(f => expandedFiles[f.path]))
 </script>
@@ -144,8 +164,9 @@
       <div class="file-item" class:expanded={expandedFiles[file.path]}>
         <button class="file-header" onclick={() => toggleFile(file.path)}>
           <span class="file-chevron">{expandedFiles[file.path] ? '\u25be' : '\u25b8'}</span>
-          <span class="file-change-icon {file.change_type}">{getChangeIcon(file.change_type)}</span>
-          <span class="file-path">{file.path}</span>
+          <span class="file-path" title={file.path}>{file.path}</span>
+          <span class="file-modified">{formatModified(file.modified)}</span>
+          <span class="file-size">{formatSize(file.size)}</span>
           <span class="file-change-label {file.change_type}">{getChangeLabel(file.change_type)}</span>
         </button>
 
@@ -308,36 +329,42 @@
     color: var(--text-secondary);
   }
 
-  .file-change-icon {
-    width: 16px;
-    height: 16px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    border-radius: 3px;
-    font-size: 0.7rem;
-    font-weight: 700;
-    color: #fff;
-    flex-shrink: 0;
-  }
-
-  .file-change-icon.added { background: #16a34a; }
-  .file-change-icon.deleted { background: #dc2626; }
-  .file-change-icon.modified { background: #d97706; }
-
   .file-path {
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
     font-size: 0.8rem;
-    flex: 1;
+    flex: 1 1 auto;
+    min-width: 80px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
+  .file-modified,
+  .file-size {
+    color: var(--text-secondary);
+    font-size: 0.74rem;
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  .file-modified {
+    width: 142px;
+  }
+
+  .file-size {
+    width: 76px;
+  }
+
   .file-change-label {
+    width: 48px;
+    box-sizing: border-box;
     font-size: 0.7rem;
     padding: 1px 6px;
     border-radius: 10px;
+    text-align: center;
+    white-space: nowrap;
     flex-shrink: 0;
   }
 

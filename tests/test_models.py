@@ -7,6 +7,30 @@ from hypothesis import strategies as st
 from runtime.models import ModelConfig
 
 
+def test_model_config_resolves_endpoint_placeholders_without_mutating_storage(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MODEL_HOST", "https://models.example/v1")
+    monkeypatch.setenv("MODEL_NAME", "gpt-test")
+    monkeypatch.setenv("MODEL_KEY", "secret-key")
+    config = ModelConfig(
+        model_id="env-model",
+        api_base="{{MODEL_HOST}}",
+        model_name="prefix-{{MODEL_NAME}}",
+        api_key="Bearer-{{MODEL_KEY}}-{{MISSING_KEY}}",
+    )
+
+    resolved = config.resolved_for_inference()
+
+    assert resolved is not config
+    assert resolved.api_base == "https://models.example/v1"
+    assert resolved.model_name == "prefix-gpt-test"
+    assert resolved.api_key == "Bearer-secret-key-"
+    assert config.to_dict()["api_base"] == "{{MODEL_HOST}}"
+    assert config.to_dict()["model_name"] == "prefix-{{MODEL_NAME}}"
+    assert config.to_dict()["api_key"] == "Bearer-{{MODEL_KEY}}-{{MISSING_KEY}}"
+
+
 # --- Hypothesis strategies ---
 
 # Strategy for generate_params: a dict with string keys and JSON-compatible values

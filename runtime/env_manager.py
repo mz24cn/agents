@@ -141,6 +141,36 @@ class EnvManager:
             return self._render_setup_script_ps1(encoded).encode("utf-8")
         raise ValueError(f"Unsupported setup script format: {script_format}")
 
+    def get_backend_build_mtime(self, project_root: str) -> float:
+        """Return the newest deployable non-web project file timestamp.
+
+        This intentionally includes accessories and non-Python extension assets
+        such as SKILL.md or C sources, so ``op=hello`` advertises their updates.
+        """
+        project_root = os.path.realpath(project_root)
+        web_root_real = os.path.realpath(os.path.join(project_root, "web"))
+        exclude_dirs = {".git", "__pycache__", ".pytest_cache", ".hypothesis", ".mypy_cache",
+                        ".ruff_cache", "node_modules", "dist", "build", ".venv", "venv",
+                        "workspace"}
+        latest_mtime = 0.0
+        for dirpath, dirnames, filenames in os.walk(project_root):
+            dir_real = os.path.realpath(dirpath)
+            dirnames[:] = [
+                name for name in dirnames
+                if (os.path.realpath(os.path.join(dir_real, name)) != web_root_real
+                    and not (name.startswith(".") and os.path.isdir(os.path.join(dir_real, name)))
+                    and name not in exclude_dirs
+                    and not os.path.islink(os.path.join(dir_real, name)))
+            ]
+            for filename in filenames:
+                fpath = os.path.join(dir_real, filename)
+                try:
+                    if not os.path.islink(fpath):
+                        latest_mtime = max(latest_mtime, os.path.getmtime(fpath))
+                except OSError:
+                    continue
+        return latest_mtime
+
     def build_delta_tar(
         self,
         *,
@@ -167,20 +197,20 @@ class EnvManager:
 
         collected: dict[str, str] = {}
 
-        # Project files: web/dist uses frontend threshold; all other included
-        # project files use the backend threshold.
         web_root_real = os.path.realpath(os.path.join(project_root, "web"))
+
+        # Every deployable file under web/ (compiled output, Svelte sources,
+        # public assets and build metadata) uses the frontend threshold.  Keeping
+        # the sources in online updates is intentional: an installed instance
+        # must remain self-contained enough to diagnose and patch frontend bugs.
+        # All other included project files, including accessories/, use the
+        # backend threshold. Every file is selected independently by mtime.
         for dirpath, dirnames, filenames in os.walk(project_root):
             dir_real = os.path.realpath(dirpath)
-            if dir_real == web_root_real:
-                # Only compiled frontend output is deployable delta content.
-                dirnames[:] = [d for d in dirnames if d == "dist"]
-                filenames = []
-            else:
-                dirnames[:] = [
-                    d for d in dirnames
-                    if not should_exclude(os.path.realpath(os.path.join(dir_real, d)), d)
-                ]
+            dirnames[:] = [
+                d for d in dirnames
+                if not should_exclude(os.path.realpath(os.path.join(dir_real, d)), d)
+            ]
             rel_dir = os.path.relpath(dir_real, project_root)
             if rel_dir != ".":
                 first = rel_dir.replace("\\", "/").split("/")[0]
@@ -188,12 +218,14 @@ class EnvManager:
                 if should_exclude(first_path, first):
                     dirnames.clear()
                     continue
-            in_web_dist = os.path.commonpath([web_dist_real, dir_real]) == web_dist_real
-            threshold = frontend_since if in_web_dist else backend_since
+            in_web = os.path.commonpath([web_root_real, dir_real]) == web_root_real
+            threshold = frontend_since if in_web else backend_since
             for filename in filenames:
                 fpath = os.path.join(dir_real, filename)
                 try:
-                    if os.path.islink(fpath) or int(os.path.getmtime(fpath)) <= int(threshold):
+                    if os.path.islink(fpath):
+                        continue
+                    if int(os.path.getmtime(fpath)) <= int(threshold):
                         continue
                 except OSError:
                     continue

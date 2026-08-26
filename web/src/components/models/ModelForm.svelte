@@ -16,6 +16,7 @@
   let api_base = $state(_init.api_base ?? '')
   let model_name = $state(_init.model_name ?? '')
   let api_key = $state(_init.api_key ?? '')
+  let showApiKey = $state(false)
   let api_protocol = $state(_init.api_protocol ?? 'openai')
   let generate_params_text = $state(
     _init.generate_params ? JSON.stringify(_init.generate_params, null, 2) : ''
@@ -42,7 +43,9 @@
       ? 'Anthropic API 地址'
       : api_protocol === 'ollama'
         ? 'Ollama 本地地址'
-        : 'OpenAI API 地址'
+        : api_protocol === 'responses'
+          ? t('responsesApiBaseHint')
+          : 'OpenAI API 地址'
   )
 
   function validate() {
@@ -159,6 +162,7 @@
     <label for="model_name">{t('modelName')} <span class="required">{t('required')}</span></label>
     <input id="model_name" type="text" bind:value={model_name} placeholder={t('modelNamePlaceholder')} />
     {#if errors.model_name}<span class="field-error">{errors.model_name}</span>{/if}
+    <span class="field-hint">{t('modelEnvPlaceholderHint')}</span>
   </div>
 
   <div class="form-group">
@@ -166,29 +170,61 @@
     <input id="api_base" type="text" bind:value={api_base} placeholder={apiBasePlaceholder} />
     {#if errors.api_base}<span class="field-error">{errors.api_base}</span>{/if}
     {#if apiBaseHint}<span class="field-hint">{apiBaseHint}</span>{/if}
+    <span class="field-hint">{t('modelEnvPlaceholderHint')}</span>
   </div>
 
   <div class="form-group">
     <label for="api_key">{t('apiKey')}</label>
-    <input id="api_key" type="password" bind:value={api_key} placeholder={t('apiKeyPlaceholder')} />
+    <div class="secret-input">
+      <input
+        id="api_key"
+        type={showApiKey ? 'text' : 'password'}
+        bind:value={api_key}
+        placeholder={t('apiKeyPlaceholder')}
+      />
+      <button
+        type="button"
+        class="secret-toggle"
+        onclick={() => { showApiKey = !showApiKey }}
+        title={showApiKey ? t('hideApiKey') : t('showApiKey')}
+        aria-label={showApiKey ? t('hideApiKey') : t('showApiKey')}
+        aria-pressed={showApiKey}
+      >
+        {#if showApiKey}
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M3 3l18 18M10.6 10.7a2 2 0 0 0 2.7 2.7M9.9 4.2A10.7 10.7 0 0 1 12 4c5.5 0 9 5.5 9 5.5a16.6 16.6 0 0 1-3 3.6M6.6 6.6A17.3 17.3 0 0 0 3 9.5S6.5 15 12 15a9.8 9.8 0 0 0 3.4-.6" />
+          </svg>
+        {:else}
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M3 12s3.5-5.5 9-5.5 9 5.5 9 5.5-3.5 5.5-9 5.5S3 12 3 12Z" />
+            <circle cx="12" cy="12" r="2.5" />
+          </svg>
+        {/if}
+      </button>
+    </div>
+    <span class="field-hint">{t('modelEnvPlaceholderHint')}</span>
   </div>
 
   <div class="form-group">
     <span class="radio-label">{t('apiProtocol')}</span>
     <div class="radio-group">
-      {#each [['openai','OpenAI'],['ollama','Ollama'],['anthropic','Anthropic']] as [val, label]}
+      {#each [['openai','OpenAI Chat Completions'],['responses','OpenAI Responses'],['ollama','Ollama'],['anthropic','Anthropic']] as [val, label]}
         <label class="radio-item">
           <input type="radio" name="api_protocol" value={val} bind:group={api_protocol} />
           {label}
         </label>
       {/each}
     </div>
+    {#if api_protocol === 'responses'}
+      <span class="field-hint">{t('responsesProtocolHint')}</span>
+    {/if}
   </div>
 
   <div class="form-group">
     <label for="generate_params">{t('generateParams')}</label>
     <JsonEditor id="generate_params" bind:value={generate_params_text} rows={4} placeholder={t('generateParamsPlaceholder')} />
     {#if errors.generate_params}<span class="field-error">{errors.generate_params}</span>{/if}
+    <span class="field-hint">{t('generateParamsExtraBodyHint')}</span>
   </div>
 
   <div class="form-group">
@@ -231,6 +267,12 @@
   .required { color: var(--danger); }
   input, select, textarea { padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-secondary); color: var(--text); font-size: 0.9rem; font-family: inherit; }
   input:disabled { opacity: 0.6; cursor: not-allowed; }
+  .secret-input { position: relative; display: flex; }
+  .secret-input input { width: 100%; box-sizing: border-box; padding-right: 42px; }
+  .secret-toggle { position: absolute; top: 50%; right: 5px; width: 32px; height: 32px; padding: 6px; transform: translateY(-50%); display: flex; align-items: center; justify-content: center; border: 0; border-radius: 5px; background: transparent; color: var(--text-secondary); cursor: pointer; }
+  .secret-toggle:hover { background: var(--border); color: var(--text); }
+  .secret-toggle:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+  .secret-toggle svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
   .radio-label { font-size: 0.9rem; color: var(--text-secondary); margin-bottom: 6px; }
   .radio-group { display: flex; gap: 20px; }
   .radio-item { display: flex; align-items: center; gap: 6px; font-size: 0.9rem; color: var(--text); cursor: pointer; }

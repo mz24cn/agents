@@ -65,9 +65,43 @@ def _stream_batch_is_protocol_complete(messages: list[Message]) -> bool:
     turn.  The next incremental write then quite correctly prunes that dangling
     turn, after which the newly arrived tool result is orphaned and pruned too.
 
+    In group chat, one agent can reach ``usage`` while another agent still has
+    an open text response.  The raw slice must therefore be complete for every
+    independently running agent; otherwise persisting the other agent's partial
+    buffer splits one inference loop into several stored assistant messages.
+
     Plain-text assistant rounds are complete at ``usage``.  Tool-call rounds are
     complete only after every declared call has a matching tool result.
     """
+    agent_order: list[str] = []
+    by_agent: dict[str, list[Message]] = {}
+    unscoped: list[Message] = []
+    for message in messages:
+        agent_id = (
+            getattr(message, "agent_id", None)
+            or getattr(message, "assistant_id", None)
+        )
+        if agent_id:
+            if agent_id not in by_agent:
+                by_agent[agent_id] = []
+                agent_order.append(agent_id)
+            by_agent[agent_id].append(message)
+        else:
+            unscoped.append(message)
+
+    if len(agent_order) > 1:
+        # Current group-chat producers tag assistant, usage and formal tool
+        # messages.  Validate every concurrent inference loop independently so
+        # one fast agent cannot cause another agent's partial output to be saved.
+        return (
+            all(
+                any(message.role == "usage" for message in by_agent[aid])
+                and _stream_batch_is_protocol_complete(by_agent[aid])
+                for aid in agent_order
+            )
+            and (not unscoped or _stream_batch_is_protocol_complete(unscoped))
+        )
+
     turns, _ = merge_stream_messages(messages)
     pending: list[tuple[Optional[str], Optional[str]]] = []
 
@@ -421,14 +455,14 @@ class HandlerInferMixin:
 
         # --- AGENTS 占位符（talk_to 专用）---
         # 调度清单：排除请求主体自己，只列出可 talk_to 的目标 agent
-        if has_talk_to and agent_ids:
+        if has_talk_to:
             from runtime.group_chat import build_agents_markdown
             agent_manager = self.server.agent_manager  # type: ignore[attr-defined]
             agents_markdown = build_agents_markdown(
                 agent_ids, agent_manager,
                 exclude_agent_id=primary_agent_id,
             )
-            if agents_markdown and assembled_messages:
+            if assembled_messages:
                 for msg in assembled_messages:
                     if msg.role == "system":
                         if "{{AGENTS}}" in (msg.content or ""):
@@ -438,6 +472,7 @@ class HandlerInferMixin:
                                 msg.arguments = {}
                             # The frontend's current roster is authoritative;
                             # overwrite arguments persisted from an older turn.
+                            # Empty is valid and prevents a literal placeholder.
                             msg.arguments["AGENTS"] = agents_markdown
                         break
 

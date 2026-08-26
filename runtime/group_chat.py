@@ -451,6 +451,7 @@ def _build_agent_system_messages(
     agent: dict,
     agent_id: str,
     agents_markdown: str,
+    dispatch_agents_markdown: Optional[str],
     promoted_turn: Optional[object],
     summary_text: str,
     memory_entries: Optional[list],
@@ -472,39 +473,61 @@ def _build_agent_system_messages(
     if template_id:
         messages.append(Message(
             role="system", content="",
-            prompt_template=template_id, arguments=template_args or {},
+            prompt_template=template_id, arguments=dict(template_args or {}),
         ))
+        sys_msg = messages[-1]
+        if sys_msg.arguments is None:
+            sys_msg.arguments = {}
+        # AGENTS inside an agent-owned template is the *dispatch roster*:
+        # current group participants minus this agent itself.  Runtime values
+        # are authoritative, so always overwrite stale/literal values such as
+        # "{{AGENTS}}" persisted in template_arguments.
+        # AGENTS is a runtime-owned dynamic placeholder. Always provide a
+        # value: the dispatch roster when talk_to is active, otherwise empty.
+        # This prevents stale/literal template arguments from leaking.
+        sys_msg.arguments["AGENTS"] = dispatch_agents_markdown or ""
+        # GC_FRAMING describes the whole group and uses the full participant
+        # roster (including user), not the dispatch roster.
         if agents_markdown:
-            sys_msg = messages[-1]
-            if sys_msg.arguments is None:
-                sys_msg.arguments = {}
-            if not sys_msg.arguments.get("AGENTS"):
-                sys_msg.arguments["AGENTS"] = agents_markdown
-            if not sys_msg.arguments.get("GC_FRAMING"):
-                sys_msg.arguments["GC_FRAMING"] = _GC_FRAMING.replace("{{AGENTS}}\n\n", "")
+            sys_msg.arguments["GC_FRAMING"] = _GC_FRAMING.replace(
+                "{{AGENTS}}", agents_markdown,
+            )
     elif sys_prompt:
+        # AGENTS in the agent's own plain-text prompt is the dispatch roster.
+        resolved_prompt = sys_prompt.replace(
+            "{{AGENTS}}", dispatch_agents_markdown or "",
+        )
         if agents_markdown:
-            merged = sys_prompt + _GC_FRAMING
-            messages.append(Message(role="system", content=merged))
+            group_framing = _GC_DEFAULT_PROMPT.replace(
+                "{{AGENTS}}", agents_markdown,
+            )
+            messages.append(Message(
+                role="system",
+                content=resolved_prompt + "\n\n" + group_framing,
+            ))
         else:
-            messages.append(Message(role="system", content=sys_prompt))
+            messages.append(Message(role="system", content=resolved_prompt))
     elif promoted_turn is not None:
         sys_content = _message_from_turn(promoted_turn).content
+        # A persisted default group prompt may still contain a literal
+        # placeholder from an older session; resolve it with the full roster.
+        sys_content = (sys_content or "").replace("{{AGENTS}}", agents_markdown)
         messages.append(Message(role="system", content=sys_content))
     elif agents_markdown:
-        messages.append(Message(role="system", content=_GC_DEFAULT_PROMPT))
+        messages.append(Message(
+            role="system",
+            content=_GC_DEFAULT_PROMPT.replace("{{AGENTS}}", agents_markdown),
+        ))
 
-    # 1b. Inject AGENTS table into the system message (plain-text path only)
-    if agents_markdown:
-        if messages and messages[-1].role == "system" and not messages[-1].prompt_template:
-            sys_msg = messages[-1]
-            content = sys_msg.content or ""
-            if "{{AGENTS}}" in content:
-                sys_msg.content = content.replace("{{AGENTS}}", agents_markdown)
-        elif not messages:
-            messages.append(Message(
-                role="system", content=agents_markdown,
-            ))
+    # 1b. Safety net: never send a literal AGENTS placeholder to the model.
+    if messages and messages[-1].role == "system" and not messages[-1].prompt_template:
+        sys_msg = messages[-1]
+        if "{{AGENTS}}" in (sys_msg.content or ""):
+            sys_msg.content = (sys_msg.content or "").replace(
+                "{{AGENTS}}", dispatch_agents_markdown or agents_markdown,
+            )
+    elif not messages and agents_markdown:
+        messages.append(Message(role="system", content=agents_markdown))
 
     # 1c. Inject rolling summary and structured memory
     has_summary = bool(summary_text.strip()) if summary_text else False
@@ -545,6 +568,7 @@ def assemble_agent_context(
     turns: list,
     current_user_msg: Optional[Message] = None,
     agents_markdown: str = "",
+    dispatch_agents_markdown: Optional[str] = None,
     summary_text: str = "",
     memory_entries: Optional[list] = None,
 ) -> list[Message]:
@@ -567,8 +591,10 @@ def assemble_agent_context(
         turns: ConversationTurn list from conversation.json (already truncated
             to recent K turns when compression is active).
         current_user_msg: The current user message that triggered this round.
-        agents_markdown: AGENTS markdown table listing all participants in
-            the group chat. Always injected for group-chat contexts.
+        agents_markdown: Full participant roster (all group agents + user),
+            used by the generic group-chat framing.
+        dispatch_agents_markdown: Schedulable AGENTS roster for this agent's
+            own prompt/template (all group agents except *agent_id*).
         summary_text: Rolling summary text (empty when compression has not
             been triggered).
         memory_entries: Optional list of structured MemoryEntry objects.
@@ -589,8 +615,8 @@ def assemble_agent_context(
 
     # 1. Agent's own system prompt (merged with group-chat framing when both exist)
     messages = _build_agent_system_messages(
-        agent, agent_id, agents_markdown, promoted_turn,
-        summary_text, memory_entries,
+        agent, agent_id, agents_markdown, dispatch_agents_markdown,
+        promoted_turn, summary_text, memory_entries,
     )
 
     # 2. Catch-up note (if any)
@@ -886,9 +912,17 @@ def _run_group_chat_stream_gen(
             if first_user_msg is None and original_messages:
                 first_user_msg = Message(role="user", content="")
 
+            dispatch_agents_markdown = None
+            if "talk_to" in agent_tool_ids:
+                dispatch_agents_markdown = build_agents_markdown(
+                    all_agent_ids,
+                    agent_manager,
+                    exclude_agent_id=agent_id,
+                )
             agent_messages = assemble_agent_context(
                 agent_id, agent, existing_turns, first_user_msg,
                 agents_markdown="",
+                dispatch_agents_markdown=dispatch_agents_markdown,
                 summary_text=summary_text,
                 memory_entries=memory_entries,
             )
@@ -1012,10 +1046,17 @@ def _run_group_chat_stream_gen(
                         filtered_turns.append(turn)
                 agent_turns = filtered_turns
 
-
+            dispatch_agents_markdown = None
+            if "talk_to" in agent_tool_ids:
+                dispatch_agents_markdown = build_agents_markdown(
+                    all_agent_ids,
+                    agent_manager,
+                    exclude_agent_id=agent_id,
+                )
             agent_messages = assemble_agent_context(
                 agent_id, agent, agent_turns, cur_user_msg,
                 agents_markdown=agents_markdown,
+                dispatch_agents_markdown=dispatch_agents_markdown,
                 summary_text=summary_text,
                 memory_entries=memory_entries,
             )

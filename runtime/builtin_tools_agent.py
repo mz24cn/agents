@@ -468,17 +468,19 @@ def _make_talk_to_fn(runtime, thread_local):
                 # 提示词模板方式：使用 prompt_template + arguments
                 sys_msg = Message(
                     role="system", content="",
-                    prompt_template=template_id, arguments=template_args or {},
+                    prompt_template=template_id, arguments=dict(template_args or {}),
                 )
-                # 注入 AGENTS 和 GC_FRAMING 到 arguments 中，供模板渲染使用
-                if agents_md:
+                # 注入 AGENTS 和 GC_FRAMING 到 arguments 中，供模板渲染使用。
+                # If talk_to is active, even an empty roster is authoritative:
+                # render {{AGENTS}} as empty rather than leaking the literal.
+                if "talk_to" in agent_tool_ids:
                     if sys_msg.arguments is None:
                         sys_msg.arguments = {}
-                    if not sys_msg.arguments.get("AGENTS"):
-                        sys_msg.arguments["AGENTS"] = agents_md
+                    sys_msg.arguments["AGENTS"] = agents_md
                     _GC_FRAMING = "\n\n" + _GC_DEFAULT_PROMPT
-                    if not sys_msg.arguments.get("GC_FRAMING"):
-                        sys_msg.arguments["GC_FRAMING"] = _GC_FRAMING.replace("{{AGENTS}}\n\n", "")
+                    sys_msg.arguments["GC_FRAMING"] = _GC_FRAMING.replace(
+                        "{{AGENTS}}", agents_md,
+                    )
                 messages.append(sys_msg)
             elif system_prompt:
                 if agents_md:

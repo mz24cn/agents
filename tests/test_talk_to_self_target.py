@@ -143,6 +143,39 @@ def test_runtime_execution_layer_rejects_agent_removed_from_current_roster():
     assert "does not exist in the current conversation or has left" in result
 
 
+def test_talk_to_child_template_overwrites_literal_agents_argument():
+    """Nested talk_to must overwrite a truthy literal/stale AGENTS argument
+    in the target agent's template, rather than preserving {{AGENTS}}."""
+    runtime = RecordingRuntime()
+    manager_agent = _agent("dev-manager", "DevManager")
+    coder = _agent("coder", "Coder")
+    coder.update({
+        "system_prompt": "",
+        "template_id": "coder-template",
+        "template_arguments": {"AGENTS": "{{AGENTS}}"},
+    })
+    manager = FakeAgentManager([manager_agent, coder])
+    set_request_context(
+        agent_manager=manager,
+        agent_id="dev-manager",
+        all_agent_ids=["dev-manager", "coder"],
+    )
+    talk_to = _make_talk_to_fn(runtime, _thread_local)
+    try:
+        result = talk_to(["coder"], "help")
+    finally:
+        clear_request_context(list(_thread_local.__dict__.keys()))
+
+    assert "done" in result
+    assert len(runtime.calls) == 1
+    sys_msg = runtime.calls[0]["request"].messages[0]
+    assert sys_msg.prompt_template == "coder-template"
+    assert sys_msg.arguments["AGENTS"] != "{{AGENTS}}"
+    assert "{{AGENTS}}" not in sys_msg.arguments["AGENTS"]
+    assert "| DevManager | dev-manager |" in sys_msg.arguments["AGENTS"]
+    assert "| Coder | coder |" not in sys_msg.arguments["AGENTS"]
+
+
 def test_talk_to_child_context_uses_target_identity_and_excludes_target_from_roster():
     runtime = RecordingRuntime()
     manager = FakeAgentManager([

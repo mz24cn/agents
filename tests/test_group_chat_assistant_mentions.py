@@ -19,13 +19,31 @@ import pytest
 
 from runtime.common import get_request_context
 from runtime.models import Message, InferenceRequest
+from runtime.registry import ModelRegistry, ToolRegistry
+from runtime.runtime import Runtime
 from runtime.group_chat import (
+    _build_agent_system_messages,
+    build_agents_markdown,
     run_group_chat_stream,
     run_group_chat_stream_gen,
     parse_mentions,
     resolve_mentions,
     route_group_chat_user_message,
 )
+
+
+class FakeTemplate:
+    def __init__(self, content: str):
+        self.content = content
+
+
+class FakeTemplateManager:
+    def __init__(self, templates: dict[str, str]):
+        self.templates = templates
+
+    def get(self, template_id: str):
+        content = self.templates.get(template_id)
+        return FakeTemplate(content) if content is not None else None
 
 
 class FakeAgentManager:
@@ -174,6 +192,108 @@ AGENTS = [
         "tool_ids": [],
     },
 ]
+
+
+def test_template_agents_placeholder_is_always_overwritten_with_dispatch_roster():
+    """Regression: template_arguments may contain a stale/literal AGENTS
+    value. The current group roster must always win, and the agent itself must
+    be excluded from the dispatch table."""
+    am = FakeAgentManager(AGENTS)
+    all_ids = ["SunWuKong", "ShaWuJing", "ZhuBaJie"]
+    full_roster = build_agents_markdown(
+        all_ids, am, include_user_row=True,
+    )
+    dispatch_roster = build_agents_markdown(
+        all_ids, am, exclude_agent_id="SunWuKong",
+    )
+    agent = {
+        **AGENTS[0],
+        "system_prompt": "",
+        "template_id": "manager-template",
+        # This was the production failure: truthy literal prevented overwrite.
+        "template_arguments": {"AGENTS": "{{AGENTS}}"},
+        "tool_ids": ["talk_to"],
+    }
+
+    msgs = _build_agent_system_messages(
+        agent,
+        "SunWuKong",
+        full_roster,
+        dispatch_roster,
+        None,
+        "",
+        [],
+    )
+    sys_msg = msgs[0]
+    assert sys_msg.prompt_template == "manager-template"
+    assert sys_msg.arguments["AGENTS"] == dispatch_roster
+    assert "{{AGENTS}}" not in sys_msg.arguments["AGENTS"]
+    assert "| 孙悟空 | SunWuKong |" not in sys_msg.arguments["AGENTS"]
+    assert "| 沙和尚 | ShaWuJing |" in sys_msg.arguments["AGENTS"]
+    assert "| 猪八戒 | ZhuBaJie |" in sys_msg.arguments["AGENTS"]
+    # Generic group framing still uses the full participant roster + user row.
+    assert "{{AGENTS}}" not in sys_msg.arguments["GC_FRAMING"]
+    assert "| 孙悟空 | SunWuKong |" in sys_msg.arguments["GC_FRAMING"]
+    assert "| 用户 | user |" in sys_msg.arguments["GC_FRAMING"]
+
+    # Simulate Runtime._normalize_messages template rendering: the actual
+    # outbound model request must contain no literal placeholder.
+    template_text = "可调度目录：\n{{AGENTS}}\n\n{{GC_FRAMING}}"
+    rendered = template_text
+    for key, value in sys_msg.arguments.items():
+        rendered = rendered.replace(f"{{{{{key}}}}}", str(value))
+    assert "{{AGENTS}}" not in rendered
+    assert dispatch_roster in rendered
+    assert full_roster in rendered
+
+    # Actual Runtime template rendering path (the exact layer that writes
+    # request_*.json) must also contain no literal placeholder.
+    runtime = Runtime(
+        ModelRegistry(),
+        ToolRegistry(),
+        prompt_template_manager=FakeTemplateManager({
+            "manager-template": template_text,
+        }),
+    )
+    request = InferenceRequest(
+        model_id="unused",
+        messages=msgs,
+        tool_ids=[],
+    )
+    final_system = runtime._normalize_messages(request)[0].content
+    assert "{{AGENTS}}" not in final_system
+    assert dispatch_roster in final_system
+    assert full_roster in final_system
+
+
+def test_plain_system_prompt_agents_placeholder_uses_dispatch_roster():
+    am = FakeAgentManager(AGENTS)
+    all_ids = ["SunWuKong", "ShaWuJing", "ZhuBaJie"]
+    full_roster = build_agents_markdown(all_ids, am, include_user_row=True)
+    dispatch_roster = build_agents_markdown(
+        all_ids, am, exclude_agent_id="SunWuKong",
+    )
+    agent = {
+        **AGENTS[0],
+        "system_prompt": "可调度目录：\n{{AGENTS}}",
+        "template_id": None,
+        "tool_ids": ["talk_to"],
+    }
+
+    msgs = _build_agent_system_messages(
+        agent,
+        "SunWuKong",
+        full_roster,
+        dispatch_roster,
+        None,
+        "",
+        [],
+    )
+    content = msgs[0].content
+    assert "{{AGENTS}}" not in content
+    assert "| 孙悟空 | SunWuKong |" not in content.split("这是一场群聊对话", 1)[0]
+    assert "| 沙和尚 | ShaWuJing |" in content.split("这是一场群聊对话", 1)[0]
+    assert "| 用户 | user |" in content.split("这是一场群聊对话", 1)[1]
 
 
 def _make_req(first_user: str, mentioned: list[str]) -> InferenceRequest:

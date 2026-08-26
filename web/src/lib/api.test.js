@@ -107,6 +107,41 @@ describe('subscribeSessionStream', () => {
     vi.useRealTimers()
   })
 
+  it('waits for batched UI acknowledgement before advancing the resume cursor', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce(sseResponse([
+        'event: init\ndata: {"active":true,"persisted_seq":4,"latest_seq":5}\n\n',
+        'id: 5\ndata: {"role":"assistant","content":"first"}\n\n',
+      ]))
+      .mockResolvedValueOnce(sseResponse(['data: [DONE]\n\n'])))
+    const acknowledgements = []
+
+    const unsubscribe = subscribeSessionStream(
+      'session-ack',
+      vi.fn(),
+      vi.fn(),
+      vi.fn(),
+      null,
+      -1,
+      (acknowledge) => acknowledgements.push(acknowledge),
+    )
+    await flushPromises()
+    await vi.advanceTimersByTimeAsync(1000)
+    await flushPromises()
+
+    // EOF must not reconnect ahead of the queued animation-frame application.
+    expect(fetch).toHaveBeenCalledOnce()
+    expect(acknowledgements).toHaveLength(1)
+    acknowledgements[0]()
+    await vi.advanceTimersByTimeAsync(1000)
+    await flushPromises()
+
+    expect(fetch.mock.calls[1][0]).toBe('/v1/sessions/session-ack/stream?after=5')
+    unsubscribe()
+    vi.useRealTimers()
+  })
+
   it('uses persisted_seq as the resume baseline if the first connection drops after init', async () => {
     vi.useFakeTimers()
     vi.stubGlobal('fetch', vi.fn()

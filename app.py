@@ -69,9 +69,8 @@ if len(sys.argv) > 1:
 if __name__ == "__main__":
     workspace_dir = os.environ.get("AGENTS_WORKSPACE", "")
     if not workspace_dir or not os.path.exists(workspace_dir):
-        workspace_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workspace")
-        if not os.path.exists(workspace_dir):
-            workspace_dir = os.path.dirname(os.path.abspath(__file__))
+        workspace_dir = os.path.expanduser("~/workspace")
+        os.makedirs(workspace_dir, exist_ok=True)
         os.environ["AGENTS_WORKSPACE"] = workspace_dir
     os.chdir(workspace_dir)
 

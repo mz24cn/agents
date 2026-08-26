@@ -311,13 +311,17 @@ export const sessions = {
  * Unexpected EOF and network/read errors are retried automatically.  Every
  * inference frame has a monotonically increasing SSE `id`; reconnects pass the
  * last successfully applied id back as `after`, so the backend replays only the
- * missing frames and then resumes the live stream.
+ * missing frames and then resumes the live stream. `onApplied`, when supplied,
+ * receives acknowledgement callbacks so a batching UI can advance that cursor
+ * only after applying the corresponding frame.
  */
-export function subscribeSessionStream(sessionId, onMessage, onDone, onError, onInit = null, after = -1) {
+export function subscribeSessionStream(sessionId, onMessage, onDone, onError, onInit = null, after = -1, onApplied = null) {
   let stopped = false
   let completed = false
   let controller = null
   let reconnectTimer = null
+  let pendingApplications = 0
+  let reconnectAfterApplications = false
   let lastSeq = Number.isFinite(Number(after)) ? Number(after) : -1
   let baselineInitialized = lastSeq >= 0
 
@@ -333,6 +337,11 @@ export function subscribeSessionStream(sessionId, onMessage, onDone, onError, on
 
   const scheduleReconnect = () => {
     if (stopped || completed || reconnectTimer) return
+    if (pendingApplications > 0) {
+      reconnectAfterApplications = true
+      return
+    }
+    reconnectAfterApplications = false
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null
       connect()
@@ -382,8 +391,26 @@ export function subscribeSessionStream(sessionId, onMessage, onDone, onError, on
               streamDebug('retained_init', { sessionId, lastSeq, ...data })
               onInit?.(data)
             } else {
-              onMessage?.(data)
-              if (currentId !== null) lastSeq = Math.max(lastSeq, currentId)
+              // Delivery and application are separate when the UI batches
+              // frames. The optional acknowledgement callback advances the
+              // reconnect cursor only after the batcher has applied this frame.
+              onMessage?.(data, currentId)
+              if (currentId !== null) {
+                if (onApplied) {
+                  const appliedSeq = currentId
+                  pendingApplications += 1
+                  let acknowledged = false
+                  onApplied(() => {
+                    if (acknowledged) return
+                    acknowledged = true
+                    lastSeq = Math.max(lastSeq, appliedSeq)
+                    pendingApplications = Math.max(0, pendingApplications - 1)
+                    if (pendingApplications === 0 && reconnectAfterApplications) scheduleReconnect()
+                  })
+                } else {
+                  lastSeq = Math.max(lastSeq, currentId)
+                }
+              }
               if (shouldLogStreamFrame(currentId, data)) {
                 streamDebug('retained_frame', { sessionId, seq: currentId, lastSeq, role: data?.role, name: data?.name, streaming: data?.streaming })
               }

@@ -525,6 +525,215 @@ class OpenAIProtocol(BaseProtocol):
         ], usage
 
 
+class OpenAIResponsesProtocol(BaseProtocol):
+    """OpenAI Responses API (``POST /v1/responses``) adapter.
+
+    The public protocol name is ``responses``.  It deliberately keeps the
+    complete conversation in ``input`` instead of relying on
+    ``previous_response_id`` so persisted/stateless conversations behave the
+    same way as the other adapters.
+    """
+
+    def build_request(self, config: ModelConfig, messages: list,
+                      tools: Optional[list] = None, stream: bool = False) -> tuple:
+        url = config.api_base.rstrip("/") + "/responses"
+        headers = {"Content-Type": "application/json"}
+        if config.api_key:
+            headers["Authorization"] = "Bearer " + config.api_key
+
+        messages = _merge_leading_system_messages(messages)
+        body = {
+            "model": config.model_name,
+            "input": [item for msg in messages for item in self._encode_message(msg)],
+            "stream": stream,
+        }
+        if config.generate_params:
+            params = dict(config.generate_params)
+            # Chat Completions' spelling is not accepted by Responses.
+            if "max_completion_tokens" in params:
+                params["max_output_tokens"] = params.pop("max_completion_tokens")
+            for key, value in params.items():
+                body[key] = value
+        if tools:
+            body["tools"] = [self._encode_tool(tool) for tool in tools]
+
+        self._dump_request_if_debug(body)
+        return url, headers, json.dumps(body).encode("utf-8")
+
+    def _encode_message(self, msg: Message) -> list[dict]:
+        if msg.role == "tool":
+            return [{
+                "type": "function_call_output",
+                "call_id": msg.tool_use_id or "call_" + uuid.uuid4().hex[:8],
+                "output": msg.content or "",
+            }]
+
+        items: list[dict] = []
+        if msg.role == "assistant" and msg.tool_calls:
+            # Preserve assistant text as a message before its function calls.
+            if msg.content:
+                items.append({"role": "assistant", "content": msg.content})
+            for tc in msg.tool_calls:
+                arguments = tc.get("arguments", "{}")
+                if not isinstance(arguments, str):
+                    arguments = json.dumps(arguments, ensure_ascii=False)
+                items.append({
+                    "type": "function_call",
+                    "call_id": tc.get("id") or tc.get("tool_use_id") or
+                               "call_" + uuid.uuid4().hex[:8],
+                    "name": tc.get("name", "unknown"),
+                    "arguments": arguments,
+                })
+            return items
+
+        if msg.images:
+            content = []
+            if msg.content:
+                content.append({
+                    "type": "input_text" if msg.role != "assistant" else "output_text",
+                    "text": msg.content,
+                })
+            for image in msg.images:
+                raw = self._convert_image_to_base64(image)
+                content.append({
+                    "type": "input_image",
+                    "image_url": "data:image/jpeg;base64," + raw,
+                })
+            return [{"role": msg.role, "content": content}]
+        return [{"role": msg.role, "content": msg.content or ""}]
+
+    @staticmethod
+    def _encode_tool(tool: ToolConfig) -> dict:
+        # Responses tools are flattened (there is no nested ``function``).
+        return {
+            "type": "function",
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": tool.parameters,
+        }
+
+    @staticmethod
+    def _usage(data: dict) -> TokenStat:
+        raw = data.get("usage") or {}
+        prompt = raw.get("input_tokens", raw.get("prompt_tokens", 0))
+        completion = raw.get("output_tokens", raw.get("completion_tokens", 0))
+        return TokenStat(
+            prompt_tokens=prompt,
+            completion_tokens=completion,
+            total_tokens=raw.get("total_tokens", prompt + completion),
+        )
+
+    @staticmethod
+    def _output_message(data: dict) -> Message:
+        content = ""
+        thinking = ""
+        tool_calls = []
+        for item in data.get("output") or []:
+            item_type = item.get("type")
+            if item_type == "message":
+                for part in item.get("content") or []:
+                    if part.get("type") in ("output_text", "text"):
+                        content += part.get("text", "")
+            elif item_type == "function_call":
+                tool_calls.append({
+                    "id": item.get("call_id") or item.get("id", ""),
+                    "name": item.get("name", ""),
+                    "arguments": item.get("arguments", "{}"),
+                })
+            elif item_type in ("reasoning", "reasoning_content"):
+                summary = item.get("summary") or []
+                for part in summary:
+                    if isinstance(part, dict):
+                        thinking += part.get("text", "")
+                if isinstance(item.get("content"), str):
+                    thinking += item["content"]
+        return Message(role="assistant", content=content,
+                       tool_calls=tool_calls or None, thinking=thinking or None)
+
+    def parse_response(self, response_data: bytes, stream: bool = False) -> tuple:
+        if stream:
+            return self._parse_stream_response(response_data)
+        data = json.loads(response_data.decode("utf-8"))
+        return [self._output_message(data)], self._usage(data)
+
+    @staticmethod
+    def _events(lines) -> Iterator[dict]:
+        for raw_line in lines:
+            line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else raw_line
+            line = line.rstrip("\r\n")
+            if not line.startswith("data:"):
+                continue
+            payload = line[len("data:"):].strip()
+            if payload == "[DONE]":
+                break
+            try:
+                yield json.loads(payload)
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+    def parse_stream(self, http_resp: object) -> Iterator[Message]:
+        usage = TokenStat()
+        for event in self._events(http_resp):
+            event_type = event.get("type", "")
+            if event_type == "response.output_text.delta":
+                delta = event.get("delta", "")
+                if delta:
+                    yield Message(role="assistant", content=delta)
+            elif event_type in ("response.reasoning_summary_text.delta",
+                                "response.reasoning_text.delta"):
+                delta = event.get("delta", "")
+                if delta:
+                    yield Message(role="assistant", content="", thinking=delta)
+            elif event_type == "response.output_item.done":
+                item = event.get("item") or {}
+                if item.get("type") == "function_call":
+                    yield Message(role="assistant", content="", tool_calls=[{
+                        "id": item.get("call_id") or item.get("id", ""),
+                        "name": item.get("name", ""),
+                        "arguments": item.get("arguments", "{}"),
+                    }])
+            elif event_type in ("response.completed", "response.incomplete"):
+                usage = self._usage(event.get("response") or {})
+        yield Message(role="usage", content=json.dumps({
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+            "total_tokens": usage.total_tokens,
+        }))
+
+    def _parse_stream_response(self, response_data: bytes) -> tuple:
+        content = ""
+        thinking = ""
+        tool_calls = []
+        usage = TokenStat()
+        for event in self._events(response_data.decode("utf-8").splitlines()):
+            event_type = event.get("type", "")
+            if event_type == "response.output_text.delta":
+                content += event.get("delta", "")
+            elif event_type in ("response.reasoning_summary_text.delta",
+                                "response.reasoning_text.delta"):
+                thinking += event.get("delta", "")
+            elif event_type == "response.output_item.done":
+                item = event.get("item") or {}
+                if item.get("type") == "function_call":
+                    tool_calls.append({
+                        "id": item.get("call_id") or item.get("id", ""),
+                        "name": item.get("name", ""),
+                        "arguments": item.get("arguments", "{}"),
+                    })
+            elif event_type in ("response.completed", "response.incomplete"):
+                response = event.get("response") or {}
+                usage = self._usage(response)
+                # Some compatible providers only put output in the terminal event.
+                if not content and not tool_calls and response.get("output"):
+                    terminal = self._output_message(response)
+                    content = terminal.content or ""
+                    thinking = terminal.thinking or thinking
+                    tool_calls = terminal.tool_calls or []
+        return [Message(role="assistant", content=content,
+                        tool_calls=tool_calls or None,
+                        thinking=thinking or None)], usage
+
+
 class OllamaProtocol(BaseProtocol):
     """Ollama native /api/chat protocol adapter.
 
@@ -1409,6 +1618,8 @@ class AnthropicProtocol(BaseProtocol):
 # Protocol name to adapter class mapping
 PROTOCOL_MAP = {
     "openai": OpenAIProtocol,
+    "responses": OpenAIResponsesProtocol,
+    "openai-responses": OpenAIResponsesProtocol,
     "ollama": OllamaProtocol,
     "anthropic": AnthropicProtocol,
 }

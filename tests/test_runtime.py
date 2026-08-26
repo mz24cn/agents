@@ -416,6 +416,49 @@ def _make_openai_function_call_response(tool_name: str, arguments: str = "{}") -
     }).encode("utf-8")
 
 
+def test_infer_resolves_model_placeholders_only_for_outbound_request(monkeypatch) -> None:
+    monkeypatch.setenv("TEST_MODEL_BASE", "https://inference.example/v1")
+    monkeypatch.setenv("TEST_MODEL_NAME", "resolved-model")
+    monkeypatch.setenv("TEST_MODEL_KEY", "resolved-key")
+
+    model_registry = ModelRegistry()
+    stored = ModelConfig(
+        model_id="placeholder-model",
+        api_base="{{TEST_MODEL_BASE}}",
+        model_name="{{TEST_MODEL_NAME}}",
+        api_key="{{TEST_MODEL_KEY}}",
+        api_protocol="openai",
+    )
+    model_registry.register(stored)
+    runtime = Runtime(model_registry=model_registry, tool_registry=ToolRegistry())
+    response_bytes = json.dumps({
+        "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+    }).encode("utf-8")
+    captured = {}
+
+    def mock_urlopen(request, **kwargs):
+        captured["url"] = request.full_url
+        captured["headers"] = dict(request.header_items())
+        captured["body"] = json.loads(request.data)
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = response_bytes
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        return mock_resp
+
+    with patch("urllib.request.urlopen", side_effect=mock_urlopen):
+        result = runtime.infer(InferenceRequest(model_id=stored.model_id, text="hello"))
+
+    assert result.success is True
+    assert captured["url"] == "https://inference.example/v1/chat/completions"
+    assert captured["headers"]["Authorization"] == "Bearer resolved-key"
+    assert captured["body"]["model"] == "resolved-model"
+    assert model_registry.get(stored.model_id) is stored
+    assert stored.api_base == "{{TEST_MODEL_BASE}}"
+    assert stored.model_name == "{{TEST_MODEL_NAME}}"
+    assert stored.api_key == "{{TEST_MODEL_KEY}}"
+
+
 def test_max_infer_per_minute_throttle_sleeps_after_ten_rounds() -> None:
     """MAX_INFER_PER_MINUTE is enforced dynamically once 10 tool rounds complete."""
     runtime = Runtime(model_registry=ModelRegistry(), tool_registry=ToolRegistry())

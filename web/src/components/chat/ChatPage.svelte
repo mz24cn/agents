@@ -15,6 +15,7 @@
   import ConfirmDialog from '../ConfirmDialog.svelte'
   import { extractPlaceholders } from '../../lib/placeholder.js'
   import { buildFileJournalTurnKeyMap } from '../../lib/file-journals.js'
+  import { mergeToolCallDeltas, startsNewToolCallRound } from '../../lib/stream-messages.js'
   import { t } from '../../lib/i18n.svelte.js'
   import { navigate } from '../../lib/router.svelte.js'
   import { sessionRestore, sessionDownload, newSessionCreated, sessionDeleted, currentSession, newSessionRequest, terminalOpen, openSessionLogDir } from '../../lib/session-state.svelte.js'
@@ -69,6 +70,10 @@
 
   function canMergeStreamFrames(previous, next) {
     if (!previous || !next || previous.role !== next.role) return false
+    // Sequence IDs are transport acknowledgements. Keep frames carrying them
+    // separate so the retained cursor can advance only after each frame has
+    // actually been applied to the UI.
+    if (previous.__streamSeq != null || next.__streamSeq != null) return false
     if (next.role === 'assistant') {
       return !previous.tool_calls && !next.tool_calls
         && (previous.agent_id || previous.assistant_id || '') === (next.agent_id || next.assistant_id || '')
@@ -153,14 +158,32 @@
     if (handoff) directlyConsumedSessions.delete(sid)
     const keyRef = { key: sid }
     const aIdxRef = { value: -1, groupMode: false, groupMap: {} }
-    const frameBatcher = createStreamFrameBatcher((msg) => onStreamMsg(msg, aIdxRef, null, keyRef))
+    const frameBatcher = createStreamFrameBatcher((msg) => {
+      const { __streamSeq: _streamSeq, ...frame } = msg
+      onStreamMsg(frame, aIdxRef, null, keyRef)
+    })
     const existing = sessionStore[sid]
-    const agentIds = new Set((existing?.messages || []).filter(m => m.role === 'assistant').map(m => m.agent_id).filter(Boolean))
+    const existingMessages = existing?.messages || []
+    const currentTurnStart = existingMessages.findLastIndex(message => message.role === 'user')
+    const agentIds = new Set(
+      existingMessages
+        .slice(currentTurnStart + 1)
+        .filter(message => message.role === 'assistant')
+        .map(getMessageAgentId)
+        .filter(Boolean),
+    )
     aIdxRef.groupMode = agentIds.size > 1
+    if (aIdxRef.groupMode) {
+      for (let index = currentTurnStart + 1; index < existingMessages.length; index++) {
+        const message = existingMessages[index]
+        const agentId = message.role === 'assistant' ? getMessageAgentId(message) : null
+        if (agentId && !message.stat) aIdxRef.groupMap[agentId] = index
+      }
+    }
     let unsubscribe = null
     unsubscribe = subscribeSessionStream(
       sid,
-      (msg) => frameBatcher.push(msg),
+      (msg, seq) => frameBatcher.push(seq == null ? msg : { ...msg, __streamSeq: seq }),
       () => {
         frameBatcher.then(() => {
           // A retained GET can legitimately observe an inactive snapshot and
@@ -205,6 +228,7 @@
         errorMsg = ''
       },
       handoff ? (directStreamLastSeq.get(sid) ?? -1) : -1,
+      (acknowledge) => frameBatcher.then(acknowledge),
     )
     sessionStreamSubscriptions[sid] = unsubscribe
   }
@@ -775,51 +799,29 @@
     if (store) store.isStreaming = false
   }
 
-  function mergeToolCallDeltas(existing = [], incoming = []) {
-    const merged = existing.map(tc => ({ ...tc }))
-
-    for (const inc of incoming) {
-      const incIndex = inc._index
-      const incId = inc.id || inc.tool_use_id
-      let pos = -1
-
-      // OpenAI-compatible streaming tool calls are deltas. Prefer the explicit
-      // delta index, then fall back to id/tool_use_id; otherwise append as a
-      // complete/non-streaming tool call.
-      if (incIndex !== undefined && incIndex !== null) {
-        pos = merged.findIndex(tc => (tc._index ?? 0) === incIndex)
-      }
-      if (pos < 0 && incId) {
-        pos = merged.findIndex(tc => tc.id === incId || tc.tool_use_id === incId)
-      }
-      if (pos < 0) {
-        merged.push({ ...inc })
-        continue
-      }
-
-      const cur = { ...merged[pos] }
-      if (incIndex !== undefined && incIndex !== null) cur._index = incIndex
-      if (inc.id) cur.id = inc.id
-      if (inc.tool_use_id) cur.tool_use_id = inc.tool_use_id
-
-      // name/arguments may arrive as multiple delta fragments.
-      if (inc.name) cur.name = (cur.name || '') + inc.name
-      if (inc.arguments !== undefined && inc.arguments !== null) {
-        if (typeof inc.arguments === 'string') {
-          cur.arguments = (cur.arguments || '') + inc.arguments
-        } else {
-          cur.arguments = inc.arguments
-        }
-      }
-
-      merged[pos] = cur
-    }
-
-    return merged
-  }
-
   function getToolUseId(msg) {
     return msg?.tool_use_id || null
+  }
+
+  function getMessageAgentId(msg) {
+    return msg?.agent_id || msg?.assistant_id || null
+  }
+
+  function findAssistantIndexForToolCall(messages, toolUseId) {
+    if (!toolUseId) return -1
+    return messages.findLastIndex(message =>
+      message.role === 'assistant'
+      && (message.tool_calls || []).some(call =>
+        (call?.id || call?.tool_use_id) === toolUseId
+      )
+    )
+  }
+
+  function resolveToolOwnerAgentId(msg, messages) {
+    const explicit = getMessageAgentId(msg)
+    if (explicit) return explicit
+    const assistantIndex = findAssistantIndexForToolCall(messages, getToolUseId(msg))
+    return assistantIndex >= 0 ? getMessageAgentId(messages[assistantIndex]) : null
   }
 
   function normalizeToolMessage(msg, overrides = {}) {
@@ -894,6 +896,45 @@
     }
 
     if (msg.role === 'assistant') {
+      const incomingAgentId = getMessageAgentId(msg)
+      if (!aIdxRef.groupMode && incomingAgentId) {
+        // A retained subscription can attach before the second participant has
+        // produced any persisted/live assistant frame. History then looks like
+        // a single-agent chat even though concurrent group output is already in
+        // progress. Detect the first different author before merging its frame,
+        // promote the router, and seed each existing agent's current bubble.
+        const currentTurnStart = msgs.findLastIndex(existing => existing.role === 'user')
+        const existingAgentIds = new Set(
+          msgs
+            .slice(currentTurnStart + 1)
+            .filter(existing => existing.role === 'assistant')
+            .map(getMessageAgentId)
+            .filter(Boolean),
+        )
+        if ([...existingAgentIds].some(agentId => agentId !== incomingAgentId)) {
+          aIdxRef.groupMode = true
+          aIdxRef.groupMap = {}
+          for (let index = currentTurnStart + 1; index < msgs.length; index++) {
+            const existing = msgs[index]
+            const agentId = existing.role === 'assistant' ? getMessageAgentId(existing) : null
+            // Seed only the still-open model response. A usage/stat frame marks
+            // historical bubbles as closed; reopening one would merge a later
+            // inference round into old content after retained-stream handoff.
+            if (agentId && !existing.stat) aIdxRef.groupMap[agentId] = index
+          }
+          aIdxRef.value = -1
+        }
+      }
+      // `aIdxRef` is transport-local and is rebuilt after a direct→retained
+      // handoff. More importantly, usage frames do not reset it because they
+      // carry stats for the current assistant bubble. If a later model round's
+      // first indexed tool call arrives without an intervening tool result
+      // frame (disconnect/replay edge case), do not merge it into the previous
+      // assistant bubble. That corrupts both chronology and call names/args.
+      if (!aIdxRef.groupMode && aIdxRef.value >= 0) {
+        const activeAssistant = msgs[aIdxRef.value]
+        if (startsNewToolCallRound(activeAssistant, msg)) aIdxRef.value = -1
+      }
       if (aIdxRef.groupMode) {
         // ── Group chat: route each agent's stream to its own bubble ──
         const agentId = msg.agent_id || msg.assistant_id || '__unknown__'
@@ -942,6 +983,14 @@
         store.messages = u
       }
     } else if (msg.role === 'tool') {
+      // Formal/streaming tool frames should already carry the caller's
+      // agent_id. Recover it from the declaring assistant call for older or
+      // partially replayed streams, so concurrent agents cannot steal each
+      // other's tool card or reset the wrong assistant route.
+      const toolOwnerAgentId = resolveToolOwnerAgentId(msg, msgs)
+      if (toolOwnerAgentId && !getMessageAgentId(msg)) {
+        msg = { ...msg, agent_id: toolOwnerAgentId }
+      }
       if (msg.streaming === true) {
         const delta = msg.delta || ''
         const tcId = getToolUseId(msg)
@@ -1097,6 +1146,15 @@
           store.messages = arr
         }
       } catch (_) {}
+      // usage(name=round) is the authoritative end of one model response. The
+      // following assistant output belongs to a new conversation turn, even
+      // when a tool result frame was missed around a disconnect/reconnect.
+      if (aIdxRef.groupMode) {
+        const agId = msg.agent_id || msg.assistant_id
+        if (agId) delete aIdxRef.groupMap[agId]
+      } else {
+        aIdxRef.value = -1
+      }
     }
     streamUiDebug('apply_end', {
       storeKey: keyRef.key,

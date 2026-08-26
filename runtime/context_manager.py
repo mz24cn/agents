@@ -926,9 +926,26 @@ def get_file_journal_diff(session_dir: str, timestamp: str) -> dict:
         except Exception:
             after = b"<read error>"
 
+        # Metadata shown in the file-change list. Prefer the current workspace
+        # stat for modification time and size, while retaining the journal size
+        # as a fallback for files that have since been deleted.
+        modified: Optional[int] = None
+        size = after_blob.get("size") if after_exists else baseline_blob.get("size")
+        workspace_path = os.path.realpath(os.path.join(workspace, rel_path))
+        workspace_root = os.path.realpath(workspace)
+        try:
+            if os.path.commonpath([workspace_root, workspace_path]) == workspace_root:
+                workspace_stat = os.lstat(workspace_path)
+                modified = int(workspace_stat.st_mtime * 1000)
+                size = workspace_stat.st_size
+        except (FileNotFoundError, OSError, ValueError):
+            pass
+
         file_obj: dict = {
             "path": rel_path,
             "change_type": change_type,
+            "modified": modified,
+            "size": size,
             "baseline": before.decode("utf-8", errors="replace"),
             "after": after.decode("utf-8", errors="replace"),
         }

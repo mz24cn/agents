@@ -4,10 +4,23 @@ Defines Message, ModelConfig, ToolConfig, InferenceRequest, and InferenceResult
 as dataclasses with JSON serialization/deserialization support.
 """
 
-from dataclasses import dataclass, field
+import os
+import re
+from dataclasses import dataclass, field, replace
 from typing import Optional, List
 
 from runtime.common import parse_labels  # noqa: F401 — re-export
+
+
+_ENV_PLACEHOLDER_RE = re.compile(r"\{\{(\w+)\}\}")
+
+
+def _resolve_env_placeholders(value: str) -> str:
+    """Replace ``{{KEY}}`` placeholders with backend environment values."""
+    return _ENV_PLACEHOLDER_RE.sub(
+        lambda match: os.environ.get(match.group(1), ""),
+        value,
+    )
 
 
 @dataclass
@@ -128,6 +141,21 @@ class ModelConfig:
 
     def __post_init__(self):
         self.labels = parse_labels(self.labels)
+
+    def resolved_for_inference(self) -> "ModelConfig":
+        """Return an inference-only copy with environment placeholders resolved.
+
+        The stored configuration is never modified, so registry memory and JSON
+        persistence continue to contain the original ``{{KEY}}`` placeholders.
+        Only endpoint fields that participate directly in the model request are
+        resolved.
+        """
+        return replace(
+            self,
+            api_base=_resolve_env_placeholders(self.api_base),
+            model_name=_resolve_env_placeholders(self.model_name),
+            api_key=_resolve_env_placeholders(self.api_key),
+        )
 
     def to_dict(self) -> dict:
         """Serialize to a dictionary."""

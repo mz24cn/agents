@@ -403,6 +403,8 @@ const translations = {
     apiBase: 'API 地址',
     apiKey: 'API 密钥',
     apiProtocol: 'API 协议',
+    responsesApiBaseHint: 'OpenAI Responses API 地址（请求将发送到 /responses）',
+    responsesProtocolHint: '适用于支持 /v1/responses 的模型，可同时使用推理参数与函数工具。',
     generateParams: '生成参数 (JSON)',
     modelIdRequired: '模型 ID 不能为空',
     apiBaseRequired: 'API 地址不能为空',
@@ -411,7 +413,11 @@ const translations = {
     modelNamePlaceholder: '例如: Qwen-7B-Chat',
     apiBasePlaceholder: '例如: http://localhost:11434',
     apiKeyPlaceholder: '选填',
+    showApiKey: '显示 API 密钥',
+    hideApiKey: '隐藏 API 密钥',
     generateParamsPlaceholder: '{"temperature": 0.7}',
+    modelEnvPlaceholderHint: '支持 {{key}} 占位符；实际推理时由后端使用同名环境变量替换。',
+    generateParamsExtraBodyHint: '不要保留 extra_body 键；请将其中字段直接摊平到 JSON 顶层，否则参数可能无效。',
 
     // ModelsPage
     modelsPageTitle: '模型管理',
@@ -945,6 +951,8 @@ const translations = {
     apiBase: 'API Base URL',
     apiKey: 'API Key',
     apiProtocol: 'API Protocol',
+    responsesApiBaseHint: 'OpenAI Responses API URL (requests are sent to /responses)',
+    responsesProtocolHint: 'For models supporting /v1/responses; reasoning and function tools can be used together.',
     generateParams: 'Generate Params (JSON)',
     modelIdRequired: 'Model ID is required',
     apiBaseRequired: 'API base URL is required',
@@ -953,7 +961,11 @@ const translations = {
     modelNamePlaceholder: 'e.g. Qwen-7B-Chat',
     apiBasePlaceholder: 'e.g. http://localhost:11434',
     apiKeyPlaceholder: 'Optional',
+    showApiKey: 'Show API key',
+    hideApiKey: 'Hide API key',
     generateParamsPlaceholder: '{"temperature": 0.7}',
+    modelEnvPlaceholderHint: 'Supports {{key}} placeholders, resolved from matching backend environment variables only during inference.',
+    generateParamsExtraBodyHint: 'Do not keep an extra_body key; flatten its fields into the top level or they may be ignored.',
 
     // ModelsPage
     modelsPageTitle: 'Models',

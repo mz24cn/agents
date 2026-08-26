@@ -204,6 +204,73 @@ def test_final_empty_persist_preserves_incremental_usage_and_triggers_compressio
 # ---------------------------------------------------------------------------
 
 
+def test_merge_stream_messages_isolates_interleaved_agents():
+    """Concurrent agent deltas must never share an assistant/tool buffer."""
+    stream = [
+        Message(role="assistant", content="A1", agent_id="agent-a", name="Agent A"),
+        Message(role="assistant", content="B1", agent_id="agent-b", name="Agent B"),
+        Message(role="assistant", content="A2", agent_id="agent-a", name="Agent A"),
+        Message(
+            role="usage", agent_id="agent-b",
+            content=json.dumps({"prompt_tokens": 2, "completion_tokens": 1}),
+        ),
+        Message(role="assistant", content="B2", agent_id="agent-b", name="Agent B"),
+        Message(
+            role="usage", agent_id="agent-a",
+            content=json.dumps({"prompt_tokens": 3, "completion_tokens": 2}),
+        ),
+        Message(
+            role="usage", agent_id="agent-b",
+            content=json.dumps({"prompt_tokens": 4, "completion_tokens": 2}),
+        ),
+    ]
+
+    turns, last_stat = merge_stream_messages(stream)
+
+    assert [(turn.agent_id, turn.name, turn.content) for turn in turns] == [
+        ("agent-a", "Agent A", "A1A2"),
+        ("agent-b", "Agent B", "B1"),
+        ("agent-b", "Agent B", "B2"),
+    ]
+    assert last_stat == {"prompt_tokens": 4, "completion_tokens": 2}
+
+
+def test_merge_stream_messages_routes_unscoped_tool_result_to_declaring_agent():
+    stream = [
+        Message(
+            role="assistant", agent_id="agent-a", name="Agent A",
+            tool_calls=[{"id": "call-a", "name": "exec_shell", "arguments": "{}"}],
+        ),
+        Message(role="assistant", content="other", agent_id="agent-b", name="Agent B"),
+        Message(role="usage", agent_id="agent-a", content="{}"),
+        Message(role="usage", agent_id="agent-b", content="{}"),
+        Message(
+            role="tool", name="exec_shell", tool_use_id="call-a",
+            content="result without legacy agent id",
+        ),
+    ]
+
+    turns, _ = merge_stream_messages(stream)
+
+    assert [(turn.role, turn.agent_id, turn.content) for turn in turns] == [
+        ("assistant", "agent-a", ""),
+        ("tool", "agent-a", "result without legacy agent id"),
+        ("assistant", "agent-b", "other"),
+    ]
+
+
+def test_multi_agent_incremental_batch_waits_for_every_started_agent_usage():
+    partial = [
+        Message(role="assistant", content="A complete", agent_id="agent-a"),
+        Message(role="assistant", content="B still streaming", agent_id="agent-b"),
+        Message(role="usage", content="{}", agent_id="agent-a"),
+    ]
+    complete = [*partial, Message(role="usage", content="{}", agent_id="agent-b")]
+
+    assert _stream_batch_is_protocol_complete(partial) is False
+    assert _stream_batch_is_protocol_complete(complete) is True
+
+
 def _round_tool_call():
     """collected_messages for one tool-call round: assistant(tool_calls) +
     usage + tool result."""

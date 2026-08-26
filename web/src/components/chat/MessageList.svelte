@@ -9,6 +9,7 @@
 
   import { resolveFileJournalTurnKey } from '../../lib/file-journals.js'
   import { isToolErrorContent } from '../../lib/tool-result.js'
+  import { buildTurnAgentGrouping } from '../../lib/message-groups.js'
   import { currentSession, messageScrollRequest } from '../../lib/session-state.svelte.js'
 
   let { messages = [], agentList = [], displayMessageDetails = false, onRevoke, onScrollAtBottom, shouldScrollToBottom = false, collapsedGroups = new Set(), onToggleCollapse, fileJournalTurnKeyMap = {}, fileDiffVisible = new Set(), fileDiffCache = {}, onToggleFileDiff, retryAssistantIndex = -1, onRetryLastInference, retryDisabled = false } = $props()
@@ -123,24 +124,14 @@
         // 是否存在中间消息（user 和 lastAssistant 之间的 tool/assistant）
         const hasIntermediate = lastAssistantIndex >= 0 && lastAssistantIndex > startIndex + 1
 
-        // Compact blocks: same-agent assistant/tool loops share one outer card.
-        const compactAgentBlocks = []
-        let compactStart = startIndex + 1
-        let compactAgentId = null
-        for (let j = startIndex + 1; j <= endIndex; j++) {
-          const m = messages[j]
-          const msgAgentId = m.agent_id || m.assistant_id || null
-          if (msgAgentId && compactAgentId && msgAgentId !== compactAgentId) {
-            compactAgentBlocks.push({ start: compactStart, end: j - 1, agentId: compactAgentId })
-            compactStart = j
-            compactAgentId = msgAgentId
-          } else if (!compactAgentId && msgAgentId) {
-            compactAgentId = msgAgentId
-          }
-        }
-        if (compactStart <= endIndex) {
-          compactAgentBlocks.push({ start: compactStart, end: endIndex, agentId: compactAgentId })
-        }
+        // Compact mode represents one user turn with exactly one outer card per
+        // participating agent. Unscoped assistant messages share the default
+        // assistant card, while tool results follow their declaring tool_use_id.
+        const { effectiveAgentIds, compactAgentBlocks } = buildTurnAgentGrouping(
+          messages,
+          startIndex + 1,
+          endIndex,
+        )
 
         // Detailed blocks preserve the old behavior: each assistant message starts
         // a new visual block and its following tool messages stay with it.
@@ -149,7 +140,7 @@
         let detailedAgentId = null
         for (let j = startIndex + 1; j <= endIndex; j++) {
           const m = messages[j]
-          const msgAgentId = m.agent_id || m.assistant_id || null
+          const msgAgentId = effectiveAgentIds.get(j)
           if (m.role === 'assistant') {
             if (detailedStart < j) detailedAgentBlocks.push({ start: detailedStart, end: j - 1, agentId: detailedAgentId })
             detailedStart = j
@@ -201,16 +192,25 @@
     return agentList.find(a => a.agent_id === block.agentId) || null
   }
 
+  function getBlockMessageIndices(block) {
+    if (block?.indices) return block.indices
+    return Array.from({ length: block.end - block.start + 1 }, (_, offset) => block.start + offset)
+  }
+
   function getBlockName(block) {
     const agent = getBlockAgent(block)
     if (agent?.nickname) return agent.nickname
-    const firstAssistant = messages.slice(block.start, block.end + 1).find(m => m.role === 'assistant')
+    const firstAssistant = getBlockMessageIndices(block)
+      .map(index => messages[index])
+      .find(m => m?.role === 'assistant')
     return firstAssistant?.agent_nickname || firstAssistant?.name || t('roleAssistant')
   }
 
   function getBlockStat(block) {
-    for (let i = block.end; i >= block.start; i--) {
-      if (messages[i]?.role === 'assistant' && messages[i]?.stat) return messages[i].stat
+    const indices = getBlockMessageIndices(block)
+    for (let offset = indices.length - 1; offset >= 0; offset--) {
+      const msg = messages[indices[offset]]
+      if (msg?.role === 'assistant' && msg.stat) return msg.stat
     }
     return null
   }
@@ -234,8 +234,8 @@
   function getBlockInferenceTimes(block) {
     let outputStartedAt = ''
     let loopCompletedAt = ''
-    for (let i = block.start; i <= block.end; i++) {
-      const msg = messages[i]
+    for (const index of getBlockMessageIndices(block)) {
+      const msg = messages[index]
       if (msg?.role !== 'assistant') continue
       if (!outputStartedAt && msg.stat?.first_token_timestamp) {
         outputStartedAt = msg.stat.first_token_timestamp
@@ -272,16 +272,17 @@
   }
 
   function getCompactToolResults(block) {
+    const indices = getBlockMessageIndices(block)
     const callIds = new Set()
-    for (let i = block.start; i <= block.end; i++) {
-      for (const tc of messages[i]?.tool_calls || []) {
+    for (const index of indices) {
+      for (const tc of messages[index]?.tool_calls || []) {
         const id = tc.id || tc.tool_use_id
         if (id) callIds.add(id)
       }
     }
     const results = {}
-    for (let i = block.start; i <= block.end; i++) {
-      const msg = messages[i]
+    for (const index of indices) {
+      const msg = messages[index]
       // Match every result frame to its originating call, including temporary
       // streaming results.  The call card owns the status icon and detail area;
       // standalone tool bubbles are only a fallback for unmatched results.
@@ -304,8 +305,8 @@
 
   function getBlockCopyText(block) {
     const parts = []
-    for (let i = block.start; i <= block.end; i++) {
-      const msg = messages[i]
+    for (const index of getBlockMessageIndices(block)) {
+      const msg = messages[index]
       if (!msg) continue
       if (msg.role === 'assistant') {
         if (msg.content) parts.push(msg.content)
@@ -442,18 +443,18 @@
                         {formatTokenCount(blockStat.prompt_tokens)}/{formatTokenCount(blockStat.completion_tokens)} tokens
                       </span>
                     {/if}
-                    {#if retryAssistantIndex >= block.start && retryAssistantIndex <= block.end && onRetryLastInference}
+                    {#if getBlockMessageIndices(block).includes(retryAssistantIndex) && onRetryLastInference}
                       <button class="agent-block-retry-btn" onclick={onRetryLastInference} disabled={retryDisabled}>{t('retryLastInference')}</button>
                     {/if}
-                    {#if block.end === group.endIndex}
+                    {#if block === group.compactAgentBlocks.at(-1)}
                       <button class="agent-block-mode-btn" onclick={() => toggleReplyMode(group.startIndex)}>{t('detailedReply')}</button>
                     {/if}
                     <CopyButton getText={() => getBlockCopyText(block)} />
                   </div>
                 </div>
                 <div class="agent-block-content">
-                  {#each Array.from({ length: block.end - block.start + 1 }) as _, offset}
-                    {@const msg = messages[block.start + offset]}
+                  {#each getBlockMessageIndices(block) as msgIndex}
+                    {@const msg = messages[msgIndex]}
                     {#if !isMatchedToolResult(msg, blockToolResults)}
                       <MessageBubble {msg} {agentList} {onRevoke} compact={true} toolResultsById={blockToolResults} />
                     {/if}
