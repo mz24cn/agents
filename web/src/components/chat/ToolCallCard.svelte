@@ -11,7 +11,10 @@
   let resultExpandedIndexes = $state(new Set())
   let resultHoverExpandedIndexes = $state(new Set())
   const hoverTimers = new Map()
+  const hoverCloseTimers = new Map()
   const resultHoverTimers = new Map()
+  const resultHoverCloseTimers = new Map()
+  const hoverCloseDelay = 200
   let previouslyStreamingIds = new Set()
 
   $effect(() => {
@@ -37,9 +40,8 @@
       for (const index of completedIndexes) {
         nextExpanded.delete(index)
         nextHover.delete(index)
-        const timer = resultHoverTimers.get(index)
-        if (timer) clearTimeout(timer)
-        resultHoverTimers.delete(index)
+        clearHoverTimer(resultHoverTimers, index)
+        clearHoverTimer(resultHoverCloseTimers, index)
       }
       resultExpandedIndexes = nextExpanded
       resultHoverExpandedIndexes = nextHover
@@ -72,18 +74,15 @@
     return isResultStreaming(result) || resultExpandedIndexes.has(index) || resultHoverExpandedIndexes.has(index)
   }
 
-  function startHoverPreview(index) {
-    if (expandedIndexes.has(index) || hoverTimers.has(index)) return
-    hoverTimers.set(index, setTimeout(() => {
-      hoverTimers.delete(index)
-      hoverExpandedIndexes = new Set(hoverExpandedIndexes).add(index)
-    }, 1000))
+  function clearHoverTimer(timers, index) {
+    const timer = timers.get(index)
+    if (timer) clearTimeout(timer)
+    timers.delete(index)
   }
 
-  function stopHoverPreview(index) {
-    const timer = hoverTimers.get(index)
-    if (timer) clearTimeout(timer)
-    hoverTimers.delete(index)
+  function closeHoverPreview(index) {
+    clearHoverTimer(hoverTimers, index)
+    clearHoverTimer(hoverCloseTimers, index)
     if (hoverExpandedIndexes.has(index)) {
       const next = new Set(hoverExpandedIndexes)
       next.delete(index)
@@ -91,18 +90,33 @@
     }
   }
 
-  function startResultHoverPreview(index) {
-    if (resultExpandedIndexes.has(index) || resultHoverTimers.has(index)) return
-    resultHoverTimers.set(index, setTimeout(() => {
-      resultHoverTimers.delete(index)
-      resultHoverExpandedIndexes = new Set(resultHoverExpandedIndexes).add(index)
+  function startHoverPreview(index) {
+    // The expanded detail can be laid out in a separate line fragment from the
+    // inline badge. Cancel a pending close while the pointer crosses that seam.
+    clearHoverTimer(hoverCloseTimers, index)
+    if (expandedIndexes.has(index) || hoverExpandedIndexes.has(index) || hoverTimers.has(index)) return
+    hoverTimers.set(index, setTimeout(() => {
+      hoverTimers.delete(index)
+      hoverExpandedIndexes = new Set(hoverExpandedIndexes).add(index)
     }, 1000))
   }
 
-  function stopResultHoverPreview(index) {
-    const timer = resultHoverTimers.get(index)
-    if (timer) clearTimeout(timer)
-    resultHoverTimers.delete(index)
+  function stopHoverPreview(index) {
+    clearHoverTimer(hoverTimers, index)
+    if (!hoverExpandedIndexes.has(index) || hoverCloseTimers.has(index)) return
+    hoverCloseTimers.set(index, setTimeout(() => {
+      hoverCloseTimers.delete(index)
+      if (hoverExpandedIndexes.has(index)) {
+        const next = new Set(hoverExpandedIndexes)
+        next.delete(index)
+        hoverExpandedIndexes = next
+      }
+    }, hoverCloseDelay))
+  }
+
+  function closeResultHoverPreview(index) {
+    clearHoverTimer(resultHoverTimers, index)
+    clearHoverTimer(resultHoverCloseTimers, index)
     if (resultHoverExpandedIndexes.has(index)) {
       const next = new Set(resultHoverExpandedIndexes)
       next.delete(index)
@@ -110,11 +124,33 @@
     }
   }
 
+  function startResultHoverPreview(index) {
+    clearHoverTimer(resultHoverCloseTimers, index)
+    if (resultExpandedIndexes.has(index) || resultHoverExpandedIndexes.has(index) || resultHoverTimers.has(index)) return
+    resultHoverTimers.set(index, setTimeout(() => {
+      resultHoverTimers.delete(index)
+      resultHoverExpandedIndexes = new Set(resultHoverExpandedIndexes).add(index)
+    }, 1000))
+  }
+
+  function stopResultHoverPreview(index) {
+    clearHoverTimer(resultHoverTimers, index)
+    if (!resultHoverExpandedIndexes.has(index) || resultHoverCloseTimers.has(index)) return
+    resultHoverCloseTimers.set(index, setTimeout(() => {
+      resultHoverCloseTimers.delete(index)
+      if (resultHoverExpandedIndexes.has(index)) {
+        const next = new Set(resultHoverExpandedIndexes)
+        next.delete(index)
+        resultHoverExpandedIndexes = next
+      }
+    }, hoverCloseDelay))
+  }
+
   function toggleExpanded(index) {
     // A pending/active hover preview must not outlive a click toggle. Otherwise
     // the click state closes while the hover state keeps the detail visible.
     const wasClickExpanded = expandedIndexes.has(index)
-    stopHoverPreview(index)
+    closeHoverPreview(index)
 
     const next = new Set(expandedIndexes)
     if (wasClickExpanded) next.delete(index)
@@ -125,7 +161,7 @@
   function toggleResultExpanded(index) {
     // Keep result-detail clicks independent from their hover-preview state too.
     const wasClickExpanded = resultExpandedIndexes.has(index)
-    stopResultHoverPreview(index)
+    closeResultHoverPreview(index)
 
     const next = new Set(resultExpandedIndexes)
     if (wasClickExpanded) next.delete(index)
@@ -189,7 +225,12 @@
             <span class="compact-tc-name">{tc.name ?? t('unknownTool')}</span>
           </button>
           {#if isExpanded(index)}
-            <span class="tool-detail compact-expanded">
+            <span
+              class="tool-detail compact-expanded"
+              role="group"
+              onmouseenter={() => startHoverPreview(index)}
+              onmouseleave={() => stopHoverPreview(index)}
+            >
               <pre><code>{@html highlightArgs(tc.arguments ?? tc)}</code></pre>
             </span>
           {/if}
@@ -199,7 +240,13 @@
             {!result || resultStreaming ? '⏳' : isToolError(result) ? '✖️' : '✔️'}
           </button>
           {#if result && isResultExpanded(index, result)}
-            <span class="tool-detail result-expanded" class:streaming={resultStreaming}>
+            <span
+              class="tool-detail result-expanded"
+              class:streaming={resultStreaming}
+              role="group"
+              onmouseenter={() => startResultHoverPreview(index)}
+              onmouseleave={() => stopResultHoverPreview(index)}
+            >
               {#if renderedResult.html}
                 <span class="detail-lang">{renderedResult.lang}</span>
                 <pre><code>{@html renderedResult.html}</code></pre>

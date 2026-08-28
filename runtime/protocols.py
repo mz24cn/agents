@@ -15,6 +15,44 @@ import datetime
 from runtime.models import Message, ModelConfig, TokenStat, ToolConfig
 
 
+def _usage_int(value) -> int:
+    """Return a non-negative integer for provider usage fields."""
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _openai_cached_tokens(raw_usage: dict) -> int:
+    details = (
+        raw_usage.get("prompt_tokens_details")
+        or raw_usage.get("input_tokens_details")
+        or {}
+    )
+    return _usage_int(details.get("cached_tokens")) if isinstance(details, dict) else 0
+
+
+def _usage_payload(
+    prompt_tokens: int,
+    completion_tokens: int,
+    *,
+    cached_input_tokens: Optional[int],
+    new_token_cache: Optional[int],
+    usage_reported: bool,
+) -> dict:
+    """Build the runtime's provider-neutral per-round usage payload."""
+    prompt = _usage_int(prompt_tokens)
+    completion = _usage_int(completion_tokens)
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": prompt + completion,
+        "cached_input_tokens": cached_input_tokens,
+        "new_token_cache": new_token_cache,
+        "usage_reported": bool(usage_reported),
+    }
+
+
 def _merge_leading_system_messages(messages: list) -> list:
     """Collapse consecutive leading ``role="system"`` messages into one.
 
@@ -167,6 +205,8 @@ class OpenAIProtocol(BaseProtocol):
         """
         prompt_tokens = 0
         completion_tokens = 0
+        cached_input_tokens = 0
+        usage_reported = False
 
         for raw_line in http_resp:
             if isinstance(raw_line, bytes):
@@ -189,9 +229,11 @@ class OpenAIProtocol(BaseProtocol):
 
             # Usage may appear in the final chunk (when stream_options.include_usage is set)
             raw_usage = chunk.get("usage")
-            if raw_usage:
-                prompt_tokens = raw_usage.get("prompt_tokens", 0)
-                completion_tokens = raw_usage.get("completion_tokens", 0)
+            if isinstance(raw_usage, dict):
+                usage_reported = True
+                prompt_tokens = _usage_int(raw_usage.get("prompt_tokens"))
+                completion_tokens = _usage_int(raw_usage.get("completion_tokens"))
+                cached_input_tokens = _openai_cached_tokens(raw_usage)
 
             choices = chunk.get("choices", [])
             if not choices:
@@ -235,11 +277,13 @@ class OpenAIProtocol(BaseProtocol):
         # Yield usage summary for this round
         yield Message(
             role="usage",
-            content=json.dumps({
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
-            }),
+            content=json.dumps(_usage_payload(
+                prompt_tokens,
+                completion_tokens,
+                cached_input_tokens=cached_input_tokens,
+                new_token_cache=None,
+                usage_reported=usage_reported,
+            )),
         )
 
     def build_request(
@@ -425,10 +469,14 @@ class OpenAIProtocol(BaseProtocol):
 
         # Extract token usage
         raw_usage = data.get("usage", {})
+        prompt_tokens = _usage_int(raw_usage.get("prompt_tokens"))
+        completion_tokens = _usage_int(raw_usage.get("completion_tokens"))
         usage = TokenStat(
-            prompt_tokens=raw_usage.get("prompt_tokens", 0),
-            completion_tokens=raw_usage.get("completion_tokens", 0),
-            total_tokens=raw_usage.get("total_tokens", 0),
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=_usage_int(raw_usage.get("total_tokens")) or prompt_tokens + completion_tokens,
+            cached_input_tokens=_openai_cached_tokens(raw_usage),
+            new_token_cache=None,
         )
 
         return messages, usage
@@ -465,10 +513,14 @@ class OpenAIProtocol(BaseProtocol):
             # Some providers send usage in the final chunk
             raw_usage = chunk.get("usage")
             if raw_usage:
+                prompt_tokens = _usage_int(raw_usage.get("prompt_tokens"))
+                completion_tokens = _usage_int(raw_usage.get("completion_tokens"))
                 usage = TokenStat(
-                    prompt_tokens=raw_usage.get("prompt_tokens", 0),
-                    completion_tokens=raw_usage.get("completion_tokens", 0),
-                    total_tokens=raw_usage.get("total_tokens", 0),
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=_usage_int(raw_usage.get("total_tokens")) or prompt_tokens + completion_tokens,
+                    cached_input_tokens=_openai_cached_tokens(raw_usage),
+                    new_token_cache=None,
                 )
 
             choices = chunk.get("choices", [])
@@ -621,6 +673,8 @@ class OpenAIResponsesProtocol(BaseProtocol):
             prompt_tokens=prompt,
             completion_tokens=completion,
             total_tokens=raw.get("total_tokens", prompt + completion),
+            cached_input_tokens=_openai_cached_tokens(raw),
+            new_token_cache=None,
         )
 
     @staticmethod
@@ -673,6 +727,7 @@ class OpenAIResponsesProtocol(BaseProtocol):
 
     def parse_stream(self, http_resp: object) -> Iterator[Message]:
         usage = TokenStat()
+        usage_reported = False
         for event in self._events(http_resp):
             event_type = event.get("type", "")
             if event_type == "response.output_text.delta":
@@ -693,12 +748,16 @@ class OpenAIResponsesProtocol(BaseProtocol):
                         "arguments": item.get("arguments", "{}"),
                     }])
             elif event_type in ("response.completed", "response.incomplete"):
-                usage = self._usage(event.get("response") or {})
-        yield Message(role="usage", content=json.dumps({
-            "prompt_tokens": usage.prompt_tokens,
-            "completion_tokens": usage.completion_tokens,
-            "total_tokens": usage.total_tokens,
-        }))
+                response = event.get("response") or {}
+                usage_reported = isinstance(response.get("usage"), dict)
+                usage = self._usage(response)
+        yield Message(role="usage", content=json.dumps(_usage_payload(
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            cached_input_tokens=usage.cached_input_tokens or 0,
+            new_token_cache=None,
+            usage_reported=usage_reported,
+        )))
 
     def _parse_stream_response(self, response_data: bytes) -> tuple:
         content = ""
@@ -766,6 +825,7 @@ class OllamaProtocol(BaseProtocol):
         accumulated_tool_calls: dict[int, dict] = {}
         prompt_tokens = 0
         completion_tokens = 0
+        usage_reported = False
 
         for raw_line in http_resp:
             if isinstance(raw_line, bytes):
@@ -814,8 +874,11 @@ class OllamaProtocol(BaseProtocol):
 
             # Stop if done — also grab usage from the final chunk
             if chunk.get("done", False):
-                prompt_tokens = chunk.get("prompt_eval_count", 0)
-                completion_tokens = chunk.get("eval_count", 0)
+                usage_reported = (
+                    "prompt_eval_count" in chunk or "eval_count" in chunk
+                )
+                prompt_tokens = _usage_int(chunk.get("prompt_eval_count"))
+                completion_tokens = _usage_int(chunk.get("eval_count"))
                 break
 
         # Yield accumulated tool calls as a single message at the end
@@ -833,11 +896,13 @@ class OllamaProtocol(BaseProtocol):
         # Yield usage summary for this round
         yield Message(
             role="usage",
-            content=json.dumps({
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
-            }),
+            content=json.dumps(_usage_payload(
+                prompt_tokens,
+                completion_tokens,
+                cached_input_tokens=None,
+                new_token_cache=None,
+                usage_reported=usage_reported,
+            )),
         )
 
     def build_request(
@@ -1002,6 +1067,8 @@ class OllamaProtocol(BaseProtocol):
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
+            cached_input_tokens=None,
+            new_token_cache=None,
         )
 
         return messages, usage
@@ -1104,10 +1171,12 @@ class AnthropicProtocol(BaseProtocol):
 
     @staticmethod
     def _input_tokens_from_usage(usage_data: dict) -> int:
+        # Anthropic's ``input_tokens`` is the uncached portion. Cached reads and
+        # newly created cache entries are separate billable/context components.
         return (
-            usage_data.get("input_tokens", 0)
-            + usage_data.get("cache_creation_input_tokens", 0)
-            + usage_data.get("cache_read_input_tokens", 0)
+            _usage_int(usage_data.get("input_tokens"))
+            + _usage_int(usage_data.get("cache_creation_input_tokens"))
+            + _usage_int(usage_data.get("cache_read_input_tokens"))
         )
 
     def parse_stream(self, http_resp: object) -> Iterator[Message]:
@@ -1131,6 +1200,9 @@ class AnthropicProtocol(BaseProtocol):
         current_tool_use_idx: Optional[int] = None
         prompt_tokens = 0
         completion_tokens = 0
+        cached_input_tokens = 0
+        new_token_cache = 0
+        usage_reported = False
 
         for raw_line in http_resp:
             if isinstance(raw_line, bytes):
@@ -1153,9 +1225,19 @@ class AnthropicProtocol(BaseProtocol):
 
             event_type = chunk.get("type")
             raw_usage_data = self._extract_usage(chunk)
+            if raw_usage_data:
+                usage_reported = True
+                cached_input_tokens = max(
+                    cached_input_tokens,
+                    _usage_int(raw_usage_data.get("cache_read_input_tokens")),
+                )
+                new_token_cache = max(
+                    new_token_cache,
+                    _usage_int(raw_usage_data.get("cache_creation_input_tokens")),
+                )
             if not event_type and raw_usage_data:
                 prompt_tokens = max(prompt_tokens, self._input_tokens_from_usage(raw_usage_data))
-                completion_tokens = max(completion_tokens, raw_usage_data.get("output_tokens", 0))
+                completion_tokens = max(completion_tokens, _usage_int(raw_usage_data.get("output_tokens")))
                 continue
 
             if event_type == "message_start":
@@ -1219,7 +1301,7 @@ class AnthropicProtocol(BaseProtocol):
                 usage_data = self._extract_usage(chunk)
                 if usage_data:
                     prompt_tokens = max(prompt_tokens, self._input_tokens_from_usage(usage_data))
-                    completion_tokens = max(completion_tokens, usage_data.get("output_tokens", 0))
+                    completion_tokens = max(completion_tokens, _usage_int(usage_data.get("output_tokens")))
 
 
             elif event_type == "message_stop":
@@ -1228,11 +1310,13 @@ class AnthropicProtocol(BaseProtocol):
         # Yield usage summary for this round
         yield Message(
             role="usage",
-            content=json.dumps({
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
-            }),
+            content=json.dumps(_usage_payload(
+                prompt_tokens,
+                completion_tokens,
+                cached_input_tokens=cached_input_tokens,
+                new_token_cache=new_token_cache,
+                usage_reported=usage_reported,
+            )),
         )
 
     def build_request(
@@ -1424,10 +1508,14 @@ class AnthropicProtocol(BaseProtocol):
 
         # Token usage
         usage_data = data.get("usage", {})
+        prompt_tokens = self._input_tokens_from_usage(usage_data)
+        completion_tokens = _usage_int(usage_data.get("output_tokens"))
         usage = TokenStat(
-            prompt_tokens=usage_data.get("input_tokens", 0),
-            completion_tokens=usage_data.get("output_tokens", 0),
-            total_tokens=usage_data.get("input_tokens", 0) + usage_data.get("output_tokens", 0),
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+            cached_input_tokens=_usage_int(usage_data.get("cache_read_input_tokens")),
+            new_token_cache=_usage_int(usage_data.get("cache_creation_input_tokens")),
         )
 
         return messages, usage
@@ -1484,11 +1572,19 @@ class AnthropicProtocol(BaseProtocol):
                 raw_usage_data = self._extract_usage(chunk)
                 if not event_type and raw_usage_data:
                     prompt_tokens = max(usage.prompt_tokens, self._input_tokens_from_usage(raw_usage_data))
-                    completion_tokens = max(usage.completion_tokens, raw_usage_data.get("output_tokens", 0))
+                    completion_tokens = max(usage.completion_tokens, _usage_int(raw_usage_data.get("output_tokens")))
                     usage = TokenStat(
                         prompt_tokens=prompt_tokens,
                         completion_tokens=completion_tokens,
                         total_tokens=prompt_tokens + completion_tokens,
+                        cached_input_tokens=max(
+                            usage.cached_input_tokens or 0,
+                            _usage_int(raw_usage_data.get("cache_read_input_tokens")),
+                        ),
+                        new_token_cache=max(
+                            usage.new_token_cache or 0,
+                            _usage_int(raw_usage_data.get("cache_creation_input_tokens")),
+                        ),
                     )
                     continue
                 if event_type in ("content_block_start", "content_block_delta",
@@ -1542,7 +1638,7 @@ class AnthropicProtocol(BaseProtocol):
         raw_usage_data = self._extract_usage(chunk)
         if not event_type and raw_usage_data:
             prompt_tokens = max(usage.prompt_tokens, self._input_tokens_from_usage(raw_usage_data))
-            completion_tokens = max(usage.completion_tokens, raw_usage_data.get("output_tokens", 0))
+            completion_tokens = max(usage.completion_tokens, _usage_int(raw_usage_data.get("output_tokens")))
             return (
                 accumulated_content,
                 accumulated_thinking,
@@ -1552,6 +1648,14 @@ class AnthropicProtocol(BaseProtocol):
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     total_tokens=prompt_tokens + completion_tokens,
+                    cached_input_tokens=max(
+                        usage.cached_input_tokens or 0,
+                        _usage_int(raw_usage_data.get("cache_read_input_tokens")),
+                    ),
+                    new_token_cache=max(
+                        usage.new_token_cache or 0,
+                        _usage_int(raw_usage_data.get("cache_creation_input_tokens")),
+                    ),
                 ),
             )
         if not event_type:
@@ -1564,6 +1668,8 @@ class AnthropicProtocol(BaseProtocol):
                 prompt_tokens=input_tokens,
                 completion_tokens=0,
                 total_tokens=input_tokens,
+                cached_input_tokens=_usage_int(usage_data.get("cache_read_input_tokens")),
+                new_token_cache=_usage_int(usage_data.get("cache_creation_input_tokens")),
             )
 
         elif event_type == "content_block_start":
@@ -1605,11 +1711,19 @@ class AnthropicProtocol(BaseProtocol):
             usage_data = self._extract_usage(chunk)
             if usage_data:
                 prompt_tokens = max(usage.prompt_tokens, self._input_tokens_from_usage(usage_data))
-                completion_tokens = max(usage.completion_tokens, usage_data.get("output_tokens", 0))
+                completion_tokens = max(usage.completion_tokens, _usage_int(usage_data.get("output_tokens")))
                 usage = TokenStat(
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     total_tokens=prompt_tokens + completion_tokens,
+                    cached_input_tokens=max(
+                        usage.cached_input_tokens or 0,
+                        _usage_int(usage_data.get("cache_read_input_tokens")),
+                    ),
+                    new_token_cache=max(
+                        usage.new_token_cache or 0,
+                        _usage_int(usage_data.get("cache_creation_input_tokens")),
+                    ),
                 )
 
         return accumulated_content, accumulated_thinking, role, current_tool_use_idx, usage

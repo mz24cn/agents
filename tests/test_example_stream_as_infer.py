@@ -30,12 +30,16 @@ def test_stream_result_matches_direct_merge_semantics() -> None:
         "prompt_tokens": 10,
         "completion_tokens": 3,
         "total_tokens": 13,
+        "cached_input_tokens": 4,
+        "new_token_cache": 2,
         "completed_at": "2026-01-01T00:00:03",
     }
     final_stat = {
         "prompt_tokens": 20,
         "completion_tokens": 5,
         "total_tokens": 25,
+        "cached_input_tokens": 8,
+        "new_token_cache": 0,
         "completed_at": "2026-01-01T00:00:06",
         "overall_ms": 6000,
     }
@@ -96,10 +100,17 @@ def test_stream_result_matches_direct_merge_semantics() -> None:
         'event: init\ndata: {"type":"init","session_id":"session-1","stream_seq":0}\n\n'
     ]
     for seq, message in enumerate(raw_messages, 1):
-        frames.append(
-            f"id: {seq}\ndata: "
-            f"{json.dumps(message.to_dict(), ensure_ascii=False)}\n\n"
-        )
+        if message.role == "usage":
+            usage = json.loads(message.content)
+            frames.append(
+                f"id: {seq}\nevent: usage\ndata: "
+                f"{json.dumps(usage, ensure_ascii=False)}\n\n"
+            )
+        else:
+            frames.append(
+                f"id: {seq}\ndata: "
+                f"{json.dumps(message.to_dict(), ensure_ascii=False)}\n\n"
+            )
     frames.append("data: [DONE]\n\n")
     response = _FakeSseResponse("".join(frames).encode("utf-8"))
 

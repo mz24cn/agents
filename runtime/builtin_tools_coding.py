@@ -49,6 +49,62 @@ from runtime.common import (
 )
 from runtime.models import ToolConfig
 
+
+class _FileJournalManagerHolder:
+    """Request-scoped, thread-safe owner of file journal managers.
+
+    ``threading.local`` contexts are copied into function-tool workers. The
+    holder itself is intentionally shared by those shallow copies, so every
+    worker participating in one request resolves the same manager for a given
+    workspace/session/turn instead of creating a manager with a fresh fallback
+    timestamp. It also gives the request thread a stable object to finalize
+    after workers have cleared their own thread-local state.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._managers: dict[tuple, '_FileJournalManager'] = {}
+
+    def get_or_create(
+        self,
+        workspace: str,
+        session_id: Optional[str],
+        user_message_timestamp: Optional[str],
+        session_dir: Optional[str],
+        *,
+        timestamp_fallback_used: bool = False,
+    ) -> '_FileJournalManager':
+        key = (
+            os.path.realpath(workspace),
+            session_id,
+            session_dir,
+            user_message_timestamp,
+            bool(timestamp_fallback_used),
+        )
+        with self._lock:
+            manager = self._managers.get(key)
+            if manager is None:
+                manager = _FileJournalManager(
+                    workspace,
+                    session_id=session_id,
+                    user_message_timestamp=user_message_timestamp,
+                    session_dir=session_dir,
+                    timestamp_fallback_used=timestamp_fallback_used,
+                )
+                manager.request_holder_managed = True
+                self._managers[key] = manager
+            return manager
+
+    def managers(self) -> list['_FileJournalManager']:
+        with self._lock:
+            return list(self._managers.values())
+
+    def flush(self) -> None:
+        """Finalize every journal touched by this request."""
+        for manager in self.managers():
+            manager.finalize(cleanup_empty=True)
+
+
 # Shared registry mapping session_id → subprocess.Popen for the currently
 # executing exec_cli command.  Populated by _exec_shell so that the abort
 # handler (which runs in the HTTPServer thread) can kill the process.
@@ -107,7 +163,7 @@ def kill_active_process(session_id: str) -> bool:
 
 def _get_file_journal_manager(workspace: str) -> '_FileJournalManager':
     # Nested agents may keep an independent conversation session while their
-    # file changes still belong to the initiating user turn.  Explicit journal
+    # file changes still belong to the initiating user turn. Explicit journal
     # overrides decouple those two concerns without changing normal requests.
     session_id = get_request_context(
         "file_journal_session_id", get_request_context("session_id"))
@@ -115,22 +171,42 @@ def _get_file_journal_manager(workspace: str) -> '_FileJournalManager':
         "file_journal_user_message_timestamp",
         get_request_context("user_message_timestamp"),
     )
+    timestamp_fallback_used = bool(get_request_context(
+        "file_journal_timestamp_fallback_used",
+        get_request_context("user_message_timestamp_fallback_used", False),
+    ))
     session_dir = get_request_context(
         "file_journal_session_dir", get_request_context("session_dir"))
 
+    holder = get_request_context("file_journal_holder")
+    if holder is not None:
+        journal_manager = holder.get_or_create(
+            workspace,
+            session_id,
+            user_message_timestamp,
+            session_dir,
+            timestamp_fallback_used=timestamp_fallback_used,
+        )
+        set_request_context(file_journal_manager=journal_manager)
+        return journal_manager
+
+    # Compatibility path for direct tool calls/tests that do not run through an
+    # inference handler. A request holder is installed by normal inference.
     journal_manager = get_request_context("file_journal_manager")
     if (
         journal_manager is None
-        or journal_manager.workspace != workspace
+        or journal_manager.workspace != os.path.realpath(workspace)
         or journal_manager.session_id != session_id
         or journal_manager.session_dir != session_dir
         or journal_manager.user_message_timestamp != user_message_timestamp
+        or journal_manager.timestamp_fallback_used != timestamp_fallback_used
     ):
         journal_manager = _FileJournalManager(
             workspace,
             session_id=session_id,
             user_message_timestamp=user_message_timestamp,
             session_dir=session_dir,
+            timestamp_fallback_used=timestamp_fallback_used,
         )
         set_request_context(file_journal_manager=journal_manager)
     return journal_manager
@@ -180,7 +256,10 @@ def _validate_path(workspace: str, raw_path: str) -> str:
 def _journal_turn_key(value: Optional[str]) -> tuple[str, str, bool]:
     dt = _parse_journal_timestamp(value)
     if dt is None:
-        dt = datetime.datetime.utcnow()
+        # Directory keys represent the local user-facing turn time. Keep the
+        # emergency fallback in the same local-wall-clock domain rather than
+        # mixing UTC into otherwise local, timezone-less directory names.
+        dt = datetime.datetime.now()
         timestamp = dt.replace(microsecond=0).isoformat()
         return dt.strftime("%y%m%d_%H%M%S"), timestamp, True
     return dt.strftime("%y%m%d_%H%M%S"), value or dt.isoformat(), False
@@ -356,13 +435,17 @@ class _FileJournalManager:
         session_id: Optional[str] = None,
         user_message_timestamp: Optional[str] = None,
         session_dir: Optional[str] = None,
+        *,
+        timestamp_fallback_used: bool = False,
     ) -> None:
         self.workspace = os.path.realpath(workspace)
         self.session_id = session_id
         self.user_message_timestamp = user_message_timestamp
         self.session_dir = session_dir
+        self.request_holder_managed = False
         self.disabled = os.environ.get("DISABLE_FILE_JOURNAL", "false").lower() == "true"
-        self.turn_key, self.timestamp, self.timestamp_fallback_used = _journal_turn_key(user_message_timestamp)
+        self.turn_key, self.timestamp, parsed_fallback_used = _journal_turn_key(user_message_timestamp)
+        self.timestamp_fallback_used = bool(timestamp_fallback_used or parsed_fallback_used)
         self.journal_id = f"{session_id or 'stateless'}/{self.turn_key}"
         if session_dir:
             self.journal_dir = os.path.join(session_dir, "file_journals", self.turn_key)
@@ -439,7 +522,7 @@ class _FileJournalManager:
             logger.warning("File journal after snapshot failed for %s: %s", file_path, exc)
             return {"error": "JournalFailed", "message": "Could not save after snapshot"}
 
-    def finalize(self) -> dict:
+    def finalize(self, *, cleanup_empty: bool = False) -> dict:
         """Reconcile all registered files with their final workspace state.
 
         Tool-level snapshots remain useful for live inspection, but arbitrary
@@ -494,17 +577,40 @@ class _FileJournalManager:
                 manifest.pop("finalize_errors", None)
             self._save_manifest(manifest)
 
+        cleaned_empty = False
+        if cleanup_empty and not errors and not files:
+            cleaned_empty = self._cleanup_empty_journal_dir()
+
         return {
             **self.response_metadata(),
             "finalized": not errors,
             "refreshed_files": refreshed,
             "removed_files": removed,
             "errors": errors,
+            "cleaned_empty": cleaned_empty,
         }
 
+    def _cleanup_empty_journal_dir(self) -> bool:
+        """Remove a finalized request journal that contains no real changes."""
+        if not self.journal_dir or not os.path.isdir(self.journal_dir):
+            return False
+        try:
+            shutil.rmtree(self.journal_dir)
+            parent = os.path.dirname(self.journal_dir)
+            try:
+                os.rmdir(parent)
+            except OSError:
+                pass
+            return True
+        except OSError as exc:
+            logger.warning("Failed to remove empty file journal %s: %s", self.journal_dir, exc)
+            return False
+
     def flush(self) -> None:
-        # Kept as the lifecycle hook used by inference cleanup.
-        self.finalize()
+        # Holder-managed managers may be flushed by nested/group workers before
+        # sibling workers finish. Only the request holder performs final empty
+        # directory cleanup after the whole turn has joined.
+        self.finalize(cleanup_empty=not self.request_holder_managed)
 
     def _load_manifest(self) -> dict:
         if self.manifest_path and os.path.isfile(self.manifest_path):

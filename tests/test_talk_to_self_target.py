@@ -1,6 +1,10 @@
+import json
+from pathlib import Path
+
 from runtime.builtin_tools import _thread_local
 from runtime.builtin_tools_agent import TALK_TO_TOOL_CONFIG, _make_talk_to_fn
 from runtime.common import clear_request_context, get_request_context, set_request_context
+from runtime.context_manager import ContextManager
 from runtime.models import Message
 from runtime.registry import ModelRegistry, ToolRegistry
 from runtime.runtime import Runtime
@@ -199,3 +203,74 @@ def test_talk_to_child_context_uses_target_identity_and_excludes_target_from_ros
     system_content = runtime.calls[0]["request"].messages[0].content
     assert "| DevManager | dev-manager |" in system_content
     assert "| Coder | coder |" not in system_content
+
+
+def test_talk_to_subsession_is_incrementally_persisted(tmp_path):
+    """A completed child model round is visible before infer_stream finishes."""
+    parent_session_id = "parent-session"
+    cm = ContextManager(infer_fn=lambda req: None, chats_dir=str(tmp_path))
+
+    class InspectingRuntime:
+        def __init__(self):
+            self.incremental_messages = None
+
+        def infer_stream(self, request, cancel_event=None):
+            yield Message(role="assistant", content="first round")
+            yield Message(
+                role="usage",
+                content=json.dumps({
+                    "prompt_tokens": 2,
+                    "completion_tokens": 3,
+                    "total_tokens": 5,
+                }),
+            )
+            # The talk_to loop persists the usage-closed round before asking the
+            # generator for its next item, so the file must already contain it.
+            paths = list(Path(tmp_path).glob(
+                "parent/session/talk_*/conversation.json"
+            ))
+            assert len(paths) == 1
+            self.incremental_messages = json.loads(
+                paths[0].read_text(encoding="utf-8")
+            )["messages"]
+            yield Message(role="assistant", content="second round")
+            yield Message(
+                role="usage",
+                content=json.dumps({
+                    "prompt_tokens": 4,
+                    "completion_tokens": 5,
+                    "total_tokens": 9,
+                }),
+            )
+
+    runtime = InspectingRuntime()
+    manager = FakeAgentManager([
+        _agent("dev-manager", "DevManager"),
+        {**_agent("coder", "Coder"), "tool_ids": []},
+    ])
+    set_request_context(
+        session_id=parent_session_id,
+        context_manager=cm,
+        agent_manager=manager,
+        agent_id="dev-manager",
+        all_agent_ids=["dev-manager", "coder"],
+    )
+    talk_to = _make_talk_to_fn(runtime, _thread_local)
+    try:
+        result = talk_to(["coder"], "help")
+    finally:
+        clear_request_context(list(_thread_local.__dict__.keys()))
+
+    assert "first roundsecond round" in result
+    assert [message["role"] for message in runtime.incremental_messages] == [
+        "system", "user", "assistant",
+    ]
+    assert runtime.incremental_messages[-1]["content"] == "first round"
+
+    paths = list(Path(tmp_path).glob(
+        "parent/session/talk_*/conversation.json"
+    ))
+    final_messages = json.loads(paths[0].read_text(encoding="utf-8"))["messages"]
+    assert [message["content"] for message in final_messages if message["role"] == "assistant"] == [
+        "first round", "second round",
+    ]

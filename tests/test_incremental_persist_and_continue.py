@@ -27,7 +27,11 @@ from runtime.models import InferenceRequest, Message, ModelConfig, ToolConfig
 from runtime.registry import ModelRegistry, ToolRegistry
 from runtime.runtime import Runtime
 from runtime.server import RuntimeHTTPServer
-from runtime.server_state import merge_stream_messages, persist_conversation
+from runtime.server_state import (
+    IncrementalConversationPersister,
+    merge_stream_messages,
+    persist_conversation,
+)
 from runtime.handler_infer import _stream_batch_is_protocol_complete
 
 # ---------------------------------------------------------------------------
@@ -197,6 +201,73 @@ def test_final_empty_persist_preserves_incremental_usage_and_triggers_compressio
     compress.assert_called_once()
     assert compress.call_args.kwargs["last_total_tokens"] is None
     assert (tmp_path / session_id / "summary.md").is_file()
+
+
+def test_interrupted_round_estimates_usage_and_drives_summary_threshold(tmp_path):
+    """Missing provider usage must not persist 0/0 or suppress compression."""
+    from runtime.server_state import StreamUsageEstimator
+
+    cm = ContextManager(
+        infer_fn=lambda req: None,
+        chats_dir=str(tmp_path),
+        max_tokens_in_context=104,
+    )
+    session_id = cm.create_session()
+    previous = [
+        Message(role="assistant", content="ok"),
+        Message(role="usage", content=json.dumps({
+            "prompt_tokens": 100,
+            "completion_tokens": 2,
+            "total_tokens": 102,
+            "usage_reported": True,
+        })),
+    ]
+    assert persist_conversation(cm, session_id, [], previous, compress=False) is None
+
+    estimator = StreamUsageEstimator(
+        cm, session_id, [Message(role="user", content="abc")],
+    )
+    failed = Message(role="assistant", content="Error: timeout")
+    estimator.observe(failed)
+    usage = estimator.terminal_usage_messages("model-x")
+    assert len(usage) == 1
+    stat = json.loads(usage[0].content)
+    assert stat["prompt_tokens"] == 103
+    assert stat["completion_tokens"] == 2
+    assert stat["total_tokens"] == 105
+    assert stat["estimated"] is True
+    assert stat["usage_reported"] is False
+    assert stat["cached_input_tokens"] is None
+    assert stat["new_token_cache"] is None
+
+    collected = [failed, *usage]
+    assert persist_conversation(cm, session_id, [], collected, compress=True) is None
+    stored = cm.load_conversation(session_id)[-1]
+    assert stored.stat["total_tokens"] == 105
+    assert stored.stat["estimated"] is True
+    assert cm.get_last_total_tokens(session_id) == 105
+    assert (tmp_path / session_id / "summary.md").is_file()
+
+
+def test_explicit_provider_zero_usage_is_not_estimated(tmp_path):
+    from runtime.server_state import StreamUsageEstimator
+
+    cm = ContextManager(infer_fn=lambda req: None, chats_dir=str(tmp_path))
+    session_id = cm.create_session()
+    estimator = StreamUsageEstimator(
+        cm, session_id, [Message(role="user", content="abc")],
+    )
+    usage = Message(role="usage", content=json.dumps({
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "usage_reported": True,
+    }))
+    estimator.observe(usage)
+    stat = json.loads(usage.content)
+    assert stat["prompt_tokens"] == 0
+    assert stat["completion_tokens"] == 0
+    assert "estimated" not in stat
 
 
 # ---------------------------------------------------------------------------
@@ -414,6 +485,42 @@ def test_incremental_tool_round_waits_for_result_before_persisting(tmp_path):
     assert loaded[2].content == "echo result"
 
 
+def test_shared_incremental_persister_pre_incremental_and_final(tmp_path):
+    """The reusable persister owns the cursor and never duplicates turns."""
+    cm = ContextManager(infer_fn=lambda req: None, chats_dir=str(tmp_path))
+    session_id = cm.create_session()
+    persister = IncrementalConversationPersister(
+        context_manager=cm,
+        session_id=session_id,
+        original_messages=[Message(role="user", content="run echo", timestamp="t0")],
+        tool_ids=["echo"],
+        agent_ids=["agent-a"],
+        model_id="test-model",
+    )
+
+    assert persister.pre_persist() is None
+    assert [turn.role for turn in cm.load_conversation(session_id)] == ["user"]
+
+    tool_round = _round_tool_call()
+    assert persister.persist_completed(tool_round[:2]) is None
+    assert persister.persisted_until == 0
+    assert [turn.role for turn in cm.load_conversation(session_id)] == ["user"]
+
+    assert persister.persist_completed(tool_round) is None
+    assert persister.persisted_until == len(tool_round)
+    assert [turn.role for turn in cm.load_conversation(session_id)] == [
+        "user", "assistant", "tool",
+    ]
+
+    all_messages = tool_round + _round_final()
+    assert persister.finalize(all_messages, compress=False) is None
+    loaded = cm.load_conversation(session_id)
+    assert [turn.role for turn in loaded] == [
+        "user", "assistant", "tool", "assistant",
+    ]
+    assert loaded[-1].content == "Done."
+
+
 # ---------------------------------------------------------------------------
 # 3. Continue-inference API
 # ---------------------------------------------------------------------------
@@ -529,6 +636,60 @@ def _get_session(server, session_id):
         return exc.code, json.loads(exc.read())
 
 
+def test_stream_transport_failure_after_tool_result_persists_error_without_title(
+    continue_server, monkeypatch,
+):
+    """An exhausted retry after a tool round must leave a visible failed turn."""
+    import io
+    import urllib.error
+
+    srv = continue_server
+    monkeypatch.setenv("MODEL_API_MAX_RETRIES", "1")
+    monkeypatch.setenv("MODEL_API_RETRY_DELAY", "0")
+    # Keep the test focused on the main inference. If the regression re-enables
+    # title generation on failure, this spy still proves that it was attempted.
+    srv._session_manager._infer_fn = MagicMock()
+
+    tool_round = _openai_sse_text("", tool_calls=[("echo", "{}")])
+    calls = 0
+
+    def model_urlopen(request, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return _make_resp(tool_round)
+        raise urllib.error.HTTPError(
+            url=request.full_url,
+            code=502,
+            msg="Bad Gateway",
+            hdrs={},
+            fp=io.BytesIO(b"error code: 502"),
+        )
+
+    status, body = _post_stream(srv, {
+        "session_id": "new",
+        "model_id": "test-model",
+        "tool_ids": ["echo"],
+        "messages": [{"role": "user", "content": "use echo"}],
+    }, model_urlopen)
+
+    assert status == 200
+    assert "Error: HTTP 502: Bad Gateway" in body
+    assert calls == 3  # tool round + initial failed request + one retry
+
+    session_id = json.loads(
+        next(line.removeprefix("data: ") for line in body.splitlines()
+             if line.startswith("data: {") and '"type": "init"' in line)
+    )["session_id"]
+    _, session = _get_session(srv, session_id)
+    assert [message["role"] for message in session["messages"]] == [
+        "user", "assistant", "tool", "assistant",
+    ]
+    assert session["messages"][-1]["content"].startswith("Error: HTTP 502")
+    assert session["meta"]["turn_count"] == 4
+    srv._session_manager._infer_fn.assert_not_called()
+
+
 def _scripted_urlopen(calls):
     """Build a urlopen side_effect that returns a scripted SSE response per
     outgoing request. `calls` is a list of bytes responses; the same response
@@ -585,6 +746,12 @@ def test_continue_explicitly_replaces_final_assistant_without_classification(con
     }, _scripted_urlopen([final_round]))
     assert status == 200, f"continue failed: {body[:500]}"
     assert "data: [DONE]" in body
+    init = json.loads(next(
+        line.removeprefix("data: ")
+        for line in body.splitlines()
+        if line.startswith("data: {") and '"type": "init"' in line
+    ))
+    assert init["user_message_timestamp"] == "2026-08-12T15:00:00"
 
     # The final assistant reply is appended; no extra user message is added.
     status, sess = _get_session(srv, session_id)

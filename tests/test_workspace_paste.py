@@ -85,6 +85,36 @@ class TestPasteDirectoryUploads:
         other_abs = str(other.resolve())
         assert not ws_manager.is_paste_directory(other_abs)
 
+    def test_create_directory_allowed_in_paste_dir_when_restricted(self, ws_manager, tmp_path, monkeypatch):
+        paste_dir = tmp_path / "paste-area"
+        paste_dir.mkdir()
+        monkeypatch.setattr(
+            "runtime.workspace_manager.get_paste_directory",
+            lambda ws: str(paste_dir),
+        )
+
+        result = ws_manager.create_directory(str(paste_dir), "attachments", restrict_workspace=True)
+
+        assert result["is_dir"] is True
+        assert result["path"] == str(paste_dir / "attachments")
+        assert (paste_dir / "attachments").is_dir()
+
+    def test_create_directory_rejected_in_other_external_dir_when_restricted(self, tmp_path, monkeypatch):
+        workspace_dir = tmp_path / "workspace"
+        paste_dir = tmp_path / "paste-area"
+        outside_dir = tmp_path / "outside-area"
+        workspace_dir.mkdir()
+        paste_dir.mkdir()
+        outside_dir.mkdir()
+        manager = WorkspaceManager(str(workspace_dir))
+        monkeypatch.setattr(
+            "runtime.workspace_manager.get_paste_directory",
+            lambda ws: str(paste_dir),
+        )
+
+        with pytest.raises(ValueError, match="outside workspace or paste directory"):
+            manager.create_directory(str(outside_dir), "not-allowed", restrict_workspace=True)
+
     def test_upload_init_allowed_into_tmp_even_when_restricted(self, ws_manager):
         task = ws_manager.create_upload_task(
             file_name="photo.png",

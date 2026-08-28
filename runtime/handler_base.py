@@ -77,6 +77,7 @@ _ROUTES: dict[str, list] = {
         (re.compile(r"^/v1/sessions/events$"), "_handle_sessions_events", ()),
         (re.compile(r"^/v1/sessions/([^/]+)/stream$"), "_handle_session_stream", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/sessions/([^/]+)/log-dir$"), "_handle_session_log_dir", (urllib.parse.unquote,)),
+        (re.compile(r"^/v1/sessions/([^/]+)/execution-analysis$"), "_handle_session_execution_analysis", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/sessions/([^/]+)$"), "_handle_get_session", ()),
         (re.compile(r"^/v1/agents$"), "_handle_list_agents", ()),
         (re.compile(r"^/v1/agents/([^/]+)$"), "_handle_get_agent", ()),

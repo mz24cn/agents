@@ -14,6 +14,8 @@ import os
 import re
 import subprocess
 import tempfile
+from unittest.mock import patch
+
 import pytest
 
 from runtime.builtin_tools import (
@@ -161,6 +163,22 @@ class TestFileJournalManager:
         assert _journal_turn_key("2026-05-11T10:20:30Z")[0] == "260511_102030"
         assert _journal_turn_key("2026-05-11T18:20:30+08:00")[0] == "260511_102030"
 
+    def test_turn_key_fallback_uses_local_wall_clock(self):
+        import datetime as datetime_module
+        real_datetime = datetime_module.datetime
+
+        class FixedDateTime:
+            @classmethod
+            def now(cls):
+                return real_datetime(2026, 5, 11, 22, 20, 30)
+
+        with patch("runtime.builtin_tools_coding.datetime.datetime", FixedDateTime):
+            key, timestamp, fallback = _journal_turn_key(None)
+
+        assert key == "260511_222030"
+        assert timestamp == "2026-05-11T22:20:30"
+        assert fallback is True
+
     def test_flattened_path_includes_hash_and_safe_chars(self):
         filename = _flatten_journal_path("src/foo bar.py", "baseline")
         assert filename.startswith("src-foo_bar.py.")
@@ -244,6 +262,19 @@ class TestFileJournalManager:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         assert "unchanged.txt" not in manifest["files"]
         assert result["removed_files"] == ["unchanged.txt"]
+
+    def test_flush_removes_empty_noop_journal_directory(self, workspace, journal_context):
+        path = workspace / "unchanged.txt"
+        path.write_text("same\n", encoding="utf-8")
+        manager = _FileJournalManager(
+            str(workspace), "session1", "2026-05-11T10:20:30", str(journal_context)
+        )
+        manager.ensure_baseline("edit_file", str(path))
+
+        manager.flush()
+
+        journal_dir = journal_context / "file_journals" / "260511_102030"
+        assert not journal_dir.exists()
 
     def test_new_snapshot_reopens_a_previously_finalized_manifest(self, workspace, journal_context):
         path = workspace / "changed.txt"

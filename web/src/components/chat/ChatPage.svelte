@@ -183,7 +183,19 @@
     let unsubscribe = null
     unsubscribe = subscribeSessionStream(
       sid,
-      (msg, seq) => frameBatcher.push(seq == null ? msg : { ...msg, __streamSeq: seq }),
+      (msg, seq, eventName) => {
+        const frame = eventName === 'usage'
+          ? {
+              role: 'usage',
+              agent_id: msg.agent_id,
+              name: msg.name,
+              content: JSON.stringify(Object.fromEntries(
+                Object.entries(msg).filter(([key]) => !['agent_id', 'assistant_id', 'name'].includes(key))
+              )),
+            }
+          : msg
+        frameBatcher.push(seq == null ? frame : { ...frame, __streamSeq: seq })
+      },
       () => {
         frameBatcher.then(() => {
           // A retained GET can legitimately observe an inactive snapshot and
@@ -763,7 +775,16 @@
     const frameBatcher = createStreamFrameBatcher((msg) => onStreamMsg(msg, aIdxRef, pendingFirstUserMsg, keyRef))
     inferStream(
       reqBody,
-      (msg) => frameBatcher.push(msg),
+      (msg, eventName) => frameBatcher.push(eventName === 'usage'
+        ? {
+            role: 'usage',
+            agent_id: msg.agent_id,
+            name: msg.name,
+            content: JSON.stringify(Object.fromEntries(
+              Object.entries(msg).filter(([key]) => !['agent_id', 'assistant_id', 'name'].includes(key))
+            )),
+          }
+        : msg),
       // Keep direct ownership until the authoritative done_* status event.
       // [DONE] is sent before the backend has necessarily finished persistence,
       // broker shutdown, and status broadcasting; releasing here can make the

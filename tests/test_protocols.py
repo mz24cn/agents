@@ -7,7 +7,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from runtime.models import Message, ModelConfig
-from runtime.protocols import OpenAIProtocol
+from runtime.protocols import AnthropicProtocol, OpenAIProtocol, OllamaProtocol
 
 
 # --- Hypothesis strategies ---
@@ -99,7 +99,6 @@ def test_openai_multimodal_content_is_array_with_image_url(
 
 # Feature: agent-service, Property 4: Ollama 协议多模态请求构造
 
-from runtime.protocols import OllamaProtocol
 
 
 # Strategy: reuse existing model_config_st but with ollama protocol
@@ -334,6 +333,47 @@ def test_openai_build_request_merges_multiple_system_messages() -> None:
     assert len(system_msgs) == 1, "OpenAI payload must have a single system message"
     assert system_msgs[0]["content"] == "agent prompt\n\n## Summary\nsummary"
     assert [m["role"] for m in api_messages] == ["system", "user"]
+
+
+def test_stream_usage_normalizes_provider_cache_fields() -> None:
+    openai = list(OpenAIProtocol().parse_stream([
+        b'data: {"choices":[{"delta":{"content":"x"}}]}\n',
+        b'data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":7}}}\n',
+        b'data: [DONE]\n',
+    ]))
+    openai_usage = json.loads(openai[-1].content)
+    assert openai_usage["cached_input_tokens"] == 7
+    assert openai_usage["new_token_cache"] is None
+    assert openai_usage["usage_reported"] is True
+
+    anthropic = list(AnthropicProtocol().parse_stream([
+        b'data: {"type":"message_start","message":{"usage":{"input_tokens":3,"cache_read_input_tokens":5,"cache_creation_input_tokens":2}}}\n',
+        b'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"x"}}\n',
+        b'data: {"type":"message_delta","usage":{"output_tokens":4}}\n',
+    ]))
+    anthropic_usage = json.loads(anthropic[-1].content)
+    assert anthropic_usage["prompt_tokens"] == 10
+    assert anthropic_usage["completion_tokens"] == 4
+    assert anthropic_usage["cached_input_tokens"] == 5
+    assert anthropic_usage["new_token_cache"] == 2
+
+    ollama = list(OllamaProtocol().parse_stream([
+        b'{"message":{"content":"x"},"done":true,"prompt_eval_count":3,"eval_count":1}\n',
+    ]))
+    ollama_usage = json.loads(ollama[-1].content)
+    assert ollama_usage["cached_input_tokens"] is None
+    assert ollama_usage["new_token_cache"] is None
+
+
+def test_openai_stream_marks_missing_usage_as_unreported() -> None:
+    messages = list(OpenAIProtocol().parse_stream([
+        b'data: {"choices":[{"delta":{"content":"x"}}]}\n',
+        b'data: [DONE]\n',
+    ]))
+    usage = json.loads(messages[-1].content)
+    assert usage["usage_reported"] is False
+    assert usage["prompt_tokens"] == 0
+    assert usage["completion_tokens"] == 0
 
 
 # **Validates: Requirements 1.9**

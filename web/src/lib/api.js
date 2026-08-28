@@ -218,7 +218,7 @@ export function inferStream(body, onMessage, onDone, onError, onInit = null, onS
                 if (currentEvent === 'init' && onInit) {
                   onInit(data)
                 } else if (currentEvent !== 'init') {
-                  onMessage(data)
+                  onMessage(data, currentEvent)
                   if (currentId !== null) onSequence?.(currentId)
                   if (shouldLogStreamFrame(currentId, data)) {
                     streamDebug('direct_frame', { seq: currentId, role: data?.role, name: data?.name, streaming: data?.streaming })
@@ -295,6 +295,7 @@ export const sessions = {
     ? requestWithDownloadProgress(`/v1/sessions/${encodeURIComponent(sessionId)}`, onProgress)
     : request('GET', `/v1/sessions/${encodeURIComponent(sessionId)}`),
   logDir:        (sessionId)     => request('GET',    `/v1/sessions/${encodeURIComponent(sessionId)}/log-dir`),
+  executionAnalysis: (sessionId) => request('GET',    `/v1/sessions/${encodeURIComponent(sessionId)}/execution-analysis`),
   delete:        (sessionId)     => request('DELETE', `/v1/sessions/${encodeURIComponent(sessionId)}`),
   generateTitle: (sessionId)     => request('POST',   `/v1/sessions/${encodeURIComponent(sessionId)}/generate-title`),
   regenerateSummary: (sessionId) => request('POST',   `/v1/sessions/${encodeURIComponent(sessionId)}/regenerate-summary`),
@@ -394,7 +395,7 @@ export function subscribeSessionStream(sessionId, onMessage, onDone, onError, on
               // Delivery and application are separate when the UI batches
               // frames. The optional acknowledgement callback advances the
               // reconnect cursor only after the batcher has applied this frame.
-              onMessage?.(data, currentId)
+              onMessage?.(data, currentId, currentEvent)
               if (currentId !== null) {
                 if (onApplied) {
                   const appliedSeq = currentId

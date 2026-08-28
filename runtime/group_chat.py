@@ -23,6 +23,7 @@ version is kept for backward compatibility during the transition.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import queue
@@ -938,6 +939,13 @@ def _run_group_chat_stream_gen(
             for msg in runtime.infer_stream(degenerate_request,
                                             cancel_event=cancel_event):
                 msg.agent_id = agent_id
+                if msg.role == "usage":
+                    try:
+                        usage_stat = json.loads(msg.content)
+                        usage_stat["model_id"] = agent_model_id
+                        msg.content = json.dumps(usage_stat, ensure_ascii=False)
+                    except (TypeError, ValueError, AttributeError):
+                        pass
                 if msg.role == "assistant":
                     msg.name = nickname
                 yield msg
@@ -1005,10 +1013,15 @@ def _run_group_chat_stream_gen(
             nickname: str = agent.get("nickname", agent_id)
             agent_model_id: str = agent.get("model_id", model_id)
             agent_tool_ids: list[str] = agent.get("tool_ids", tool_ids)
-            agent_tool_scope = [
-                tc for tid in agent_tool_ids
-                if (tc := runtime._tool_registry.get(tid)) is not None
-            ]
+            tool_registry = getattr(runtime, "_tool_registry", None)
+            agent_tool_scope = (
+                [
+                    tc for tid in agent_tool_ids
+                    if (tc := tool_registry.get(tid)) is not None
+                ]
+                if tool_registry is not None
+                else []
+            )
             set_request_context(
                 tool_scope=agent_tool_scope,
                 available_tool_ids=agent_tool_ids,
@@ -1135,6 +1148,13 @@ def _run_group_chat_stream_gen(
                 for msg in runtime.infer_stream(request,
                                                 cancel_event=cancel_event):
                     msg.agent_id = agent_id
+                    if msg.role == "usage":
+                        try:
+                            usage_stat = json.loads(msg.content)
+                            usage_stat["model_id"] = agent_model_id
+                            msg.content = json.dumps(usage_stat, ensure_ascii=False)
+                        except (TypeError, ValueError, AttributeError):
+                            pass
                     if msg.role == "assistant":
                         msg.name = nickname
                         asst_buf.append(msg)

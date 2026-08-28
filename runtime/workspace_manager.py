@@ -500,10 +500,17 @@ class WorkspaceManager:
             raise ValueError(f"Permission denied: {old_path}")
 
     def create_directory(self, parent_path: str, name: str, restrict_workspace: bool = True) -> Dict[str, Any]:
-        """Create a directory under the given parent path."""
+        """Create a directory in the workspace or approved paste directory."""
         if not name or '/' in name or '\\' in name or ':' in name:
             raise ValueError("Invalid directory name")
-        parent_dir = self._resolve_path(parent_path, restrict_workspace)
+        parent_dir = self._resolve_path(parent_path, restrict_workspace=False)
+        if restrict_workspace:
+            try:
+                inside_workspace = os.path.commonpath([self.workspace_path, parent_dir]) == self.workspace_path
+            except ValueError:
+                inside_workspace = False  # different drives on Windows
+            if not inside_workspace and not self.is_paste_directory(parent_dir):
+                raise ValueError("Access denied: path is outside workspace or paste directory")
         if not os.path.isdir(parent_dir):
             raise ValueError(f"Parent is not a directory: {parent_path}")
         new_path = os.path.join(parent_dir, name)

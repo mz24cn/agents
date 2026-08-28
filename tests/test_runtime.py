@@ -1262,18 +1262,23 @@ def test_function_tool_normal_call_with_guard_enabled(monkeypatch) -> None:
     assert time.monotonic() - start < 2
 
 
-def test_function_tool_guard_disabled_runs_inline(monkeypatch) -> None:
-    """TOOL_EXEC_TIMEOUT disabled -> callable runs inline (no worker)."""
+def test_function_tool_guard_disabled_still_runs_on_worker(monkeypatch) -> None:
+    """TOOL_EXEC_TIMEOUT disabled still keeps callables off the inference thread."""
     from runtime.models import ToolConfig
     from runtime.registry import ToolRegistry
 
     monkeypatch.setenv("TOOL_EXEC_TIMEOUT", "")
 
+    import threading
+
     registry = ToolRegistry()
     called: list = []
+    caller_thread = threading.get_ident()
+    worker_threads: list[int] = []
 
     def fast_fn(x: str = "") -> str:
         called.append(x)
+        worker_threads.append(threading.get_ident())
         return f"ok_{x}"
 
     tool_config = ToolConfig(
@@ -1289,6 +1294,278 @@ def test_function_tool_guard_disabled_runs_inline(monkeypatch) -> None:
     result = runtime._execute_function_tool(tool_config, {"x": "hi"})
     assert result == "ok_hi"
     assert called == ["hi"]
+    assert worker_threads and worker_threads[0] != caller_thread
+
+
+def test_tool_exec_workers_parsing(monkeypatch) -> None:
+    from runtime.runtime import _get_tool_exec_workers
+
+    monkeypatch.delenv("TOOL_EXEC_WORKERS", raising=False)
+    assert _get_tool_exec_workers() == 1
+
+    monkeypatch.setenv("TOOL_EXEC_WORKERS", "4")
+    assert _get_tool_exec_workers() == 4
+
+    monkeypatch.setenv("TOOL_EXEC_WORKERS", "bad")
+    assert _get_tool_exec_workers() == 1
+
+    monkeypatch.setenv("TOOL_EXEC_WORKERS", "0")
+    assert _get_tool_exec_workers() == 1
+
+
+def test_function_tool_round_workers_one_preserves_serial_execution(monkeypatch) -> None:
+    import threading
+    import time
+
+    from runtime.models import ToolConfig
+    from runtime.registry import ToolRegistry
+
+    monkeypatch.setenv("TOOL_EXEC_WORKERS", "1")
+    monkeypatch.setenv("TOOL_EXEC_TIMEOUT", "5")
+
+    registry = ToolRegistry()
+    active = 0
+    peak_active = 0
+    lock = threading.Lock()
+    configs = []
+
+    def make_tool(name: str):
+        config = ToolConfig(
+            tool_id=name,
+            tool_type="function",
+            name=name,
+            description=name,
+            parameters={"type": "object", "properties": {}},
+        )
+
+        def callable_fn():
+            nonlocal active, peak_active
+            with lock:
+                active += 1
+                peak_active = max(peak_active, active)
+            time.sleep(0.03)
+            with lock:
+                active -= 1
+            return name
+
+        registry.register(config, callable_fn=callable_fn)
+        configs.append(config)
+
+    make_tool("tool_a")
+    make_tool("tool_b")
+    runtime = Runtime(model_registry=ModelRegistry(), tool_registry=registry)
+    messages = list(runtime._execute_tool_call_round(
+        [
+            {"id": "call-a", "name": "tool_a", "arguments": "{}"},
+            {"id": "call-b", "name": "tool_b", "arguments": "{}"},
+        ],
+        configs,
+        timestamp=False,
+    ))
+
+    assert peak_active == 1
+    assert [message.tool_use_id for message in messages] == ["call-a", "call-b"]
+    assert all(message.started_at for message in messages)
+    assert messages[0].started_at < messages[1].started_at
+
+
+def test_function_tool_started_at_is_captured_inside_worker(monkeypatch) -> None:
+    import datetime
+    import threading
+    import time
+
+    from runtime.models import ToolConfig
+    from runtime.registry import ToolRegistry
+
+    monkeypatch.setenv("TOOL_EXEC_WORKERS", "1")
+    monkeypatch.setenv("TOOL_EXEC_TIMEOUT", "5")
+
+    registry = ToolRegistry()
+    config = ToolConfig(
+        tool_id="worker_started_at",
+        tool_type="function",
+        name="worker_started_at",
+        description="worker start timestamp",
+        parameters={"type": "object", "properties": {}},
+    )
+    callable_started = {}
+
+    def callable_fn():
+        callable_started["at"] = datetime.datetime.now()
+        callable_started["thread"] = threading.get_ident()
+        time.sleep(0.01)
+        return "ok"
+
+    registry.register(config, callable_fn=callable_fn)
+    runtime = Runtime(model_registry=ModelRegistry(), tool_registry=registry)
+    caller_thread = threading.get_ident()
+
+    message = list(runtime._execute_tool_call_round(
+        [{"id": "call-worker", "name": config.name, "arguments": "{}"}],
+        [config],
+        timestamp=True,
+    ))[0]
+
+    recorded = datetime.datetime.fromisoformat(message.started_at)
+    assert callable_started["thread"] != caller_thread
+    assert abs((callable_started["at"] - recorded).total_seconds()) < 0.05
+    assert datetime.datetime.fromisoformat(message.timestamp) >= recorded
+
+
+def test_function_tool_round_runs_concurrently_and_keeps_context(monkeypatch) -> None:
+    import threading
+    import time
+
+    from runtime.common import _thread_local, clear_request_context, set_request_context
+    from runtime.models import ToolConfig
+    from runtime.registry import ToolRegistry
+
+    monkeypatch.setenv("TOOL_EXEC_WORKERS", "2")
+    monkeypatch.setenv("TOOL_EXEC_TIMEOUT", "5")
+
+    registry = ToolRegistry()
+    barrier = threading.Barrier(2)
+    configs = []
+
+    def make_tool(name: str):
+        config = ToolConfig(
+            tool_id=name,
+            tool_type="function",
+            name=name,
+            description=name,
+            parameters={"type": "object", "properties": {}},
+        )
+
+        def callable_fn():
+            barrier.wait(timeout=1)
+            time.sleep(0.05)
+            return (
+                f"{getattr(_thread_local, 'session_id', None)}:"
+                f"{getattr(_thread_local, 'tool_use_id', None)}"
+            )
+
+        registry.register(config, callable_fn=callable_fn)
+        configs.append(config)
+
+    make_tool("tool_a")
+    make_tool("tool_b")
+    runtime = Runtime(model_registry=ModelRegistry(), tool_registry=registry)
+    set_request_context(session_id="parallel-session")
+    try:
+        start = time.monotonic()
+        messages = list(runtime._execute_tool_call_round(
+            [
+                {"id": "call-a", "name": "tool_a", "arguments": "{}"},
+                {"id": "call-b", "name": "tool_b", "arguments": "{}"},
+            ],
+            configs,
+            timestamp=False,
+        ))
+        elapsed = time.monotonic() - start
+    finally:
+        clear_request_context(["session_id"])
+
+    assert elapsed < 0.8
+    assert {message.tool_use_id for message in messages} == {"call-a", "call-b"}
+    assert {message.content for message in messages} == {
+        "parallel-session:call-a",
+        "parallel-session:call-b",
+    }
+
+
+def test_function_tool_round_timeout_does_not_starve_later_calls(monkeypatch) -> None:
+    import time
+
+    from runtime.models import ToolConfig
+    from runtime.registry import ToolRegistry
+
+    monkeypatch.setenv("TOOL_EXEC_WORKERS", "1")
+    monkeypatch.setenv("TOOL_EXEC_TIMEOUT", "0.1")
+
+    registry = ToolRegistry()
+    configs = []
+
+    hung_config = ToolConfig(
+        tool_id="hung_first",
+        tool_type="function",
+        name="hung_first",
+        description="hung",
+        parameters={"type": "object", "properties": {}},
+    )
+    fast_config = ToolConfig(
+        tool_id="fast_second",
+        tool_type="function",
+        name="fast_second",
+        description="fast",
+        parameters={"type": "object", "properties": {}},
+    )
+    registry.register(
+        hung_config,
+        callable_fn=lambda: (time.sleep(1), "late")[1],
+    )
+    registry.register(fast_config, callable_fn=lambda: "fast")
+    configs.extend([hung_config, fast_config])
+
+    runtime = Runtime(model_registry=ModelRegistry(), tool_registry=registry)
+    start = time.monotonic()
+    messages = list(runtime._execute_tool_call_round(
+        [
+            {"id": "call-hung", "name": "hung_first", "arguments": "{}"},
+            {"id": "call-fast", "name": "fast_second", "arguments": "{}"},
+        ],
+        configs,
+        timestamp=False,
+    ))
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 0.7
+    assert "timed out" in messages[0].content
+    assert messages[1].content == "fast"
+
+
+def test_function_tool_round_emits_final_results_in_declaration_order(monkeypatch) -> None:
+    import time
+
+    from runtime.models import ToolConfig
+    from runtime.registry import ToolRegistry
+
+    monkeypatch.setenv("TOOL_EXEC_WORKERS", "2")
+    monkeypatch.setenv("TOOL_EXEC_TIMEOUT", "5")
+
+    registry = ToolRegistry()
+    configs = []
+
+    def make_tool(name: str, delay: float):
+        config = ToolConfig(
+            tool_id=name,
+            tool_type="function",
+            name=name,
+            description=name,
+            parameters={"type": "object", "properties": {}},
+        )
+
+        def callable_fn():
+            time.sleep(delay)
+            return name
+
+        registry.register(config, callable_fn=callable_fn)
+        configs.append(config)
+
+    make_tool("slow_first", 0.08)
+    make_tool("fast_second", 0.01)
+    runtime = Runtime(model_registry=ModelRegistry(), tool_registry=registry)
+    messages = list(runtime._execute_tool_call_round(
+        [
+            {"id": "call-first", "name": "slow_first", "arguments": "{}"},
+            {"id": "call-second", "name": "fast_second", "arguments": "{}"},
+        ],
+        configs,
+        timestamp=True,
+    ))
+
+    assert [message.tool_use_id for message in messages] == [
+        "call-first", "call-second",
+    ]
 
 
 # ------------------------------------------------------------------
@@ -1473,3 +1750,46 @@ def test_write_file_journal_scoped_to_session(monkeypatch, session_ctx, tmp_path
         f"write_file journal 未归属会话（退化为 stateless）: {journal!r}")
     assert str(payload.get("journal_id", "")).startswith("sess-1/"), (
         f"journal 未绑定会话 session_id: {payload!r}")
+
+
+def test_file_tools_share_request_journal_holder_across_worker_calls(
+    monkeypatch, session_ctx, tmp_path,
+):
+    """Worker-created managers remain visible and reusable on the caller."""
+    from runtime.builtin_tools import WRITE_FILE_TOOL_CONFIG, _write_file
+    from runtime.common import get_request_context
+    from runtime.registry import ModelRegistry, ToolRegistry
+    from runtime.runtime import Runtime
+
+    workspace, session_dir = session_ctx
+    monkeypatch.setenv("TOOL_EXEC_TIMEOUT", "30")
+    monkeypatch.setenv("DISABLE_FILE_JOURNAL", "false")
+    monkeypatch.setenv("AGENTS_WORKSPACE", str(tmp_path / "wrong-env-ws"))
+
+    registry = ToolRegistry()
+    registry.register(WRITE_FILE_TOOL_CONFIG, callable_fn=_write_file)
+    runtime = Runtime(model_registry=ModelRegistry(), tool_registry=registry)
+
+    payloads = []
+    for name in ("one.txt", "two.txt"):
+        payloads.append(json.loads(runtime._execute_function_tool(
+            WRITE_FILE_TOOL_CONFIG, {"path": name, "content": name}
+        )))
+
+    assert {payload["journal_id"] for payload in payloads} == {
+        "sess-1/250601_120000"
+    }
+    journals_root = __import__("pathlib").Path(session_dir) / "file_journals"
+    assert [path.name for path in journals_root.iterdir() if path.is_dir()] == [
+        "250601_120000"
+    ]
+
+    holder = get_request_context("file_journal_holder")
+    assert holder is not None
+    holder.flush()
+    manifest = json.loads(
+        (journals_root / "250601_120000" / "manifest.json").read_text()
+    )
+    assert manifest["status"] == "finalized"
+    assert manifest["finalized"] is True
+    assert set(manifest["files"]) == {"one.txt", "two.txt"}

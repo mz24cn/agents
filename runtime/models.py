@@ -40,6 +40,8 @@ class Message:
         tool_use_id: Optional protocol-level tool call ID linking a tool result to its assistant tool call.
         agent_id: Optional agent_id identifying which agent produced this message
             (used for all roles: assistant, tool, etc.).
+        started_at: Optional ISO 8601 timestamp indicating when a tool invocation
+            actually started executing (used for tool role messages).
     """
 
     role: str
@@ -56,6 +58,7 @@ class Message:
     tool_use_id: Optional[str] = None
     mentions: Optional[list[str]] = None
     agent_id: Optional[str] = None
+    started_at: Optional[str] = None
     # Internal, in-memory marker (never persisted / never sent to clients):
     # on an assistant message, signals that the pending tool_calls were NOT
     # executed (e.g. max tool-call rounds reached) and should be dropped when
@@ -90,6 +93,8 @@ class Message:
             d["mentions"] = self.mentions
         if self.agent_id is not None:
             d["agent_id"] = self.agent_id
+        if self.started_at is not None:
+            d["started_at"] = self.started_at
         return d
 
     @classmethod
@@ -110,6 +115,7 @@ class Message:
             tool_use_id=data.get("tool_use_id"),
             mentions=data.get("mentions"),
             agent_id=data.get("agent_id") or data.get("assistant_id"),
+            started_at=data.get("started_at"),
         )
 
 
@@ -319,6 +325,8 @@ class TokenStat:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    cached_input_tokens: Optional[int] = None
+    new_token_cache: Optional[int] = None
     ttft_ms: Optional[float] = None
     net_ms: Optional[float] = None
     total_ms: Optional[float] = None
@@ -336,6 +344,10 @@ class TokenStat:
             "total_completion_tokens": self.total_completion_tokens,
             "total_all_tokens": self.total_all_tokens,
         }
+        if self.cached_input_tokens is not None:
+            d["cached_input_tokens"] = self.cached_input_tokens
+        if self.new_token_cache is not None:
+            d["new_token_cache"] = self.new_token_cache
         if self.ttft_ms is not None:
             d["ttft_ms"] = round(self.ttft_ms, 1)
         if self.net_ms is not None:

@@ -250,7 +250,8 @@
   function buildBlockStatTooltip(s, block) {
     const fmtMs = (n) => n == null ? 'N/A' : n >= 10000 ? `${(n / 1000).toFixed(1)}s` : `${n}ms`
     const lines = [
-      `${t('tokenIn')} ${formatTokenCount(s.prompt_tokens)}   ${t('tokenOut')} ${formatTokenCount(s.completion_tokens)}   ${t('tokenTotal')} ${formatTokenCount(s.total_tokens)}`
+      `${t('tokenIn')} ${formatTokenCount(s.prompt_tokens)}   ${t('tokenOut')} ${formatTokenCount(s.completion_tokens)}   ${t('tokenTotal')} ${formatTokenCount(s.total_tokens)}`,
+      `${t('tokenCached')} ${s.cached_input_tokens == null ? 'N/A' : formatTokenCount(s.cached_input_tokens)}`,
     ]
     if (s.total_prompt_tokens !== s.prompt_tokens || s.total_completion_tokens !== s.completion_tokens) {
       lines.push(`${t('tokenCumIn')} ${formatTokenCount(s.total_prompt_tokens)}   ${t('tokenCumOut')} ${formatTokenCount(s.total_completion_tokens)}   ${t('tokenCumTotal')} ${formatTokenCount(s.total_all_tokens)}`)

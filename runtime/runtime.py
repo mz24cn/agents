@@ -12,12 +12,13 @@ import logging
 import os
 import re
 import socket
+import threading
 import time
 import urllib.request
 import urllib.error
 from collections import deque
 from dataclasses import replace
-from typing import Iterator, Optional
+from typing import Callable, Iterator, Optional
 
 from runtime.common import (
     _thread_local,
@@ -28,6 +29,28 @@ from runtime.common import (
 )
 
 _logger = logging.getLogger("runtime.runtime")
+
+
+def _now_precise_iso() -> str:
+    """Return a wall-clock timestamp precise enough for execution analysis."""
+    return datetime.datetime.now().isoformat(timespec="microseconds")
+
+
+def _snapshot_tool_request_context() -> dict:
+    """Capture worker context with a shared request-level journal holder.
+
+    HTTP inference installs the holder during request preparation. Direct
+    Runtime users and tests may not, so lazily add one on the caller thread
+    before copying the context into a function-tool worker.
+    """
+    ctx = snapshot_request_context()
+    if ctx.get("file_journal_holder") is None and ctx.get("session_dir"):
+        from runtime.builtin_tools_coding import _FileJournalManagerHolder
+        holder = _FileJournalManagerHolder()
+        _thread_local.file_journal_holder = holder
+        ctx["file_journal_holder"] = holder
+    return ctx
+
 
 # Socket timeout (seconds) for model API calls (connect + read).
 # Covers the entire lifecycle: TCP handshake, TLS negotiation, waiting for
@@ -63,10 +86,11 @@ def _get_model_infer_timeout() -> Optional[float]:
     return val
 
 
-# Experimental repetitive-output detection. The final 100 chars are used as a
-# fingerprint and searched backwards for two earlier complete matches. Both
-# visible content and hidden thinking are checked independently. This is
-# observation-only: the runtime logs a warning but keeps streaming.
+# Experimental repetitive-output detection. After MODEL_INFER_TIMEOUT fires,
+# the final 100 chars are used as a fingerprint and searched backwards for two
+# earlier complete matches. Visible content and hidden thinking are inspected
+# independently. This is diagnostic-only because the timeout already ended the
+# model round.
 _LOOP_FINGERPRINT_CHARS = 100
 
 # Window used by timeout diagnostics to distinguish active generation from a
@@ -154,6 +178,30 @@ def _wait_model_retry(attempt: int, cancel_event: Optional[object] = None) -> bo
         if remaining <= 0:
             return True
         time.sleep(min(remaining, 0.2))
+
+
+def _get_tool_exec_workers() -> int:
+    """Return the maximum number of concurrent function-tool workers.
+
+    The value is read dynamically so deployments can tune it without changing
+    Runtime construction.  ``1`` preserves declaration-order execution while
+    still running every function callable on its isolated worker thread.
+    Invalid and non-positive values fall back to the safe default of ``1``.
+    """
+    raw = os.environ.get("TOOL_EXEC_WORKERS", "1").strip()
+    try:
+        workers = int(raw)
+    except (TypeError, ValueError):
+        _logger.warning(
+            "invalid TOOL_EXEC_WORKERS=%r; using default 1", raw,
+        )
+        return 1
+    if workers <= 0:
+        _logger.warning(
+            "non-positive TOOL_EXEC_WORKERS=%r; using default 1", raw,
+        )
+        return 1
+    return workers
 
 
 def _get_tool_exec_timeout() -> Optional[float]:
@@ -888,6 +936,8 @@ class Runtime:
                 prompt_tokens=round_token_stat.prompt_tokens,
                 completion_tokens=round_token_stat.completion_tokens,
                 total_tokens=round_token_stat.prompt_tokens + round_token_stat.completion_tokens,
+                cached_input_tokens=round_token_stat.cached_input_tokens,
+                new_token_cache=round_token_stat.new_token_cache,
                 net_ms=net_ms,
                 total_ms=round_total_ms,
                 total_prompt_tokens=total_prompt,
@@ -921,9 +971,25 @@ class Runtime:
                 assistant_msg.content = ((assistant_msg.content or "") + "\n\n" + note).strip()
                 break
 
-            # Execute all tool calls sequentially in this round
+            # Skills mutate the round's tool scope/cwd and therefore retain the
+            # existing declaration-order path. Ordinary function-only batches
+            # are dispatched together below.
             skill_triggered = False
-            _logger.info("infer_stream: executing %d tool calls in round %d", len(tool_calls_to_execute), tool_round)
+            _logger.info(
+                "infer: executing %d tool calls in round %d with up to %d function workers",
+                len(tool_calls_to_execute), tool_round, _get_tool_exec_workers(),
+            )
+            if not any(
+                self._is_skill_tool(fn_call.get("name", ""))
+                for fn_call in tool_calls_to_execute
+            ):
+                for tool_msg in self._execute_tool_call_round(
+                    tool_calls_to_execute, tools, timestamp=False,
+                ):
+                    messages.append(tool_msg)
+                _logger.info("infer: tool-call batch done, continuing to next round")
+                continue
+
             for fn_call in tool_calls_to_execute:
                 tool_name = fn_call.get("name", "")
                 arguments_str = fn_call.get("arguments", "{}")
@@ -970,18 +1036,22 @@ class Runtime:
                 except (json.JSONDecodeError, ValueError):
                     arguments = {}
 
-                # Execute tool and get result
+                # Execute tool and get result. Function tools report their real
+                # start from inside the worker immediately before the callable.
+                execution_start = {}
                 tool_result, tool_config = self._execute_tool_call(
                     tool_name,
                     arguments,
                     tool_scope=tools,
                     tool_use_id=fn_call.get("id") or fn_call.get("tool_use_id"),
+                    on_started=lambda value: execution_start.setdefault("value", value),
                 )
 
                 # Add tool result as tool role message
                 messages.append(
                     Message(
                         role="tool",
+                        started_at=execution_start.get("value"),
                         content=tool_result,
                         name=tool_name,
                         tool_id=tool_config.tool_id if tool_config else None,
@@ -1039,6 +1109,7 @@ class Runtime:
         arguments: dict,
         tool_scope: Optional[list] = None,
         tool_use_id: Optional[str] = None,
+        on_started: Optional[Callable[[str], None]] = None,
     ) -> tuple[str, Optional[ToolConfig]]:
         """Execute a tool call by name.
 
@@ -1062,6 +1133,9 @@ class Runtime:
             tool_use_id: Protocol-level ID of the current model tool call. It is
                 exposed through the request context while the callable runs so
                 self-streaming built-ins can use the canonical call ID.
+            on_started: Optional callback receiving the actual execution-start
+                timestamp. Function tools invoke it inside the worker immediately
+                before entering the callable.
 
         Returns:
             A tuple of (result_str, tool_config). tool_config is None if tool not found.
@@ -1088,7 +1162,9 @@ class Runtime:
         _thread_local.tool_use_id = tool_use_id
         try:
             if tool_config.tool_type == "function":
-                result_str = self._execute_function_tool(tool_config, arguments)
+                result_str = self._execute_function_tool(
+                    tool_config, arguments, on_started=on_started,
+                )
             elif tool_config.tool_type == "mcp":
                 # --- Base64 file path auto-conversion (for file transfer MCP) ---
                 # 检测参数中的 base64_content 等字段，如果值看起来是文件路径（非 base64），
@@ -1096,6 +1172,8 @@ class Runtime:
                 from runtime.tools import process_tool_arguments_for_base64
                 arguments = process_tool_arguments_for_base64(arguments)
             
+                if on_started is not None:
+                    on_started(_now_precise_iso())
                 result_str = self._execute_mcp_tool(tool_config, arguments)
 
                 # --- Base64 image interception (inference loop only) ---
@@ -1387,6 +1465,335 @@ class Runtime:
         tool_config = self._find_tool_by_name(tool_name)
         return tool_config is not None and tool_config.tool_type == "skill"
 
+    def _prepare_tool_call(
+        self,
+        fn_call: dict,
+        tool_scope: Optional[list],
+    ) -> tuple[str, dict, Optional[str], Optional[ToolConfig], Optional[str], list]:
+        """Parse and resolve one model tool call before round scheduling.
+
+        Returns ``(name, arguments, tool_use_id, config, immediate_result,
+        compat_notes)``.  ``immediate_result`` is populated for lookup or
+        argument-normalization failures, which therefore do not need a worker.
+        """
+        tool_name = fn_call.get("name", "")
+        arguments_str = fn_call.get("arguments", "{}")
+        tool_use_id = fn_call.get("id") or fn_call.get("tool_use_id")
+        try:
+            arguments = (
+                json.loads(arguments_str)
+                if isinstance(arguments_str, str)
+                else arguments_str
+            )
+        except (json.JSONDecodeError, ValueError):
+            arguments = {}
+        if not isinstance(arguments, dict):
+            arguments = {}
+
+        tool_config = self._find_tool_by_name(tool_name, scope=tool_scope)
+        if tool_config is None:
+            if tool_scope is not None:
+                immediate_result = (
+                    f"Error: specified tool '{tool_name}' is temporarily unavailable "
+                    "(not found in the current tool list)."
+                )
+            else:
+                immediate_result = f"Error: tool '{tool_name}' not found in registry"
+            return tool_name, arguments, tool_use_id, None, immediate_result, []
+
+        arguments, compat_notes = self._normalize_argument_names(tool_config, arguments)
+        if compat_notes is None:
+            return tool_name, {}, tool_use_id, tool_config, arguments, []
+        return tool_name, arguments, tool_use_id, tool_config, None, compat_notes
+
+    def _postprocess_tool_result(self, result_str: str, compat_notes: list) -> str:
+        """Apply the common result transforms after a concrete tool finishes."""
+        if compat_notes:
+            result_str = self._append_compat_notes(result_str, compat_notes)
+        return self._guard_tool_result_length(result_str)
+
+    @staticmethod
+    def _tool_message(
+        tool_name: str,
+        tool_use_id: Optional[str],
+        result_str: str,
+        tool_config: Optional[ToolConfig],
+        *,
+        timestamp: bool,
+        started_at: Optional[str] = None,
+    ) -> Message:
+        return Message(
+            role="tool",
+            timestamp=_now_precise_iso() if timestamp else None,
+            started_at=started_at,
+            content=result_str,
+            name=tool_name,
+            tool_id=tool_config.tool_id if tool_config else None,
+            tool_use_id=tool_use_id,
+        )
+
+    def _execute_function_tool_calls(
+        self,
+        prepared_calls: list[tuple[str, dict, Optional[str], ToolConfig, list]],
+        *,
+        timestamp: bool,
+    ) -> Iterator[Message]:
+        """Execute prepared function calls on bounded batches of worker threads.
+
+        Each callable receives its own request-context snapshot and canonical
+        ``tool_use_id``. Self-streaming tools such as ``talk_to`` run and update
+        the frontend concurrently; final tool messages are emitted in declaration
+        order for stable conversation persistence.
+
+        Calls are submitted in batches of at most ``TOOL_EXEC_WORKERS``. A new
+        executor is used for each batch so a timed-out callable which keeps
+        running in the background cannot permanently occupy a pool slot and
+        prevent later calls from starting. With ``TOOL_EXEC_WORKERS=1`` this is
+        equivalent to the previous sequential execution order, while still
+        isolating every callable on its own worker thread.
+        """
+        if not prepared_calls:
+            return
+
+        max_workers = min(_get_tool_exec_workers(), len(prepared_calls))
+        ready_messages: dict[int, Message] = {}
+        runnable_calls = []
+        next_index = 0
+
+        def _yield_ready_in_order() -> Iterator[Message]:
+            nonlocal next_index
+            while next_index in ready_messages:
+                yield ready_messages.pop(next_index)
+                next_index += 1
+
+        for index, (tool_name, arguments, tool_use_id, tool_config, compat_notes) in enumerate(prepared_calls):
+            callable_fn = self._tool_registry.get_callable(tool_config.tool_id)
+            if callable_fn is None:
+                result_str = self._postprocess_tool_result(
+                    f"Error: no callable registered for tool '{tool_config.tool_id}'",
+                    compat_notes,
+                )
+                ready_messages[index] = self._tool_message(
+                    tool_name, tool_use_id, result_str, tool_config, timestamp=timestamp,
+                )
+                continue
+
+            validation_error = self._validate_talk_to_target(tool_config, arguments)
+            if validation_error is not None:
+                result_str = self._postprocess_tool_result(validation_error, compat_notes)
+                ready_messages[index] = self._tool_message(
+                    tool_name, tool_use_id, result_str, tool_config, timestamp=timestamp,
+                )
+                continue
+
+            caller_ctx = _snapshot_tool_request_context()
+            caller_ctx["tool_use_id"] = tool_use_id
+            runnable_calls.append((
+                index,
+                tool_name,
+                arguments,
+                tool_use_id,
+                tool_config,
+                compat_notes,
+                callable_fn,
+                caller_ctx,
+                _get_effective_tool_exec_timeout(tool_config, arguments),
+            ))
+
+        yield from _yield_ready_in_order()
+
+        for batch_start in range(0, len(runnable_calls), max_workers):
+            batch = runnable_calls[batch_start:batch_start + max_workers]
+            executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=len(batch),
+                thread_name_prefix="fn-tool",
+            )
+            futures = {}
+            submitted_at = {}
+            execution_started = {}
+            execution_started_lock = threading.Lock()
+            try:
+                for spec in batch:
+                    (
+                        _index, _tool_name, arguments, _tool_use_id,
+                        _tool_config, _compat_notes, callable_fn,
+                        caller_ctx, _timeout,
+                    ) = spec
+
+                    def _run_with_context(
+                        fn=callable_fn,
+                        fn_arguments=arguments,
+                        ctx=caller_ctx,
+                        call_index=_index,
+                    ):
+                        restore_request_context(ctx)
+                        try:
+                            # Capture the real execution start in the worker,
+                            # immediately before entering the tool callable.
+                            # Thread-pool scheduling time must not be attributed
+                            # to the tool itself.
+                            with execution_started_lock:
+                                execution_started[call_index] = _now_precise_iso()
+                            return fn(**fn_arguments)
+                        finally:
+                            _thread_local.__dict__.clear()
+
+                    future = executor.submit(_run_with_context)
+                    futures[future] = spec
+                    submitted_at[future] = time.monotonic()
+
+                pending = set(futures)
+                while pending:
+                    done, _ = concurrent.futures.wait(
+                        pending,
+                        timeout=0.05,
+                        return_when=concurrent.futures.FIRST_COMPLETED,
+                    )
+                    now = time.monotonic()
+                    expired = {
+                        future for future in pending
+                        if futures[future][-1] is not None
+                        and now - submitted_at[future] >= futures[future][-1]
+                    }
+
+                    for future in done | expired:
+                        if future not in pending:
+                            continue
+                        pending.remove(future)
+                        (
+                            index, tool_name, _arguments, tool_use_id,
+                            tool_config, compat_notes, _callable_fn,
+                            _caller_ctx, timeout,
+                        ) = futures[future]
+                        if future in expired and not future.done():
+                            future.cancel()
+                            result_str = (
+                                f"Error: tool '{tool_config.name}' timed out "
+                                f"after {timeout:g}s"
+                            )
+                        else:
+                            try:
+                                result = future.result()
+                                result_str = str(result) if result is not None else ""
+                            except Exception as exc:
+                                result_str = f"Error: {type(exc).__name__}: {exc}"
+                        result_str = self._postprocess_tool_result(
+                            result_str, compat_notes,
+                        )
+                        with execution_started_lock:
+                            started = execution_started.get(index)
+                        ready_messages[index] = self._tool_message(
+                            tool_name,
+                            tool_use_id,
+                            result_str,
+                            tool_config,
+                            timestamp=timestamp,
+                            started_at=started,
+                        )
+                    yield from _yield_ready_in_order()
+            finally:
+                # Never wait for timed-out/hung callables. Running Python
+                # threads cannot be force-cancelled and may finish later.
+                executor.shutdown(wait=False, cancel_futures=True)
+
+        yield from _yield_ready_in_order()
+
+    def _execute_tool_call_round(
+        self,
+        tool_calls: list[dict],
+        tool_scope: Optional[list],
+        *,
+        timestamp: bool,
+    ) -> Iterator[Message]:
+        """Execute one non-Skill tool-call batch.
+
+        A batch is parallelized only when every call resolves to a function
+        tool. Mixed/unknown/MCP batches keep the previous declaration-order
+        path, so this first step does not change MCP concurrency semantics.
+        """
+        prepared_batch = [
+            self._prepare_tool_call(fn_call, tool_scope)
+            for fn_call in tool_calls
+        ]
+        all_functions = bool(tool_calls) and all(
+            immediate_result is not None
+            or (tool_config is not None and tool_config.tool_type == "function")
+            for (
+                _tool_name, _arguments, _tool_use_id, tool_config,
+                immediate_result, _compat_notes,
+            ) in prepared_batch
+        )
+
+        if all_functions:
+            function_calls = []
+            immediate_by_index = {}
+            function_index_by_local_index = {}
+            for batch_index, prepared in enumerate(prepared_batch):
+                (
+                    tool_name, arguments, tool_use_id, tool_config,
+                    immediate_result, compat_notes,
+                ) = prepared
+                if immediate_result is not None:
+                    immediate_by_index[batch_index] = self._tool_message(
+                        tool_name,
+                        tool_use_id,
+                        self._postprocess_tool_result(immediate_result, compat_notes),
+                        tool_config,
+                        timestamp=timestamp,
+                    )
+                else:
+                    function_index_by_local_index[len(function_calls)] = batch_index
+                    function_calls.append(
+                        (tool_name, arguments, tool_use_id, tool_config, compat_notes)
+                    )
+
+            # _execute_function_tool_calls preserves the relative declaration
+            # order of submitted function calls. Merge immediate validation
+            # errors back into their original positions before yielding.
+            function_messages = iter(self._execute_function_tool_calls(
+                function_calls, timestamp=timestamp,
+            ))
+            local_function_index = 0
+            for batch_index in range(len(prepared_batch)):
+                if batch_index in immediate_by_index:
+                    yield immediate_by_index[batch_index]
+                else:
+                    assert function_index_by_local_index[local_function_index] == batch_index
+                    yield next(function_messages)
+                    local_function_index += 1
+            return
+
+        for fn_call in tool_calls:
+            tool_name = fn_call.get("name", "")
+            arguments_str = fn_call.get("arguments", "{}")
+            try:
+                arguments = (
+                    json.loads(arguments_str)
+                    if isinstance(arguments_str, str)
+                    else arguments_str
+                )
+            except (json.JSONDecodeError, ValueError):
+                arguments = {}
+            if not isinstance(arguments, dict):
+                arguments = {}
+            tool_use_id = fn_call.get("id") or fn_call.get("tool_use_id")
+            execution_start = {}
+            result_str, tool_config = self._execute_tool_call(
+                tool_name,
+                arguments,
+                tool_scope=tool_scope,
+                tool_use_id=tool_use_id,
+                on_started=lambda value: execution_start.setdefault("value", value),
+            )
+            yield self._tool_message(
+                tool_name,
+                tool_use_id,
+                result_str,
+                tool_config,
+                timestamp=timestamp,
+                started_at=execution_start.get("value"),
+            )
+
     @staticmethod
     def _validate_talk_to_target(tool_config: ToolConfig, arguments: dict) -> Optional[str]:
         """Reject ``talk_to`` calls that target the currently executing agent.
@@ -1426,12 +1833,19 @@ class Runtime:
                 )
         return None
 
-    def _execute_function_tool(self, tool_config: ToolConfig, arguments: dict) -> str:
+    def _execute_function_tool(
+        self,
+        tool_config: ToolConfig,
+        arguments: dict,
+        on_started: Optional[Callable[[str], None]] = None,
+    ) -> str:
         """Execute a function-type tool.
 
         Args:
             tool_config: The tool configuration.
             arguments: Arguments to pass to the function.
+            on_started: Optional callback invoked from the worker immediately
+                before entering the callable.
 
         Returns:
             The function result as a string, or an error message.
@@ -1445,50 +1859,39 @@ class Runtime:
             return f"Error: no callable registered for tool '{tool_config.tool_id}'"
 
         timeout = _get_effective_tool_exec_timeout(tool_config, arguments)
+        # Function callables always run on a worker, even when the timeout guard
+        # is disabled. This keeps exceptions and thread-local mutations isolated
+        # from the inference loop and makes the direct-call path consistent with
+        # round-level parallel execution.
+        caller_ctx = _snapshot_tool_request_context()
+
+        def _run_with_context() -> str:
+            restore_request_context(caller_ctx)
+            try:
+                if on_started is not None:
+                    # This is the actual callable entry point in the worker;
+                    # executor queueing time is intentionally excluded.
+                    on_started(_now_precise_iso())
+                return callable_fn(**arguments)
+            finally:
+                # Do not leak this session's context into a reused worker.
+                _thread_local.__dict__.clear()
+
+        executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="fn-tool")
+        future = executor.submit(_run_with_context)
         try:
-            if timeout is None:
-                # Guard disabled: run inline.
-                result = callable_fn(**arguments)
-            else:
-                # Run on a dedicated daemon worker so a hung callable cannot
-                # block this thread (group-chat worker / HTTP handler) forever.
-                # NOTE: never use `with ThreadPoolExecutor(...)` here -- its
-                # shutdown(wait=True) would block until the hung callable
-                # finishes, recreating the very hang we guard against.
-                #
-                # The worker is a brand-new thread, so `threading.local`
-                # request context (session_id / workspace / session_dir ...)
-                # is empty there.  Propagate the caller thread's snapshot
-                # before running, otherwise tools that depend on it (exec_cli
-                # persistent PTY, write_file per-session journal, undo) would
-                # silently degrade to a fresh subprocess / lost context.
-                caller_ctx = snapshot_request_context()
-
-                def _run_with_context() -> str:
-                    restore_request_context(caller_ctx)
-                    try:
-                        return callable_fn(**arguments)
-                    finally:
-                        # Do not leak this session's context into a reused
-                        # worker thread for the next tool call.
-                        _thread_local.__dict__.clear()
-
-                executor = concurrent.futures.ThreadPoolExecutor(
-                    max_workers=1, thread_name_prefix="fn-tool")
-                future = executor.submit(_run_with_context)
-                try:
-                    result = future.result(timeout=timeout)
-                except concurrent.futures.TimeoutError:
-                    future.cancel()
-                    return (f"Error: tool '{tool_config.name}' timed out "
-                            f"after {timeout:g}s")
-                finally:
-                    # wait=False: never block on a hung callable; the worker
-                    # is a daemon thread and keeps running in the background.
-                    executor.shutdown(wait=False, cancel_futures=True)
+            result = future.result(timeout=timeout)
             return str(result) if result is not None else ""
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            return (f"Error: tool '{tool_config.name}' timed out "
+                    f"after {timeout:g}s")
         except Exception as exc:
             return f"Error: {type(exc).__name__}: {exc}"
+        finally:
+            # Never block on a hung callable during executor shutdown.
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def _execute_mcp_tool(self, tool_config: ToolConfig, arguments: dict) -> str:
         """Execute an MCP-type tool via MCPClientManager.
@@ -1824,6 +2227,9 @@ class Runtime:
             accumulated_tool_calls: dict[int, dict] = {}
             round_prompt = 0
             round_completion = 0
+            round_cached_input: Optional[int] = None
+            round_new_token_cache: Optional[int] = None
+            round_usage_reported = False
             first_token_time: Optional[float] = None
             first_token_timestamp: Optional[str] = None  # ISO timestamp of first token
             tool_calls_first_ts: Optional[str] = None  # Reset for each round
@@ -1837,6 +2243,35 @@ class Runtime:
             last_output_time: Optional[float] = None
             max_output_gap = 0.0
             recent_output: deque[tuple[float, int]] = deque()
+
+            def _inspect_timeout_output() -> None:
+                """Inspect content and thinking once, only after inference timeout."""
+                nonlocal content_loop_detected, thinking_loop_detected
+
+                for channel, output in (
+                    ("thinking", full_thinking),
+                    ("content", full_content),
+                ):
+                    repeated = _find_repetitive_output_tail(output)
+                    if repeated is not None:
+                        if channel == "thinking":
+                            thinking_loop_detected = True
+                        else:
+                            content_loop_detected = True
+                        second_match_pos = len(output) - len(repeated)
+                        _logger.warning(
+                            "infer_stream repetitive output detected | "
+                            "round=%d channel=%s output_len=%d "
+                            "second_match_pos=%d repeated_content=%r",
+                            tool_round, channel, len(output), second_match_pos,
+                            repeated,
+                        )
+                    else:
+                        _logger.info(
+                            "infer_stream timeout output tail | "
+                            "round=%d channel=%s output_len=%d last_500_chars=%r",
+                            tool_round, channel, len(output), output[-500:],
+                        )
 
             def _timeout_diagnostics(now: float) -> str:
                 while (
@@ -1907,32 +2342,8 @@ class Runtime:
 
                         if msg.thinking:
                             full_thinking += msg.thinking
-                            if not thinking_loop_detected:
-                                repeated = _find_repetitive_output_tail(full_thinking)
-                                if repeated is not None:
-                                    thinking_loop_detected = True
-                                    second_match_pos = len(full_thinking) - len(repeated)
-                                    _logger.warning(
-                                        "infer_stream repetitive output detected | "
-                                        "round=%d channel=thinking output_len=%d "
-                                        "second_match_pos=%d repeated_content=%r",
-                                        tool_round, len(full_thinking), second_match_pos,
-                                        repeated,
-                                    )
                         if msg.content:
                             full_content += msg.content
-                            if not content_loop_detected:
-                                repeated = _find_repetitive_output_tail(full_content)
-                                if repeated is not None:
-                                    content_loop_detected = True
-                                    second_match_pos = len(full_content) - len(repeated)
-                                    _logger.warning(
-                                        "infer_stream repetitive output detected | "
-                                        "round=%d channel=content output_len=%d "
-                                        "second_match_pos=%d repeated_content=%r",
-                                        tool_round, len(full_content), second_match_pos,
-                                        repeated,
-                                    )
 
                     # Per-round continuous-output guard (MODEL_INFER_TIMEOUT).
                     # The clock restarts on every model round and is separate
@@ -1941,6 +2352,7 @@ class Runtime:
                         elapsed_round = guard_now - round_start
                         if elapsed_round > infer_timeout:
                             http_resp.close()
+                            _inspect_timeout_output()
                             _logger.error(
                                 "infer_stream inference timeout | url=%s "
                                 "round=%d elapsed=%.3fs limit=%.3fs %s",
@@ -1963,6 +2375,9 @@ class Runtime:
                             u = json.loads(msg.content)
                             round_prompt = u.get("prompt_tokens", 0)
                             round_completion = u.get("completion_tokens", 0)
+                            round_cached_input = u.get("cached_input_tokens")
+                            round_new_token_cache = u.get("new_token_cache")
+                            round_usage_reported = u.get("usage_reported") is not False
                         except (json.JSONDecodeError, ValueError, AttributeError):
                             pass
                         continue
@@ -2033,6 +2448,7 @@ class Runtime:
                 ):
                     timeout_now = time.monotonic()
                     elapsed_round = timeout_now - round_start
+                    _inspect_timeout_output()
                     _logger.error(
                         "infer_stream inference timeout during stream | url=%s "
                         "round=%d elapsed=%.3fs limit=%.3fs %s",
@@ -2059,9 +2475,39 @@ class Runtime:
                 stream_end_time = time.monotonic()
                 http_resp.close()
 
+            # A transport can return HTTP 200 and terminate the SSE/NDJSON body
+            # without ever producing content, thinking, or a tool call.  Treat
+            # that as a transient pre-output failure rather than a successful
+            # empty assistant round.  Retrying is safe because no model output
+            # (and therefore no new tool call) has been exposed or executed.
+            if first_token_time is None:
+                if pre_output_retry_count < max_retries:
+                    pre_output_retry_count += 1
+                    _logger.warning(
+                        "infer_stream empty response before first output; retrying | "
+                        "url=%s attempt=%d/%d",
+                        url, pre_output_retry_count, max_retries,
+                    )
+                    if not _wait_model_retry(pre_output_retry_count, cancel_event):
+                        yield Message(role="assistant", timestamp=_now_iso(),
+                                      content="Error: user interrupted.")
+                        return
+                    continue
+                _logger.error(
+                    "infer_stream empty response after retries | url=%s attempts=%d",
+                    url, pre_output_retry_count + 1,
+                )
+                yield Message(
+                    role="assistant",
+                    timestamp=_now_iso(),
+                    content="Error: model API returned an empty response.",
+                )
+                return
+
             pre_output_retry_count = 0
 
             # net_ms = time from request start to stream fully received
+            # (empty streams return above and are never recorded as success).
             net_ms = (stream_end_time - round_start) * 1000
             ttft_ms = (first_token_time - round_start) * 1000 if first_token_time else None
             total_prompt += round_prompt
@@ -2093,6 +2539,9 @@ class Runtime:
                     "prompt_tokens": round_prompt,
                     "completion_tokens": round_completion,
                     "total_tokens": round_prompt + round_completion,
+                    "cached_input_tokens": round_cached_input,
+                    "new_token_cache": round_new_token_cache,
+                    "usage_reported": round_usage_reported,
                     "total_prompt_tokens": total_prompt,
                     "total_completion_tokens": total_completion,
                     "total_all_tokens": total_prompt + total_completion,
@@ -2134,6 +2583,9 @@ class Runtime:
                     "prompt_tokens": round_prompt,
                     "completion_tokens": round_completion,
                     "total_tokens": round_prompt + round_completion,
+                    "cached_input_tokens": round_cached_input,
+                    "new_token_cache": round_new_token_cache,
+                    "usage_reported": round_usage_reported,
                     "total_prompt_tokens": total_prompt,
                     "total_completion_tokens": total_completion,
                     "total_all_tokens": total_prompt + total_completion,
@@ -2156,6 +2608,9 @@ class Runtime:
                 "prompt_tokens": round_prompt,
                 "completion_tokens": round_completion,
                 "total_tokens": round_prompt + round_completion,
+                "cached_input_tokens": round_cached_input,
+                "new_token_cache": round_new_token_cache,
+                "usage_reported": round_usage_reported,
                 "total_prompt_tokens": total_prompt,
                 "total_completion_tokens": total_completion,
                 "total_all_tokens": total_prompt + total_completion,
@@ -2170,8 +2625,25 @@ class Runtime:
                 stat_dict["ttft_ms"] = round(ttft_ms, 1)
             yield Message(role="usage", name="round", content=json.dumps(stat_dict))
 
-            # Execute all tool calls sequentially in this round
+            # Skills keep the existing sequential progressive-disclosure path.
+            # A function-only batch shares one worker pool and yields tool
+            # results as individual callables complete.
             skill_triggered = False
+            if not any(
+                self._is_skill_tool(fn_call.get("name", ""))
+                for fn_call in tool_calls_to_execute
+            ):
+                _logger.info(
+                    "infer_stream: executing %d tool calls in round %d with up to %d function workers",
+                    len(tool_calls_to_execute), tool_round, _get_tool_exec_workers(),
+                )
+                for tool_msg in self._execute_tool_call_round(
+                    tool_calls_to_execute, tools, timestamp=True,
+                ):
+                    messages.append(tool_msg)
+                    yield tool_msg
+                continue
+
             for fn_call in tool_calls_to_execute:
                 tool_name = fn_call.get("name", "")
                 arguments_str = fn_call.get("arguments", "{}")
@@ -2213,20 +2685,23 @@ class Runtime:
                 except (json.JSONDecodeError, ValueError):
                     arguments = {}
 
+                execution_start = {}
                 tool_result, tool_config = self._execute_tool_call(
                     tool_name,
                     arguments,
                     tool_scope=tools,
                     tool_use_id=fn_call.get("id") or fn_call.get("tool_use_id"),
+                    on_started=lambda value: execution_start.setdefault("value", value),
                 )
 
                 tool_msg = Message(
                     role="tool",
-                    timestamp=_now_iso(),
+                    timestamp=_now_precise_iso(),
                     content=tool_result,
                     name=tool_name,
                     tool_id=tool_config.tool_id if tool_config else None,
                     tool_use_id=fn_call.get("id") or fn_call.get("tool_use_id"),
+                    started_at=execution_start.get("value"),
                 )
                 messages.append(tool_msg)
                 yield tool_msg

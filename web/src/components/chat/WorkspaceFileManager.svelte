@@ -107,6 +107,25 @@
   let trackedWorkspace = $state('')
   let uploadTasks = $state([])
   let uploadQueueRunning = false
+  // Backend-approved clipboard/upload directory (/tmp on Unix, OS temp on
+  // Windows). It is a special writable/selectable area outside the workspace.
+  let pasteDirectoryPath = $state('')
+  let pasteDirectoryLoading = false
+
+  async function ensurePasteDirectory() {
+    if (pasteDirectoryPath || pasteDirectoryLoading) return
+    pasteDirectoryLoading = true
+    try {
+      const result = await workspaceApi.pasteDir()
+      pasteDirectoryPath = result?.path || ''
+    } catch (err) {
+      // Keep normal workspace operations available if this optional endpoint
+      // cannot be resolved; an upload outside the workspace remains disabled.
+      console.warn('Failed to resolve paste directory:', err)
+    } finally {
+      pasteDirectoryLoading = false
+    }
+  }
   
   // 拖放相关状态
   let dragState = $state({
@@ -158,6 +177,18 @@
   function isInsideWorkspacePath(path) {
     return pathsEqual(path, workspacePath) || pathStartsWith(workspacePath, path)
   }
+
+  function isInsidePasteDirectoryPath(path) {
+    if (!pasteDirectoryPath) return false
+    return pathsEqual(path, pasteDirectoryPath) || pathStartsWith(pasteDirectoryPath, path)
+  }
+
+  // Uploads and chat file selection are allowed in the normal workspace and
+  // in the backend-approved paste directory. Other external directories stay
+  // read-only/non-selectable.
+  function isAllowedFileArea(path) {
+    return isInsideWorkspacePath(path) || isInsidePasteDirectoryPath(path)
+  }
   /**
    * 计算相对于工作区的路径，支持 ../ 表示工作区外的路径
    * 工作区根目录本身返回 '.'
@@ -191,7 +222,7 @@
   }
 
   function isSelectableFile(file) {
-    return !!file && !file.is_dir && isInsideWorkspacePath(file.path)
+    return !!file && !file.is_dir && isAllowedFileArea(file.path)
   }
 
   // PDF / DOCX 文件判断（按扩展名，无需后端支持）
@@ -267,8 +298,8 @@
 
   let displayedFiles = $derived(filterAndSortFiles(searchMode ? searchResults : files, searchMode))
 
-  // 当前目录是否在工作区内
-  let isCurrentPathInWorkspace = $derived(isInsideWorkspacePath(currentPath))
+  // 当前目录是否允许上传/选择（工作区或后端批准的粘贴目录）
+  let isCurrentPathInAllowedArea = $derived(isAllowedFileArea(currentPath))
 
 
   // 跟踪上次的面板打开状态，用于打开时滚动工作区节点
@@ -287,6 +318,7 @@
     }
 
     if (open && workspacePath) {
+      ensurePasteDirectory()
       if (!currentPath) {
         currentPath = workspacePath
         loadFiles(currentPath)
@@ -1080,7 +1112,21 @@
     for (const [index, match] of previewSearchMatches.entries()) {
       match.classList.toggle('current', index === previewSearchCurrent)
     }
-    previewSearchMatches[previewSearchCurrent]?.scrollIntoView({ block: 'center', inline: 'nearest' })
+
+    const currentMatch = previewSearchMatches[previewSearchCurrent]
+    if (!currentMatch) return
+
+    // TreeWalker can find text inside a collapsed JSON long-value panel. When
+    // navigation reaches such a match, reveal its owning <details> before
+    // scrolling so the highlighted result is actually visible. Matches in the
+    // already-visible summary do not expand the panel unnecessarily.
+    const fullValuePanel = currentMatch.closest('.hl-json-expand-full')
+    const collapsedLongValue = fullValuePanel?.closest('details.hl-json-expand')
+    if (collapsedLongValue && !collapsedLongValue.open) {
+      collapsedLongValue.open = true
+    }
+
+    currentMatch.scrollIntoView({ block: 'center', inline: 'nearest' })
   }
 
   function movePreviewSearch(direction) {
@@ -1125,9 +1171,13 @@
       if (rawLines.length && rawLines[rawLines.length - 1] === '') rawLines.pop()
       const lineCount = rawLines.length
       const digits = Math.max(String(lineCount).length, 3)
-      const gutter = rawLines.map((_, i) => `<span>${i + 1}</span>`).join('')
-      const body = rawLines.join('\n')
-      return `<div class="code-container" style="--digits:${digits}"><div class="line-gutter">${gutter}</div><pre class="code-body"><code>${body}</code></pre></div>`
+      // Render each source line and its number in the same grid row. JSON long-value
+      // details can therefore grow that row when opened, while a closed details box
+      // contributes no height. Subsequent line numbers move together with the code.
+      const rows = rawLines.map((line, i) => (
+        `<div class="code-line"><span class="line-number">${i + 1}</span><pre class="code-line-body"><code>${line}</code></pre></div>`
+      )).join('')
+      return `<div class="code-container" style="--digits:${digits}">${rows}</div>`
     }
 
     // 解析 markdown 文件所在目录，用于解决相对路径引用
@@ -1248,7 +1298,15 @@
   function confirmSelectFiles() {
     const selected = displayedFiles
       .filter(f => selectedFiles.has(f.path) && isSelectableFile(f))
-      .map(f => ({ ...f, relative_path: relativeWorkspacePath(f.path) }))
+      .map(f => ({
+        ...f,
+        // Paste-directory files use their absolute backend-approved path,
+        // matching direct ChatInput clipboard uploads. Normal workspace files
+        // keep their existing workspace-relative references.
+        relative_path: isInsidePasteDirectoryPath(f.path)
+          ? f.path
+          : relativeWorkspacePath(f.path),
+      }))
     if (selected.length === 0) return
     onSelectFiles?.(selected)
     selectedFiles.clear()
@@ -1576,7 +1634,7 @@
   }
 
   function canWriteCurrentDirectory() {
-    return Boolean(currentPath && isInsideWorkspacePath(currentPath))
+    return Boolean(currentPath && isAllowedFileArea(currentPath))
   }
 
   async function handleCreateFolder() {
@@ -1605,7 +1663,7 @@
 
   function makeUploadEntries(files, useRelativePath = false, targetDirPath = currentPath) {
     // target_dir_path 已作为 base_dir 发送到后端，target_path 只需文件名即可
-    if (!isInsideWorkspacePath(targetDirPath)) return []
+    if (!isAllowedFileArea(targetDirPath)) return []
     return files.map((file) => {
       const relativeName = useRelativePath && file.webkitRelativePath ? file.webkitRelativePath : file.name
       return {
@@ -1616,7 +1674,7 @@
   }
 
   async function enqueueUploads(entries, targetDirPath = currentPath) {
-    if (!workspacePath || !isInsideWorkspacePath(targetDirPath)) return
+    if (!workspacePath || !isAllowedFileArea(targetDirPath)) return
     const tasks = entries.map((entry) => ({
       client_id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
       upload_id: null,
@@ -2050,8 +2108,8 @@
           <button 
             class="header-btn primary" 
             onclick={confirmSelectFiles} 
-            disabled={!isCurrentPathInWorkspace}
-            title={!isCurrentPathInWorkspace ? t('onlyWorkspaceFilesCanBeSelected') : ''}
+            disabled={!isCurrentPathInAllowedArea}
+            title={!isCurrentPathInAllowedArea ? t('onlyWorkspaceFilesCanBeSelected') : ''}
           >
             {t('selectFiles')} ({selectedFiles.size})
           </button>
@@ -2121,7 +2179,7 @@
                   class="file-item"
                   class:selected={selectedFiles.has(file.path)}
                   class:directory={file.is_dir}
-                  class:outside-workspace={!file.is_dir && !isInsideWorkspacePath(file.path)}
+                  class:outside-workspace={!file.is_dir && !isAllowedFileArea(file.path)}
                   class:dragging={dragState.isDragging && dragState.dragPaths.includes(file.path)}
                   draggable="true"
                   onclick={(e) => file.is_dir ? enterDirectory(file.path) : handleFileClick(file, e)}
@@ -2145,7 +2203,7 @@
                   <button 
                     class="grid-item"
                     class:selected={selectedFiles.has(file.path)}
-                    class:outside-workspace={!file.is_dir && !isInsideWorkspacePath(file.path)}
+                    class:outside-workspace={!file.is_dir && !isAllowedFileArea(file.path)}
                     class:dragging={dragState.isDragging && dragState.dragPaths.includes(file.path)}
                     draggable="true"
                     onclick={(e) => file.is_dir ? enterDirectory(file.path) : handleFileClick(file, e)}
@@ -3100,41 +3158,62 @@
     outline: 1px solid #e8590c;
   }
 
-  /* Two-column code layout */
+  /* Source lines and line numbers share rows so expandable JSON values keep them aligned. */
   .text-preview :global(.code-container) {
-    display: flex;
+    min-width: 100%;
     min-height: 100%;
+    padding: 12px 0;
+    background: linear-gradient(
+      to right,
+      var(--bg-secondary) 0,
+      var(--bg-secondary) calc(var(--digits, 3) * 0.7em + 1.2em),
+      var(--border, rgba(0,0,0,0.08)) calc(var(--digits, 3) * 0.7em + 1.2em),
+      var(--border, rgba(0,0,0,0.08)) calc(var(--digits, 3) * 0.7em + 1.2em + 1px),
+      transparent calc(var(--digits, 3) * 0.7em + 1.2em + 1px)
+    );
   }
-  .text-preview :global(.line-gutter) {
-    flex-shrink: 0;
-    width: calc(var(--digits, 3) * 0.7em + 1.2em);
-    padding: 12px 0.4em 12px 0.6em;
+  .text-preview :global(.code-line) {
+    display: grid;
+    grid-template-columns: calc(var(--digits, 3) * 0.7em + 1.2em) minmax(0, 1fr);
+    align-items: start;
+    min-width: 100%;
+  }
+  .text-preview :global(.line-number) {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    padding: 0 0.4em 0 0.6em;
     text-align: right;
-    background: var(--bg-secondary);
     color: var(--text-secondary, #888);
+    background: var(--bg-secondary);
+    border-right: 1px solid var(--border, rgba(0,0,0,0.08));
     font-size: inherit;
     line-height: inherit;
     user-select: none;
-    border-right: 1px solid var(--border, rgba(0,0,0,0.08));
   }
-  .text-preview :global(.line-gutter span) {
-    display: block;
-  }
-  .text-preview :global(.code-body) {
-    flex: 1;
+  .text-preview :global(.code-line-body) {
+    min-width: 0;
     margin: 0;
-    padding: 12px 16px;
-    overflow-x: auto;
+    padding: 0 16px;
     white-space: pre;
     word-wrap: normal;
     background: transparent;
   }
-  .text-preview :global(.code-body code) {
+  .text-preview :global(.code-line-body code) {
     font-family: inherit;
     font-size: inherit;
+    line-height: inherit;
     background: transparent;
     padding: 0;
     border-radius: 0;
+  }
+  /* A closed details element must be exactly inline-height; the hidden full-value
+     panel must not create an anonymous/blank source row in a <pre>. */
+  .text-preview :global(.code-line-body .hl-json-expand:not([open]) > .hl-json-expand-full) {
+    display: none !important;
+  }
+  .text-preview :global(.code-line-body .hl-json-expand[open] > .hl-json-expand-full) {
+    white-space: pre-wrap;
   }
 
   /* Markdown rendering */

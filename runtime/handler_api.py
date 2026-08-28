@@ -1483,7 +1483,10 @@ class HandlerApiMixin:
         try:
             self.wfile.write(f"event: init\ndata: {json.dumps(init, ensure_ascii=False)}\n\n".encode("utf-8"))
             for item in snapshot["frames"]:
-                self.wfile.write(f"id: {item['seq']}\ndata: {json.dumps(item['frame'], ensure_ascii=False)}\n\n".encode("utf-8"))
+                event_line = f"event: {item['event']}\n" if item.get("event") else ""
+                self.wfile.write(
+                    f"id: {item['seq']}\n{event_line}data: {json.dumps(item['frame'], ensure_ascii=False)}\n\n".encode("utf-8")
+                )
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError):
             if registered:
@@ -1511,7 +1514,10 @@ class HandlerApiMixin:
                     break
                 if item["seq"] <= replay_latest:
                     continue
-                self.wfile.write(f"id: {item['seq']}\ndata: {json.dumps(item['frame'], ensure_ascii=False)}\n\n".encode("utf-8"))
+                event_line = f"event: {item['event']}\n" if item.get("event") else ""
+                self.wfile.write(
+                    f"id: {item['seq']}\n{event_line}data: {json.dumps(item['frame'], ensure_ascii=False)}\n\n".encode("utf-8")
+                )
                 if stream_debug:
                     logger.warning(
                         "session_stream http_write conn=%s sid=%s seq=%s qsize=%s",
@@ -1622,6 +1628,29 @@ class HandlerApiMixin:
             self._send_json_error(400, str(exc))
             return
         self._send_json_response(200, {"path": path, "session_id": session_id})
+
+    def _handle_session_execution_analysis(self, session_id: str) -> None:
+        """GET /v1/sessions/{session_id}/execution-analysis — 分析主/子会话执行耗时。"""
+        from runtime.execution_analysis import analyze_session_execution
+
+        session_manager = self.server.session_manager  # type: ignore[attr-defined]
+        try:
+            session_dir = session_manager.session_dir(session_id)
+            result = analyze_session_execution(
+                session_dir,
+                self.server.runtime,  # type: ignore[attr-defined]
+                getattr(self.server, "agent_manager", None),
+            )
+        except FileNotFoundError:
+            self._send_json_error(404, f"Session not found: {session_id}")
+            return
+        except ValueError as exc:
+            self._send_json_error(400, str(exc))
+            return
+        except OSError as exc:
+            self._send_json_error(500, f"Failed to analyze session: {exc}")
+            return
+        self._send_json_response(200, result)
 
     def _handle_session_flight(self, session_id: str) -> None:
         body = self._read_json_body()

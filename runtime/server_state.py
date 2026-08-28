@@ -41,6 +41,174 @@ from runtime.context_manager import ConversationTurn
 logger = logging.getLogger("runtime.server")
 
 
+def _safe_token_int(value) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _message_token_chars(message) -> int:
+    """Estimate token contribution using the requested one-character rule."""
+    total = len(getattr(message, "content", "") or "")
+    total += len(getattr(message, "thinking", "") or "")
+    tool_calls = getattr(message, "tool_calls", None)
+    if tool_calls:
+        try:
+            total += len(json.dumps(tool_calls, ensure_ascii=False))
+        except (TypeError, ValueError):
+            total += len(str(tool_calls))
+    return total
+
+
+class StreamUsageEstimator:
+    """Normalize provider usage and synthesize stats for interrupted rounds.
+
+    A provider-reported usage object is authoritative, including an explicit
+    0/0. When usage was not reported, estimate this round from the previous
+    normal inference plus newly observed input/output characters (1 char = 1
+    token), and mark the result with ``estimated=true``.
+    """
+
+    def __init__(self, context_manager=None, session_id=None, original_messages=None):
+        self._base_by_agent: dict[str, dict] = {}
+        self._pending_input_by_agent: dict[str, int] = {}
+        self._output_by_agent: dict[str, int] = {}
+        self._open_by_agent: dict[str, bool] = {}
+        self._error_by_agent: dict[str, bool] = {}
+        self._model_by_agent: dict[str, Optional[str]] = {}
+        self._default_input_chars = sum(
+            _message_token_chars(message) for message in (original_messages or [])
+        )
+
+        turns = []
+        if context_manager is not None and session_id:
+            try:
+                turns = context_manager.load_conversation(session_id)
+            except (FileNotFoundError, OSError, ValueError):
+                turns = []
+        for turn in turns:
+            if getattr(turn, "role", None) != "assistant":
+                continue
+            stat = getattr(turn, "stat", None)
+            if not isinstance(stat, dict) or stat.get("estimated") is True:
+                continue
+            if stat.get("usage_reported") is False:
+                continue
+            key = getattr(turn, "agent_id", None) or ""
+            self._base_by_agent[key] = stat
+
+    @staticmethod
+    def _agent_key(message) -> str:
+        return (
+            getattr(message, "agent_id", None)
+            or getattr(message, "assistant_id", None)
+            or ""
+        )
+
+    def _base(self, key: str) -> dict:
+        return self._base_by_agent.get(key) or self._base_by_agent.get("") or {}
+
+    def _ensure_agent(self, key: str) -> None:
+        self._pending_input_by_agent.setdefault(key, self._default_input_chars)
+        self._output_by_agent.setdefault(key, 0)
+        self._open_by_agent.setdefault(key, False)
+        self._error_by_agent.setdefault(key, False)
+
+    def _estimate(self, key: str, stat: Optional[dict] = None) -> dict:
+        source = dict(stat or {})
+        base = self._base(key)
+        prompt = _safe_token_int(base.get("prompt_tokens")) + self._pending_input_by_agent.get(key, 0)
+        completion = _safe_token_int(base.get("completion_tokens")) + self._output_by_agent.get(key, 0)
+        source.update({
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": prompt + completion,
+            "total_prompt_tokens": prompt,
+            "total_completion_tokens": completion,
+            "total_all_tokens": prompt + completion,
+            "estimated": True,
+            "usage_reported": False,
+        })
+        # Provider usage was absent, so cache counters are unknown even for
+        # protocols that normally report numeric cache fields.
+        source["cached_input_tokens"] = None
+        source["new_token_cache"] = None
+        source.pop("model_id", None)
+        return source
+
+    def observe(self, message) -> None:
+        """Mutate an unreported usage message into an estimate, if necessary."""
+        key = self._agent_key(message)
+        self._ensure_agent(key)
+        role = getattr(message, "role", None)
+        if role == "assistant":
+            self._open_by_agent[key] = True
+            content = getattr(message, "content", "") or ""
+            if content.startswith("Error:") or content.lstrip().startswith("Error:"):
+                self._error_by_agent[key] = True
+            else:
+                self._output_by_agent[key] += _message_token_chars(message)
+            return
+        if role == "tool":
+            self._pending_input_by_agent[key] = (
+                self._pending_input_by_agent.get(key, self._default_input_chars)
+                + _message_token_chars(message)
+            )
+            return
+        if role != "usage":
+            return
+
+        try:
+            stat = json.loads(getattr(message, "content", "") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            stat = {}
+        if stat.get("usage_reported") is False:
+            stat = self._estimate(key, stat)
+            message.content = json.dumps(stat, ensure_ascii=False)
+        else:
+            self._base_by_agent[key] = stat
+        if stat.get("model_id"):
+            self._model_by_agent[key] = stat.get("model_id")
+        self._pending_input_by_agent[key] = 0
+        self._output_by_agent[key] = 0
+        self._open_by_agent[key] = False
+        self._error_by_agent[key] = False
+
+    def terminal_usage_messages(self, default_model_id: Optional[str] = None) -> list:
+        """Return synthetic usage messages for error rounds that never closed."""
+        from runtime.models import Message
+        from runtime.common import now_iso
+
+        messages = []
+        for key, is_open in list(self._open_by_agent.items()):
+            if not is_open or not self._error_by_agent.get(key):
+                continue
+            stat = self._estimate(key)
+            stat["completed_at"] = now_iso()
+            usage = Message(
+                role="usage",
+                name="round",
+                timestamp=now_iso(),
+                agent_id=key or None,
+                content=json.dumps(stat, ensure_ascii=False),
+            )
+            # The estimate is already normalized. Close the local round state
+            # directly instead of feeding it through observe() again (which
+            # would intentionally re-estimate usage_reported=false payloads).
+            self._pending_input_by_agent[key] = 0
+            self._output_by_agent[key] = 0
+            self._open_by_agent[key] = False
+            self._error_by_agent[key] = False
+            normalized = json.loads(usage.content)
+            model_id = self._model_by_agent.get(key) or default_model_id
+            if model_id:
+                normalized["model_id"] = model_id
+            usage.content = json.dumps(normalized, ensure_ascii=False)
+            messages.append(usage)
+        return messages
+
+
 # ---------------------------------------------------------------------------
 # Conversation formatting helpers
 # ---------------------------------------------------------------------------
@@ -112,6 +280,9 @@ def _merge_single_agent_stream_messages(
         if m.role == "usage":
             try:
                 current_stat = _json.loads(m.content)
+                usage_agent_id = getattr(m, "agent_id", None) or getattr(m, "assistant_id", None)
+                if usage_agent_id and not current_agent_id:
+                    current_agent_id = usage_agent_id
                 last_stat = current_stat
             except (ValueError, AttributeError):
                 pass
@@ -176,6 +347,7 @@ def _merge_single_agent_stream_messages(
                 tool_id=getattr(m, "tool_id", None),
                 tool_use_id=getattr(m, "tool_use_id", None),
                 agent_id=getattr(m, "agent_id", None),
+                started_at=getattr(m, "started_at", None),
             ))
         # skip system deltas
 
@@ -274,6 +446,78 @@ def merge_stream_messages(stream_messages: list) -> tuple[list, Optional[dict]]:
     return turns, last_stat
 
 
+def stream_batch_is_protocol_complete(messages: list) -> bool:
+    """Return whether an incremental stream slice is safe to persist.
+
+    A plain assistant round is complete when its usage frame arrives.  An
+    assistant tool-call declaration is only complete after every declared call
+    has a matching tool result.  Multi-agent slices are checked independently
+    so one agent cannot cause another agent's partial round to be written.
+    """
+    agent_order: list[str] = []
+    by_agent: dict[str, list] = {}
+    unscoped: list = []
+    for message in messages:
+        agent_id = (
+            getattr(message, "agent_id", None)
+            or getattr(message, "assistant_id", None)
+        )
+        if agent_id:
+            if agent_id not in by_agent:
+                by_agent[agent_id] = []
+                agent_order.append(agent_id)
+            by_agent[agent_id].append(message)
+        else:
+            unscoped.append(message)
+
+    if len(agent_order) > 1:
+        return (
+            all(
+                any(message.role == "usage" for message in by_agent[aid])
+                and stream_batch_is_protocol_complete(by_agent[aid])
+                for aid in agent_order
+            )
+            and (
+                not unscoped
+                or stream_batch_is_protocol_complete(unscoped)
+            )
+        )
+
+    turns, _ = merge_stream_messages(messages)
+    pending: list[tuple[Optional[str], Optional[str]]] = []
+    for turn in turns:
+        if turn.role == "assistant" and turn.tool_calls:
+            if pending:
+                return False
+            pending = [
+                (call.get("id") or call.get("tool_use_id"), call.get("name"))
+                for call in turn.tool_calls
+            ]
+            if any(not call_id or not name for call_id, name in pending):
+                return False
+        elif turn.role == "tool":
+            if not pending:
+                return False
+            tool_use_id = turn.tool_use_id
+            match_index = next(
+                (
+                    i for i, (call_id, _) in enumerate(pending)
+                    if tool_use_id and call_id == tool_use_id
+                ),
+                None,
+            )
+            if match_index is None and not tool_use_id:
+                match_index = next(
+                    (i for i, (_, name) in enumerate(pending) if name == turn.name),
+                    0,
+                )
+            if match_index is None:
+                return False
+            pending.pop(match_index)
+
+    return not pending
+
+
 def persist_conversation(
     context_manager: "ContextManager",
     session_id: str,
@@ -342,6 +586,7 @@ def persist_conversation(
                 tool_id=getattr(m, "tool_id", None),
                 tool_use_id=getattr(m, "tool_use_id", None),
                 mentions=getattr(m, "mentions", None),
+                started_at=getattr(m, "started_at", None),
             ))
         merged_turns, last_stat = merge_stream_messages(collected_messages)
         # 如果有 agent_ids，为所有 role=assistant 的消息设置 name（nickname）和 agent_id 字段
@@ -358,10 +603,19 @@ def persist_conversation(
                     # Tool messages inherit agent_id from the assistant that called them
                     turn.agent_id = primary_agent_id
         new_turns.extend(merged_turns)
-        last_total_tokens = (
-            (last_stat.get("prompt_tokens", 0) + last_stat.get("completion_tokens", 0))
-            if last_stat else None
-        ) or None
+        last_total_tokens = None
+        if last_stat:
+            last_total_tokens = _safe_token_int(last_stat.get("total_tokens"))
+            if not last_total_tokens:
+                last_total_tokens = (
+                    _safe_token_int(last_stat.get("prompt_tokens"))
+                    + _safe_token_int(last_stat.get("completion_tokens"))
+                )
+            # Preserve an explicit provider-reported 0/0, but never manufacture
+            # 0/0 merely because usage was absent. Unreported rounds are
+            # converted to estimates by StreamUsageEstimator before persistence.
+            if last_total_tokens == 0 and last_stat.get("usage_reported") is False:
+                last_total_tokens = None
         merged_extra: Optional[dict] = None
         if tool_ids is not None or extra_meta or model_id or agent_ids or workspace:
             merged_extra = {}
@@ -403,6 +657,131 @@ def persist_conversation(
     except Exception as exc:
         return exc
     return None
+
+
+class IncrementalConversationPersister:
+    """Shared state machine for safely persisting an inference stream.
+
+    The HTTP inference handler and nested agent tools all use the same three
+    phases: pre-persist the input messages, append protocol-complete streamed
+    batches without compression, then persist the remaining tail and perform
+    the one final compression/title update.
+    """
+
+    def __init__(
+        self,
+        *,
+        context_manager,
+        session_id: Optional[str],
+        original_messages: Optional[list] = None,
+        session_manager=None,
+        tool_ids: Optional[list] = None,
+        extra_meta: Optional[dict] = None,
+        agent_ids: Optional[list] = None,
+        agent_nickname: Optional[str] = None,
+        model_id: Optional[str] = None,
+        workspace: Optional[str] = None,
+        is_active: Optional[Callable[[], bool]] = None,
+        on_incremental_persist: Optional[Callable[[], None]] = None,
+    ):
+        self.context_manager = context_manager
+        self.session_id = session_id
+        self.original_messages = list(original_messages or [])
+        self.session_manager = session_manager
+        self.tool_ids = tool_ids
+        self.extra_meta = extra_meta
+        self.agent_ids = agent_ids
+        self.agent_nickname = agent_nickname
+        self.model_id = model_id
+        self.workspace = workspace
+        self.is_active = is_active
+        self.on_incremental_persist = on_incremental_persist
+        self.persisted_until = 0
+        self._original_persisted = not self.original_messages
+        self._disabled = context_manager is None or session_id is None
+
+    def _active(self) -> bool:
+        return not self._disabled and (
+            self.is_active is None or self.is_active()
+        )
+
+    def _persist(
+        self,
+        original_messages: list,
+        collected_messages: list,
+        *,
+        compress: bool,
+        update_title: bool,
+    ) -> Optional[Exception]:
+        return persist_conversation(
+            context_manager=self.context_manager,
+            session_id=self.session_id,
+            original_messages=original_messages,
+            collected_messages=collected_messages,
+            session_manager=self.session_manager,
+            tool_ids=self.tool_ids,
+            extra_meta=self.extra_meta,
+            agent_ids=self.agent_ids,
+            agent_nickname=self.agent_nickname,
+            model_id=self.model_id,
+            workspace=self.workspace,
+            compress=compress,
+            update_title=update_title,
+        )
+
+    def pre_persist(self) -> Optional[Exception]:
+        """Persist input messages so the conversation exists before inference."""
+        if self._original_persisted or not self._active():
+            return None
+        exc = self._persist(
+            self.original_messages, [], compress=False, update_title=False,
+        )
+        if exc is None:
+            self._original_persisted = True
+        return exc
+
+    def persist_completed(self, collected_messages: list) -> Optional[Exception]:
+        """Append the pending slice if it is a complete protocol batch."""
+        if not self._active():
+            self.persisted_until = len(collected_messages)
+            return None
+        new_messages = collected_messages[self.persisted_until:]
+        if not new_messages or not stream_batch_is_protocol_complete(new_messages):
+            return None
+        originals = [] if self._original_persisted else self.original_messages
+        exc = self._persist(
+            originals, new_messages, compress=False, update_title=False,
+        )
+        if exc is None:
+            self._original_persisted = True
+            self.persisted_until = len(collected_messages)
+            if self.on_incremental_persist is not None:
+                self.on_incremental_persist()
+        return exc
+
+    def finalize(
+        self,
+        collected_messages: list,
+        *,
+        compress: bool = True,
+        update_title: bool = True,
+    ) -> Optional[Exception]:
+        """Persist the remaining tail and perform final compression/update."""
+        if not self._active():
+            self.persisted_until = len(collected_messages)
+            return None
+        originals = [] if self._original_persisted else self.original_messages
+        remaining = collected_messages[self.persisted_until:]
+        exc = self._persist(
+            originals,
+            remaining,
+            compress=compress,
+            update_title=update_title,
+        )
+        if exc is None:
+            self._original_persisted = True
+            self.persisted_until = len(collected_messages)
+        return exc
 
 
 
@@ -495,7 +874,10 @@ def _cancel_unobserved_stream_locked(session_id: str, stream: dict) -> bool:
 
 
 def begin_session_stream(session_id: str, cancel_event=None) -> None:
+    """Start a new inference generation and retire any previous broker."""
     with _session_stream_lock:
+        previous = _session_streams.get(session_id)
+        previous_subscribers = list(previous["subscribers"]) if previous else []
         _session_streams[session_id] = {
             "next_seq": 1,
             "persisted_seq": 0,
@@ -505,19 +887,44 @@ def begin_session_stream(session_id: str, cancel_event=None) -> None:
             "cancel_event": cancel_event,
             "done": False,
         }
+    # Wake retained GET handlers attached to the retired generation. Their UI
+    # observes the authoritative streaming status and reconnects to this broker.
+    for send_fn in previous_subscribers:
+        try:
+            send_fn(None)
+        except Exception:
+            pass
 
 
-def publish_session_stream_frame(session_id: Optional[str], frame: dict) -> int:
+def publish_session_stream_frame(
+    session_id: Optional[str],
+    frame: dict,
+    owner_event=None,
+    event: Optional[str] = None,
+) -> Optional[int]:
+    """Publish a retained frame for the current inference generation.
+
+    ``session_id`` can be reused immediately after a force-abort. In that case
+    the old handler may still unwind while the replacement inference is already
+    producing output. ``owner_event`` prevents that stale handler from
+    publishing into the replacement stream's broker.
+    """
     if not session_id:
         return 0
     with _session_stream_lock:
         stream = _session_streams.get(session_id)
         if stream is None:
-            begin_session_stream(session_id)
+            begin_session_stream(session_id, owner_event)
             stream = _session_streams[session_id]
+        elif owner_event is not None and stream.get("cancel_event") is not owner_event:
+            return None
         seq = stream["next_seq"]
         stream["next_seq"] += 1
-        envelope = {"seq": seq, "frame": frame}
+        envelope = {
+            "seq": seq,
+            "event": event,
+            "frame": frame,
+        }
         stream["frames"].append(envelope)
         subscribers = list(stream["subscribers"])
         if _session_stream_debug_enabled():
@@ -549,18 +956,25 @@ def publish_session_stream_frame(session_id: Optional[str], frame: dict) -> int:
     return seq
 
 
-def mark_session_stream_persisted(session_id: str, seq: int) -> None:
-    with _session_stream_lock:
-        stream = _session_streams.get(session_id)
-        if stream is not None:
-            stream["persisted_seq"] = max(stream["persisted_seq"], seq)
-
-
-def finish_session_stream(session_id: str) -> None:
+def mark_session_stream_persisted(session_id: str, seq: int, owner_event=None) -> bool:
     with _session_stream_lock:
         stream = _session_streams.get(session_id)
         if stream is None:
-            return
+            return False
+        if owner_event is not None and stream.get("cancel_event") is not owner_event:
+            return False
+        stream["persisted_seq"] = max(stream["persisted_seq"], seq)
+        return True
+
+
+def finish_session_stream(session_id: str, owner_event=None) -> bool:
+    """Finish only the broker generation owned by ``owner_event``."""
+    with _session_stream_lock:
+        stream = _session_streams.get(session_id)
+        if stream is None:
+            return False
+        if owner_event is not None and stream.get("cancel_event") is not owner_event:
+            return False
         stream["done"] = True
         subscribers = list(stream["subscribers"])
     for send_fn in subscribers:
@@ -568,6 +982,35 @@ def finish_session_stream(session_id: str) -> None:
             send_fn(None)
         except Exception:
             pass
+    return True
+
+
+def transition_session_stream_status(
+    session_id: str,
+    owner_event,
+    status: str,
+) -> bool:
+    """Set/broadcast status only for the current inference generation.
+
+    The stream-owner check, state mutation and event enqueue are serialized
+    against ``begin_session_stream``. This guarantees that an old request cannot
+    broadcast ``done_error_unread`` after a newer request for the same session
+    has already announced ``streaming``.
+    """
+    with _session_stream_lock:
+        stream = _session_streams.get(session_id)
+        if stream is None or stream.get("cancel_event") is not owner_event:
+            return False
+        with _session_state_lock:
+            _session_statuses[session_id] = status
+            if status in {"done_success_unread", "done_error_unread"}:
+                _unread_sessions[session_id] = status
+            else:
+                _unread_sessions.pop(session_id, None)
+        # Keep the stream-generation lock through enqueueing. A replacement
+        # begin/status transition therefore always appears after this event.
+        _broadcast_session_status(session_id, status)
+        return True
 
 
 def get_session_stream_snapshot(session_id: str, after_seq: int = -1) -> dict:
@@ -607,11 +1050,17 @@ def unsubscribe_session_stream(session_id: str, send_fn) -> None:
             _cancel_unobserved_stream_locked(session_id, stream)
 
 
-def disconnect_session_stream_starter(session_id: str) -> bool:
-    """Mark the inference-starting browser connection as disconnected."""
+def disconnect_session_stream_starter(session_id: str, owner_event=None) -> bool:
+    """Mark the inference-starting browser connection as disconnected.
+
+    A stale POST connection must not disconnect the starter belonging to a
+    replacement inference for the same session.
+    """
     with _session_stream_lock:
         stream = _session_streams.get(session_id)
         if stream is None:
+            return False
+        if owner_event is not None and stream.get("cancel_event") is not owner_event:
             return False
         stream["starter_connected"] = False
         return _cancel_unobserved_stream_locked(session_id, stream)

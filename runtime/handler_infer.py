@@ -17,22 +17,24 @@ from typing import Optional
 from runtime.common import (
     clear_request_context,
     get_request_context,
+    now_iso,
     set_request_context,
 )
+from runtime.builtin_tools_coding import _FileJournalManagerHolder
 from runtime.models import InferenceRequest, Message, ModelConfig
 from runtime.server_state import (
-    _broadcast_session_status,
-    _session_state_lock,
-    _session_statuses,
-    _unread_sessions,
     begin_session_stream,
     disconnect_session_stream_starter,
     finish_session_stream,
     get_terminal_for_session,
+    IncrementalConversationPersister,
     mark_session_stream_persisted,
     merge_stream_messages,
     publish_session_stream_frame,
     persist_conversation,
+    stream_batch_is_protocol_complete,
+    StreamUsageEstimator,
+    transition_session_stream_status,
 )
 
 logger = logging.getLogger("runtime.server")
@@ -56,87 +58,7 @@ def _add_exec_cli_for_open_terminal(
     return [*tool_ids, "exec_cli"]
 
 
-def _stream_batch_is_protocol_complete(messages: list[Message]) -> bool:
-    """Return whether an incremental stream slice is safe to persist.
-
-    A ``usage`` frame closes the provider's assistant response, but an
-    assistant response containing tool calls is not yet a complete conversation
-    segment.  Persisting it at that point creates a dangling assistant(tool_calls)
-    turn.  The next incremental write then quite correctly prunes that dangling
-    turn, after which the newly arrived tool result is orphaned and pruned too.
-
-    In group chat, one agent can reach ``usage`` while another agent still has
-    an open text response.  The raw slice must therefore be complete for every
-    independently running agent; otherwise persisting the other agent's partial
-    buffer splits one inference loop into several stored assistant messages.
-
-    Plain-text assistant rounds are complete at ``usage``.  Tool-call rounds are
-    complete only after every declared call has a matching tool result.
-    """
-    agent_order: list[str] = []
-    by_agent: dict[str, list[Message]] = {}
-    unscoped: list[Message] = []
-    for message in messages:
-        agent_id = (
-            getattr(message, "agent_id", None)
-            or getattr(message, "assistant_id", None)
-        )
-        if agent_id:
-            if agent_id not in by_agent:
-                by_agent[agent_id] = []
-                agent_order.append(agent_id)
-            by_agent[agent_id].append(message)
-        else:
-            unscoped.append(message)
-
-    if len(agent_order) > 1:
-        # Current group-chat producers tag assistant, usage and formal tool
-        # messages.  Validate every concurrent inference loop independently so
-        # one fast agent cannot cause another agent's partial output to be saved.
-        return (
-            all(
-                any(message.role == "usage" for message in by_agent[aid])
-                and _stream_batch_is_protocol_complete(by_agent[aid])
-                for aid in agent_order
-            )
-            and (not unscoped or _stream_batch_is_protocol_complete(unscoped))
-        )
-
-    turns, _ = merge_stream_messages(messages)
-    pending: list[tuple[Optional[str], Optional[str]]] = []
-
-    for turn in turns:
-        if turn.role == "assistant" and turn.tool_calls:
-            # A new assistant tool-call declaration cannot begin while the
-            # previous declaration is still waiting for results.
-            if pending:
-                return False
-            pending = [
-                (call.get("id") or call.get("tool_use_id"), call.get("name"))
-                for call in turn.tool_calls
-            ]
-            if any(not call_id or not name for call_id, name in pending):
-                return False
-        elif turn.role == "tool":
-            if not pending:
-                return False
-            tool_use_id = turn.tool_use_id
-            match_index = next(
-                (i for i, (call_id, _) in enumerate(pending) if tool_use_id and call_id == tool_use_id),
-                None,
-            )
-            # Backward-compatible fallback for providers/tools that omit the
-            # result ID: match by tool name, then declaration order.
-            if match_index is None and not tool_use_id:
-                match_index = next(
-                    (i for i, (_, name) in enumerate(pending) if name == turn.name),
-                    0,
-                )
-            if match_index is None:
-                return False
-            pending.pop(match_index)
-
-    return not pending
+_stream_batch_is_protocol_complete = stream_batch_is_protocol_complete
 
 
 class HandlerInferMixin:
@@ -302,6 +224,7 @@ class HandlerInferMixin:
                     )
 
         # === Retry validation ===
+        continued_user_message_timestamp = None
         if is_continue:
             if raw_session_id in (None, "new"):
                 self._send_json_error(400, "continue requires an existing session_id")
@@ -328,6 +251,17 @@ class HandlerInferMixin:
                 turns = context_manager.load_conversation(session_id)
                 if turns and turns[-1].role == "assistant":
                     removed_message = turns[-1]
+                # Continue retries the same user turn, so all file operations
+                # must retain that turn's journal key rather than falling back
+                # to the current retry/tool execution time.
+                continued_user_message_timestamp = next(
+                    (
+                        turn.timestamp
+                        for turn in reversed(turns)
+                        if turn.role == "user" and turn.timestamp
+                    ),
+                    None,
+                )
                 removed = context_manager.remove_trailing_assistant_message(session_id)
             except (OSError, ValueError) as exc:
                 self._send_json_error(
@@ -352,8 +286,8 @@ class HandlerInferMixin:
 
         original_messages = None
         user_message_timestamp = None
+        timestamp_fallback_used = False
         if "messages" in body and not is_continue:
-            from runtime.common import now_iso
             from runtime.workspace_manager import expand_workspace_file_refs
             from runtime.common import get_workspace as _get_ws
             now_ts = now_iso()
@@ -375,8 +309,17 @@ class HandlerInferMixin:
                 self._send_json_error(400, str(exc))
                 return None
         elif is_continue:
-            # 继续推理：不携带新用户消息，基于会话既有上下文推理
+            # 继续推理：不携带新用户消息，基于会话既有上下文推理。
+            # File journals still belong to the existing initiating user turn.
             original_messages = []
+            user_message_timestamp = continued_user_message_timestamp
+
+        # Establish one stable request-level fallback before any model/tool
+        # worker starts. This is a last resort for malformed/history-less input;
+        # normal messages and Continue both use a real user-turn timestamp.
+        if user_message_timestamp is None:
+            user_message_timestamp = now_iso()
+            timestamp_fallback_used = True
 
         assembled_messages = original_messages
         if use_session and session_id is not None:
@@ -494,6 +437,9 @@ class HandlerInferMixin:
             session_id=session_id,
             session_dir=session_dir,
             user_message_timestamp=user_message_timestamp,
+            user_message_timestamp_fallback_used=timestamp_fallback_used,
+            file_journal_holder=_FileJournalManagerHolder(),
+            file_journal_manager=None,
             depth=0,
             tool_scope=tool_scope,
             available_tool_ids=tool_ids,
@@ -512,11 +458,13 @@ class HandlerInferMixin:
 
     def _finalize_file_journal(self) -> None:
         """Best-effort turn-level reconciliation of registered file changes."""
+        journal_holder = get_request_context("file_journal_holder")
         file_journal_manager = get_request_context("file_journal_manager")
-        if file_journal_manager is None:
+        target = journal_holder or file_journal_manager
+        if target is None:
             return
         try:
-            file_journal_manager.flush()
+            target.flush()
         except Exception as flush_err:
             logger.warning("Error finalizing file journal: %s", flush_err)
 
@@ -526,12 +474,13 @@ class HandlerInferMixin:
 
         clear_request_context([
             "sse_callback", "cancel_event", "session_id", "session_dir",
-            "user_message_timestamp", "depth", "tool_scope",
-            "available_tool_ids",
+            "user_message_timestamp", "user_message_timestamp_fallback_used",
+            "depth", "tool_scope", "available_tool_ids",
             "context_manager", "session_manager", "agent_manager", "workspace",
             "agent_id", "agent_ids", "all_agent_ids", "mentioned_agent_ids",
-            "file_journal_session_id", "file_journal_session_dir",
-            "file_journal_user_message_timestamp",
+            "file_journal_holder", "file_journal_session_id",
+            "file_journal_session_dir", "file_journal_user_message_timestamp",
+            "file_journal_timestamp_fallback_used",
         ])
 
     def _persist_conversation(self, context_manager, session_id, original_messages, collected_messages, agent_ids=None, agent_nickname=None, model_id=None, tool_ids=None, workspace=None, compress=True, update_title=True):
@@ -688,7 +637,9 @@ class HandlerInferMixin:
 
         # === 前置发送 Session Init 消息 ===
         # 从 original_messages 中提取用户消息时间戳（已在 _prepare_infer_request 中注入）
-        user_message_ts = None
+        # Continue has no new user message, but still exposes the stable existing
+        # user-turn timestamp selected during preparation.
+        user_message_ts = get_request_context("user_message_timestamp")
         has_system_prompt = False
         if original_messages:
             if original_messages[0].role == "system":
@@ -709,7 +660,7 @@ class HandlerInferMixin:
                 pass
         if session and session.get("title"):
             session_title = session["title"]
-        elif user_message_ts:
+        elif user_message_ts and original_messages:
             # 从 original_messages 中提取第一条用户消息内容作为预览标题
             for m in original_messages:
                 if m.role == "user":
@@ -762,7 +713,11 @@ class HandlerInferMixin:
                     "removed_timestamp": _body.get("_removed_trailing_assistant_timestamp"),
                     "removed_agent_id": _body.get("_removed_trailing_assistant_agent_id"),
                 }
-                latest_stream_seq = publish_session_stream_frame(session_id, remove_frame)
+                published_seq = publish_session_stream_frame(
+                    session_id, remove_frame, owner_event=cancel_event,
+                )
+                if published_seq is not None:
+                    latest_stream_seq = published_seq
             # The initiating browser renders the submitted user turn from the
             # POST stream's init event, but other browsers only consume the
             # retained session stream. Publish the user turn into that broker
@@ -781,7 +736,11 @@ class HandlerInferMixin:
                     user_frame["timestamp"] = user_message_ts
                 if mentioned_for_init and not user_frame.get("mentions"):
                     user_frame["mentions"] = mentioned_for_init
-                latest_stream_seq = publish_session_stream_frame(session_id, user_frame)
+                published_seq = publish_session_stream_frame(
+                    session_id, user_frame, owner_event=cancel_event,
+                )
+                if published_seq is not None:
+                    latest_stream_seq = published_seq
 
         # The starter consumes the same retained sequence space as every GET
         # subscriber. Expose the baseline before the first mirrored frame so it
@@ -801,21 +760,30 @@ class HandlerInferMixin:
             if not client_connected:
                 return
             client_connected = False
-            cancelled = bool(session_id) and disconnect_session_stream_starter(session_id)
+            cancelled = bool(session_id) and disconnect_session_stream_starter(
+                session_id, owner_event=cancel_event,
+            )
             logger.warning(
                 "infer_stream: starter SSE disconnected%s: %s: %s",
                 "; cancelling unobserved non-flight inference" if cancelled else "",
                 type(exc).__name__, exc,
             )
 
-        def _sse_write(frame: dict) -> bool:
+        def _sse_write(frame: dict, event: Optional[str] = None) -> bool:
             """Publish once, then best-effort mirror to the starter browser.
 
             Losing the starter cancels a non-flight inference only when no other
             browser has opened and is still subscribed to this session.
             """
             nonlocal latest_stream_seq
-            latest_stream_seq = publish_session_stream_frame(session_id, frame)
+            published_seq = publish_session_stream_frame(
+                session_id, frame, owner_event=cancel_event, event=event,
+            )
+            if published_seq is None:
+                # This handler has been superseded by a newer inference for the
+                # same session. Never leak old tail frames into the new broker.
+                return False
+            latest_stream_seq = published_seq
             if not client_connected:
                 return True
             try:
@@ -826,7 +794,10 @@ class HandlerInferMixin:
                         frame.get("streaming"), frame.get("tool_use_id"),
                     )
                 event_data = json.dumps(frame, ensure_ascii=False)
-                _write_sse_payload(f"id: {latest_stream_seq}\ndata: {event_data}\n\n".encode("utf-8"))
+                event_line = f"event: {event}\n" if event else ""
+                _write_sse_payload(
+                    f"id: {latest_stream_seq}\n{event_line}data: {event_data}\n\n".encode("utf-8")
+                )
                 if stream_debug:
                     logger.warning(
                         "session_stream starter_write_end sid=%s seq=%s",
@@ -854,27 +825,37 @@ class HandlerInferMixin:
 
         # --- Session Status Stream: broadcast "streaming" ---
         if session_id is not None:
-            with _session_state_lock:
-                _session_statuses[session_id] = "streaming"
-                _unread_sessions.pop(session_id, None)
-            _broadcast_session_status(session_id, "streaming")
+            transition_session_stream_status(session_id, cancel_event, "streaming")
 
-        # --- Pre-inference persistence: save user message so conversation.json exists ---
-        # 继续推理（continue）不携带新用户消息，跳过 pre-persist（空写 + 避免意外触发压缩）
+        usage_estimator = StreamUsageEstimator(
+            context_manager=context_manager if use_session else None,
+            session_id=session_id if use_session else None,
+            original_messages=original_messages,
+        )
+        conversation_persister = IncrementalConversationPersister(
+            context_manager=context_manager,
+            session_id=session_id if use_session else None,
+            original_messages=original_messages,
+            session_manager=self.server.session_manager,  # type: ignore[attr-defined]
+            agent_ids=agent_ids,
+            agent_nickname=agent_nickname,
+            model_id=model_id,
+            tool_ids=tool_ids,
+            workspace=workspace,
+            is_active=lambda: self._is_active_stream(session_id, cancel_event),
+            on_incremental_persist=lambda: mark_session_stream_persisted(
+                session_id, latest_stream_seq, owner_event=cancel_event,
+            ) if session_id is not None else None,
+        )
+
+        # Save the input turn before inference so conversation.json exists.
+        # Continue requests have no original messages, making this a no-op.
         if use_session and original_messages:
-            pre_exc = self._persist_conversation(
-                context_manager, session_id, original_messages, [],
-                agent_ids, agent_nickname, model_id, tool_ids, workspace,
-                compress=False, update_title=False,
-            )
+            pre_exc = conversation_persister.pre_persist()
             if pre_exc is not None:
                 logger.error("infer_stream: failed to pre-persist conversation for session %s: %s", session_id, pre_exc)
 
         try:
-            # 已增量持久化的 collected_messages 条数。推理过程中每完成一轮
-            # 工具调用就落盘一次，进程被中断时最多丢失最后一轮。
-            persisted_until = 0
-
             # === Group chat routing ===
             mentioned_agent_ids = get_request_context("mentioned_agent_ids") or []
             is_group_chat = len(agent_ids) > 1
@@ -887,37 +868,12 @@ class HandlerInferMixin:
                 合并，保证 conversation.json 中不会出现孤立 tool_calls。
                 compress=False：推理过程中不触发 LLM 摘要压缩（最终持久化才做）。
                 """
-                nonlocal persisted_until
-                if not use_session or session_id is None:
-                    persisted_until = len(collected_messages)
-                    return
-                if not self._is_active_stream(session_id, cancel_event):
-                    # 已被新请求接管：不再落盘，避免覆盖更新的会话状态
-                    persisted_until = len(collected_messages)
-                    return
-                new_msgs = collected_messages[persisted_until:]
-                if not new_msgs:
-                    return
-                if not _stream_batch_is_protocol_complete(new_msgs):
-                    # A usage frame may have closed an assistant tool-call
-                    # declaration, but the declaration and all of its tool
-                    # results must be persisted atomically.  Keep the whole
-                    # slice pending until the final matching tool result arrives.
-                    return
-                exc = self._persist_conversation(
-                    context_manager, session_id, [], new_msgs,
-                    agent_ids, agent_nickname, model_id, tool_ids, workspace,
-                    compress=False, update_title=False,
-                )
+                exc = conversation_persister.persist_completed(collected_messages)
                 if exc is not None:
                     logger.error(
                         "infer_stream: incremental persist failed for session %s: %s",
                         session_id, exc,
                     )
-                else:
-                    persisted_until = len(collected_messages)
-                    if session_id is not None:
-                        mark_session_stream_persisted(session_id, latest_stream_seq)
 
             # === 统一消息源 ===
             if is_group_chat:
@@ -941,8 +897,22 @@ class HandlerInferMixin:
                 msg_gen = runtime.infer_stream(request, cancel_event=cancel_event)
 
             for msg in msg_gen:
+                # Agent identity is attached by group-chat workers. In the
+                # single-agent path attach it before usage estimation so the
+                # estimator can find that agent's previous normal stat.
+                if not is_group_chat and agent_ids and not getattr(msg, "agent_id", None):
+                    msg.agent_id = agent_ids[0]
+                usage_estimator.observe(msg)
                 collected_messages.append(msg)
                 # 单聊：手工设置 agent_id/name（群聊的 _run_one_gen 已设好）
+                if msg.role == "usage" and not is_group_chat:
+                    msg.agent_id = getattr(msg, "agent_id", None) or (agent_ids[0] if agent_ids else None)
+                    try:
+                        usage_stat = json.loads(msg.content)
+                        usage_stat["model_id"] = request.model_id
+                        msg.content = json.dumps(usage_stat, ensure_ascii=False)
+                    except (TypeError, ValueError, AttributeError):
+                        pass
                 if msg.role == "assistant" and not is_group_chat and agent_ids:
                     msg.agent_id = agent_ids[0]
                     if agent_nickname:
@@ -951,7 +921,18 @@ class HandlerInferMixin:
                 #   usage 消息 → assistant 一轮结束（纯文本回复或 tool_calls 声明），
                 #               merge_stream_messages 已将其 flush 为一个完整 turn
                 #   tool 消息  → 工具调用结果配对完成 → 立即落盘
-                _sse_write(msg.to_dict())
+                if msg.role == "usage":
+                    try:
+                        usage_payload = json.loads(msg.content)
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        usage_payload = {}
+                    if msg.agent_id is not None:
+                        usage_payload["agent_id"] = msg.agent_id
+                    if msg.name is not None:
+                        usage_payload["name"] = msg.name
+                    _sse_write(usage_payload, event="usage")
+                else:
+                    _sse_write(msg.to_dict())
                 if msg.role in ("usage", "tool"):
                     _incremental_persist()
                 if msg.role == "assistant" and msg.content and msg.content.startswith("Error:"):
@@ -959,6 +940,25 @@ class HandlerInferMixin:
                     logger.error("infer_stream error event | model=%s %s", model_id_for_log, msg.content)
 
             # 【已移除】尾部发送 session_id 的逻辑，已在第一条消息中发送
+
+            # A model-side failure can terminate after emitting partial output
+            # but before provider usage arrives. Close that error round with an
+            # estimated usage event so the UI, persistence and summary trigger
+            # all observe the same non-zero statistic.
+            for usage_msg in usage_estimator.terminal_usage_messages(request.model_id):
+                collected_messages.append(usage_msg)
+                usage_payload = json.loads(usage_msg.content)
+                if usage_msg.agent_id is not None:
+                    usage_payload["agent_id"] = usage_msg.agent_id
+                _sse_write(usage_payload, event="usage")
+                _incremental_persist()
+
+            # The generator can finish after this request has been replaced by a
+            # newer inference for the same session. Do not send the old POST's
+            # [DONE] before checking generation ownership: ChatPage would treat
+            # that as completion even though the replacement is still running.
+            if session_id is not None and not self._is_active_stream(session_id, cancel_event):
+                return
 
             # Reconcile file snapshots before announcing completion so a
             # client fetching the journal immediately after [DONE] sees the
@@ -970,50 +970,52 @@ class HandlerInferMixin:
                 except Exception:
                     client_connected = False
 
+            # Check the terminal outcome before final persistence.  Failed or
+            # interrupted inference must still append its assistant error turn,
+            # but must not trigger title generation as if the round completed
+            # successfully.
+            has_error = any(
+                m.role == "assistant" and m.content and m.content.startswith("Error:")
+                for m in collected_messages
+            )
             if use_session and self._is_active_stream(session_id, cancel_event):
-                # original_messages already saved in pre-inference step, pass [] to avoid duplication.
-                # 只持久化增量部分（增量持久化已写入的轮次不重复追加）。
-                persist_exc = self._persist_conversation(context_manager, session_id, [], collected_messages[persisted_until:], agent_ids, agent_nickname, model_id, tool_ids, workspace)
+                persist_exc = conversation_persister.finalize(
+                    collected_messages,
+                    update_title=not has_error,
+                )
                 if persist_exc is not None:
                     logger.error("infer_stream: failed to save conversation for session %s: %s", session_id, persist_exc)
 
-            # --- Session Status Stream: broadcast "done_success_unread" or "done_error_unread" ---
+            # --- Session Status Stream: broadcast the terminal outcome ---
             if session_id is not None:
-                # Check if any collected message indicates an error
-                has_error = any(
-                    m.role == "assistant" and m.content and m.content.startswith("Error:")
-                    for m in collected_messages
-                )
                 status = "done_error_unread" if has_error else "done_success_unread"
-                with _session_state_lock:
-                    _session_statuses[session_id] = status
-                    _unread_sessions[session_id] = status
-                _broadcast_session_status(session_id, status)
+                transition_session_stream_status(session_id, cancel_event, status)
         except (BrokenPipeError, ConnectionResetError):
             cancel_event.set()
             if use_session and self._is_active_stream(session_id, cancel_event):
                 from runtime.common import now_iso
                 collected_messages.append(Message(role="assistant", timestamp=now_iso(), content="\n\nError: user interrupted."))
-                # original_messages already saved in pre-inference step, pass [] to avoid duplication.
-                # 只持久化增量部分（增量持久化已写入的轮次不重复追加）。
-                persist_exc = self._persist_conversation(context_manager, session_id, [], collected_messages[persisted_until:], agent_ids, agent_nickname, model_id, tool_ids, workspace)
+                persist_exc = conversation_persister.finalize(
+                    collected_messages,
+                    update_title=False,
+                )
                 if persist_exc is not None:
                     logger.error("infer_stream: failed to save aborted conversation for session %s: %s", session_id, persist_exc)
             elif use_session:
                 logger.info("infer_stream: skipped stale persist for session %s (BrokenPipe)", session_id)
             # --- Session Status Stream: broadcast "done_error_unread" ---
             if session_id is not None:
-                with _session_state_lock:
-                    _session_statuses[session_id] = "done_error_unread"
-                    _unread_sessions[session_id] = "done_error_unread"
-                _broadcast_session_status(session_id, "done_error_unread")
+                transition_session_stream_status(
+                    session_id, cancel_event, "done_error_unread",
+                )
         except Exception as exc:
             if use_session and self._is_active_stream(session_id, cancel_event):
                 from runtime.common import now_iso
                 collected_messages.append(Message(role="assistant", timestamp=now_iso(), content=f"\n\nError: system aborted. ({exc})"))
-                # original_messages already saved in pre-inference step, pass [] to avoid duplication.
-                # 只持久化增量部分（增量持久化已写入的轮次不重复追加）。
-                persist_exc = self._persist_conversation(context_manager, session_id, [], collected_messages[persisted_until:], agent_ids, agent_nickname, model_id, tool_ids, workspace)
+                persist_exc = conversation_persister.finalize(
+                    collected_messages,
+                    update_title=False,
+                )
                 if persist_exc is not None:
                     logger.error("infer_stream: failed to save aborted conversation for session %s: %s", session_id, persist_exc)
             elif use_session:
@@ -1026,13 +1028,12 @@ class HandlerInferMixin:
                 pass
             # --- Session Status Stream: broadcast "done_error_unread" ---
             if session_id is not None:
-                with _session_state_lock:
-                    _session_statuses[session_id] = "done_error_unread"
-                    _unread_sessions[session_id] = "done_error_unread"
-                _broadcast_session_status(session_id, "done_error_unread")
+                transition_session_stream_status(
+                    session_id, cancel_event, "done_error_unread",
+                )
         finally:
             if session_id is not None:
-                finish_session_stream(session_id)
+                finish_session_stream(session_id, owner_event=cancel_event)
             # Only unregister from active_streams if we are still the active stream
             # for this session. A newer inference may have replaced our cancel_event.
             if active_streams is not None and session_id is not None:
@@ -1076,11 +1077,12 @@ class HandlerInferMixin:
         forced = body.get("forced", False) is True
 
         active_streams = getattr(self.server, "active_streams", None)
-        if active_streams is not None and session_id in active_streams:
-            active_streams[session_id].set()
+        target_event = active_streams.get(session_id) if active_streams is not None else None
+        if target_event is not None:
+            target_event.set()
 
         if forced:
-            self._force_abort(session_id)
+            self._force_abort(session_id, owner_event=target_event)
             self._send_json_response(200, {"ok": True, "forced": True})
         elif active_streams is not None and session_id in active_streams:
             self._send_json_response(200, {"ok": True})
@@ -1088,8 +1090,8 @@ class HandlerInferMixin:
             # 会话不存在或已结束，视为成功（幂等）
             self._send_json_response(200, {"ok": True, "note": "session not found or already done"})
 
-    def _force_abort(self, session_id: str) -> None:
-        """Kill running tool processes and force session status to done."""
+    def _force_abort(self, session_id: str, owner_event=None) -> None:
+        """Kill running tool processes and force the targeted generation done."""
         # 1. Kill any running exec_cli process for this session.
         try:
             from runtime.builtin_tools import kill_active_process
@@ -1106,11 +1108,12 @@ class HandlerInferMixin:
         except Exception as exc:
             logger.error("force_abort: mcp abort_all failed for %s: %s", session_id, exc)
 
-        # 3. Force session status to done so the frontend can stop waiting.
-        with _session_state_lock:
-            _session_statuses[session_id] = "done_error_unread"
-            _unread_sessions[session_id] = "done_error_unread"
-        _broadcast_session_status(session_id, "done_error_unread")
+        # 3. Force only the aborted generation to done. If a replacement has
+        # already taken ownership, this stale abort must not turn it red.
+        if owner_event is not None:
+            transition_session_stream_status(
+                session_id, owner_event, "done_error_unread",
+            )
 
     @staticmethod
     def _extract_json(text: str) -> Optional[dict | list]:

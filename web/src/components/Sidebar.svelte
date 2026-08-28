@@ -29,6 +29,10 @@
   let userMessageMenuError = $state('')
   let menuUserMessages = $state([])
   let menuSessionData = $state(null)
+  let executionAnalysisOpen = $state(false)
+  let executionAnalysisLoading = $state(false)
+  let executionAnalysisError = $state('')
+  let executionAnalysisData = $state(null)
 
   // hover 弹出菜单状态：鼠标悬停到 ... 按钮即弹出，悬停在菜单上保持显示
   let hoverBtnId = $state(null)   // 当前鼠标悬停的 ... 按钮 session id
@@ -288,6 +292,10 @@
       userMessageMenuError = ''
       menuUserMessages = []
       menuSessionData = null
+      executionAnalysisOpen = false
+      executionAnalysisLoading = false
+      executionAnalysisError = ''
+      executionAnalysisData = null
     }
     menuOpenId = sid
   }
@@ -304,6 +312,10 @@
     userMessageMenuError = ''
     menuUserMessages = []
     menuSessionData = null
+    executionAnalysisOpen = false
+    executionAnalysisLoading = false
+    executionAnalysisError = ''
+    executionAnalysisData = null
     hoverBtnId = null
     hoverMenuId = null
     if (closeTimer) {
@@ -356,11 +368,58 @@
     }
   }
 
-  function userMessageMenuWidth() {
-    if (typeof window === 'undefined') return 600
+  function submenuPanelWidth(preferred = 600) {
+    if (typeof window === 'undefined') return preferred
     const chatAreaWidth = Math.max(320, window.innerWidth - sidebarWidth.current)
-    const availableWidth = Math.max(220, window.innerWidth - menuPos.x - 210)
-    return Math.min(chatAreaWidth * 0.85, availableWidth)
+    const availableWidth = Math.max(260, window.innerWidth - menuPos.x - 210)
+    return Math.min(preferred, chatAreaWidth * 0.85, availableWidth)
+  }
+
+  function userMessageMenuWidth() {
+    return submenuPanelWidth(600)
+  }
+
+  function formatDuration(ms) {
+    const value = Number(ms) || 0
+    if (value < 1000) return `${Math.round(value)} ms`
+    if (value < 60000) return `${(value / 1000).toFixed(value < 10000 ? 2 : 1)} s`
+    if (value < 3600000) {
+      const minutes = Math.floor(value / 60000)
+      const seconds = ((value % 60000) / 1000).toFixed(1)
+      return `${minutes}m ${seconds}s`
+    }
+    const hours = Math.floor(value / 3600000)
+    const minutes = Math.floor((value % 3600000) / 60000)
+    const seconds = Math.floor((value % 60000) / 1000)
+    return `${hours}h ${minutes}m ${seconds}s`
+  }
+
+  function analysisName(item, kind) {
+    if (kind === 'agent') return item.agent_id || 'null'
+    if (kind === 'model') return item.model_label ? `${item.model_id || 'null'} (${item.model_label})` : (item.model_id || 'null')
+    return item.tool_name ? `${item.tool_name}${item.tool_id && item.tool_id !== item.tool_name ? ` (${item.tool_id})` : ''}` : (item.tool_id || 'null')
+  }
+
+  async function openExecutionAnalysis(e, sessionId) {
+    e.stopPropagation()
+    cancelClose()
+    if (executionAnalysisOpen) return
+    executionAnalysisOpen = true
+    executionAnalysisLoading = true
+    executionAnalysisError = ''
+    executionAnalysisData = null
+    const requestedSessionId = sessionId
+    try {
+      const data = await sessions.executionAnalysis(sessionId)
+      if (menuOpenId !== requestedSessionId || !executionAnalysisOpen) return
+      executionAnalysisData = data
+    } catch (err) {
+      if (menuOpenId === requestedSessionId) {
+        executionAnalysisError = err.message || t('executionAnalysisFailed')
+      }
+    } finally {
+      if (menuOpenId === requestedSessionId) executionAnalysisLoading = false
+    }
   }
 
   function userMessageText(content) {
@@ -731,6 +790,85 @@
       <span class="menu-emoji">💻</span>
       Open Terminal
     </button>
+    <div class="session-dropdown-submenu-row" class:active={executionAnalysisOpen}>
+      <div class="session-dropdown-item session-dropdown-submenu-label">
+        <svg class="menu-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="M2 13.5h12M3 11V7M6.5 11V3M10 11V5M13 11V1.5"/>
+        </svg>
+        <span>{t('executionAnalysis')}</span>
+      </div>
+      <button
+        class="submenu-more-btn"
+        aria-label={t('executionAnalysis')}
+        aria-haspopup="menu"
+        aria-expanded={executionAnalysisOpen}
+        onclick={(e) => openExecutionAnalysis(e, menuOpenId)}
+        onmouseenter={(e) => openExecutionAnalysis(e, menuOpenId)}
+      >···</button>
+    </div>
+    {#if executionAnalysisOpen}
+      <div
+        class="execution-analysis-submenu"
+        role="menu"
+        style="width:{submenuPanelWidth(520)}px;"
+      >
+        {#if executionAnalysisLoading}
+          <div class="user-message-submenu-status">{t('loading')}</div>
+        {:else if executionAnalysisError}
+          <div class="user-message-submenu-status error">{executionAnalysisError}</div>
+        {:else if executionAnalysisData}
+          <div class="execution-analysis-content">
+            <div class="analysis-summary-list">
+              <div class="analysis-summary-row"><span>{t('totalExecutionNetTime')}</span><strong>{formatDuration(executionAnalysisData.summary?.total_execution_net_ms)}</strong></div>
+              <div class="analysis-summary-row"><span>{t('modelExecutionTotalTime')}</span><strong>{formatDuration(executionAnalysisData.summary?.model_execution_total_ms)}</strong></div>
+              <div class="analysis-summary-row"><span>{t('toolExecutionTotalTime')}</span><strong>{formatDuration(executionAnalysisData.summary?.tool_execution_total_ms)}</strong></div>
+            </div>
+            <div class="analysis-section">
+              <div class="analysis-section-title">{t('analysisByAgent')}</div>
+              {#if (executionAnalysisData.by_agent || []).length === 0}
+                <div class="analysis-empty">{t('analysisNoData')}</div>
+              {:else}
+                {#each executionAnalysisData.by_agent as item}
+                  <div class="analysis-list-row">
+                    <span class="analysis-name" title={analysisName(item, 'agent')}>{analysisName(item, 'agent')}</span>
+                    <span class="analysis-meta">M {formatDuration(item.model_duration_ms)} · T {formatDuration(item.tool_duration_ms)}</span>
+                    <strong>{formatDuration(item.total_duration_ms)}</strong>
+                  </div>
+                {/each}
+              {/if}
+            </div>
+            <div class="analysis-section">
+              <div class="analysis-section-title">{t('analysisByModel')}</div>
+              {#if (executionAnalysisData.by_model || []).length === 0}
+                <div class="analysis-empty">{t('analysisNoData')}</div>
+              {:else}
+                {#each executionAnalysisData.by_model as item}
+                  <div class="analysis-list-row">
+                    <span class="analysis-name" title={analysisName(item, 'model')}>{analysisName(item, 'model')}</span>
+                    <span class="analysis-meta">{item.calls} {t('analysisCalls')} · {item.input_tokens}/{item.output_tokens} tok</span>
+                    <strong>{formatDuration(item.duration_ms)}</strong>
+                  </div>
+                {/each}
+              {/if}
+            </div>
+            <div class="analysis-section">
+              <div class="analysis-section-title">{t('analysisByTool')}</div>
+              {#if (executionAnalysisData.by_tool || []).length === 0}
+                <div class="analysis-empty">{t('analysisNoData')}</div>
+              {:else}
+                {#each executionAnalysisData.by_tool as item}
+                  <div class="analysis-list-row">
+                    <span class="analysis-name" title={analysisName(item, 'tool')}>{analysisName(item, 'tool')}</span>
+                    <span class="analysis-meta">{item.calls} {t('analysisCalls')}</span>
+                    <strong>{formatDuration(item.duration_ms)}</strong>
+                  </div>
+                {/each}
+              {/if}
+            </div>
+          </div>
+        {/if}
+      </div>
+    {/if}
     <button
       class="session-dropdown-item"
       role="menuitem"
@@ -1159,11 +1297,12 @@
     background: var(--bg);
     color: var(--text);
   }
-  .user-message-submenu {
+  .user-message-submenu,
+  .execution-analysis-submenu {
     position: absolute;
     left: calc(100% + 6px);
     top: 0;
-    max-height: min(60vh, 480px);
+    max-height: min(70vh, 620px);
     display: flex;
     flex-direction: column;
     overflow: hidden;
@@ -1171,6 +1310,72 @@
     border: 1px solid var(--border);
     border-radius: 8px;
     box-shadow: 0 6px 20px rgba(0,0,0,0.15);
+  }
+  .execution-analysis-content {
+    min-height: 0;
+    overflow-y: auto;
+    padding: 10px 12px 12px;
+  }
+  .analysis-summary-list {
+    display: grid;
+    gap: 7px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--border);
+  }
+  .analysis-summary-row,
+  .analysis-list-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+    font-size: 0.82rem;
+  }
+  .analysis-summary-row span {
+    flex: 1;
+    color: var(--text-secondary);
+  }
+  .analysis-summary-row strong,
+  .analysis-list-row strong {
+    flex-shrink: 0;
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+  }
+  .analysis-section {
+    padding-top: 11px;
+  }
+  .analysis-section-title {
+    margin-bottom: 6px;
+    color: var(--text-secondary);
+    font-size: 0.75rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .analysis-list-row {
+    padding: 5px 0;
+  }
+  .analysis-name {
+    flex: 1 1 42%;
+    min-width: 0;
+    overflow: hidden;
+    color: var(--text);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .analysis-meta {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    color: var(--text-secondary);
+    font-size: 0.75rem;
+    text-align: right;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .analysis-empty {
+    padding: 5px 0;
+    color: var(--text-secondary);
+    font-size: 0.8rem;
   }
   .user-message-list {
     min-height: 0;

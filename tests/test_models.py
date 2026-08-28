@@ -4,7 +4,25 @@
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from runtime.models import ModelConfig
+from runtime.models import Message, ModelConfig
+
+
+def test_tool_message_started_at_round_trip() -> None:
+    message = Message(
+        role="tool",
+        content="ok",
+        timestamp="2026-08-28T12:00:01.000000",
+        started_at="2026-08-28T12:00:00.123456",
+        name="shell",
+        tool_use_id="call-1",
+    )
+
+    serialized = message.to_dict()
+    restored = Message.from_dict(serialized)
+
+    assert serialized["started_at"] == "2026-08-28T12:00:00.123456"
+    assert "tool_stat" not in serialized
+    assert restored.started_at == message.started_at
 
 
 def test_model_config_resolves_endpoint_placeholders_without_mutating_storage(

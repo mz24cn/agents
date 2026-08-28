@@ -15,7 +15,8 @@ SSE 协议说明：
   - 首条控制事件：  event: init\ndata: <json>\n\n（不属于推理 messages）
   - 消息事件示例：  id: <seq>\ndata: <message-json>\n\n
   - 最后一条事件：  data: [DONE]\n\n
-  - 消息 data 是一个 Message.to_dict() 序列化的 JSON 对象
+  - 普通消息 data 是 Message.to_dict() 序列化的 JSON 对象
+  - usage 统计使用 event: usage，data 直接是 stat JSON（不再包装为正文消息）
   - 错误事件：      data: {"error": "..."}\n\n
 
 运行方式：
@@ -216,15 +217,25 @@ def infer_via_stream(
                 return True
 
             role = event.get("role", "")
+            if event_name == "usage":
+                # Usage is now a named SSE event whose data is the stat object,
+                # not a Message wrapper. Keep role=usage fallback for old servers.
+                role = "usage"
             if verbose:
                 preview = str(event.get("content", "") or event.get("thinking", ""))[:60]
                 print(f"  [stream] role={role}  {preview!r}")
 
             if role == "usage":
-                try:
-                    last_stat = json.loads(event.get("content", "{}"))
-                except (json.JSONDecodeError, ValueError, TypeError):
-                    last_stat = None
+                if event_name == "usage":
+                    last_stat = {
+                        key: value for key, value in event.items()
+                        if key not in ("agent_id", "assistant_id", "name")
+                    }
+                else:
+                    try:
+                        last_stat = json.loads(event.get("content", "{}"))
+                    except (json.JSONDecodeError, ValueError, TypeError):
+                        last_stat = None
                 # usage 同时是当前 assistant round 的结束边界。
                 flush_assistant(last_stat)
             elif role == "assistant":

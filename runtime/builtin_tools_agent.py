@@ -10,6 +10,8 @@ The tool configs and factory functions are consumed by
 ``register_builtin_tools`` in ``runtime.builtin_tools`` (the facade module).
 """
 
+import copy
+import json
 import logging
 import os
 import re
@@ -17,6 +19,7 @@ import re
 from runtime.models import InferenceRequest, Message, ToolConfig
 from runtime.common import session_timestamp, snapshot_request_context, restore_request_context
 from runtime.group_chat import build_agents_markdown, _GC_DEFAULT_PROMPT
+from runtime.server_state import IncrementalConversationPersister
 
 logger = logging.getLogger("runtime.builtin_tools")
 
@@ -32,6 +35,17 @@ def _restore_thread_attr(thread_local, name: str, previous) -> None:
             pass
     else:
         setattr(thread_local, name, previous)
+
+
+def _make_sub_context_manager(context_manager, parent_session_id: str):
+    """Create an isolated ContextManager rooted below a parent session."""
+    sub_cm = copy.copy(context_manager)
+    sub_cm._chats_dir = os.path.join(
+        context_manager._chats_dir,
+        parent_session_id.replace("-", os.sep),
+    )
+    sub_cm._memory_store = {}
+    return sub_cm
 
 DELEGATE_TOOL_CONFIG = ToolConfig(
     tool_id="delegate",
@@ -218,9 +232,44 @@ def _make_delegate_fn(runtime, thread_local):
 
             chunks = []
             collected_msgs = []
+            persistence_warning = ""
+            conversation_persister = None
+            if (
+                context_manager is not None
+                and session_id is not None
+                and sub_session_id is not None
+                and sub_session_id.startswith(f"{session_id}-")
+            ):
+                short_sub_id = sub_session_id[len(session_id) + 1:]
+                conversation_persister = IncrementalConversationPersister(
+                    context_manager=_make_sub_context_manager(
+                        context_manager, session_id,
+                    ),
+                    session_id=short_sub_id,
+                    original_messages=messages,
+                    session_manager=None,
+                    tool_ids=resolved_ids,
+                    agent_ids=getattr(thread_local, "agent_ids", None) or None,
+                    model_id=model_id or getattr(thread_local, "model_id", None) or None,
+                    extra_meta={"parent_session_id": session_id},
+                )
+                pre_exc = conversation_persister.pre_persist()
+                if pre_exc is not None:
+                    logger.warning(
+                        "delegate: failed to pre-persist SubAgent Session: %s",
+                        pre_exc,
+                    )
             try:
                 cancel_event = getattr(thread_local, "cancel_event", None)
                 for msg in runtime.infer_stream(request, cancel_event=cancel_event):
+                    msg.agent_id = getattr(msg, "agent_id", None) or getattr(thread_local, "agent_id", None)
+                    if msg.role == "usage":
+                        try:
+                            usage_stat = json.loads(msg.content)
+                            usage_stat["model_id"] = request.model_id
+                            msg.content = json.dumps(usage_stat, ensure_ascii=False)
+                        except (TypeError, ValueError, AttributeError):
+                            pass
                     collected_msgs.append(msg)
                     if msg.role == "assistant" and msg.content:
                         chunks.append(msg.content)
@@ -237,6 +286,15 @@ def _make_delegate_fn(runtime, thread_local):
                                 })
                             except Exception:
                                 pass  # SSE 写入失败不中断推理
+                    if conversation_persister is not None and msg.role in ("usage", "tool"):
+                        persist_err = conversation_persister.persist_completed(
+                            collected_msgs,
+                        )
+                        if persist_err is not None:
+                            logger.warning(
+                                "delegate: incremental SubAgent persistence failed: %s",
+                                persist_err,
+                            )
             finally:
                 sub_journal_manager = getattr(thread_local, "file_journal_manager", None)
                 if sub_journal_manager is not None:
@@ -272,43 +330,9 @@ def _make_delegate_fn(runtime, thread_local):
                 except Exception:
                     pass
 
-            # 持久化 SubAgent Session
-            persistence_warning = ""
-            if context_manager is not None and sub_session_id is not None:
-                try:
-                    from runtime.server import persist_conversation
-                    # 子 session 目录路径：chats_dir/<parent>/<sub_session_id 中 - 替换为 />
-                    sub_session_dir = os.path.join(
-                        context_manager._chats_dir,
-                        sub_session_id.replace("-", os.sep),
-                    )
-                    os.makedirs(sub_session_dir, exist_ok=True)
-                    import copy as _copy
-                    sub_cm = _copy.copy(context_manager)
-                    # sub_cm 的 _chats_dir 指向父 session 目录，sub_session_id 只含最后一段
-                    sub_cm._chats_dir = os.path.join(
-                        context_manager._chats_dir,
-                        session_id.replace("-", os.sep),
-                    )
-                    sub_cm._memory_store = {}  # 隔离 memory 缓存，避免污染父 context_manager
-                    # persist 时使用不含父路径前缀的短 ID（最后一段）
-                    short_sub_id = sub_session_id[len(session_id) + 1:]  # "sub_YYMMDD_HHmmss"
-                    sub_agent_ids = getattr(thread_local, "agent_ids", None) or None
-                    sub_model_id = model_id or getattr(thread_local, "model_id", None) or None
-                    exc = persist_conversation(
-                        context_manager=sub_cm,
-                        session_id=short_sub_id,
-                        original_messages=messages,
-                        collected_messages=collected_msgs,
-                        session_manager=None,  # sub session 不更新顶层 index
-                        tool_ids=resolved_ids,
-                        agent_ids=sub_agent_ids,
-                        model_id=sub_model_id,
-                        extra_meta={"parent_session_id": session_id},
-                    )
-                    if exc is not None:
-                        raise exc
-                except Exception as persist_err:
+            if conversation_persister is not None:
+                persist_err = conversation_persister.finalize(collected_msgs)
+                if persist_err is not None:
                     logger.warning("delegate: 持久化 SubAgent Session 失败: %s", persist_err)
                     persistence_warning = f" [Warning: session persistence failed: {persist_err}]"
 
@@ -510,8 +534,45 @@ def _make_talk_to_fn(runtime, thread_local):
 
             chunks = []
             collected_msgs = []
+            persistence_info = None
+            conversation_persister = None
+            short_sub_id = None
+            if (
+                context_manager is not None
+                and sub_session_id is not None
+                and parent_session_id is not None
+            ):
+                short_sub_id = sub_session_id[len(parent_session_id) + 1:]
+                conversation_persister = IncrementalConversationPersister(
+                    context_manager=_make_sub_context_manager(
+                        context_manager, parent_session_id,
+                    ),
+                    session_id=short_sub_id,
+                    original_messages=messages,
+                    session_manager=None,
+                    tool_ids=agent_tool_ids,
+                    agent_ids=[agent_id],
+                    model_id=model_id,
+                    extra_meta={"parent_session_id": parent_session_id},
+                )
+                pre_exc = conversation_persister.pre_persist()
+                if pre_exc is not None:
+                    logger.warning(
+                        "talk_to: failed to pre-persist SubAgent Session (%s): %s",
+                        agent_id, pre_exc,
+                    )
+
+            infer_error = None
             try:
                 for msg in runtime.infer_stream(request, cancel_event=cancel_event):
+                    msg.agent_id = getattr(msg, "agent_id", None) or agent_id
+                    if msg.role == "usage":
+                        try:
+                            usage_stat = json.loads(msg.content)
+                            usage_stat["model_id"] = request.model_id
+                            msg.content = json.dumps(usage_stat, ensure_ascii=False)
+                        except (TypeError, ValueError, AttributeError):
+                            pass
                     collected_msgs.append(msg)
                     if msg.role == "assistant" and msg.content:
                         chunks.append(msg.content)
@@ -530,8 +591,17 @@ def _make_talk_to_fn(runtime, thread_local):
                                 })
                             except Exception:
                                 pass
+                    if conversation_persister is not None and msg.role in ("usage", "tool"):
+                        persist_err = conversation_persister.persist_completed(
+                            collected_msgs,
+                        )
+                        if persist_err is not None:
+                            logger.warning(
+                                "talk_to: incremental SubAgent persistence failed (%s): %s",
+                                agent_id, persist_err,
+                            )
             except Exception as exc:
-                return (agent_id, nickname, f"Error: {exc}", None)
+                infer_error = exc
             finally:
                 journal_manager = getattr(thread_local, "file_journal_manager", None)
                 if journal_manager is not None:
@@ -540,40 +610,20 @@ def _make_talk_to_fn(runtime, thread_local):
                     except Exception as journal_err:
                         logger.warning("talk_to: failed to finalize file journal: %s", journal_err)
 
-            result = "".join(chunks)
-
-            # 持久化子会话（复用 delegate 的 persist_conversation 机制）
-            persistence_info = None
-            if context_manager is not None and sub_session_id is not None and parent_session_id is not None:
-                try:
-                    from runtime.server import persist_conversation
-                    import copy as _copy
-                    sub_cm = _copy.copy(context_manager)
-                    sub_cm._chats_dir = os.path.join(
-                        context_manager._chats_dir,
-                        parent_session_id.replace("-", os.sep),
+            if conversation_persister is not None:
+                persist_err = conversation_persister.finalize(collected_msgs)
+                if persist_err is not None:
+                    logger.warning(
+                        "talk_to: 持久化 SubAgent Session 失败 (%s): %s",
+                        agent_id, persist_err,
                     )
-                    sub_cm._memory_store = {}
-                    short_sub_id = sub_session_id[len(parent_session_id) + 1:]
-                    sub_agent_ids = [agent_id]
-                    sub_model_id = model_id
-                    exc = persist_conversation(
-                        context_manager=sub_cm,
-                        session_id=short_sub_id,
-                        original_messages=messages,
-                        collected_messages=collected_msgs,
-                        session_manager=None,  # 子会话不更新顶层 index
-                        tool_ids=agent_tool_ids,
-                        agent_ids=sub_agent_ids,
-                        model_id=sub_model_id,
-                        extra_meta={"parent_session_id": parent_session_id},
-                    )
-                    if exc is not None:
-                        raise exc
+                else:
                     persistence_info = short_sub_id
-                except Exception as persist_err:
-                    logger.warning("talk_to: 持久化 SubAgent Session 失败 (%s): %s",
-                                   agent_id, persist_err)
+
+            if infer_error is not None:
+                return (agent_id, nickname, f"Error: {infer_error}", persistence_info)
+
+            result = "".join(chunks)
 
             return (agent_id, nickname, result, persistence_info)
 

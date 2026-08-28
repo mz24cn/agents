@@ -61,6 +61,8 @@ class ConversationTurn:
         completed_at: Kept for backward compatibility with old sessions.
             For new sessions, msg.timestamp is the inference completion time,
             and stat.first_token_timestamp is the first token time.
+        started_at: Optional ISO 8601 timestamp indicating when a tool invocation
+            actually started executing (used for tool-role turns).
     """
 
     role: str
@@ -79,6 +81,7 @@ class ConversationTurn:
     tool_use_id: Optional[str] = None
     completed_at: Optional[str] = None
     mentions: Optional[list[str]] = None
+    started_at: Optional[str] = None
 
 
 @dataclass
@@ -1238,6 +1241,7 @@ class ContextManager:
                 tool_use_id=msg.get("tool_use_id"),
                 completed_at=msg.get("completed_at"),
                 mentions=msg.get("mentions"),
+                started_at=msg.get("started_at"),
             ))
         return turns
 

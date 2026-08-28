@@ -362,6 +362,39 @@ class TestInferStream:
         assert status == 400
         assert "error" in body
 
+    def test_usage_is_named_sse_event_with_direct_stat_data(self, runtime, server):
+        runtime._model_registry.register(ModelConfig(
+            model_id="usage-model",
+            api_base="http://x",
+            model_name="x",
+            api_protocol="openai",
+        ))
+        usage = {
+            "prompt_tokens": 10,
+            "completion_tokens": 2,
+            "total_tokens": 12,
+            "cached_input_tokens": 7,
+            "new_token_cache": None,
+            "usage_reported": True,
+        }
+        with patch.object(runtime, "infer_stream", return_value=iter([
+            Message(role="assistant", content="ok"),
+            Message(role="usage", content=json.dumps(usage)),
+        ])):
+            status, raw = _post_raw(server, "/v1/infer/stream", {
+                "model_id": "usage-model",
+                "text": "hello",
+            })
+        assert status == 200
+        text = raw.decode("utf-8")
+        assert "event: usage\n" in text
+        usage_event = text.split("event: usage\n", 1)[1].split("\n\n", 1)[0]
+        payload_line = next(line for line in usage_event.splitlines() if line.startswith("data: "))
+        payload = json.loads(payload_line[6:])
+        assert payload["cached_input_tokens"] == 7
+        assert "role" not in payload
+        assert "content" not in payload
+
     def test_stream_model_not_found(self, server):
         """When model is not found, the SSE stream should contain an error message."""
         data = {"model_id": "nonexistent", "text": "hello"}
