@@ -249,6 +249,7 @@ def _message_from_turn(turn) -> Message:
             arguments=turn.get("arguments"),
             tool_id=turn.get("tool_id"),
             tool_use_id=turn.get("tool_use_id"),
+            started_at=turn.get("started_at"),
         )
     else:
         return Message(
@@ -265,6 +266,7 @@ def _message_from_turn(turn) -> Message:
             arguments=getattr(turn, "arguments", None),
             tool_id=getattr(turn, "tool_id", None),
             tool_use_id=getattr(turn, "tool_use_id", None),
+            started_at=getattr(turn, "started_at", None),
         )
 
 
@@ -1119,9 +1121,13 @@ def _run_group_chat_stream_gen(
                     tc.pop("_index", None)
 
                 ts = None
+                started_at = None
                 for m in asst_buf:
-                    if m.timestamp:
+                    if ts is None and m.timestamp:
                         ts = m.timestamp
+                    if started_at is None and m.started_at:
+                        started_at = m.started_at
+                    if ts is not None and started_at is not None:
                         break
                 full = Message(
                     role="assistant",
@@ -1129,6 +1135,7 @@ def _run_group_chat_stream_gen(
                     thinking=thinking,
                     tool_calls=tool_calls or None,
                     timestamp=ts,
+                    started_at=started_at,
                     agent_id=agent_id,
                     name=nickname,
                 )
@@ -1194,6 +1201,7 @@ def _run_group_chat_stream_gen(
                     "tool_calls": getattr(msg, "tool_calls", None),
                     "tool_id": getattr(msg, "tool_id", None),
                     "tool_use_id": getattr(msg, "tool_use_id", None),
+                    "started_at": getattr(msg, "started_at", None),
                 })
 
             # Detect @-mentions in merged (post-_flush_asst) assistant messages.

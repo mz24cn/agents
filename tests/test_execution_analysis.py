@@ -184,6 +184,34 @@ def test_analysis_writes_raw_csv_and_compact_aggregated_json(tmp_path):
     assert "conversation_turns" not in result
 
 
+def test_model_csv_prefers_top_level_started_at(tmp_path):
+    root = tmp_path / "assistant-started-session"
+    _write(root / "conversation.json", {
+        "meta": {"session_id": "assistant-started-session"},
+        "messages": [
+            {"role": "user", "timestamp": "2026-01-01T00:00:00"},
+            {
+                "role": "assistant",
+                "content": "done",
+                "started_at": "2026-01-01T00:00:02",
+                "timestamp": "2026-01-01T00:00:03",
+                "stat": {
+                    "request_started_at": "2026-01-01T00:00:01",
+                    "completed_at": "2026-01-01T00:00:03",
+                    "net_ms": 1000,
+                },
+            },
+        ],
+    })
+
+    result = analyze_session_execution(str(root), _Runtime(), _Agents())
+    model = next(row for row in _csv_rows(root) if row["record_type"] == "model")
+
+    assert model["started_at"] == "2026-01-01T00:00:02.000000"
+    assert model["duration_ms"] == "1000.0"
+    assert result["summary"]["model_execution_total_ms"] == 1000
+
+
 def test_historical_tool_falls_back_to_assistant_timestamp_in_csv(tmp_path):
     root = tmp_path / "legacy-session"
     _write(root / "conversation.json", {

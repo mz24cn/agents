@@ -2382,8 +2382,11 @@ class Runtime:
                             pass
                         continue
 
-                    # Set timestamp before yielding
+                    # Set timing before yielding. ``started_at`` is the real
+                    # outbound request-send time, so outer schedulers (including
+                    # group-chat thread pools) are excluded automatically.
                     if msg.role == "assistant":
+                        msg.started_at = request_started_at
                         if msg.tool_calls:
                             # For tool calls, record the first timestamp
                             if tool_calls_first_ts is None:

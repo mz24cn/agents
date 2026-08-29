@@ -1177,6 +1177,48 @@ class TestMergeStreamMessages:
         assert "maximum tool-call rounds" in turns[0].content
         assert turns[0].tool_calls is None, "dangling tool_calls must be dropped"
 
+    def test_assistant_started_at_survives_stream_merge(self):
+        from runtime.server import merge_stream_messages
+
+        started_at = "2026-08-29T08:00:00.123456"
+        completed_at = "2026-08-29T08:00:02.000000"
+        stream = [
+            Message(
+                role="assistant",
+                content="done",
+                started_at=started_at,
+            ),
+            Message(
+                role="usage",
+                content=json.dumps({
+                    "request_started_at": started_at,
+                    "completed_at": completed_at,
+                    "net_ms": 1876.544,
+                }),
+            ),
+        ]
+
+        turns, _ = merge_stream_messages(stream)
+
+        assert len(turns) == 1
+        assert turns[0].role == "assistant"
+        assert turns[0].started_at == started_at
+        assert turns[0].timestamp == completed_at
+
+    def test_assistant_started_at_falls_back_to_usage_stat(self):
+        from runtime.server import merge_stream_messages
+
+        started_at = "2026-08-29T08:00:00.123456"
+        turns, _ = merge_stream_messages([
+            Message(role="assistant", content="legacy chunk"),
+            Message(
+                role="usage",
+                content=json.dumps({"request_started_at": started_at}),
+            ),
+        ])
+
+        assert turns[0].started_at == started_at
+
     def test_tool_message_flushes_pending_assistant_first(self):
         """If a tool message arrives while an assistant turn is still pending
         (out-of-order stream), the assistant must be flushed first so the

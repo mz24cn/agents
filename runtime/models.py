@@ -40,8 +40,10 @@ class Message:
         tool_use_id: Optional protocol-level tool call ID linking a tool result to its assistant tool call.
         agent_id: Optional agent_id identifying which agent produced this message
             (used for all roles: assistant, tool, etc.).
-        started_at: Optional ISO 8601 timestamp indicating when a tool invocation
-            actually started executing (used for tool role messages).
+        started_at: Optional ISO 8601 timestamp indicating when the underlying
+            operation actually started. For assistant messages this is the real
+            model-request send time; for tool messages it is the callable/MCP
+            execution start time.
     """
 
     role: str

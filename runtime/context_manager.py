@@ -61,8 +61,10 @@ class ConversationTurn:
         completed_at: Kept for backward compatibility with old sessions.
             For new sessions, msg.timestamp is the inference completion time,
             and stat.first_token_timestamp is the first token time.
-        started_at: Optional ISO 8601 timestamp indicating when a tool invocation
-            actually started executing (used for tool-role turns).
+        started_at: Optional ISO 8601 timestamp indicating when the underlying
+            operation actually started. For assistant turns this is the real
+            model-request send time; for tool turns it is the callable/MCP
+            execution start time.
     """
 
     role: str

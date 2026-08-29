@@ -243,13 +243,14 @@ def _merge_single_agent_stream_messages(
     # Agent identity tracking — carried over from stream Message objects
     current_agent_id: Optional[str] = None
     current_name: Optional[str] = None
+    current_started_at: Optional[str] = None
     # @-mention tracking: the last assistant chunk carrying mentions wins
     # (group-chat aggregated assistant messages carry the full mentions list).
     current_mentions: Optional[list] = None
 
     def _flush_assistant(stat=None):
         nonlocal assistant_text_buf, assistant_thinking_buf, pending_tool_calls
-        nonlocal current_agent_id, current_name, current_mentions
+        nonlocal current_agent_id, current_name, current_started_at, current_mentions
         if assistant_text_buf or pending_tool_calls or assistant_thinking_buf:
             # timestamp should be the inference completion time from stat
             # Fall back to now_iso() if stat doesn't have it
@@ -266,12 +267,17 @@ def _merge_single_agent_stream_messages(
                 agent_id=current_agent_id,
                 name=current_name,
                 mentions=current_mentions,
+                started_at=(
+                    current_started_at
+                    or (stat.get("request_started_at") if stat else None)
+                ),
             ))
             assistant_text_buf = ""
             assistant_thinking_buf = ""
             pending_tool_calls = []
             current_agent_id = None
             current_name = None
+            current_started_at = None
             current_mentions = None
 
     current_stat: Optional[dict] = None
@@ -299,6 +305,8 @@ def _merge_single_agent_stream_messages(
                 current_agent_id = m.assistant_id
             if getattr(m, "name", None) and not current_name:
                 current_name = m.name
+            if getattr(m, "started_at", None) and not current_started_at:
+                current_started_at = m.started_at
             if getattr(m, "mentions", None):
                 current_mentions = m.mentions
             if getattr(m, "tool_calls_dropped", False):

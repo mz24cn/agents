@@ -1,15 +1,17 @@
 # Feature: agent-service, Property 1: ModelConfig 序列化往返一致性
 """Property-based tests for data model serialization round-trip consistency."""
 
+import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from runtime.models import Message, ModelConfig
 
 
-def test_tool_message_started_at_round_trip() -> None:
+@pytest.mark.parametrize("role", ["assistant", "tool"])
+def test_message_started_at_round_trip(role) -> None:
     message = Message(
-        role="tool",
+        role=role,
         content="ok",
         timestamp="2026-08-28T12:00:01.000000",
         started_at="2026-08-28T12:00:00.123456",

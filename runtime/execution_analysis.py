@@ -290,7 +290,12 @@ def _extract_raw_records(
                     or _parse_timestamp(message.get("completed_at"))
                     or _parse_timestamp(message.get("timestamp"))
                 )
-                started = _parse_timestamp(stat.get("request_started_at"))
+                # New assistant turns expose the real model-request send time at
+                # top level. Historical turns retain it in stat.
+                started = (
+                    _parse_timestamp(message.get("started_at"))
+                    or _parse_timestamp(stat.get("request_started_at"))
+                )
                 duration_ms = _number(stat.get("net_ms"), -1.0)
                 if duration_ms < 0:
                     duration_ms = _number(stat.get("total_ms"), -1.0)

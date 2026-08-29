@@ -683,7 +683,15 @@ def test_infer_stream_max_rounds_yields_assistant_note_not_fake_tool() -> None:
     # client can use the first round's first_token_timestamp as the loop output
     # start, and the last round's completed_at as the loop completion time.
     usage_stats = [json.loads(m.content) for m in collected if m.role == "usage"]
+    assistant_msgs = [m for m in collected if m.role == "assistant"]
     assert len(usage_stats) == 2
+    assert assistant_msgs
+    # Every real model round emits at least one assistant delta carrying the
+    # request-send time. Synthetic notes (such as max-rounds text) may not.
+    assistant_starts = {m.started_at for m in assistant_msgs if m.started_at}
+    assert {stat["request_started_at"] for stat in usage_stats}.issubset(
+        assistant_starts
+    )
     assert all("request_started_at" in s for s in usage_stats)
     assert all("first_token_timestamp" in s for s in usage_stats)
     assert all("ttft_ms" in s for s in usage_stats)

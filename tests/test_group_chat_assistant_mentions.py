@@ -8,8 +8,10 @@ Scenario:
     round2: ShaWuJing should be triggered and reply
 """
 
+import datetime
 import os
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -77,6 +79,58 @@ class FakeRuntime:
         else:
             content = "（无更多回复）"
         yield Message(role="assistant", content=content)
+
+
+class StartedAtRuntime:
+    def infer_stream(self, request: InferenceRequest, cancel_event=None):
+        yield Message(
+            role="assistant",
+            content="done",
+            timestamp="2026-08-29T08:00:02.000000",
+            started_at="2026-08-29T08:00:01.123456",
+        )
+        yield Message(
+            role="usage",
+            name="round",
+            content=(
+                '{"request_started_at":"2026-08-29T08:00:01.123456",'
+                '"completed_at":"2026-08-29T08:00:02.000000","net_ms":876.544}'
+            ),
+        )
+
+
+class QueuedStartedAtRuntime:
+    """Records request starts inside infer_stream after pool scheduling."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._call_count = 0
+        self.first_started = threading.Event()
+        self.release_first = threading.Event()
+
+    def infer_stream(self, request: InferenceRequest, cancel_event=None):
+        with self._lock:
+            self._call_count += 1
+            call_number = self._call_count
+        if call_number == 1:
+            self.first_started.set()
+            assert self.release_first.wait(timeout=5)
+        started_at = datetime.datetime.now().isoformat(timespec="microseconds")
+        yield Message(
+            role="assistant",
+            content=f"reply-{call_number}",
+            timestamp=datetime.datetime.now().isoformat(timespec="microseconds"),
+            started_at=started_at,
+        )
+        yield Message(
+            role="usage",
+            name="round",
+            content=(
+                '{"request_started_at":"' + started_at + '",'
+                '"completed_at":"' + datetime.datetime.now().isoformat(timespec="microseconds") + '",'
+                '"net_ms":0}'
+            ),
+        )
 
 
 class ToolRoundRuntime:
@@ -339,6 +393,69 @@ def test_group_chat_retry_targets_only_retry_agent(tmp_path):
     assert runtime.call_count == 1
     assert assistant_output
     assert {msg.agent_id for msg in assistant_output} == {"ShaWuJing"}
+
+
+def test_group_chat_preserves_real_model_request_started_at():
+    am = FakeAgentManager(AGENTS)
+
+    messages = list(run_group_chat_stream_gen(
+        runtime=StartedAtRuntime(),
+        mentioned_agent_ids=["SunWuKong"],
+        all_agent_ids=["SunWuKong", "ShaWuJing", "ZhuBaJie"],
+        original_messages=[Message(role="user", content="@SunWuKong ask")],
+        base_request=_make_req("@SunWuKong ask", ["SunWuKong"]),
+        cancel_event=None,
+        sse_callback=None,
+        context_manager=None,
+        session_id=None,
+        agent_manager=am,
+        model_id="m1",
+        tool_ids=[],
+        max_rounds=1,
+    ))
+
+    assistant = next(message for message in messages if message.role == "assistant")
+    assert assistant.agent_id == "SunWuKong"
+    assert assistant.started_at == "2026-08-29T08:00:01.123456"
+
+
+def test_group_chat_queued_agent_started_at_excludes_pool_wait(monkeypatch):
+    monkeypatch.setenv("MAX_GROUP_CHAT_WORKERS", "1")
+    am = FakeAgentManager(AGENTS)
+    runtime = QueuedStartedAtRuntime()
+
+    with ThreadPoolExecutor(max_workers=1) as caller_pool:
+        future = caller_pool.submit(
+            lambda: list(run_group_chat_stream_gen(
+                runtime=runtime,
+                mentioned_agent_ids=["SunWuKong", "ShaWuJing"],
+                all_agent_ids=["SunWuKong", "ShaWuJing", "ZhuBaJie"],
+                original_messages=[Message(role="user", content="@all ask")],
+                base_request=_make_req("@all ask", ["SunWuKong", "ShaWuJing"]),
+                cancel_event=None,
+                sse_callback=None,
+                context_manager=None,
+                session_id=None,
+                agent_manager=am,
+                model_id="m1",
+                tool_ids=[],
+                max_rounds=1,
+            ))
+        )
+        assert runtime.first_started.wait(timeout=5)
+        release_time = datetime.datetime.now()
+        runtime.release_first.set()
+        messages = future.result(timeout=5)
+
+    starts = {
+        message.agent_id: datetime.datetime.fromisoformat(message.started_at)
+        for message in messages
+        if message.role == "assistant" and message.started_at
+    }
+    assert set(starts) == {"SunWuKong", "ShaWuJing"}
+    # The second task could not enter the only worker before release_time. Its
+    # persisted start therefore proves submit/queue wait is not counted.
+    assert starts["ShaWuJing"] >= release_time
 
 
 @pytest.mark.parametrize("tool_name", ["talk_to", "delegate"])

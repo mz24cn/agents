@@ -286,7 +286,6 @@ const translations = {
     modelLabel: '模型',
     fetchModelsFailed: '获取模型列表失败',
     selectModelPlaceholder: '请先选择模型',
-    selectModelHint: '请先选择模型',
 
     // PlaceholderInputs
     templatePreview: '模板预览',
@@ -845,7 +844,6 @@ const translations = {
     modelLabel: 'Model',
     fetchModelsFailed: 'Failed to fetch models',
     selectModelPlaceholder: 'Select a model',
-    selectModelHint: 'Please select a model first',
 
     // PlaceholderInputs
     templatePreview: 'Template preview',

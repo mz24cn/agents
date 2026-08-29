@@ -1,0 +1,217 @@
+{
+  "version": "draft-1",
+  "status": "candidate",
+  "classification_policy": {
+    "primary_label": "每个主会话选择一个最能表示主要开发对象的叶子标签",
+    "secondary_labels": "允许附加零到多个次要叶子标签，以覆盖跨模块会话",
+    "inheritance": "命中叶子标签时自动继承其全部祖先标签",
+    "other_policy": "other 只允许作为临时兜底；样本积累后应重新聚类或合并到明确模块"
+  },
+  "tree": [
+    {
+      "id": "agent-service",
+      "name": "Agent Service 开发",
+      "children": [
+        {
+          "id": "runtime-inference",
+          "name": "运行时与推理",
+          "children": [
+            {"id": "inference-loop", "name": "推理循环与轮次限制"},
+            {"id": "tool-call-execution", "name": "工具调用执行与并行"},
+            {"id": "streaming-sse", "name": "流式推理与 SSE"},
+            {"id": "model-protocols", "name": "模型协议与响应解析", "children": [
+              {"id": "protocol-openai", "name": "OpenAI 协议"},
+              {"id": "protocol-anthropic", "name": "Anthropic 协议"},
+              {"id": "protocol-ollama", "name": "Ollama 协议"}
+            ]},
+            {"id": "context-memory", "name": "上下文压缩与记忆"},
+            {"id": "attachment-vlm", "name": "附件解析与 VLM 回落"},
+            {"id": "inference-metrics", "name": "推理统计、Token 与时间戳"},
+            {"id": "inference-error-retry", "name": "推理错误、超时与重试"}
+          ]
+        },
+        {
+          "id": "multi-agent",
+          "name": "多 Agent",
+          "children": [
+            {"id": "group-chat-routing", "name": "群聊路由与参与者选择"},
+            {"id": "mention-trigger", "name": "@Mention 解析与续轮触发"},
+            {"id": "delegation-subagent", "name": "委派与子 Agent"},
+            {"id": "multi-agent-timeout", "name": "多 Agent 超时与生命周期"},
+            {"id": "multi-agent-context", "name": "群聊上下文与记忆"},
+            {"id": "multi-agent-ui", "name": "多 Agent 消息展示"}
+          ]
+        },
+        {
+          "id": "session-conversation",
+          "name": "会话与历史记录",
+          "children": [
+            {"id": "conversation-persistence", "name": "conversation.json 持久化与结构"},
+            {"id": "message-timestamps", "name": "消息时间戳与完成时间"},
+            {"id": "session-status-stream", "name": "会话状态流与未读状态"},
+            {"id": "session-switch-concurrency", "name": "会话切换与并发隔离"},
+            {"id": "session-abort-resume", "name": "中止、继续与恢复推理"},
+            {"id": "history-search-governance", "name": "历史会话搜索与知识治理"}
+          ]
+        },
+        {
+          "id": "tools-extensions",
+          "name": "工具与扩展机制",
+          "children": [
+            {
+              "id": "builtin-tools",
+              "name": "内置工具",
+              "children": [
+                {"id": "file-path-tools", "name": "文件、目录与路径工具"},
+                {"id": "shell-process-tools", "name": "Shell、终端与进程工具"},
+                {"id": "code-search-tools", "name": "代码与全文搜索工具"},
+                {"id": "edit-file-patch", "name": "edit_file 与 Patch"},
+                {"id": "tool-output-limits", "name": "工具输出截断与限制"},
+                {"id": "base64-file-transfer", "name": "Base64 与文件传输"}
+              ]
+            },
+            {
+              "id": "mcp",
+              "name": "MCP",
+              "children": [
+                {"id": "mcp-registration-editing", "name": "MCP 注册、编辑与配置"},
+                {"id": "mcp-connection-lifecycle", "name": "MCP 连接、重连与超时"},
+                {"id": "mcp-tool-schema", "name": "MCP 工具 Schema 与参数兼容"}
+              ]
+            },
+            {
+              "id": "skills",
+              "name": "技能与函数工具",
+              "children": [
+                {"id": "skill-loading", "name": "技能发现、加载与自动启用"},
+                {"id": "function-tools", "name": "Function 工具注册与执行"},
+                {"id": "tool-argument-compat", "name": "工具参数兼容与模糊匹配"}
+              ]
+            }
+          ]
+        },
+        {
+          "id": "web-frontend",
+          "name": "Web 前端",
+          "children": [
+            {
+              "id": "chat-page",
+              "name": "ChatPage",
+              "children": [
+                {"id": "message-rendering", "name": "消息渲染与紧凑显示"},
+                {"id": "tool-message-rendering", "name": "工具调用与结果展示"},
+                {"id": "json-rendering", "name": "JSON 与长文本展示"},
+                {"id": "chat-input-upload", "name": "输入框、粘贴与上传"},
+                {"id": "chat-scroll-layout", "name": "滚动、布局与交互状态"}
+              ]
+            },
+            {
+              "id": "sidebar",
+              "name": "Sidebar",
+              "children": [
+                {"id": "sidebar-history-search", "name": "历史列表与搜索"},
+                {"id": "sidebar-session-state", "name": "会话状态、颜色与选中态"},
+                {"id": "sidebar-session-actions", "name": "会话菜单与快捷操作"}
+              ]
+            },
+            {
+              "id": "setup-page",
+              "name": "Setup 配置页面",
+              "children": [
+                {"id": "setup-models", "name": "模型配置"},
+                {"id": "setup-tools", "name": "工具配置"},
+                {"id": "setup-agents", "name": "Agent 配置"},
+                {"id": "setup-prompts", "name": "提示词模板"},
+                {"id": "setup-labels-sorting", "name": "标签、分组与排序"}
+              ]
+            },
+            {
+              "id": "workspace-file-manager",
+              "name": "工作区文件管理器",
+              "children": [
+                {"id": "workspace-selection", "name": "工作区选择与路径传递"},
+                {"id": "workspace-directory-tree", "name": "目录树与文件列表"},
+                {"id": "workspace-preview", "name": "文件、Markdown 与 JSON 预览"},
+                {"id": "workspace-file-actions", "name": "复制、上传与右键菜单"}
+              ]
+            },
+            {"id": "icons-assets", "name": "图标、SVG 与静态资源"},
+            {"id": "frontend-build-cache", "name": "Vite 构建、版本与前端缓存"}
+          ]
+        },
+        {
+          "id": "change-safety",
+          "name": "变更安全与版本管理",
+          "children": [
+            {"id": "file-journal", "name": "文件操作日志与快照"},
+            {"id": "message-rollback", "name": "消息撤回与文件恢复"},
+            {"id": "git-automation", "name": "Git 自动提交与 Sidecar"},
+            {"id": "git-sync-release", "name": "Git 同步、整理与发布"}
+          ]
+        },
+        {
+          "id": "platform-engineering",
+          "name": "平台与工程化",
+          "children": [
+            {"id": "server-api", "name": "Server API 与服务拆分"},
+            {"id": "configuration-env", "name": "环境变量与运行配置"},
+            {"id": "packaging-installation", "name": "打包、安装与升级"},
+            {"id": "testing-cicd", "name": "测试与 CI/CD"},
+            {"id": "windows-compatibility", "name": "Windows 与跨平台兼容"},
+            {"id": "network-remote", "name": "网络、SSH 与端口转发"},
+            {"id": "static-serving-performance", "name": "静态服务、压缩与缓存"},
+            {"id": "authorization-security", "name": "授权、认证与路径安全"}
+          ]
+        }
+      ]
+    },
+    {
+      "id": "computer-use-automation",
+      "name": "设备与界面自动化",
+      "children": [
+        {
+          "id": "mobile-automation",
+          "name": "手机自动化",
+          "children": [
+            {"id": "android-adb", "name": "Android 与 ADB"},
+            {"id": "mobile-screen-ui", "name": "手机屏幕识别与交互"},
+            {"id": "mobile-file-transfer", "name": "手机文件与相册传输"},
+            {"id": "mobile-login-qrcode", "name": "扫码与移动端登录"}
+          ]
+        },
+        {"id": "desktop-automation", "name": "桌面与窗口自动化"},
+        {"id": "browser-automation", "name": "浏览器与网页自动化"},
+        {"id": "screen-recording", "name": "截图、录屏与 FFmpeg"}
+      ]
+    },
+    {
+      "id": "models-media",
+      "name": "模型与媒体工具链",
+      "children": [
+        {
+          "id": "model-deployment",
+          "name": "模型部署",
+          "children": [
+            {"id": "ollama-gpu", "name": "Ollama 与 GPU"},
+            {"id": "gguf-llamacpp", "name": "GGUF 与 llama.cpp"},
+            {"id": "model-registry", "name": "模型查找、注册与配置"}
+          ]
+        },
+        {"id": "comfyui-video", "name": "ComfyUI 与视频生成"},
+        {"id": "ocr-image-processing", "name": "OCR 与图像处理"},
+        {"id": "document-ppt-generation", "name": "文档、PPT 与材料生成"}
+      ]
+    },
+    {
+      "id": "other",
+      "name": "其他",
+      "children": [
+        {"id": "external-project-development", "name": "非 Agent Service 项目开发"},
+        {"id": "product-research", "name": "产品与技术调研"},
+        {"id": "content-summary-generation", "name": "内容总结与生成"},
+        {"id": "demo-validation", "name": "演示、验证与重复测试"},
+        {"id": "general-chat", "name": "问候、时间与一般问答"}
+      ]
+    }
+  ]
+}

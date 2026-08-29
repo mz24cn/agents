@@ -66,9 +66,6 @@
         </optgroup>
       {/each}
     </select>
-    {#if !selectedModelId}
-      <span class="hint">{t('selectModelHint')}</span>
-    {/if}
   {/if}
 </div>
 
