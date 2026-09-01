@@ -739,10 +739,18 @@
         store.messages = store.messages.slice(0, -1)
       }
       // 创建用户消息（带服务端返回的时间戳）
-      if (initData.user_message_timestamp) {
-        const userMsg = { ...pendingUserMsg }
+      // 仅当本次请求确实携带新用户消息（pendingUserMsg 非空）时才创建；
+      // continue/retry 时用户消息已在列表中，init 里的时间戳只用于后端文件
+      // journal 归属。若此时仍按 {...pendingUserMsg} 补建，会追加一条无 role
+      // 的幽灵消息，在紧凑模式下被拆出一个空的"🤖 助手"卡片。
+      // 强制 role: 'user' 并按时间戳去重（与流式 user 帧的去重逻辑一致）。
+      if (initData.user_message_timestamp && pendingUserMsg) {
+        const userMsg = { ...pendingUserMsg, role: 'user' }
         userMsg.timestamp = initData.user_message_timestamp
-        store.messages = [...store.messages, userMsg]
+        const duplicate = store.messages.some(existing =>
+          existing.role === 'user' && existing.timestamp === userMsg.timestamp
+        )
+        if (!duplicate) store.messages = [...store.messages, userMsg]
       }
       // 创建空助手消息占位（群聊模式不创建，由 onStreamMsg 按 agent_id 动态创建）
       if (initData.group_chat) {
@@ -758,10 +766,12 @@
         }
         store.messages = [...store.messages, assistantMsg]
         aIdxRef.value = store.messages.length - 1
-        // 继承 agent_nickname
-        const prevAgent = [...store.messages].reverse().find(m => m.role === 'assistant' && m.agent_nickname)
+        // 继承上一条 assistant 消息的 agent 名称。
+        // 后端把 agent 昵称统一存放在 name 字段（持久化消息与流式帧均如此），
+        // 从不写 agent_nickname；此前查找 agent_nickname 永远是 undefined。
+        const prevAgent = [...store.messages].reverse().find(m => m.role === 'assistant' && m.name)
         if (prevAgent) {
-          store.messages[aIdxRef.value] = { ...store.messages[aIdxRef.value], agent_nickname: prevAgent.agent_nickname }
+          store.messages[aIdxRef.value] = { ...store.messages[aIdxRef.value], name: prevAgent.name }
           store.messages = [...store.messages]  // trigger reactivity
         }
       }
@@ -981,10 +991,12 @@
         }
       } else if (aIdxRef.value === -1) {
         aIdxRef.value = msgs.length
-        // Inherit agent_nickname from the previous assistant message (if any)
-        const prevAgent = [...msgs].reverse().find(m => m.role === 'assistant' && m.agent_nickname)
+        // Inherit the agent name from the previous assistant message (if any).
+        // 后端把 agent 昵称统一存放在 name 字段（持久化消息与流式帧均如此），
+        // 从不写 agent_nickname；帧自身携带的 name 会在 ...msg 展开时覆盖继承值。
+        const prevAgent = [...msgs].reverse().find(m => m.role === 'assistant' && m.name)
         // 首次帧：直接展开 msg 的所有字段（含 content/thinking/tool_calls 等），无需增量拼接
-        const initialMsg = { role: 'assistant', content: '', thinking: null, agent_nickname: prevAgent?.agent_nickname, ...msg }
+        const initialMsg = { role: 'assistant', content: '', thinking: null, name: prevAgent?.name, ...msg }
         if (msg.tool_calls) initialMsg.tool_calls = mergeToolCallDeltas([], msg.tool_calls)
         store.messages = [...msgs, initialMsg]
         return  // 首次创建已完成所有字段的设置，跳过后续合并逻辑
