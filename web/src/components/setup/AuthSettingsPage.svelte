@@ -37,7 +37,12 @@
   let backendSync = $state('')
   let configSync = $state('')
   let updateAvailable = $state(false)
-  let inferenceActive = $state(false)
+  let overallInferenceActive = $state(false)
+  let webInferenceActive = $state(false)
+  let apiInferenceActive = $state(false)
+  let inferenceActive = $derived(
+    overallInferenceActive || webInferenceActive || apiInferenceActive
+  )
   let serverInstanceId = $state('')
   let checkingUpdate = $state(false)
   let applyingUpdate = $state(false)
@@ -89,11 +94,19 @@
     return err?.status ? t(fallbackKey) : (err?.message || t(fallbackKey))
   }
 
+  function inferenceBusyReason() {
+    if (apiInferenceActive && webInferenceActive) return t('inferenceBusyBoth')
+    if (apiInferenceActive) return t('inferenceBusyApi')
+    if (webInferenceActive) return t('inferenceBusySession')
+    return t('inferenceBusyGeneric')
+  }
+
   function refreshUpdateMessage() {
+    const busy = inferenceActive ? inferenceBusyReason() : ''
     if (updateAvailable) {
-      updateMessage = inferenceActive ? t('updateAvailableButBusy') : ''
+      updateMessage = busy ? t('updateBusyPrefix') + t('updateVersionSeparator') + busy : ''
     } else if (downgradeAvailable) {
-      updateMessage = inferenceActive ? t('downgradeAvailableButBusy') : ''
+      updateMessage = busy ? t('downgradeBusyPrefix') + t('updateVersionSeparator') + busy : ''
     }
   }
 
@@ -120,11 +133,11 @@
     const unsubscribe = subscribeSessionEvents(
       (event) => {
         if (event.event === 'init') {
-          inferenceActive = Object.values(event.sessions || {}).some((status) => status === 'streaming')
+          webInferenceActive = Object.values(event.sessions || {}).some((status) => status === 'streaming')
           refreshUpdateMessage()
         } else if (event.event === 'message') {
           if (event.status === 'streaming') {
-            inferenceActive = true
+            webInferenceActive = true
             refreshUpdateMessage()
           } else {
             // Re-read authoritative state; another session may still be running.
@@ -143,7 +156,11 @@
       frontend = data.frontend_build || ''
       backend = data.backend_build || ''
       lastConfig = data.last_config || ''
-      inferenceActive = !!data.inference_active
+      // Older backends do not report the per-source breakdown; fall back to
+      // the overall flag and attribute the busy state to a web session.
+      overallInferenceActive = !!data.inference_active
+      webInferenceActive = data.session_inference_active ?? overallInferenceActive
+      apiInferenceActive = !!data.api_inference_active
       serverInstanceId = data.server_instance_id || serverInstanceId
       refreshUpdateMessage()
     } catch {
@@ -189,13 +206,13 @@
       const hasDowngrade = frontendSync === 'downgrade' || backendSync === 'downgrade' || configSync === 'downgrade'
       updateAvailable = hasUpgrade
       const current = await build.info()
-      inferenceActive = !!current.inference_active
+      overallInferenceActive = !!current.inference_active
+      webInferenceActive = current.session_inference_active ?? overallInferenceActive
+      apiInferenceActive = !!current.api_inference_active
       if (!hasUpgrade && !hasDowngrade) {
         updateMessage = t('updateAlreadyLatest')
-      } else if (hasUpgrade) {
-        refreshUpdateMessage()
       } else {
-        updateMessage = inferenceActive ? t('downgradeAvailableButBusy') : ''
+        refreshUpdateMessage()
       }
     } catch (err) {
       updateError = t('checkUpdateFailed', { error: err?.message || err })
@@ -237,7 +254,9 @@
       // Re-check immediately before changing files. The displayed state may
       // have been rendered just before inference started in another tab.
       const current = await build.info()
-      inferenceActive = !!current.inference_active
+      overallInferenceActive = !!current.inference_active
+      webInferenceActive = current.session_inference_active ?? overallInferenceActive
+      apiInferenceActive = !!current.api_inference_active
       refreshUpdateMessage()
       if (inferenceActive) return
     } catch (err) {

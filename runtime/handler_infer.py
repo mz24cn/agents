@@ -192,6 +192,11 @@ class HandlerInferMixin:
         raw_session_id: Optional[str] = body.get("session_id") or None
         session_id: Optional[str] = None
         use_session: bool = False
+        # A request without a session_id parameter is a stateless API call:
+        # web conversations always carry session_id ("new" or an existing id).
+        # The flag is read by the handlers to track API inference separately so
+        # the setup page can distinguish it from visible browser sessions.
+        set_request_context(api_inference=raw_session_id is None)
 
         if raw_session_id is not None:
             if raw_session_id == "new":
@@ -502,6 +507,44 @@ class HandlerInferMixin:
         )
         return exc
 
+    def _enter_api_inference(self) -> bool:
+        """Begin server-level tracking of a stateless (API) inference.
+
+        Web requests always carry a session_id and are already tracked per
+        session via ``active_streams`` and the session status events.  A
+        stateless API call is invisible to the web UI, so the setup page
+        needs a separate counter to report it.  Returns True when this
+        request is stateless and the counter was incremented.
+        """
+        if get_request_context("api_inference") is not True:
+            return False
+        server = self.server
+        lock = getattr(server, "inference_update_lock", None)
+        if lock is not None:
+            with lock:
+                server.active_api_inference_count = int(
+                    getattr(server, "active_api_inference_count", 0) or 0
+                ) + 1
+        else:
+            server.active_api_inference_count = int(
+                getattr(server, "active_api_inference_count", 0) or 0
+            ) + 1
+        return True
+
+    def _leave_api_inference(self) -> None:
+        """Stop server-level tracking of a stateless (API) inference."""
+        server = self.server
+        lock = getattr(server, "inference_update_lock", None)
+        if lock is not None:
+            with lock:
+                server.active_api_inference_count = max(
+                    0, int(getattr(server, "active_api_inference_count", 0) or 0) - 1
+                )
+        else:
+            server.active_api_inference_count = max(
+                0, int(getattr(server, "active_api_inference_count", 0) or 0) - 1
+            )
+
     def _handle_infer(self) -> None:
         """POST /v1/infer — execute model inference (non-streaming).
 
@@ -515,6 +558,7 @@ class HandlerInferMixin:
             return
         _body, request, session_id, use_session, original_messages, context_manager, agent_ids, agent_nickname, model_id, tool_ids, workspace = result
 
+        api_inference = self._enter_api_inference()
         try:
             runtime = self._get_runtime()
 
@@ -611,6 +655,8 @@ class HandlerInferMixin:
             self._send_json_response(status, response_data)
         finally:
             self._cleanup_thread_local()
+            if api_inference:
+                self._leave_api_inference()
 
     def _handle_infer_stream(self) -> None:
         """POST /v1/infer/stream — execute streaming model inference.
@@ -624,6 +670,7 @@ class HandlerInferMixin:
             return
         _body, request, session_id, use_session, original_messages, context_manager, agent_ids, agent_nickname, model_id, tool_ids, workspace = result
 
+        api_inference = self._enter_api_inference()
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -1048,6 +1095,8 @@ class HandlerInferMixin:
             if active_streams is not None and session_id is not None:
                 if active_streams.get(session_id) is cancel_event:
                     active_streams.pop(session_id, None)
+            if api_inference:
+                self._leave_api_inference()
             self._cleanup_thread_local()
 
     def _is_active_stream(self, session_id: Optional[str], cancel_event: threading.Event) -> bool:

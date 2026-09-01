@@ -945,6 +945,12 @@ class HandlerApiMixin:
                 "backend_build": backend,
                 "last_config": last_config,
                 "inference_active": inference_active,
+                # Per-source busy breakdown: web sessions carry a session_id
+                # and are tracked in active_streams; stateless API calls (no
+                # session_id) are invisible to the web UI and counted
+                # separately so the setup page can tell the two apart.
+                "api_inference_active": bool(int(getattr(self.server, "active_api_inference_count", 0) or 0)),
+                "session_inference_active": bool(getattr(self.server, "active_streams", {})),
                 "server_started_at": _SERVER_STARTED_AT,
                 "server_instance_id": _SERVER_INSTANCE_ID,
             })
