@@ -319,11 +319,23 @@ class OpenAIProtocol(BaseProtocol):
             "messages": [self._encode_message(msg) for msg in messages],
             "stream": stream,
         }
-
         # Merge generate_params (temperature, top_p, etc.)
         if config.generate_params:
             for key, value in config.generate_params.items():
                 body[key] = value
+
+        # OpenAI-compatible streaming endpoints only include authoritative token
+        # usage in the terminal SSE chunk when this option is requested. Apply it
+        # after generate_params so a stale user setting cannot disable usage;
+        # preserve any unrelated stream options supplied by the model config.
+        if stream:
+            stream_options = body.get("stream_options")
+            if not isinstance(stream_options, dict):
+                stream_options = {}
+            else:
+                stream_options = dict(stream_options)
+            stream_options["include_usage"] = True
+            body["stream_options"] = stream_options
 
         # Encode tools if provided
         if tools:

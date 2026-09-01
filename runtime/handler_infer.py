@@ -831,6 +831,15 @@ class HandlerInferMixin:
             context_manager=context_manager if use_session else None,
             session_id=session_id if use_session else None,
             original_messages=original_messages,
+            # ``request.messages`` is the complete assembled context actually
+            # handed to Runtime, unlike ``original_messages`` which normally
+            # contains only this HTTP request's new user turn.
+            request_messages=request.messages,
+            tools=[
+                tool
+                for tool_id in request.tool_ids
+                if (tool := runtime._tool_registry.get(tool_id)) is not None
+            ],
         )
         conversation_persister = IncrementalConversationPersister(
             context_manager=context_manager,

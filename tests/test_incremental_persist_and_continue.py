@@ -29,9 +29,11 @@ from runtime.runtime import Runtime
 from runtime.server import RuntimeHTTPServer
 from runtime.server_state import (
     IncrementalConversationPersister,
+    StreamUsageEstimator,
     merge_stream_messages,
     persist_conversation,
 )
+from runtime.common import estimate_chat_prompt_tokens, estimate_message_payload_tokens
 from runtime.handler_infer import _stream_batch_is_protocol_complete
 
 # ---------------------------------------------------------------------------
@@ -203,38 +205,41 @@ def test_final_empty_persist_preserves_incremental_usage_and_triggers_compressio
     assert (tmp_path / session_id / "summary.md").is_file()
 
 
-def test_interrupted_round_estimates_usage_and_drives_summary_threshold(tmp_path):
-    """Missing provider usage must not persist 0/0 or suppress compression."""
-    from runtime.server_state import StreamUsageEstimator
-
+def test_interrupted_round_estimates_complete_prompt_and_drives_summary_threshold(tmp_path):
+    """Missing provider usage estimates the actual assembled request, not a delta."""
+    request_messages = [
+        Message(role="system", content="You are concise."),
+        Message(role="user", content="old question"),
+        Message(role="assistant", content="old answer"),
+        Message(role="user", content="abc"),
+    ]
+    expected_prompt = estimate_chat_prompt_tokens(request_messages)
     cm = ContextManager(
         infer_fn=lambda req: None,
         chats_dir=str(tmp_path),
-        max_tokens_in_context=104,
+        max_tokens_in_context=max(1, expected_prompt - 1),
     )
     session_id = cm.create_session()
-    previous = [
-        Message(role="assistant", content="ok"),
-        Message(role="usage", content=json.dumps({
-            "prompt_tokens": 100,
-            "completion_tokens": 2,
-            "total_tokens": 102,
-            "usage_reported": True,
-        })),
-    ]
-    assert persist_conversation(cm, session_id, [], previous, compress=False) is None
+    cm.save_conversation(session_id, [
+        ConversationTurn(
+            role="user", content="old question", timestamp="2026-09-01T00:00:00",
+        ),
+        ConversationTurn(
+            role="assistant", content="old answer", timestamp="2026-09-01T00:00:01",
+        ),
+    ])
 
-    estimator = StreamUsageEstimator(
-        cm, session_id, [Message(role="user", content="abc")],
-    )
+    estimator = StreamUsageEstimator(request_messages=request_messages)
     failed = Message(role="assistant", content="Error: timeout")
     estimator.observe(failed)
     usage = estimator.terminal_usage_messages("model-x")
     assert len(usage) == 1
     stat = json.loads(usage[0].content)
-    assert stat["prompt_tokens"] == 103
-    assert stat["completion_tokens"] == 2
-    assert stat["total_tokens"] == 105
+    assert stat["prompt_tokens"] == expected_prompt
+    assert stat["completion_tokens"] == 0
+    assert stat["total_tokens"] == expected_prompt
+    assert stat["total_prompt_tokens"] == expected_prompt
+    assert stat["total_completion_tokens"] == 0
     assert stat["estimated"] is True
     assert stat["usage_reported"] is False
     assert stat["cached_input_tokens"] is None
@@ -243,15 +248,108 @@ def test_interrupted_round_estimates_usage_and_drives_summary_threshold(tmp_path
     collected = [failed, *usage]
     assert persist_conversation(cm, session_id, [], collected, compress=True) is None
     stored = cm.load_conversation(session_id)[-1]
-    assert stored.stat["total_tokens"] == 105
+    assert stored.stat["total_tokens"] == expected_prompt
     assert stored.stat["estimated"] is True
-    assert cm.get_last_total_tokens(session_id) == 105
+    assert cm.get_last_total_tokens(session_id) == expected_prompt
     assert (tmp_path / session_id / "summary.md").is_file()
 
 
-def test_explicit_provider_zero_usage_is_not_estimated(tmp_path):
-    from runtime.server_state import StreamUsageEstimator
+def test_estimated_usage_keeps_round_completion_separate_and_grows_tool_prompt():
+    request_messages = [
+        Message(role="system", content="Use tools when needed."),
+        Message(role="user", content="查询北京天气"),
+    ]
+    estimator = StreamUsageEstimator(request_messages=request_messages)
 
+    first_output = Message(
+        role="assistant",
+        thinking="需要调用工具",
+        tool_calls=[{"_index": 0, "name": "weather", "arguments": '{"city":"北京"}'}],
+    )
+    estimator.observe(first_output)
+    usage1 = Message(role="usage", content=json.dumps({"usage_reported": False}))
+    estimator.observe(usage1)
+    stat1 = json.loads(usage1.content)
+
+    expected_first_completion = estimate_message_payload_tokens({
+        "thinking": "需要调用工具",
+        "tool_calls": [{"id": "", "name": "weather", "arguments": '{"city":"北京"}'}],
+    })
+    assert stat1["prompt_tokens"] == estimate_chat_prompt_tokens(request_messages)
+    assert stat1["completion_tokens"] == expected_first_completion
+    assert stat1["estimated"] is True
+
+    tool_result = Message(
+        role="tool", content='{"temperature":26}',
+        name="weather", tool_use_id="call_1",
+    )
+    estimator.observe(tool_result)
+    estimator.observe(Message(role="assistant", content="北京当前 26°C。"))
+    usage2 = Message(role="usage", content=json.dumps({"usage_reported": False}))
+    estimator.observe(usage2)
+    stat2 = json.loads(usage2.content)
+
+    assert stat2["prompt_tokens"] > stat1["prompt_tokens"]
+    assert stat2["completion_tokens"] == estimate_message_payload_tokens({
+        "content": "北京当前 26°C。",
+    })
+    assert stat2["completion_tokens"] < stat1["completion_tokens"] + stat2["prompt_tokens"]
+    assert stat2["total_prompt_tokens"] == stat1["prompt_tokens"] + stat2["prompt_tokens"]
+    assert stat2["total_completion_tokens"] == (
+        stat1["completion_tokens"] + stat2["completion_tokens"]
+    )
+
+
+def test_estimated_prompt_counts_cjk_logically_and_includes_full_history():
+    short = [Message(role="user", content="你好世界")]
+    long = [
+        Message(role="system", content="你是助手"),
+        Message(role="user", content="第一轮问题"),
+        Message(role="assistant", content="第一轮回答"),
+        Message(role="user", content="你好世界"),
+    ]
+    assert estimate_message_payload_tokens(short[0]) == 4
+    assert estimate_chat_prompt_tokens(long) > estimate_chat_prompt_tokens(short)
+
+
+def test_runtime_estimates_unreported_stream_usage_from_exact_request(monkeypatch):
+    model_reg = ModelRegistry()
+    model_reg.register(ModelConfig(
+        model_id="test-model",
+        api_base="http://localhost:9999",
+        model_name="test",
+        api_protocol="openai",
+    ))
+    runtime = Runtime(model_registry=model_reg, tool_registry=ToolRegistry())
+    request_messages = [
+        Message(role="system", content="You are helpful."),
+        Message(role="user", content="old question"),
+        Message(role="assistant", content="old answer"),
+        Message(role="user", content="你好世界"),
+    ]
+    raw = (
+        'data: {"choices":[{"delta":{"reasoning_content":"思考"}}]}\n\n'
+        'data: {"choices":[{"delta":{"content":"最终 answer"}}]}\n\n'
+        'data: [DONE]\n\n'
+    ).encode()
+    monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: _make_resp(raw))
+
+    streamed = list(runtime.infer_stream(InferenceRequest(
+        model_id="test-model", messages=request_messages, stream=True,
+    )))
+    stat = json.loads([msg for msg in streamed if msg.role == "usage"][-1].content)
+    assert stat["prompt_tokens"] == estimate_chat_prompt_tokens(request_messages)
+    assert stat["completion_tokens"] == estimate_message_payload_tokens({
+        "thinking": "思考", "content": "最终 answer",
+    })
+    assert stat["total_tokens"] == stat["prompt_tokens"] + stat["completion_tokens"]
+    assert stat["total_prompt_tokens"] == stat["prompt_tokens"]
+    assert stat["total_completion_tokens"] == stat["completion_tokens"]
+    assert stat["usage_reported"] is False
+    assert stat["estimated"] is True
+
+
+def test_explicit_provider_zero_usage_is_not_estimated(tmp_path):
     cm = ContextManager(infer_fn=lambda req: None, chats_dir=str(tmp_path))
     session_id = cm.create_session()
     estimator = StreamUsageEstimator(

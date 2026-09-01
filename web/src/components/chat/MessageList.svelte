@@ -247,11 +247,37 @@
     return { outputStartedAt, loopCompletedAt }
   }
 
+ // 推理输出速度：输出 token 数 / 耗时，按 tok/s 显示；时间缺失或非法时显示 N/A
+  function formatOutputSpeed(tokens, startAt, endAt) {
+    if (tokens == null || !Number.isFinite(tokens)) return 'N/A'
+    if (!startAt || !endAt) return 'N/A'
+    const startMs = new Date(startAt).getTime()
+    const endMs = new Date(endAt).getTime()
+    if (Number.isNaN(startMs) || Number.isNaN(endMs) || endMs <= startMs) return 'N/A'
+    const seconds = (endMs - startMs) / 1000
+    return `${(tokens / seconds).toFixed(1)} tok/s`
+  }
+
+  // 紧凑模式的统计标签来自末次 assistant 推理；速度也必须使用同一次
+  // 推理的 token 与起止时间，不能跨越中间的工具执行阶段。
+  function getBlockLastAssistant(block) {
+    const indices = getBlockMessageIndices(block)
+    for (let offset = indices.length - 1; offset >= 0; offset--) {
+      const msg = messages[indices[offset]]
+      if (msg?.role === 'assistant' && msg.stat) return msg
+    }
+    return null
+  }
+
   function buildBlockStatTooltip(s, block) {
     const fmtMs = (n) => n == null ? 'N/A' : n >= 10000 ? `${(n / 1000).toFixed(1)}s` : `${n}ms`
+    const { outputStartedAt, loopCompletedAt } = getBlockInferenceTimes(block)
+    const lastAssistant = getBlockLastAssistant(block)
     const lines = [
       `${t('tokenIn')} ${formatTokenCount(s.prompt_tokens)}   ${t('tokenOut')} ${formatTokenCount(s.completion_tokens)}   ${t('tokenTotal')} ${formatTokenCount(s.total_tokens)}`,
       `${t('tokenCached')} ${s.cached_input_tokens == null ? 'N/A' : formatTokenCount(s.cached_input_tokens)}`,
+      // 末次推理输出速度：末轮 token 数 / 末轮模型请求开始到推理输出完成。
+      `${t('statLastOutputSpeed')} ${formatOutputSpeed(s.completion_tokens, lastAssistant?.started_at || s.request_started_at, s.completed_at || lastAssistant?.timestamp)}`,
     ]
     if (s.total_prompt_tokens !== s.prompt_tokens || s.total_completion_tokens !== s.completion_tokens) {
       lines.push(`${t('tokenCumIn')} ${formatTokenCount(s.total_prompt_tokens)}   ${t('tokenCumOut')} ${formatTokenCount(s.total_completion_tokens)}   ${t('tokenCumTotal')} ${formatTokenCount(s.total_all_tokens)}`)
@@ -260,7 +286,6 @@
     if (s.net_ms != null) lines.push(`${t('statNet')} ${fmtMs(s.net_ms)}`)
     if (s.total_ms != null) lines.push(`${t('statRound')} ${fmtMs(s.total_ms)}`)
     if (s.overall_ms != null) lines.push(`${t('statOverall')} ${fmtMs(s.overall_ms)}`)
-    const { outputStartedAt, loopCompletedAt } = getBlockInferenceTimes(block)
     const outputStartedTime = formatTimestamp(outputStartedAt)
     const loopCompletedTime = formatTimestamp(loopCompletedAt)
     if (outputStartedTime) lines.push(`${t('statOutputStartedTime')} ${outputStartedTime}`)

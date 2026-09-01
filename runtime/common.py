@@ -130,6 +130,130 @@ def estimate_tokens(text: str) -> int:
     return len(text) // 4
 
 
+def _is_cjk_token_char(char: str) -> bool:
+    """Return whether *char* is normally close to one tokenizer token.
+
+    CJK ideographs, kana, Hangul and full-width punctuation are kept separate
+    from the usual four-Latin-characters-per-token heuristic.  This is still an
+    estimate, but it avoids under-counting Chinese text by roughly 4x.
+    """
+    codepoint = ord(char)
+    return (
+        0x2E80 <= codepoint <= 0x30FF
+        or 0x31F0 <= codepoint <= 0x31FF
+        or 0x3400 <= codepoint <= 0x4DBF
+        or 0x4E00 <= codepoint <= 0x9FFF
+        or 0xAC00 <= codepoint <= 0xD7AF
+        or 0xF900 <= codepoint <= 0xFAFF
+        or 0xFF00 <= codepoint <= 0xFFEF
+        or 0x20000 <= codepoint <= 0x323AF
+    )
+
+
+def estimate_llm_tokens(text: object) -> int:
+    """Estimate model tokens for mixed natural-language or JSON text.
+
+    Most Latin text averages about four characters per token, while Chinese,
+    Japanese and Korean characters are commonly one token each (occasionally
+    fewer or more depending on the model).  The estimate deliberately rounds a
+    non-empty Latin fragment up so short messages never become zero tokens.
+    """
+    if text is None:
+        return 0
+    value = text if isinstance(text, str) else str(text)
+    if not value:
+        return 0
+    cjk_chars = sum(1 for char in value if _is_cjk_token_char(char))
+    other_chars = len(value) - cjk_chars
+    return cjk_chars + ((other_chars + 3) // 4 if other_chars else 0)
+
+
+def _message_field(message: object, field: str, default=None):
+    if isinstance(message, dict):
+        return message.get(field, default)
+    return getattr(message, field, default)
+
+
+def _compact_json(value: object) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def estimate_message_payload_tokens(message: object) -> int:
+    """Estimate tokens carried by one message, excluding chat-role overhead.
+
+    This is suitable for completion-token fallback because it counts visible
+    content, hidden reasoning and structured tool calls without charging the
+    model's assistant-role/chat-template wrapper as generated output.
+    """
+    total = 0
+    content = _message_field(message, "content", "")
+    if isinstance(content, str):
+        total += estimate_llm_tokens(content)
+    elif content:
+        total += estimate_llm_tokens(_compact_json(content))
+
+    thinking = _message_field(message, "thinking", None)
+    if thinking is None:
+        thinking = _message_field(message, "reasoning_content", None)
+    total += estimate_llm_tokens(thinking)
+
+    tool_calls = _message_field(message, "tool_calls", None)
+    if tool_calls:
+        total += estimate_llm_tokens(_compact_json(tool_calls))
+
+    # Raw base64 length is unrelated to vision/audio tokens.  A fixed fallback
+    # is more logical than treating every encoded byte as a model token.
+    images = _message_field(message, "images", None) or []
+    total += 256 * len(images)
+    if _message_field(message, "audio", None):
+        total += 256
+    return total
+
+
+def estimate_chat_message_tokens(message: object) -> int:
+    """Estimate one input message including role/template bookkeeping."""
+    total = 4 + estimate_message_payload_tokens(message)
+    total += estimate_llm_tokens(_message_field(message, "name", None))
+    total += estimate_llm_tokens(
+        _message_field(message, "tool_use_id", None)
+        or _message_field(message, "tool_call_id", None)
+    )
+    return total
+
+
+def estimate_chat_prompt_tokens(messages: object, tools: object = None) -> int:
+    """Estimate the complete prompt for one model request.
+
+    The estimate includes every context message, chat-template role overhead,
+    the assistant-generation primer, and tool schemas.  Consequently multi-turn
+    fallback usage grows with the actual context instead of only measuring the
+    newest user/tool message.
+    """
+    total = 3  # assistant-generation primer used by common chat templates
+    for message in messages or []:
+        total += estimate_chat_message_tokens(message)
+
+    for tool in tools or []:
+        if isinstance(tool, dict):
+            function = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+            payload = {
+                "name": function.get("name", ""),
+                "description": function.get("description", ""),
+                "parameters": function.get("parameters", {}),
+            }
+        else:
+            payload = {
+                "name": getattr(tool, "name", ""),
+                "description": getattr(tool, "description", ""),
+                "parameters": getattr(tool, "parameters", {}),
+            }
+        total += 8 + estimate_llm_tokens(_compact_json(payload))
+    return total
+
+
 # ---------------------------------------------------------------------------
 # Atomic file I/O
 # ---------------------------------------------------------------------------

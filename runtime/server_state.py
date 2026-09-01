@@ -35,7 +35,13 @@ else:
     import fcntl
     import termios
 
-from runtime.common import get_system_encoding, SYSTEM_ENCODING
+from runtime.common import (
+    get_system_encoding,
+    SYSTEM_ENCODING,
+    estimate_chat_message_tokens,
+    estimate_chat_prompt_tokens,
+    estimate_message_payload_tokens,
+)
 from runtime.context_manager import ConversationTurn
 
 logger = logging.getLogger("runtime.server")
@@ -48,55 +54,45 @@ def _safe_token_int(value) -> int:
         return 0
 
 
-def _message_token_chars(message) -> int:
-    """Estimate token contribution using the requested one-character rule."""
-    total = len(getattr(message, "content", "") or "")
-    total += len(getattr(message, "thinking", "") or "")
-    tool_calls = getattr(message, "tool_calls", None)
-    if tool_calls:
-        try:
-            total += len(json.dumps(tool_calls, ensure_ascii=False))
-        except (TypeError, ValueError):
-            total += len(str(tool_calls))
-    return total
+def _message_estimated_tokens(message) -> int:
+    """Estimate one message as it contributes to a subsequent model prompt."""
+    return estimate_chat_message_tokens(message)
 
 
 class StreamUsageEstimator:
-    """Normalize provider usage and synthesize stats for interrupted rounds.
+    """Normalize provider usage and synthesize logical per-request estimates.
 
     A provider-reported usage object is authoritative, including an explicit
-    0/0. When usage was not reported, estimate this round from the previous
-    normal inference plus newly observed input/output characters (1 char = 1
-    token), and mark the result with ``estimated=true``.
+    0/0.  When usage is absent, prompt tokens are estimated from the complete
+    context sent to the first model request.  Later tool-loop requests extend
+    that context with the preceding assistant/tool messages.  Completion tokens
+    describe only the current model response, while ``total_*`` fields accumulate
+    all model requests in this HTTP inference.
     """
 
-    def __init__(self, context_manager=None, session_id=None, original_messages=None):
-        self._base_by_agent: dict[str, dict] = {}
-        self._pending_input_by_agent: dict[str, int] = {}
-        self._output_by_agent: dict[str, int] = {}
+    def __init__(
+        self,
+        context_manager=None,
+        session_id=None,
+        original_messages=None,
+        request_messages=None,
+        tools=None,
+    ):
+        del context_manager, session_id  # Retained for call-site compatibility.
+        initial_messages = (
+            request_messages if request_messages is not None else original_messages
+        ) or []
+        self._default_prompt_tokens = estimate_chat_prompt_tokens(initial_messages, tools)
+        self._prompt_by_agent: dict[str, int] = {}
+        self._pending_context_by_agent: dict[str, int] = {}
+        self._total_prompt_by_agent: dict[str, int] = {}
+        self._total_completion_by_agent: dict[str, int] = {}
         self._open_by_agent: dict[str, bool] = {}
         self._error_by_agent: dict[str, bool] = {}
         self._model_by_agent: dict[str, Optional[str]] = {}
-        self._default_input_chars = sum(
-            _message_token_chars(message) for message in (original_messages or [])
-        )
-
-        turns = []
-        if context_manager is not None and session_id:
-            try:
-                turns = context_manager.load_conversation(session_id)
-            except (FileNotFoundError, OSError, ValueError):
-                turns = []
-        for turn in turns:
-            if getattr(turn, "role", None) != "assistant":
-                continue
-            stat = getattr(turn, "stat", None)
-            if not isinstance(stat, dict) or stat.get("estimated") is True:
-                continue
-            if stat.get("usage_reported") is False:
-                continue
-            key = getattr(turn, "agent_id", None) or ""
-            self._base_by_agent[key] = stat
+        self._content_by_agent: dict[str, str] = {}
+        self._thinking_by_agent: dict[str, str] = {}
+        self._tool_calls_by_agent: dict[str, dict[object, dict]] = {}
 
     @staticmethod
     def _agent_key(message) -> str:
@@ -106,27 +102,65 @@ class StreamUsageEstimator:
             or ""
         )
 
-    def _base(self, key: str) -> dict:
-        return self._base_by_agent.get(key) or self._base_by_agent.get("") or {}
-
     def _ensure_agent(self, key: str) -> None:
-        self._pending_input_by_agent.setdefault(key, self._default_input_chars)
-        self._output_by_agent.setdefault(key, 0)
+        self._prompt_by_agent.setdefault(key, self._default_prompt_tokens)
+        self._pending_context_by_agent.setdefault(key, 0)
+        self._total_prompt_by_agent.setdefault(key, 0)
+        self._total_completion_by_agent.setdefault(key, 0)
         self._open_by_agent.setdefault(key, False)
         self._error_by_agent.setdefault(key, False)
+        self._content_by_agent.setdefault(key, "")
+        self._thinking_by_agent.setdefault(key, "")
+        self._tool_calls_by_agent.setdefault(key, {})
+
+    def _observe_assistant_output(self, key: str, message) -> None:
+        self._content_by_agent[key] += getattr(message, "content", "") or ""
+        self._thinking_by_agent[key] += getattr(message, "thinking", "") or ""
+        calls = self._tool_calls_by_agent[key]
+        for position, call in enumerate(getattr(message, "tool_calls", None) or []):
+            if not isinstance(call, dict):
+                continue
+            index = call.get("_index", position)
+            merged = calls.setdefault(index, {"id": "", "name": "", "arguments": ""})
+            for field in ("id", "name", "arguments"):
+                value = call.get(field)
+                if value is None:
+                    continue
+                if not isinstance(value, str):
+                    try:
+                        value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+                    except (TypeError, ValueError):
+                        value = str(value)
+                merged[field] += value
+
+    def _current_completion(self, key: str) -> int:
+        payload = {
+            "content": self._content_by_agent.get(key, ""),
+            "thinking": self._thinking_by_agent.get(key, ""),
+            "tool_calls": list(self._tool_calls_by_agent.get(key, {}).values()) or None,
+        }
+        # Completion usage excludes the assistant role/chat-template wrapper.
+        return estimate_message_payload_tokens(payload)
+
+    def _current_prompt(self, key: str) -> int:
+        return (
+            self._prompt_by_agent.get(key, self._default_prompt_tokens)
+            + self._pending_context_by_agent.get(key, 0)
+        )
 
     def _estimate(self, key: str, stat: Optional[dict] = None) -> dict:
         source = dict(stat or {})
-        base = self._base(key)
-        prompt = _safe_token_int(base.get("prompt_tokens")) + self._pending_input_by_agent.get(key, 0)
-        completion = _safe_token_int(base.get("completion_tokens")) + self._output_by_agent.get(key, 0)
+        prompt = self._current_prompt(key)
+        completion = self._current_completion(key)
+        total_prompt = self._total_prompt_by_agent.get(key, 0) + prompt
+        total_completion = self._total_completion_by_agent.get(key, 0) + completion
         source.update({
             "prompt_tokens": prompt,
             "completion_tokens": completion,
             "total_tokens": prompt + completion,
-            "total_prompt_tokens": prompt,
-            "total_completion_tokens": completion,
-            "total_all_tokens": prompt + completion,
+            "total_prompt_tokens": total_prompt,
+            "total_completion_tokens": total_completion,
+            "total_all_tokens": total_prompt + total_completion,
             "estimated": True,
             "usage_reported": False,
         })
@@ -136,6 +170,30 @@ class StreamUsageEstimator:
         source["new_token_cache"] = None
         source.pop("model_id", None)
         return source
+
+    def _close_round(self, key: str, stat: dict) -> None:
+        prompt = _safe_token_int(stat.get("prompt_tokens"))
+        completion = _safe_token_int(stat.get("completion_tokens"))
+        self._prompt_by_agent[key] = prompt
+        if "total_prompt_tokens" in stat:
+            self._total_prompt_by_agent[key] = _safe_token_int(stat.get("total_prompt_tokens"))
+        else:
+            self._total_prompt_by_agent[key] += prompt
+        if "total_completion_tokens" in stat:
+            self._total_completion_by_agent[key] = _safe_token_int(stat.get("total_completion_tokens"))
+        else:
+            self._total_completion_by_agent[key] += completion
+
+        # If another tool-loop round follows, this assistant response and later
+        # tool results become new prompt context.  Use observed text/JSON rather
+        # than provider completion count because those exact messages are what
+        # the next request serializes.
+        self._pending_context_by_agent[key] = 4 + self._current_completion(key)
+        self._content_by_agent[key] = ""
+        self._thinking_by_agent[key] = ""
+        self._tool_calls_by_agent[key] = {}
+        self._open_by_agent[key] = False
+        self._error_by_agent[key] = False
 
     def observe(self, message) -> None:
         """Mutate an unreported usage message into an estimate, if necessary."""
@@ -148,13 +206,10 @@ class StreamUsageEstimator:
             if content.startswith("Error:") or content.lstrip().startswith("Error:"):
                 self._error_by_agent[key] = True
             else:
-                self._output_by_agent[key] += _message_token_chars(message)
+                self._observe_assistant_output(key, message)
             return
         if role == "tool":
-            self._pending_input_by_agent[key] = (
-                self._pending_input_by_agent.get(key, self._default_input_chars)
-                + _message_token_chars(message)
-            )
+            self._pending_context_by_agent[key] += _message_estimated_tokens(message)
             return
         if role != "usage":
             return
@@ -164,16 +219,23 @@ class StreamUsageEstimator:
         except (TypeError, ValueError, json.JSONDecodeError):
             stat = {}
         if stat.get("usage_reported") is False:
-            stat = self._estimate(key, stat)
+            # Runtime normally fills logical estimates from the exact request.
+            # Re-estimate only legacy/third-party 0/0 payloads that still carry
+            # no usable fallback values.
+            if (
+                _safe_token_int(stat.get("prompt_tokens")) == 0
+                and _safe_token_int(stat.get("completion_tokens")) == 0
+            ):
+                stat = self._estimate(key, stat)
+            else:
+                stat["estimated"] = True
+                stat["usage_reported"] = False
+                stat["cached_input_tokens"] = None
+                stat["new_token_cache"] = None
             message.content = json.dumps(stat, ensure_ascii=False)
-        else:
-            self._base_by_agent[key] = stat
         if stat.get("model_id"):
             self._model_by_agent[key] = stat.get("model_id")
-        self._pending_input_by_agent[key] = 0
-        self._output_by_agent[key] = 0
-        self._open_by_agent[key] = False
-        self._error_by_agent[key] = False
+        self._close_round(key, stat)
 
     def terminal_usage_messages(self, default_model_id: Optional[str] = None) -> list:
         """Return synthetic usage messages for error rounds that never closed."""
@@ -194,12 +256,8 @@ class StreamUsageEstimator:
                 content=json.dumps(stat, ensure_ascii=False),
             )
             # The estimate is already normalized. Close the local round state
-            # directly instead of feeding it through observe() again (which
-            # would intentionally re-estimate usage_reported=false payloads).
-            self._pending_input_by_agent[key] = 0
-            self._output_by_agent[key] = 0
-            self._open_by_agent[key] = False
-            self._error_by_agent[key] = False
+            # directly instead of feeding it through observe() again.
+            self._close_round(key, stat)
             normalized = json.loads(usage.content)
             model_id = self._model_by_agent.get(key) or default_model_id
             if model_id:

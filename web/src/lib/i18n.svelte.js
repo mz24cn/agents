@@ -278,6 +278,8 @@ const translations = {
     statCompletedTime: '推理完成时间:',
     statOutputStartedTime: '推理输出开始时间:',
     statLoopCompletedTime: '推理循环结束时间:',
+    statOutputSpeed: '推理输出速度:',
+    statLastOutputSpeed: '末次推理输出速度:',
 
     // MessageList
     startChat: '开始对话吧 💬',
@@ -836,6 +838,8 @@ const translations = {
     statCompletedTime: 'completed time:',
     statOutputStartedTime: 'inference output started:',
     statLoopCompletedTime: 'inference loop completed:',
+    statOutputSpeed: 'output speed:',
+    statLastOutputSpeed: 'last inference output speed:',
 
     // MessageList
     startChat: 'Start a conversation 💬',

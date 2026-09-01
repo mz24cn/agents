@@ -86,6 +86,17 @@
   const agentNickname = $derived(matchedAgent?.nickname)
   const displayName = $derived(agentNickname || msg.name || t('roleAssistant'))
 
+ // 推理输出速度：输出 token 数 / 耗时，按 tok/s 显示；时间缺失或非法时显示 N/A
+  function formatOutputSpeed(tokens, startAt, endAt) {
+    if (tokens == null || !Number.isFinite(tokens)) return 'N/A'
+    if (!startAt || !endAt) return 'N/A'
+    const startMs = new Date(startAt).getTime()
+    const endMs = new Date(endAt).getTime()
+    if (Number.isNaN(startMs) || Number.isNaN(endMs) || endMs <= startMs) return 'N/A'
+    const seconds = (endMs - startMs) / 1000
+    return `${(tokens / seconds).toFixed(1)} tok/s`
+  }
+
   function buildStatTooltip(s) {
     const fmtTokens = (n) => n >= 10000 ? `${(n / 1000).toFixed(1)}k` : `${n}`
     const fmtMs = (n) => n == null ? 'N/A' : n >= 10000 ? `${(n / 1000).toFixed(1)}s` : `${n}ms`
@@ -93,6 +104,9 @@
     const lines = []
     lines.push(`${t('tokenIn')} ${fmtTokens(s.prompt_tokens)}   ${t('tokenOut')} ${fmtTokens(s.completion_tokens)}   ${t('tokenTotal')} ${fmtTokens(s.total_tokens)}`)
     lines.push(`${t('tokenCached')} ${s.cached_input_tokens == null ? 'N/A' : fmtTokens(s.cached_input_tokens)}`)
+    // 详细模式：本轮输出 token 数 / 模型请求实际开始到本轮推理输出完成。
+    // completed_at 在后端执行工具前生成，因此该区间不包含后续工具时间。
+    lines.push(`${t('statOutputSpeed')} ${formatOutputSpeed(s.completion_tokens, msg.started_at || s.request_started_at, s.completed_at || msg.timestamp)}`)
     if (s.total_prompt_tokens !== s.prompt_tokens || s.total_completion_tokens !== s.completion_tokens) {
       lines.push(`${t('tokenCumIn')} ${fmtTokens(s.total_prompt_tokens)}   ${t('tokenCumOut')} ${fmtTokens(s.total_completion_tokens)}   ${t('tokenCumTotal')} ${fmtTokens(s.total_all_tokens)}`)
     }

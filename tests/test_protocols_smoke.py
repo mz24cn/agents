@@ -249,6 +249,39 @@ def test_stream_flag_in_body():
     _, _, body_bytes = proto.build_request(config, msgs, stream=True)
     body = json.loads(body_bytes)
     assert body["stream"] is True
+    assert body["stream_options"] == {"include_usage": True}
+
+
+def test_stream_request_forces_usage_without_dropping_other_stream_options():
+    proto = OpenAIProtocol()
+    config = ModelConfig(
+        model_id="test", api_base="http://localhost:11434",
+        model_name="qwen3.5:9b",
+        generate_params={
+            "stream_options": {"include_usage": False, "vendor_flag": "keep"},
+        },
+    )
+    _, _, body_bytes = proto.build_request(
+        config, [Message(role="user", content="Hi")], stream=True,
+    )
+    body = json.loads(body_bytes)
+    assert body["stream_options"] == {
+        "include_usage": True,
+        "vendor_flag": "keep",
+    }
+
+
+def test_non_stream_request_omits_stream_options():
+    proto = OpenAIProtocol()
+    config = ModelConfig(
+        model_id="test", api_base="http://localhost:11434",
+        model_name="qwen3.5:9b"
+    )
+    msgs = [Message(role="user", content="Hi")]
+    _, _, body_bytes = proto.build_request(config, msgs, stream=False)
+    body = json.loads(body_bytes)
+    assert body["stream"] is False
+    assert "stream_options" not in body
 
 
 def test_openai_tool_call_arguments_are_json_strings():

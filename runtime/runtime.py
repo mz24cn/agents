@@ -26,6 +26,8 @@ from runtime.common import (
     is_likely_base64,
     snapshot_request_context,
     restore_request_context,
+    estimate_chat_prompt_tokens,
+    estimate_message_payload_tokens,
 )
 
 _logger = logging.getLogger("runtime.runtime")
@@ -2513,13 +2515,29 @@ class Runtime:
             # (empty streams return above and are never recorded as success).
             net_ms = (stream_end_time - round_start) * 1000
             ttft_ms = (first_token_time - round_start) * 1000 if first_token_time else None
-            total_prompt += round_prompt
-            total_completion += round_completion
-
             # Build tool calls list from accumulated data
             all_tool_calls = None
             if accumulated_tool_calls:
                 all_tool_calls = [accumulated_tool_calls[idx] for idx in sorted(accumulated_tool_calls.keys())]
+
+            # Protocols that cannot report stream usage still need logical
+            # per-request statistics. Estimate from the exact messages/tool
+            # schemas sent in this model round and the fully assembled response,
+            # not from this HTTP request's newest user-message characters.
+            if not round_usage_reported:
+                round_prompt = estimate_chat_prompt_tokens(
+                    request_messages, tools if tools else None,
+                )
+                round_completion = estimate_message_payload_tokens({
+                    "content": full_content,
+                    "thinking": full_thinking,
+                    "tool_calls": all_tool_calls,
+                })
+                round_cached_input = None
+                round_new_token_cache = None
+
+            total_prompt += round_prompt
+            total_completion += round_completion
 
             # Build the complete assistant message for conversation history
             # timestamp should be the inference completion time (now)
@@ -2554,6 +2572,8 @@ class Runtime:
                     "request_started_at": request_started_at,
                     "completed_at": _now_iso(),
                 }
+                if not round_usage_reported:
+                    stat_dict["estimated"] = True
                 if first_token_timestamp:
                     stat_dict["first_token_timestamp"] = first_token_timestamp
                 if ttft_ms is not None:
@@ -2598,6 +2618,8 @@ class Runtime:
                     "request_started_at": request_started_at,
                     "completed_at": _now_iso(),
                 }
+                if not round_usage_reported:
+                    stat_dict["estimated"] = True
                 if first_token_timestamp:
                     stat_dict["first_token_timestamp"] = first_token_timestamp
                 if ttft_ms is not None:
@@ -2622,6 +2644,8 @@ class Runtime:
                 "request_started_at": request_started_at,
                 "completed_at": _now_iso(),
             }
+            if not round_usage_reported:
+                stat_dict["estimated"] = True
             if first_token_timestamp:
                 stat_dict["first_token_timestamp"] = first_token_timestamp
             if ttft_ms is not None:
