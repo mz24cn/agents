@@ -148,6 +148,7 @@ def resolve_mentions(
 
     Rules:
 
+    * *all_agent_ids* is the AI-agent roster; it never includes the user
     * ``all`` / ``everyone`` (case-insensitive) → return *all_agent_ids*
     * Otherwise: first try exact agent_id match, then nickname match
     * Only agents present in *all_agent_ids* are returned
@@ -695,8 +696,8 @@ def run_group_chat_stream(
     Parameters:
         runtime: Runtime instance for model inference.
         mentioned_agent_ids: Agent IDs that should respond this round.
-        all_agent_ids: All agent IDs participating in this group chat
-            (used to build the AGENTS markdown table).
+        all_agent_ids: All AI agent IDs participating in this group chat.
+            The user is never included (used to build the AGENTS markdown table).
         original_messages: Raw new messages from the request (no system prompt).
         base_request: The InferenceRequest built by ``_prepare_infer_request``
             (used as template for per-agent requests).
@@ -768,23 +769,13 @@ def run_group_chat_stream_gen(
     ``infer_stream``.  The caller (handler) can do unified SSE writing
     and incremental persistence without needing callback/notification.
 
-    When ``len(all_agent_ids) <= 2`` (user + a single AI, or solo),
-    the group-chat machinery normally used for multi-agent scenarios
-    (AGENTS markdown, _normalize_for_model with role-rewriting, parallel
-    ThreadPoolExecutor) is bypassed.  The degenerate case is handled by
-    a direct single-agent inference path that behaves identically to
-    ``runtime.infer_stream`` — same system prompt, same tool loop, same
-    message normalization.
-
     Args:
         sse_callback: Optional callback retained for self-managing tools such
             as delegate/talk_to, which emit nested stream frames directly.
             Ordinary model messages are yielded and must be written by the
             caller, so they are not duplicated through this callback.
         sse_heartbeat: Optional zero-argument callback emitting an SSE
-            keep-alive comment frame while waiting on slow agents in
-            multi-agent mode (degenerate mode does not need it).
-            Ignored in degenerate mode.
+            keep-alive comment frame while waiting on slow agents.
 
     Yields:
         Message objects tagged with ``agent_id`` and ``name``.
@@ -837,10 +828,6 @@ def _run_group_chat_stream_gen(
     caller (handler) to do unified SSE writing and incremental persistence
     without needing a callback.
 
-    When ``len(all_agent_ids) <= 2`` (i.e. just user + one AI, or solo),
-    the group-chat machinery is bypassed and the function behaves identically
-    to a direct call to ``runtime.infer_stream`` — the degenerate case.
-
     Parameters (same as ``run_group_chat_stream``):
 
     Yields:
@@ -854,7 +841,7 @@ def _run_group_chat_stream_gen(
     # silently create a stateless (non-visible) journal.
     parent_request_context = snapshot_request_context()
 
-    # ── Load conversation history (needed by both degenerate and full paths) ──
+    # ── Load conversation history for the full group-chat path ──
     existing_turns = []
     summary_text: str = ""
     memory_entries: list = []
@@ -883,75 +870,6 @@ def _run_group_chat_stream_gen(
                        and existing_turns[recent_start].role not in ("user", "system")):
                     recent_start -= 1
                 existing_turns = existing_turns[recent_start:]
-
-    # ── Degenerate case: single participant (user + 1 AI, or solo) ─────
-    # When len(all_agent_ids) <= 2 (user + one AI), the group-chat
-    # machinery is unnecessary.  We route directly through a single
-    # infer_stream call (which already has its own tool loop) so the
-    # behavior is identical to a non-group-chat single-agent session.
-    # This ensures group_chat and infer_stream produce the same results
-    # for the 1- or 2-participant case.
-    if len(all_agent_ids) <= 2 and all_agent_ids and len(mentioned_agent_ids) <= 1:
-        # In retry mode the retained roster may contain two agents while only
-        # retry_agent_id is selected to answer.  Prefer the explicit target;
-        # historical behavior for normal single-agent requests remains the
-        # first roster entry.
-        agent_id = mentioned_agent_ids[0] if mentioned_agent_ids else all_agent_ids[0]
-        agent = agent_manager.get(agent_id)
-        if agent is not None:
-            nickname: str = agent.get("nickname", agent_id)
-            agent_model_id: str = agent.get("model_id", model_id)
-            agent_tool_ids: list[str] = agent.get("tool_ids", tool_ids)
-
-            # Build context as a regular single-agent inference context
-            # (no AGENTS markdown, no group-chat framing, no catch-up).
-            # We reuse assemble_agent_context with agents_markdown="" to
-            # get the standard single-agent system prompt + history.
-            first_user_msg: Optional[Message] = None
-            for m in reversed(original_messages):
-                if m.role == "user":
-                    first_user_msg = m
-                    break
-            if first_user_msg is None and original_messages:
-                first_user_msg = Message(role="user", content="")
-
-            dispatch_agents_markdown = None
-            if "talk_to" in agent_tool_ids:
-                dispatch_agents_markdown = build_agents_markdown(
-                    all_agent_ids,
-                    agent_manager,
-                    exclude_agent_id=agent_id,
-                )
-            agent_messages = assemble_agent_context(
-                agent_id, agent, existing_turns, first_user_msg,
-                agents_markdown="",
-                dispatch_agents_markdown=dispatch_agents_markdown,
-                summary_text=summary_text,
-                memory_entries=memory_entries,
-            )
-
-            degenerate_request = InferenceRequest(
-                model_id=agent_model_id,
-                tool_ids=agent_tool_ids,
-                messages=agent_messages,
-                stream=True,
-                max_tool_rounds=base_request.max_tool_rounds,
-            )
-
-            for msg in runtime.infer_stream(degenerate_request,
-                                            cancel_event=cancel_event):
-                msg.agent_id = agent_id
-                if msg.role == "usage":
-                    try:
-                        usage_stat = json.loads(msg.content)
-                        usage_stat["model_id"] = agent_model_id
-                        msg.content = json.dumps(usage_stat, ensure_ascii=False)
-                    except (TypeError, ValueError, AttributeError):
-                        pass
-                if msg.role == "assistant":
-                    msg.name = nickname
-                yield msg
-            return
 
     agents_markdown = build_agents_markdown(
         all_agent_ids, agent_manager, include_user_row=True,

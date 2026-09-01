@@ -19,7 +19,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
 
-from runtime.common import get_request_context
+from runtime.common import (
+    clear_request_context,
+    get_request_context,
+    set_request_context,
+    _thread_local,
+)
+from runtime.builtin_tools_agent import TALK_TO_TOOL_CONFIG, _make_talk_to_fn
 from runtime.models import Message, InferenceRequest
 from runtime.registry import ModelRegistry, ToolRegistry
 from runtime.runtime import Runtime
@@ -246,6 +252,89 @@ AGENTS = [
         "tool_ids": [],
     },
 ]
+
+
+def test_two_agent_roster_uses_full_group_chat_path_for_single_mention():
+    """A two-AI roster remains a real group chat even for one mention.
+
+    The selected agent must receive its own worker context; otherwise a
+    talk_to call targeting the other agent can be incorrectly rejected as a
+    self-target.
+    """
+    code_master = {
+        **AGENTS[0],
+        "agent_id": "CodeMaster_GPT",
+        "nickname": "CodeMaster_GPT",
+        "tool_ids": [],
+    }
+    dev_manager = {
+        **AGENTS[1],
+        "agent_id": "DevManager",
+        "nickname": "DevManager",
+        "tool_ids": ["talk_to"],
+    }
+    manager = FakeAgentManager([code_master, dev_manager])
+
+    class RuntimeUnderTest:
+        def __init__(self):
+            self._tool_registry = {"talk_to": TALK_TO_TOOL_CONFIG}
+            self.calls = []
+            self.talk_to = _make_talk_to_fn(self, _thread_local)
+
+        def infer_stream(self, request, cancel_event=None):
+            self.calls.append({
+                "agent_id": get_request_context("agent_id"),
+                "available_tool_ids": get_request_context("available_tool_ids"),
+                "tool_scope": get_request_context("tool_scope"),
+                "request": request,
+            })
+            if get_request_context("agent_id") == "DevManager":
+                result = self.talk_to(["CodeMaster_GPT"], "please help")
+                assert "talk_to cannot target the calling agent itself" not in result
+                yield Message(role="assistant", content=result)
+            else:
+                yield Message(role="assistant", content="CodeMaster reply")
+
+    runtime = RuntimeUnderTest()
+    original_tool_scope = [object()]
+    set_request_context(
+        agent_id="CodeMaster_GPT",
+        agent_manager=manager,
+        all_agent_ids=["CodeMaster_GPT", "DevManager"],
+        available_tool_ids=["parent-tool"],
+        tool_scope=original_tool_scope,
+        model_id="parent-model",
+    )
+    try:
+        messages = list(run_group_chat_stream_gen(
+            runtime=runtime,
+            mentioned_agent_ids=["DevManager"],
+            all_agent_ids=["CodeMaster_GPT", "DevManager"],
+            original_messages=[Message(role="user", content="@DevManager ask")],
+            base_request=InferenceRequest(model_id="m1", messages=[]),
+            context_manager=None,
+            session_id=None,
+            agent_manager=manager,
+            model_id="m1",
+            tool_ids=[],
+            max_rounds=1,
+        ))
+        assert get_request_context("agent_id") == "CodeMaster_GPT"
+        assert get_request_context("available_tool_ids") == ["parent-tool"]
+        assert get_request_context("tool_scope") is original_tool_scope
+        assert get_request_context("model_id") == "parent-model"
+    finally:
+        clear_request_context(list(_thread_local.__dict__.keys()))
+
+    assert runtime.calls[0]["agent_id"] == "DevManager"
+    assert runtime.calls[1]["agent_id"] == "CodeMaster_GPT"
+    assert runtime.calls[0]["request"].tool_ids == ["talk_to"]
+    assert runtime.calls[0]["available_tool_ids"] == ["talk_to"]
+    assert [tool.tool_id for tool in runtime.calls[0]["tool_scope"]] == ["talk_to"]
+    assert any(
+        msg.role == "assistant" and "CodeMaster reply" in (msg.content or "")
+        for msg in messages
+    )
 
 
 def test_template_agents_placeholder_is_always_overwritten_with_dispatch_roster():
