@@ -1582,12 +1582,47 @@ class HandlerApiMixin:
             "has_more": end < total,
         }
 
+    def _handle_session_category_tree(self) -> None:
+        """GET /v1/sessions/tree — 返回会话分类树。
+
+        tree.json 缺失且会话数量大于 5 时，后台触发
+        runtime/category_tree_builder.py 在守护线程中生成初步分类树（不阻塞请求）；
+        此时响应附加 building 标记，生成完成后再访问即返回真实分类树。
+        """
+        session_manager = self.server.session_manager  # type: ignore[attr-defined]
+        tree = session_manager.get_category_tree()
+        if not session_manager.category_tree_exists():
+            if len(session_manager.list_sessions()) > 5:
+                from runtime import category_tree_builder
+                category_tree_builder.start_build(
+                    session_manager.chats_dir,
+                    llm=category_tree_builder.make_summary_llm(session_manager),
+                )
+                tree = dict(tree)
+                tree["building"] = True
+                state = category_tree_builder.build_state()
+                if state.get("last_error"):
+                    tree["build_error"] = state["last_error"]
+        self._send_json_response(200, tree)
+
     def _handle_list_sessions(self) -> None:
-        """GET /v1/sessions — 分页返回最近会话列表，页大小受 SEARCH_MAX_RESULTS 限制。"""
+        """GET /v1/sessions — 分页返回最近会话，category 可筛选末级分类。"""
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
         session_manager = self.server.session_manager  # type: ignore[attr-defined]
-        result = self._paginate_session_results(session_manager.list_sessions(), params)
+        category = (params.get("category") or params.get("categorry") or [""])[0].strip()
+        try:
+            ordered = (
+                session_manager.list_sessions_by_category(category)
+                if category
+                else session_manager.list_sessions()
+            )
+        except ValueError as exc:
+            self._send_json_error(400, str(exc))
+            return
+        result = self._paginate_session_results(ordered, params)
+        if category:
+            result["category"] = category
         self._send_json_response(200, result)
 
     def _handle_search_sessions(self) -> None:

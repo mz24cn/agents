@@ -308,6 +308,22 @@ describe('sessions.list', () => {
     expect(result).toEqual(responseData)
   })
 
+  it('adds category when listing a terminal directory node', async () => {
+    vi.stubGlobal('fetch', mockFetch({ sessions: [] }))
+
+    await sessions.list(2, 25, '1/2/3')
+
+    expect(fetch.mock.calls[0][0]).toBe('/v1/sessions?page=2&page_size=25&category=1%2F2%2F3')
+  })
+
+  it('fetches the session category tree', async () => {
+    const responseData = { version: 1, tree: [] }
+    vi.stubGlobal('fetch', mockFetch(responseData))
+
+    await expect(sessions.tree()).resolves.toEqual(responseData)
+    expect(fetch.mock.calls[0][0]).toBe('/v1/sessions/tree')
+  })
+
   it('throws Error when response is not ok', async () => {
     vi.stubGlobal('fetch', mockFetch({ error: 'Request failed: 500' }, 500))
 

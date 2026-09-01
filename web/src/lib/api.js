@@ -289,7 +289,8 @@ export const env = {
 
 /** 会话 API */
 export const sessions = {
-  list:          (page = 1, pageSize = 100) => request('GET', `/v1/sessions?page=${encodeURIComponent(page)}&page_size=${encodeURIComponent(pageSize)}`),
+  list:          (page = 1, pageSize = 100, category = '') => request('GET', `/v1/sessions?page=${encodeURIComponent(page)}&page_size=${encodeURIComponent(pageSize)}${category ? `&category=${encodeURIComponent(category)}` : ''}`),
+  tree:          () => request('GET', '/v1/sessions/tree'),
   search:        (query, page = 1, pageSize = 100) => request('GET', `/v1/sessions/search?q=${encodeURIComponent(query)}&page=${encodeURIComponent(page)}&page_size=${encodeURIComponent(pageSize)}`),
   get:           (sessionId, onProgress = null) => onProgress
     ? requestWithDownloadProgress(`/v1/sessions/${encodeURIComponent(sessionId)}`, onProgress)

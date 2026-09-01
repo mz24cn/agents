@@ -459,6 +459,13 @@ const translations = {
 
     // SessionPanel
     sessionPanelTitle: '📚 最近会话',
+    sessionDirectory: '目录',
+    sessionDirectories: '所属目录',
+    noSessionDirectories: '该会话暂无所属目录',
+    recentSessions: '最近',
+    sessionDirectoryEmpty: '暂无分类目录',
+    sessionTreeBuilding: '分类目录正在后台生成，每 10 秒自动刷新…',
+    sessionDirectoryLoadFailed: '获取会话目录失败',
     noSessions: '暂无最近会话',
     fetchSessionsFailed: '获取会话列表失败',
     restoreSessionFailed: '恢复会话失败',
@@ -1023,6 +1030,13 @@ const translations = {
 
     // SessionPanel
     sessionPanelTitle: '📚 Recent Sessions',
+    sessionDirectory: 'Directory',
+    sessionDirectories: 'Directories',
+    noSessionDirectories: 'This session is not in any directory',
+    recentSessions: 'Recent',
+    sessionDirectoryEmpty: 'No session categories',
+    sessionTreeBuilding: 'Building session directory in the background, refreshing every 10s…',
+    sessionDirectoryLoadFailed: 'Failed to fetch session directory',
     noSessions: 'No recent sessions yet',
     fetchSessionsFailed: 'Failed to fetch sessions',
     restoreSessionFailed: 'Failed to restore session',

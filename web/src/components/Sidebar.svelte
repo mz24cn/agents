@@ -5,6 +5,7 @@
   import { sessions, subscribeSessionEvents } from '../lib/api.js'
   import { sessionRestore, sessionDownload, newSessionCreated, sessionDeleted, currentSession, newSessionRequest, terminalOpen, openSessionLogDir, messageScrollRequest } from '../lib/session-state.svelte.js'
   import { sidebarWidth, setSidebarWidth, toggleSidebarCollapsed, collapseSidebar, SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH } from '../lib/sidebar-width.svelte.js'
+  import SessionCategoryNode from './SessionCategoryNode.svelte'
 
   const SESSION_PAGE_SIZE = 100
 
@@ -20,6 +21,23 @@
   let searchText = $state('')
   let activeSearchQuery = $state('')
   let searchInput = $state(null)
+  let directoryOpen = $state(false)
+  let categoryTree = $state([])
+  let categoryTreeLoading = $state(false)
+  let categoryTreeError = $state('')
+  let categoryExpandedPaths = $state(new Set())
+  let selectedCategory = $state('')
+  let categoryTreePromise = null
+  let categoryTreeBuilding = $state(false)
+  let categoryTreePollTimer = null
+  let categoryTreePolling = false
+  const CATEGORY_TREE_POLL_MS = 10000
+  let sessionListElement = $state(null)
+  let categoryTreeElement = $state(null)
+  let recentSessionView = null
+  let categorySessionViews = new Map()
+  let directoryTreeScrollTop = 0
+  let sessionLoadToken = 0
 
   // 弹出菜单状态
   let menuOpenId = $state(null)   // 当前展开菜单的 session id
@@ -33,6 +51,10 @@
   let executionAnalysisLoading = $state(false)
   let executionAnalysisError = $state('')
   let executionAnalysisData = $state(null)
+  let sessionDirectoryMenuOpen = $state(false)
+  let sessionDirectoryMenuLoading = $state(false)
+  let sessionDirectoryMenuError = $state('')
+  let menuSessionDirectories = $state([])
 
   // hover 弹出菜单状态：鼠标悬停到 ... 按钮即弹出，悬停在菜单上保持显示
   let hoverBtnId = $state(null)   // 当前鼠标悬停的 ... 按钮 session id
@@ -57,7 +79,7 @@
       sessionList = sessionList.map(s =>
         s.session_id === sid ? { ...s, _status: status } : s
       )
-    } else if (status === 'streaming') {
+    } else if (status === 'streaming' && !(directoryOpen && selectedCategory)) {
       // New session detected via SSE before newSessionCreated fires —
       // add it immediately so the user sees it during inference.
       // Title is a placeholder (session_id); it will be updated by
@@ -103,6 +125,7 @@
   })
 
   onDestroy(() => {
+    stopCategoryTreePolling()
     if (_unsubscribeSessionEvents) {
       _unsubscribeSessionEvents()
       _unsubscribeSessionEvents = null
@@ -134,6 +157,9 @@
   async function loadSessions(append = false) {
     if (append && (!sessionHasMore || sessionLoading || sessionLoadingMore)) return
 
+    const requestToken = ++sessionLoadToken
+    const requestedCategory = directoryOpen ? selectedCategory : ''
+    const requestedSearch = activeSearchQuery
     const nextPage = append ? sessionPage + 1 : 1
     if (append) {
       sessionLoadingMore = true
@@ -145,9 +171,10 @@
     }
     sessionError = ''
     try {
-      const data = activeSearchQuery
-        ? await sessions.search(activeSearchQuery, nextPage, SESSION_PAGE_SIZE)
-        : await sessions.list(nextPage, SESSION_PAGE_SIZE)
+      const data = requestedSearch
+        ? await sessions.search(requestedSearch, nextPage, SESSION_PAGE_SIZE)
+        : await sessions.list(nextPage, SESSION_PAGE_SIZE, requestedCategory)
+      if (requestToken !== sessionLoadToken) return
       // A list response contains persisted metadata but no live inference
       // status. Preserve the SSE snapshot/events that may have arrived while
       // this request was in flight; otherwise replacing sessionList briefly or
@@ -166,7 +193,7 @@
         // Keep those SSE-only rows until a later list response can supply the
         // persisted title and metadata.
         const incomingIds = new Set(incoming.map(entry => entry.session_id))
-        const liveOnly = sessionList.filter(entry =>
+        const liveOnly = requestedCategory ? [] : sessionList.filter(entry =>
           !incomingIds.has(entry.session_id)
           && (sessionStatuses[entry.session_id] === 'streaming' || entry._status === 'streaming')
         )
@@ -174,22 +201,228 @@
       }
       sessionPage = data.page ?? nextPage
       sessionHasMore = Boolean(data.has_more)
+      if (append) sessionLoadingMore = false
+      else sessionLoading = false
+      await tick()
+      if (directoryOpen && requestedCategory === selectedCategory) {
+        categorySessionViews.set(requestedCategory, currentSessionView())
+      } else if (!directoryOpen && !requestedCategory && !requestedSearch) {
+        recentSessionView = currentSessionView()
+      }
     } catch (err) {
-      sessionError = err.message || t('fetchSessionsFailed')
+      if (requestToken === sessionLoadToken) {
+        sessionError = err.message || t('fetchSessionsFailed')
+      }
     } finally {
-      if (append) {
-        sessionLoadingMore = false
-      } else {
-        sessionLoading = false
+      if (requestToken === sessionLoadToken) {
+        if (append) {
+          sessionLoadingMore = false
+        } else {
+          sessionLoading = false
+        }
       }
     }
   }
 
   function handleSessionScroll(e) {
     const { scrollTop, scrollHeight, clientHeight } = e.target
+    if (directoryOpen && selectedCategory) {
+      const view = categorySessionViews.get(selectedCategory)
+      if (view) view.scrollTop = scrollTop
+    } else if (!directoryOpen && !activeSearchQuery && recentSessionView) {
+      recentSessionView.scrollTop = scrollTop
+    }
     if (scrollHeight - scrollTop - clientHeight < 50) {
       loadSessions(true)
     }
+  }
+
+  function currentSessionView() {
+    return {
+      sessionList: sessionList.map(entry => ({ ...entry })),
+      sessionError,
+      sessionPage,
+      sessionHasMore,
+      loaded: !sessionLoading && !sessionLoadingMore,
+      scrollTop: sessionListElement?.scrollTop || 0,
+    }
+  }
+
+  function saveCurrentSessionView() {
+    if (sessionLoading || sessionLoadingMore) return
+    if (directoryOpen && selectedCategory) {
+      categorySessionViews.set(selectedCategory, currentSessionView())
+    } else if (!directoryOpen && !activeSearchQuery) {
+      recentSessionView = currentSessionView()
+    }
+  }
+
+  async function restoreSessionView(view) {
+    if (!view?.loaded) return false
+    sessionLoadToken++
+    sessionList = view.sessionList.map(entry => ({ ...entry }))
+    sessionError = view.sessionError || ''
+    sessionPage = view.sessionPage || 1
+    sessionHasMore = Boolean(view.sessionHasMore)
+    sessionLoading = false
+    sessionLoadingMore = false
+    await tick()
+    if (sessionListElement) sessionListElement.scrollTop = view.scrollTop || 0
+    return true
+  }
+
+  async function restoreDirectoryScroll() {
+    await tick()
+    if (categoryTreeElement) categoryTreeElement.scrollTop = directoryTreeScrollTop
+  }
+
+  function scrollItemWithinList(listElement, itemElement) {
+    if (!listElement || !itemElement) return
+    const listRect = listElement.getBoundingClientRect()
+    const itemRect = itemElement.getBoundingClientRect()
+    let nextScrollTop = listElement.scrollTop
+    if (itemRect.top < listRect.top) {
+      nextScrollTop += itemRect.top - listRect.top
+    } else if (itemRect.bottom > listRect.bottom) {
+      nextScrollTop += itemRect.bottom - listRect.bottom
+    }
+    if (nextScrollTop !== listElement.scrollTop) {
+      listElement.scrollTo({ top: nextScrollTop, behavior: 'smooth' })
+    }
+  }
+
+  async function scrollCategoryIntoView(path) {
+    if (!path) return
+    await tick()
+    const row = [...(categoryTreeElement?.querySelectorAll('[data-category-path]') || [])]
+      .find(element => element.dataset.categoryPath === path)
+    scrollItemWithinList(categoryTreeElement, row)
+  }
+
+  async function scrollSessionIntoView(sessionId) {
+    if (!sessionId) return
+    await tick()
+    const row = [...(sessionListElement?.querySelectorAll('[data-session-id]') || [])]
+      .find(element => element.dataset.sessionId === sessionId)
+    scrollItemWithinList(sessionListElement, row)
+  }
+
+  async function loadCategoryTree(force = false) {
+    if (!force && categoryTree.length > 0 && !categoryTreeBuilding) return categoryTree
+    if (categoryTreePromise) return categoryTreePromise
+    categoryTreeLoading = true
+    categoryTreeError = ''
+    categoryTreePromise = sessions.tree()
+      .then(data => {
+        categoryTree = data.tree || []
+        if (data.building) {
+          // 后端正在后台生成分类树：显示提示并按固定间隔重试，直到 building 消失
+          categoryTreeBuilding = true
+          startCategoryTreePolling()
+        } else {
+          categoryTreeBuilding = false
+          stopCategoryTreePolling()
+        }
+        // "所属目录"菜单打开期间树可能已变化（新会话挂载、后台构建完成等），同步刷新
+        if (sessionDirectoryMenuOpen && menuOpenId) {
+          menuSessionDirectories = findSessionDirectories(menuOpenId)
+        }
+        return categoryTree
+      })
+      .catch(err => {
+        categoryTreeError = err.message || t('sessionDirectoryLoadFailed')
+        return []
+      })
+      .finally(() => {
+        categoryTreeLoading = false
+        categoryTreePromise = null
+      })
+    return categoryTreePromise
+  }
+
+  function startCategoryTreePolling() {
+    stopCategoryTreePolling()
+    categoryTreePollTimer = setInterval(async () => {
+      if (categoryTreePolling) return
+      categoryTreePolling = true
+      try {
+        await loadCategoryTree(true)
+      } finally {
+        categoryTreePolling = false
+      }
+    }, CATEGORY_TREE_POLL_MS)
+  }
+
+  function stopCategoryTreePolling() {
+    if (categoryTreePollTimer) {
+      clearInterval(categoryTreePollTimer)
+      categoryTreePollTimer = null
+    }
+  }
+
+  function expandCategoryAncestors(path) {
+    const parts = String(path || '').split('/').filter(Boolean)
+    const next = new Set(categoryExpandedPaths)
+    for (let index = 1; index < parts.length; index++) {
+      next.add(parts.slice(0, index).join('/'))
+    }
+    categoryExpandedPaths = next
+  }
+
+  async function showDirectoryState() {
+    saveCurrentSessionView()
+    directoryOpen = true
+    searchOpen = false
+    activeSearchQuery = ''
+    await loadCategoryTree()
+    if (selectedCategory) {
+      expandCategoryAncestors(selectedCategory)
+      const restored = await restoreSessionView(categorySessionViews.get(selectedCategory))
+      if (!restored) await loadSessions()
+    } else {
+      sessionLoadToken++
+      sessionList = []
+      sessionError = ''
+      sessionPage = 1
+      sessionHasMore = false
+      sessionLoading = false
+      sessionLoadingMore = false
+    }
+    await restoreDirectoryScroll()
+  }
+
+  async function toggleDirectory(e) {
+    e.preventDefault()
+    e.stopPropagation()
+    if (directoryOpen) await showRecentSessions()
+    else await showDirectoryState()
+  }
+
+  function toggleCategoryPath(path) {
+    const next = new Set(categoryExpandedPaths)
+    if (next.has(path)) next.delete(path)
+    else next.add(path)
+    categoryExpandedPaths = next
+  }
+
+  async function selectCategory(path) {
+    if (selectedCategory === path && sessionList.length > 0) return
+    saveCurrentSessionView()
+    selectedCategory = path
+    activeSearchQuery = ''
+    const restored = await restoreSessionView(categorySessionViews.get(path))
+    if (!restored) await loadSessions()
+  }
+
+  async function showRecentSessions() {
+    if (!directoryOpen && !activeSearchQuery) return
+    saveCurrentSessionView()
+    if (categoryTreeElement) directoryTreeScrollTop = categoryTreeElement.scrollTop
+    directoryOpen = false
+    searchOpen = false
+    activeSearchQuery = ''
+    const restored = await restoreSessionView(recentSessionView)
+    if (!restored) await loadSessions()
   }
 
   function handleNewSession(e) {
@@ -206,6 +439,8 @@
   function toggleSearch(e) {
     e.preventDefault()
     e.stopPropagation()
+    directoryOpen = false
+    selectedCategory = ''
     searchOpen = !searchOpen
     if (searchOpen) {
       // 等待 DOM 更新（{#if} 渲染 input）后再聚焦
@@ -296,6 +531,10 @@
       executionAnalysisLoading = false
       executionAnalysisError = ''
       executionAnalysisData = null
+      sessionDirectoryMenuOpen = false
+      sessionDirectoryMenuLoading = false
+      sessionDirectoryMenuError = ''
+      menuSessionDirectories = []
     }
     menuOpenId = sid
   }
@@ -316,6 +555,10 @@
     executionAnalysisLoading = false
     executionAnalysisError = ''
     executionAnalysisData = null
+    sessionDirectoryMenuOpen = false
+    sessionDirectoryMenuLoading = false
+    sessionDirectoryMenuError = ''
+    menuSessionDirectories = []
     hoverBtnId = null
     hoverMenuId = null
     if (closeTimer) {
@@ -404,6 +647,8 @@
     e.stopPropagation()
     cancelClose()
     if (executionAnalysisOpen) return
+    userMessageMenuOpen = false
+    sessionDirectoryMenuOpen = false
     executionAnalysisOpen = true
     executionAnalysisLoading = true
     executionAnalysisError = ''
@@ -430,11 +675,77 @@
     return content == null ? '' : String(content).replace(/\s+/g, ' ').trim()
   }
 
+  function findSessionDirectories(sessionId) {
+    const matches = []
+    function visit(nodes, pathIds = [], pathNames = []) {
+      for (const node of nodes || []) {
+        if (!node || typeof node !== 'object') continue
+        const ids = [...pathIds, String(node.id)]
+        const names = [...pathNames, node.name || String(node.id)]
+        const childNodes = (node.children || []).filter(child => child && typeof child === 'object')
+        if (childNodes.length === 0 && (node.children || []).includes(sessionId)) {
+          matches.push({ path: ids.join('/'), names, label: names.join(' → ') })
+        }
+        visit(childNodes, ids, names)
+      }
+    }
+    visit(categoryTree)
+    return matches.sort((left, right) => left.label.localeCompare(right.label, undefined, { sensitivity: 'base' }))
+  }
+
+  async function openSessionDirectoryMenu(e, sessionId) {
+    e.stopPropagation()
+    cancelClose()
+    if (sessionDirectoryMenuOpen) return
+    userMessageMenuOpen = false
+    executionAnalysisOpen = false
+    sessionDirectoryMenuOpen = true
+    sessionDirectoryMenuLoading = true
+    sessionDirectoryMenuError = ''
+    menuSessionDirectories = []
+    const requestedSessionId = sessionId
+    await loadCategoryTree()
+    if (menuOpenId !== requestedSessionId || !sessionDirectoryMenuOpen) return
+    if (categoryTreeError) {
+      sessionDirectoryMenuError = categoryTreeError
+    } else {
+      menuSessionDirectories = findSessionDirectories(sessionId)
+      // 查不到且不在后台构建中：本地缓存树可能滞后于磁盘 tree.json，
+      // 强制拉取一次（结果由 loadCategoryTree 回调自动同步到菜单）
+      if (menuSessionDirectories.length === 0 && !categoryTreeBuilding) {
+        await loadCategoryTree(true)
+      }
+    }
+    sessionDirectoryMenuLoading = false
+  }
+
+  async function handleSessionDirectoryClick(e, directory) {
+    e.stopPropagation()
+    const targetPath = directory.path
+    const targetSessionId = menuOpenId
+    closeMenu()
+    saveCurrentSessionView()
+    if (categoryTreeElement) directoryTreeScrollTop = categoryTreeElement.scrollTop
+    directoryOpen = true
+    searchOpen = false
+    activeSearchQuery = ''
+    await loadCategoryTree()
+    expandCategoryAncestors(targetPath)
+    selectedCategory = targetPath
+    const restored = await restoreSessionView(categorySessionViews.get(targetPath))
+    if (!restored) await loadSessions()
+    await restoreDirectoryScroll()
+    await scrollCategoryIntoView(targetPath)
+    await scrollSessionIntoView(targetSessionId)
+  }
+
   async function openUserMessageMenu(e, sessionId) {
     e.stopPropagation()
     cancelClose()
     if (userMessageMenuOpen) return
 
+    sessionDirectoryMenuOpen = false
+    executionAnalysisOpen = false
     userMessageMenuOpen = true
     userMessageMenuLoading = true
     userMessageMenuError = ''
@@ -683,7 +994,7 @@
         // 动态添加新会话条目到列表顶部。搜索过滤状态下仅当标题/首条消息命中时显示，
         // 避免破坏当前过滤结果；清空搜索后会正常显示所有会话。
         const searchable = `${title} ${firstMsg || ''} ${sid}`.toLowerCase()
-        if (!activeSearchQuery || searchable.includes(activeSearchQuery.toLowerCase())) {
+        if (!(directoryOpen && selectedCategory) && (!activeSearchQuery || searchable.includes(activeSearchQuery.toLowerCase()))) {
           sessionList = [{ session_id: sid, title }, ...sessionList]
         }
       } else {
@@ -757,6 +1068,51 @@
         {/if}
       </div>
     {/if}
+    <div class="session-dropdown-submenu-row" class:active={sessionDirectoryMenuOpen}>
+        <div class="session-dropdown-item session-dropdown-submenu-label">
+          <span class="menu-emoji">🌲</span>
+          <span>{t('sessionDirectories')}</span>
+        </div>
+        <button
+          class="submenu-more-btn"
+          aria-label={t('sessionDirectories')}
+          aria-haspopup="menu"
+          aria-expanded={sessionDirectoryMenuOpen}
+          onclick={(e) => openSessionDirectoryMenu(e, menuOpenId)}
+          onmouseenter={(e) => openSessionDirectoryMenu(e, menuOpenId)}
+        >···</button>
+      </div>
+      {#if sessionDirectoryMenuOpen}
+        <div
+          class="session-directory-submenu"
+          role="menu"
+          style="width:{submenuPanelWidth(520)}px;"
+        >
+          {#if sessionDirectoryMenuLoading}
+            <div class="user-message-submenu-status">{t('loading')}</div>
+          {:else if sessionDirectoryMenuError}
+            <div class="user-message-submenu-status error">{sessionDirectoryMenuError}</div>
+          {:else if menuSessionDirectories.length === 0}
+            <div class="user-message-submenu-status">{t('noSessionDirectories')}</div>
+          {:else}
+            <div class="user-message-list">
+              {#each menuSessionDirectories as directory (directory.path)}
+                <button
+                  class="user-message-item session-directory-item"
+                  role="menuitem"
+                  title={directory.label}
+                  onclick={(e) => handleSessionDirectoryClick(e, directory)}
+                >
+                  {#each directory.names as name, index}
+                    {#if index > 0}<span class="directory-path-arrow">→</span>{/if}
+                    <span>{name}</span>
+                  {/each}
+                </button>
+              {/each}
+            </div>
+          {/if}
+        </div>
+      {/if}
     <button
       class="session-dropdown-item"
       role="menuitem"
@@ -948,54 +1304,89 @@
       />
     {/if}
   </nav>
-  <!-- 最近会话面板 -->
+  <!-- 最近会话 / 分类目录面板 -->
   <div class="session-panel">
-    <div class="session-panel-title">{t('sessionPanelTitle')}</div>
-    <div class="session-list" onscroll={handleSessionScroll}>
-      {#if sessionLoading && sessionList.length === 0}
-        <div class="session-loading">{t('loading')}</div>
-      {:else if sessionError && sessionList.length === 0}
-        <div class="session-error">{sessionError}</div>
-      {:else if sessionList.length === 0}
-        <div class="session-empty">{t('noSessions')}</div>
-      {:else}
-        {#each sessionList as entry (entry.session_id)}
-          <div
-            class="session-row"
-            ontouchstart={(e) => handleRowTouchStart(e, entry.session_id)}
-            ontouchmove={handleRowTouchMove}
-            ontouchend={(e) => handleRowTouchEnd(e, entry.session_id)}
-          >
-            <button
-              class="session-item {getSessionStatusClass(entry)}"
-              class:active={entry.session_id === currentSession.sessionId}
-              onclick={() => handleSessionClick(entry.session_id)}
-              ontouchend={(e) => { e.preventDefault(); handleSessionClick(entry.session_id) }}
-              title={getSessionDisplay(entry).tooltip}
-            >
-              {getSessionDisplay(entry).display}
-              {#if flightSessions.has(entry.session_id)}<span class="session-flight-check">✓</span>{/if}
-            </button>
-            <button
-              class="session-menu-btn"
-              onclick={(e) => openMenu(e, entry.session_id)}
-              onmouseenter={(e) => handleMenuBtnEnter(e, entry.session_id)}
-              onmouseleave={handleMenuBtnLeave}
-              aria-label={t('deleteSession')}
-            >···</button>
-          </div>
-        {/each}
-        {#if sessionLoadingMore}
-          <div class="session-loading session-loading-more">{t('loading')}</div>
-        {/if}
-        {#if sessionError}
-          <div class="session-error">{sessionError}</div>
-        {/if}
-      {/if}
-      {#if restoreError}
-        <div class="session-error">{restoreError}</div>
-      {/if}
+    <div class="session-panel-heading">
+      <button class="session-panel-title" class:active={!directoryOpen} onclick={showRecentSessions}>{t('sessionPanelTitle')}</button>
+      <button class="directory-toggle" class:active={directoryOpen} onclick={toggleDirectory} title={t('sessionDirectory')}>
+        <span class="directory-glyph">🌲</span>{t('sessionDirectory')}
+      </button>
     </div>
+    {#if directoryOpen}
+      <div class="category-tree" bind:this={categoryTreeElement} onscroll={(e) => { directoryTreeScrollTop = e.currentTarget.scrollTop }}>
+        {#if categoryTreeBuilding}
+          <div class="category-tree-building" role="status">
+            <span class="category-tree-building-dot" aria-hidden="true"></span>
+            {t('sessionTreeBuilding')}
+          </div>
+        {/if}
+        {#if categoryTreeLoading && categoryTree.length === 0}
+          <div class="session-loading">{t('loading')}</div>
+        {:else if categoryTreeError && categoryTree.length === 0}
+          <div class="session-error">{categoryTreeError}</div>
+        {:else if categoryTree.length === 0 && !categoryTreeBuilding}
+          <div class="session-empty">{t('sessionDirectoryEmpty')}</div>
+        {:else}
+          {#each categoryTree as node (node.id)}
+            <SessionCategoryNode
+              node={{ ...node, category: String(node.id) }}
+              expandedPaths={categoryExpandedPaths}
+              {selectedCategory}
+              onToggle={toggleCategoryPath}
+              onSelect={selectCategory}
+            />
+          {/each}
+        {/if}
+      </div>
+    {/if}
+    {#if !directoryOpen || selectedCategory}
+      <div class="session-list" bind:this={sessionListElement} onscroll={handleSessionScroll}>
+        {#if sessionLoading && sessionList.length === 0}
+          <div class="session-loading">{t('loading')}</div>
+        {:else if sessionError && sessionList.length === 0}
+          <div class="session-error">{sessionError}</div>
+        {:else if sessionList.length === 0}
+          <div class="session-empty">{t('noSessions')}</div>
+        {:else}
+          {#each sessionList as entry (entry.session_id)}
+            <div
+              class="session-row"
+              data-session-id={entry.session_id}
+              ontouchstart={(e) => handleRowTouchStart(e, entry.session_id)}
+              ontouchmove={handleRowTouchMove}
+              ontouchend={(e) => handleRowTouchEnd(e, entry.session_id)}
+            >
+              <button
+                class="session-item {getSessionStatusClass(entry)}"
+                class:active={entry.session_id === currentSession.sessionId}
+                onclick={() => handleSessionClick(entry.session_id)}
+                ontouchend={(e) => { e.preventDefault(); handleSessionClick(entry.session_id) }}
+                title={getSessionDisplay(entry).tooltip}
+              >
+                {getSessionDisplay(entry).display}
+                {#if flightSessions.has(entry.session_id)}<span class="session-flight-check">✓</span>{/if}
+              </button>
+              <button
+                class="session-menu-btn"
+                onclick={(e) => openMenu(e, entry.session_id)}
+                onmouseenter={(e) => handleMenuBtnEnter(e, entry.session_id)}
+                onmouseleave={handleMenuBtnLeave}
+                aria-label={t('deleteSession')}
+              >···</button>
+            </div>
+          {/each}
+          {#if sessionLoadingMore}
+            <div class="session-loading session-loading-more">{t('loading')}</div>
+          {/if}
+          {#if sessionError}
+            <div class="session-error">{sessionError}</div>
+          {/if}
+        {/if}
+        {#if restoreError}
+          <div class="session-error">{restoreError}</div>
+        {/if}
+      </div>
+    {/if}
   </div>
 </aside>
 
@@ -1139,15 +1530,72 @@
     display: flex;
     flex-direction: column;
   }
-  .session-panel-title {
-    padding: 6px 0 4px 10px;
+  .session-panel-heading {
+    min-height: 28px;
+    display: flex;
+    align-items: stretch;
+    flex-shrink: 0;
+  }
+  .session-panel-title,
+  .directory-toggle {
+    padding: 6px 8px 4px 10px;
+    border: none;
+    background: none;
+    color: var(--text-secondary);
     font-size: 0.78rem;
     font-weight: 600;
-    color: var(--text-secondary);
-    opacity: 0.45;
     text-transform: uppercase;
     letter-spacing: 0.05em;
+    cursor: pointer;
+    transition: background-color 0.15s, color 0.15s, opacity 0.15s;
+  }
+  .session-panel-title {
+    flex: 1;
+    text-align: left;
+  }
+  .directory-toggle {
+    margin-left: auto;
+    padding-left: 6px;
+  }
+  .session-panel-title:hover,
+  .directory-toggle:hover {
+    color: var(--text);
+    opacity: 1;
+  }
+  .session-panel-title:not(.active),
+  .directory-toggle:not(.active) { opacity: 0.55; }
+  .session-panel-title.active,
+  .directory-toggle.active { color: var(--text); opacity: 1; }
+  .directory-glyph { margin-right: 3px; }
+  .category-tree {
+    max-height: 46%;
+    min-height: 0;
+    overflow-y: auto;
+    border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+    padding: 3px 0;
+    flex-shrink: 1;
+  }
+  .category-tree-building {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 0 6px 10px;
+    font-size: 0.8rem;
+    color: var(--text-secondary);
     flex-shrink: 0;
+  }
+  .category-tree-building-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--accent, #4c9aff);
+    animation: category-tree-pulse 1.2s ease-in-out infinite;
+    flex-shrink: 0;
+  }
+  @keyframes category-tree-pulse {
+    0%, 100% { opacity: 0.35; }
+    50% { opacity: 1; }
   }
   .session-list {
     flex: 1;
@@ -1298,6 +1746,7 @@
     color: var(--text);
   }
   .user-message-submenu,
+  .session-directory-submenu,
   .execution-analysis-submenu {
     position: absolute;
     left: calc(100% + 6px);
@@ -1400,6 +1849,20 @@
   }
   .user-message-item:hover {
     background: var(--border);
+  }
+  .session-directory-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .session-directory-item span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .directory-path-arrow {
+    flex-shrink: 0;
+    color: var(--text-secondary);
   }
   .user-message-submenu-status {
     padding: 14px 12px;

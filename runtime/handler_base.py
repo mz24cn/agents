@@ -72,6 +72,7 @@ _ROUTES: dict[str, list] = {
         (re.compile(r"^/v1/env$"), "_handle_get_env", ()),
         (re.compile(r"^/v1/auth/config$"), "_handle_auth_config_get", ()),
         (re.compile(r"^/v1/setup$"), "_handle_setup_script", ()),
+        (re.compile(r"^/v1/sessions/tree$"), "_handle_session_category_tree", ()),
         (re.compile(r"^/v1/sessions$"), "_handle_list_sessions", ()),
         (re.compile(r"^/v1/sessions/search$"), "_handle_search_sessions", ()),
         (re.compile(r"^/v1/sessions/events$"), "_handle_sessions_events", ()),

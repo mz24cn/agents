@@ -1473,6 +1473,142 @@ class TestSessionAPI:
         assert len(second_page_ids) == 2
         assert set(first_page_ids).isdisjoint(second_page_ids)
 
+    def test_get_sessions_filters_by_terminal_category(self, server_with_env):
+        import json as _json
+
+        chats_dir = server_with_env._context_manager._chats_dir
+        for sid in ("260101_100001", "260101_100002", "260101_100003"):
+            session_dir = os.path.join(chats_dir, sid)
+            os.makedirs(session_dir, exist_ok=True)
+            with open(os.path.join(session_dir, "conversation.json"), "w", encoding="utf-8") as f:
+                _json.dump({"meta": {"session_id": sid}, "messages": []}, f)
+            server_with_env._session_manager.on_session_created(sid)
+
+        index_path = os.path.join(chats_dir, "index.json")
+        with open(index_path, "r", encoding="utf-8") as f:
+            index = _json.load(f)
+        index["260101_100002"]["title"] = "Zulu topic"
+        index["260101_100003"]["title"] = "Alpha topic"
+        with open(index_path, "w", encoding="utf-8") as f:
+            _json.dump(index, f)
+
+        tree = {
+            "version": 1,
+            "tree": [{
+                "id": 1,
+                "name": "Root",
+                "children": [{
+                    "id": 2,
+                    "name": "Group",
+                    "children": [{
+                        "id": 3,
+                        "name": "Leaf",
+                        "category": "1/2/3",
+                        "children": ["260101_100002", "260101_100003"],
+                    }],
+                }, {
+                    "id": 4,
+                    "name": "Direct leaf",
+                    "category": "1/4",
+                    "children": ["260101_100003", "260101_100002"],
+                }],
+            }],
+        }
+        with open(os.path.join(chats_dir, "tree.json"), "w", encoding="utf-8") as f:
+            _json.dump(tree, f)
+
+        status, body = _get(server_with_env, "/v1/sessions?page=1&page_size=100&category=1/2/3")
+        assert status == 200
+        assert body["category"] == "1/2/3"
+        assert [item["session_id"] for item in body["sessions"]] == [
+            "260101_100003",
+            "260101_100002",
+        ]
+
+        # A second-level node may be terminal when a redundant only-child
+        # third level has been collapsed.
+        status, body = _get(server_with_env, "/v1/sessions?category=1/4")
+        assert status == 200
+        assert body["category"] == "1/4"
+        assert [item["session_id"] for item in body["sessions"]] == [
+            "260101_100003",
+            "260101_100002",
+        ]
+
+        # Keep the typo from the original request as a compatibility alias.
+        status, body = _get(server_with_env, "/v1/sessions?categorry=1/2/3")
+        assert status == 200
+        assert [item["session_id"] for item in body["sessions"]] == [
+            "260101_100003",
+            "260101_100002",
+        ]
+
+    def test_get_session_category_tree(self, server_with_env):
+        import json as _json
+
+        chats_dir = server_with_env._context_manager._chats_dir
+        os.makedirs(chats_dir, exist_ok=True)
+        expected = {"version": 1, "tree": [{"id": 1, "name": "Root", "children": []}]}
+        with open(os.path.join(chats_dir, "tree.json"), "w", encoding="utf-8") as f:
+            _json.dump(expected, f)
+
+        status, body = _get(server_with_env, "/v1/sessions/tree")
+        assert status == 200
+        assert body == expected
+
+    def test_session_tree_triggers_background_build_when_missing(self, server_with_env, monkeypatch):
+        """tree.json 缺失且会话数 > 5 时，GET /v1/sessions/tree 返回空树 + building 标记并触发后台构建。"""
+        import json as _json
+
+        import runtime.category_tree_builder as builder
+
+        chats_dir = server_with_env._session_manager.chats_dir
+        os.makedirs(chats_dir, exist_ok=True)
+        for i in range(6):
+            sid = f"260101_90000{i}"
+            session_dir = os.path.join(chats_dir, sid)
+            os.makedirs(session_dir, exist_ok=True)
+            with open(os.path.join(session_dir, "conversation.json"), "w", encoding="utf-8") as f:
+                _json.dump({"meta": {"session_id": sid}, "messages": []}, f)
+            server_with_env._session_manager.on_session_created(sid)
+
+        builder.reset_state_for_tests()
+        monkeypatch.setattr(builder, "RETRY_COOLDOWN_SECONDS", 0.0)
+
+        status, body = _get(server_with_env, "/v1/sessions/tree")
+        assert status == 200
+        assert body["tree"] == []
+        assert body["building"] is True
+
+        # 等待后台构建线程结束，避免测试进程退出时残留
+        import time
+        deadline = time.time() + 60
+        while builder.build_state()["building"] and time.time() < deadline:
+            time.sleep(0.1)
+        assert not builder.build_state()["building"]
+
+    def test_session_tree_no_build_when_too_few_sessions(self, server_with_env):
+        """tree.json 缺失但会话数 <= 5 时不触发构建，响应保持空树原样。"""
+        import json as _json
+
+        import runtime.category_tree_builder as builder
+
+        chats_dir = server_with_env._session_manager.chats_dir
+        os.makedirs(chats_dir, exist_ok=True)
+        for i in range(4):
+            sid = f"260101_91000{i}"
+            session_dir = os.path.join(chats_dir, sid)
+            os.makedirs(session_dir, exist_ok=True)
+            with open(os.path.join(session_dir, "conversation.json"), "w", encoding="utf-8") as f:
+                _json.dump({"meta": {"session_id": sid}, "messages": []}, f)
+            server_with_env._session_manager.on_session_created(sid)
+
+        builder.reset_state_for_tests()
+        status, body = _get(server_with_env, "/v1/sessions/tree")
+        assert status == 200
+        assert body == {"version": 1, "experimental": True, "tree": []}
+        assert not builder.build_state()["building"]
+
     def test_search_sessions_respects_search_max_results_after_full_search(self, server_with_env, monkeypatch):
         """GET /v1/sessions/search 在全量搜索命中后再按 SEARCH_MAX_RESULTS 截断。"""
         import json as _json
