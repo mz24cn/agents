@@ -448,8 +448,39 @@ def call_mcp_ocr_tool(tool_name: str, arguments: dict) -> dict:
 
 # ==================== find_and_click 工具 ====================
 
+
+def _normalize_image_base64(image_file_base64):
+    """
+    校验并规范化 base64 编码的图片字符串。
+
+    Args:
+        image_file_base64: base64 编码的图片内容字符串。
+
+    Returns:
+        解析成功时返回规范化（去除空白字符）后的 base64 字符串；
+        为空或 base64 解析失败时返回 None。
+    """
+    if not image_file_base64 or not isinstance(image_file_base64, str):
+        return None
+    s = ''.join(image_file_base64.split())
+    if not s:
+        return None
+    try:
+        base64.b64decode(s, validate=True)
+        return s
+    except (base64.binascii.Error, ValueError):
+        pass
+    # 兼容去掉 padding 的 base64
+    padded = s + '=' * (-len(s) % 4)
+    try:
+        base64.b64decode(padded, validate=True)
+        return padded
+    except (base64.binascii.Error, ValueError):
+        return None
+
+
 @server.tool()
-def find_and_click(keyword_or_image_file: str, is_image: bool = False) -> str:
+def find_and_click(keyword: str = None, image_file_base64: str = None) -> str:
     """
     查找并点击屏幕上的文字或图片。
 
@@ -459,8 +490,9 @@ def find_and_click(keyword_or_image_file: str, is_image: bool = False) -> str:
     3. 根据返回的坐标执行点击
 
     Args:
-        keyword_or_image_file: 如果 is_image=True，则为小图片路径；否则为要查找的关键词（支持正则）。
-        is_image: 是否为图片模式。True 表示图片模式，False 表示文字模式。
+        keyword: 要查找的关键词（支持正则），文字模式使用。
+        image_file_base64: 小图片的 base64 编码内容，图片模式使用。
+            为空或 None 时按文字模式处理；base64 解析失败时同样按文字模式处理。
 
     Returns:
         JSON 格式的操作结果
@@ -480,17 +512,23 @@ def find_and_click(keyword_or_image_file: str, is_image: bool = False) -> str:
         # 步骤 2: 调用 MCP-OCR 服务的 find_location 工具
         find_args = {"base64_image_big": screenshot_base64}
 
+        # 判断查找模式：image_file_base64 非空且 base64 解析成功 → 图片模式，否则 → 文字模式
+        small_img_base64 = _normalize_image_base64(image_file_base64)
+        if image_file_base64 and small_img_base64 is None:
+            logger.warning("image_file_base64 不是有效的 base64，回退为文字模式")
+        is_image = small_img_base64 is not None
+
         if is_image:
-            if not os.path.exists(keyword_or_image_file):
+            # 图片模式：直接使用调用方传入的 base64 小图片（无需本地文件）
+            find_args["base64_image_small"] = small_img_base64
+        else:
+            # 文字模式：使用 pattern 参数
+            if not keyword:
                 return json.dumps({
                     "success": False,
-                    "message": f"图片文件不存在: {keyword_or_image_file}"
+                    "message": "必须提供 keyword 或有效的 image_file_base64"
                 }, ensure_ascii=False)
-            with open(keyword_or_image_file, 'rb') as f:
-                small_img_bytes = f.read()
-            find_args["base64_image_small"] = base64.b64encode(small_img_bytes).decode('utf-8')
-        else:
-            find_args["pattern"] = keyword_or_image_file
+            find_args["pattern"] = keyword
 
         location_result = call_mcp_ocr_tool("find_location", find_args)
 
@@ -524,7 +562,7 @@ def find_and_click(keyword_or_image_file: str, is_image: bool = False) -> str:
                 "coordinates": {"x": center_x, "y": center_y},
                 "confidence": score,
                 "is_image": is_image,
-                "target": keyword_or_image_file
+                "target": f"image (base64, {len(small_img_base64)} chars)" if is_image else keyword
             }, ensure_ascii=False)
         else:
             return json.dumps({

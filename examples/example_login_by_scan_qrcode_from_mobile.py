@@ -35,6 +35,7 @@
 
 """
 
+import os
 import re
 import sys
 import json
@@ -370,10 +371,19 @@ def android_find_and_click(keyword: str, device_id: str) -> dict:
     """在手机屏幕上查找并点击包含指定文字的元素"""
     return call_tool(
         "mcp-android-use-find_and_click",
-        {"keyword_or_image_file": keyword, "device_id": device_id},
+        {"keyword": keyword, "device_id": device_id},
         format="json",
     )
 
+def android_find_image_and_click(image_file: str, device_id: str) -> dict:
+    """在手机屏幕上查找并点击包含指定图片的元素"""
+    with open(image_file, "rb") as f:
+        image_base64 = base64.b64encode(f.read()).decode("ascii")
+    return call_tool(
+        "mcp-android-use-find_and_click",
+        {"image_file_base64": image_base64, "device_id": device_id},
+        format="json",
+    )
 
 # ============================================================
 # 核心业务逻辑
@@ -552,7 +562,10 @@ def login_video_account_by_scan(
     # 步骤6：点击"+"按钮，然后点击"扫一扫"
     # --------------------------------------------------------
     print("[步骤6/7] 点击微信右上角 '+' 按钮...")
-    android_find_and_click("\\+", scan_device_id)
+    wechat_button_png = os.path.abspath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "resources", "wechat_button.png")
+    )
+    android_find_image_and_click(wechat_button_png, scan_device_id)
     time.sleep(1)
 
     print("   点击 '扫一扫'...")
