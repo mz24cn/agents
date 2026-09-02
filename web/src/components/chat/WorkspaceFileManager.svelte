@@ -1261,12 +1261,11 @@
   // - 单击：选中当前文件，取消其他
   // - Ctrl+点击：切换选中状态（添加/移除）
   // - Shift+点击：范围选择（从上次选中到当前）
-  function handleFileClick(file, event) {
-    if (file.is_dir) return
-    
+ function handleFileClick(file, event) {
+    // 目录与文件一样：单击仅选中（双击才进入目录，见 handleDoubleClick）
     if (event.shiftKey && lastSelectedFile) {
-      // Shift+点击：范围选择
-      const currentFiles = displayedFiles.filter(f => !f.is_dir)
+     // Shift+点击：范围选择（含目录，与 Windows 资源管理器一致）
+      const currentFiles = displayedFiles
       const lastIdx = currentFiles.findIndex(f => f.path === lastSelectedFile.path)
       const currentIdx = currentFiles.findIndex(f => f.path === file.path)
       if (lastIdx !== -1 && currentIdx !== -1) {
@@ -2182,7 +2181,7 @@
                   class:outside-workspace={!file.is_dir && !isAllowedFileArea(file.path)}
                   class:dragging={dragState.isDragging && dragState.dragPaths.includes(file.path)}
                   draggable="true"
-                  onclick={(e) => file.is_dir ? enterDirectory(file.path) : handleFileClick(file, e)}
+                 onclick={(e) => handleFileClick(file, e)}
                   ondblclick={() => handleDoubleClick(file)}
                   oncontextmenu={(e) => showContextMenu(e, file)}
                   ondragstart={(e) => handleFileDragStart(e, file)}
@@ -2206,7 +2205,7 @@
                     class:outside-workspace={!file.is_dir && !isAllowedFileArea(file.path)}
                     class:dragging={dragState.isDragging && dragState.dragPaths.includes(file.path)}
                     draggable="true"
-                    onclick={(e) => file.is_dir ? enterDirectory(file.path) : handleFileClick(file, e)}
+                   onclick={(e) => handleFileClick(file, e)}
                     ondblclick={() => handleDoubleClick(file)}
                     oncontextmenu={(e) => showContextMenu(e, file)}
                     ondragstart={(e) => handleFileDragStart(e, file)}
@@ -2900,7 +2899,14 @@
     background: var(--bg-secondary);
   }
 
-  .tree-node.active {
+ .tree-node.active {
+    background: var(--bg-secondary);
+    /* 用 outline（内缩 1px）画边框：不改变布局，且与工作区背景特效叠加不冲突 */
+    outline: 1px solid var(--primary);
+    outline-offset: -1px;
+  }
+
+  .tree-node.active:hover {
     background: var(--bg-secondary);
   }
 
