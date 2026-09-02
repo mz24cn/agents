@@ -1409,6 +1409,72 @@ class TestSessionAPI:
         assert len(body["messages"]) == 1
         assert body["messages"][0]["role"] == "user"
 
+    def test_get_session_serves_raw_file_bytes(self, server_with_env):
+        """GET /v1/sessions/{session_id} 返回 conversation.json 原始字节（无 load+dump 往返）。"""
+        import http.client
+        import json as _json
+        chats_dir = server_with_env._context_manager._chats_dir
+        session_id = "2026-02-02_00-00-00"
+        session_dir = os.path.join(chats_dir, session_id)
+        os.makedirs(session_dir, exist_ok=True)
+        conv_data = {
+            "meta": {"session_id": session_id},
+            "messages": [{"role": "user", "content": "你好", "timestamp": "2026-02-02T00:00:00"}],
+        }
+        raw = _json.dumps(conv_data, ensure_ascii=False, indent=2).encode("utf-8")
+        with open(os.path.join(session_dir, "conversation.json"), "wb") as f:
+            f.write(raw)
+
+        conn = http.client.HTTPConnection("127.0.0.1", server_with_env.port, timeout=10)
+        conn.request("GET", f"/v1/sessions/{session_id}")
+        resp = conn.getresponse()
+        body = resp.read()
+        headers = {k.lower(): v for k, v in resp.getheaders()}
+        conn.close()
+
+        assert resp.status == 200
+        assert body == raw
+        assert headers.get("etag")
+        assert headers.get("cache-control") == "no-cache"
+
+    def test_get_session_gzip_and_304_revalidation(self, server_with_env):
+        """Accept-Encoding: gzip 返回压缩响应；携带 ETag 重验时返回 304 零字节响应。"""
+        import gzip as _gzip
+        import http.client
+        import json as _json
+        chats_dir = server_with_env._context_manager._chats_dir
+        session_id = "2026-03-03_00-00-00"
+        session_dir = os.path.join(chats_dir, session_id)
+        os.makedirs(session_dir, exist_ok=True)
+        conv_data = {
+            "meta": {"session_id": session_id},
+            "messages": [{"role": "user", "content": "x" * 4096}],
+        }
+        raw = _json.dumps(conv_data, ensure_ascii=False).encode("utf-8")
+        with open(os.path.join(session_dir, "conversation.json"), "wb") as f:
+            f.write(raw)
+
+        conn = http.client.HTTPConnection("127.0.0.1", server_with_env.port, timeout=10)
+        conn.request("GET", f"/v1/sessions/{session_id}", headers={"Accept-Encoding": "gzip"})
+        resp = conn.getresponse()
+        body = resp.read()
+        headers = {k.lower(): v for k, v in resp.getheaders()}
+        assert resp.status == 200
+        assert headers.get("content-encoding") == "gzip"
+        assert headers.get("vary") == "Accept-Encoding"
+        assert _gzip.decompress(body) == raw
+        assert len(body) < len(raw)
+        etag = headers.get("etag")
+        assert etag
+
+        # 重新校验：If-None-Match → 304，零字节响应体
+        conn.request("GET", f"/v1/sessions/{session_id}", headers={"If-None-Match": etag})
+        resp2 = conn.getresponse()
+        body2 = resp2.read()
+        assert resp2.status == 304
+        assert body2 == b""
+        conn.close()
+
     def test_get_session_log_dir_returns_path(self, server_with_env):
         """GET /v1/sessions/{session_id}/log-dir 返回 conversation.json 所在目录。"""
         import json as _json

@@ -158,6 +158,15 @@ _STATIC_GZIP_CACHE: dict = {}
 _STATIC_GZIP_CACHE_LOCK = threading.Lock()
 _STATIC_GZIP_CACHE_MAX = 64
 
+# Session conversation.json files are rewritten by the incremental persister
+# while a session is active, so every write orphans the previous cache entry.
+# Use a small dedicated cache (oldest-first eviction) so that re-downloading
+# an unchanged session (e.g. switching away and back to it) reuses the
+# compressed bytes while the memory footprint stays bounded.
+_SESSION_GZIP_CACHE: dict = {}
+_SESSION_GZIP_CACHE_LOCK = threading.Lock()
+_SESSION_GZIP_CACHE_MAX = 8
+
 # Files at or above this size are streamed with zero-copy sendfile instead of
 # being read into memory (and never gzip-compressed in memory).
 _SENDFILE_THRESHOLD = 256 * 1024  # 256 KB
@@ -672,74 +681,80 @@ class HandlerBaseMixin:
             except OSError:
                 pass  # connection likely broken; handler will close it
 
-    def _handle_static_file(self) -> None:
-        """Serve static files from the web/dist directory.
+    def _gzip_cached(
+        self,
+        data: bytes,
+        file_path: str,
+        stat_info: os.stat_result,
+        cache: dict,
+        cache_lock: threading.Lock,
+        cache_max: int,
+    ) -> tuple[bytes, bool]:
+        """Gzip-compress *data* and cache the result keyed by file identity.
 
-        Supports:
-        - gzip compression for text-based MIME types (when client
-          advertises ``Accept-Encoding: gzip``).
-        - Conditional requests via ``If-None-Match`` (ETag) and
-          ``If-Modified-Since`` → 304 Not Modified.
-        - Byte-range requests (RFC 7233) → 206 Partial Content, enabling
-          e.g. pdf.js chunked PDF loading and video seeking.
-        - Zero-copy ``sendfile`` streaming for large files.
-        - Cache-Control with a long max-age for content-hashed assets
-          and a short (or ``no-cache``) lifetime for HTML / non-hashed.
+        The cache key ``(file_path, mtime_ns, size)`` means any rewrite of
+        the file (new mtime/size) automatically invalidates the entry, so
+        repeat requests for an unchanged file reuse the compressed bytes
+        without re-compressing. Returns ``(compressed, True)`` when gzip
+        shrank the payload, otherwise ``(data, False)`` so the caller
+        serves the raw bytes.
         """
-        static_dir = self.server.static_dir  # type: ignore[attr-defined]
-        if static_dir is None:
-            self._send_json_error(404, f"Not found: {self.path}")
-            return
+        cache_key = (file_path, stat_info.st_mtime_ns, stat_info.st_size)
+        with cache_lock:
+            compressed = cache.get(cache_key)
+        if compressed is None:
+            buf = io.BytesIO()
+            with gzip.GzipFile(fileobj=buf, mode="wb", mtime=stat_info.st_mtime) as gz:
+                gz.write(data)
+            compressed = buf.getvalue()
+            if len(compressed) >= len(data):
+                # Not worth compressing — serve raw bytes (and do not cache).
+                return data, False
+            with cache_lock:
+                if len(cache) >= cache_max:
+                    # Evict the oldest entry (dicts keep insertion order) so
+                    # a steady stream of rewrites cannot flush live entries.
+                    cache.pop(next(iter(cache)), None)
+                cache[cache_key] = compressed
+        return compressed, True
 
-        # Strip query string
-        url_path = self.path.split("?")[0]
+    def _serve_file_response(
+        self,
+        file_path: str,
+        mime_type: str,
+        *,
+        cache_control: Optional[str] = None,
+        disposition: Optional[str] = None,
+        gzip_cache: Optional[tuple] = None,
+    ) -> None:
+        """Serve a local file with the full static-file treatment.
 
-        # Try to serve the exact file first
-        if url_path == "/":
-            file_path = os.path.join(static_dir, "index.html")
-        else:
-            file_path = os.path.join(static_dir, url_path.lstrip("/"))
+        Shared by the static-file endpoint and the session download endpoint
+        (``GET /v1/sessions/{id}`` serves the conversation.json bytes
+        directly). Provides:
 
-        # Prevent path traversal
-        file_path = os.path.realpath(file_path)
-        if not file_path.startswith(os.path.realpath(static_dir)):
-            self._send_json_error(403, "Forbidden")
-            return
+        - conditional requests via ``If-None-Match`` (ETag) and
+          ``If-Modified-Since`` → 304 Not Modified (cache reuse);
+        - byte-range requests (RFC 7233) → 206 Partial Content, enabling
+          e.g. pdf.js chunked PDF loading and video seeking;
+        - gzip compression for text-based MIME types (when client
+          advertises ``Accept-Encoding: gzip``), with the compressed bytes
+          cached per (path, mtime, size);
+        - zero-copy ``sendfile`` streaming for large files.
 
-        if not os.path.isfile(file_path):
-            # Fall back to index.html for SPA client-side routing
-            file_path = os.path.join(static_dir, "index.html")
-
-        if not os.path.isfile(file_path):
-            self._send_json_error(404, f"Not found: {self.path}")
-            return
-
-        # ---------- file metadata ----------
+        ``gzip_cache`` selects the compressed-bytes cache as
+        ``(dict, lock, max_entries)``; it defaults to the static-file cache.
+        """
         try:
             stat_info = os.stat(file_path)
         except OSError:
             self._send_json_error(500, "Failed to stat file")
             return
 
-        mime_type, _ = mimetypes.guess_type(file_path)
-        mime_type = mime_type or "application/octet-stream"
         last_modified = datetime.datetime.fromtimestamp(
             stat_info.st_mtime, tz=datetime.timezone.utc
         )
         etag = self._file_etag(file_path, stat_info)
-
-        # ---------- cache-control ----------
-        filename = os.path.basename(file_path)
-        if self._is_hashed_asset(filename):
-            # Content-hashed assets are immutable → 1 year
-            cache_control = "public, max-age=31536000, immutable"
-        elif filename == "index.html" or mime_type == "text/html":
-            # HTML should always be revalidated (SPA entry point)
-            cache_control = "no-cache"
-        else:
-            # Other assets: cache for 1 hour, allow stale for 1 day
-            cache_control = "public, max-age=3600, stale-while-revalidate=86400"
-
         last_modified_str = last_modified.strftime("%a, %d %b %Y %H:%M:%S GMT")
 
         # ---------- conditional request ----------
@@ -770,6 +785,7 @@ class HandlerBaseMixin:
             etag=etag,
             last_modified=last_modified_str,
             cache_control=cache_control,
+            disposition=disposition,
         ):
             return
 
@@ -797,25 +813,16 @@ class HandlerBaseMixin:
 
         do_gzip = False
         if data is not None and gzip_candidate:
-            cache_key = (file_path, stat_info.st_mtime_ns, stat_info.st_size)
-            with _STATIC_GZIP_CACHE_LOCK:
-                compressed = _STATIC_GZIP_CACHE.get(cache_key)
-            if compressed is None:
-                buf = io.BytesIO()
-                with gzip.GzipFile(fileobj=buf, mode="wb", mtime=stat_info.st_mtime) as gz:
-                    gz.write(data)
-                compressed = buf.getvalue()
-                if len(compressed) < len(data):
-                    with _STATIC_GZIP_CACHE_LOCK:
-                        if len(_STATIC_GZIP_CACHE) >= _STATIC_GZIP_CACHE_MAX:
-                            _STATIC_GZIP_CACHE.clear()
-                        _STATIC_GZIP_CACHE[cache_key] = compressed
-                else:
-                    # Not worth compressing — fall through and serve raw bytes.
-                    compressed = None
-            if compressed is not None:
-                data = compressed
-                do_gzip = True
+            if gzip_cache is None:
+                gzip_cache = (
+                    _STATIC_GZIP_CACHE,
+                    _STATIC_GZIP_CACHE_LOCK,
+                    _STATIC_GZIP_CACHE_MAX,
+                )
+            cache, cache_lock, cache_max = gzip_cache
+            data, do_gzip = self._gzip_cached(
+                data, file_path, stat_info, cache, cache_lock, cache_max
+            )
 
         # ---------- response ----------
         self._send_full_file(
@@ -825,9 +832,63 @@ class HandlerBaseMixin:
             etag=etag,
             last_modified=last_modified_str,
             cache_control=cache_control,
+            disposition=disposition,
             body=data,
             gzip=do_gzip,
         )
+
+    def _handle_static_file(self) -> None:
+        """Serve static files from the web/dist directory.
+
+        Path resolution (exact file → SPA index.html fallback, traversal
+        guard) and the Cache-Control policy live here; the shared transport
+        (304 revalidation, 206 ranges, gzip + compressed-bytes cache,
+        sendfile) is ``_serve_file_response``.
+        """
+        static_dir = self.server.static_dir  # type: ignore[attr-defined]
+        if static_dir is None:
+            self._send_json_error(404, f"Not found: {self.path}")
+            return
+
+        # Strip query string
+        url_path = self.path.split("?")[0]
+
+        # Try to serve the exact file first
+        if url_path == "/":
+            file_path = os.path.join(static_dir, "index.html")
+        else:
+            file_path = os.path.join(static_dir, url_path.lstrip("/"))
+
+        # Prevent path traversal
+        file_path = os.path.realpath(file_path)
+        if not file_path.startswith(os.path.realpath(static_dir)):
+            self._send_json_error(403, "Forbidden")
+            return
+
+        if not os.path.isfile(file_path):
+            # Fall back to index.html for SPA client-side routing
+            file_path = os.path.join(static_dir, "index.html")
+
+        if not os.path.isfile(file_path):
+            self._send_json_error(404, f"Not found: {self.path}")
+            return
+
+        mime_type, _ = mimetypes.guess_type(file_path)
+        mime_type = mime_type or "application/octet-stream"
+
+        # ---------- cache-control ----------
+        filename = os.path.basename(file_path)
+        if self._is_hashed_asset(filename):
+            # Content-hashed assets are immutable → 1 year
+            cache_control = "public, max-age=31536000, immutable"
+        elif filename == "index.html" or mime_type == "text/html":
+            # HTML should always be revalidated (SPA entry point)
+            cache_control = "no-cache"
+        else:
+            # Other assets: cache for 1 hour, allow stale for 1 day
+            cache_control = "public, max-age=3600, stale-while-revalidate=86400"
+
+        self._serve_file_response(file_path, mime_type, cache_control=cache_control)
 
     def _send_304(
         self,

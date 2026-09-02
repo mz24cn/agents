@@ -28,6 +28,11 @@ import uuid
 from runtime.agent_manager import validate_agent_id
 from runtime.common import session_timestamp
 from runtime.context_manager import JournalConflictError
+from runtime.handler_base import (
+    _SESSION_GZIP_CACHE,
+    _SESSION_GZIP_CACHE_LOCK,
+    _SESSION_GZIP_CACHE_MAX,
+)
 from runtime.models import ModelConfig, ToolConfig
 from runtime.skill_manager import SkillManager
 
@@ -1637,21 +1642,62 @@ class HandlerApiMixin:
     def _handle_get_session(self, session_id: str) -> None:
         """GET /v1/sessions/{session_id} — 返回指定会话的完整消息记录。
 
-        成功返回后实现"查看即已读"：如果该 session 处于 unread 状态，
-        清除 unread 并广播 idle。
+        响应体即 conversation.json 的原始字节（该接口本质上就是下载会话
+        文件），复用静态文件管线（_serve_file_response）：
+
+        - 客户端声明 Accept-Encoding: gzip 时 gzip 压缩，压缩字节按
+          (path, mtime, size) 缓存并在重复请求间复用；
+        - ETag（mtime/size/inode）+ If-None-Match → 304 Not Modified，
+          没有新轮次的会话再次打开时是零字节响应。
+
+        由此跳过旧的 json.load → json.dumps 往返，多轮（多 MB）会话既省
+        服务端 CPU 也省网络带宽；conversation.json 通过 tmp 文件 + rename
+        原子写入，被服务的文件总是完整版本。
         """
         session_manager = self.server.session_manager  # type: ignore[attr-defined]
-        try:
-            data = session_manager.get_session(session_id)
-        except FileNotFoundError:
+        session_id = urllib.parse.unquote(session_id)
+        if (
+            not session_id
+            or os.sep in session_id
+            or (os.altsep and os.altsep in session_id)
+            or ".." in session_id
+        ):
+            self._send_json_error(400, f"非法的 session_id: {session_id}")
+            return
+
+        conv_path = os.path.join(session_manager.chats_dir, session_id, "conversation.json")
+
+        if not os.path.isfile(conv_path):
             # conversation.json 不存在（人为删除或磁盘故障），顺手清理 index
             session_manager.remove_from_index(session_id)
             self._send_json_error(404, f"Session not found: {session_id}")
             return
-        except ValueError as exc:
-            self._send_json_error(400, f"Invalid conversation format: {exc}")
+
+        # 廉价的顶层健全性检查：文件必须是一个 JSON 对象开头。
+        # 故意不做完整解析——它的开销和旧的 load+dump 往返相当；更深层的
+        # 校验交给客户端的 JSON.parse（解析失败时前端会显示错误提示）。
+        try:
+            with open(conv_path, "rb") as fh:
+                head = fh.read(4096)
+        except OSError:
+            self._send_json_error(500, f"Failed to read session: {session_id}")
             return
-        self._send_json_response(200, data)
+        if not head.lstrip().startswith(b"{"):
+            self._send_json_error(
+                400, "Invalid conversation format: top-level JSON object expected"
+            )
+            return
+
+        self._serve_file_response(
+            conv_path,
+            "application/json; charset=utf-8",
+            cache_control="no-cache",
+            gzip_cache=(
+                _SESSION_GZIP_CACHE,
+                _SESSION_GZIP_CACHE_LOCK,
+                _SESSION_GZIP_CACHE_MAX,
+            ),
+        )
 
     def _handle_session_log_dir(self, session_id: str) -> None:
         """GET /v1/sessions/{session_id}/log-dir — 返回该会话日志目录的绝对路径。
