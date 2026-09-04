@@ -12,6 +12,7 @@ The tool configs and callables are aggregated and registered by
 ``runtime.builtin_tools`` (the facade module).
 """
 
+import base64
 import fnmatch
 import gzip
 import hashlib
@@ -1958,8 +1959,13 @@ def _exec_shell(command: str, timeout: Optional[int] = None, background: bool = 
 
     Args:
         command: The shell command to execute.
-        timeout: Optional timeout in seconds. If None, uses EXEC_DEFAULT_TIMEOUT.
-        background: If True and platform is Windows, run command in background using Start-Process.
+      timeout: Optional timeout in seconds. If None, uses EXEC_DEFAULT_TIMEOUT.
+        background: If True and platform is Windows, run command in background using
+            Start-Process. Note: the process is spawned directly with no shell, so
+            shell syntax (>, &&, |, %VAR%) is not interpreted. To use shell
+            features, wrap the whole command, e.g. `cmd /c "..."` or
+            `powershell -NoProfile -Command "..."`. The spawned process is
+            detached: its output is not captured and the timeout does not apply.
 
     Returns:
         JSON string with keys: exit_code, stdout, stderr, truncated on success.
@@ -1980,26 +1986,43 @@ def _exec_shell(command: str, timeout: Optional[int] = None, background: bool = 
 
         if background:
             try:
-                parts = shlex.split(command)
+              # Split like a Windows command line: quote characters only
+                # group characters (and are stripped) while backslashes stay
+                # literal. shlex.split() in POSIX mode eats backslashes as
+                # escape characters; posix=False keeps quote characters in
+                # the tokens, which breaks the spawned command line later.
+                lexer = shlex.shlex(command, posix=True)
+                lexer.whitespace_split = True
+                lexer.escape = ""
+                parts = list(lexer)
                 if not parts:
                     return json.dumps({"error": "EmptyCommand", "message": "Command must not be empty"})
 
                 program = parts[0]
                 arguments = parts[1:] if len(parts) > 1 else []
 
-                # Escape single quotes for PowerShell (double them)
-                def escape_ps(s):
-                    return s.replace("'", "''")
+               # Ship the Start-Process script via -EncodedCommand (base64
+                # UTF-16LE). The encoded payload contains no quotes or
+                # backslashes, so neither the cmd layer nor the
+                # powershell -Command layer can mangle the program name or the
+                # arguments.
+                def ps_quote(s):
+       # Single-quoted PowerShell string literal; double inner quotes.
+                    return "'" + s.replace("'", "''") + "'"
 
-                # Build Start-Process command via PowerShell
+                def ps_arg(a):
+                    # Start-Process joins ArgumentList entries with plain
+                    # spaces, so re-quote tokens that contain spaces (their
+                    # grouping quotes were stripped by the splitter) to keep
+                    # them a single argument for the spawned program.
+                    return ps_quote('"%s"' % a if " " in a else a)
+
+                script = "Start-Process -WindowStyle Hidden -FilePath " + ps_quote(program)
                 if arguments:
-                    arg_str = " ".join(arguments)
-                    ps_command = f"Start-Process -WindowStyle Hidden '{escape_ps(program)}' -ArgumentList '{escape_ps(arg_str)}'"
-                else:
-                    ps_command = f"Start-Process -WindowStyle Hidden '{escape_ps(program)}'"
+                    script += " -ArgumentList " + ", ".join(ps_arg(a) for a in arguments)
 
-                # Wrap in powershell.exe -Command
-                command = f"powershell.exe -Command \"{ps_command}\""
+                encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+                command = f"powershell.exe -NoProfile -EncodedCommand {encoded}"
             except ValueError as e:
                 return json.dumps({"error": "CommandParseError", "message": f"Failed to parse command: {e}"})
 
@@ -2158,8 +2181,14 @@ EXEC_SHELL_TOOL_CONFIG = ToolConfig(
 # Add background parameter only on Windows
 if sys.platform == "win32":
     EXEC_SHELL_TOOL_CONFIG.parameters["properties"]["background"] = {
-        "type": "boolean",
-        "description": "Run command in background mode.",
+     "type": "boolean",
+        "description": (
+            "Run command in background mode. The process is spawned directly with "
+            "no shell, so shell syntax (>, &&, |, %VAR%) is not interpreted; to use "
+            "shell features, wrap the whole command, e.g. cmd /c \"...\" or "
+            "powershell -NoProfile -Command \"...\". The process is detached: its "
+            "output is not captured and the timeout does not apply."
+        ),
         "default": False,
     }
 
