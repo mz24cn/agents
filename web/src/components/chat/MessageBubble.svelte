@@ -289,12 +289,9 @@
         <CopyButton getText={() => msg.content ?? ''} />
       </div>
     {:else if msg.role === 'assistant'}
-      {#if matchedAgent}
-          <IconDisplay 
-            value={matchedAgent.avatar || '🤖'} 
-            class="agent-avatar" 
-            size={32}
-          />
+     {#if matchedAgent}
+        <!-- 与紧凑模式（MessageList 的 agent-block-label）保持一致：size=18，图片固定 18x18，emoji 随字号 -->
+        <IconDisplay value={matchedAgent.avatar || '🤖'} size={18} />
       {/if}
       <span class="agent-name">{displayName}</span>
       <div class="role-actions">
@@ -540,13 +537,7 @@
     margin-right: auto;
     font-size: 0.9rem;
   }
-  .agent-avatar {
-    width: 18px;
-    height: 18px;
-    border-radius: 50%;
-    object-fit: cover;
-  }
-  .role-actions {
+ .role-actions {
     display: flex;
     align-items: center;
     gap: 4px;

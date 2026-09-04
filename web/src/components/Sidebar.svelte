@@ -879,10 +879,14 @@
     }
   }
 
-  async function handleDeleteSession(e, sid) {
+ async function handleDeleteSession(e, sid) {
     e.stopPropagation()
     closeMenu()
-    if (!confirm(t('confirmDeleteSession', { id: sid }))) return
+   // 优先展示会话标题，标题缺失或与 id 相同时回退为只显示 id
+    const entry = sessionList.find(s => s.session_id === sid)
+    const title = entry?.title
+    const hasTitle = !!(title && title !== sid)
+    if (!confirm(t(hasTitle ? 'confirmDeleteSession' : 'confirmDeleteSessionById', { title, id: sid }))) return
     try {
       await sessions.delete(sid)
       sessionList = sessionList.filter(s => s.session_id !== sid)
@@ -1027,10 +1031,7 @@
   >
     <div class="session-dropdown-submenu-row" class:active={userMessageMenuOpen}>
       <div class="session-dropdown-item session-dropdown-submenu-label">
-        <svg class="menu-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-          <path d="M2.5 3.5h11v7h-7l-3.5 3v-3h-.5z"/>
-          <path d="M5 6h6M5 8h4"/>
-        </svg>
+       <span class="menu-emoji">💬</span>
         <span>{t('userMessages')}</span>
       </div>
       <button
@@ -1118,11 +1119,7 @@
       role="menuitem"
       onclick={(e) => handleGenerateTitle(e, menuOpenId)}
     >
-      <svg class="menu-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-        <path d="M2 4h12M2 8h10M2 12h8"/>
-        <circle cx="13" cy="12" r="2.5" fill="none"/>
-        <line x1="14.5" y1="13.5" x2="16" y2="15"/>
-      </svg>
+     <span class="menu-emoji">🖋️</span>
       {t('generateTitle')}
     </button>
     <button
@@ -1130,12 +1127,7 @@
       role="menuitem"
       onclick={(e) => handleRegenerateSummary(e, menuOpenId)}
     >
-      <svg class="menu-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-        <path d="M1 2v4h4"/>
-        <path d="M14 8A6 6 0 0 0 3.2 4.8L1 6"/>
-        <path d="M15 14v-4h-4"/>
-        <path d="M2 8a6 6 0 0 0 10.8 3.2L15 10"/>
-      </svg>
+     <span class="menu-emoji">📝</span>
       {t('regenerateSummary')}
     </button>
     <button
@@ -1148,9 +1140,7 @@
     </button>
     <div class="session-dropdown-submenu-row" class:active={executionAnalysisOpen}>
       <div class="session-dropdown-item session-dropdown-submenu-label">
-        <svg class="menu-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-          <path d="M2 13.5h12M3 11V7M6.5 11V3M10 11V5M13 11V1.5"/>
-        </svg>
+      <span class="menu-emoji">📊</span>
         <span>{t('executionAnalysis')}</span>
       </div>
       <button
@@ -1230,10 +1220,7 @@
       role="menuitem"
       onclick={(e) => handleOpenSessionLogDir(e, menuOpenId)}
     >
-      <svg class="menu-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-        <path d="M2 2.5h4l1.5 2H14a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1v-9a1 1 0 0 1 1-1z"/>
-        <path d="M2 8.5h12"/>
-      </svg>
+    <span class="menu-emoji">📂</span>
       {t('openSessionLogDir')}
     </button>
     <button
@@ -1251,13 +1238,7 @@
       role="menuitem"
       onclick={(e) => handleDeleteSession(e, menuOpenId)}
     >
-      <svg class="menu-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-        <polyline points="3,4 13,4"/>
-        <path d="M5 4V3a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v1"/>
-        <rect x="4" y="4" width="8" height="9" rx="1"/>
-        <line x1="6.5" y1="7" x2="6.5" y2="11"/>
-        <line x1="9.5" y1="7" x2="9.5" y2="11"/>
-      </svg>
+    <span class="menu-emoji">🗑️</span>
       {t('deleteSession')}
     </button>
   </div>
@@ -1878,17 +1859,18 @@
   .session-dropdown-danger:hover {
     background-color: rgba(229, 62, 62, 0.08);
   }
-  .menu-icon {
-    width: 14px;
-    height: 14px;
-    flex-shrink: 0;
-  }
-  .menu-check { margin-left: auto; font-weight: 700; color: #22c55e; }
+ .menu-check { margin-left: auto; font-weight: 700; color: #22c55e; }
   .session-flight-check { margin-left: .35rem; color: #22c55e; font-weight: 700; }
 
   .menu-emoji {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 14px;
+    height: 14px;
+    flex-shrink: 0;
     font-size: 14px;
-    margin-right: 2px;
+    line-height: 1;
   }
   .session-loading, .session-empty, .session-error {
     padding: 6px 0 6px 10px;
