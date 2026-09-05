@@ -521,8 +521,8 @@ def test_post_env_response_matches_file_content(operations: list) -> None:
              patch("runtime.server._PROMPT_TEMPLATES_PATH", prompt_templates_path), \
              patch("runtime.server._DATA_DIR", tmpdir), \
              patch("runtime.server._ENV_PATH", env_path):
-            srv = RuntimeHTTPServer(runtime, host="127.0.0.1", port=0, chats_dir=chats_dir)
-            srv.start_background()
+            srv = RuntimeHTTPServer(runtime, chats_dir=chats_dir)
+            srv.start_background(host="127.0.0.1", port=0)
             try:
                 port = srv.port
                 for key, value in operations:

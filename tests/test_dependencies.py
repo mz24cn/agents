@@ -27,7 +27,12 @@ RUNTIME_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "runtime"
 # Python 3.10+ exposes stdlib_module_names
 STDLIB_MODULES: frozenset[str] = frozenset(sys.stdlib_module_names)
 
-_PLATFORM_SPECIFIC_ALLOWLIST: frozenset[str] = frozenset({"winpty"})
+# Optional third-party dependencies: each is imported only inside a
+# try/except ImportError block and used purely as a best-effort feature
+# (winpty: Windows PTY support; cryptography: generating a self-signed
+# fallback certificate for https when no certificate files are provided).
+# The service keeps working without any of them installed.
+_OPTIONAL_DEPENDENCIES: frozenset[str] = frozenset({"winpty", "cryptography"})
 
 
 def _collect_py_files() -> list[str]:
@@ -73,7 +78,7 @@ def _is_allowed_module(top_level: str) -> bool:
         return True
     if top_level in STDLIB_MODULES:
         return True
-    if top_level in _PLATFORM_SPECIFIC_ALLOWLIST:
+    if top_level in _OPTIONAL_DEPENDENCIES:
         return True
     return False
 

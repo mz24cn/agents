@@ -114,11 +114,9 @@ def server(mock_runtime, chats_tmp, tmp_path):
          patch("runtime.server._DATA_DIR", str(tmp_path)):
         srv = RuntimeHTTPServer(
             mock_runtime,
-            host="127.0.0.1",
-            port=0,
             chats_dir=chats_tmp,
         )
-        srv.start_background()
+        srv.start_background(host="127.0.0.1", port=0)
         yield srv
         srv.stop()
 

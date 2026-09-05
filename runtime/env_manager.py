@@ -464,7 +464,6 @@ set -eu
 
 AGENTS_HOME="$PWD/agents"
 : "${AGENTS_RUNTIME_DIR:=$HOME/.agents_runtime}"
-: "${AGENTS_PORT:=7988}"
 : "${START_AGENTS:=background}"
 
 TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/agent-service-setup.XXXXXX")
@@ -487,17 +486,19 @@ rm -rf "$AGENTS_HOME/web/dist"
 cat > "$PWD/start-agent-service.sh" <<'SH'
 #!/bin/sh
 set -eu
-: "${AGENTS_PORT:=7988}"
+# 访问地址由 app.py 启动时解析：AGENTS_URL（如 https://domain:7988/，
+# 可在 web 界面的环境变量设置中修改，重启后生效），默认 http://0.0.0.0:7988。
+: "${AGENTS_URL:=}"
 : "${AGENTS_RUNTIME_DIR:=$HOME/.agents_runtime}"
 : "${AGENTS_LOG:=$AGENTS_RUNTIME_DIR/server.log}"
 : "${START_AGENTS:=background}"
-export AGENTS_RUNTIME_DIR AGENTS_LOG
+export AGENTS_URL AGENTS_RUNTIME_DIR AGENTS_LOG
 mkdir -p "$AGENTS_RUNTIME_DIR"
 AGENTS_DIR="$(cd "$(dirname "$0")/agents" >/dev/null 2>&1 && pwd)"
 
 case "$START_AGENTS" in
 background)
-  nohup python3 "$AGENTS_DIR/app.py" "0.0.0.0:${AGENTS_PORT}" >> "$AGENTS_LOG" 2>&1 &
+ nohup python3 "$AGENTS_DIR/app.py" >> "$AGENTS_LOG" 2>&1 &
   pid=$!
   # server.pid 由 app.py 在启动时写入（os.getpid()），这里等待其出现后读取，
   # 确保返回的是 python 进程的真实 PID，且与 PID 文件内容一致。
@@ -512,7 +513,7 @@ background)
   echo "$pid"
   ;;
 foreground)
-  exec python3 "$AGENTS_DIR/app.py" "0.0.0.0:${AGENTS_PORT}" 2>&1 | tee -a "$AGENTS_LOG"
+ exec python3 "$AGENTS_DIR/app.py" 2>&1 | tee -a "$AGENTS_LOG"
   ;;
 none)
   exit 0
@@ -626,7 +627,7 @@ exit 0
         start_bat = (
             "@echo off\r\n"
             "setlocal enabledelayedexpansion\r\n"
-            "if not defined AGENTS_PORT set AGENTS_PORT=7988\r\n"
+            "rem 访问地址由 app.py 启动时解析: AGENTS_URL（如 https://domain:7988/），默认 http://0.0.0.0:7988\r\n"
             "if not defined AGENTS_RUNTIME_DIR set \"AGENTS_RUNTIME_DIR=%USERPROFILE%\\.agents_runtime\"\r\n"
             "if not defined AGENTS_LOG set \"AGENTS_LOG=%AGENTS_RUNTIME_DIR%\\server.log\"\r\n"
             "if not defined START_AGENTS set START_AGENTS=background\r\n"
@@ -642,7 +643,7 @@ exit 0
             "exit /b 2\r\n"
             "\r\n"
             ":foreground\r\n"
-            "python \"%AGENTS_HOME%\\app.py\" 0.0.0.0:%AGENTS_PORT%\r\n"
+            "python \"%AGENTS_HOME%\\app.py\"\r\n"
             "exit /b %ERRORLEVEL%\r\n"
             "\r\n"
             ":none\r\n"
@@ -654,7 +655,7 @@ exit 0
             "del \"%AGENTS_RUNTIME_DIR%\\server.pid\" 2>nul\r\n"
             "set \"PS_START=%TEMP%\\agent-start-%RANDOM%-%RANDOM%.ps1\"\r\n"
             "> \"%PS_START%\" echo $ErrorActionPreference = 'Stop'\r\n"
-            ">> \"%PS_START%\" echo $p = Start-Process -FilePath 'python' -ArgumentList '\"%AGENTS_HOME%\\app.py\"','0.0.0.0:%AGENTS_PORT%' -RedirectStandardOutput '%AGENTS_LOG%' -RedirectStandardError '%AGENTS_LOG%.err' -PassThru -WindowStyle Hidden\r\n"
+            ">> \"%PS_START%\" echo $p = Start-Process -FilePath 'python' -ArgumentList '\"%AGENTS_HOME%\\app.py\"' -RedirectStandardOutput '%AGENTS_LOG%' -RedirectStandardError '%AGENTS_LOG%.err' -PassThru -WindowStyle Hidden\r\n"
             ">> \"%PS_START%\" echo $p.Id\r\n"
             "powershell -NoProfile -ExecutionPolicy Bypass -File \"%PS_START%\"\r\n"
             "set \"START_RC=%ERRORLEVEL%\"\r\n"
@@ -714,8 +715,7 @@ exit 0
             "$ErrorActionPreference = 'Stop'\n"
             "\n"
             "$AgentServiceHome = Join-Path $PWD 'agents'\n"
-            "if (-not $env:AGENTS_RUNTIME_DIR) { $env:AGENTS_RUNTIME_DIR = Join-Path $HOME '.agents_runtime' }\n"
-            "if (-not $env:AGENTS_PORT) { $env:AGENTS_PORT = '7988' }\n"
+           "if (-not $env:AGENTS_RUNTIME_DIR) { $env:AGENTS_RUNTIME_DIR = Join-Path $HOME '.agents_runtime' }\n"
             "if (-not $env:START_AGENTS) { $env:START_AGENTS = 'background' }\n"
             "\n"
             "$tmpDir = Join-Path ([IO.Path]::GetTempPath()) ('agent-setup-' + [guid]::NewGuid().ToString('N').Substring(0,8))\n"

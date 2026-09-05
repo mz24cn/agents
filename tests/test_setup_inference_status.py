@@ -39,8 +39,8 @@ def server(runtime, tmp_path):
          patch("runtime.server._TOOLS_PATH", tools_path), \
          patch("runtime.server._PROMPT_TEMPLATES_PATH", prompt_templates_path), \
          patch("runtime.server._DATA_DIR", str(tmp_path)):
-        srv = RuntimeHTTPServer(runtime, host="127.0.0.1", port=0)
-        srv.start_background()
+        srv = RuntimeHTTPServer(runtime)
+        srv.start_background(host="127.0.0.1", port=0)
         yield srv
         srv.stop()
 

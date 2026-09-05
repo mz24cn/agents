@@ -253,10 +253,31 @@ Key features:
 **6. Start the HTTP Server**
 
 ```bash
-python app.py              # default: 0.0.0.0:7988
-python app.py 7988         # custom port
-python app.py 0.0.0.0:9000 # custom host and port
+python app.py              # from AGENTS_URL; default http://0.0.0.0:7988
+python app.py 7988         # custom port (overrides AGENTS_URL)
+python app.py 0.0.0.0:9000 # custom host and port (overrides AGENTS_URL)
 ```
+
+The access address comes from the `AGENTS_URL` environment variable
+(e.g. `https://domain:7988/`), parsed into protocol, domain and port
+when the server starts:
+
+- a domain of `localhost` binds to `127.0.0.1`; a valid IP literal binds
+  to that IP; any other domain name binds to `0.0.0.0`;
+- an `https` protocol enables TLS. Certificates live in `DATA_DIR/certs`
+  and are loaded per SNI domain as `{domain}.pem` / `{domain}.key`, so one
+  server can serve multiple domain certificates. Unmatched SNI names fall
+  back to a default certificate (`default.pem` or a generated
+  self-signed one) — browsers show a certificate warning, but the site
+  stays reachable;
+- with no `AGENTS_URL` and no command-line argument, the defaults are
+ `http` + `0.0.0.0` + `7988` (listening on all interfaces so the service
+  is reachable from other machines right after installation; set
+  `AGENTS_URL=http://localhost:7988/` to restrict access to loopback).
+
+`AGENTS_URL` can be changed in the web UI's environment settings (written
+to `env.json` and synced into the process environment at startup); the
+change takes effect after a restart.
 
 ### HTTP API Reference
 

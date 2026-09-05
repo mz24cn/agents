@@ -58,9 +58,9 @@ def server(runtime, tmp_path):
     with patch("runtime.server._MODELS_PATH", models_path), \
          patch("runtime.server._TOOLS_PATH", tools_path), \
          patch("runtime.server._PROMPT_TEMPLATES_PATH", prompt_templates_path), \
-         patch("runtime.server._DATA_DIR", str(tmp_path)):
-        srv = RuntimeHTTPServer(runtime, host="127.0.0.1", port=0)
-        srv.start_background()
+        patch("runtime.server._DATA_DIR", str(tmp_path)):
+        srv = RuntimeHTTPServer(runtime)
+        srv.start_background(host="127.0.0.1", port=0)
         yield srv
         srv.stop()
 
@@ -1055,8 +1055,8 @@ def server_with_session(runtime, tmp_path):
          patch("runtime.server._TOOLS_PATH", tools_path), \
          patch("runtime.server._PROMPT_TEMPLATES_PATH", prompt_templates_path), \
          patch("runtime.server._DATA_DIR", str(tmp_path)):
-        srv = RuntimeHTTPServer(runtime, host="127.0.0.1", port=0, chats_dir=chats_dir)
-        srv.start_background()
+        srv = RuntimeHTTPServer(runtime, chats_dir=chats_dir)
+        srv.start_background(host="127.0.0.1", port=0)
         yield srv, srv._context_manager
         srv.stop()
 
@@ -1297,8 +1297,8 @@ def server_with_env(runtime, tmp_path):
          patch("runtime.server._PROMPT_TEMPLATES_PATH", prompt_templates_path), \
          patch("runtime.server._DATA_DIR", str(tmp_path)), \
          patch("runtime.server._ENV_PATH", env_path):
-        srv = RuntimeHTTPServer(runtime, host="127.0.0.1", port=0, chats_dir=chats_dir)
-        srv.start_background()
+        srv = RuntimeHTTPServer(runtime, chats_dir=chats_dir)
+        srv.start_background(host="127.0.0.1", port=0)
         yield srv
         srv.stop()
 

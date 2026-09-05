@@ -239,10 +239,24 @@ result = runtime.infer(InferenceRequest(
 **6. 启动 HTTP 服务**
 
 ```bash
-python app.py              # 默认：0.0.0.0:7988
-python app.py 7988         # 自定义端口
-python app.py 0.0.0.0:9000 # 自定义主机和端口
+python app.py              # 由 AGENTS_URL 决定，默认 http://0.0.0.0:7988
+python app.py 7988         # 自定义端口（重载 AGENTS_URL）
+python app.py 0.0.0.0:9000 # 自定义主机和端口（重载 AGENTS_URL）
 ```
+
+访问地址由环境变量 `AGENTS_URL` 决定（形如 `https://domain:7988/`），
+服务启动时解析出协议、域名和端口：
+
+- 域名是 `localhost` 时绑定 `127.0.0.1`；是有效 IP 时绑定该 IP；
+  其他域名绑定 `0.0.0.0`（对外提供访问）；
+- 协议为 `https` 时启用 TLS。证书放在 `DATA_DIR/certs` 目录，
+  基于 SNI 按域名加载 `{domain}.pem` / `{domain}.key`，一个服务可挂多个域名证书；
+  SNI 未命中时使用兜底证书（`default.pem`，或自动生成的自签名证书），
+  浏览器会提示证书问题，但站点仍可访问；
+- 未设置 `AGENTS_URL` 且无命令行参数时，默认 `http` + `0.0.0.0` + `7988`（监听所有网卡，装好即可从外部访问；如需仅回环访问可设置 `AGENTS_URL=http://localhost:7988/`）。
+
+`AGENTS_URL` 可以在 Web 界面的环境变量设置中修改（写入 `env.json`，
+启动时同步到进程环境），重启后生效。
 
 ### HTTP API 接口
 

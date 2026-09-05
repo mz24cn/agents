@@ -1,12 +1,22 @@
 """Entry point for the Agent Service server.
 
-Default host/port come from the AGENTS_HOST / AGENTS_PORT env vars
-(falling back to 0.0.0.0 / 7988). A positional argument overrides them.
+The address the server listens on is resolved by RuntimeHTTPServer.start():
+
+  1. A positional command-line argument (``host:port`` or ``port``) is the
+     final override;
+  2. otherwise the AGENTS_URL environment variable (e.g.
+     ``https://domain:7988/``) is parsed into protocol/domain/port;
+ 3. otherwise the defaults http + 0.0.0.0 + 7988 are used.
+
+AGENTS_URL may have been written into env.json from the web UI and synced
+into the process environment by EnvManager at startup, so changing it there
+takes effect after a restart. An https protocol enables TLS; certificates
+are loaded from DATA_DIR/certs as {domain}.pem / {domain}.key based on SNI.
 
 Usage:
-    python app.py              # default host/port (env or fallback)
-    python app.py 7988         # custom port
-    python app.py 0.0.0.0:7988 # custom host and port
+   python app.py              # AGENTS_URL or default (http://0.0.0.0:7988)
+    python app.py 7988         # custom port (overrides AGENTS_URL)
+    python app.py 0.0.0.0:7988 # custom host and port (overrides AGENTS_URL)
 """
 
 import os
@@ -54,9 +64,11 @@ def _remove_pid_file() -> None:
         pass
 
 
-host = os.environ.get("AGENTS_HOST", "").strip() or "0.0.0.0"
-port = int(os.environ.get("AGENTS_PORT", "").strip() or "7988")
-
+# 可选的位置参数（host:port 或 port），作为 start() 的最终重载值；
+# 不再读取 AGENTS_HOST / AGENTS_PORT，访问地址由 start() 里的
+# AGENTS_URL（或默认值）决定。
+host = None
+port = None
 if len(sys.argv) > 1:
     arg = sys.argv[1]
     parts = arg.split(":", 1)
@@ -82,16 +94,16 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, _handle_signal)
 
     _write_pid_file()
-    server = RuntimeHTTPServer(host=host, port=port)
+    server = RuntimeHTTPServer()
 
     try:
-        server.start()
+        server.start(host=host, port=port)
     except KeyboardInterrupt:
         pass
     finally:
         # 优雅收尾：先通知进行中的推理线程终止并落盘，再关闭服务器。
-        # 推理线程是 daemon 线程，直接 stop() 会在进程退出时被强行终止，
-        # 可能丢掉最后一轮对话输出。这里 set 所有 active_streams 的
+        # 推理线程是 daemon 线程，直接 stop() 会在进程退出时被强制终止，
+        # 可能丢失最后一轮对话输出。这里 set 所有 active_streams 的
         # cancel_event 并短暂等待，让推理线程走正常的最终持久化分支。
         # （配合推理过程中的增量持久化，最多丢失正在执行的最后一轮。）
         try:

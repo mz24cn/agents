@@ -651,8 +651,8 @@ def continue_server(tmp_path):
          patch("runtime.server._TOOLS_PATH", str(tmp_path / "tools.json")), \
          patch("runtime.server._PROMPT_TEMPLATES_PATH", str(tmp_path / "prompt_templates.json")), \
          patch("runtime.server._DATA_DIR", str(tmp_path)):
-        srv = RuntimeHTTPServer(runtime, host="127.0.0.1", port=0, chats_dir=str(tmp_path / "chat_data"))
-        srv.start_background()
+        srv = RuntimeHTTPServer(runtime, chats_dir=str(tmp_path / "chat_data"))
+        srv.start_background(host="127.0.0.1", port=0)
         yield srv
         srv.stop()
 

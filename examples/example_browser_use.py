@@ -98,12 +98,12 @@ def run_server():
         tool_registry=tool_registry,
         mcp_manager=mcp,
     )
-    server = RuntimeHTTPServer(runtime, host=SERVER_HOST, port=SERVER_PORT)
+    server = RuntimeHTTPServer(runtime)
 
     print(f">>> Server 启动在 http://{SERVER_HOST}:{SERVER_PORT}")
     print(">>> 按 Ctrl+C 停止\n")
     try:
-        server.start()
+        server.start(host=SERVER_HOST, port=SERVER_PORT)
     except KeyboardInterrupt:
         print("\n>>> 正在关闭...")
         server.stop()
