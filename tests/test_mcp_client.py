@@ -576,6 +576,9 @@ class TestHTTPDeadline:
         monkeypatch.setenv("TOOL_EXEC_TIMEOUT", "0.3")
 
         httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _SlowSSEHandler)
+        # Daemon request threads: the handler streams until the client
+        # disconnects; a late teardown must never block interpreter exit.
+        httpd.daemon_threads = True
         server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         server_thread.start()
         url = f"http://127.0.0.1:{httpd.server_address[1]}/mcp"
@@ -597,6 +600,7 @@ class TestHTTPDeadline:
 
         httpd = http.server.ThreadingHTTPServer(
             ("127.0.0.1", 0), _FastEchoHandler)
+        httpd.daemon_threads = True
         server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         server_thread.start()
         url = f"http://127.0.0.1:{httpd.server_address[1]}/mcp"

@@ -66,6 +66,7 @@ class MCPClientManager:
         )
         self._loop_thread.start()
         # Start background reaper thread if timeout is enabled
+        self._reaper_stop = threading.Event()
         if idle_timeout > 0:
             self._start_reaper()
 
@@ -80,8 +81,9 @@ class MCPClientManager:
 
     def _reaper_loop(self) -> None:
         """Check every 60 s and terminate processes idle longer than idle_timeout."""
-        while True:
-            time.sleep(60)
+        while not self._reaper_stop.is_set():
+            if self._reaper_stop.wait(60):
+                break
             now = time.monotonic()
             for server_name, conn in list(self._connections.items()):
                 if conn["type"] != "stdio":
@@ -183,6 +185,7 @@ class MCPClientManager:
 
     def _http_reinitialize_and_retry(
         self, conn: dict, body: bytes, reason: str, socket_timeout: float | None,
+        abort_event: "threading.Event | None" = None,
     ) -> dict:
         """Re-initialize the HTTP connection and retry the original request once.
 
@@ -217,7 +220,7 @@ class MCPClientManager:
                             conn["session_id"] = new_session_id2
                         ct2 = resp2.headers.get("Content-Type", "")
                         if "text/event-stream" in ct2:
-                            return self._read_sse_stream(resp2)
+                            return self._read_sse_stream(resp2, abort_event)
                         return json.loads(resp2.read().decode("utf-8"))
                 except Exception:
                     pass  # fall through to full re-initialize below
@@ -239,7 +242,7 @@ class MCPClientManager:
                         conn["session_id"] = new_session_id2
                     ct2 = resp2.headers.get("Content-Type", "")
                     if "text/event-stream" in ct2:
-                        return self._read_sse_stream(resp2)
+                        return self._read_sse_stream(resp2, abort_event)
                     return json.loads(resp2.read().decode("utf-8"))
             except Exception as retry_exc:
                 conn["connected"] = False
@@ -253,12 +256,17 @@ class MCPClientManager:
         Enforces the shared TOOL_EXEC_TIMEOUT as a HARD wall-clock deadline
         for the ENTIRE exchange -- connect, read, SSE streaming and the
         session re-initialize retry all count against it.  The request runs
-        on a dedicated worker thread and the caller waits at most
+        on a dedicated daemon worker thread and the caller waits at most
         TOOL_EXEC_TIMEOUT seconds, so a server that keeps an SSE stream open
         (progress lines) or trickles a plain JSON body forever can never pin
         the calling thread indefinitely.  On timeout a RuntimeError is
-        raised; the orphaned worker is a daemon thread and dies at its next
-        socket timeout.
+        raised; the abandoned worker is signalled via an abort event, closes
+        its socket and exits, so no thread or connection is leaked.
+
+        A ThreadPoolExecutor must not be used for the deadline worker: its
+        workers are NON-daemon and interpreter shutdown joins them forever
+        when the exchange hangs (a permanently streaming server keeps
+        feeding the socket, so the worker's read never even times out).
 
         When the guard is disabled (TOOL_EXEC_TIMEOUT empty / <= 0) the
         request runs inline without a deadline, matching the historical
@@ -280,29 +288,41 @@ class MCPClientManager:
         t = timeout if timeout is not None else _get_tool_exec_timeout()
         if t is None:
             return self._http_send_impl(conn, request, socket_timeout=None)
-        # NOTE: never use `with ThreadPoolExecutor(...)` here -- its
-        # shutdown(wait=True) would block until the hung exchange finishes,
-        # recreating the very hang we guard against.
-        executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="mcp-http")
-        future = executor.submit(self._http_send_impl, conn, request, socket_timeout=t)
-        try:
-            return future.result(timeout=t)
-        except concurrent.futures.TimeoutError:
-            future.cancel()
+        done = threading.Event()
+        abort = threading.Event()
+        state: dict = {}
+
+        def _target() -> None:
+            try:
+                state["value"] = self._http_send_impl(
+                    conn, request, socket_timeout=t, abort_event=abort)
+            except BaseException as exc:  # re-raised below
+                state["error"] = exc
+            finally:
+                done.set()
+
+        worker = threading.Thread(
+            target=_target, name="mcp-http-deadline", daemon=True)
+        worker.start()
+        if not done.wait(t):
+            abort.set()
             raise RuntimeError(
                 f"MCP HTTP tool call timed out after {t:g}s"
             ) from None
-        finally:
-            # wait=False: never block on a hung worker; it is a daemon thread
-            # and dies at its next socket timeout.
-            executor.shutdown(wait=False, cancel_futures=True)
+        if "error" in state:
+            raise state["error"]
+        return state["value"]
 
     def _http_send_impl(
         self, conn: dict, request: dict, socket_timeout: float | None,
+        abort_event: "threading.Event | None" = None,
     ) -> dict:
         """Actual HTTP exchange; runs on the caller thread when the deadline
-        guard is disabled, or on the deadline worker thread otherwise."""
+        guard is disabled, or on the deadline worker thread otherwise.
+
+        *abort_event*, when set (deadline reached), makes the SSE reader
+        stop and close the socket so the worker thread can terminate.
+        """
         url = conn["url"]
         headers = dict(conn.get("headers") or {})
         headers.setdefault("Content-Type", "application/json")
@@ -321,7 +341,7 @@ class MCPClientManager:
                     conn["session_id"] = new_session_id
                 content_type = resp.headers.get("Content-Type", "")
                 if "text/event-stream" in content_type:
-                    return self._read_sse_stream(resp)
+                    return self._read_sse_stream(resp, abort_event)
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             # 404 with stale session_id means the server restarted or the
@@ -329,40 +349,55 @@ class MCPClientManager:
             # then retry the original request exactly once.
             if exc.code == 404 and session_id:
                 return self._http_reinitialize_and_retry(
-                    conn, body, "session expired (404)", socket_timeout)
+                    conn, body, "session expired (404)", socket_timeout,
+                    abort_event)
             raise RuntimeError(f"MCP HTTP error {exc.code}: {exc.reason}") from exc
         except urllib.error.URLError as exc:
             # Connection-level error (e.g. server restarted, connection reset).
             # Re-initialize once so subsequent calls transparently reconnect.
             return self._http_reinitialize_and_retry(
-                conn, body, f"connection error: {exc.reason}", socket_timeout)
+                conn, body, f"connection error: {exc.reason}", socket_timeout,
+                abort_event)
 
-    def _read_sse_stream(self, resp) -> dict:
+    def _read_sse_stream(self, resp, abort_event: "threading.Event | None" = None) -> dict:
         """Read an SSE stream line-by-line and return the first JSON-RPC response.
 
         Returns as soon as a ``data:`` line containing a JSON-RPC response
         (with an ``id`` field) is found, without consuming the rest of the
         stream.  This avoids blocking indefinitely on long-lived SSE connections
         that servers keep open for server-initiated messages.
+
+        When *abort_event* is set (the wall-clock deadline fired on the
+        calling thread), the read stops and the socket is closed so the
+        worker thread can terminate instead of leaking.
         """
         import io
         # resp is a http.client.HTTPResponse; wrap in a text reader
         reader = io.TextIOWrapper(resp, encoding="utf-8", errors="replace")
-        for raw_line in reader:
-            line = raw_line.strip()
-            if not line.startswith("data:"):
-                continue
-            data_str = line[len("data:"):].strip()
-            if not data_str or data_str == "[DONE]":
-                continue
+        try:
+            for raw_line in reader:
+                if abort_event is not None and abort_event.is_set():
+                    raise RuntimeError("MCP SSE read aborted (deadline reached)")
+                line = raw_line.strip()
+                if not line.startswith("data:"):
+                    continue
+                data_str = line[len("data:"):].strip()
+                if not data_str or data_str == "[DONE]":
+                    continue
+                try:
+                    parsed = json.loads(data_str)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                # Skip notifications (no "id") - only return actual responses
+                if "id" in parsed or "error" in parsed:
+                    return parsed
+        finally:
             try:
-                parsed = json.loads(data_str)
-            except (json.JSONDecodeError, ValueError):
-                continue
-            # Skip notifications (no "id") — only return actual responses
-            if "id" in parsed or "error" in parsed:
-                return parsed
+                reader.close()
+            except OSError:
+                pass
         raise RuntimeError("No valid JSON-RPC response found in SSE stream")
+
 
     def _http_delete_session(self, conn: dict) -> None:
         """Send DELETE to release the server-side session (Streamable HTTP spec)."""
@@ -820,6 +855,10 @@ class MCPClientManager:
         """Reset the singleton instance (for testing purposes only)."""
         inst = cls._instance
         if inst is not None:
+            # Stop the idle reaper so it does not outlive the instance.
+            stop = getattr(inst, "_reaper_stop", None)
+            if stop is not None:
+                stop.set()
             # Stop the dedicated event loop so the background thread exits.
             loop = getattr(inst, "_loop", None)
             if loop is not None and loop.is_running():

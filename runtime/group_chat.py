@@ -28,7 +28,7 @@ import logging
 import os
 import queue
 import re
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+import threading
 from dataclasses import dataclass
 from typing import Generator, Optional
 
@@ -835,7 +835,7 @@ def _run_group_chat_stream_gen(
         Each message is tagged with ``agent_id`` and ``name``.
         The final yield is always a ``usage`` message if any exists.
     """
-    # Group-chat agents run in ThreadPoolExecutor workers.  Capture the HTTP
+    # Group-chat agents run in dedicated worker threads.  Capture the HTTP
     # thread's complete request context before entering those workers; otherwise
     # session_dir / user_message_timestamp / workspace are absent and file tools
     # silently create a stateless (non-visible) journal.
@@ -1144,7 +1144,6 @@ def _run_group_chat_stream_gen(
         # --- parallel execution for this round ----------------------------
         round_collected: list[Message] = []
 
-        executor = ThreadPoolExecutor(max_workers=max_workers)
         # Submit each agent's generator via a queue so the main thread can
         # yield messages as they come in.  Include agent_id in every event so
         # timeout handling can distinguish completed from still-running agents.
@@ -1198,58 +1197,67 @@ def _run_group_chat_stream_gen(
                 restore_request_context({})
                 _msg_queue.put((agent_id, None))  # sentinel: this agent is done
 
-        futures = {
-            executor.submit(_agent_worker, aid): aid
-            for aid in pending_mentioned
-        }
+        # Plain daemon threads (not a ThreadPoolExecutor): executor workers
+        # are joined at interpreter shutdown, so an abandoned agent worker
+        # (hung model call after a client disconnect) would block process
+        # exit.  Daemon workers die with the process.
+        # Keep the MAX_GROUP_CHAT_WORKERS concurrency cap (previously
+        # enforced by the executor size).
+        _parallel_slots = threading.BoundedSemaphore(max(1, max_workers))
 
-        try:
-            remaining = _agent_count
-            completed_agent_ids: set[str] = set()
-            while remaining > 0:
-                # Collect messages from queue until an agent finishes or
-                # we hit the heartbeat interval (for keep-alive).
-                got_any = False
-                while True:
-                    try:
-                        event_agent_id, msg = _msg_queue.get(
-                            timeout=_GROUP_CHAT_HEARTBEAT_INTERVAL)
-                    except queue.Empty:
-                        # Timeout or heartbeat interval reached
-                        if cancel_event is not None and cancel_event.is_set():
-                            remaining = 0
-                        else:
-                            if sse_heartbeat is not None:
-                                try:
-                                    sse_heartbeat()
-                                except Exception:
-                                    pass
-                        break
+        for aid in pending_mentioned:
+            def _bounded_worker(_aid=aid):
+                with _parallel_slots:
+                    _agent_worker(_aid)
+            worker = threading.Thread(
+                target=_bounded_worker,
+                name="group-chat-agent", daemon=True)
+            worker.start()
+
+        remaining = _agent_count
+        completed_agent_ids: set[str] = set()
+        while remaining > 0:
+            # Collect messages from queue until an agent finishes or
+            # we hit the heartbeat interval (for keep-alive).
+            got_any = False
+            while True:
+                try:
+                    event_agent_id, msg = _msg_queue.get(
+                        timeout=_GROUP_CHAT_HEARTBEAT_INTERVAL)
+                except queue.Empty:
+                    # Timeout or heartbeat interval reached
+                    if cancel_event is not None and cancel_event.is_set():
+                        remaining = 0
                     else:
-                        if isinstance(msg, _NestedStreamFrame):
-                            got_any = True
-                            if sse_callback is not None:
-                                try:
-                                    sse_callback(msg.frame)
-                                except Exception:
-                                    pass
-                            continue
-                        if msg is None:
-                            if event_agent_id not in completed_agent_ids:
-                                completed_agent_ids.add(event_agent_id)
-                                remaining -= 1
-                            if remaining <= 0:
-                                got_any = True
-                            break
-                        got_any = True
-                        round_collected.append(msg)
-                        yield msg
-
-                if remaining <= 0:
+                        if sse_heartbeat is not None:
+                            try:
+                                sse_heartbeat()
+                            except Exception:
+                                pass
                     break
+                else:
+                    if isinstance(msg, _NestedStreamFrame):
+                        got_any = True
+                        if sse_callback is not None:
+                            try:
+                                sse_callback(msg.frame)
+                            except Exception:
+                                pass
+                        continue
+                    if msg is None:
+                        if event_agent_id not in completed_agent_ids:
+                            completed_agent_ids.add(event_agent_id)
+                            remaining -= 1
+                        if remaining <= 0:
+                            got_any = True
+                        break
+                    got_any = True
+                    round_collected.append(msg)
+                    yield msg
 
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+            if remaining <= 0:
+                break
+
 
         all_collected.extend(round_collected)
 

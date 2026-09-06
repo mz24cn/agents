@@ -704,7 +704,12 @@ class RuntimeHTTPServer:
         host/port/protocol overrides as start().
         """
         self._prepare_server(host=host, port=port, protocol=protocol)
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        # poll_interval keeps shutdown() responsive: the default 0.5 s poll
+        # made every stop() wait up to half a second for the loop to notice.
+        self._thread = threading.Thread(
+            target=lambda: self._server.serve_forever(poll_interval=0.05),
+            daemon=True,
+        )
         self._thread.start()
 
     def stop(self) -> None:

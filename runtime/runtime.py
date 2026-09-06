@@ -9,6 +9,7 @@ import concurrent.futures
 import datetime
 import json
 import logging
+import queue
 import os
 import re
 import socket
@@ -1607,97 +1608,104 @@ class Runtime:
 
         for batch_start in range(0, len(runnable_calls), max_workers):
             batch = runnable_calls[batch_start:batch_start + max_workers]
-            executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=len(batch),
-                thread_name_prefix="fn-tool",
-            )
-            futures = {}
-            submitted_at = {}
-            execution_started = {}
+            # Plain daemon worker threads (not a ThreadPoolExecutor):
+            # executor workers are joined at interpreter shutdown
+            # (concurrent.futures.thread._python_exit), so an abandoned hung
+            # callable would block process exit for the whole remaining task
+            # duration -- or forever.  Daemon workers die with the process.
+            finished: "queue.Queue" = queue.Queue()
+            specs: dict[int, tuple] = {}
+            submitted_at: dict[int, float] = {}
+            execution_started: dict[int, str] = {}
             execution_started_lock = threading.Lock()
-            try:
-                for spec in batch:
-                    (
-                        _index, _tool_name, arguments, _tool_use_id,
-                        _tool_config, _compat_notes, callable_fn,
-                        caller_ctx, _timeout,
-                    ) = spec
 
-                    def _run_with_context(
-                        fn=callable_fn,
-                        fn_arguments=arguments,
-                        ctx=caller_ctx,
-                        call_index=_index,
-                    ):
-                        restore_request_context(ctx)
-                        try:
-                            # Capture the real execution start in the worker,
-                            # immediately before entering the tool callable.
-                            # Thread-pool scheduling time must not be attributed
-                            # to the tool itself.
-                            with execution_started_lock:
-                                execution_started[call_index] = _now_precise_iso()
-                            return fn(**fn_arguments)
-                        finally:
-                            _thread_local.__dict__.clear()
+            def _finalize(index: int, result_str: str) -> None:
+                (
+                    _index, tool_name, _arguments, tool_use_id,
+                    tool_config, compat_notes, _callable_fn,
+                    _caller_ctx, _timeout,
+                ) = specs[index]
+                result_str = self._postprocess_tool_result(
+                    result_str, compat_notes,
+                )
+                with execution_started_lock:
+                    started = execution_started.get(index)
+                ready_messages[index] = self._tool_message(
+                    tool_name,
+                    tool_use_id,
+                    result_str,
+                    tool_config,
+                    timestamp=timestamp,
+                    started_at=started,
+                )
 
-                    future = executor.submit(_run_with_context)
-                    futures[future] = spec
-                    submitted_at[future] = time.monotonic()
+            for spec in batch:
+                (
+                    index, _tool_name, arguments, _tool_use_id,
+                    _tool_config, _compat_notes, callable_fn,
+                    caller_ctx, _timeout,
+                ) = spec
+                specs[index] = spec
 
-                pending = set(futures)
-                while pending:
-                    done, _ = concurrent.futures.wait(
-                        pending,
-                        timeout=0.05,
-                        return_when=concurrent.futures.FIRST_COMPLETED,
-                    )
-                    now = time.monotonic()
-                    expired = {
-                        future for future in pending
-                        if futures[future][-1] is not None
-                        and now - submitted_at[future] >= futures[future][-1]
-                    }
-
-                    for future in done | expired:
-                        if future not in pending:
-                            continue
-                        pending.remove(future)
-                        (
-                            index, tool_name, _arguments, tool_use_id,
-                            tool_config, compat_notes, _callable_fn,
-                            _caller_ctx, timeout,
-                        ) = futures[future]
-                        if future in expired and not future.done():
-                            future.cancel()
-                            result_str = (
-                                f"Error: tool '{tool_config.name}' timed out "
-                                f"after {timeout:g}s"
-                            )
-                        else:
-                            try:
-                                result = future.result()
-                                result_str = str(result) if result is not None else ""
-                            except Exception as exc:
-                                result_str = f"Error: {type(exc).__name__}: {exc}"
-                        result_str = self._postprocess_tool_result(
-                            result_str, compat_notes,
-                        )
+                def _run_with_context(
+                    fn=callable_fn,
+                    fn_arguments=arguments,
+                    ctx=caller_ctx,
+                    call_index=index,
+                ):
+                    restore_request_context(ctx)
+                    try:
+                        # Capture the real execution start in the worker,
+                        # immediately before entering the tool callable.
+                        # Worker scheduling time must not be attributed
+                        # to the tool itself.
                         with execution_started_lock:
-                            started = execution_started.get(index)
-                        ready_messages[index] = self._tool_message(
-                            tool_name,
-                            tool_use_id,
-                            result_str,
-                            tool_config,
-                            timestamp=timestamp,
-                            started_at=started,
-                        )
-                    yield from _yield_ready_in_order()
-            finally:
-                # Never wait for timed-out/hung callables. Running Python
-                # threads cannot be force-cancelled and may finish later.
-                executor.shutdown(wait=False, cancel_futures=True)
+                            execution_started[call_index] = _now_precise_iso()
+                        result = fn(**fn_arguments)
+                    except BaseException as exc:
+                        finished.put((call_index, "error", exc))
+                    else:
+                        finished.put((call_index, "ok", result))
+                    finally:
+                        # Do not leak this session's context into the thread.
+                        _thread_local.__dict__.clear()
+
+                worker = threading.Thread(
+                    target=_run_with_context, name="fn-tool", daemon=True)
+                worker.start()
+                submitted_at[index] = time.monotonic()
+
+            pending = set(specs)
+            while pending:
+                # Drain every completion accumulated so far.
+                while True:
+                    try:
+                        index, kind, payload = finished.get(timeout=0.05)
+                    except queue.Empty:
+                        break
+                    if index not in pending:
+                        continue
+                    pending.remove(index)
+                    if kind == "ok":
+                        result_str = str(payload) if payload is not None else ""
+                    else:
+                        result_str = f"Error: {type(payload).__name__}: {payload}"
+                    _finalize(index, result_str)
+
+                now = time.monotonic()
+                expired = {
+                    index for index in pending
+                    if specs[index][-1] is not None
+                    and now - submitted_at[index] >= specs[index][-1]
+                }
+                for index in expired:
+                    pending.remove(index)
+                    _finalize(
+                        index,
+                        f"Error: tool '{specs[index][4].name}' timed out "
+                        f"after {specs[index][-1]:g}s",
+                    )
+                yield from _yield_ready_in_order()
 
         yield from _yield_ready_in_order()
 
@@ -1880,21 +1888,31 @@ class Runtime:
                 # Do not leak this session's context into a reused worker.
                 _thread_local.__dict__.clear()
 
-        executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="fn-tool")
-        future = executor.submit(_run_with_context)
-        try:
-            result = future.result(timeout=timeout)
-            return str(result) if result is not None else ""
-        except concurrent.futures.TimeoutError:
-            future.cancel()
+        # Plain daemon worker instead of a ThreadPoolExecutor: executor
+        # workers are joined at interpreter shutdown (_python_exit), so an
+        # abandoned hung callable would block process exit for the whole
+        # remaining task duration (or forever).  A daemon worker simply
+        # dies with the process.
+        done = threading.Event()
+        state: dict = {}
+
+        def _worker() -> None:
+            try:
+                state["value"] = _run_with_context()
+            except BaseException as exc:  # re-raised below
+                state["error"] = exc
+            finally:
+                done.set()
+
+        worker = threading.Thread(target=_worker, name="fn-tool", daemon=True)
+        worker.start()
+        if not done.wait(timeout):
             return (f"Error: tool '{tool_config.name}' timed out "
                     f"after {timeout:g}s")
-        except Exception as exc:
+        if "error" in state:
+            exc = state["error"]
             return f"Error: {type(exc).__name__}: {exc}"
-        finally:
-            # Never block on a hung callable during executor shutdown.
-            executor.shutdown(wait=False, cancel_futures=True)
+        return str(state["value"]) if state.get("value") is not None else ""
 
     def _execute_mcp_tool(self, tool_config: ToolConfig, arguments: dict) -> str:
         """Execute an MCP-type tool via MCPClientManager.
