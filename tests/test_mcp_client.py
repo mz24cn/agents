@@ -286,7 +286,6 @@ class TestSingletonProperty:
     **Validates: Requirements 3.1**
     """
 
-    @settings(max_examples=100)
     @given(n=st.integers(min_value=2, max_value=20))
     def test_multiple_instantiations_return_same_object(self, n):
         """For any number of instantiations, all MCPClientManager instances
@@ -350,7 +349,6 @@ class TestMCPToolDiscoveryProperty:
     **Validates: Requirements 3.4, 3.5**
     """
 
-    @settings(max_examples=100)
     @given(server_name=_server_name, raw_tools=_raw_tools_list)
     def test_convert_tools_produces_valid_tool_configs(self, server_name, raw_tools):
         """For any MCP server tool list, _convert_tools should produce

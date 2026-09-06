@@ -442,6 +442,28 @@ All configuration is persisted to `~/.agents_runtime/`:
 }
 ```
 
+### Testing
+
+```bash
+# Full suite (CI / release gate; Hypothesis runs 100 examples per property)
+pytest
+
+# Fast local iteration (25 examples per property, seconds of feedback)
+HYPOTHESIS_PROFILE=fast pytest
+
+# Parallel (requires: pip install pytest-xdist; -n auto = one worker per core)
+pytest -n auto
+
+# Fast critical path only (smoke marker)
+pytest -m smoke
+```
+
+- Property-test iteration counts are driven by `HYPOTHESIS_PROFILE`:
+  `default` (100) / `full` (200) / `fast` (25).
+- The suite should terminate a few seconds after the last test; tool and MCP
+  executors use daemon worker threads on purpose so abandoned hung calls
+  cannot block interpreter shutdown.
+
 ### Requirements
 
 - Python 3.10+

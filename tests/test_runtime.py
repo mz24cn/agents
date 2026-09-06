@@ -136,7 +136,6 @@ messages_list_st = st.lists(message_st, min_size=1, max_size=10)
 
 
 @given(text=text_input_st)
-@settings(max_examples=200)
 def test_normalize_text_input_wraps_as_user_message(text: str) -> None:
     """For any plain text input, _normalize_messages should wrap it as
     [Message(role="user", content=text)]."""
@@ -152,7 +151,6 @@ def test_normalize_text_input_wraps_as_user_message(text: str) -> None:
 
 
 @given(messages=messages_list_st)
-@settings(max_examples=200)
 def test_normalize_messages_input_passes_through_unchanged(
     messages: list,
 ) -> None:
@@ -170,7 +168,6 @@ def test_normalize_messages_input_passes_through_unchanged(
 
 
 @given(text=text_input_st, messages=messages_list_st)
-@settings(max_examples=200)
 def test_normalize_messages_takes_precedence_over_text(
     text: str, messages: list
 ) -> None:
@@ -190,7 +187,6 @@ def test_normalize_messages_takes_precedence_over_text(
 
 
 @given(text=text_input_st)
-@settings(max_examples=100)
 def test_normalize_text_and_messages_produce_consistent_format(
     text: str,
 ) -> None:
@@ -269,7 +265,6 @@ def _unique_tool_configs(configs: list[ToolConfig]) -> list[ToolConfig]:
     configs=st.lists(_tool_config_st, min_size=1, max_size=20),
     data=st.data(),
 )
-@settings(max_examples=200)
 def test_selective_tool_enabling_returns_exact_subset(
     configs: list[ToolConfig], data: st.DataObject
 ) -> None:
@@ -331,7 +326,6 @@ def test_selective_tool_enabling_returns_exact_subset(
     ),
     data=st.data(),
 )
-@settings(max_examples=200)
 def test_selective_tool_enabling_ignores_unknown_ids(
     configs: list[ToolConfig],
     extra_ids: list[str],
@@ -494,7 +488,7 @@ def test_max_infer_per_minute_throttle_ignored_before_ten_rounds() -> None:
 
 
 @given(max_rounds=st.integers(min_value=1, max_value=10))
-@settings(max_examples=100, deadline=None)
+@settings(deadline=None)
 def test_tool_call_loop_terminates_at_max_rounds(max_rounds: int) -> None:
     """For any max_tool_rounds value N (1-10), when the model always returns
     function_call, the Runtime should terminate after N tool call rounds.
@@ -708,7 +702,6 @@ def _make_openai_plain_text_response(content: str) -> bytes:
     tool_name=_tool_name_st,
     arg_value=_arg_value_st,
 )
-@settings(max_examples=100)
 def test_tool_dispatch_and_execution(tool_name: str, arg_value: str) -> None:
     """For any registered tool with a matching function_call, Runtime
     successfully dispatches and executes it.
@@ -893,7 +886,6 @@ def _setup_model_registry() -> ModelRegistry:
 
 
 @given(bad_tool_name=_nonexistent_tool_name_st)
-@settings(max_examples=50)
 def test_tool_error_not_found(bad_tool_name: str) -> None:
     """When the model returns a function_call for a tool_name that does NOT
     exist in the ToolRegistry, the function role message should contain
@@ -952,7 +944,6 @@ def test_tool_error_not_found(bad_tool_name: str) -> None:
 
 
 @given(exc_msg=_exception_msg_st)
-@settings(max_examples=50)
 def test_tool_error_exception(exc_msg: str) -> None:
     """When a registered tool raises an exception during execution, the
     function role message should contain the exception type name and
@@ -1053,7 +1044,6 @@ def test_infer_retries_transient_502_and_succeeds(monkeypatch) -> None:
 
 
 @given(http_code=_http_error_code_st)
-@settings(max_examples=34)
 def test_tool_error_http_failure(http_code: int) -> None:
     """When urllib.request.urlopen raises an HTTPError, the InferenceResult
     should have success=False and error_code set to the HTTP status code."""
@@ -1113,7 +1103,6 @@ _tool_id_st = st.text(
     tool_id=_tool_id_st,
     num_sessions=_session_count_st,
 )
-@settings(max_examples=100)
 def test_tool_instance_reuse_across_sessions(tool_id: str, num_sessions: int) -> None:
     """For any tool_id registered in ToolRegistry, get_callable() returns
     the same callable object (same id()) across multiple inference sessions.

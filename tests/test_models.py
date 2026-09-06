@@ -83,7 +83,6 @@ model_config_st = st.builds(
 
 # **Validates: Requirements 1.11, 1.12**
 @given(config=model_config_st)
-@settings(max_examples=200)
 def test_model_config_round_trip(config: ModelConfig) -> None:
     """For any valid ModelConfig, from_dict(to_dict(config)) should equal the original."""
     serialized = config.to_dict()
@@ -176,7 +175,6 @@ tool_config_st = st.one_of(
 
 # **Validates: Requirements 2.7, 2.8, 3.10, 3.11, 4.6, 4.7**
 @given(config=function_tool_config_st)
-@settings(max_examples=100)
 def test_function_tool_config_round_trip(config: ToolConfig) -> None:
     """For any valid function-type ToolConfig, from_dict(to_dict(config)) should equal the original."""
     serialized = config.to_dict()
@@ -193,7 +191,6 @@ def test_function_tool_config_round_trip(config: ToolConfig) -> None:
 
 
 @given(config=mcp_tool_config_st)
-@settings(max_examples=100)
 def test_mcp_tool_config_round_trip(config: ToolConfig) -> None:
     """For any valid mcp-type ToolConfig, from_dict(to_dict(config)) should equal the original."""
     serialized = config.to_dict()
@@ -210,7 +207,6 @@ def test_mcp_tool_config_round_trip(config: ToolConfig) -> None:
 
 
 @given(config=skill_tool_config_st)
-@settings(max_examples=100)
 def test_skill_tool_config_round_trip(config: ToolConfig) -> None:
     """For any valid skill-type ToolConfig, from_dict(to_dict(config)) should equal the original."""
     serialized = config.to_dict()
@@ -227,7 +223,6 @@ def test_skill_tool_config_round_trip(config: ToolConfig) -> None:
 
 
 @given(config=tool_config_st)
-@settings(max_examples=100)
 def test_tool_config_round_trip_all_types(config: ToolConfig) -> None:
     """For any valid ToolConfig (function/mcp/skill), from_dict(to_dict(config)) should equal the original."""
     serialized = config.to_dict()

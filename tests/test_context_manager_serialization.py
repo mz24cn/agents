@@ -284,7 +284,6 @@ def front_matter_strategy(turns_count: int):
 
 
 @given(turns=st.lists(conversation_turn_strategy(), min_size=0, max_size=50))
-@settings(max_examples=25)
 def test_conversation_roundtrip(turns: list[ConversationTurn]) -> None:
     """For any valid list of ConversationTurns, serialize then parse must
     produce an equivalent list.
@@ -319,7 +318,6 @@ def test_conversation_roundtrip(turns: list[ConversationTurn]) -> None:
     missing_close=st.booleans(),
     payload=st.text(min_size=0, max_size=100),
 )
-@settings(max_examples=25)
 def test_parse_conversation_invalid_raises_value_error(
     missing_open: bool,
     missing_close: bool,

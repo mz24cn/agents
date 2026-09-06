@@ -81,7 +81,6 @@ _identifier_strategy = st.from_regex(r"[A-Za-z_]\w{0,31}", fullmatch=True)
         max_size=20,
     )
 )
-@settings(max_examples=100)
 def test_env_read_write_roundtrip(env_dict: dict) -> None:
     """属性 1：对于任意非空字符串键值对字典，写入后读取应得到相同内容。
 
@@ -118,7 +117,6 @@ def test_env_read_write_roundtrip(env_dict: dict) -> None:
     key=_env_key_strategy,
     value=_env_value_strategy,
 )
-@settings(max_examples=100)
 def test_set_syncs_to_os_environ(key: str, value: str) -> None:
     """属性 2：调用 set() 后，os.environ 中应包含该键值对。
 
@@ -151,7 +149,6 @@ def test_set_syncs_to_os_environ(key: str, value: str) -> None:
         max_size=20,
     )
 )
-@settings(max_examples=100)
 def test_delete_removes_key(env_dict: dict) -> None:
     """属性 3：删除任意一个 key 后，该 key 不在读取结果中，且其余键值对不变。
 
@@ -225,7 +222,6 @@ _invalid_json_object_strategy = st.one_of(
 
 
 @given(invalid_content=_invalid_json_object_strategy)
-@settings(max_examples=100)
 def test_read_raises_value_error_for_invalid_json(invalid_content: str) -> None:
     """属性 4：非 JSON 对象内容应使 read() 抛出 ValueError。
 
@@ -273,7 +269,6 @@ def test_read_accepts_empty_json_object() -> None:
 # ---------------------------------------------------------------------------
 
 @given(identifier=_identifier_strategy)
-@settings(max_examples=100)
 def test_detect_used_keys_roundtrip(identifier: str) -> None:
     """属性 5：将标识符以三种环境变量引用形式写入 .py 文件后，
     detect_used_keys() 应返回包含该标识符的列表。
@@ -315,7 +310,6 @@ def test_detect_used_keys_roundtrip(identifier: str) -> None:
     repeat_count=st.integers(min_value=2, max_value=10),
     file_count=st.integers(min_value=1, max_value=5),
 )
-@settings(max_examples=100)
 def test_detect_used_keys_deduplication(
     identifier: str, repeat_count: int, file_count: int
 ) -> None:
@@ -365,7 +359,6 @@ def test_detect_used_keys_deduplication(
         unique=True,
     )
 )
-@settings(max_examples=100)
 def test_list_sessions_descending_order(session_names: list) -> None:
     """属性 7：对于任意数量（≥2）的会话目录，list_sessions() 返回结果应严格降序排列。
 
@@ -425,7 +418,6 @@ _message_strategy = st.fixed_dictionaries({
         max_size=20,
     )
 )
-@settings(max_examples=100)
 def test_get_session_roundtrip(messages: list) -> None:
     """属性 8：通过 ContextManager.save_conversation() 保存的会话，
     调用 SessionManager.get_session() 读取后，messages 数组长度及每条消息的
@@ -489,9 +481,38 @@ import urllib.request
 import urllib.error
 from unittest.mock import patch
 
+from hypothesis import HealthCheck
+
 from runtime.server import RuntimeHTTPServer
 from runtime.runtime import Runtime
 from runtime.registry import ModelRegistry, ToolRegistry
+
+
+@pytest.fixture()
+def env_server(tmp_path):
+    """RuntimeHTTPServer with an isolated data dir, shared by every example
+    of the property test below.
+
+    The original implementation started (and stopped) one server per
+    Hypothesis example; with ~100 examples that server churn dominated the
+    test runtime.  The property only needs a live /v1/env endpoint, so the
+    server is started once per test run and env.json is reset to ``{}`` at
+    the start of each example to preserve the fresh-store semantics.
+    """
+    env_path = str(tmp_path / "env.json")
+    models_path = str(tmp_path / "models.json")
+    tools_path = str(tmp_path / "tools.json")
+    prompt_templates_path = str(tmp_path / "prompt_templates.json")
+    runtime = Runtime(ModelRegistry(), ToolRegistry())
+    with patch("runtime.server._MODELS_PATH", models_path), \
+         patch("runtime.server._TOOLS_PATH", tools_path), \
+         patch("runtime.server._PROMPT_TEMPLATES_PATH", prompt_templates_path), \
+         patch("runtime.server._DATA_DIR", str(tmp_path)), \
+         patch("runtime.server._ENV_PATH", env_path):
+        srv = RuntimeHTTPServer(runtime, chats_dir=str(tmp_path / "chats"))
+        srv.start_background(host="127.0.0.1", port=0)
+        yield srv, env_path
+        srv.stop()
 
 
 def _post_env(port: int, key: str, value: str) -> tuple:
@@ -530,46 +551,35 @@ def _get_env(port: int) -> tuple:
         max_size=10,
     )
 )
-@settings(max_examples=50, deadline=None)
-def test_post_env_response_matches_file_content(operations: list) -> None:
+@settings(deadline=None,
+          suppress_health_check=[HealthCheck.function_scoped_fixture])
+def test_post_env_response_matches_file_content(env_server, operations: list) -> None:
     """属性 9：对于任意有效的 POST /v1/env 请求序列，
     每次响应体中的 env 对象应与 env.json 实际内容完全一致（不多不少）。
 
     **Validates: Requirements 6.5**
     """
-    with tempfile.TemporaryDirectory() as tmpdir:
-        env_path = os.path.join(tmpdir, "env.json")
-        models_path = os.path.join(tmpdir, "models.json")
-        tools_path = os.path.join(tmpdir, "tools.json")
-        prompt_templates_path = os.path.join(tmpdir, "prompt_templates.json")
-        chats_dir = os.path.join(tmpdir, "chats")
+    srv, env_path = env_server
+    port = srv.port
 
-        runtime = Runtime(ModelRegistry(), ToolRegistry())
+    # Reset the store to a fresh, empty env for every example (the server
+    # itself is shared across examples — see the env_server fixture).
+    with open(env_path, "w", encoding="utf-8") as fh:
+        _json.dump({}, fh)
 
-        with patch("runtime.server._MODELS_PATH", models_path), \
-             patch("runtime.server._TOOLS_PATH", tools_path), \
-             patch("runtime.server._PROMPT_TEMPLATES_PATH", prompt_templates_path), \
-             patch("runtime.server._DATA_DIR", tmpdir), \
-             patch("runtime.server._ENV_PATH", env_path):
-            srv = RuntimeHTTPServer(runtime, chats_dir=chats_dir)
-            srv.start_background(host="127.0.0.1", port=0)
-            try:
-                port = srv.port
-                for key, value in operations:
-                    status, body = _post_env(port, key, value)
-                    assert status == 200, f"POST /v1/env 返回非 200 状态码: {status}"
-                    assert "env" in body, "响应体中缺少 env 字段"
+    for key, value in operations:
+        status, body = _post_env(port, key, value)
+        assert status == 200, f"POST /v1/env 返回非 200 状态码: {status}"
+        assert "env" in body, "响应体中缺少 env 字段"
 
-                    # 读取 env.json 实际内容
-                    if os.path.isfile(env_path):
-                        with open(env_path, "r", encoding="utf-8") as fh:
-                            actual_file_content = _json.load(fh)
-                    else:
-                        actual_file_content = {}
+        # 读取 env.json 实际内容
+        if os.path.isfile(env_path):
+            with open(env_path, "r", encoding="utf-8") as fh:
+                actual_file_content = _json.load(fh)
+        else:
+            actual_file_content = {}
 
-                    # 验证响应体中的 env 与文件内容完全一致
-                    assert body["env"] == actual_file_content, (
-                        f"响应体 env={body['env']!r} 与文件内容 {actual_file_content!r} 不一致"
-                    )
-            finally:
-                srv.stop()
+        # 验证响应体中的 env 与文件内容完全一致
+        assert body["env"] == actual_file_content, (
+            f"响应体 env={body['env']!r} 与文件内容 {actual_file_content!r} 不一致"
+        )

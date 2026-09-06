@@ -168,7 +168,6 @@ def _build_cm_from_state(
 
 
 @given(state=session_state_strategy())
-@settings(max_examples=25)
 def test_assemble_context_ordering(state: dict) -> None:
     """assemble_context must return a single merged system message → turns → new order.
 
@@ -243,7 +242,6 @@ def test_assemble_context_ordering(state: dict) -> None:
     state=session_state_strategy(),
     budget=st.integers(min_value=1, max_value=100000),
 )
-@settings(max_examples=25)
 def test_token_budget_respected(state: dict, budget: int) -> None:
     """assemble_context with token_budget must not exceed the budget when the
     budget is large enough to hold the irreducible turn messages.
@@ -297,7 +295,6 @@ def test_token_budget_respected(state: dict, budget: int) -> None:
 
 
 @given(state=session_state_strategy())
-@settings(max_examples=25)
 def test_introspect_consistency(state: dict) -> None:
     """introspect snapshot must satisfy total_turns == summarized_turns + recent_window_size
     and memory_entry_count == sum(memory_entries_by_type.values()).

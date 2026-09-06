@@ -194,7 +194,6 @@ def _build_openai_stream_response(tool_calls: list[dict]) -> bytes:
 
 # **Validates: Requirements 1.1**
 @given(tool_calls=_multi_tool_calls_st)
-@settings(max_examples=50)
 def test_openai_non_stream_extracts_all_tool_calls(tool_calls: list[dict]) -> None:
     """OpenAI non-stream: when response has N>1 tool_calls, the parsed Message
     should have a tool_calls list of length N.
@@ -230,7 +229,6 @@ def test_openai_non_stream_extracts_all_tool_calls(tool_calls: list[dict]) -> No
 
 # **Validates: Requirements 1.2**
 @given(tool_calls=_multi_tool_calls_st)
-@settings(max_examples=50)
 def test_ollama_non_stream_extracts_all_tool_calls(tool_calls: list[dict]) -> None:
     """Ollama non-stream: when response has N>1 tool_calls, the parsed Message
     should have a tool_calls list of length N.
@@ -264,7 +262,6 @@ def test_ollama_non_stream_extracts_all_tool_calls(tool_calls: list[dict]) -> No
 
 # **Validates: Requirements 1.3**
 @given(tool_calls=_multi_tool_calls_st)
-@settings(max_examples=50)
 def test_ollama_stream_extracts_all_tool_calls(tool_calls: list[dict]) -> None:
     """Ollama stream: when the final chunk has N>1 tool_calls, the parsed Message
     should have a tool_calls list of length N.
@@ -298,7 +295,6 @@ def test_ollama_stream_extracts_all_tool_calls(tool_calls: list[dict]) -> None:
 
 # **Validates: Requirements 1.4, 1.6**
 @given(tool_calls=_multi_tool_calls_st)
-@settings(max_examples=50)
 def test_openai_stream_extracts_all_tool_calls(tool_calls: list[dict]) -> None:
     """OpenAI stream: when SSE response has N>1 tool_call deltas (each with
     distinct index), the parsed Message should have a tool_calls list of length N.

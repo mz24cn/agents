@@ -421,6 +421,25 @@ npm run build
 }
 ```
 
+### 测试
+
+```bash
+# 全量（CI/发布门槛，Hypothesis 每属性 100 次迭代）
+pytest
+
+# 快速本地迭代（Hypothesis 每属性 25 次，秒级反馈）
+HYPOTHESIS_PROFILE=fast pytest
+
+# 并行（需先 pip install pytest-xdist；-n auto 按 CPU 核数）
+pytest -n auto
+
+# 只看最快关键路径（smoke 标记）
+pytest -m smoke
+```
+
+- 属性测试（Hypothesis）的迭代次数由 `HYPOTHESIS_PROFILE` 控制：`default`(100) / `full`(200) / `fast`(25)。
+- 测试结束后若进程迟迟不退出，通常是某个后台线程未收尾；本仓库的工具/MCP 执行器已改用守护线程，正常应在数秒内退出。
+
 ### 环境要求
 
 - Python 3.10+

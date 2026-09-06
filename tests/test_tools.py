@@ -320,7 +320,6 @@ class TestProperty7FunctionToolSchemaGeneration:
     """
 
     @given(param_specs=_param_list_st)
-    @settings(max_examples=150)
     def test_schema_structure_is_valid_json_schema(self, param_specs):
         """Generated ToolConfig always has valid JSON Schema structure."""
         fn = _build_function(param_specs)
@@ -343,7 +342,6 @@ class TestProperty7FunctionToolSchemaGeneration:
             )
 
     @given(param_specs=_param_list_st)
-    @settings(max_examples=150)
     def test_parameter_names_match_function_signature(self, param_specs):
         """Schema property names match the function's parameter names exactly."""
         fn = _build_function(param_specs)
@@ -354,7 +352,6 @@ class TestProperty7FunctionToolSchemaGeneration:
         assert actual_names == expected_names
 
     @given(param_specs=_param_list_st)
-    @settings(max_examples=150)
     def test_parameter_types_match_annotations(self, param_specs):
         """Schema types correspond to the Python type annotations."""
         fn = _build_function(param_specs)
@@ -368,7 +365,6 @@ class TestProperty7FunctionToolSchemaGeneration:
             )
 
     @given(param_specs=_param_list_st)
-    @settings(max_examples=150)
     def test_required_params_are_those_without_defaults(self, param_specs):
         """Only parameters without default values appear in 'required'."""
         fn = _build_function(param_specs)
@@ -379,7 +375,6 @@ class TestProperty7FunctionToolSchemaGeneration:
         assert actual_required == expected_required
 
     @given(param_specs=_param_list_st)
-    @settings(max_examples=150)
     def test_tool_config_metadata(self, param_specs):
         """Generated ToolConfig has correct tool_type and name."""
         fn = _build_function(param_specs)

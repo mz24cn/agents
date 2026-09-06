@@ -1,5 +1,7 @@
 """Root-level conftest for the Agent Service test suite."""
 
+import os
+
 import pytest
 
 
@@ -17,6 +19,34 @@ def pytest_configure(config):
         "markers",
         "regression: Full test suite for deeper validation (CI full + CD gate).",
     )
+    _load_hypothesis_profile()
+
+
+# Hypothesis profiles
+# Property tests no longer hard-code ``max_examples``; the active profile does:
+#   default: 100 examples  (spec minimum: "at least 100 iterations" per property)
+#   full:    200 examples  (deeper gate, e.g. nightly / release)
+#   fast:     25 examples  (local iteration)
+# Select with:  HYPOTHESIS_PROFILE=fast pytest ...
+def _load_hypothesis_profile() -> None:
+    try:
+        from hypothesis import HealthCheck, settings
+    except ImportError:  # pragma: no cover - hypothesis is a dev dependency
+        return
+    # deadline=None everywhere: several properties exercise real subprocess /
+    # file / HTTP paths, so per-example wall-clock varies with machine load
+    # and the default 200 ms deadline produces load-dependent DeadlineExceeded
+    # flakes. Timing guarantees are asserted explicitly where they matter.
+    settings.register_profile("default", max_examples=100, deadline=None)
+    settings.register_profile("full", max_examples=200, deadline=None)
+    settings.register_profile(
+        "fast", max_examples=25, deadline=None,
+        suppress_health_check=list(HealthCheck),
+    )
+    name = os.environ.get("HYPOTHESIS_PROFILE", "default").strip().lower()
+    if name not in {"default", "full", "fast"}:
+        name = "default"
+    settings.load_profile(name)
 
 
 # ── Automatic marker assignment by file name ──────────────────────────

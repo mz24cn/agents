@@ -264,7 +264,10 @@ def test_infer_stream_http_error() -> None:
 
     request = InferenceRequest(model_id="test-model", text="hi", stream=True)
 
-    with patch("urllib.request.urlopen", side_effect=mock_urlopen):
+    # Retry delay is zeroed so the (intentional) retry backoff does not add
+    # seconds to the test; the sibling connection-error test does the same.
+    with patch.dict("os.environ", {"MODEL_API_RETRY_DELAY": "0"}), \
+         patch("urllib.request.urlopen", side_effect=mock_urlopen):
         messages = list(runtime.infer_stream(request))
 
     assert len(messages) == 1

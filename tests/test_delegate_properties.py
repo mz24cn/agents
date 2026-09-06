@@ -9,7 +9,6 @@ from runtime.builtin_tools import _make_delegate_fn
 # Feature: multi-agent-collaboration, Property 4: 异常隔离——delegate 始终返回字符串
 # Validates: Requirements 2.6
 @given(st.text())
-@settings(max_examples=100)
 def test_exception_isolation_property(error_message):
     """对任意异常消息，delegate 捕获后返回包含 'Error' 的字符串，不向上传播。"""
     class FailingRuntime:
@@ -26,7 +25,6 @@ def test_exception_isolation_property(error_message):
 # Feature: multi-agent-collaboration, Property 6: tool_use_id 的唯一性
 # Validates: Requirements 3.5
 @given(st.integers(min_value=2, max_value=20))
-@settings(max_examples=100)
 def test_tool_use_id_uniqueness_property(call_count):
     """多次调用生成的 tool_use_id 互不相同。"""
     import uuid
@@ -52,7 +50,6 @@ def test_tool_use_id_uniqueness_property(call_count):
         whitelist_characters="-_/."
     )),
 )
-@settings(max_examples=100)
 def test_subagent_session_path_property(parent_session_id, chats_dir):
     """对任意 parent_session_id 和 chats_dir，生成路径以 {chats_dir}/{parent_session_id}/sub_ 为前缀。"""
     import os
@@ -69,7 +66,6 @@ def test_subagent_session_path_property(parent_session_id, chats_dir):
 # Feature: multi-agent-collaboration, Property 8: 持久化失败不中断推理
 # Validates: Requirements 5.4
 @given(st.text(), st.text(min_size=1))
-@settings(max_examples=100)
 def test_persistence_failure_does_not_interrupt_property(task_content, error_message):
     """模拟持久化抛出异常，delegate 仍返回推理结果字符串，不抛出异常，不返回空字符串。"""
     from runtime.models import Message
@@ -95,7 +91,6 @@ def test_persistence_failure_does_not_interrupt_property(task_content, error_mes
 # Feature: multi-agent-collaboration, Property 5: depth 字段的正确传递
 # Validates: Requirements 3.4, 3.6
 @given(st.integers(min_value=0, max_value=10))
-@settings(max_examples=100)
 def test_depth_propagation_property(initial_depth):
     """对任意初始深度 d >= 0，推送的流式帧 depth == d + 1；delegate 返回后 thread_local.depth 恢复为 d。"""
     from runtime.models import Message

@@ -108,7 +108,6 @@ def memory_entry_strategy():
 
 
 @given(entries=st.lists(memory_entry_strategy(), min_size=0, max_size=20))
-@settings(max_examples=25)
 def test_memory_confidence_filter(entries: list[MemoryEntry]) -> None:
     """compress_context must discard memory entries with confidence < threshold.
 
@@ -148,7 +147,6 @@ def test_memory_confidence_filter(entries: list[MemoryEntry]) -> None:
     entries=st.lists(memory_entry_strategy(), min_size=0, max_size=20),
     entry_type=st.sampled_from(["fact", "preference", "decision", "entity"]),
 )
-@settings(max_examples=25)
 def test_memory_filter_by_type(
     entries: list[MemoryEntry], entry_type: str
 ) -> None:

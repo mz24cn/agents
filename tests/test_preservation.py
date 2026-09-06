@@ -136,7 +136,6 @@ def _build_ollama_no_tool_call_response(content: str) -> bytes:
 
 # **Validates: Requirements 3.1**
 @given(name=_tool_name_st, arguments=_arguments_st, content=_content_st)
-@settings(max_examples=100)
 def test_openai_single_tool_call_preserves_tool_calls(
     name: str, arguments: dict, content: str
 ) -> None:
@@ -171,7 +170,6 @@ def test_openai_single_tool_call_preserves_tool_calls(
 
 # **Validates: Requirements 3.2**
 @given(content=_nonempty_content_st)
-@settings(max_examples=100)
 def test_openai_no_tool_call_preserves_content(content: str) -> None:
     """For any OpenAI response with 0 tool_calls, the parsed Message has
     tool_calls=None and content is preserved."""
@@ -196,7 +194,6 @@ def test_openai_no_tool_call_preserves_content(content: str) -> None:
 
 # **Validates: Requirements 3.1**
 @given(name=_tool_name_st, arguments=_arguments_st, content=_content_st)
-@settings(max_examples=100)
 def test_ollama_single_tool_call_preserves_tool_calls(
     name: str, arguments: dict, content: str
 ) -> None:
@@ -231,7 +228,6 @@ def test_ollama_single_tool_call_preserves_tool_calls(
 
 # **Validates: Requirements 3.2**
 @given(content=_nonempty_content_st)
-@settings(max_examples=100)
 def test_ollama_no_tool_call_preserves_content(content: str) -> None:
     """For any Ollama response with 0 tool_calls, the parsed Message has
     tool_calls=None and content is preserved."""
@@ -260,7 +256,6 @@ def test_ollama_no_tool_call_preserves_content(content: str) -> None:
     name=_tool_name_st,
     arguments=_arguments_st,
 )
-@settings(max_examples=100)
 def test_message_single_tool_calls_round_trip(
     content: str, name: str, arguments: dict
 ) -> None:

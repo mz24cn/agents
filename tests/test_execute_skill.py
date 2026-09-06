@@ -188,7 +188,6 @@ def test_execute_skill_prev_result_chaining():
 
 # Feature: agent-service, Property 13: Skill 步骤顺序执行
 # **Validates: Requirements 4.2, 4.4**
-@settings(max_examples=100)
 @given(n_steps=st.integers(min_value=1, max_value=5))
 def test_property_skill_steps_execute_sequentially(n_steps):
     """For any Skill with N tool steps, execution proceeds in order
@@ -282,7 +281,6 @@ def test_property_skill_steps_execute_sequentially(n_steps):
 
 # Feature: agent-service, Property 14: Skill 失败中止
 # **Validates: Requirements 4.5**
-@settings(max_examples=100)
 @given(data=st.data())
 def test_property_skill_failure_aborts_subsequent_steps(data):
     """For any Skill with N steps, if step K fails (0 <= K < N),

@@ -17,9 +17,16 @@ import re
 import tarfile
 import tempfile
 import textwrap
+import time
 from io import BytesIO
 
 logger = logging.getLogger("runtime.env_manager")
+
+# Short-TTL cache for get_backend_build_mtime(): {(real) project_root:
+# (monotonic_timestamp, latest_mtime)}.  Bounded by the number of project
+# roots served by one process (normally one), so no eviction is needed.
+_BACKEND_MTIME_TTL = 5.0
+_BACKEND_MTIME_CACHE: dict = {}
 
 
 class EnvManager:
@@ -159,6 +166,18 @@ class EnvManager:
         such as SKILL.md or C sources, so ``op=hello`` advertises their updates.
         """
         project_root = os.path.realpath(project_root)
+
+        now = time.monotonic()
+        cached = _BACKEND_MTIME_CACHE.get(project_root)
+        if cached is not None and now - cached[0] < _BACKEND_MTIME_TTL:
+            return cached[1]
+
+        latest_mtime = self._scan_backend_build_mtime(project_root)
+        _BACKEND_MTIME_CACHE[project_root] = (now, latest_mtime)
+        return latest_mtime
+
+    def _scan_backend_build_mtime(self, project_root: str) -> float:
+        """Uncached implementation of :meth:`get_backend_build_mtime`."""
         web_root_real = os.path.realpath(os.path.join(project_root, "web"))
         exclude_dirs = {".git", "__pycache__", ".pytest_cache", ".hypothesis", ".mypy_cache",
                         ".ruff_cache", "node_modules", "dist", "build", ".venv", "venv",

@@ -107,7 +107,6 @@ def test_remove_trailing_assistant_message_preserves_non_assistant_tail() -> Non
         ),
     ),
 )
-@settings(max_examples=25)
 def test_tool_call_file_naming(turn_index: int, tool_name: str) -> None:
     """record_tool_call is a no-op — returns empty string (tool results stored inline in conversation.json).
 

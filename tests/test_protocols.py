@@ -50,7 +50,6 @@ model_config_st = st.builds(
 
 # **Validates: Requirements 1.3**
 @given(messages=messages_with_images_st, config=model_config_st)
-@settings(max_examples=100)
 def test_openai_multimodal_content_is_array_with_image_url(
     messages: list, config: ModelConfig
 ) -> None:
@@ -114,7 +113,6 @@ ollama_model_config_st = st.builds(
 
 # **Validates: Requirements 1.4**
 @given(messages=messages_with_images_st, config=ollama_model_config_st)
-@settings(max_examples=100)
 def test_ollama_multimodal_images_at_same_level_as_content(
     messages: list, config: ModelConfig
 ) -> None:
@@ -214,7 +212,6 @@ ollama_response_st = st.builds(
 
 # **Validates: Requirements 1.9**
 @given(response_data=openai_response_st)
-@settings(max_examples=100)
 def test_openai_parse_response_produces_assistant_message(response_data: bytes) -> None:
     """For any valid OpenAI-format response data, parse_response() should produce
     at least one Message with role='assistant' and content as a non-None string."""
@@ -378,7 +375,6 @@ def test_openai_stream_marks_missing_usage_as_unreported() -> None:
 
 # **Validates: Requirements 1.9**
 @given(response_data=ollama_response_st)
-@settings(max_examples=100)
 def test_ollama_parse_response_produces_assistant_message(response_data: bytes) -> None:
     """For any valid Ollama-format response data, parse_response() should produce
     at least one Message with role='assistant' and content as a non-None string."""

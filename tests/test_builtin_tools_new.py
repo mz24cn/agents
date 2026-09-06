@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 from unittest.mock import patch
@@ -31,42 +32,47 @@ from runtime.builtin_tools import (
 # Fixtures
 # ---------------------------------------------------------------------------
 
-@pytest.fixture
-def workspace(monkeypatch, tmp_path):
-    """Provide a temporary git-initialised workspace.
+@pytest.fixture(scope="session")
+def _git_template(tmp_path_factory):
+    """Build one git-initialised template repo for the whole session.
 
-    Steps:
-    1. Create a temporary directory (provided by pytest's tmp_path).
-    2. Run `git init` inside it.
-    3. Configure git user name and email (required for commits).
-    4. Create an initial README commit so the repo has at least one commit.
-    5. Set the AGENTS_WORKSPACE environment variable to the temp dir path.
-    6. Yield the Path object for use in tests.
-    7. Cleanup is handled automatically by tmp_path.
+    Property tests receive hundreds of fresh workspaces; paying for
+    ``git init`` + config + add + commit (5 subprocesses) on every example
+    cost several minutes of pure subprocess overhead.  The template is built
+    once and copied per workspace below.
     """
-    ws = tmp_path
-
-    # Initialise git repository
-    subprocess.run(["git", "init"], cwd=ws, check=True, capture_output=True)
-
-    # Configure git identity (needed for commits in a clean environment)
+    template = tmp_path_factory.mktemp("git_template")
+    subprocess.run(["git", "init", "-q"], cwd=template, check=True, capture_output=True)
+    # Local identity so that per-test commits in the COPIES (which inherit
+    # .git/config) work even in environments without a global git identity.
     subprocess.run(
         ["git", "config", "user.email", "test@example.com"],
-        cwd=ws, check=True, capture_output=True,
+        cwd=template, check=True, capture_output=True,
     )
     subprocess.run(
         ["git", "config", "user.name", "Test User"],
-        cwd=ws, check=True, capture_output=True,
+        cwd=template, check=True, capture_output=True,
     )
-
-    # Create an initial commit
-    readme = ws / "README.md"
-    readme.write_text("# Test Workspace\n")
-    subprocess.run(["git", "add", "README.md"], cwd=ws, check=True, capture_output=True)
+    (template / "README.md").write_text("# Test Workspace\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=template, check=True, capture_output=True)
     subprocess.run(
-        ["git", "commit", "-m", "Initial commit"],
-        cwd=ws, check=True, capture_output=True,
+        ["git", "commit", "-q", "-m", "Initial commit"],
+        cwd=template, check=True, capture_output=True,
     )
+    return template
+
+
+@pytest.fixture
+def workspace(_git_template, monkeypatch, tmp_path):
+    """Provide a temporary git-initialised workspace.
+
+    The repo is a copy of the session template (one initial commit);
+    copies are byte-for-byte self-contained, so no subprocess is needed
+    per workspace.  ``AGENTS_WORKSPACE`` is set to the copy and cleanup is
+    handled by tmp_path.
+    """
+    ws = tmp_path
+    shutil.copytree(_git_template, ws, symlinks=True, dirs_exist_ok=True)
 
     # Expose the workspace path via environment variable
     monkeypatch.setenv("AGENTS_WORKSPACE", str(ws))
@@ -390,7 +396,7 @@ from hypothesis import strategies as st
 class TestReadFilePropertyP3:
     """**Validates: Requirements 3.1**"""
 
-    @settings(max_examples=100, suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
     @given(
         lines=st.lists(
             st.text(
@@ -444,7 +450,7 @@ class TestReadFilePropertyP3:
 class TestReadFilePropertyP4:
     """**Validates: Requirements 3.2, 3.3, 3.4**"""
 
-    @settings(max_examples=100, suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
     @given(
         lines=st.lists(
             st.text(
@@ -505,7 +511,7 @@ class TestReadFilePropertyP4:
 class TestReadFilePropertyP5:
     """**Validates: Requirements 3.5**"""
 
-    @settings(max_examples=100, suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
     @given(
         threshold=st.integers(min_value=2, max_value=20),
         extra=st.integers(min_value=1, max_value=10),
@@ -609,7 +615,7 @@ class TestWriteFileUnit:
 class TestWriteFilePropertyP6:
     """**Validates: Requirements 4.1, 4.2**"""
 
-    @settings(max_examples=100, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
+    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
     @given(
         rel_path=st.from_regex(r"[a-zA-Z0-9_][a-zA-Z0-9_\-]{0,10}\.[a-z]{1,4}", fullmatch=True),
         content=st.text(
@@ -909,7 +915,7 @@ class TestEditFilePropertyP7:
         whitelist_characters="!#$%&*+,-./:;<=>?@[]^_`{|}~",
     )
 
-    @settings(max_examples=100, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
+    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
     @given(
         # Use a unique prefix/suffix so target won't appear in them by construction
         unique_id=st.integers(min_value=1000, max_value=9999),
@@ -967,7 +973,7 @@ class TestEditFilePropertyP7:
 class TestEditFilePropertyP8:
     """**Validates: Requirements 5.2**"""
 
-    @settings(max_examples=100, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
+    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
     @given(
         line_content=st.text(
             # Use only printable ASCII to avoid characters that Python treats as
@@ -1044,7 +1050,7 @@ class TestEditFilePropertyP8:
 class TestEditFilePropertyP9:
     """**Validates: Requirements 5.3**"""
 
-    @settings(max_examples=50, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
+    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
     @given(
         original_lines=st.lists(
             # Use only printable ASCII to avoid Unicode line-separator characters
@@ -1129,7 +1135,14 @@ class TestEditFilePropertyP9:
 class TestEditFilePropertyP10:
     """**Validates: Requirements 5.4, 5.5**"""
 
-    @settings(max_examples=30, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
+   # NOTE: every example runs the REAL linter (``python -m py_compile``
+    # subprocess), so this test is capped below the profile default.  The
+    # example space only varies the generated identifier/value and the
+    # produced code is invalid syntax for ALL examples, so extra iterations
+    # add no coverage of the lint-failure-rollback property.
+    @settings(max_examples=20,
+              suppress_health_check=[HealthCheck.function_scoped_fixture],
+              deadline=None)
     @given(
         func_name=st.from_regex(r"[a-z][a-z0-9_]{0,10}", fullmatch=True),
         return_val=st.integers(min_value=0, max_value=999),
@@ -1269,7 +1282,7 @@ class TestSearchCodeUnit:
 class TestSearchCodePropertyP11:
     """**Validates: Requirements 6.1**"""
 
-    @settings(max_examples=30, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
+    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
     @given(
         pattern=st.from_regex(r"[a-z]{4,8}_[a-z]{4,8}", fullmatch=True),
         num_files=st.integers(min_value=1, max_value=5),
@@ -1305,7 +1318,7 @@ class TestSearchCodePropertyP11:
 class TestSearchCodePropertyP12:
     """**Validates: Requirements 6.2**"""
 
-    @settings(max_examples=20, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
+    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
     @given(
         excluded_dir=st.sampled_from(["node_modules", ".git", "dist"]),
         pattern=st.from_regex(r"excluded_[a-z]{4,8}_content", fullmatch=True),
@@ -1346,7 +1359,7 @@ class TestSearchCodePropertyP12:
 class TestSearchCodePropertyP13:
     """**Validates: Requirements 6.3, 6.4**"""
 
-    @settings(max_examples=20, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
+    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
     @given(
         pattern=st.from_regex(r"filter_[a-z]{4,8}_test", fullmatch=True),
     )
@@ -1386,7 +1399,7 @@ class TestSearchCodePropertyP13:
 class TestSearchCodePropertyP14:
     """**Validates: Requirements 6.5**"""
 
-    @settings(max_examples=20, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
+    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
     @given(
         max_results=st.integers(min_value=2, max_value=5),
         extra=st.integers(min_value=1, max_value=5),
@@ -1460,7 +1473,7 @@ class TestExecuteCommandUnit:
 class TestExecuteCommandPropertyP15:
     """**Validates: Requirements 7.1, 7.6**"""
 
-    @settings(max_examples=10, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
+    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
     @given(st.just(None))  # single-shot property, no interesting variation needed
     def test_cwd_is_workspace_and_response_has_required_fields(self, workspace, _):
         """Running 'pwd' returns the workspace path and response has exit_code/stdout/stderr/truncated."""
@@ -1490,7 +1503,7 @@ class TestExecuteCommandPropertyP15:
 class TestExecuteCommandPropertyP16:
     """**Validates: Requirements 7.3, 7.7**"""
 
-    @settings(max_examples=5, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
+    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
     @given(st.just(None))  # single-shot property
     def test_timeout_forces_termination(self, workspace, _):
         """A sleep command with a very short timeout returns a Timeout error."""
@@ -1515,7 +1528,7 @@ class TestExecuteCommandPropertyP16:
 class TestExecuteCommandPropertyP17:
     """**Validates: Requirements 7.5**"""
 
-    @settings(max_examples=10, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
+    @settings(suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
     @given(
         limit=st.integers(min_value=2, max_value=10),
         extra=st.integers(min_value=1, max_value=5),
