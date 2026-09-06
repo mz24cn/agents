@@ -28,6 +28,7 @@ from runtime.common import (
     restore_request_context,
     estimate_chat_prompt_tokens,
     estimate_message_payload_tokens,
+    env_int,
 )
 
 _logger = logging.getLogger("runtime.runtime")
@@ -1181,7 +1182,7 @@ class Runtime:
                 # --- Base64 image interception (inference loop only) ---
                 # Long base64 payloads (e.g. screenshots from windows-mcp / chrome-devtools)
                 # are harmful to the model context. Replace them with saved file paths.
-                if len(result_str) > int(os.environ.get("BASE64_CHECK_THRESHOLD", "1024")):
+                if len(result_str) > env_int("BASE64_CHECK_THRESHOLD", 1024):
                     if is_likely_base64(result_str):
                         result_str = '{"data":"' + result_str + '"}'
                     from runtime.tools import save_and_replace_base64
@@ -1232,7 +1233,7 @@ class Runtime:
             The original string when under the threshold, or a short hint
             pointing at a temp file.
         """
-        max_len = int(os.environ.get("TOOL_RESULT_MAX_LENGTH", "262144"))
+        max_len = env_int("TOOL_RESULT_MAX_LENGTH", 262144)
         if len(result_str) <= max_len:
             return result_str
 

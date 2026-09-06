@@ -21,7 +21,13 @@ import time
 import urllib.request
 import urllib.error
 
-from runtime.common import SYSTEM_ENCODING, get_request_context, convert_image_to_base64
+from runtime.common import (
+    SYSTEM_ENCODING,
+    get_request_context,
+    convert_image_to_base64,
+    env_float,
+    env_int,
+)
 from runtime.models import InferenceRequest, Message, ToolConfig
 
 logger = logging.getLogger("runtime.builtin_tools")
@@ -44,7 +50,7 @@ def _exec_cli(
     timeout is intentionally not a tool parameter; CLI_EXEC_TIMEOUT is the
     hard safety cap for all completion conditions.
     """
-    timeout = int(os.environ.get("CLI_EXEC_TIMEOUT", 300))
+    timeout = env_int("CLI_EXEC_TIMEOUT", 300)
     session_id = get_request_context("session_id")
     if session_id:
         try:
@@ -106,7 +112,7 @@ def _fetch_url(url: str, method: str = "GET", body: str = "",
 
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = resp.read().decode("utf-8", errors="replace")
-            max_size = int(os.environ.get("FETCH_MAX_SIZE", 262144))
+            max_size = env_int("FETCH_MAX_SIZE", 262144)
             return data[:max_size] if len(data) > max_size else data
     except urllib.error.HTTPError as e:
         err_body = ""
@@ -254,7 +260,7 @@ def execute_command_in_terminal(
 
     idle_timeout_seconds = max(0.1, idle_timeout_value / 1000.0)
     read_after_delay_seconds = max(0.0, read_after_delay_value / 1000.0)
-    check_interval = float(os.environ.get("OUTPUT_CHECK_INTERVAL", "0.05"))
+    check_interval = env_float("OUTPUT_CHECK_INTERVAL", 0.05)
     deadline = time.monotonic() + timeout
 
     if command:

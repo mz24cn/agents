@@ -573,7 +573,7 @@ def is_likely_base64(value: str) -> bool:
         return False
 
     # 长度检查：base64 编码的文件内容通常很长
-    if len(value) < int(os.environ.get("BASE64_CHECK_THRESHOLD", "1024")):
+    if len(value) < env_int("BASE64_CHECK_THRESHOLD", 1024):
         return False
 
     # 字符合法性检查：只包含 base64 字符集
@@ -623,6 +623,39 @@ DATA_DIR: str = os.environ.get(
     "AGENTS_RUNTIME_DIR",
     os.path.join(os.path.expanduser("~"), ".agents_runtime"),
 )
+
+
+# ---------------------------------------------------------------------------
+# Defensive numeric env parsing
+# ---------------------------------------------------------------------------
+
+
+def env_int(name: str, default: int) -> int:
+    """Return ``int(os.environ[name])``, or *default* when unset or invalid.
+
+    Numeric config vars must degrade to their default instead of raising:
+    a corrupted value (e.g. from a stale or polluted environment) should
+    never break an otherwise healthy tool call. Matches the convention of
+    the timeout helpers in runtime/runtime.py (invalid -> default).
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(str(raw).strip() or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def env_float(name: str, default: float) -> float:
+    """Return ``float(os.environ[name])``, or *default* when unset/invalid."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(str(raw).strip() or default)
+    except (TypeError, ValueError):
+        return default
 
 
 # ---------------------------------------------------------------------------

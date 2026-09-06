@@ -94,8 +94,19 @@ class EnvManager:
         return env_map
 
     def detect_used_keys(self, scan_dir: str) -> list[str]:
-        """递归扫描 scan_dir 下所有 .py 文件，提取 os.environ.get( "KEY" ) 中的 KEY。"""
-        pattern = re.compile(r'os\.environ\.get\("(\w+)"')
+        """递归扫描 scan_dir 下所有 .py 文件，提取引用环境变量的 KEY。
+
+        识别三种源码形式：
+
+        * ``os.environ.get("KEY")``
+        * ``env_int("KEY", default)``（runtime.common.env_int）
+        * ``env_float("KEY", default)``（runtime.common.env_float）
+
+        后两种是防御式数值解析 helper：调用点不再出现
+        ``os.environ.get("...")`` 字面量，若正则不覆盖它们，
+        这些 key 会从侦测结果中静默消失。
+        """
+        pattern = re.compile(r'(?:os\.environ\.get|env_int|env_float)\("(\w+)"')
         found: set[str] = set()
         for dirpath, _dirnames, filenames in os.walk(scan_dir):
             for filename in filenames:

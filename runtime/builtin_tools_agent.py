@@ -17,7 +17,7 @@ import os
 import re
 
 from runtime.models import InferenceRequest, Message, ToolConfig
-from runtime.common import session_timestamp, snapshot_request_context, restore_request_context
+from runtime.common import session_timestamp, snapshot_request_context, restore_request_context, env_int
 from runtime.group_chat import build_agents_markdown, _GC_DEFAULT_PROMPT
 from runtime.server_state import IncrementalConversationPersister
 
@@ -198,7 +198,7 @@ def _make_delegate_fn(runtime, thread_local):
                 model_id=model_id,
                 tool_ids=resolved_ids,
                 messages=messages,
-                max_tool_rounds=int(os.environ.get("MAX_TOOL_ROUNDS", 200))
+                max_tool_rounds=env_int("MAX_TOOL_ROUNDS", 200)
             )
 
             # 保存旧值，切换到子 session 上下文
@@ -529,7 +529,7 @@ def _make_talk_to_fn(runtime, thread_local):
                 model_id=model_id,
                 tool_ids=agent_tool_ids,
                 messages=messages,
-                max_tool_rounds=int(os.environ.get("MAX_TOOL_ROUNDS", 200))
+                max_tool_rounds=env_int("MAX_TOOL_ROUNDS", 200)
             )
 
             chunks = []

@@ -47,6 +47,7 @@ from runtime.common import (
     safe_rel_path as _safe_rel_path,
     atomic_write_json as _atomic_write_json,
     kill_process_group,
+    env_int,
 )
 from runtime.models import ToolConfig
 
@@ -788,7 +789,7 @@ def _read_file(path: str, start_line: Optional[int] = None, end_line: Optional[i
         end_line = total_lines
 
     if start_line is None and end_line is None:
-        threshold = int(os.environ.get("READ_TRUNCATION_LINES", 1000))
+        threshold = env_int("READ_TRUNCATION_LINES", 1000)
         start, end = 1, min(total_lines, threshold)
         truncated = total_lines > threshold
         # If we're truncating by READ_TRUNCATION_LINES, track omitted lines
@@ -805,8 +806,8 @@ def _read_file(path: str, start_line: Optional[int] = None, end_line: Optional[i
     
     # Apply output limits (EXEC_OUTPUT_LINE_LIMIT and EXEC_OUTPUT_COLUMN_LIMIT)
     # similar to exec_shell and search_code
-    output_line_limit = int(os.environ.get("EXEC_OUTPUT_LINE_LIMIT", 1000))
-    max_line_length = int(os.environ.get("EXEC_OUTPUT_COLUMN_LIMIT", 1000))
+    output_line_limit = env_int("EXEC_OUTPUT_LINE_LIMIT", 1000)
+    max_line_length = env_int("EXEC_OUTPUT_COLUMN_LIMIT", 1000)
     
     # Track if any truncation occurs
     line_truncated = False
@@ -1768,8 +1769,8 @@ def _search_code(query: str, include: Optional[str] = None, exclude: Optional[st
     # Get workspace
     workspace = get_workspace()
 
-    max_results = int(os.environ.get("SEARCH_MAX_RESULTS", 100))
-    max_context_length = int(os.environ.get("EXEC_OUTPUT_COLUMN_LIMIT", 1000))
+    max_results = env_int("SEARCH_MAX_RESULTS", 100)
+    max_context_length = env_int("EXEC_OUTPUT_COLUMN_LIMIT", 1000)
 
     # Default excludes
     default_excludes = [".git", "node_modules", "dist"]
@@ -2082,10 +2083,10 @@ def _exec_shell(command: str, timeout: Optional[int] = None, background: bool = 
                 return json.dumps({"error": "CommandParseError", "message": f"Failed to parse command: {e}"})
 
     # Read configuration
-    output_line_limit = int(os.environ.get("EXEC_OUTPUT_LINE_LIMIT", 1000))
-    max_line_length = int(os.environ.get("EXEC_OUTPUT_COLUMN_LIMIT", 1000))
+    output_line_limit = env_int("EXEC_OUTPUT_LINE_LIMIT", 1000)
+    max_line_length = env_int("EXEC_OUTPUT_COLUMN_LIMIT", 1000)
     if timeout is None:
-        timeout_val = int(os.environ.get("EXEC_DEFAULT_TIMEOUT", 30))
+        timeout_val = env_int("EXEC_DEFAULT_TIMEOUT", 30)
     else:
         timeout_val = int(timeout)
 

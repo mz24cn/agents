@@ -19,6 +19,7 @@ from runtime.common import (
     get_request_context,
     now_iso,
     set_request_context,
+    env_int,
 )
 from runtime.builtin_tools_coding import _FileJournalManagerHolder
 from runtime.models import InferenceRequest, Message, ModelConfig
@@ -431,7 +432,7 @@ class HandlerInferMixin:
             messages=assembled_messages,
             text=body.get("text"),
             stream=True,
-            max_tool_rounds=body.get("max_tool_rounds") or int(os.environ.get("MAX_TOOL_ROUNDS", 200)),
+            max_tool_rounds=body.get("max_tool_rounds") or env_int("MAX_TOOL_ROUNDS", 200),
         )
 
         session_dir = None

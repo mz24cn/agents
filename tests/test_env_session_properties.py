@@ -20,6 +20,28 @@ from runtime.env_manager import EnvManager
 
 
 # ---------------------------------------------------------------------------
+# Process-environment guard
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _restore_os_environ():
+    """Restore os.environ after every test in this module.
+
+    ``EnvManager.set()`` syncs every key of env.json into the process
+    environment, so the property tests below (which use random
+    keys/values) would otherwise leak hundreds of synthetic variables
+    into os.environ.  Leftover garbage breaks later tests that parse
+    numeric env vars (e.g. CLI_EXEC_TIMEOUT) and is inherited by any
+    subprocess they start.  Snapshotting/restoring around each test
+    keeps the suite hermetic without changing what the tests assert.
+    """
+    before = dict(os.environ)
+    yield
+    os.environ.clear()
+    os.environ.update(before)
+
+
+# ---------------------------------------------------------------------------
 # 辅助策略
 # ---------------------------------------------------------------------------
 
@@ -253,8 +275,12 @@ def test_read_accepts_empty_json_object() -> None:
 @given(identifier=_identifier_strategy)
 @settings(max_examples=100)
 def test_detect_used_keys_roundtrip(identifier: str) -> None:
-    """属性 5：将标识符嵌入 os.environ.get("KEY") 格式写入 .py 文件后，
+    """属性 5：将标识符以三种环境变量引用形式写入 .py 文件后，
     detect_used_keys() 应返回包含该标识符的列表。
+
+    三种形式：``os.environ.get("KEY")``、``env_int("KEY", d)``、
+    ``env_float("KEY", d)``。后两种是防御式解析 helper 的调用形式，
+    侦测正则必须覆盖它们，否则相关 key 会从侦测结果中静默消失。
 
     **Validates: Requirements 3.1, 3.2**
     """
@@ -262,8 +288,12 @@ def test_detect_used_keys_roundtrip(identifier: str) -> None:
         env_path = os.path.join(tmpdir, "env.json")
         mgr = EnvManager(env_path=env_path)
 
-        # 写入包含 os.environ.get("KEY") 格式的 .py 文件
-        py_content = f'value = os.environ.get("{identifier}")\n'
+        # 写入包含三种环境变量引用形式的 .py 文件
+        py_content = (
+            f'value = os.environ.get("{identifier}")\n'
+            f'n = env_int("{identifier}", 1)\n'
+            f'f = env_float("{identifier}", 1.0)\n'
+        )
         py_file = os.path.join(tmpdir, "test_script.py")
         with open(py_file, "w", encoding="utf-8") as fh:
             fh.write(py_content)
