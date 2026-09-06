@@ -27,7 +27,7 @@
 
   function getWsUrl(sid) {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    let url = `${proto}//${location.host}/ws?terminal_id=${sid}`;
+    let url = `${proto}//${location.host}/v1/terminals/ws?terminal_id=${sid}`;
     if (workspace) {
       url += `&workspace=${encodeURIComponent(workspace)}`;
     }

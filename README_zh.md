@@ -327,7 +327,7 @@ python app.py 0.0.0.0:9000 # 自定义主机和端口（重载 AGENTS_URL）
 | POST | `/v1/workspace/upload/{upload_id}/complete` | 完成分块上传 |
 | DELETE | `/v1/workspace/upload/{upload_id}` | 取消上传 |
 
-> **补充：** 另有 WebSocket 终端 `WS /ws`（非 `/v1` 前缀，未在上表列出），用于浏览器实时终端会话。
+> **补充：** 另有 WebSocket 终端端点 `WS /v1/terminals/ws`，用于浏览器实时终端会话。与所有 `/v1/` 端点一样需要鉴权（会话 cookie 或 `Authorization: Bearer` API key）。
 
 **流式推理请求示例：**
 

@@ -24,7 +24,7 @@ def test_websocket(host='localhost', port=7988):
         # WebSocket 握手
         key = base64.b64encode(b'test-key-123456789012345').decode()
         handshake = (
-            f"GET /ws HTTP/1.1\r\n"
+            f"GET /v1/terminals/ws HTTP/1.1\r\n"
             f"Host: {host}:{port}\r\n"
             f"Upgrade: websocket\r\n"
             f"Connection: Upgrade\r\n"

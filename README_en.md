@@ -348,7 +348,7 @@ change takes effect after a restart.
 | POST | `/v1/workspace/upload/{upload_id}/complete` | Complete a chunked upload |
 | DELETE | `/v1/workspace/upload/{upload_id}` | Cancel an upload |
 
-> **Note:** A WebSocket terminal `WS /ws` (without the `/v1` prefix, not listed above) is also available for real-time terminal sessions in the browser.
+> **Note:** A WebSocket terminal endpoint `WS /v1/terminals/ws` is also available for real-time terminal sessions in the browser. Like all `/v1/` endpoints, it requires authentication (session cookie or `Authorization: Bearer` API key).
 
 **Streaming inference request:**
 

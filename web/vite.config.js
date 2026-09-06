@@ -32,13 +32,13 @@ export default defineConfig({
   plugins: [svelte(), buildVersionPlugin()],
   server: {
     proxy: {
+      '/v1/terminals/ws': {
+        target: 'ws://localhost:7988',
+        ws: true
+      },
       '/v1': {
         target: 'http://localhost:7988',
         changeOrigin: true
-      },
-      '/ws': {
-        target: 'ws://localhost:7988',
-        ws: true
       }
     }
   },

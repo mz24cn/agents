@@ -133,6 +133,7 @@ def patched_paths(tmp_path):
          mock.patch("runtime.server._PROMPT_TEMPLATES_PATH", str(tmp_path / "prompt_templates.json")), \
          mock.patch("runtime.server._ENV_PATH", str(tmp_path / "env.json")), \
          mock.patch("runtime.server._CERTS_DIR", str(tmp_path / "certs")), \
+         mock.patch("runtime.server._AUTH_PATH", str(tmp_path / "auth_token.json")), \
          mock.patch("runtime.server._DATA_DIR", str(tmp_path)):
         yield tmp_path
 
@@ -380,5 +381,191 @@ class TestSniMultiCert:
             cn, status, _ = _tls_probe(srv.port, "late.example")
             assert cn == "late.example"
             assert status == b"HTTP/1.1 200 OK"
+        finally:
+            srv.stop()
+
+# ---------------------------------------------------------------------------
+# Authorization for the /v1/terminals/ws terminal endpoint (security regression)
+# ---------------------------------------------------------------------------
+
+
+class TestWebSocketEndpointAuth:
+    """The /v1/terminals/ws terminal endpoint spawns a real shell process and must be
+    gated by the same authorization as the rest of /v1/*.  Regression
+    coverage for the unauthenticated WebSocket RCE: the endpoint used to
+    live at /ws (outside the /v1/ auth prefix), so a bare upgrade yielded a
+    shell with no token/cookie at all.
+    """
+
+    @staticmethod
+    def _ws_upgrade_status(port, cookie=None, path="/v1/terminals/ws"):
+        """Raw WebSocket upgrade request; returns the HTTP status line."""
+        import base64 as _b64
+
+        raw = socket.create_connection(("127.0.0.1", port), timeout=10)
+        try:
+            key = _b64.b64encode(os.urandom(16)).decode()
+            cookie_line = f"Cookie: {cookie}\r\n" if cookie else ""
+            raw.sendall(
+                (
+                    f"GET {path}?terminal_id=ws-auth-test HTTP/1.1\r\n"
+                    f"Host: 127.0.0.1:{port}\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    f"Sec-WebSocket-Key: {key}\r\n"
+                    f"{cookie_line}"
+                    "Sec-WebSocket-Version: 13\r\n"
+                    "\r\n"
+                ).encode("ascii")
+            )
+            data = b""
+            while b"\r\n\r\n" not in data:
+                chunk = raw.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            return data.split(b"\r\n", 1)[0]
+        finally:
+            raw.close()
+
+    @staticmethod
+    def _post_json(srv, path_, payload):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{srv.port}{path_}",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status, resp.headers
+
+    @staticmethod
+    def _login_cookie(srv, password):
+        status, headers = TestWebSocketEndpointAuth._post_json(
+            srv, "/v1/auth/login", {"password": password}
+        )
+        assert status == 200
+        set_cookie = headers.get("Set-Cookie", "")
+        assert "agent_service_session=" in set_cookie
+        return (
+            "agent_service_session="
+            + set_cookie.split("agent_service_session=", 1)[1].split(";", 1)[0]
+        )
+
+    @staticmethod
+    def _cleanup_terminals(srv, cookie=None, expect_id="ws-auth-test:auto", timeout=5.0):
+        """Delete the terminal spawned by the test (PTY children outlive the
+        WebSocket connection by design, so the test must not leave shells)."""
+        deadline = time.monotonic() + timeout
+        headers = {"Cookie": cookie} if cookie else {}
+        terminals = []
+        while time.monotonic() < deadline:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{srv.port}/v1/terminals", headers=headers
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                terminals = json.loads(resp.read()).get("terminals", [])
+            if any(t.get("terminal_id") == expect_id for t in terminals):
+                break
+            time.sleep(0.1)
+        for t in terminals:
+            if t.get("terminal_id") == expect_id:
+                dreq = urllib.request.Request(
+                    f"http://127.0.0.1:{srv.port}/v1/terminals/{t['terminal_id']}",
+                    headers=headers,
+                    method="DELETE",
+                )
+                urllib.request.urlopen(dreq, timeout=10)
+
+    def test_ws_rejected_without_credentials(self, patched_paths):
+        srv = _make_server(patched_paths)
+        try:
+            self._post_json(srv, "/v1/auth/config", {"password": "test-password-123"})
+            assert self._ws_upgrade_status(srv.port) == b"HTTP/1.1 401 Unauthorized"
+        finally:
+            srv.stop()
+
+    def test_legacy_ws_paths_do_not_upgrade(self, patched_paths):
+        """The pre-rename /ws and /v1/ws locations must never complete a
+        WebSocket handshake (they now fall through to static-file serving /
+        the JSON 404 handler)."""
+        srv = _make_server(patched_paths)
+        try:
+            for legacy in ("/ws", "/v1/ws"):
+                status = self._ws_upgrade_status(srv.port, path=legacy)
+                assert status != b"HTTP/1.1 101 Switching Protocols"
+        finally:
+            srv.stop()
+
+    def test_ws_allowed_with_session_cookie(self, patched_paths):
+        srv = _make_server(patched_paths)
+        try:
+            self._post_json(srv, "/v1/auth/config", {"password": "test-password-123"})
+            cookie = self._login_cookie(srv, "test-password-123")
+            assert (
+                self._ws_upgrade_status(srv.port, cookie)
+                == b"HTTP/1.1 101 Switching Protocols"
+            )
+            self._cleanup_terminals(srv, cookie)
+        finally:
+            srv.stop()
+
+    def test_ws_open_when_auth_disabled(self, patched_paths):
+        srv = _make_server(patched_paths)
+        try:
+            assert (
+                self._ws_upgrade_status(srv.port)
+                == b"HTTP/1.1 101 Switching Protocols"
+            )
+            self._cleanup_terminals(srv)
+        finally:
+            srv.stop()
+
+    def test_oversized_json_body_rejected_with_413(self, patched_paths, monkeypatch):
+        import runtime.handler_base as hb
+
+        monkeypatch.setattr(hb, "_MAX_JSON_BODY_BYTES", 1024)
+        srv = _make_server(patched_paths)
+        try:
+            body = json.dumps({"pad": "x" * 2048}).encode()
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{srv.port}/v1/env",
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with pytest.raises(urllib.error.HTTPError) as excinfo:
+                urllib.request.urlopen(req, timeout=15)
+            assert excinfo.value.code == 413
+        finally:
+            srv.stop()
+
+    @needs_cryptography
+    def test_session_cookie_has_secure_flag_over_https(self, patched_paths):
+        os.makedirs(patched_paths / "certs", exist_ok=True)
+        srv = _make_server(patched_paths, protocol="https")
+        try:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            req = urllib.request.Request(
+                f"https://127.0.0.1:{srv.port}/v1/auth/config",
+                data=json.dumps({"password": "test-password-123"}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+                assert resp.status == 200
+            req = urllib.request.Request(
+                f"https://127.0.0.1:{srv.port}/v1/auth/login",
+                data=json.dumps({"password": "test-password-123"}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+                assert resp.status == 200
+                set_cookie = resp.headers.get("Set-Cookie", "")
+            assert "agent_service_session=" in set_cookie
+            assert "Secure" in set_cookie
         finally:
             srv.stop()

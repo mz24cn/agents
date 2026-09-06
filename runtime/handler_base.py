@@ -51,6 +51,11 @@ from runtime.server_state import (
 
 logger = logging.getLogger("runtime.server")
 
+# Maximum accepted JSON request body (bytes).  Larger bodies are rejected with
+# 413 and the connection is closed, so a public-facing instance cannot be
+# pushed to buffer multi-gigabyte payloads (memory exhaustion / DoS).
+_MAX_JSON_BODY_BYTES = 64 * 1024 * 1024
+
 
 # ---------------------------------------------------------------------------
 # Declarative route tables (precompiled regexes)
@@ -260,6 +265,12 @@ class HandlerBaseMixin:
         if content_length == 0:
             self._send_json_error(400, "Empty request body")
             return None
+        if content_length > _MAX_JSON_BODY_BYTES:
+            # Reject without buffering the payload; closing the connection
+            # keeps the unread bytes from corrupting keep-alive framing.
+            self.close_connection = True
+            self._send_json_error(413, "Request body too large")
+            return None
         raw = self.rfile.read(content_length)
         try:
             return json.loads(raw)
@@ -302,6 +313,8 @@ class HandlerBaseMixin:
         return ""
 
     def _is_authorized(self, method: str, path: str) -> bool:
+        # Everything except the /v1/ JSON API (including the /v1/terminals/ws
+        # terminal endpoint, which spawns a real shell) is public (static files, etc.).
         if not path.startswith("/v1/"):
             return True
         if method == "OPTIONS":
@@ -352,7 +365,12 @@ class HandlerBaseMixin:
             "HttpOnly",
             "SameSite=Strict",
         ]
-        if self.headers.get("X-Forwarded-Proto", "").lower() == "https":
+# Secure is set for TLS connections: either the request arrived over this
+        # server's own TLS listener (ssl_context set) or a reverse proxy
+        # marked it https via X-Forwarded-Proto.
+        if self.headers.get("X-Forwarded-Proto", "").lower() == "https" or bool(
+            getattr(self.server, "ssl_context", None)
+        ):
             parts.append("Secure")
         self.send_header("Set-Cookie", "; ".join(parts))
 
@@ -392,14 +410,18 @@ class HandlerBaseMixin:
         """Handle GET requests."""
         # Strip query string before routing so GET endpoints can accept query params.
         path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
-        if path.startswith("/v1/") and not self._require_authorized("GET", path):
-            return
         if path.startswith("/v1/"):
+            if not self._require_authorized("GET", path):
+                return
+            # The terminal endpoint spawns a real shell; its WebSocket
+            # handshake is a plain GET with an Upgrade header, so it must be
+            # handled here, before the JSON route table (which would 404 it).
+            # Credentials are already enforced by the /v1/ gate above.
+            if path == "/v1/terminals/ws" and self.headers.get("Upgrade", "").lower() == "websocket":
+                self._handle_websocket()
+                return
             if not self._dispatch_route("GET", path):
                 self._send_json_error(404, f"Not found: {self.path}")
-            return
-        if path == "/ws" and self.headers.get("Upgrade", "").lower() == "websocket":
-            self._handle_websocket()
             return
         self._handle_static_file()
 
