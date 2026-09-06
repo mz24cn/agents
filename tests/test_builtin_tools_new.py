@@ -683,6 +683,43 @@ class TestEditFileUnit:
         assert result["error"] == "LineNotFound"
         assert "message" in result
 
+    def test_whitespace_only_match_is_refused(self, workspace):
+        """old_str matching only modulo whitespace is refused; file unchanged."""
+        test_file = workspace / "indent_test.py"
+        original = "def foo():\n    return 1\n"
+        test_file.write_text(original)
+        result = _json.loads(_edit_file("indent_test.py", "search_replace",
+                                        old_str="def foo():\n  return 1",
+                                        new_str="def foo():\n    return 2"))
+        assert result["error"] == "LineNotFound"
+        assert "仅在忽略空白后匹配" in result["message"]
+        assert "第 1 行" in result["message"]
+        assert test_file.read_text() == original
+
+    def test_exact_match_still_applies(self, workspace):
+        """An exact old_str (correct indentation) is applied as before."""
+        test_file = workspace / "exact_test.py"
+        test_file.write_text("def foo():\n    return 1\n")
+        result = _json.loads(_edit_file("exact_test.py", "search_replace",
+                                        old_str="def foo():\n    return 1",
+                                        new_str="def foo():\n    return 2"))
+        assert "error" not in result, f"Unexpected error: {result}"
+        assert test_file.read_text() == "def foo():\n    return 2\n"
+
+    def test_multiple_tolerant_matches_are_reported(self, workspace):
+        """When the block matches (modulo whitespace) in several places, the
+        message reports the total number of tolerant matches."""
+        test_file = workspace / "dup_test.py"
+        original = "x = 1\ny = 2\nx = 1\n"
+        test_file.write_text(original)
+        result = _json.loads(_edit_file("dup_test.py", "search_replace",
+                                        old_str=" x = 1",
+                                        new_str="x = 99"))
+        assert result["error"] == "LineNotFound"
+        assert "共有 2 处" in result["message"]
+        assert "第 1 行" in result["message"]
+        assert test_file.read_text() == original
+
     def test_patch_does_not_apply_returns_patch_failed(self, workspace):
         """Returns PatchFailed error when the patch does not apply cleanly."""
         test_file = workspace / "patch_test.py"
@@ -923,10 +960,10 @@ class TestEditFilePropertyP7:
 
 
 # ---------------------------------------------------------------------------
-# Task 7.6 — Property test P8: whitespace-tolerant matching
+# Task 7.6 — Property test P8: whitespace-sensitive (two-tier) matching
 # ---------------------------------------------------------------------------
 
-# Feature: builtin-tools, Property 8: whitespace-tolerant matching
+# Feature: builtin-tools, Property 8: two-tier matching
 class TestEditFilePropertyP8:
     """**Validates: Requirements 5.2**"""
 
@@ -954,33 +991,49 @@ class TestEditFilePropertyP8:
             max_size=30,
         ),
     )
-    def test_whitespace_tolerant_matching(self, workspace, line_content, file_indent, search_indent, replacement):
-        """old_str with different leading/trailing whitespace still matches the file content."""
+    def test_whitespace_sensitive_matching(self, workspace, line_content, file_indent, search_indent, replacement):
+        """old_str must match the file exactly, including indentation.
+
+        An exact match is applied; a whitespace-only match is refused with a
+        diagnostic and leaves the file unmodified.
+        """
         # Write file with file_indent spaces before the line
         file_line = " " * file_indent + line_content
         content = f"before\n{file_line}\nafter\n"
         test_file = workspace / "prop8_test.txt"
         test_file.write_text(content, encoding="utf-8")
 
-        # Search with search_indent spaces (different from file_indent)
+        # Search with search_indent spaces (may differ from file_indent)
         search_line = " " * search_indent + line_content
 
         result = _json.loads(_edit_file("prop8_test.txt", "search_replace",
                                         old_str=search_line,
                                         new_str=replacement))
 
-        # The match should succeed because whitespace-tolerant matching strips leading/trailing spaces
-        assert "error" not in result, (
-            f"Expected match to succeed with file_indent={file_indent}, "
-            f"search_indent={search_indent}, line={line_content!r}, "
-            f"but got error: {result}"
-        )
-
-        # Verify the replacement was applied
-        new_content = test_file.read_text(encoding="utf-8")
-        assert replacement in new_content, (
-            f"Replacement {replacement!r} not found in file after edit"
-        )
+        if search_indent == file_indent:
+            # Exact match: the replacement must be applied.
+            assert "error" not in result, (
+                f"Expected match to succeed with file_indent={file_indent}, "
+                f"search_indent={search_indent}, line={line_content!r}, "
+                f"but got error: {result}"
+            )
+            new_content = test_file.read_text(encoding="utf-8")
+            assert replacement in new_content, (
+                f"Replacement {replacement!r} not found in file after edit"
+            )
+        else:
+            # Whitespace-only match: refused, file left unmodified.
+            assert result.get("error") == "LineNotFound", (
+                f"Expected LineNotFound for file_indent={file_indent}, "
+                f"search_indent={search_indent}, line={line_content!r}, "
+                f"but got: {result}"
+            )
+            assert "仅在忽略空白后匹配" in result["message"], (
+                f"Expected indentation-mismatch diagnostic, got: {result['message']}"
+            )
+            assert test_file.read_text(encoding="utf-8") == content, (
+                "File must be left unmodified when only a tolerant match exists"
+            )
 
 
 # ---------------------------------------------------------------------------

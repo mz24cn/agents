@@ -1143,6 +1143,45 @@ def _find_first_occurrence(file_lines: list[str], old_str: str) -> Optional[int]
     return None
 
 
+def _find_first_occurrence_strict(file_lines: list[str], old_str: str) -> Optional[int]:
+    """Find the start index (0-based) of the first exact occurrence of old_str.
+
+    Each line of old_str must equal the corresponding file line exactly,
+    including leading/trailing whitespace (line terminators are ignored).
+    Unlike :func:`_find_first_occurrence`, whitespace is NOT stripped.
+
+    Returns the 0-based line index of the first matching line, or None if not found.
+    """
+    old_lines = old_str.splitlines()
+    if not old_lines:
+        return None
+    n_old = len(old_lines)
+    n_file = len(file_lines)
+    if n_old > n_file:
+        return None
+    for i in range(n_file - n_old + 1):
+        for j in range(n_old):
+            if file_lines[i + j].rstrip("\r\n") != old_lines[j]:
+                break
+        else:
+            return i
+    return None
+
+
+def _count_tolerant_occurrences(file_lines: list[str], old_str: str) -> int:
+    """Count whitespace-tolerant occurrences of old_str in file_lines."""
+    old_stripped = _strip_lines(old_str)
+    if not old_stripped:
+        return 0
+    n_old = len(old_stripped)
+    file_stripped = [line.strip() for line in file_lines]
+    return sum(
+        1
+        for i in range(len(file_stripped) - n_old + 1)
+        if file_stripped[i:i + n_old] == old_stripped
+    )
+
+
 def _edit_file_search_replace(
     resolved_path: str,
     rel_path: str,
@@ -1161,10 +1200,24 @@ def _edit_file_search_replace(
     with open(resolved_path, "r", encoding="utf-8", errors="replace") as f:
         file_lines = f.readlines()
 
-    # Find first occurrence using whitespace-tolerant matching
-    match_start = _find_first_occurrence(file_lines, old_str)
+    # Two-tier matching: an exact (whitespace-sensitive) match is required.
+    # A whitespace-tolerant-only match is refused instead of applied: silently
+    # re-indenting the replacement has repeatedly produced IndentationError
+    # output, so report where the block matches modulo whitespace and ask the
+    # model to fix old_str/new_str indentation and retry.
+    match_start = _find_first_occurrence_strict(file_lines, old_str)
     if match_start is None:
-        return json.dumps({"error": "LineNotFound", "message": "Could not find text block in the specified file"})
+        tolerant_start = _find_first_occurrence(file_lines, old_str)
+        if tolerant_start is None:
+            return json.dumps({"error": "LineNotFound", "message": "Could not find text block in the specified file"})
+        message = (
+            f"old_str 仅在忽略空白后匹配（第 {tolerant_start + 1} 行），"
+            "缩进不一致，请修正 old_str/new_str 后重试"
+        )
+        occurrences = _count_tolerant_occurrences(file_lines, old_str)
+        if occurrences > 1:
+            message += f"；文件中共有 {occurrences} 处忽略空白后的匹配，行号为首处"
+        return json.dumps({"error": "LineNotFound", "message": message}, ensure_ascii=False)
 
     old_line_count = len(old_str.splitlines()) if old_str else 0
     # Ensure we handle old_str that doesn't end with newline
@@ -1579,12 +1632,14 @@ EDIT_FILE_TOOL_CONFIG = ToolConfig(
     tool_id="edit_file",
     tool_type="function",
     name="edit_file",
-    description=(
-        "Edit a file in the workspace using search_replace or diff mode. "
-        "In search_replace mode, finds the first occurrence of old_str and replaces it with new_str. "
-        "In diff mode, applies a unified diff patch. "
-        "A file journal snapshot is saved before editing. "
-        "Syntax is checked after editing; if it fails the edit is reverted to its pre-call state."
+description=(
+    "Edit a file in the workspace using search_replace or diff mode. "
+    "In search_replace mode, old_str must match the file exactly, including indentation; "
+    "the first exact occurrence is replaced with new_str. If old_str matches only when "
+    "leading/trailing whitespace is ignored, the edit is refused and the matching line is reported. "
+    "In diff mode, applies a unified diff patch. "
+    "A file journal snapshot is saved before editing. "
+    "Syntax is checked after editing; if it fails the edit is reverted to its pre-call state."
     ),
     parameters={
         "type": "object",
@@ -1599,8 +1654,8 @@ EDIT_FILE_TOOL_CONFIG = ToolConfig(
                 "description": "Edit mode: 'search_replace' (recommended) or 'diff'",
             },
             "old_str": {
-                "type": "string",
-                "description": "(search_replace mode) The text block to find and replace",
+            "type": "string",
+            "description": "(search_replace mode) The text block to find and replace; must match the file exactly, including indentation",
             },
             "new_str": {
                 "type": "string",
