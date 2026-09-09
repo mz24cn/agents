@@ -15,6 +15,7 @@ import datetime
 import json
 import logging
 import os
+import platform
 import shutil
 import sys
 import tarfile
@@ -29,11 +30,17 @@ from runtime.agent_manager import validate_agent_id
 from runtime.common import session_timestamp
 from runtime.context_manager import JournalConflictError
 from runtime.handler_base import (
+    _MAX_PUSH_BODY_BYTES,
     _SESSION_GZIP_CACHE,
     _SESSION_GZIP_CACHE_LOCK,
     _SESSION_GZIP_CACHE_MAX,
 )
 from runtime.models import ModelConfig, ToolConfig
+from runtime.remote_env_manager import (
+    build_setup_request_url,
+    normalize_setup_url,
+    snapshot_from_hello,
+)
 from runtime.skill_manager import SkillManager
 
 _SERVER_STARTED_AT = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -53,6 +60,43 @@ from runtime.server_state import (
 )
 
 logger = logging.getLogger("runtime.server")
+
+def _json_or_empty(raw) -> dict:
+    """Best-effort JSON parse of a response/error body; {} on any failure."""
+    try:
+        data = json.loads(raw if isinstance(raw, (bytes, bytearray)) else b"")
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return {}
+
+
+def _platform_arch() -> str:
+    """Normalize the hardware architecture to x86_64 / aarch64.
+
+    ``platform.machine()`` reports e.g. ``x86_64``/``AMD64`` on x86-64 and
+    ``aarch64``/``arm64`` on ARM; anything unrecognized is passed through
+    verbatim so exotic platforms stay visible.
+    """
+    machine = (platform.machine() or "").strip()
+    lowered = machine.lower()
+    if lowered in {"x86_64", "amd64", "x64"}:
+        return "x86_64"
+    if lowered in {"aarch64", "arm64"}:
+        return "aarch64"
+    return machine or "unknown"
+
+
+def _platform_os() -> str:
+    """Normalize the OS name to windows / linux / macOS (others as-is)."""
+    system = (platform.system() or "").strip()
+    if not system:
+        return "unknown"
+    lowered = system.lower()
+    if lowered == "darwin":
+        return "macOS"
+    if lowered in {"windows", "linux"}:
+        return lowered
+    return system
 
 
 class HandlerApiMixin:
@@ -818,6 +862,257 @@ class HandlerApiMixin:
         self._send_json_response(200, {"status": "deleted", "template_id": template_id})
 
     # ------------------------------------------------------------------
+    # Remote environment management handlers
+    # ------------------------------------------------------------------
+
+    def _handle_remote_envs_list(self) -> None:
+        """GET /v1/remote-envs — 返回远程环境列表（含最近一次状态检查的版本快照）。"""
+        self._send_json_response(200, {
+            "envs": self.server.remote_env_manager.read(),  # type: ignore[attr-defined]
+        })
+
+    def _handle_remote_envs_add(self) -> None:
+        """POST /v1/remote-envs — 新增（或更新）一条远程环境记录。
+
+        Body:
+            url (str, 必填): 环境地址，形态与 SETUP_SOURCE 相同
+                （http://host:7988/、http://host:7988/v1/setup、
+                http://host:7988/v1/setup?token=...）。
+            snapshot (dict, 可选): 前端查询目标环境 op=hello 的响应，
+                作为版本/推理状态快照一并落盘。
+
+        环境按 scheme://netloc 去重：重复添加同一地址时更新其
+        URL 与快照，不会产生重复记录。
+        """
+        body = self._read_json_body()
+        if body is None:
+            return
+        url = str(body.get("url", "")).strip()
+        if not url:
+            self._send_json_error(400, "Missing required field: url")
+            return
+        try:
+            normalize_setup_url(url)
+        except ValueError as exc:
+            self._send_json_error(400, str(exc))
+            return
+        snapshot = body.get("snapshot")
+        if not isinstance(snapshot, dict):
+            snapshot = None
+        manager = self.server.remote_env_manager  # type: ignore[attr-defined]
+        try:
+            envs = manager.upsert(url, snapshot)
+        except (OSError, ValueError) as exc:
+            self._send_json_error(500, f"Failed to write remote_envs.json: {exc}")
+            return
+        self._send_json_response(200, {"envs": envs})
+
+    def _handle_remote_envs_update(self, env_id: str) -> None:
+        """PUT /v1/remote-envs/{id} — 刷新/更新完成后回写该环境的版本快照。"""
+        body = self._read_json_body()
+        if body is None:
+            return
+        snapshot = body.get("snapshot")
+        if not isinstance(snapshot, dict) or not snapshot:
+            self._send_json_error(400, "Missing required field: snapshot")
+            return
+        manager = self.server.remote_env_manager  # type: ignore[attr-defined]
+        try:
+            envs = manager.update_snapshot(env_id, snapshot)
+        except KeyError:
+            self._send_json_error(404, f"Remote environment not found: {env_id}")
+            return
+        except OSError as exc:
+            self._send_json_error(500, f"Failed to write remote_envs.json: {exc}")
+            return
+        self._send_json_response(200, {"envs": envs})
+
+    def _handle_remote_envs_delete(self, env_id: str) -> None:
+        """DELETE /v1/remote-envs/{id} — 删除一条远程环境记录（不影响远程环境本身）。"""
+        manager = self.server.remote_env_manager  # type: ignore[attr-defined]
+        try:
+            envs = manager.remove(env_id)
+        except KeyError:
+            self._send_json_error(404, f"Remote environment not found: {env_id}")
+            return
+        except OSError as exc:
+            self._send_json_error(500, f"Failed to write remote_envs.json: {exc}")
+            return
+        self._send_json_response(200, {"envs": envs})
+
+    def _handle_remote_envs_push_update(self, env_id: str) -> None:
+        """POST /v1/remote-envs/{id}/push-update — 推送增量到子环境。
+
+        母环境从自己的文件构建增量 tar，直接 POST 到子环境的
+        ``/v1/setup?op=push``。子环境无需知道（更无需能访问）母环境地址——
+        母环境可以匿名、或只能通过 localhost 访问，更新依然成立。
+
+        流程：
+          1. 通过子环境 ``op=hello`` 读取其当前版本（hello 走常规授权；
+             子环境启用授权时，登记的 URL 需携带 ?token=...）；
+          2. 本地没有任何更新版本 -> 直接返回 up-to-date（不推送）；
+          3. 以子环境版本为基线在本地构建增量（与 op=delta 同一构建器）；
+          4. POST tar 到子环境 op=push（子环境 token 保留在存储的 URL 中）。
+        """
+        # 前端不带请求体；排空以防 keep-alive 帧错位。
+        self._drain_request_body()
+        manager = self.server.remote_env_manager  # type: ignore[attr-defined]
+        try:
+            env = manager.get(env_id)
+        except KeyError:
+            self._send_json_error(404, f"Remote environment not found: {env_id}")
+            return
+        env_url = str(env.get("url", ""))
+
+        # 1. 子环境当前版本（token 保留在登记 URL 中，随 hello 请求携带）。
+        hello_url = build_setup_request_url(env_url, {"op": "hello"})
+        try:
+            with urllib.request.urlopen(hello_url, timeout=30) as resp:
+                child_data = json.loads(resp.read())
+        except urllib.error.HTTPError as exc:
+            child_body = _json_or_empty(exc.read())
+            if exc.code in (401, 403):
+                # 子环境启用了授权，但登记的 URL 没有携带有效 token
+                # （hello 不再是公共端点，与其他接口一致）。
+                self._send_json_response(400, {
+                    "error": "child_auth",
+                    "message": "Child environment rejected the status check: "
+                               "it has authorization enabled. Re-add it with "
+                               "its full setup link (with ?token=...).",
+                })
+                return
+            self._send_child_error(exc.code, child_body)
+            return
+        except Exception as exc:
+            self._send_json_response(502, {
+                "error": "child_unreachable",
+                "message": f"Cannot reach child environment: {exc}",
+            })
+            return
+        remote = snapshot_from_hello(child_data)
+        remote_versions = {
+            key: remote.get(key, "") for key in ("frontend_build", "backend_build", "last_config")
+        }
+
+        # 2. 本地是否有更新版本（任一维度即视为有更新可推）。
+        local = self._local_setup_versions()
+
+        def _is_newer(key: str) -> bool:
+            here = local.get(key, "")
+            there = remote_versions.get(key, "")
+            if not there:
+                return bool(here)
+            if not here:
+                return False
+            try:
+                return self._parse_build_version(here) > self._parse_build_version(there)
+            except (ValueError, TypeError):
+                return False
+
+        if not any(_is_newer(key) for key in ("frontend_build", "backend_build", "last_config")):
+            self._send_json_response(200, {
+                "ok": True, "updated": False, "restart_backend": False,
+                "method": "push", "reason": "up-to-date",
+                "local": local, "remote": remote,
+            })
+            return
+
+        # 3. 从本地文件构建增量（子环境版本作基线）。
+        project_root = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
+        env_manager = self.server.env_manager  # type: ignore[attr-defined]
+        try:
+            tar_data = env_manager.build_delta_tar(
+                project_root=project_root,
+                data_dir=self.server.data_dir,  # type: ignore[attr-defined]
+                frontend_since=self._parse_build_version(remote_versions["frontend_build"], allow_empty=True),
+                backend_since=self._parse_build_version(remote_versions["backend_build"], allow_empty=True),
+                config_since=self._parse_build_version(remote_versions["last_config"], allow_empty=True),
+            )
+        except Exception as exc:
+            logger.exception("Failed to build delta tar for push update: %s", exc)
+            self._send_json_error(500, f"Failed to build delta tar: {exc}")
+            return
+        if tar_data is None:
+            self._send_json_response(200, {
+                "ok": True, "updated": False, "restart_backend": False,
+                "method": "push", "reason": "no-changes",
+                "local": local, "remote": remote,
+            })
+            return
+
+        # 4. 推送到子环境（其 token 保留在存储 URL 中，随请求鉴权）。
+        push_url = build_setup_request_url(env_url, {
+            "op": "push",
+            "frontend_build": local["frontend_build"],
+            "backend_build": local["backend_build"],
+            "last_config": local["last_config"],
+        })
+        try:
+            request = urllib.request.Request(
+                push_url, data=tar_data, method="POST",
+                headers={
+                    "Content-Type": "application/gzip",
+                    "User-Agent": "Agent-Service-Updater/1",
+                },
+            )
+            with urllib.request.urlopen(request, timeout=300) as resp:
+                payload = json.loads(resp.read())
+        except urllib.error.HTTPError as exc:
+            child_body = _json_or_empty(exc.read())
+            error_text = str(child_body.get("error", "") or "")
+            if exc.code == 400 and "Unsupported setup op" in error_text:
+                # 旧版子环境没有 op=push：推送模型要求子环境也升级到新版本。
+                self._send_json_response(400, {
+                    "error": "push_not_supported",
+                    "message": "Child environment is too old to support pushed updates (op=push). "
+                               "Upgrade it first (e.g. re-run its setup script).",
+                    "remote": remote,
+                })
+                return
+            self._send_child_error(exc.code, child_body)
+            return
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            self._send_json_response(502, {
+                "error": "child_unreachable",
+                "message": f"Cannot reach child environment: {exc}",
+            })
+            return
+        self._send_json_response(200, {
+            "ok": True,
+            "updated": bool(payload.get("updated")),
+            "restart_backend": bool(payload.get("restart_backend")),
+            "updated_files": payload.get("updated_files", []),
+            "method": "push",
+            "local": local,
+            "remote": remote,
+        })
+
+    def _send_child_error(self, status: int, child_body: dict) -> None:
+        """把子环境返回的 4xx/5xx 映射为母环境 API 的错误响应。"""
+        message = str(child_body.get("message") or child_body.get("error") or f"HTTP {status}")
+        child_code = str(child_body.get("error") or "")
+        if status in (401, 403):
+            self._send_json_response(400, {
+                "error": "child_auth",
+                "message": f"Child environment rejected the push: {message}",
+            })
+        elif status == 409:
+            self._send_json_response(409, {
+                "error": child_code or "busy",
+                "message": message,
+            })
+        elif status == 400:
+            self._send_json_response(400, {
+                "error": "child_rejected",
+                "message": message,
+            })
+        else:
+            self._send_json_response(502, {
+                "error": "child_error",
+                "message": f"Child environment returned HTTP {status}: {message}",
+            })
+
+    # ------------------------------------------------------------------
     # Env handlers
     # ------------------------------------------------------------------
 
@@ -878,77 +1173,100 @@ class HandlerApiMixin:
         keys = sorted(set(keys_runtime) | set(keys_accessories))
         self._send_json_response(200, {"keys": keys})
 
+    def _local_setup_versions(self) -> dict:
+        """Compute this environment's advertised build versions.
+
+        Returns a dict with ``frontend_build`` / ``backend_build`` /
+        ``last_config`` (each ``""`` when not determinable).  Shared by the
+        ``op=hello`` probe and the parent-side push-update flow, which
+        must compare and baseline against exactly the numbers the delta
+        builder and the child would see.
+        """
+        script_dir = os.path.dirname(os.path.abspath(__file__))  # runtime/
+        project_root = os.path.dirname(script_dir)
+
+        frontend = ""
+        build_version_path = os.path.join(project_root, "web", "dist", "build_version")
+        try:
+            with open(build_version_path, "r") as f:
+                frontend = f.read().strip()
+        except (OSError, IOError):
+            pass
+
+        # Backend version covers every deployable non-web project file,
+        # including accessories extensions and skill assets.  Otherwise an
+        # accessories-only change would never be advertised to online update.
+        env_manager = self.server.env_manager  # type: ignore[attr-defined]
+        latest_mtime = env_manager.get_backend_build_mtime(project_root)
+
+        backend = ""
+        if latest_mtime > 0:
+            build_dt = datetime.datetime.fromtimestamp(latest_mtime)
+            backend = build_dt.strftime("%y%m%d_%H%M%S")
+
+        config_mtime: float = 0.0
+        data_dir = self.server.data_dir
+        config_paths = [
+            os.path.join(data_dir, "models.json"),
+            os.path.join(data_dir, "tools.json"),
+            os.path.join(data_dir, "mcp_servers.json"),
+            os.path.join(data_dir, "prompt_templates.json"),
+        ]
+        agents_dir = os.path.join(data_dir, "agents")
+        if os.path.isdir(agents_dir):
+            for root, _dirs, files in os.walk(agents_dir):
+                config_paths.extend(
+                    os.path.join(root, filename)
+                    for filename in files
+                    if filename.endswith(".json")
+                )
+        for path in config_paths:
+            try:
+                if os.path.isfile(path):
+                    config_mtime = max(config_mtime, os.path.getmtime(path))
+            except OSError:
+                continue
+        last_config = ""
+        if config_mtime > 0:
+            last_config = datetime.datetime.fromtimestamp(config_mtime).strftime("%y%m%d_%H%M%S")
+
+        return {
+            "frontend_build": frontend,
+            "backend_build": backend,
+            "last_config": last_config,
+        }
+
     def _handle_setup_script(self) -> None:
         """GET /v1/setup -- multi-purpose endpoint.
 
         Operations:
-          GET  op=hello   Public version and inference status query.
+          GET  op=hello   Version and inference status query (normal authorization).
           GET  op=delta   Authorized minimal tar.gz delta using three version thresholds.
           GET  op=update           Authorized: download remote delta and apply it locally.
+          POST op=push    Authorized: apply a delta tar pushed by the parent environment.
           GET  op=restart_backend  Authorized: restart the backend without updating files.
           GET  no op               Authorized full self-extracting setup script.
         """
         import os
         import datetime
 
-        # -- op=hello: public version info --
+        # -- op=hello: version and inference status (normal authorization) --
         op = self._get_query_param("op", "")
         if op == "hello":
-            script_dir = os.path.dirname(os.path.abspath(__file__))  # runtime/
-            project_root = os.path.dirname(script_dir)
-
-            frontend = ""
-            build_version_path = os.path.join(project_root, "web", "dist", "build_version")
-            try:
-                with open(build_version_path, "r") as f:
-                    frontend = f.read().strip()
-            except (OSError, IOError):
-                pass
-
-            # Backend version covers every deployable non-web project file,
-            # including accessories extensions and skill assets.  Otherwise an
-            # accessories-only change would never be advertised to online update.
-            env_manager = self.server.env_manager  # type: ignore[attr-defined]
-            latest_mtime = env_manager.get_backend_build_mtime(project_root)
-
-            backend = ""
-            if latest_mtime > 0:
-                build_dt = datetime.datetime.fromtimestamp(latest_mtime)
-                backend = build_dt.strftime("%y%m%d_%H%M%S")
-
-            config_mtime: float = 0.0
-            data_dir = self.server.data_dir
-            config_paths = [
-                os.path.join(data_dir, "models.json"),
-                os.path.join(data_dir, "tools.json"),
-                os.path.join(data_dir, "mcp_servers.json"),
-                os.path.join(data_dir, "prompt_templates.json"),
-            ]
-            agents_dir = os.path.join(data_dir, "agents")
-            if os.path.isdir(agents_dir):
-                for root, _dirs, files in os.walk(agents_dir):
-                    config_paths.extend(
-                        os.path.join(root, filename)
-                        for filename in files
-                        if filename.endswith(".json")
-                    )
-            for path in config_paths:
-                try:
-                    if os.path.isfile(path):
-                        config_mtime = max(config_mtime, os.path.getmtime(path))
-                except OSError:
-                    continue
-            last_config = ""
-            if config_mtime > 0:
-                last_config = datetime.datetime.fromtimestamp(config_mtime).strftime("%y%m%d_%H%M%S")
-
+            versions = self._local_setup_versions()
             inference_active = bool(getattr(self.server, "active_streams", {})) or bool(
                 int(getattr(self.server, "active_inference_count", 0) or 0)
             )
+            # App metadata for the parent's remote-environment list. hello is
+            # a lightweight probe: a broken env.json must not fail it.
+            try:
+                env_map = self.server.env_manager.read()  # type: ignore[attr-defined]
+            except Exception:
+                env_map = {}
             self._send_json_response(200, {
-                "frontend_build": frontend,
-                "backend_build": backend,
-                "last_config": last_config,
+                "frontend_build": versions["frontend_build"],
+                "backend_build": versions["backend_build"],
+                "last_config": versions["last_config"],
                 "inference_active": inference_active,
                 # Per-source busy breakdown: web sessions carry a session_id
                 # and are tracked in active_streams; stateless API calls (no
@@ -958,6 +1276,12 @@ class HandlerApiMixin:
                 "session_inference_active": bool(getattr(self.server, "active_streams", {})),
                 "server_started_at": _SERVER_STARTED_AT,
                 "server_instance_id": _SERVER_INSTANCE_ID,
+                # App identity + platform: displayed in the parent's remote
+                # environment list (logo / title / arch / os).
+                "app_title": str(env_map.get("APP_TITLE", "") or ""),
+                "app_logo": str(env_map.get("APP_LOGO", "") or ""),
+                "arch": _platform_arch(),
+                "os": _platform_os(),
             })
             return
 
@@ -967,6 +1291,10 @@ class HandlerApiMixin:
 
         if op == "update":
             self._handle_setup_update()
+            return
+
+        if op == "push":
+            self._handle_setup_push_update()
             return
 
         if op == "restart_backend":
@@ -1086,8 +1414,18 @@ class HandlerApiMixin:
         backend_build = str(self._get_query_param("backend_build", "")).strip()
         last_config = str(self._get_query_param("last_config", "")).strip()
         if not source:
+            # 调用方未指定更新源时回退到本环境自己记录在 env.json 里的
+            # SETUP_SOURCE（安装脚本在安装时写入）：这样远程环境可以被
+            # 告知“更新自己”，调用方无需知道它当年从哪里安装。
+            try:
+                env_manager = self.server.env_manager  # type: ignore[attr-defined]
+                source = str(env_manager.read().get("SETUP_SOURCE", "")).strip()
+            except (ValueError, AttributeError):
+                source = ""
+        if not source:
             self._send_json_error(400, "Missing required field: source")
             return
+
         try:
             self._parse_build_version(frontend_build, allow_empty=True)
             self._parse_build_version(backend_build, allow_empty=True)
@@ -1097,26 +1435,9 @@ class HandlerApiMixin:
             return
 
         # Atomically block new inference requests while checking/applying update.
-        update_lock = getattr(self.server, "inference_update_lock", None)
+        update_lock = self._acquire_update_slot()
         if update_lock is None:
-            self._send_json_error(500, "Update lock is unavailable")
             return
-        with update_lock:
-            active_streams = getattr(self.server, "active_streams", {})
-            active_count = int(getattr(self.server, "active_inference_count", 0) or 0)
-            if active_streams or active_count > 0:
-                self._send_json_response(409, {
-                    "error": "inference_active",
-                    "message": "Cannot update while inference sessions are active",
-                })
-                return
-            if getattr(self.server, "update_in_progress", False):
-                self._send_json_response(409, {
-                    "error": "update_in_progress",
-                    "message": "Another update is already in progress",
-                })
-                return
-            self.server.update_in_progress = True
 
         def release_update_lock() -> None:
             with update_lock:
@@ -1149,7 +1470,6 @@ class HandlerApiMixin:
             "",
         ))
 
-        project_root = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
         try:
             request = urllib.request.Request(update_url, headers={"User-Agent": "Agent-Service-Updater/1"})
             with urllib.request.urlopen(request, timeout=120) as response:
@@ -1165,6 +1485,87 @@ class HandlerApiMixin:
             release_update_lock()
             self._send_json_error(502, f"Failed to download update: {exc}")
             return
+
+        self._apply_setup_delta(tar_data, update_lock)
+
+
+    def _acquire_update_slot(self):
+        """Atomically block new inference while checking/applying an update.
+
+        Returns the held update lock, or ``None`` after an error response has
+        been sent (409 inference active / another update in progress, 500 no
+        lock).  The caller owns the slot until :meth:`_apply_setup_delta`
+        releases it (or the backend restart replaces the process).
+        """
+        update_lock = getattr(self.server, "inference_update_lock", None)
+        if update_lock is None:
+            self._send_json_error(500, "Update lock is unavailable")
+            return None
+        with update_lock:
+            active_streams = getattr(self.server, "active_streams", {})
+            active_count = int(getattr(self.server, "active_inference_count", 0) or 0)
+            if active_streams or active_count > 0:
+                self._send_json_response(409, {
+                    "error": "inference_active",
+                    "message": "Cannot update while inference sessions are active",
+                })
+                return None
+            if getattr(self.server, "update_in_progress", False):
+                self._send_json_response(409, {
+                    "error": "update_in_progress",
+                    "message": "Another update is already in progress",
+                })
+                return None
+            self.server.update_in_progress = True
+        return update_lock
+
+    def _handle_setup_push_update(self) -> None:
+        """Apply a delta tar pushed by the parent environment (op=push).
+
+        POST /v1/setup?op=push with the raw tar.gz body.  The parent builds
+        the delta from its *own* files and ships it here, so the child never
+        needs to know or reach the parent's address — the parent may be
+        anonymous or only reachable through localhost.  The query params carry
+        the parent's current versions and act as a downgrade guard: any axis
+        older than what we already run is rejected before anything is applied.
+        """
+        if self.command != "POST":
+            self._send_json_error(405, "op=push requires POST")
+            return
+        tar_data = self._read_raw_body(_MAX_PUSH_BODY_BYTES)
+        if tar_data is None:
+            return
+
+        local = self._local_setup_versions()
+        for key in ("frontend_build", "backend_build", "last_config"):
+            target = str(self._get_query_param(key, "") or "").strip()
+            current = local.get(key, "")
+            if target and current:
+                try:
+                    if self._parse_build_version(target) < self._parse_build_version(current):
+                        self._send_json_error(400, f"Refusing push: {key} {target} is older than local {current}")
+                        return
+                except (ValueError, TypeError):
+                    self._send_json_error(400, f"Invalid {key} in push request")
+                    return
+
+        update_lock = self._acquire_update_slot()
+        if update_lock is None:
+            return
+        self._apply_setup_delta(tar_data, update_lock)
+
+    def _apply_setup_delta(self, tar_data: bytes, update_lock) -> None:
+        """Apply a setup delta tar to this environment (shared by op=update / op=push).
+
+        Called with the update slot already held (see :meth:`_acquire_update_slot`).
+        Releases the slot when done, unless backend files changed — then it stays
+        held until the execv restart replaces the process.
+        """
+        project_root = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
+
+        def release_update_lock() -> None:
+            with update_lock:
+                self.server.update_in_progress = False
 
         restart_backend = False
         config_updated = False

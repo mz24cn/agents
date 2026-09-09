@@ -18,7 +18,7 @@
 - **AI代理管理** — 将当前模型、工具和系统提示词配置保存为可复用的AI代理；在聊天界面中快速切换已保存的AI代理
 - **Web UI 管理控制台** — Svelte 5 SPA，支持模型、工具、提示词模板、AI代理管理和对话
 - **紧凑消息显示** — 对多 Agent 协作和长工具链对话按 Agent 回复块紧凑展示，并将工具调用与对应执行结果配对为可交互胶囊；参数和结果可分别点击或悬停展开，支持 JSON、Python、Shell 语法高亮与 Markdown 结果渲染，在保留完整执行细节的同时减少长会话的视觉占用
-- **服务级授权系统** — 面向单租户场景的可选授权机制，保护所有 `/v1/*` API；脚本/SDK 使用 Bearer API Key，Web UI 使用 HttpOnly Session Cookie；凭据以哈希形式保存在本地 `~/.agents_runtime/auth_token.json`，`/v1/setup` 导出链接使用短有效期 setup token
+- **服务级授权系统** — 面向单租户场景的可选授权机制，保护所有 `/v1/*` API；脚本/SDK 使用 Bearer API Key，Web UI 使用 HttpOnly Session Cookie；凭据以哈希形式保存在本地 `~/.agents_runtime/auth_token.json`，`/v1/setup` 导出链接使用短有效期 setup token（`token` 参数也接受长效 API Key，便于持久化链接）
 - **HTTP API 服务** — 基于 `http.server` 的轻量 REST API，无需 FastAPI/uvicorn
 - **多模态** — 支持图片（base64）和音频输入，适配 VLM 模型；非 VLM 模型收到图片时，自动通过 `read_image` 工具调用 VLM 模型将图片转述为文本（需注册 `model_id` 或 `labels` 含 `read-image` 的 VLM 模型）
 - **对话持久化加固与继续推理** — 推理过程中每完成一轮工具调用即增量落盘（`conversation.json`），服务器异常重启时最多丢失最后一轮；中断的会话（最后一轮为用户消息/工具调用/工具结果）可在 Web UI 中一键"继续推理"，基于既有上下文恢复，无需重发消息；`POST /v1/infer/stream` 请求体加 `"continue": true` 即可通过 API 触发
@@ -268,7 +268,7 @@ python app.py 0.0.0.0:9000 # 自定义主机和端口（重载 AGENTS_URL）
 | POST | `/v1/auth/login` | 登录，获取访问凭证 |
 | POST | `/v1/auth/logout` | 登出，使当前访问凭证失效 |
 | GET | `/v1/auth/config` | 查询授权配置 |
-| GET | `/v1/setup` | 导出自安装脚本（带短时效 setup token） |
+| GET | `/v1/setup` | 导出自安装脚本（`token` 参数支持短时效 setup token 或长效 API Key） |
 | GET | `/v1/models` | 获取模型列表 |
 | POST | `/v1/models` | 注册模型 |
 | PUT | `/v1/models/{model_id}` | 更新模型 |

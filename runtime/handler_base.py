@@ -56,6 +56,12 @@ logger = logging.getLogger("runtime.server")
 # pushed to buffer multi-gigabyte payloads (memory exhaustion / DoS).
 _MAX_JSON_BODY_BYTES = 64 * 1024 * 1024
 
+# Pushed update deltas (POST /v1/setup?op=push) are raw tar.gz bodies. A full
+# delta (first update of a child) can carry the whole deployed project plus
+# web/dist, so this limit is far above any realistic update while still
+# bounding memory.
+_MAX_PUSH_BODY_BYTES = 512 * 1024 * 1024
+
 
 # ---------------------------------------------------------------------------
 # Declarative route tables (precompiled regexes)
@@ -75,6 +81,7 @@ _ROUTES: dict[str, list] = {
         (re.compile(r"^/v1/mcp-servers$"), "_handle_list_mcp_servers", ()),
         (re.compile(r"^/v1/prompt-templates$"), "_handle_list_prompt_templates", ()),
         (re.compile(r"^/v1/env$"), "_handle_get_env", ()),
+        (re.compile(r"^/v1/remote-envs$"), "_handle_remote_envs_list", ()),
         (re.compile(r"^/v1/auth/config$"), "_handle_auth_config_get", ()),
         (re.compile(r"^/v1/setup$"), "_handle_setup_script", ()),
         (re.compile(r"^/v1/sessions/tree$"), "_handle_session_category_tree", ()),
@@ -102,6 +109,9 @@ _ROUTES: dict[str, list] = {
         (re.compile(r"^/v1/auth/login$"), "_handle_auth_login", ()),
         (re.compile(r"^/v1/auth/logout$"), "_handle_auth_logout", ()),
         (re.compile(r"^/v1/auth/config$"), "_handle_auth_config_post", ()),
+        # op=push: the parent pushes a delta tar to this environment; the
+        # handler dispatches on ?op= just like the GET route.
+        (re.compile(r"^/v1/setup$"), "_handle_setup_script", ()),
         (re.compile(r"^/v1/infer$"), "_handle_infer", ()),
         (re.compile(r"^/v1/infer/stream$"), "_handle_infer_stream", ()),
         (re.compile(r"^/v1/infer/abort$"), "_handle_infer_abort", ()),
@@ -113,6 +123,8 @@ _ROUTES: dict[str, list] = {
         (re.compile(r"^/v1/tools$"), "_handle_register_tool", ()),
         (re.compile(r"^/v1/prompt-templates$"), "_handle_create_prompt_template", ()),
         (re.compile(r"^/v1/env$"), "_handle_set_env", ()),
+        (re.compile(r"^/v1/remote-envs$"), "_handle_remote_envs_add", ()),
+        (re.compile(r"^/v1/remote-envs/(.+)/push-update$"), "_handle_remote_envs_push_update", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/env/detect$"), "_handle_detect_env", ()),
         (re.compile(r"^/v1/sessions/([^/]+)/generate-title$"), "_handle_generate_session_title", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/sessions/([^/]+)/regenerate-summary$"), "_handle_regenerate_session_summary", (urllib.parse.unquote,)),
@@ -134,6 +146,7 @@ _ROUTES: dict[str, list] = {
         (re.compile(r"^/v1/mcp-servers/([^/]+)$"), "_handle_restore_mcp_server_config", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/prompt-templates/([^/]+)$"), "_handle_update_prompt_template", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/agents/([^/]+)$"), "_handle_update_agent", ()),
+        (re.compile(r"^/v1/remote-envs/(.+)$"), "_handle_remote_envs_update", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/workspace/upload/([^/]+)/chunk/(\d+)$"), "_handle_workspace_upload_chunk", (urllib.parse.unquote, int)),
     ],
     "DELETE": [
@@ -143,6 +156,7 @@ _ROUTES: dict[str, list] = {
         (re.compile(r"^/v1/tools/([^/]+)$"), "_handle_delete_tool", ()),
         (re.compile(r"^/v1/prompt-templates/([^/]+)$"), "_handle_delete_prompt_template", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/env/([^/]+)$"), "_handle_delete_env", (urllib.parse.unquote,)),
+        (re.compile(r"^/v1/remote-envs/(.+)$"), "_handle_remote_envs_delete", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/sessions/([^/]+)$"), "_handle_delete_session", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/agents/([^/]+)$"), "_handle_delete_agent", ()),
         (re.compile(r"^/v1/workspace/delete$"), "_handle_workspace_delete", ()),
@@ -278,6 +292,34 @@ class HandlerBaseMixin:
             self._send_json_error(400, f"Invalid JSON: {exc}")
             return None
 
+    def _read_raw_body(self, max_bytes: int) -> Optional[bytes]:
+        """Read the request body as raw bytes (non-JSON payloads, e.g. op=push).
+
+        Returns:
+            Body bytes, or None if the request was rejected (an error
+            response has already been sent).
+        """
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            self._send_json_error(400, "Invalid Content-Length")
+            return None
+        if content_length <= 0:
+            self._send_json_error(400, "Empty request body")
+            return None
+        if content_length > max_bytes:
+            # Reject without buffering the payload; closing the connection
+            # keeps the unread bytes from corrupting keep-alive framing.
+            self.close_connection = True
+            self._send_json_error(413, "Request body too large")
+            return None
+        try:
+            return self.rfile.read(content_length)
+        except OSError:
+            self.close_connection = True
+            self._send_json_error(400, "Failed to read request body")
+            return None
+
     def _send_json_response(self, status: int, data: object) -> None:
         """Send a JSON response with the given status code."""
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -330,15 +372,25 @@ class HandlerBaseMixin:
         if not auth_manager.is_enabled():
             return True
 
-        # /v1/setup is public only for GET op=hello. All other setup
-        # operations follow normal authorization and may use a setup token.
-        if method == "GET" and path == "/v1/setup":
+        # /v1/setup additionally accepts a setup token (st_...) or an API key
+        # (as_...) via the ``token`` query parameter (the setup link carries
+        # it), for both GET ops and POST op=push (the parent pushing a delta
+        # to a child). The token already carries update rights, so this adds
+        # no new privilege. The long-lived API key is accepted as well so a
+        # setup link can be persistent: st_ setup tokens expire after one
+        # hour, which would break URLs stored for remote env management and
+        # as SETUP_SOURCE for online updates.
+        # op=hello is NOT exempt: it follows the same authorization as any
+        # other /v1/ endpoint (public only when the environment has no auth
+        # enabled).
+        if method in {"GET", "POST"} and path == "/v1/setup":
             parsed = urllib.parse.urlparse(self.path)
             params = urllib.parse.parse_qs(parsed.query)
-            if method == "GET" and params.get("op", [""])[0] == "hello":
-                return True
             token = params.get("token", [""])[0]
-            if token and auth_manager.verify_setup_token(token):
+            if token and (
+                auth_manager.verify_setup_token(token)
+                or auth_manager.verify_api_key(token)
+            ):
                 return True
 
         session_token = self._request_cookie(COOKIE_NAME)

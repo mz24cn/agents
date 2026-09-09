@@ -58,6 +58,7 @@ logger = logging.getLogger("runtime.server")
 from runtime.auth_manager import AuthManager, COOKIE_NAME
 from runtime.common import get_system_encoding, SYSTEM_ENCODING
 from runtime.env_manager import EnvManager
+from runtime.remote_env_manager import RemoteEnvManager
 from runtime.session_manager import SessionManager
 from runtime.mcp_client import MCPClientManager
 from runtime.skill_manager import SkillManager
@@ -83,6 +84,9 @@ _TOOLS_PATH = os.path.join(_DATA_DIR, "tools.json")
 _MCP_SERVERS_PATH = os.path.join(_DATA_DIR, "mcp_servers.json")
 _PROMPT_TEMPLATES_PATH = os.path.join(_DATA_DIR, "prompt_templates.json")
 _ENV_PATH = os.path.join(_DATA_DIR, "env.json")
+# 远程环境管理记录（母环境视角管理的子环境列表 + 版本快照）。
+# 与 env.json 一样只存本地：不参与在线更新（build_delta_tar）和自解压导出。
+_REMOTE_ENVS_PATH = os.path.join(_DATA_DIR, "remote_envs.json")
 _AUTH_PATH = os.path.join(_DATA_DIR, "auth_token.json")
 _AGENTS_DIR = os.path.join(_DATA_DIR, "agents")
 # https 多证书目录：证书 {domain}.pem + 密钥 {domain}.key（见 _build_ssl_context）
@@ -522,6 +526,7 @@ class RuntimeHTTPServer:
         # Initialize EnvManager
         self._env_manager = EnvManager(env_path=_ENV_PATH)
         self._env_manager._sync_to_environ(self._env_manager.read())
+        self._remote_env_manager = RemoteEnvManager(_REMOTE_ENVS_PATH)
 
         # Configure logging if not already configured
         if not logging.root.handlers:
@@ -645,6 +650,7 @@ class RuntimeHTTPServer:
         self._server.static_dir = self._static_dir  # type: ignore[attr-defined]
         self._server.context_manager = self._context_manager  # type: ignore[attr-defined]
         self._server.env_manager = self._env_manager  # type: ignore[attr-defined]
+        self._server.remote_env_manager = self._remote_env_manager  # type: ignore[attr-defined]
         self._server.auth_manager = self._auth_manager  # type: ignore[attr-defined]
         self._server.session_manager = self._session_manager  # type: ignore[attr-defined]
         self._server.active_streams = self._active_streams  # type: ignore[attr-defined]

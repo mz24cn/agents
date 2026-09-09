@@ -30,7 +30,7 @@ A minimal, zero-dependency Agent Service built with the pure Python standard lib
 - **Agent management** — save current model, tools, and system prompt configurations as reusable Agents; quickly switch between saved Agents in the chat interface
 - **Web UI management console** — Svelte 5 SPA for managing models, tools, prompt templates, agents, and chat
 - **Compact message display** — presents multi-agent collaboration and long tool-chain conversations as compact per-agent reply blocks, pairing each tool call with its execution result in an interactive capsule; arguments and results can be expanded independently by click or hover, with JSON, Python, and Shell syntax highlighting plus Markdown result rendering, preserving full execution details while reducing visual clutter in long sessions
-- **Service-level authorization** — optional single-tenant auth system for all `/v1/*` APIs, with Bearer API keys for scripts/SDKs and HttpOnly session cookies for the Web UI; credentials are stored locally as hashes in `~/.agents_runtime/auth_token.json`, and `/v1/setup` export links use short-lived setup tokens
+- **Service-level authorization** — optional single-tenant auth system for all `/v1/*` APIs, with Bearer API keys for scripts/SDKs and HttpOnly session cookies for the Web UI; credentials are stored locally as hashes in `~/.agents_runtime/auth_token.json`, and `/v1/setup` export links use short-lived setup tokens (the `token` parameter also accepts the long-lived API key, so setup links can be persistent)
 - **HTTP API server** — lightweight REST API built on `http.server`, no FastAPI/uvicorn needed
 - **Multimodal** — supports image (base64) and audio inputs for VLM models; when a non-VLM model receives images, they are automatically transcribed to text via the built-in `read_image` tool (register a VLM-capable model whose `model_id` or `labels` include `read-image`)
 - **Hardened persistence + continue inference** — each completed tool round is incrementally persisted to `conversation.json` during inference, so an abnormal server restart loses at most the last round; an interrupted session (last turn is a user message / tool call / tool result) can be resumed with one click ("Continue") in the Web UI, or via API by posting `"continue": true` to `/v1/infer/stream` with an empty `messages` array
@@ -289,7 +289,7 @@ change takes effect after a restart.
 | POST | `/v1/auth/login` | Log in and obtain an access credential |
 | POST | `/v1/auth/logout` | Log out and invalidate the current access credential |
 | GET | `/v1/auth/config` | Query authorization configuration |
-| GET | `/v1/setup` | Export the self-extracting setup script (with short-lived setup token) |
+| GET | `/v1/setup` | Export the self-extracting setup script (`token` param accepts a short-lived setup token or the long-lived API key) |
 | GET | `/v1/models` | List registered models |
 | POST | `/v1/models` | Register a model |
 | PUT | `/v1/models/{model_id}` | Update a model |

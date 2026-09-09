@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte'
-  import { auth, build, env, subscribeSessionEvents } from '../../lib/api.js'
+  import { auth, build, env, remoteEnv, buildSetupRequestUrl, extractSetupSnapshot, fetchRemoteJson, subscribeSessionEvents, remoteEnvHomeUrl, isRemoteLogoImage, resolveRemoteEnvLogo } from '../../lib/api.js'
   import { copyToClipboard } from '../../lib/clipboard.js'
   import { t } from '../../lib/i18n.svelte.js'
 
@@ -50,6 +50,15 @@
   let updateMessage = $state('')
   let updateError = $state('')
 
+  // ---- 远程环境管理（母环境视角管理子环境，记录在 DATA_DIR/remote_envs.json） ----
+  let envList = $state([])
+  let envListLoading = $state(false)
+  let envsError = $state('')
+  let newEnvUrl = $state('')
+  let addingEnv = $state(false)
+  let checkingAllEnvs = $state(false)
+  let updatingAllEnvs = $state(false)
+
   let setupLink = $derived(`${window.location.origin}/v1/setup${setupToken ? `?token=${encodeURIComponent(setupToken)}` : ''}`)
   let windowsSetupCommand = $derived(`irm ${setupLink} | iex`)
   let linuxSetupCommand = $derived(`curl -fsSL ${setupLink} | sh`)
@@ -59,6 +68,10 @@
   let canApplyUpdate = $derived(updateAvailable && !inferenceActive && !checkingUpdate && !applyingUpdate && !restartingBackend)
   let canApplyDowngrade = $derived(downgradeAvailable && !inferenceActive && !checkingUpdate && !applyingUpdate && !restartingBackend)
   let canRestartBackend = $derived(!restartingBackend)
+
+  let canAddEnv = $derived(!!newEnvUrl.trim() && !addingEnv && !checkingAllEnvs && !updatingAllEnvs)
+  let canCheckAllEnvs = $derived(envList.length > 0 && !checkingAllEnvs && !updatingAllEnvs)
+  let canUpdateAllEnvs = $derived(envList.length > 0 && !checkingAllEnvs && !updatingAllEnvs)
 
   function pad2(value) {
     return String(value).padStart(2, '0')
@@ -130,6 +143,7 @@
   onMount(() => {
     loadConfig()
     loadBuildInfo().then(loadSetupSource)
+    loadRemoteEnvs()
     const unsubscribe = subscribeSessionEvents(
       (event) => {
         if (event.event === 'init') {
@@ -179,12 +193,7 @@
   }
 
   function buildHelloUrl(source) {
-    const url = new URL(source.trim())
-    url.pathname = '/v1/setup'
-    url.search = ''
-    url.hash = ''
-    url.searchParams.set('op', 'hello')
-    return url.toString()
+    return buildSetupRequestUrl(source, { op: 'hello' })
   }
 
   async function checkUpdate() {
@@ -334,6 +343,184 @@
     } catch (err) {
       updateError = t('restartBackendFailed', { error: err?.message || err })
       restartingBackend = false
+    }
+  }
+
+  function normalizeEnvEntries(envs) {
+    return (envs || []).map((entry) => ({
+      ...entry,
+      refreshing: false,
+      updating: false,
+      status: '',
+      statusIsError: false,
+    }))
+  }
+
+  async function loadRemoteEnvs() {
+    envListLoading = true
+    try {
+      const data = await remoteEnv.list()
+      envList = normalizeEnvEntries(data?.envs)
+    } catch (err) {
+      envsError = t('remoteEnvLoadFailed', { error: err?.message || err })
+    } finally {
+      envListLoading = false
+    }
+  }
+
+  async function addRemoteEnv() {
+    const url = newEnvUrl.trim()
+    if (!url || addingEnv) return
+    addingEnv = true
+    envsError = ''
+    try {
+      // 与构建版本页一致：先请求目标环境的 /v1/setup?op=hello 拿版本号
+      const data = await fetchRemoteJson(buildSetupRequestUrl(url, { op: 'hello' }))
+      const snapshot = extractSetupSnapshot(data)
+      const res = await remoteEnv.add(url, snapshot)
+      envList = normalizeEnvEntries(res?.envs)
+      newEnvUrl = ''
+    } catch (err) {
+      envsError = err?.status === 401
+        ? t('remoteEnvAuthRequired')
+        : t('remoteEnvAddFailed', { error: err?.message || err })
+    } finally {
+      addingEnv = false
+    }
+  }
+
+  // 刷新单个环境：查询其版本 / 推理状态并回写本地快照
+  async function refreshRemoteEnv(entry, { silent = false } = {}) {
+    if (entry.refreshing) return false
+    entry.refreshing = true
+    try {
+      const data = await fetchRemoteJson(buildSetupRequestUrl(entry.url, { op: 'hello' }))
+      const snapshot = extractSetupSnapshot(data)
+      await remoteEnv.updateSnapshot(entry.id, snapshot)
+      Object.assign(entry, snapshot)
+      if (!silent) {
+        entry.status = ''
+        entry.statusIsError = false
+      }
+      return true
+    } catch (err) {
+      entry.status = err?.status === 401
+        ? t('remoteEnvAuthRequired')
+        : t('remoteEnvCheckFailed', { error: err?.message || err })
+      entry.statusIsError = true
+      return false
+    } finally {
+      entry.refreshing = false
+    }
+  }
+
+  // 等待远程环境后端重启后恢复（更新包含后端文件时，远端会 execv 重启）
+  async function waitForRemoteReady(entry, timeoutMs = 30000) {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      try {
+        await fetchRemoteJson(buildSetupRequestUrl(entry.url, { op: 'hello' }))
+        return true
+      } catch {
+        await new Promise((resolve) => window.setTimeout(resolve, 500))
+      }
+    }
+    return false
+  }
+
+  // 更新单个环境：由母环境把增量直接推送到该环境（后端 /v1/remote-envs/{id}/push-update）。
+  // 目标环境无需能访问本环境地址（localhost 场景也能更新）。
+  async function updateRemoteEnv(entry, { postRefresh = true } = {}) {
+    if (entry.updating) return
+    entry.updating = true
+    entry.status = ''
+    entry.statusIsError = false
+    try {
+      const result = await remoteEnv.pushUpdate(entry.id)
+      // 后端返回了推送前读到的目标环境快照：先落到行上并持久化，
+      // 重启等待期间也能展示最新基线
+      if (result?.remote) {
+        Object.assign(entry, result.remote)
+        await remoteEnv.updateSnapshot(entry.id, result.remote).catch(() => {})
+      }
+      if (result && result.updated === false) {
+        entry.status = t('remoteEnvUpToDate')
+        entry.statusIsError = false
+        return
+      }
+      if (result?.restart_backend) {
+        entry.status = t('remoteEnvRestarting')
+        entry.statusIsError = false
+        const ready = await waitForRemoteReady(entry)
+        if (!ready) {
+          entry.status = t('remoteEnvRestartTimeout')
+          entry.statusIsError = true
+          return
+        }
+      }
+      if (postRefresh) {
+        // 单独更新：完成后立即刷新一次，展示该环境更新后的版本
+        await refreshRemoteEnv(entry, { silent: true })
+      }
+    } catch (err) {
+      entry.status = remoteEnvUpdateError(err)
+      entry.statusIsError = true
+    } finally {
+      entry.updating = false
+    }
+  }
+
+  // 推送更新失败 -> 面向用户的提示（后端错误码决定类别）
+  function remoteEnvUpdateError(err) {
+    const message = err?.message || String(err)
+    switch (err?.code) {
+      case 'inference_active':
+        return t('updateInferenceActive')
+      case 'update_in_progress':
+        return t('remoteEnvUpdateInProgress')
+      case 'child_unreachable':
+        return t('remoteEnvUnreachable', { error: message })
+      case 'push_not_supported':
+        return t('remoteEnvPushNotSupported')
+      case 'child_auth':
+        return t('remoteEnvChildAuth', { error: message })
+      default:
+        return t('remoteEnvUpdateFailed', { error: message })
+    }
+  }
+
+  // 状态检查：并发刷新所有环境（等价于同时点击每行的刷新按钮）
+  async function checkAllRemoteEnvs() {
+    if (checkingAllEnvs || updatingAllEnvs || envList.length === 0) return
+    checkingAllEnvs = true
+    envsError = ''
+    await Promise.all(envList.map((entry) => refreshRemoteEnv(entry)))
+    checkingAllEnvs = false
+  }
+
+  // 一键更新：并发把增量推送到所有环境，全部返回后最终调用一次状态检查
+  async function updateAllRemoteEnvs() {
+    if (updatingAllEnvs || checkingAllEnvs || envList.length === 0) return
+    updatingAllEnvs = true
+    envsError = ''
+    try {
+      await Promise.all(envList.map((entry) => updateRemoteEnv(entry, { postRefresh: false })))
+      // 更新后的版本未必与本地一致（可能更新被拒绝而版本未变，也可能更新后
+      // 比本地更新），所以统一再检查一次，以各环境实际返回的版本为准。
+      await Promise.all(envList.map((entry) => refreshRemoteEnv(entry, { silent: true })))
+    } finally {
+      updatingAllEnvs = false
+    }
+  }
+
+  async function removeRemoteEnv(entry) {
+    if (checkingAllEnvs || updatingAllEnvs) return
+    if (!window.confirm(t('remoteEnvDeleteConfirm', { address: entry.id }))) return
+    try {
+      const data = await remoteEnv.remove(entry.id)
+      envList = normalizeEnvEntries(data?.envs)
+    } catch (err) {
+      envsError = t('remoteEnvRemoveFailed', { error: err?.message || err })
     }
   }
 
@@ -618,6 +805,106 @@
             <div class="hint warning">{t('authSetupTokenWarning', { expires: setupTokenExpiresDisplay })}</div>
           {:else}
             <div class="hint">{t('authSetupNoTokenHint')}</div>
+          {/if}
+        </section>
+
+        <section class="card remote-envs-card">
+          <div class="card-header compact">
+            <div>
+              <h3>{t('remoteEnvsTitle')}</h3>
+              <p>{t('remoteEnvsHint')}</p>
+            </div>
+          </div>
+
+          <div class="remote-envs-toolbar">
+            <input
+              aria-label="Remote environment URL"
+              placeholder={t('remoteEnvUrlPlaceholder')}
+              bind:value={newEnvUrl}
+            />
+            <button class="btn btn-primary" type="button" onclick={addRemoteEnv} disabled={!canAddEnv}>
+              {addingEnv ? t('remoteEnvAdding') : t('remoteEnvAdd')}
+            </button>
+            <button class="btn btn-secondary" type="button" onclick={checkAllRemoteEnvs} disabled={!canCheckAllEnvs}>
+              {checkingAllEnvs ? t('remoteEnvCheckingAll') : t('remoteEnvCheckAll')}
+            </button>
+            <button class="btn btn-secondary" type="button" onclick={updateAllRemoteEnvs} disabled={!canUpdateAllEnvs}>
+              {updatingAllEnvs ? t('remoteEnvUpdatingAll') : t('remoteEnvUpdateAll')}
+            </button>
+          </div>
+
+          {#if envsError}
+            <div class="error-msg remote-envs-error">{envsError}</div>
+          {/if}
+
+          {#if envListLoading}
+            <div class="loading">{t('loading')}</div>
+          {:else if envList.length === 0}
+            <div class="hint">{t('remoteEnvEmpty')}</div>
+          {:else}
+            <div class="remote-envs-list">
+              <div class="remote-envs-scroll">
+                <div class="remote-env-head">
+                  <span>{t('remoteEnvAddress')}</span>
+                  <span>{t('remoteEnvTitle')}</span>
+                  <span>{t('remoteEnvPlatform')}</span>
+                  <span>{t('buildFrontend')}</span>
+                  <span>{t('buildBackend')}</span>
+                  <span>{t('buildConfig')}</span>
+                  <span>{t('remoteEnvInference')}</span>
+                  <span></span>
+                </div>
+                {#each envList as entry (entry.id)}
+                  <div class="remote-env-item">
+                    <div class="remote-env-row">
+                      <a class="remote-env-address" href={remoteEnvHomeUrl(entry.url)} target="_blank" rel="noopener noreferrer" title={entry.url}>{entry.id}</a>
+                      <span class="remote-env-app">
+                        {#if isRemoteLogoImage(entry.app_logo)}
+                          <img class="remote-env-logo" src={resolveRemoteEnvLogo(entry.id, entry.app_logo)} alt="" loading="lazy" />
+                        {:else if entry.app_logo}
+                          <span class="remote-env-logo-emoji">{entry.app_logo}</span>
+                        {/if}
+                        <span class="remote-env-app-title" title={entry.app_title}>{entry.app_title || '-'}</span>
+                      </span>
+                      <span class="remote-env-platform" title={[entry.arch, entry.os].filter(Boolean).join(' / ')}>{[entry.arch, entry.os].filter(Boolean).join(' / ') || '-'}</span>
+                      <code class="build-value">{entry.frontend_build || '-'}</code>
+                      <code class="build-value">{entry.backend_build || '-'}</code>
+                      <code class="build-value">{entry.last_config || '-'}</code>
+                      <span class="inference-pill" class:busy={entry.inference_active}>
+                        <span class="dot"></span>
+                        {entry.inference_active ? t('remoteEnvInferenceActive') : t('remoteEnvIdle')}
+                      </span>
+                      <span class="remote-env-actions">
+                        <button
+                          class="btn btn-sm btn-secondary"
+                          type="button"
+                          title={t('remoteEnvRefreshHint')}
+                          onclick={() => refreshRemoteEnv(entry)}
+                          disabled={entry.refreshing || checkingAllEnvs || updatingAllEnvs}
+                        >{entry.refreshing ? t('remoteEnvRefreshing') : t('remoteEnvRefresh')}</button>
+                        <button
+                          class="btn btn-sm"
+                          type="button"
+                          title={t('remoteEnvUpdateHint')}
+                          onclick={() => updateRemoteEnv(entry)}
+                          disabled={entry.updating || checkingAllEnvs || updatingAllEnvs}
+                        >{entry.updating ? t('remoteEnvUpdating') : t('remoteEnvUpdate')}</button>
+                        <button
+                          class="btn btn-sm btn-danger"
+                          type="button"
+                          title={t('remoteEnvDelete')}
+                          onclick={() => removeRemoteEnv(entry)}
+                          disabled={checkingAllEnvs || updatingAllEnvs}
+                        >{t('remoteEnvDelete')}</button>
+                      </span>
+                    </div>
+                    {#if entry.status}
+                      <div class="remote-env-status" class:error={entry.statusIsError}>{entry.status}</div>
+                    {/if}
+                  </div>
+                {/each}
+              </div>
+            </div>
           {/if}
         </section>
 
@@ -1017,6 +1304,195 @@
   @media (max-width: 720px) {
     .build-content, .update-controls {
       grid-template-columns: 1fr;
+    }
+  }
+  .remote-envs-toolbar {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto auto auto;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+  .remote-envs-error {
+    margin-bottom: 10px;
+  }
+  .remote-envs-list {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow-x: auto;
+  }
+  .remote-envs-scroll {
+    display: grid;
+    grid-template-columns: minmax(150px, max-content) minmax(120px, max-content) max-content repeat(3, 130px) max-content 1fr;
+    column-gap: 12px;
+    width: max-content;
+    min-width: 100%;
+    padding: 0 12px;
+  }
+  .remote-env-head,
+  .remote-env-row {
+    display: grid;
+    grid-column: 1 / -1;
+    grid-template-columns: subgrid;
+    align-items: center;
+    padding: 8px 0;
+  }
+  /* Chromium 会忽略 subgrid 容器上的 justify-items，逐列对齐改在单元格上做：
+     表头单元格拉伸占满轨道宽，用 text-align 对齐文字（前两列默认即左对齐）；
+     数据行单元格用 justify-self 收缩为内容宽——地址(id)与标题列左对齐，
+     架构/系统、前端、后端、配置、状态列右对齐（状态列宽度由最长的三字
+     "推理中"胶囊撑开），操作列保持右对齐 */
+  .remote-env-head {
+    text-align: right;
+    /* 负 margin 抵消容器左右 padding，使灰色表头条横贯整个列表且不影响轨道对齐 */
+    margin: 0 -12px;
+    padding: 8px 12px;
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    font-size: 0.8rem;
+    font-weight: 600;
+  }
+  .remote-env-address,
+  .remote-env-app {
+    justify-self: start;
+  }
+  .remote-env-platform,
+  .remote-env-actions,
+  .remote-env-row .build-value,
+  .remote-env-row .inference-pill {
+    justify-self: end;
+  }
+  .remote-env-item + .remote-env-item {
+    border-top: 1px solid var(--border);
+  }
+  .remote-env-item {
+    display: grid;
+    grid-column: 1 / -1;
+    grid-template-columns: subgrid;
+    background: var(--bg);
+  }
+  .remote-env-address {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 0.84rem;
+    color: var(--primary);
+    text-decoration: none;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 320px;
+  }
+  .remote-env-address:hover {
+    color: var(--primary-hover);
+    text-decoration: underline;
+  }
+  .remote-env-app {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+  .remote-env-logo {
+    width: 20px;
+    height: 20px;
+    flex: none;
+    object-fit: contain;
+    border-radius: 4px;
+  }
+  .remote-env-logo-emoji {
+    flex: none;
+    font-size: 1.1rem;
+    line-height: 1;
+  }
+  .remote-env-app-title {
+    min-width: 0;
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 0.9rem;
+  }
+  .remote-env-platform {
+    color: var(--text-secondary);
+    font-size: 0.84rem;
+    white-space: nowrap;
+  }
+  .inference-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    font-size: 0.8rem;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .inference-pill .dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 999px;
+    background: var(--text-secondary);
+  }
+  .inference-pill.busy {
+    color: var(--warning);
+    background: color-mix(in srgb, var(--warning) 12%, var(--bg));
+  }
+  .inference-pill.busy .dot {
+    background: var(--warning);
+  }
+  .remote-env-actions {
+    display: flex;
+    gap: 6px;
+    /* 右对齐：1fr 末列 + auto margin，每行按钮组都贴住右边缘（移动端
+       flex-wrap 布局下同样生效），保证各行按钮上下对齐。 */
+    margin-left: auto;
+  }
+  .btn-sm {
+    padding: 4px 10px;
+    font-size: 0.8rem;
+  }
+  .remote-env-status {
+    grid-column: 1 / -1;
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    padding: 0 0 8px;
+  }
+  .remote-env-status.error {
+    color: var(--danger);
+  }
+  @media (max-width: 900px) {
+    .remote-envs-toolbar {
+      grid-template-columns: minmax(0, 1fr) auto;
+    }
+    /* 移动端恢复流式布局（外层网格不再参与排版），不需要横向滚动 */
+    .remote-envs-scroll {
+      display: block;
+      width: auto;
+      min-width: 0;
+      padding: 0;
+    }
+    .remote-env-head {
+      display: none;
+    }
+    .remote-env-item {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .remote-env-row {
+      display: flex;
+      flex-wrap: wrap;
+      row-gap: 6px;
+      padding: 8px 12px;
+    }
+    .remote-env-row > * {
+      justify-self: auto;
+    }
+    .remote-env-address {
+      max-width: 100%;
+    }
+    .remote-env-app {
+      max-width: 100%;
     }
   }
 </style>
