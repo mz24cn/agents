@@ -303,7 +303,7 @@ change takes effect after a restart.
 | POST | `/v1/tools/skill` | Register a skill |
 | GET | `/v1/mcp-servers` | List registered MCP servers |
 | DELETE | `/v1/mcp-servers/{server_name}` | Delete an MCP server |
-| POST | `/v1/sessions/{session_id}/generate-title` | Auto-generate session title |
+| POST | `/v1/sessions/{session_id}/generate-title` | Set or generate session title (body `title` = manual, empty = model-generated) |
 | POST | `/v1/sessions/{session_id}/revoke` | Revoke a session |
 | DELETE | `/v1/tools/batch` | Batch delete tools |
 | GET | `/v1/prompt-templates` | List prompt templates |

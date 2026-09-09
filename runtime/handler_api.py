@@ -1744,6 +1744,10 @@ class HandlerApiMixin:
         if body is None:
             return
         enabled = set_session_flight_mode(session_id, bool(body.get("enabled")))
+        # 持久化飞行模式设定到 index.json，重启后仍保持该会话的飞行模式
+        session_manager = self.server.session_manager  # type: ignore[attr-defined]
+        if session_manager is not None:
+            session_manager.set_session_flight_mode(session_id, enabled)
         from runtime.server_state import _broadcast_session_event
         _broadcast_session_event(session_id, "flight_mode", {"enabled": enabled})
         self._send_json_response(200, {"session_id": session_id, "enabled": enabled})
@@ -1771,18 +1775,52 @@ class HandlerApiMixin:
         except ValueError as exc:
             self._send_json_error(400, str(exc))
             return
+        # index.json 中对应条目已移除：一并清理内存中的飞行模式状态
+        set_session_flight_mode(session_id, False)
         self._send_json_response(200, {"status": "deleted", "session_id": session_id})
 
     def _handle_generate_session_title(self, session_id: str) -> None:
-        """POST /v1/sessions/{session_id}/generate-title — 手动生成会话标题。"""
+        """POST /v1/sessions/{session_id}/generate-title — 设定或生成会话标题。
+
+        请求体可选：
+          * ``{"title": "..."}`` 且 title 非空：人工设定为会话标题
+            （index.json 标记 ``title_given: true``，原模型生成的标题记入
+            ``title_generated``）；
+          * 无请求体或 title 为空：走模型生成标题的原逻辑。
+        """
         session_manager = self.server.session_manager  # type: ignore[attr-defined]
+        given = ""
         try:
-            # 强制生成标题（传入 None 表示强制生成，跳过 token 阈值检查）
-            title = session_manager.generate_title_forced(session_id)
-            if title:
-                self._send_json_response(200, {"status": "success", "session_id": session_id, "title": title})
+            content_length = int(self.headers.get("Content-Length", 0) or 0)
+        except (TypeError, ValueError):
+            content_length = 0
+        if content_length > 0:
+            body = self._read_json_body()
+            if body is None:
+                return  # 错误响应已发送
+            if isinstance(body, dict):
+                given = str(body.get("title") or "").strip()
+        try:
+            if given:
+                title = session_manager.set_title_manually(session_id, given)
+                self._send_json_response(200, {
+                    "status": "success",
+                    "session_id": session_id,
+                    "title": title,
+                    "title_given": True,
+                })
             else:
-                self._send_json_error(500, f"Failed to generate title for session: {session_id}")
+                # 强制生成标题（跳过 token 阈值检查）
+                title = session_manager.generate_title_forced(session_id)
+                if title:
+                    self._send_json_response(200, {
+                        "status": "success",
+                        "session_id": session_id,
+                        "title": title,
+                        "title_given": False,
+                    })
+                else:
+                    self._send_json_error(500, f"Failed to generate title for session: {session_id}")
         except FileNotFoundError:
             self._send_json_error(404, f"Session not found: {session_id}")
             return

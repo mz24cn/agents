@@ -1144,6 +1144,17 @@ def set_session_flight_mode(session_id: str, enabled: bool) -> bool:
         return session_id in _flight_sessions
 
 
+def load_flight_sessions(session_ids) -> None:
+    """从持久化来源（index.json）恢复内存中的飞行模式集合。
+
+    服务启动时调用：重启后老的飞行模式会话在继续对话时仍保持飞行模式设定
+    （无浏览器连接时也允许推理继续）。
+    """
+    with _session_stream_lock:
+        for session_id in session_ids or []:
+            _flight_sessions.add(session_id)
+
+
 def is_session_flight_mode(session_id: str) -> bool:
     with _session_stream_lock:
         return session_id in _flight_sessions

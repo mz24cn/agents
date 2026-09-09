@@ -56,6 +56,14 @@
   let sessionDirectoryMenuError = $state('')
   let menuSessionDirectories = $state([])
 
+  // 标题设定/生成对话框状态
+  let titleDialogOpen = $state(false)
+  let titleDialogSid = $state(null)
+  let titleDialogValue = $state('')
+  let titleDialogLoading = $state(false)
+  let titleDialogError = $state('')
+  let titleDialogInput = $state(null)
+
   // hover 弹出菜单状态：鼠标悬停到 ... 按钮即弹出，悬停在菜单上保持显示
   let hoverBtnId = $state(null)   // 当前鼠标悬停的 ... 按钮 session id
   let hoverMenuId = $state(null)  // 当前鼠标悬停的弹出菜单 session id
@@ -113,7 +121,13 @@
           const newTitle = data.title
           if (sid && newTitle) {
             sessionList = sessionList.map(s =>
-              s.session_id === sid ? { ...s, title: newTitle } : s
+              s.session_id === sid
+                ? {
+                    ...s,
+                    title: newTitle,
+                    title_given: typeof data.title_given === 'boolean' ? data.title_given : s.title_given,
+                  }
+                : s
             )
           }
         }
@@ -835,19 +849,67 @@
     }
   }
 
-  async function handleGenerateTitle(e, sid) {
+  // “标题设定或生成”：弹出输入框，初值为当前标题（人工指定或模型生成的均显示）。
+  // 留空确定 = 走模型生成标题的原逻辑；非空确定 = 人工设定标题。
+  function handleOpenTitleDialog(e, sid) {
     e.stopPropagation()
     closeMenu()
+    if (titleDialogOpen && titleDialogSid === sid) return
+    const entry = sessionList.find(s => s.session_id === sid)
+    const current = entry?.title
+    titleDialogSid = sid
+    titleDialogValue = current && current !== sid ? current : ''
+    titleDialogError = ''
+    titleDialogLoading = false
+    titleDialogOpen = true
+    tick().then(() => {
+      if (titleDialogInput) {
+        titleDialogInput.focus()
+        titleDialogInput.select()
+      }
+    })
+  }
+
+  function closeTitleDialog() {
+    if (titleDialogLoading) return
+    titleDialogOpen = false
+    titleDialogSid = null
+    titleDialogError = ''
+  }
+
+  async function confirmTitleDialog() {
+    if (titleDialogLoading) return
+    const sid = titleDialogSid
+    if (!sid) return
+    const title = titleDialogValue.trim()
+    titleDialogLoading = true
+    titleDialogError = ''
     try {
-      const result = await sessions.generateTitle(sid)
-      if (result.status === 'success') {
+      const result = await sessions.generateTitle(sid, title)
+      if (result && result.status === 'success') {
         // 更新本地列表中的标题
-        sessionList = sessionList.map(s => 
-          s.session_id === sid ? { ...s, title: result.title } : s
+        sessionList = sessionList.map(s =>
+          s.session_id === sid
+            ? { ...s, title: result.title, title_given: !!result.title_given }
+            : s
         )
       }
+      titleDialogOpen = false
+      titleDialogSid = null
     } catch (err) {
-      restoreError = err.message || t('generateTitleFailed')
+      titleDialogError = err.message || t('generateTitleFailed')
+    } finally {
+      titleDialogLoading = false
+    }
+  }
+
+  function handleTitleDialogKeydown(e) {
+    if (e.key === 'Enter') {
+      e.preventDefault()
+      confirmTitleDialog()
+    } else if (e.key === 'Escape') {
+      e.preventDefault()
+      closeTitleDialog()
     }
   }
 
@@ -1117,7 +1179,7 @@
     <button
       class="session-dropdown-item"
       role="menuitem"
-      onclick={(e) => handleGenerateTitle(e, menuOpenId)}
+      onclick={(e) => handleOpenTitleDialog(e, menuOpenId)}
     >
      <span class="menu-emoji">🖋️</span>
       {t('generateTitle')}
@@ -1244,6 +1306,38 @@
   </div>
 {/if}
 
+<!-- 标题设定/生成对话框 -->
+{#if titleDialogOpen}
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div class="title-dialog-overlay" onclick={(e) => { e.stopPropagation(); closeTitleDialog() }}>
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div class="title-dialog" role="dialog" aria-modal="true" onclick={(e) => e.stopPropagation()}>
+      <h3 class="title-dialog-title">🔔 {t('generateTitle')}</h3>
+      <p class="title-dialog-hint">{t('titleDialogHint')}</p>
+      <input
+        class="title-dialog-input"
+        type="text"
+        bind:this={titleDialogInput}
+        bind:value={titleDialogValue}
+        placeholder={t('titleDialogPlaceholder')}
+        maxlength="100"
+        onkeydown={handleTitleDialogKeydown}
+      />
+      {#if titleDialogError}
+        <div class="title-dialog-error">{titleDialogError}</div>
+      {/if}
+      <div class="title-dialog-actions">
+        <button class="title-dialog-btn title-dialog-cancel" disabled={titleDialogLoading} onclick={closeTitleDialog}>
+          {t('cancel')}
+        </button>
+        <button class="title-dialog-btn title-dialog-confirm" disabled={titleDialogLoading} onclick={confirmTitleDialog}>
+          {titleDialogLoading ? t('loading') : t('confirm')}
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
+
 <aside class="sidebar" class:collapsed={sidebarWidth.collapsed} style="width: {sidebarWidth.collapsed ? 0 : sidebarWidth.current}px">
   <nav class="nav">
     <div class="nav-row">
@@ -1345,7 +1439,7 @@
                 title={getSessionDisplay(entry).tooltip}
               >
                 {getSessionDisplay(entry).display}
-                {#if flightSessions.has(entry.session_id)}<span class="session-flight-check">✓</span>{/if}
+                {#if flightSessions.has(entry.session_id)}<span class="session-flight">✈️</span>{/if}
               </button>
               <button
                 class="session-menu-btn"
@@ -1860,7 +1954,7 @@
     background-color: rgba(229, 62, 62, 0.08);
   }
  .menu-check { margin-left: auto; font-weight: 700; color: #22c55e; }
-  .session-flight-check { margin-left: .35rem; color: #22c55e; font-weight: 700; }
+  .session-flight { margin-left: .35rem; font-size: .9em; vertical-align: -0.1em; }
 
   .menu-emoji {
     display: inline-flex;
@@ -1897,5 +1991,79 @@
   }
   .session-list:hover::-webkit-scrollbar-thumb:hover {
     background: var(--text-secondary);
+  }
+
+  /* 标题设定/生成对话框 */
+  .title-dialog-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1100;
+  }
+  .title-dialog {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 20px 24px;
+    width: min(440px, 90vw);
+  }
+  .title-dialog-title {
+    margin: 0 0 8px;
+    font-size: 1.05rem;
+    color: var(--text);
+  }
+  .title-dialog-hint {
+    margin: 0 0 12px;
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    line-height: 1.4;
+  }
+  .title-dialog-input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 8px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--bg-secondary);
+    color: var(--text);
+    font-size: 0.9rem;
+    outline: none;
+  }
+  .title-dialog-input:focus {
+    border-color: var(--text-secondary);
+  }
+  .title-dialog-error {
+    margin-top: 10px;
+    font-size: 0.8rem;
+    color: var(--danger);
+  }
+  .title-dialog-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 12px;
+    margin-top: 16px;
+  }
+  .title-dialog-btn {
+    padding: 7px 18px;
+    border-radius: 6px;
+    border: none;
+    cursor: pointer;
+    font-size: 0.9rem;
+  }
+  .title-dialog-btn:disabled {
+    opacity: 0.6;
+    cursor: default;
+  }
+  .title-dialog-cancel {
+    background: var(--bg-secondary);
+    color: var(--text);
+    border: 1px solid var(--border);
+  }
+  .title-dialog-confirm {
+    background: var(--danger);
+    color: #fff;
   }
 </style>

@@ -1704,3 +1704,143 @@ class TestSessionAPI:
         second_page_ids = [s["session_id"] for s in body["sessions"]]
         assert len(second_page_ids) == 2
         assert set(first_page_ids).isdisjoint(second_page_ids)
+
+
+# ------------------------------------------------------------------
+# POST /v1/sessions/{id}/generate-title (title set or generate)
+# POST /v1/sessions/{id}/flight (persistent flight mode)
+# ------------------------------------------------------------------
+
+
+class TestSessionTitleAndFlight:
+    """标题设定/生成与飞行模式持久化（index.json）的 HTTP 集成测试。"""
+
+    def _create_session(self, srv, session_id):
+        import json as _json
+        sm = srv._session_manager
+        session_dir = os.path.join(sm.chats_dir, session_id)
+        os.makedirs(session_dir, exist_ok=True)
+        with open(os.path.join(session_dir, "conversation.json"), "w", encoding="utf-8") as f:
+            _json.dump({
+                "meta": {"session_id": session_id},
+                "messages": [{"role": "user", "content": "hi"}],
+            }, f, ensure_ascii=False)
+        sm.on_session_created(session_id, "hi")
+        return sm
+
+    def test_manual_title_sets_index_and_response(self, server_with_env):
+        sm = self._create_session(server_with_env, "260101_110001")
+        index = sm._read_index()
+        index["260101_110001"]["title"] = "模型生成的标题"
+        index["260101_110001"]["title_generated"] = "模型生成的标题"
+        sm._write_index(index)
+
+        status, body = _post(
+            server_with_env,
+            "/v1/sessions/260101_110001/generate-title",
+            {"title": "  人工标题  "},
+        )
+        assert status == 200
+        assert body["status"] == "success"
+        assert body["title"] == "人工标题"
+        assert body["title_given"] is True
+
+        index = sm._read_index()
+        assert index["260101_110001"]["title"] == "人工标题"
+        assert index["260101_110001"]["title_given"] is True
+        assert index["260101_110001"]["title_generated"] == "模型生成的标题"
+
+    def test_blank_title_body_triggers_model_generation(self, server_with_env, runtime, monkeypatch):
+        sm = self._create_session(server_with_env, "260101_110002")
+        # 注册 summary 模型并指定环境变量，使真实的标题生成流程可跑通
+        monkeypatch.setenv("SUMMARY_MODEL_ID", "summary")
+        runtime._model_registry.register(ModelConfig(
+            model_id="summary",
+            api_base="http://localhost:11434",
+            model_name="summary:latest",
+            api_protocol="openai",
+        ))
+
+        def fake_infer(request):
+            return InferenceResult(
+                success=True,
+                messages=[
+                    Message(role="user", content=request.messages[0].content),
+                    Message(role="assistant", content="新生成"),
+                ],
+            )
+
+        sm._infer_fn = fake_infer
+        status, body = _post(
+            server_with_env,
+            "/v1/sessions/260101_110002/generate-title",
+            {"title": "   "},
+        )
+        assert status == 200
+        assert body["title"] == "新生成"
+        assert body["title_given"] is False
+
+        index = sm._read_index()
+        assert index["260101_110002"]["title"] == "新生成"
+        assert index["260101_110002"]["title_generated"] == "新生成"
+        assert index["260101_110002"]["title_given"] is False
+
+    def test_generate_title_missing_session_404(self, server_with_env):
+        status, body = _post(
+            server_with_env,
+            "/v1/sessions/260101_999999/generate-title",
+            {"title": "x"},
+        )
+        assert status == 404
+        assert "error" in body
+
+    def test_flight_mode_persisted_to_index(self, server_with_env):
+        from runtime import server_state
+        sm = self._create_session(server_with_env, "260101_120001")
+        server_state._flight_sessions.clear()
+        try:
+            status, body = _post(
+                server_with_env,
+                "/v1/sessions/260101_120001/flight",
+                {"enabled": True},
+            )
+            assert status == 200
+            assert body["enabled"] is True
+            assert sm._read_index()["260101_120001"]["flight_mode"] is True
+
+            status, body = _post(
+                server_with_env,
+                "/v1/sessions/260101_120001/flight",
+                {"enabled": False},
+            )
+            assert status == 200
+            assert body["enabled"] is False
+            assert sm._read_index()["260101_120001"]["flight_mode"] is False
+        finally:
+            server_state._flight_sessions.clear()
+
+    def test_flight_mode_restored_after_restart(self, server_with_env, runtime, tmp_path):
+        """重启后（新的 RuntimeHTTPServer 实例）从 index.json 恢复飞行模式。"""
+        from runtime import server_state
+        sm = self._create_session(server_with_env, "260101_130001")
+        status, _ = _post(
+            server_with_env,
+            "/v1/sessions/260101_130001/flight",
+            {"enabled": True},
+        )
+        assert status == 200
+        try:
+            # 模拟重启：清空内存中的飞行模式集合
+            server_state._flight_sessions.clear()
+            assert server_state.is_session_flight_mode("260101_130001") is False
+
+            chats_dir = server_with_env._session_manager.chats_dir
+            srv2 = RuntimeHTTPServer(runtime, chats_dir=chats_dir)
+            srv2.start_background(host="127.0.0.1", port=0)
+            try:
+                assert server_state.is_session_flight_mode("260101_130001") is True
+                assert srv2._session_manager.flight_sessions() == ["260101_130001"]
+            finally:
+                srv2.stop()
+        finally:
+            server_state._flight_sessions.clear()

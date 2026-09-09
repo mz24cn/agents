@@ -454,7 +454,9 @@ class SessionManager:
                 "last_inference_at": now,
                 "turn_count": 0,
                 "last_total_tokens": None,
-                "title_generated": False,
+                "title_generated": "",
+                "title_given": False,
+                "flight_mode": False,
             }
             self._write_index(index)
         except Exception as exc:
@@ -490,7 +492,9 @@ class SessionManager:
                 "last_inference_at": now,
                 "turn_count": 0,
                 "last_total_tokens": None,
-                "title_generated": False,
+                "title_generated": "",
+                "title_given": False,
+                "flight_mode": False,
             })
 
             # 读取 conversation.json 的 meta.turn_count
@@ -537,7 +541,10 @@ class SessionManager:
             last_total_tokens: 本次推理的总 token 数。
         """
         entry = self._read_index().get(session_id) or {}
-        if entry.get("title_generated") and not compression_updated:
+        # 人工设定的标题优先：自动生成（含压缩后刷新）不得覆盖它
+        if entry.get("title_given"):
+            return
+        if self._generated_title_of(entry) and not compression_updated:
             return
         self._do_generate_title(session_id)
 
@@ -551,6 +558,62 @@ class SessionManager:
             生成的标题，失败时返回 None。
         """
         return self._do_generate_title(session_id)
+
+    @staticmethod
+    def _generated_title_of(entry: dict) -> str:
+        """返回 index 条目中记录的模型生成标题。
+
+        新格式下 ``title_generated`` 直接存生成的标题字符串；旧格式存的是
+        bool，``True`` 表示当前标题即模型生成。
+        """
+        value = entry.get("title_generated")
+        if isinstance(value, str):
+            return value
+        if value is True:
+            return str(entry.get("title") or "")
+        return ""
+
+    def set_title_manually(self, session_id: str, title: str) -> str:
+        """人工设定会话标题并持久化到 index.json。
+
+        给定标题成为当前标题（``title`` 字段）并标记 ``title_given: true``；
+        原模型生成的标题记入 ``title_generated``（尚无生成标题时置空）。
+        已标记 ``title_given`` 的会话再次设定时复用同一逻辑。
+
+        Args:
+            session_id: 会话 ID。
+            title: 人工设定的标题（strip 后非空，超过 100 字符则截断）。
+
+        Returns:
+            实际保存的标题。
+
+        Raises:
+            ValueError: title 为空时抛出。
+            FileNotFoundError: 会话不在 index.json 中时抛出。
+        """
+        title = str(title or "").strip()
+        if not title:
+            raise ValueError("title must not be empty")
+        if len(title) > 100:
+            title = title[:100]
+
+        index = self._read_index()
+        entry = index.get(session_id)
+        if not isinstance(entry, dict):
+            raise FileNotFoundError(f"Session not found: {session_id}")
+
+        # 原模型生成的标题：新格式为字符串值，旧格式 bool True 表示
+        # 当前标题即模型生成（必须在覆盖 title 字段之前取回）
+        generated = self._generated_title_of(entry)
+        entry["title"] = title
+        entry["title_given"] = True
+        entry["title_generated"] = generated
+        index[session_id] = entry
+        self._write_index(index)
+        logger.info("set_title_manually: 人工设定标题 (session=%s): %s", session_id, title)
+        if self._broadcast_fn:
+            self._broadcast_fn(session_id, "title_update", {"title": title, "title_given": True})
+        return title
 
     def _do_generate_title(self, session_id: str) -> Optional[str]:
         """实际执行标题生成的内部方法（顺带完成分类）。
@@ -661,12 +724,14 @@ class SessionManager:
             index = self._read_index()
             if session_id in index:
                 index[session_id]["title"] = title
-                index[session_id]["title_generated"] = True
+                # 记录模型生成的标题；人工设定标记复位
+                index[session_id]["title_generated"] = title
+                index[session_id]["title_given"] = False
                 self._write_index(index)
                 logger.info("generate_title: 成功生成标题 (session=%s): %s", session_id, title)
                 # 广播标题更新事件
                 if self._broadcast_fn:
-                    self._broadcast_fn(session_id, "title_update", {"title": title})
+                    self._broadcast_fn(session_id, "title_update", {"title": title, "title_given": False})
                 # 将会话归入模型选择的既有末级分类（失败不影响标题）
                 if category:
                     valid_paths = {item["path"] for item in categories}
@@ -703,6 +768,55 @@ class SessionManager:
                 self._write_index(index)
         except Exception as exc:
             logger.warning("remove_from_index: 更新 index.json 失败 (session=%s): %s", session_id, exc)
+
+    def set_session_flight_mode(self, session_id: str, enabled: bool) -> None:
+        """持久化会话的飞行模式设定到 index.json（``flight_mode`` 字段）。
+
+        会话尚不在 index 中时（如刚创建）补写默认条目，保证设定不丢失。
+        失败时仅记录日志（不影响内存状态与请求流程）。
+
+        Args:
+            session_id: 会话 ID。
+            enabled: 是否启用飞行模式。
+        """
+        from runtime.common import now_iso
+        try:
+            index = self._read_index()
+            entry = index.get(session_id)
+            if not isinstance(entry, dict):
+                now = now_iso()
+                entry = {
+                    "session_id": session_id,
+                    "title": session_id,
+                    "created_at": now,
+                    "last_inference_at": now,
+                    "turn_count": 0,
+                    "last_total_tokens": None,
+                    "title_generated": "",
+                    "title_given": False,
+                    "flight_mode": False,
+                }
+            entry["flight_mode"] = bool(enabled)
+            index[session_id] = entry
+            self._write_index(index)
+        except Exception as exc:
+            logger.warning(
+                "set_session_flight_mode: 写入 index.json 失败 (session=%s): %s",
+                session_id, exc,
+            )
+
+    def flight_sessions(self) -> list[str]:
+        """列出 index.json 中启用飞行模式的会话 ID（升序）。
+
+        供服务启动时恢复内存中的飞行模式集合，使重启后老的飞行模式会话
+        继续对话时仍保持飞行模式设定。
+        """
+        index = self._read_index()
+        return sorted(
+            session_id
+            for session_id, entry in index.items()
+            if isinstance(entry, dict) and entry.get("flight_mode")
+        )
 
     def list_sessions(self, session_ids: Optional[set[str]] = None) -> list[dict]:
         """读取 index.json，返回所有 SessionIndexEntry 列表，按 last_inference_at 降序排列。

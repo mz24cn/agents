@@ -159,7 +159,9 @@ def test_do_generate_title_with_category_attaches_session(tmp_path):
     # index 已更新
     index = sm._read_index()
     assert index["s1"]["title"] == "推理超时排查"
-    assert index["s1"]["title_generated"] is True
+    # 新格式：title_generated 记录模型生成的标题文本
+    assert index["s1"]["title_generated"] == "推理超时排查"
+    assert index["s1"]["title_given"] is False
 
     # tree.json 已挂载
     tree = _read_tree(tmp_path)

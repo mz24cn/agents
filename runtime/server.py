@@ -110,6 +110,7 @@ from runtime.server_state import (
     get_terminal_for_session,
     get_terminal_session,
     IncrementalConversationPersister,
+    load_flight_sessions,
     merge_stream_messages,
     persist_conversation,
     register_terminal_session,
@@ -597,6 +598,9 @@ class RuntimeHTTPServer:
             broadcast_fn=_broadcast_session_event,
             model_registry=self._runtime._model_registry,
         )
+        # 恢复持久化的飞行模式设定：重启后老的飞行模式会话继续对话时
+        # 仍保持飞行模式（无浏览器连接也允许推理继续）。
+        load_flight_sessions(self._session_manager.flight_sessions())
 
     def _prepare_server(
         self,

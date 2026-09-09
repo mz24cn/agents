@@ -282,7 +282,7 @@ python app.py 0.0.0.0:9000 # 自定义主机和端口（重载 AGENTS_URL）
 | POST | `/v1/tools/skill` | 注册 Skill |
 | GET | `/v1/mcp-servers` | 列出已注册的 MCP servers |
 | DELETE | `/v1/mcp-servers/{server_name}` | 删除一个 MCP server |
-| POST | `/v1/sessions/{session_id}/generate-title` | 为会话自动生成标题 |
+| POST | `/v1/sessions/{session_id}/generate-title` | 设定或生成会话标题（body 带非空 title 为人工设定，空则模型生成） |
 | POST | `/v1/sessions/{session_id}/revoke` | 撤销/取消一个会话 |
 | DELETE | `/v1/tools/batch` | 批量删除工具 |
 | GET | `/v1/prompt-templates` | 获取提示词模板列表 |

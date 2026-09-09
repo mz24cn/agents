@@ -298,7 +298,8 @@ export const sessions = {
   logDir:        (sessionId)     => request('GET',    `/v1/sessions/${encodeURIComponent(sessionId)}/log-dir`),
   executionAnalysis: (sessionId) => request('GET',    `/v1/sessions/${encodeURIComponent(sessionId)}/execution-analysis`),
   delete:        (sessionId)     => request('DELETE', `/v1/sessions/${encodeURIComponent(sessionId)}`),
-  generateTitle: (sessionId)     => request('POST',   `/v1/sessions/${encodeURIComponent(sessionId)}/generate-title`),
+  // title 非空 = 人工设定标题；空 = 模型生成标题
+  generateTitle: (sessionId, title = '') => request('POST', `/v1/sessions/${encodeURIComponent(sessionId)}/generate-title`, { title }),
   regenerateSummary: (sessionId) => request('POST',   `/v1/sessions/${encodeURIComponent(sessionId)}/regenerate-summary`),
   revoke:        (sessionId, timestamp, { forced = false, keepFiles = false } = {}) => request('POST', `/v1/sessions/${encodeURIComponent(sessionId)}/revoke`, { session_id: sessionId, timestamp, forced, keep_files: keepFiles }),
   markRead:      (sessionId)     => request('POST',   `/v1/sessions/${encodeURIComponent(sessionId)}/read`),
