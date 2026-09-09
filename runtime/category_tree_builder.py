@@ -300,13 +300,16 @@ def _load_file_journal(session_dir: Path, fallback_workspace: str = "") -> tuple
         if not isinstance(files, dict):
             continue
         for key, entry in files.items():
-            rel = str(key or "").strip()
+            label = str(key or "").strip().replace("\\", "/")
             if isinstance(entry, dict) and str(entry.get("path") or "").strip():
-                rel = str(entry["path"]).strip()
-            rel = rel.lstrip("/")
-            if not rel:
+                label = str(entry["path"]).strip().replace("\\", "/")
+            if not label:
                 continue
-            full = f"{workspace}/{rel}" if workspace else rel
+            if label.startswith("/"):
+                # Absolute label: a permitted /tmp scratch file, already a full path.
+                full = label
+            else:
+                full = f"{workspace}/{label}" if workspace else label
             if full not in seen:
                 seen.add(full)
                 paths.append(full)

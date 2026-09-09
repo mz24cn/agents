@@ -381,12 +381,32 @@ from runtime.common import (
 )
 
 
+def _journal_normalize_label(raw: object) -> str:
+    """Normalise a manifest path label.
+
+    In addition to workspace-relative labels, absolute labels for the
+    permitted ``/tmp`` scratch area are accepted (same rule as
+    ``builtin_tools_coding._validate_path``).
+    """
+    label = str(raw).replace("\\", "/")
+    if os.path.isabs(label):
+        root = os.path.realpath("/tmp")
+        resolved = os.path.realpath(label)
+        if not (resolved == root or resolved.startswith(root + os.sep)):
+            raise ValueError(f"Unsafe journal path: {label}")
+        return label
+    return _journal_safe_rel_path(label)
+
+
 def _journal_resolve_workspace_path(workspace: str, rel_path: str) -> str:
-    safe_rel = _journal_safe_rel_path(rel_path)
+    label = _journal_normalize_label(rel_path)
+    if os.path.isabs(label):
+        # Absolute labels point at the /tmp scratch area, not the workspace.
+        return os.path.realpath(label)
     root = os.path.realpath(workspace)
-    resolved = os.path.realpath(os.path.join(root, safe_rel))
+    resolved = os.path.realpath(os.path.join(root, label))
     if not (resolved == root or resolved.startswith(root + os.sep)):
-        raise ValueError(f"Journal path escapes workspace: {rel_path}")
+        raise ValueError(f"Journal path escapes workspace: {label}")
     return resolved
 
 
@@ -445,6 +465,12 @@ def materialize_blob(blob_ref: dict, target_path: str, workspace: str, journal_d
     raw = _read_journal_blob(blob_ref, workspace, journal_dir)
     if blob_ref.get("is_symlink"):
         os.symlink(raw.decode("utf-8", errors="surrogateescape"), target_path)
+        uid, gid = blob_ref.get("uid"), blob_ref.get("gid")
+        if uid is not None and gid is not None:
+            try:
+                os.lchown(target_path, uid, gid)
+            except (OSError, AttributeError):
+                pass
         return
     fd, tmp_path = tempfile.mkstemp(dir=parent or None)
     try:
@@ -452,7 +478,16 @@ def materialize_blob(blob_ref: dict, target_path: str, workspace: str, journal_d
             fh.write(raw)
         os.replace(tmp_path, target_path)
         tmp_path = ""
-        os.chmod(target_path, 0o755 if blob_ref.get("mode") == "100755" else 0o644)
+        file_mode = blob_ref.get("file_mode")
+        if file_mode is None:
+            file_mode = 0o755 if blob_ref.get("mode") == "100755" else 0o644
+        os.chmod(target_path, file_mode)
+        uid, gid = blob_ref.get("uid"), blob_ref.get("gid")
+        if uid is not None and gid is not None:
+            try:
+                os.chown(target_path, uid, gid)
+            except OSError:
+                pass
     finally:
         if tmp_path:
             try:
@@ -641,7 +676,7 @@ def undo_latest_file_journal_turn(
     for rel_path, entry in manifest.get("files", {}).items():
         if not isinstance(entry, dict) or "baseline" not in entry or "after" not in entry:
             continue
-        safe_rel = _journal_safe_rel_path(entry.get("path") or rel_path)
+        safe_rel = _journal_normalize_label(entry.get("path") or rel_path)
         restore_plan[safe_rel] = {
             "baseline": entry["baseline"],
             "expected_current": entry["after"],
@@ -698,7 +733,7 @@ def revoke_session_file_changes(
         for rel_path, entry in manifest.get("files", {}).items():
             if not isinstance(entry, dict) or "baseline" not in entry or "after" not in entry:
                 continue
-            safe_rel = _journal_safe_rel_path(entry.get("path") or rel_path)
+            safe_rel = _journal_normalize_label(entry.get("path") or rel_path)
             if safe_rel not in restore_plan:
                 restore_plan[safe_rel] = {
                     "baseline": entry["baseline"],

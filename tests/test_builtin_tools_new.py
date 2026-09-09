@@ -306,7 +306,145 @@ class TestFileJournalManager:
 # ---------------------------------------------------------------------------
 
 import json as _json
-from runtime.builtin_tools import _read_file
+from runtime.builtin_tools import (  # noqa: E402
+    _read_file,
+    _journal_path_label,
+    _validate_path,
+)
+from runtime.context_manager import undo_latest_file_journal_turn  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# /tmp scratch area: write_file/edit_file on absolute /tmp paths
+# ---------------------------------------------------------------------------
+
+
+class TestTmpScratchJournal:
+    """/tmp is a permitted scratch area for write_file and edit_file.
+
+    Files under the real ``/tmp`` are journaled with absolute path labels
+    (sidecar baselines, git skipped), while workspace files keep
+    workspace-relative labels.
+    """
+
+    @staticmethod
+    def _tmp_target(name: str) -> str:
+        # Directly under the system /tmp: outside the pytest workspace
+        # (tmp_path lives in a /tmp/pytest-of-* subdirectory).
+        return os.path.realpath(os.path.join("/tmp", name))
+
+    def test_validate_path_allows_tmp_absolute_path(self, workspace):
+        target = self._tmp_target("agents_validate_tmp.txt")
+        assert not target.startswith(str(workspace) + os.sep)
+        assert _validate_path(str(workspace), target) == target
+
+    def test_journal_path_label_workspace_file_is_relative(self, workspace):
+        path = workspace / "sub" / "f.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x", encoding="utf-8")
+        label = _journal_path_label(str(workspace), str(path))
+        assert label == "sub/f.txt"
+        assert not os.path.isabs(label)
+
+    def test_journal_path_label_tmp_file_is_absolute(self, workspace):
+        target = self._tmp_target("agents_label_tmp.txt")
+        with open(target, "w", encoding="utf-8"):
+            pass
+        try:
+            label = _journal_path_label(str(workspace), target)
+            assert os.path.isabs(label)
+            assert label.replace(os.sep, "/") == target.replace(os.sep, "/")
+        finally:
+            os.unlink(target)
+
+    def test_journal_path_label_outside_workspace_and_tmp_denied(self, workspace):
+        home = os.path.realpath(os.path.expanduser("~"))
+        assert not (home == os.path.realpath("/tmp") or home.startswith(os.path.realpath("/tmp") + os.sep))
+        target = os.path.join(home, "agents_outside_label.txt")
+        with open(target, "w", encoding="utf-8"):
+            pass
+        try:
+            with pytest.raises(ValueError):
+                _journal_path_label(str(workspace), target)
+        finally:
+            os.unlink(target)
+
+    def test_flatten_journal_path_accepts_absolute_label(self):
+        name = _flatten_journal_path("/tmp/agents flat.txt", "baseline")
+        assert name.endswith(".baseline.gz")
+        assert not name.startswith("/")
+        assert ".." not in name
+
+    def test_write_file_tmp_new_file_journaled_with_absolute_label(self, workspace, journal_context):
+        target = self._tmp_target("agents_write_tmp.txt")
+        try:
+            r = _json.loads(_write_file(target, "scratch content\n"))
+            assert "error" not in r, r
+            assert r["file"] == target
+            assert os.path.isfile(target)
+            manifest_path = journal_context / "file_journals" / "260511_102030" / "manifest.json"
+            manifest = _json.loads(manifest_path.read_text(encoding="utf-8"))
+            entry = manifest["files"].get(target)
+            assert entry is not None, f"labels={list(manifest['files'])}"
+            assert entry["baseline"] == {"exists": False}
+            assert entry["after"]["store"] == "sidecar"
+        finally:
+            if os.path.lexists(target):
+                os.unlink(target)
+
+    def test_write_file_tmp_existing_file_uses_sidecar_baseline(self, workspace, journal_context):
+        target = self._tmp_target("agents_write_tmp_existing.txt")
+        with open(target, "w", encoding="utf-8") as fh:
+            fh.write("original\n")
+        try:
+            r = _json.loads(_write_file(target, "rewritten\n"))
+            assert "error" not in r, r
+            manifest_path = journal_context / "file_journals" / "260511_102030" / "manifest.json"
+            manifest = _json.loads(manifest_path.read_text(encoding="utf-8"))
+            entry = manifest["files"].get(target)
+            assert entry is not None, f"labels={list(manifest['files'])}"
+            # Git baselines are skipped for absolute /tmp labels.
+            assert entry["baseline"]["store"] == "sidecar"
+            assert entry["baseline"]["exists"] is True
+        finally:
+            if os.path.lexists(target):
+                os.unlink(target)
+
+    def test_write_edit_undo_cycle_for_tmp_files(self, workspace, journal_context):
+        new_target = self._tmp_target("agents_undo_new.txt")
+        old_target = self._tmp_target("agents_undo_old.txt")
+        original = "original A\noriginal B\n"
+        with open(old_target, "w", encoding="utf-8") as fh:
+            fh.write(original)
+        try:
+            r = _json.loads(_write_file(new_target, "hello\n"))
+            assert "error" not in r, r
+            r = _json.loads(_write_file(old_target, "rewritten\n"))
+            assert "error" not in r, r
+            r = _json.loads(_edit_file(
+                path=new_target, mode="search_replace",
+                old_str="hello", new_str="bye",
+            ))
+            assert "error" not in r, r
+            with open(new_target, encoding="utf-8") as fh:
+                assert fh.read() == "bye\n"
+
+            manifest_path = journal_context / "file_journals" / "260511_102030" / "manifest.json"
+            manifest = _json.loads(manifest_path.read_text(encoding="utf-8"))
+            assert new_target in manifest["files"]
+            assert old_target in manifest["files"]
+
+            result = undo_latest_file_journal_turn(
+                str(workspace), str(journal_context), session_id="session1"
+            )
+            assert "error" not in result, result
+            assert not os.path.lexists(new_target)
+            with open(old_target, encoding="utf-8") as fh:
+                assert fh.read() == original
+        finally:
+            for p in (new_target, old_target):
+                if os.path.lexists(p):
+                    os.unlink(p)
 
 
 class TestReadFileUnit:

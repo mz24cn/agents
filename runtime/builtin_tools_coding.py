@@ -255,6 +255,24 @@ def _validate_path(workspace: str, raw_path: str) -> str:
     return resolved
 
 
+def _journal_path_label(workspace: str, resolved_path: str) -> str:
+    """Return the manifest path label for a resolved file path.
+
+    Files inside the workspace are keyed by their workspace-relative path.
+    Files outside the workspace — only ``/tmp`` is permitted by
+    :func:`_validate_path` — are keyed by their absolute path so the journal
+    can track, snapshot and restore them as well.
+    """
+    workspace = os.path.realpath(workspace)
+    resolved_path = os.path.realpath(resolved_path)
+    ws_prefix = workspace + os.sep
+    if resolved_path == workspace or resolved_path.startswith(ws_prefix):
+        return _safe_rel_path(os.path.relpath(resolved_path, workspace))
+    if resolved_path == _REAL_TMP or resolved_path.startswith(_REAL_TMP + os.sep):
+        return resolved_path.replace(os.sep, "/")
+    raise ValueError(f"Journal path outside workspace: {resolved_path}")
+
+
 def _journal_turn_key(value: Optional[str]) -> tuple[str, str, bool]:
     dt = _parse_journal_timestamp(value)
     if dt is None:
@@ -268,16 +286,47 @@ def _journal_turn_key(value: Optional[str]) -> tuple[str, str, bool]:
 
 
 def _flatten_journal_path(rel_path: str, role: str) -> str:
-    safe_rel = _safe_rel_path(rel_path)
-    flat = re.sub(r"[\\/]+", "-", safe_rel)
+    # Accepts both workspace-relative labels and absolute /tmp labels.
+    # Absolute labels originate from :func:`_journal_path_label` (already
+    # validated), so no traversal check is needed here.
+    normalized = str(rel_path).replace("\\", "/")
+    flat = re.sub(r"[\\/]+", "-", normalized.lstrip("/"))
     flat = re.sub(r"[^A-Za-z0-9._-]", "_", flat) or "file"
-    short_hash = hashlib.sha256(safe_rel.encode("utf-8")).hexdigest()[:8]
+    short_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:8]
     return f"{flat}.{short_hash}.{role}.gz"
 
 
 def _file_mode(path: str) -> str:
     mode = os.lstat(path).st_mode
     return "100755" if mode & stat.S_IXUSR else "100644"
+
+
+def _apply_file_metadata(
+    path: str,
+    mode: Optional[int] = None,
+    uid: Optional[int] = None,
+    gid: Optional[int] = None,
+) -> None:
+    """Best-effort restoration of the mode/ownership of *path*.
+
+    Atomic-replace writes (mkstemp + os.replace / shutil.move, or the
+    external ``patch`` command) install the temp file's inode.  That inode
+    is owned by the agent process and, for mkstemp, has mode 0o600.  When
+    the agent runs as root this silently converts project files into
+    root-only files that no other user can read or execute.  Callers pass
+    the pre-write stat values so the original metadata can be reapplied.
+
+    Failures are swallowed on purpose: metadata restoration must never turn
+    a successful write into an error, and chown is not available to
+    non-root callers anyway.
+    """
+    try:
+        if mode is not None:
+            os.chmod(path, mode)
+        if uid is not None and gid is not None:
+            os.chown(path, uid, gid)
+    except OSError as exc:
+        logger.debug("Could not restore metadata for %s: %s", path, exc)
 
 
 def _capture_file_state(path: str) -> dict:
@@ -296,6 +345,9 @@ def _capture_file_state(path: str) -> dict:
         "data": data,
         "mode": "100755" if st.st_mode & stat.S_IXUSR else "100644",
         "is_symlink": is_symlink,
+        "file_mode": stat.S_IMODE(st.st_mode),
+        "uid": st.st_uid,
+        "gid": st.st_gid,
     }
 
 
@@ -350,6 +402,12 @@ def _restore_file_state(path: str, state: dict) -> None:
     if state.get("is_symlink"):
         target = data.decode("utf-8", errors="surrogateescape")
         os.symlink(target, path)
+        uid, gid = state.get("uid"), state.get("gid")
+        if uid is not None and gid is not None:
+            try:
+                os.lchown(path, uid, gid)
+            except (OSError, AttributeError):
+                pass
         return
     fd, tmp_path = tempfile.mkstemp(dir=parent or None)
     try:
@@ -357,7 +415,12 @@ def _restore_file_state(path: str, state: dict) -> None:
             fh.write(data)
         os.replace(tmp_path, path)
         tmp_path = None
-        os.chmod(path, 0o755 if state.get("mode") == "100755" else 0o644)
+        file_mode = state.get("file_mode")
+        if file_mode is None:
+            file_mode = 0o755 if state.get("mode") == "100755" else 0o644
+        _apply_file_metadata(
+            path, mode=file_mode, uid=state.get("uid"), gid=state.get("gid")
+        )
     finally:
         if tmp_path is not None:
             try:
@@ -383,6 +446,9 @@ def _blob_ref_from_state(state: dict, journal_dir: str, rel_path: str, role: str
         "compression": "gzip",
         "mode": state.get("mode", "100644"),
         "is_symlink": bool(state.get("is_symlink")),
+        "file_mode": state.get("file_mode"),
+        "uid": state.get("uid"),
+        "gid": state.get("gid"),
     }
 
 
@@ -475,7 +541,7 @@ class _FileJournalManager:
             return self._skipped("no_session_dir")
         try:
             resolved_path = _validate_path(self.workspace, file_path)
-            rel_path = _safe_rel_path(os.path.relpath(resolved_path, self.workspace))
+            rel_path = _journal_path_label(self.workspace, resolved_path)
             with _ManifestLock(self.lock_path):
                 manifest = self._load_manifest()
                 manifest["status"] = "active"
@@ -504,7 +570,7 @@ class _FileJournalManager:
             return self._skipped("no_session_dir")
         try:
             resolved_path = _validate_path(self.workspace, file_path)
-            rel_path = _safe_rel_path(os.path.relpath(resolved_path, self.workspace))
+            rel_path = _journal_path_label(self.workspace, resolved_path)
             with _ManifestLock(self.lock_path):
                 manifest = self._load_manifest()
                 manifest["status"] = "active"
@@ -555,17 +621,17 @@ class _FileJournalManager:
                     errors.append({"path": rel_path, "error": "missing_baseline"})
                     continue
                 try:
-                    safe_rel = _safe_rel_path(str(rel_path).replace("\\", "/"))
-                    resolved_path = _validate_path(self.workspace, safe_rel)
+                    label = str(rel_path)
+                    resolved_path = self._resolve_journal_label(label)
                     current_state = _capture_file_state(resolved_path)
                     if not _journal_ref_matches_state(entry.get("after"), current_state):
                         entry["after"] = _blob_ref_from_state(
-                            current_state, self.journal_dir, safe_rel, "after"
+                            current_state, self.journal_dir, label, "after"
                         )
-                        refreshed.append(safe_rel)
+                        refreshed.append(label)
                     if _journal_refs_equal(entry["baseline"], entry["after"]):
                         files.pop(rel_path, None)
-                        removed.append(safe_rel)
+                        removed.append(label)
                 except Exception as exc:
                     logger.warning("File journal finalize failed for %s: %s", rel_path, exc)
                     errors.append({"path": str(rel_path), "error": str(exc)})
@@ -637,12 +703,29 @@ class _FileJournalManager:
         manifest["updated_at"] = _utc_now_iso()
         _atomic_write_json(self.manifest_path, manifest)  # type: ignore[arg-type]
 
+    def _resolve_journal_label(self, label: str) -> str:
+        """Map a manifest path label back to a filesystem path.
+
+        Relative labels stay inside the workspace; absolute labels are only
+        accepted for the ``/tmp`` scratch area (same rule as
+        :func:`_validate_path`).
+        """
+        label = str(label).replace("\\", "/")
+        if os.path.isabs(label):
+            return _validate_path(self.workspace, label)
+        return _validate_path(self.workspace, _safe_rel_path(label))
+
     def _baseline_ref(self, resolved_path: str, rel_path: str) -> dict:
         state = _capture_file_state(resolved_path)
         if not state.get("exists"):
             return {"exists": False}
-        git_ref = self._git_baseline_ref(rel_path, state)
+        # Git baselines only make sense for files inside the workspace.
+        git_ref = None if os.path.isabs(rel_path) else self._git_baseline_ref(rel_path, state)
         if git_ref is not None:
+            # Git stores content only; keep the on-disk ownership so undo can
+            # restore a root-written file to its original owner.
+            git_ref["uid"] = state.get("uid")
+            git_ref["gid"] = state.get("gid")
             return git_ref
         return _blob_ref_from_state(state, self.journal_dir or "", rel_path, "baseline")
 
@@ -965,12 +1048,36 @@ def _write_file(path: str, content: str) -> str:
     except OSError as exc:
         return json.dumps({"error": "WriteFailure", "message": str(exc)})
 
+    # Remember pre-write metadata.  shutil.move swaps in the temp file's
+    # inode (mode 0o600, owned by the agent process), so the original
+    # file's mode/ownership must be reapplied afterwards; otherwise a
+    # root-run agent silently converts project files into root-only
+    # 0o600 files that no other user can read or execute.
+    try:
+        pre_stat = os.stat(resolved_path)
+    except FileNotFoundError:
+        pre_stat = None
+
     # Move temp file to target.  shutil.move uses os.rename (atomic) when
     # /tmp and the target are on the same filesystem, falling back to
     # copy+delete otherwise.
     try:
         shutil.move(tmp_path, resolved_path)
         tmp_path = None  # moved successfully, no cleanup needed
+        if pre_stat is not None:
+            _apply_file_metadata(
+                resolved_path,
+                mode=stat.S_IMODE(pre_stat.st_mode),
+                uid=pre_stat.st_uid,
+                gid=pre_stat.st_gid,
+            )
+        else:
+            # New file: mkstemp's 0o600 default would hide it from other
+            # users in shared workspaces, so give it a readable default.
+            try:
+                os.chmod(resolved_path, 0o644)
+            except OSError:
+                pass
     except OSError as exc:
         return json.dumps({"error": "WriteFailure", "message": str(exc)})
     finally:
@@ -994,8 +1101,9 @@ def _write_file(path: str, content: str) -> str:
             "message": "Could not save after snapshot; file was restored to pre-call state",
         })
 
-    # Compute relative path from workspace root for the response
-    rel_path = os.path.relpath(resolved_path, workspace)
+    # Response path: workspace-relative inside the workspace, absolute for
+    # permitted /tmp targets (see _journal_path_label).
+    rel_path = _journal_path_label(workspace, resolved_path)
 
     journal_meta = journal_manager.response_metadata()
     return json.dumps({
@@ -1012,7 +1120,7 @@ WRITE_FILE_TOOL_CONFIG = ToolConfig(
     tool_type="function",
     name="write_file",
     description=(
-        "Write content to a file in the workspace atomically. "
+        "Write content to a file in the workspace atomically; paths under /tmp are also permitted as a scratch/data-exchange area. "
         "Creates parent directories if they don't exist. "
         "A file journal snapshot is saved before writing so the change can be reviewed or reverted with the session."
     ),
@@ -1021,7 +1129,7 @@ WRITE_FILE_TOOL_CONFIG = ToolConfig(
         "properties": {
             "path": {
                 "type": "string",
-                "description": "Path to the file (relative to workspace)",
+                "description": "Path to the file (relative to workspace, or an absolute path under /tmp)",
             },
             "content": {
                 "type": "string",
@@ -1074,7 +1182,7 @@ def _edit_file(
     if isinstance(journal_result, dict) and journal_result.get("error"):
         return json.dumps(journal_result)
 
-    rel_path = os.path.relpath(resolved_path, workspace)
+    rel_path = _journal_path_label(workspace, resolved_path)
 
     result = None
     if mode == "search_replace":
@@ -1248,6 +1356,10 @@ def _edit_file_search_replace(
     try:
         import tempfile
         parent_dir = os.path.dirname(resolved_path)
+        try:
+            pre_stat = os.stat(resolved_path)
+        except OSError:
+            pre_stat = None
         fd, tmp_path = tempfile.mkstemp(dir=parent_dir)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -1260,6 +1372,13 @@ def _edit_file_search_replace(
             os.unlink(tmp_path)
             raise
         os.replace(tmp_path, resolved_path)
+        if pre_stat is not None:
+            _apply_file_metadata(
+                resolved_path,
+                mode=stat.S_IMODE(pre_stat.st_mode),
+                uid=pre_stat.st_uid,
+                gid=pre_stat.st_gid,
+            )
     except OSError as exc:
         return json.dumps({"error": "WriteFailure", "message": str(exc)})
 
@@ -1589,10 +1708,25 @@ def _edit_file_diff(
         _cleanup_patch_artifacts(resolved_path)
         return json.dumps({"error": "PatchFailed", "message": _patch_process_output(dry_run)})
 
+    try:
+        pre_stat = os.stat(resolved_path)
+    except OSError:
+        pre_stat = None
     result = _run_patch(workspace, normalized_patch, dry_run=False)
     if result.returncode != 0:
         _restore_patched_file(resolved_path, backup)
         return json.dumps({"error": "PatchFailed", "message": _patch_process_output(result)})
+    # The patch command renames its own temp file into the target; reapply
+    # the pre-patch mode/ownership (a root-run agent would otherwise own
+    # the file and other users could no longer read or execute it).
+    if pre_stat is not None:
+        _apply_file_metadata(
+            resolved_path,
+            mode=stat.S_IMODE(pre_stat.st_mode),
+            uid=pre_stat.st_uid,
+            gid=pre_stat.st_gid,
+        )
+
 
     _cleanup_patch_artifacts(resolved_path)
 
@@ -1634,7 +1768,7 @@ EDIT_FILE_TOOL_CONFIG = ToolConfig(
     tool_type="function",
     name="edit_file",
 description=(
-    "Edit a file in the workspace using search_replace or diff mode. "
+    "Edit a file in the workspace using search_replace or diff mode; paths under /tmp are also permitted. "
     "In search_replace mode, old_str must match the file exactly, including indentation; "
     "the first exact occurrence is replaced with new_str. If old_str matches only when "
     "leading/trailing whitespace is ignored, the edit is refused and the matching line is reported. "
@@ -1647,7 +1781,7 @@ description=(
         "properties": {
             "path": {
                 "type": "string",
-                "description": "Path to the file (relative to workspace)",
+                "description": "Path to the file (relative to workspace, or an absolute path under /tmp)",
             },
             "mode": {
                 "type": "string",
