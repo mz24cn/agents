@@ -348,7 +348,7 @@ const translations = {
     promptTemplatePanelTitle: '提示词模板',
 
     // WorkspaceFileManager
-    workspaceFileManager: '工作区文件管理器',
+    workspaceFileManager: '文件',
     search: '搜索',
     searchFiles: '搜索文件内容...',
     filterFileNames: '过滤文件名...',
@@ -961,7 +961,7 @@ const translations = {
     promptTemplatePanelTitle: 'Prompt Templates',
 
     // WorkspaceFileManager
-    workspaceFileManager: 'Workspace File Manager',
+    workspaceFileManager: 'Files',
     search: 'Search',
     searchFiles: 'Search file contents...',
     filterFileNames: 'Filter file names...',

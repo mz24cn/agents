@@ -2,6 +2,7 @@
   import { t } from '../../lib/i18n.svelte.js'
   import { highlight } from '../../lib/highlight.js'
   import { isToolErrorContent } from '../../lib/tool-result.js'
+  import { compactToolDisplay } from '../../lib/compact-tool.js'
   import MarkdownRenderer from './MarkdownRenderer.svelte'
 
   let { toolCalls = null, compact = false, toolResultsById = {} } = $props()
@@ -218,11 +219,12 @@
       {@const result = getToolResult(tc)}
       {@const resultStreaming = isResultStreaming(result)}
       {@const renderedResult = result ? renderResult(result) : null}
+      {@const compactDisplay = compactToolDisplay(tc, t('unknownTool'))}
       <span class="compact-tool-pair" role="group">
         <span class="compact-tool-zone" role="group" onmouseenter={() => startHoverPreview(index)} onmouseleave={() => stopHoverPreview(index)}>
-          <button class="compact-tool-call has-result" aria-expanded={isExpanded(index)} onclick={() => toggleExpanded(index)}>
-            <span class="compact-tc-icon">🛠️</span>
-            <span class="compact-tc-name">{tc.name ?? t('unknownTool')}</span>
+          <button class="compact-tool-call has-result" aria-expanded={isExpanded(index)} title={tc.name ?? t('unknownTool')} onclick={() => toggleExpanded(index)}>
+            <span class="compact-tc-icon">{compactDisplay.icon}</span>
+            <span class="compact-tc-name">{compactDisplay.label}</span>
           </button>
           {#if isExpanded(index)}
             <span

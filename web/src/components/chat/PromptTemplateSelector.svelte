@@ -161,4 +161,8 @@
     border-color: var(--primary);
   }
   .tpl-name { font-weight: 500; }
+  /* 移动端：长 template_id 允许换行，避免横向溢出 */
+  @media (max-width: 720px) {
+    .template-item { white-space: normal; word-break: break-word; }
+  }
 </style>

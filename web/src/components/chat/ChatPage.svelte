@@ -2258,4 +2258,36 @@
     border: 1px solid var(--border);
   }
   .btn-secondary:hover { background: var(--bg-secondary); }
+  /* ===== 移动端适配（≤720px）：提示词面板改为纵向堆叠（预览在上、列表在下） ===== */
+  @media (max-width: 720px) {
+    .template-panel .panel-body {
+      flex-direction: column;
+    }
+    .template-panel .panel-left {
+      flex: 1 1 auto;
+      min-height: 0;
+      border-right: none;
+      border-bottom: 1px solid var(--border);
+      padding: 12px;
+    }
+    .template-panel .panel-right {
+      width: 100%;
+      min-width: 0;
+      max-width: none;
+      flex: 0 0 auto;
+      max-height: 40%;
+      border-left: none;
+      border-top: 1px solid var(--border);
+    }
+    /* 顶栏：允许换行，防止长 template_id / 占位符标签溢出裁切 */
+    .template-panel .panel-header {
+      flex-wrap: wrap;
+      row-gap: 6px;
+      padding: 8px 12px;
+    }
+    .template-panel .header-apply-row {
+      flex-wrap: wrap;
+      column-gap: 6px;
+    }
+  }
 </style>

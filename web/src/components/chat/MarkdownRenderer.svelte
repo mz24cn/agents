@@ -4,60 +4,13 @@
   import { t } from '$lib/i18n.svelte.js'
   import { copyToClipboard } from '$lib/clipboard.js'
 
+  import { extractMath, renderMathElements } from '$lib/math.js'
+
   let { content = '' } = $props()
 
-  // Lightweight LaTeX symbol → Unicode replacement (no external deps)
-  const LATEX_SYMBOLS = {
-    // Arrows
-    rightarrow: '→', Rightarrow: '⇒',
-    leftarrow: '←', Leftarrow: '⇐',
-    leftrightarrow: '↔', Leftrightarrow: '⇔',
-    uparrow: '↑', downarrow: '↓',
-    nearrow: '↗', searrow: '↘', nwarrow: '↖', swarrow: '↙',
-    to: '→', gets: '←',
-    // Greek lowercase
-    alpha: 'α', beta: 'β', gamma: 'γ', delta: 'δ', epsilon: 'ε',
-    zeta: 'ζ', eta: 'η', theta: 'θ', iota: 'ι', kappa: 'κ',
-    lambda: 'λ', mu: 'μ', nu: 'ν', xi: 'ξ', pi: 'π',
-    rho: 'ρ', sigma: 'σ', tau: 'τ', upsilon: 'υ', phi: 'φ',
-    chi: 'χ', psi: 'ψ', omega: 'ω',
-    // Greek uppercase
-    Gamma: 'Γ', Delta: 'Δ', Theta: 'Θ', Lambda: 'Λ', Xi: 'Ξ',
-    Pi: 'Π', Sigma: 'Σ', Upsilon: 'Υ', Phi: 'Φ', Psi: 'Ψ', Omega: 'Ω',
-    // Math operators & relations
-    times: '×', div: '÷', pm: '±', mp: '∓',
-    leq: '≤', geq: '≥', neq: '≠', approx: '≈', equiv: '≡',
-    sim: '∼', simeq: '≃', cong: '≅', propto: '∝',
-    // Sets & logic
-    in: '∈', notin: '∉', subset: '⊂', supset: '⊃',
-    subseteq: '⊆', supseteq: '⊇', cup: '∪', cap: '∩',
-    emptyset: '∅', forall: '∀', exists: '∃', nexists: '∄',
-    land: '∧', lor: '∨', lnot: '¬', neg: '¬',
-    // Misc math
-    infty: '∞', partial: '∂', nabla: '∇', sqrt: '√',
-    sum: '∑', prod: '∏', int: '∫',
-    cdot: '·', cdots: '⋯', ldots: '…', vdots: '⋮', ddots: '⋱',
-    circ: '∘', bullet: '•', star: '★',
-    // Spacing (strip)
-    quad: ' ', qquad: '  ',
-  }
-
-  function replaceLatex(src) {
-    // Replace $$...$$ (block) and $...$ (inline) with Unicode equivalents
-    return src.replace(/\$\$([\s\S]+?)\$\$|\$([^$\n]+?)\$/g, (match, block, inline) => {
-      const inner = block ?? inline
-      return inner
-        .replace(/\\text\{([^}]*)\}/g, '$1')
-        .replace(/\\mathrm\{([^}]*)\}/g, '$1')
-        .replace(/\\mathbf\{([^}]*)\}/g, '$1')
-        .replace(/\\frac\{([^}]*)\}\{([^}]*)\}/g, '($1/$2)')
-        .replace(/\\([A-Za-z]+)/g, (_, cmd) => LATEX_SYMBOLS[cmd] ?? `\\${cmd}`)
-        .replace(/[\^_]\{([^}]*)\}/g, '$1')
-        .replace(/[\^_](\S)/g, '$1')
-        .replace(/[{}]/g, '')
-        .trim()
-    })
-  }
+  // Mermaid 渲染结果缓存（code -> SVG）：流式重渲染会重建 DOM，
+  // 同一图命中缓存后同步回填，避免每个 chunk 都重新请求 mermaid.ink
+  const mermaidCache = new Map()
 
   // Simple HTML escaper for XSS prevention — applied after marked renders
   function sanitizeHtml(html) {
@@ -104,7 +57,7 @@
   function renderMarkdown(src) {
     if (!src) return ''
     try {
-      const raw = marked.parse(replaceLatex(src), markedOptions)
+      const raw = marked.parse(extractMath(src), markedOptions)
       return sanitizeHtml(raw)
     } catch {
       return src
@@ -154,17 +107,28 @@
       for (const el of placeholders) {
         el.dataset.mermaidRendered = '1'
         const code = decodeURIComponent(escape(atob(el.dataset.mermaidCode)))
+        const cachedSvg = mermaidCache.get(code)
+        if (cachedSvg) {
+          el.innerHTML = cachedSvg
+          el.classList.add('mermaid-rendered')
+          continue
+        }
         const encoded = encodeForMermaidInk(code)
         if (!encoded) { el.classList.add('mermaid-error'); continue }
         const url = `https://mermaid.ink/svg/${encoded}`
         fetch(url)
           .then(r => { if (!r.ok) throw new Error(r.status); return r.text() })
           .then(svg => {
+            if (mermaidCache.size >= 100) mermaidCache.clear()
+            mermaidCache.set(code, svg)
             el.innerHTML = svg
             el.classList.add('mermaid-rendered')
           })
           .catch(() => { el.classList.add('mermaid-error') })
       }
+      // --- Math rendering via KaTeX CDN (on-demand download, zero bundle size) ---
+      const mathEls = markdownContainer.querySelectorAll('.math-pending:not([data-math-done])')
+      if (mathEls.length) void renderMathElements([...mathEls])
     })
   })
 </script>
@@ -356,6 +320,30 @@
     opacity: 0.7;
   }
   .markdown-content :global(.mermaid-error)::after {
+    content: ' ⚠';
+    color: #f78c6c;
+    font-size: 0.8em;
+  }
+
+  /* Math (KaTeX on-demand CDN, zero bundle size) */
+  .markdown-content :global(.math-display) {
+    display: block;
+    margin: 0.6em 0;
+    padding: 0.15em 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    text-align: center;
+  }
+  .markdown-content :global(.katex-display) {
+    /* displayMode 默认输出 <div>，在 <p> 内是无效嵌套 → 改为 inline-block（样式仍由 KaTeX CSS 的 class 提供） */
+    display: inline-block;
+    margin: 0;
+    text-align: center;
+  }
+  .markdown-content :global(.math-error) {
+    opacity: 0.7;
+  }
+  .markdown-content :global(.math-error)::after {
     content: ' ⚠';
     color: #f78c6c;
     font-size: 0.8em;

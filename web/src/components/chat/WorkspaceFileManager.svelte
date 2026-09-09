@@ -50,6 +50,8 @@
 
   // 视图模式：list（列表）/ grid（网格大图）/ preview（满幅预览）
   let viewMode = $state('list')
+  // 移动端目录树浮层开关（默认选中/展开；桌面端目录树始终为固定列，忽略此状态）
+  let treeOpen = $state(true)
   // 当前目录路径
   let currentPath = $state('')
   // 文件列表
@@ -2085,6 +2087,17 @@
         <button class="header-btn" class:active={viewMode === 'grid'} onclick={() => viewMode = 'grid'} title={t('gridView')}>
           ⊞
         </button>
+        <!-- 移动端：目录树浮层开关（仅图标，置于 ⊞ 之后；桌面端隐藏；选中态 = 目录树展开） -->
+        <button
+          class="header-btn tree-toggle-btn"
+          class:active={treeOpen}
+          onclick={() => treeOpen = !treeOpen}
+          title={t('directoryTree')}
+          aria-label={t('directoryTree')}
+          aria-pressed={treeOpen}
+        >
+          🌲
+        </button>
         
         <!-- 上传按钮组 -->
         <div class="upload-group">
@@ -2119,7 +2132,9 @@
     </div>
 
     <!-- 主体区域 -->
-    <div class="panel-body">
+    <div class="panel-body" class:tree-open={treeOpen}>
+      <!-- 移动端：目录树浮层遮罩（点击关闭；桌面端隐藏） -->
+      <div class="tree-backdrop" onclick={() => treeOpen = false}></div>
       <!-- 左侧：文件列表 -->
       <div class="panel-left">
         {#if error}
@@ -2507,10 +2522,13 @@
     flex-shrink: 0;
   }
 
-  .refresh-btn:hover:not(:disabled) {
-    background: var(--primary);
-    color: #fff;
-    border-color: var(--primary);
+  /* 悬停反馈仅限有真 hover 的设备（触摸设备点按后 :hover 会粘滞，视觉上卡死） */
+  @media (hover: hover) {
+    .refresh-btn:hover:not(:disabled) {
+      background: var(--primary);
+      color: #fff;
+      border-color: var(--primary);
+    }
   }
 
   .refresh-btn:disabled {
@@ -2536,10 +2554,13 @@
     transition: all 0.2s;
   }
 
-  .header-btn:hover:not(:disabled) {
-    background: var(--primary);
-    color: #fff;
-    border-color: var(--primary);
+  /* 悬停反馈仅限有真 hover 的设备（桌面鼠标），且弱于选中态：
+     触摸设备点按后 :hover 会粘滞，若悬停与选中同色，选中态看起来“不切换” */
+  @media (hover: hover) {
+    .header-btn:hover:not(:disabled):not(.active):not(.primary) {
+      background: var(--bg-secondary);
+      border-color: var(--text-secondary);
+    }
   }
 
   .header-btn:disabled {
@@ -2713,6 +2734,7 @@
     display: flex;
     flex: 1;
     overflow: hidden;
+    position: relative; /* 移动端：目录树浮层/遮罩的定位参照 */
   }
 
   .panel-left {
@@ -2731,6 +2753,12 @@
     display: flex;
     flex-direction: column;
   }
+
+  /* 移动端：目录树浮层开关按钮，桌面端隐藏 */
+  .tree-toggle-btn { display: none; }
+
+  /* 移动端：目录树浮层遮罩，桌面端隐藏 */
+  .tree-backdrop { display: none; }
 
   .file-list {
     height: 100%;
@@ -3422,5 +3450,54 @@
   .tree-node.drop-invalid {
     opacity: 0.5;
     cursor: not-allowed;
+  }
+
+  /* ===== 移动端适配（≤720px）：目录树改为右侧浮层，文件列表占满全宽 ===== */
+  @media (max-width: 720px) {
+    /* 顶栏：过滤框可伸缩、按钮组允许换行，防止溢出被裁切 */
+    .panel-header { padding: 6px 10px; }
+    .header-actions { flex-wrap: wrap; row-gap: 4px; flex-shrink: 1; min-width: 0; }
+    .filename-filter-input { flex: 1 1 90px; width: auto; min-width: 70px; }
+    .inline-search-input { flex: 1 1 90px; width: auto; min-width: 70px; }
+    .upload-group { margin-left: 4px; padding-left: 4px; }
+
+    /* 目录树开关按钮：仅移动端显示（选中态高亮由 .header-btn.active 提供） */
+    .tree-toggle-btn { display: inline-flex; align-items: center; justify-content: center; }
+
+
+    /* 目录树：固定列 → 右侧浮层（默认选中/展开；z-index 低于预览层 20） */
+    .panel-right {
+      position: absolute;
+      top: 0;
+      right: 0;
+      bottom: 0;
+      width: min(280px, 85vw);
+      z-index: 16;
+      transform: translateX(100%);
+      transition: transform 0.22s ease;
+      box-shadow: -6px 0 18px rgba(0, 0, 0, 0.18);
+    }
+    .panel-body.tree-open .panel-right {
+      transform: translateX(0);
+    }
+
+    /* 遮罩层：随浮层显示，点击关闭目录树 */
+    .tree-backdrop {
+      display: block;
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: rgba(0, 0, 0, 0.35);
+      z-index: 15;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.22s ease;
+    }
+    .panel-body.tree-open .tree-backdrop {
+      opacity: 1;
+      pointer-events: auto;
+    }
   }
 </style>
