@@ -1,0 +1,135 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="1050" viewBox="0 0 1100 1050" role="img" aria-labelledby="title desc">
+<title id="title">母端子端总体架构</title>
+<desc id="desc">玲珑 Agent Service 的远程环境管理与远程执行总体架构：母端以 RemoteEnvManager / TunnelManager / RemoteToolProxy 管理并调用子环境，子端以 TunnelClient 主动外呼建立反向隧道；两种传输为直连 HTTP 与 WS 反向隧道，浏览器可直连子端或经 tunnel-proxy 桥访问，母端把增量 tar 推送到子端完成一键更新。推理留在母端，工具在子端执行。</desc>
+<defs>
+  <marker id="arrow_ind" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#6366f1"/></marker>
+  <marker id="arrow_green" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#10b981"/></marker>
+  <marker id="arrow_amber" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#f59e0b"/></marker>
+</defs>
+<rect width="1100" height="1050" fill="#ffffff"/>
+<text x="550" y="46" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="30" font-weight="800" fill="#0f172a">母端子端总体架构</text>
+<text x="550" y="76" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="15" fill="#64748b">同一套代码扮演两个角色：母端管理子环境并做推理，子端主动外呼建立反向隧道；两种传输（直连 / 隧道）对上层完全透明</text>
+
+<!-- ======================= 浏览器 ======================= -->
+<rect x="380" y="98" width="340" height="64" rx="12" fill="#f8fafc" stroke="#cbd5e1" stroke-width="2"/>
+<text x="550" y="126" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="17" font-weight="700" fill="#0f172a">浏览器（用户）</text>
+<text x="550" y="148" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12.5" fill="#475569">聊天页 · 文件管理器 · 终端</text>
+
+<!-- ⑤ tunnel-proxy 桥（浏览器 → 母端，隧道模式） -->
+<path d="M 430 162 C 300 162, 225 170, 225 192" fill="none" stroke="#10b981" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrow_green)"/>
+<text x="225" y="108" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="13" font-weight="700" fill="#047857">⑤ tunnel-proxy 桥（隧道模式）</text>
+<text x="225" y="126" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11.5" fill="#475569">浏览器 → 母端同源 /v1/tunnel-proxy/{env_id}/…</text>
+<text x="225" y="142" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11.5" fill="#475569">无需直连子端 · 无 CORS · cookie 直接可用</text>
+
+<!-- ④ 浏览器直连子端（直连模式） -->
+<path d="M 670 162 C 800 162, 875 170, 875 192" fill="none" stroke="#6366f1" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrow_ind)"/>
+<text x="872" y="108" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="13" font-weight="700" fill="#4338ca">④ 浏览器直连子端（直连模式）</text>
+<text x="872" y="126" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11.5" fill="#475569">工作区文件 · file journal · 终端 WS（?token=）</text>
+<text x="872" y="142" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11.5" fill="#475569">大负载不经母端</text>
+
+<!-- ======================= 母端容器 ======================= -->
+<rect x="30" y="196" width="390" height="640" rx="16" fill="#eef2ff" stroke="#6366f1" stroke-width="2.5"/>
+<text x="50" y="228" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="18" font-weight="800" fill="#3730a3">母端（当前实例）</text>
+<text x="50" y="248" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="11.5" fill="#6366f1">parent · 推理在母端</text>
+
+<rect x="48" y="264" width="354" height="70" rx="10" fill="#ffffff" stroke="#c7d2fe" stroke-width="1.5"/>
+<text x="66" y="290" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="14" font-weight="700" fill="#3730a3">Web UI · 设置页：远程环境管理</text>
+<text x="66" y="310" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">添加子端 URL · 并行状态检查（版本/推理/快照）</text>
+<text x="66" y="326" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">一键推送更新 · 删除记录</text>
+
+<rect x="48" y="342" width="354" height="70" rx="10" fill="#ffffff" stroke="#c7d2fe" stroke-width="1.5"/>
+<text x="66" y="368" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="14" font-weight="700" fill="#3730a3">Web UI · 聊天页：执行环境选择器</text>
+<text x="66" y="388" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">会话绑定子环境（存于会话 meta.remote_env）</text>
+<text x="66" y="404" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">默认本地执行 · 切换即重置工具/工作区/终端</text>
+
+<rect x="48" y="420" width="354" height="70" rx="10" fill="#ffffff" stroke="#c7d2fe" stroke-width="1.5"/>
+<text x="66" y="446" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="14" font-weight="700" fill="#3730a3">RemoteEnvManager</text>
+<text x="66" y="466" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">remote_envs.json：直连 id = scheme://netloc（可带 ?token=）</text>
+<text x="66" y="482" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="12" fill="#475569">tunnel:&lt;16hex&gt; 记录（transport: ws-tunnel）</text>
+
+<rect x="48" y="498" width="354" height="70" rx="10" fill="#ffffff" stroke="#c7d2fe" stroke-width="1.5"/>
+<text x="66" y="524" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="14" font-weight="700" fill="#3730a3">TunnelManager</text>
+<text x="66" y="544" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">隧道注册表 + 清扫线程：attach · call_env · open_stream_env</text>
+<text x="66" y="560" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">ping 30s · 90s 无帧强断 · send_deregister</text>
+
+<rect x="48" y="576" width="354" height="70" rx="10" fill="#ffffff" stroke="#c7d2fe" stroke-width="1.5"/>
+<text x="66" y="602" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="14" font-weight="700" fill="#3730a3">RemoteToolProxy</text>
+<text x="66" y="622" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">按环境共享的工具代理：GET /v1/tools（TTL 30s 缓存）</text>
+<text x="66" y="638" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">skill 正文（TTL 300s）· talk_to / delegate / 群聊全代理</text>
+
+<rect x="48" y="654" width="354" height="70" rx="10" fill="#ffffff" stroke="#c7d2fe" stroke-width="1.5"/>
+<text x="66" y="680" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="14" font-weight="700" fill="#3730a3">模型推理（本地）</text>
+<text x="66" y="700" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">母端模型 + 会话历史，流式输出</text>
+<text x="66" y="716" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">推理留在母端 · 会话目录留在母端</text>
+
+<rect x="48" y="732" width="354" height="70" rx="10" fill="#ffffff" stroke="#c7d2fe" stroke-width="1.5"/>
+<text x="66" y="758" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="14" font-weight="700" fill="#3730a3">/v1/tunnel-proxy 桥</text>
+<text x="66" y="778" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">浏览器桥（隧道模式）：工作区文件 · file journal</text>
+<text x="66" y="794" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">终端 WS 桥 /v1/tunnel-proxy/{env_id}/v1/terminals/ws</text>
+
+<!-- ======================= 子端容器 ======================= -->
+<rect x="680" y="196" width="390" height="640" rx="16" fill="#ecfdf5" stroke="#10b981" stroke-width="2.5"/>
+<text x="700" y="228" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="18" font-weight="800" fill="#047857">子端（派生实例）</text>
+<text x="700" y="248" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="11.5" fill="#059669">child · 工具在子端执行</text>
+
+<rect x="698" y="264" width="354" height="70" rx="10" fill="#ffffff" stroke="#6ee7b7" stroke-width="1.5"/>
+<text x="716" y="290" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="14" font-weight="700" fill="#047857">Web UI · 设置页：隧道连接</text>
+<text x="716" y="310" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">注册到母环境 · 注销 · 状态显示</text>
+<text x="716" y="326" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">（空闲 / 连接中 / 在线 / 错误）</text>
+
+<rect x="698" y="342" width="354" height="70" rx="10" fill="#ffffff" stroke="#6ee7b7" stroke-width="1.5"/>
+<text x="716" y="368" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="14" font-weight="700" fill="#047857">TunnelClient（拨号器）</text>
+<text x="716" y="388" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">拨号 GET /v1/tunnel/ws?token=…（子端主动外呼）</text>
+<text x="716" y="404" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">断线重连退避 1→30s · 请求 worker 池 8</text>
+
+<rect x="698" y="420" width="354" height="70" rx="10" fill="#ffffff" stroke="#6ee7b7" stroke-width="1.5"/>
+<text x="716" y="446" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="14" font-weight="700" fill="#047857">本地 HTTP 服务（127.0.0.1:port）</text>
+<text x="716" y="466" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">正常 handler 与授权原样生效</text>
+<text x="716" y="482" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">隧道 req 帧在本地 loopback「自我授权」执行</text>
+
+<rect x="698" y="498" width="354" height="70" rx="10" fill="#ffffff" stroke="#6ee7b7" stroke-width="1.5"/>
+<text x="716" y="524" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="14" font-weight="700" fill="#047857">工具执行</text>
+<text x="716" y="544" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">exec_shell / write_file / MCP / delegate… 保留原名</text>
+<text x="716" y="560" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">journal / 终端 / 子会话挂在同一 session_id</text>
+
+<rect x="698" y="576" width="354" height="70" rx="10" fill="#ffffff" stroke="#6ee7b7" stroke-width="1.5"/>
+<text x="716" y="602" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="14" font-weight="700" fill="#047857">终端 WS /v1/terminals/ws</text>
+<text x="716" y="622" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">stream-open / ready / data / close 双向桥接</text>
+<text x="716" y="638" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">stream-data 携带 base64，保留 text 帧类型</text>
+
+<rect x="698" y="654" width="354" height="70" rx="10" fill="#ffffff" stroke="#6ee7b7" stroke-width="1.5"/>
+<text x="716" y="680" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="14" font-weight="700" fill="#047857">本地持久化</text>
+<text x="716" y="700" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">env.json：TUNNEL_ENABLED · SETUP_SOURCE（母端地址）</text>
+<text x="716" y="716" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="12" fill="#475569">DATA_DIR/tunnel_id：16 位 hex 子端身份</text>
+
+<!-- ======================= 中央传输带 ======================= -->
+<!-- ① 直连 HTTP -->
+<text x="550" y="296" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="14" font-weight="800" fill="#4338ca">① 直连 HTTP</text>
+<text x="550" y="312" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">母端直调子端 /v1/*（更新/工具/状态检查）</text>
+<text x="550" y="326" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">子端 URL 可带 ?token=</text>
+<line x1="420" y1="338" x2="674" y2="338" stroke="#6366f1" stroke-width="2.5" marker-end="url(#arrow_ind)"/>
+
+<!-- ② WS 反向隧道 -->
+<text x="550" y="430" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="14" font-weight="800" fill="#047857">② WS 反向隧道（子端主动外呼）</text>
+<text x="550" y="446" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">子端拨号 GET /v1/tunnel/ws?token=…</text>
+<text x="550" y="460" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">母端经隧道转发 req / resp / stream 帧</text>
+<line x1="680" y1="478" x2="426" y2="478" stroke="#10b981" stroke-width="2.5" marker-end="url(#arrow_green)"/>
+<line x1="420" y1="502" x2="674" y2="502" stroke="#10b981" stroke-width="2" stroke-dasharray="7 4" marker-end="url(#arrow_green)"/>
+<text x="550" y="522" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11" fill="#047857">拨号 = 子端 → 母端；转发 = 母端 → 子端（双向）</text>
+
+<!-- ③ 推送更新 -->
+<text x="550" y="560" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="14" font-weight="800" fill="#b45309">③ 推送更新（一键更新）</text>
+<text x="550" y="576" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">母端 → 子端：增量 tar</text>
+<text x="550" y="590" text-anchor="middle" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="12" fill="#475569">POST /v1/setup?op=push（直连或经隧道）</text>
+<line x1="420" y1="602" x2="674" y2="602" stroke="#f59e0b" stroke-width="2.5" marker-end="url(#arrow_amber)"/>
+<text x="550" y="624" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11.5" fill="#64748b">子端无需知道（更无需能访问）母端地址</text>
+<text x="550" y="640" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11.5" fill="#64748b">母端可匿名、可仅 localhost</text>
+
+<!-- ======================= 底部关键标注 ======================= -->
+<rect x="30" y="872" width="1040" height="118" rx="14" fill="#eef2ff" stroke="#6366f1" stroke-width="2"/>
+<text x="550" y="904" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="17" font-weight="800" fill="#3730a3">关键分工：推理留母端 · 工具在子端执行</text>
+<text x="550" y="932" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="13" fill="#334155">会话绑定后，该会话全部工具来自子端（exec_shell / write_file 等保留子端原名），不注册进母端全局 ToolRegistry；talk_to / delegate / 群聊也全部代理到子端</text>
+<text x="550" y="956" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="13" fill="#334155">每次推理由 RemoteToolProxy 构建 ToolConfig → POST 子端 /v1/tools/call（携带母端 session_id + 用户消息时间戳，子端 journal / 终端 / 子会话挂同一会话）</text>
+
+<text x="550" y="1024" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#64748b">安全：/v1/tunnel/* 与 /v1/tunnel-proxy/* 受同一 /v1 授权门保护；母端若未设密码（匿名），任何能到达端口的客户端都可注册隧道——勿暴露到不受信网络</text>
+</svg>

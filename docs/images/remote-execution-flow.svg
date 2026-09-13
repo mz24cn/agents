@@ -1,0 +1,128 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="1010" viewBox="0 0 1100 1010" role="img" aria-labelledby="title desc">
+<title id="title">远程执行数据流</title>
+<desc id="desc">会话绑定到子环境后的远程执行数据流：用户在母端聊天页通过执行环境选择器绑定子环境；推理（母端模型+会话历史）留在母端；RemoteToolProxy 拉取子端工具清单构建 ToolConfig（保留子端原名、不注册母端全局 ToolRegistry）；工具调用 POST 子端 /v1/tools/call 并携带母端 session_id 与用户消息时间戳（直连或隧道双路径）；skill 渐进披露由母端触发、SKILL.md 从子端拉取；浏览器在直连模式下直连子端取文件/journal/终端，隧道模式走同源 tunnel-proxy 桥。</desc>
+<defs>
+  <marker id="arrow_ind" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#6366f1"/></marker>
+  <marker id="arrow_green" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#10b981"/></marker>
+  <marker id="arrow_amber" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#f59e0b"/></marker>
+</defs>
+<rect width="1100" height="1010" fill="#ffffff"/>
+<text x="550" y="46" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="30" font-weight="800" fill="#0f172a">远程执行数据流</text>
+<text x="550" y="76" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="15" fill="#64748b">会话绑定子环境后：推理留在母端（模型 + 会话历史），该会话全部工具在子端执行；直连 / 隧道双传输对上层透明</text>
+
+<!-- 浏览器 -->
+<rect x="60" y="98" width="340" height="64" rx="12" fill="#f8fafc" stroke="#cbd5e1" stroke-width="2"/>
+<text x="230" y="124" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="16" font-weight="700" fill="#0f172a">浏览器（用户）</text>
+<text x="230" y="144" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11.5" fill="#475569">聊天页 · 执行环境选择器 · 文件管理器 · 终端</text>
+
+<!-- 浏览器 → 母端（用户消息 / 绑定） -->
+<line x1="230" y1="162" x2="230" y2="190" stroke="#6366f1" stroke-width="2" marker-end="url(#arrow_ind)"/>
+<text x="244" y="184" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">用户消息 · 会话恢复时按 meta.remote_env 重绑执行环境</text>
+
+<!-- 浏览器 → 子端（直连模式） -->
+<path d="M 400 124 C 640 124, 860 124, 860 190" fill="none" stroke="#6366f1" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrow_ind)"/>
+<text x="640" y="104" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12.5" font-weight="700" fill="#4338ca">浏览器直连子端（直连模式）：工作区文件 / file journal / 终端 WS（?token=）</text>
+
+<!-- 母端桥 → 子端（隧道模式浏览器路径） -->
+<path d="M 350 196 C 450 148, 700 148, 760 192" fill="none" stroke="#10b981" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrow_green)"/>
+<text x="600" y="140" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11.5" fill="#047857">隧道模式：浏览器 → 母端 /v1/tunnel-proxy/{env_id}/… → 经隧道 → 子端</text>
+
+<!-- ======================= 母端容器 ======================= -->
+<rect x="40" y="196" width="520" height="592" rx="16" fill="#eef2ff" stroke="#6366f1" stroke-width="2.5"/>
+<text x="58" y="226" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="17" font-weight="800" fill="#3730a3">母端（推理侧）</text>
+<text x="58" y="246" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11.5" fill="#6366f1">模型推理 + 会话历史留在母端</text>
+
+<rect x="58" y="258" width="484" height="74" rx="10" fill="#ffffff" stroke="#c7d2fe" stroke-width="1.5"/>
+<circle cx="84" cy="295" r="15" fill="#6366f1"/>
+<text x="84" y="300" text-anchor="middle" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="14" font-weight="700" fill="#ffffff">1</text>
+<text x="108" y="286" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="14" font-weight="700" fill="#3730a3">聊天页 · 执行环境选择器</text>
+<text x="108" y="306" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">会话绑定子环境（存于会话 meta.remote_env），默认本地执行</text>
+<text x="108" y="322" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">切换即重置工具选择 · 工作区路由 · 终端目标</text>
+
+<rect x="58" y="340" width="484" height="74" rx="10" fill="#ffffff" stroke="#c7d2fe" stroke-width="1.5"/>
+<circle cx="84" cy="377" r="15" fill="#6366f1"/>
+<text x="84" y="382" text-anchor="middle" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="14" font-weight="700" fill="#ffffff">2</text>
+<text x="108" y="368" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="14" font-weight="700" fill="#3730a3">模型推理（本地）</text>
+<text x="108" y="388" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">母端模型 + 会话历史，流式输出到浏览器</text>
+<text x="108" y="404" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">会话目录留在母端（会话日志不上子端）</text>
+
+<rect x="58" y="422" width="484" height="74" rx="10" fill="#ffffff" stroke="#c7d2fe" stroke-width="1.5"/>
+<circle cx="84" cy="459" r="15" fill="#6366f1"/>
+<text x="84" y="464" text-anchor="middle" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="14" font-weight="700" fill="#ffffff">3</text>
+<text x="108" y="450" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="14" font-weight="700" fill="#3730a3">RemoteToolProxy 构建 ToolConfig</text>
+<text x="108" y="470" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">拉子端 GET /v1/tools（TTL 30s）；工具保留子端原名</text>
+<text x="108" y="486" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">不注册进母端全局 ToolRegistry（远程与本地不混用）</text>
+
+<rect x="58" y="504" width="484" height="74" rx="10" fill="#ffffff" stroke="#c7d2fe" stroke-width="1.5"/>
+<circle cx="84" cy="541" r="15" fill="#6366f1"/>
+<text x="84" y="546" text-anchor="middle" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="14" font-weight="700" fill="#ffffff">4</text>
+<text x="108" y="532" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="14" font-weight="700" fill="#3730a3">工具调用转发</text>
+<text x="108" y="552" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">POST 子端 /v1/tools/call，携带母端 session_id + 用户消息时间戳</text>
+<text x="108" y="568" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">子端 journal · 终端 · delegate 子会话挂同一会话</text>
+
+<rect x="58" y="586" width="484" height="74" rx="10" fill="#ffffff" stroke="#c7d2fe" stroke-width="1.5"/>
+<circle cx="84" cy="623" r="15" fill="#f59e0b"/>
+<text x="84" y="628" text-anchor="middle" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="14" font-weight="700" fill="#ffffff">5</text>
+<text x="108" y="614" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="14" font-weight="700" fill="#3730a3">skill 渐进披露</text>
+<text x="108" y="634" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">skill 是披露型条目：母端推理循环触发披露（不在子端执行）</text>
+<text x="108" y="650" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">SKILL.md 从子端拉取 GET /v1/tools/skill/{id}（300s 缓存）</text>
+
+<rect x="58" y="668" width="484" height="74" rx="10" fill="#ffffff" stroke="#c7d2fe" stroke-width="1.5"/>
+<circle cx="84" cy="705" r="15" fill="#10b981"/>
+<text x="84" y="710" text-anchor="middle" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="14" font-weight="700" fill="#ffffff">6</text>
+<text x="108" y="696" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="14" font-weight="700" fill="#3730a3">/v1/tunnel-proxy 桥（隧道模式浏览器路径）</text>
+<text x="108" y="716" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">浏览器同源：工作区文件 · file journal · 终端 WS 桥</text>
+<text x="108" y="732" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">隧道模式下浏览器无需直连子端（无 CORS、无子端 token）</text>
+
+<!-- ======================= 子端容器 ======================= -->
+<rect x="660" y="196" width="400" height="592" rx="16" fill="#ecfdf5" stroke="#10b981" stroke-width="2.5"/>
+<text x="678" y="226" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="17" font-weight="800" fill="#047857">子端（执行侧）</text>
+<text x="678" y="246" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11.5" fill="#059669">该会话全部工具在此执行（保留原名）</text>
+
+<rect x="678" y="258" width="364" height="74" rx="10" fill="#ffffff" stroke="#6ee7b7" stroke-width="1.5"/>
+<text x="696" y="286" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="14" font-weight="700" fill="#047857">/v1/tools/call —— 工具入口</text>
+<text x="696" y="306" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">执行 exec_shell / write_file / MCP / delegate / talk_to…</text>
+<text x="696" y="322" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">（直连 HTTP 或隧道 req 帧，入口一致）</text>
+
+<rect x="678" y="340" width="364" height="74" rx="10" fill="#ffffff" stroke="#6ee7b7" stroke-width="1.5"/>
+<text x="696" y="368" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="14" font-weight="700" fill="#047857">工具执行（子端原有 handler）</text>
+<text x="696" y="388" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">正常 handler 与授权原样生效</text>
+<text x="696" y="404" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">隧道请求由子端「自我授权」（自签 cookie）</text>
+
+<rect x="678" y="422" width="364" height="74" rx="10" fill="#ffffff" stroke="#6ee7b7" stroke-width="1.5"/>
+<text x="696" y="450" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="14" font-weight="700" fill="#047857">会话数据（同一 session_id）</text>
+<text x="696" y="470" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">file journal · 终端 · delegate 子会话</text>
+<text x="696" y="486" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">与母端会话同 id，子端 UI 可直接查看</text>
+
+<rect x="678" y="504" width="364" height="74" rx="10" fill="#ffffff" stroke="#6ee7b7" stroke-width="1.5"/>
+<text x="696" y="532" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="14" font-weight="700" fill="#047857">/v1/tools · /v1/tools/skill/{id}</text>
+<text x="696" y="552" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">工具清单（母端代理缓存 TTL 30s）</text>
+<text x="696" y="568" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">SKILL.md 正文（母端代理缓存 TTL 300s）</text>
+
+<rect x="678" y="586" width="364" height="74" rx="10" fill="#ffffff" stroke="#6ee7b7" stroke-width="1.5"/>
+<text x="696" y="614" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="14" font-weight="700" fill="#047857">工作区文件 / file journal / 终端 WS</text>
+<text x="696" y="634" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">/v1/workspace/* · file-journals · /v1/terminals/ws</text>
+<text x="696" y="650" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">大负载直接服务浏览器（不经母端）</text>
+
+<rect x="678" y="668" width="364" height="74" rx="10" fill="#ffffff" stroke="#6ee7b7" stroke-width="1.5"/>
+<text x="696" y="696" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="14" font-weight="700" fill="#047857">/v1/setup?op=push</text>
+<text x="696" y="716" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">接收母端增量 tar（一键更新）</text>
+<text x="696" y="732" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#475569">直连 POST 或经隧道二进制帧流式（900s）</text>
+
+<!-- 双传输箭头 -->
+<text x="610" y="452" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12.5" font-weight="800" fill="#4338ca">直连 HTTP</text>
+<text x="610" y="466" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11" fill="#475569">/v1/*（?token=）</text>
+<line x1="560" y1="478" x2="654" y2="478" stroke="#6366f1" stroke-width="2.5" marker-end="url(#arrow_ind)"/>
+<text x="610" y="516" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12.5" font-weight="800" fill="#047857">隧道转发</text>
+<text x="610" y="530" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11" fill="#475569">req/resp 帧</text>
+<line x1="560" y1="542" x2="654" y2="542" stroke="#10b981" stroke-width="2.5" marker-end="url(#arrow_green)"/>
+
+<!-- ======================= 底部关键标注 ======================= -->
+<rect x="40" y="812" width="1020" height="128" rx="14" fill="#eef2ff" stroke="#6366f1" stroke-width="2"/>
+<text x="550" y="844" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="16" font-weight="800" fill="#3730a3">三个关键不变量</text>
+<text x="550" y="872" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="13" fill="#334155">① 推理留母端：模型、会话历史、会话目录都在母端；② 工具保留子端原名：exec_shell / write_file… 与本地执行完全一致，不注册进母端全局 ToolRegistry</text>
+<text x="550" y="898" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="13" fill="#334155">③ session_id 共享：工具调用转发时携带母端 session_id + 用户消息时间戳 → 子端 journal / 终端 / 子会话挂同一会话（子端 UI 可直接查看）</text>
+
+<text x="550" y="958" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#64748b">talk_to / delegate / 群聊也全部代理到子端；skill 为披露型条目——母端触发披露，SKILL.md 从子端拉取（300s 缓存）</text>
+<text x="550" y="980" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#64748b">推送更新：母端增量 tar → /v1/setup?op=push（直连 POST 或经隧道二进制帧流式，900s）</text>
+</svg>

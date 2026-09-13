@@ -1,0 +1,148 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="1024" viewBox="0 0 1100 1024" role="img" aria-labelledby="title desc">
+<title id="title">两种典型部署场景</title>
+<desc id="desc">直连与反向隧道两种典型部署场景对比：场景一为直连——母端匿名或仅 localhost，子端有公网或可达地址，母端直调子端 /v1/* 并推送增量 tar，浏览器可直连子端；场景二为反向隧道——母端公网受 token 保护，子端在 NAT/内网无公网 IP，只需能外呼母端，全部流量（工具/更新/文件/终端）经隧道。底部为可达方向、母端暴露面、典型网络、浏览器访问、更新路径的对比表。</desc>
+<defs>
+  <marker id="arrow_ind" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#6366f1"/></marker>
+  <marker id="arrow_green" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#10b981"/></marker>
+  <marker id="arrow_amber" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#f59e0b"/></marker>
+</defs>
+<rect width="1100" height="1024" fill="#ffffff"/>
+<text x="550" y="46" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="30" font-weight="800" fill="#0f172a">两种典型部署场景</text>
+<text x="550" y="76" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="15" fill="#64748b">直连 / 反向隧道的选择，只取决于一个方向：谁要能到达谁</text>
+
+<!-- ======================= 场景一：直连 ======================= -->
+<rect x="30" y="100" width="510" height="540" rx="16" fill="#f8fafc" stroke="#6366f1" stroke-width="2"/>
+<rect x="50" y="118" width="140" height="34" rx="17" fill="#6366f1"/>
+<text x="120" y="141" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="15" font-weight="800" fill="#ffffff">场景一 · 直连</text>
+<text x="204" y="140" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12.5" fill="#475569">母端 → 子端可达（子端有公网 / 可达地址）</text>
+
+<rect x="50" y="180" width="190" height="86" rx="12" fill="#eef2ff" stroke="#6366f1" stroke-width="2"/>
+<text x="145" y="206" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="14" font-weight="800" fill="#3730a3">母端</text>
+<text x="145" y="226" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11.5" fill="#475569">匿名 / 仅 localhost</text>
+<text x="145" y="244" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11.5" fill="#475569">如笔记本 127.0.0.1:7988</text>
+
+<rect x="350" y="180" width="190" height="86" rx="12" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+<text x="445" y="206" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="14" font-weight="800" fill="#047857">子端</text>
+<text x="445" y="226" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11.5" fill="#475569">公网服务器 / 同局域网</text>
+<text x="445" y="244" text-anchor="middle" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="11" fill="#475569">http://1.2.3.4:7988/v1/setup</text>
+
+<text x="295" y="172" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11.5" font-weight="700" fill="#4338ca">母端直调子端 /v1/*：增量 tar（op=push）· 工具转发 · 状态检查（?token=）</text>
+<line x1="240" y1="223" x2="344" y2="223" stroke="#f59e0b" stroke-width="2.5" marker-end="url(#arrow_amber)"/>
+
+<rect x="50" y="300" width="190" height="54" rx="10" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="145" y="322" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="13" font-weight="700" fill="#0f172a">浏览器（用户）</text>
+<text x="145" y="340" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11" fill="#475569">聊天 / 文件 / 终端</text>
+
+<line x1="145" y1="300" x2="145" y2="272" stroke="#6366f1" stroke-width="2" marker-end="url(#arrow_ind)"/>
+<text x="157" y="290" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11" fill="#475569">聊天（推理在母端）</text>
+
+<path d="M 240 327 C 320 327, 445 320, 445 270" fill="none" stroke="#6366f1" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrow_ind)"/>
+<text x="340" y="336" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11" fill="#475569">浏览器直连子端取文件 / 终端（token 走查询参数）</text>
+
+<rect x="50" y="390" width="490" height="120" rx="10" fill="#eef2ff" stroke="#c7d2fe" stroke-width="1.5"/>
+<text x="66" y="414" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="13" font-weight="800" fill="#3730a3">要点</text>
+<text x="66" y="436" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#334155">· 只需母端 → 子端可达（子端有公网 IP / 同局域网 / 端口映射）</text>
+<text x="66" y="456" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#334155">· 子端无需知道（更无需能访问）母端地址——母端可匿名、可仅 localhost</text>
+<text x="66" y="476" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#334155">· 更新 = 母端把增量 tar POST 到子端 /v1/setup?op=push（300s）</text>
+<text x="66" y="496" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#334155">· 浏览器可直连子端，大负载（文件/上传/终端）不经母端</text>
+
+<text x="295" y="556" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="13" font-weight="800" fill="#4338ca">只需 母端 → 子端 可达</text>
+<text x="295" y="580" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#64748b">子端无需知道母端地址</text>
+<text x="295" y="604" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#64748b">适用：子端在公网服务器 / 同一局域网</text>
+
+<!-- ======================= 场景二：反向隧道 ======================= -->
+<rect x="560" y="100" width="510" height="540" rx="16" fill="#f8fafc" stroke="#10b981" stroke-width="2"/>
+<rect x="580" y="118" width="180" height="34" rx="17" fill="#10b981"/>
+<text x="670" y="141" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="15" font-weight="800" fill="#ffffff">场景二 · 反向隧道</text>
+<text x="774" y="140" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12.5" fill="#475569">子端 → 母端可达（出向，无需开入向端口）</text>
+
+<rect x="580" y="182" width="222" height="110" rx="12" fill="none" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="6 4"/>
+<text x="792" y="287" text-anchor="end" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="10.5" fill="#64748b">NAT / 无公网 IP</text>
+
+<rect x="596" y="196" width="190" height="76" rx="12" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+<text x="691" y="220" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="14" font-weight="800" fill="#047857">子端</text>
+<text x="691" y="240" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11.5" fill="#475569">内网 / 蜂窝 / NAT 之后</text>
+<text x="691" y="258" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11.5" fill="#475569">TunnelClient 主动外呼</text>
+
+<rect x="856" y="196" width="180" height="76" rx="12" fill="#eef2ff" stroke="#6366f1" stroke-width="2"/>
+<text x="946" y="220" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="14" font-weight="800" fill="#3730a3">母端（公网）</text>
+<text x="946" y="240" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11.5" fill="#475569">公网 IP:port</text>
+<text x="946" y="258" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11.5" fill="#475569">/v1 受密码 / token 保护</text>
+
+<text x="740" y="176" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11.5" font-weight="700" fill="#047857">子端拨号 GET /v1/tunnel/ws?token=…（只需出向）</text>
+<line x1="786" y1="234" x2="850" y2="234" stroke="#10b981" stroke-width="2.5" marker-start="url(#arrow_green)" marker-end="url(#arrow_green)"/>
+<text x="821" y="254" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="10.5" fill="#047857">转发</text>
+
+<rect x="596" y="330" width="170" height="54" rx="10" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="681" y="352" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="13" font-weight="700" fill="#0f172a">浏览器（用户）</text>
+<text x="681" y="370" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11" fill="#475569">聊天 / 文件 / 终端</text>
+
+<path d="M 766 357 C 880 357, 946 330, 946 276" fill="none" stroke="#10b981" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrow_green)"/>
+<text x="860" y="320" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11.5" fill="#047857">同源 /v1/tunnel-proxy/{env_id}/…（文件 / journal / 终端 WS）</text>
+
+<rect x="596" y="400" width="440" height="150" rx="10" fill="#ecfdf5" stroke="#6ee7b7" stroke-width="1.5"/>
+<text x="612" y="424" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="13" font-weight="800" fill="#047857">要点</text>
+<text x="612" y="446" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#334155">· 只需子端 → 母端可达（出向拨号，无需开入向端口）</text>
+<text x="612" y="466" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#334155">· 子端无需公网 IP；母端暴露公网端口，受 token 保护</text>
+<text x="612" y="486" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#334155">· 全部流量（工具 / 更新 / 文件 / 终端）都经隧道</text>
+<text x="612" y="506" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#334155">· 子端断线自动重连（退避 1–30s），重启后自动回拨</text>
+<text x="612" y="526" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#b91c1c">· 母端匿名（未设密码）= 任何能到达的客户端可注册隧道，勿暴露</text>
+
+<text x="815" y="580" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="13" font-weight="800" fill="#047857">只需 子端 → 母端 可达</text>
+<text x="815" y="604" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#64748b">适用：子端在 NAT / 防火墙后，无公网 IP（手机、拨号、内网）</text>
+
+<!-- ======================= 对比表 ======================= -->
+<rect x="30" y="664" width="140" height="44" fill="#334155"/>
+<rect x="170" y="664" width="450" height="44" fill="#6366f1"/>
+<rect x="620" y="664" width="450" height="44" fill="#10b981"/>
+<text x="100" y="692" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="14" font-weight="800" fill="#ffffff">维度</text>
+<text x="395" y="692" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="14" font-weight="800" fill="#ffffff">场景一 · 直连</text>
+<text x="845" y="692" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="14" font-weight="800" fill="#ffffff">场景二 · 反向隧道</text>
+
+<rect x="30" y="708" width="140" height="52" fill="#f8fafc"/>
+<rect x="170" y="708" width="450" height="52" fill="#ffffff"/>
+<rect x="620" y="708" width="450" height="52" fill="#ffffff"/>
+<text x="100" y="739" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="13" font-weight="800" fill="#334155">可达方向</text>
+<text x="186" y="730" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="13" font-weight="700" fill="#334155">母端 → 子端</text>
+<text x="186" y="748" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11.5" fill="#64748b">子端需要公网 IP 或母端可达的地址</text>
+<text x="636" y="730" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="13" font-weight="700" fill="#334155">子端 → 母端（出向）</text>
+<text x="636" y="748" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11.5" fill="#64748b">子端只需出向访问能力，无需公网 IP</text>
+
+<rect x="30" y="760" width="140" height="52" fill="#f1f5f9"/>
+<rect x="170" y="760" width="450" height="52" fill="#ffffff"/>
+<rect x="620" y="760" width="450" height="52" fill="#ffffff"/>
+<text x="100" y="791" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="13" font-weight="800" fill="#334155">母端暴露面</text>
+<text x="186" y="782" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="13" font-weight="700" fill="#334155">可匿名 / 仅 localhost</text>
+<text x="186" y="800" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11.5" fill="#64748b">母端零公网暴露</text>
+<text x="636" y="782" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="13" font-weight="700" fill="#334155">需暴露公网端口</text>
+<text x="636" y="800" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11.5" fill="#64748b">设密码（token 保护）；匿名勿暴露到不受信网络</text>
+
+<rect x="30" y="812" width="140" height="52" fill="#f8fafc"/>
+<rect x="170" y="812" width="450" height="52" fill="#ffffff"/>
+<rect x="620" y="812" width="450" height="52" fill="#ffffff"/>
+<text x="100" y="843" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="13" font-weight="800" fill="#334155">典型网络</text>
+<text x="186" y="834" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="13" font-weight="700" fill="#334155">子端在公网服务器 / 同局域网</text>
+<text x="186" y="852" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11.5" fill="#64748b">母端可在内网、在路上、是台笔记本</text>
+<text x="636" y="834" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="13" font-weight="700" fill="#334155">子端在 NAT / 防火墙之后</text>
+<text x="636" y="852" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11.5" fill="#64748b">蜂窝网 / 拨号 / 无公网 IP 的内网</text>
+
+<rect x="30" y="864" width="140" height="52" fill="#f1f5f9"/>
+<rect x="170" y="864" width="450" height="52" fill="#ffffff"/>
+<rect x="620" y="864" width="450" height="52" fill="#ffffff"/>
+<text x="100" y="895" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="13" font-weight="800" fill="#334155">浏览器访问</text>
+<text x="186" y="886" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="13" font-weight="700" fill="#334155">浏览器直连子端（token 查询参数）</text>
+<text x="186" y="904" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11.5" fill="#64748b">大负载不经母端</text>
+<text x="636" y="886" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="13" font-weight="700" fill="#334155">浏览器走母端同源 tunnel-proxy 桥</text>
+<text x="636" y="904" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11.5" fill="#64748b">无 CORS、无需子端 token</text>
+
+<rect x="30" y="916" width="140" height="52" fill="#f8fafc"/>
+<rect x="170" y="916" width="450" height="52" fill="#ffffff"/>
+<rect x="620" y="916" width="450" height="52" fill="#ffffff"/>
+<text x="100" y="947" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="13" font-weight="800" fill="#334155">更新路径</text>
+<text x="186" y="938" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="13" font-weight="700" fill="#334155">母端 POST 增量 tar → /v1/setup?op=push</text>
+<text x="186" y="956" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11.5" fill="#64748b">子端无需知道（更无需能访问）母端地址</text>
+<text x="636" y="938" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="13" font-weight="700" fill="#334155">tar 经隧道二进制帧流式下发（900s）</text>
+<text x="636" y="956" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11.5" fill="#64748b">子端重启后自动回拨隧道即恢复</text>
+
+<text x="550" y="1000" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#64748b">两种场景下分工不变：推理留母端、工具在子端执行；区别只在于请求（工具调用 / 更新 / 文件 / 终端）走哪条传输</text>
+</svg>

@@ -1,0 +1,125 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="1190" viewBox="0 0 1100 1190" role="img" aria-labelledby="title desc">
+<title id="title">反向隧道协议</title>
+<desc id="desc">子端主动外呼母端建立 WebSocket 反向隧道的协议时序：注册握手（register upsert、拨号 WS、hello、welcome/reject/replaced/deregister）、数据转发（req/resp 帧 256KB 二进制分块、零长帧结束，stream 帧桥接终端 WS）、保活与故障恢复（ping 30s、stale 90s 强断、重连退避 1 至 30 秒）。控制帧为 JSON 文本帧，HTTP 体为二进制帧。</desc>
+<defs>
+  <marker id="arrow_ind" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#6366f1"/></marker>
+  <marker id="arrow_green" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#10b981"/></marker>
+  <marker id="arrow_red" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#ef4444"/></marker>
+  <marker id="arrow_amber" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#f59e0b"/></marker>
+</defs>
+<rect width="1100" height="1190" fill="#ffffff"/>
+<text x="550" y="46" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="30" font-weight="800" fill="#0f172a">反向隧道协议</text>
+<text x="550" y="76" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="15" fill="#64748b">控制帧 = JSON 文本帧；HTTP 体 = 二进制帧（256KB/帧，零长帧表示体结束，不预声明长度）；子端主动拨号，母端是 WS 服务端</text>
+
+<!-- 参与方 -->
+<rect x="130" y="104" width="300" height="58" rx="12" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+<text x="280" y="128" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="16" font-weight="800" fill="#047857">子端（TunnelClient）</text>
+<text x="280" y="148" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11.5" fill="#475569">拨号器 · req worker 池 8 · stream pump</text>
+<rect x="670" y="104" width="300" height="58" rx="12" fill="#eef2ff" stroke="#6366f1" stroke-width="2"/>
+<text x="820" y="128" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="16" font-weight="800" fill="#3730a3">母端（TunnelManager）</text>
+<text x="820" y="148" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11.5" fill="#475569">注册表 · call_env · 清扫线程</text>
+
+<line x1="280" y1="162" x2="280" y2="1136" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="5 5"/>
+<line x1="820" y1="162" x2="820" y2="1136" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="5 5"/>
+
+<!-- ================= 段 1 注册握手 ================= -->
+<rect x="50" y="184" width="1000" height="34" rx="8" fill="#eef2ff"/>
+<circle cx="76" cy="201" r="14" fill="#6366f1"/>
+<text x="76" y="206" text-anchor="middle" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="14" font-weight="700" fill="#ffffff">1</text>
+<text x="100" y="207" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="15" font-weight="800" fill="#3730a3">注册握手（register upsert → 拨号 WS → hello → welcome）</text>
+
+<text x="550" y="240" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="13" font-weight="700" fill="#374151">POST /v1/tunnel/register —— upsert remote_envs.json（id = tunnel:&lt;16hex&gt;）</text>
+<text x="550" y="256" text-anchor="middle" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="12" fill="#4338ca">{tunnel_id: &lt;16hex&gt;, snapshot{版本/推理状态/架构/工作区…}}</text>
+<line x1="280" y1="266" x2="814" y2="266" stroke="#6366f1" stroke-width="2" marker-end="url(#arrow_ind)"/>
+
+<text x="550" y="296" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12.5" fill="#374151">200 {ok: true, env_id: "tunnel:&lt;16hex&gt;"} → 子端置 TUNNEL_ENABLED=1</text>
+<line x1="820" y1="308" x2="286" y2="308" stroke="#6366f1" stroke-width="2" marker-end="url(#arrow_ind)"/>
+
+<text x="550" y="340" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="13" font-weight="700" fill="#374151">WS 拨号：GET /v1/tunnel/ws?token=…（子端主动外呼，过 /v1 授权门）</text>
+<line x1="280" y1="352" x2="814" y2="352" stroke="#10b981" stroke-width="2" marker-end="url(#arrow_green)"/>
+
+<text x="550" y="384" text-anchor="middle" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="12.5" fill="#374151">hello {op, tunnel_id, snapshot}</text>
+<line x1="280" y1="396" x2="814" y2="396" stroke="#10b981" stroke-width="2" marker-end="url(#arrow_green)"/>
+
+<text x="550" y="428" text-anchor="middle" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="12.5" fill="#374151">welcome {op, env_id: "tunnel:&lt;16hex&gt;"}</text>
+<line x1="820" y1="440" x2="286" y2="440" stroke="#10b981" stroke-width="2" marker-end="url(#arrow_green)"/>
+
+<rect x="856" y="352" width="220" height="118" rx="10" fill="#fffbeb" stroke="#fcd34d" stroke-width="1.5"/>
+<text x="868" y="372" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" font-weight="700" fill="#92400e">母端分支应答</text>
+<text x="868" y="390" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="11" fill="#78350f">reject{not_registered}</text>
+<text x="868" y="406" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11" fill="#78350f">→ 子端清除 TUNNEL_ENABLED</text>
+<text x="868" y="422" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11" fill="#78350f">（重启后不自动复活）</text>
+<text x="868" y="440" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11" fill="#78350f">重复 id → 旧连接收 replaced</text>
+<text x="868" y="456" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11" fill="#78350f">母端删记录 → 发 deregister</text>
+
+<!-- ================= 段 2 数据转发 ================= -->
+<rect x="50" y="496" width="1000" height="34" rx="8" fill="#eef2ff"/>
+<circle cx="76" cy="513" r="14" fill="#6366f1"/>
+<text x="76" y="518" text-anchor="middle" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="14" font-weight="700" fill="#ffffff">2</text>
+<text x="100" y="519" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="15" font-weight="800" fill="#3730a3">数据转发（req / resp 帧 + stream 帧桥接终端）</text>
+
+<text x="550" y="558" text-anchor="middle" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="12.5" fill="#374151">req {id, method, path, headers}（JSON 文本帧）</text>
+<line x1="820" y1="570" x2="286" y2="570" stroke="#6366f1" stroke-width="2" marker-end="url(#arrow_ind)"/>
+
+<text x="550" y="596" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12.5" fill="#374151">二进制 body 帧 ×N —— 256KB/帧，零长帧 = 体结束</text>
+<line x1="820" y1="608" x2="286" y2="608" stroke="#6366f1" stroke-width="2" marker-end="url(#arrow_ind)"/>
+
+<rect x="96" y="626" width="368" height="44" rx="10" fill="#ecfdf5" stroke="#10b981" stroke-width="1.5"/>
+<text x="280" y="644" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12.5" font-weight="700" fill="#047857">子端在本地 loopback（127.0.0.1:port）执行</text>
+<text x="280" y="662" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11.5" fill="#047857">正常 handler 与授权原样生效 =「自我授权」</text>
+
+<text x="550" y="696" text-anchor="middle" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="12.5" fill="#374151">resp {id, status, headers}（JSON 文本帧）</text>
+<line x1="280" y1="708" x2="814" y2="708" stroke="#10b981" stroke-width="2" marker-end="url(#arrow_green)"/>
+
+<text x="550" y="734" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12.5" fill="#374151">二进制 body 帧 ×N（256KB/帧 · 零长帧结束 · 流式不占双倍内存）</text>
+<line x1="280" y1="746" x2="814" y2="746" stroke="#10b981" stroke-width="2" marker-end="url(#arrow_green)"/>
+
+<text x="550" y="780" text-anchor="middle" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="12.5" fill="#374151">stream-open {sid, path}（终端 WS 桥）</text>
+<line x1="820" y1="792" x2="286" y2="792" stroke="#f59e0b" stroke-width="2" marker-end="url(#arrow_amber)"/>
+
+<text x="550" y="822" text-anchor="middle" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="12.5" fill="#374151">stream-ready {sid} ｜ stream-error {sid, status}</text>
+<line x1="280" y1="834" x2="814" y2="834" stroke="#f59e0b" stroke-width="2" marker-end="url(#arrow_amber)"/>
+
+<text x="550" y="864" text-anchor="middle" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="12.5" fill="#374151">stream-data {sid, data: base64, t: text|bin}（双向，保留帧类型）</text>
+<line x1="280" y1="876" x2="820" y2="876" stroke="#f59e0b" stroke-width="2" marker-start="url(#arrow_amber)" marker-end="url(#arrow_amber)"/>
+
+<text x="550" y="904" text-anchor="middle" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="12.5" fill="#374151">stream-close {sid}</text>
+<line x1="820" y1="916" x2="286" y2="916" stroke="#f59e0b" stroke-width="2" marker-end="url(#arrow_amber)"/>
+
+<rect x="856" y="556" width="220" height="180" rx="10" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="868" y="576" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12.5" font-weight="700" fill="#334155">关键参数</text>
+<text x="868" y="596" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="11" fill="#475569">CHUNK_SIZE = 256KB/帧</text>
+<text x="868" y="614" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="11" fill="#475569">INFLIGHT_MAX = 16</text>
+<text x="868" y="630" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11" fill="#475569">（母端每隧道并发在途上限）</text>
+<text x="868" y="648" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="11" fill="#475569">子端 worker 池 = 8</text>
+<text x="868" y="666" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="11" fill="#475569">call 超时 = 600s</text>
+<text x="868" y="684" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11" fill="#475569">body ≤ 8MB 内存，否则落临时文件</text>
+<text x="868" y="702" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11" fill="#475569">推送更新经隧道超时 = 900s</text>
+<text x="868" y="720" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11" fill="#475569">stream-data 为 base64（终端流量小）</text>
+
+<!-- ================= 段 3 保活与故障恢复 ================= -->
+<rect x="50" y="940" width="1000" height="34" rx="8" fill="#eef2ff"/>
+<circle cx="76" cy="957" r="14" fill="#6366f1"/>
+<text x="76" y="962" text-anchor="middle" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="14" font-weight="700" fill="#ffffff">3</text>
+<text x="100" y="963" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="15" font-weight="800" fill="#3730a3">保活与故障恢复（ping 30s · stale 90s 强断 · 重连退避 1–30s）</text>
+
+<text x="550" y="1002" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12.5" fill="#374151">ping（每 30s，WS 原生控制帧）</text>
+<line x1="820" y1="1014" x2="286" y2="1014" stroke="#ef4444" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrow_red)"/>
+
+<text x="550" y="1040" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12.5" fill="#374151">pong</text>
+<line x1="280" y1="1052" x2="814" y2="1052" stroke="#ef4444" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrow_red)"/>
+
+<rect x="856" y="998" width="220" height="54" rx="10" fill="#fef2f2" stroke="#fca5a5" stroke-width="1.5"/>
+<text x="868" y="1018" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="11.5" font-weight="700" fill="#b91c1c">STALE_AFTER = 90s</text>
+<text x="868" y="1038" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="11.5" fill="#b91c1c">无帧 → 清扫线程强断该连接</text>
+
+<text x="550" y="1082" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12.5" fill="#374151">断线 → 重连退避 1→2→4→…→30s（上限 30s）再拨号</text>
+<line x1="280" y1="1094" x2="814" y2="1094" stroke="#10b981" stroke-width="2" marker-end="url(#arrow_green)"/>
+
+<rect x="90" y="1110" width="380" height="48" rx="10" fill="#ecfdf5" stroke="#10b981" stroke-width="1.5"/>
+<text x="280" y="1128" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" font-weight="700" fill="#047857">同一 tunnel_id 再拨号 → hello → welcome</text>
+<text x="280" y="1146" text-anchor="middle" font-family="'JetBrains Mono','SFMono-Regular','Consolas',monospace" font-size="11" fill="#047857">记录已删 → reject{not_registered}，清 TUNNEL_ENABLED</text>
+
+<text x="550" y="1166" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#64748b">deregister（母端删除记录，best-effort 3s）/ replaced（重复 id 替换旧连接）</text>
+<text x="550" y="1184" text-anchor="middle" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="12" fill="#64748b">母端地址 + token 取自子端 SETUP_SOURCE；tunnel_id（16 位 hex）持久化于 DATA_DIR/tunnel_id；TUNNEL_ENABLED 持久化于 env.json</text>
+</svg>
