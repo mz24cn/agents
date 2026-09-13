@@ -36,7 +36,7 @@
   }
 
   const validTabs = ['models', 'tools', 'prompts', 'agents', 'env', 'auth', 'model-add', 'tool-add', 'prompt-add', 'agent-add', 'env-add', 'model-edit', 'tool-edit', 'mcp-tool-edit', 'prompt-edit', 'agent-edit']
-  const initialTab = validTabs.includes(getQueryParam('tab')) ? getQueryParam('tab') : 'agents'
+  const initialTab = validTabs.includes(getQueryParam('tab')) ? getQueryParam('tab') : 'models'
   let activeTab = $state(initialTab)
   let envDetectTrigger = $state(0)
   let authRefreshTrigger = $state(0)
@@ -84,7 +84,7 @@
   })
 
   function resetToDefaultTab() {
-    activeTab = 'agents'
+    activeTab = 'models'
     editingModel = null
     editingTool = null
     editingPrompt = null

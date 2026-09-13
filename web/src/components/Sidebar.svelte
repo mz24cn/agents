@@ -1010,7 +1010,7 @@
     if (window.innerWidth < 1024) {
       collapseSidebar()
     }
-    navigate('#/setup')
+    navigate('#/setup?tab=models')
     window.dispatchEvent(new CustomEvent('setup:reset'))
   }
 
@@ -1359,7 +1359,7 @@
         aria-label={t('searchSessions')}
       >🔍</button>
       <a
-        href="#/setup"
+        href="#/setup?tab=models"
         class="nav-action-btn setup-top-btn"
         class:active={router.current.split('?')[0] === '#/setup'}
         onclick={handleSetupClick}
