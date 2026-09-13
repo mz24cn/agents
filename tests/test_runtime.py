@@ -1875,3 +1875,79 @@ def test_file_tools_share_request_journal_holder_across_worker_calls(
     assert manifest["status"] == "finalized"
     assert manifest["finalized"] is True
     assert set(manifest["files"]) == {"one.txt", "two.txt"}
+
+
+# ---------------------------------------------------------------------------
+# call_tool runs the same per-call pipeline as the inference loop
+# (base64 pre/post processing for MCP tools) — this is what makes remote
+# tool execution (child POST /v1/tools/call) behave like local execution.
+# ---------------------------------------------------------------------------
+
+class _FakeMcpManager:
+    def __init__(self, result):
+        self.result = result
+        self.received = {}
+
+    def call_tool(self, server_name, tool_name, arguments, timeout=None):
+        self.received = {
+            "server": server_name,
+            "tool": tool_name,
+            "arguments": arguments,
+        }
+        return self.result
+
+
+def _runtime_with_mcp(result):
+    from runtime.models import ToolConfig
+    registry = ToolRegistry()
+    registry.register(ToolConfig(
+        tool_id="mcp_shot",
+        tool_type="mcp",
+        name="mcp_shot",
+        description="fake mcp tool",
+        parameters={
+            "type": "object",
+            "properties": {"base64_content": {"type": "string"}},
+        },
+        mcp_server_name="fake-srv",
+        tool_name="shot",
+    ))
+    mgr = _FakeMcpManager(result)
+    return Runtime(
+        model_registry=ModelRegistry(), tool_registry=registry, mcp_manager=mgr,
+    ), mgr
+
+
+def test_call_tool_mcp_preprocesses_path_to_base64(tmp_path):
+    """A path in a *base64* argument is read from the local filesystem and
+    converted before dispatch — identical to a local inference round."""
+    import base64
+    f = tmp_path / "pic.bin"
+    f.write_bytes(b"\x89PNG\x00fake-image-bytes")
+    runtime, mgr = _runtime_with_mcp('{"ok": true}')
+    out = runtime.call_tool("mcp_shot", {"base64_content": str(f)})
+    sent = mgr.received["arguments"]["base64_content"]
+    assert sent != str(f)
+    assert base64.b64decode(sent) == f.read_bytes()
+    assert out == '{"ok": true}'
+
+
+def test_call_tool_mcp_intercepts_base64_result(tmp_path):
+    """Long base64 payloads in the MCP result are saved to a local file and
+    replaced with the path (BASE64_CHECK_THRESHOLD gate), same as local
+    inference — remote children run this same code, so remote results
+    arrive pre-intercepted."""
+    import base64
+    import re
+    payload = base64.b64encode(b"\x89PNG" + b"x" * 2000).decode()
+    os.environ["BASE64_CHECK_THRESHOLD"] = "1024"
+    try:
+        runtime, _mgr = _runtime_with_mcp(f'{{"screenshot": "{payload}"}}')
+        out = runtime.call_tool("mcp_shot", {})
+    finally:
+        del os.environ["BASE64_CHECK_THRESHOLD"]
+    assert payload not in out
+    m = re.search(r'"filePath":\s*"([^"]+)"', out)
+    assert m, out
+    saved = open(m.group(1), "rb").read()
+    assert saved == b"\x89PNG" + b"x" * 2000

@@ -190,6 +190,33 @@ class HandlerInferMixin:
         if workspace:
             set_request_context(workspace=workspace)
 
+        # === Remote execution environment binding ===
+        # remote_env 是 remote_envs.json 中的环境 id。绑定时，本会话的全部
+        # 工具（tool_ids 中的每一个）都转发到子环境执行，不与本地工具混用：
+        # 推理仍在母环境进行（母环境模型 + 会话历史），工具清单、工作区、
+        # 终端与文件 journal 都归属子环境。
+        remote_env_id = str(body.get("remote_env") or "").strip() or None
+        remote_proxy = None
+        if remote_env_id:
+            remote_envs_mgr = getattr(self.server, "remote_env_manager", None)
+            if remote_envs_mgr is None:
+                self._send_json_error(
+                    400, "Remote environments are not supported by this server"
+                )
+                return None
+            try:
+                # 按环境共享的工具代理（内含子端工具清单 TTL 缓存）：同一环境
+                # 的多轮推理 / talk_to / delegate 复用，不再每轮重新拉取 /v1/tools。
+                remote_proxy = remote_envs_mgr.get_proxy(
+                    remote_env_id,
+                    tunnel_manager=getattr(self.server, "tunnel_manager", None),
+                )
+            except KeyError:
+                self._send_json_error(
+                    404, f"Remote environment not found: {remote_env_id}"
+                )
+                return None
+
         raw_session_id: Optional[str] = body.get("session_id") or None
         session_id: Optional[str] = None
         use_session: bool = False
@@ -309,11 +336,14 @@ class HandlerInferMixin:
                 if msg.role == "user" and mentioned_agent_ids:
                     msg.mentions = mentioned_agent_ids
                 original_messages.append(msg)
-            try:
-                original_messages = expand_workspace_file_refs(original_messages, _get_ws())
-            except ValueError as exc:
-                self._send_json_error(400, str(exc))
-                return None
+            # 远程会话的工具执行在子环境，本地工作区的 <file> 引用于子端
+            # 无意义；保留原文不展开。
+            if remote_proxy is None:
+                try:
+                    original_messages = expand_workspace_file_refs(original_messages, _get_ws())
+                except ValueError as exc:
+                    self._send_json_error(400, str(exc))
+                    return None
         elif is_continue:
             # 继续推理：不携带新用户消息，基于会话既有上下文推理。
             # File journals still belong to the existing initiating user turn.
@@ -343,16 +373,37 @@ class HandlerInferMixin:
             assembled_messages = copy.deepcopy(assembled_messages)
 
         tool_ids = list(body.get("tool_ids", []))
-        tool_ids = _add_exec_cli_for_open_terminal(
-            tool_ids,
-            session_id,
-            is_group_chat,
-        )
+        has_delegate = "delegate" in tool_ids
+        has_talk_to = "talk_to" in tool_ids
+
+        if remote_proxy is None:
+            # 本地模式：终端已打开时暴露 exec_cli（推理准备不创建终端）。
+            tool_ids = _add_exec_cli_for_open_terminal(
+                tool_ids,
+                session_id,
+                is_group_chat,
+            )
+        remote_selected: Optional[list] = None
+        if remote_proxy is not None:
+            # 远程模式：工具清单全部来自子端，保持子端原始 tool_id/name
+            # （远程与本地工具从不在同一会话混用，无冲突，不注册母端
+            # registry）：代理条目经 InferenceRequest.tools 直传推理循环。
+            # 子端不存在的工具直接丢弃（无法在那里执行）；exec_cli 由前端
+            # 按终端面板状态追加（终端运行在子端，本地终端注册表无此状态）。
+            from runtime.remote_tool_proxy import RemoteToolCallError
+            try:
+                remote_configs = remote_proxy.list_tool_configs()
+            except RemoteToolCallError as exc:
+                self._send_json_error(
+                    502, f"Cannot load tools from remote environment: {exc}"
+                )
+                return None
+            available_ids = {c.tool_id for c in remote_configs}
+            tool_ids = [tid for tid in tool_ids if tid in available_ids]
+            remote_selected = [c for c in remote_configs if c.tool_id in set(tool_ids)]
         # Keep the normalized/augmented selection on the request body so retry
         # logging and conversation metadata reflect the actual inference tools.
         body["tool_ids"] = tool_ids
-        has_delegate = "delegate" in tool_ids
-        has_talk_to = "talk_to" in tool_ids
 
         tool_scope: list = []
         # --- TOOLS 占位符（delegate 专用）---
@@ -361,12 +412,17 @@ class HandlerInferMixin:
             mcp_by_server: dict[str, list[str]] = {}
             non_mcp_rows: list[tuple[str, str]] = []
 
-            for tid in tool_ids:
-                tc = runtime._tool_registry.get(tid)
-                if tc is None:
-                    continue
+            if remote_selected is not None:
+                # 远程会话：选中的工具条目已是子端代理条目（不在母端 registry）
+                scope_configs = remote_selected
+            else:
+                scope_configs = [
+                    tc for tid in tool_ids
+                    if (tc := runtime._tool_registry.get(tid)) is not None
+                ]
+            for tc in scope_configs:
                 tool_scope.append(tc)
-                if tid == "delegate" and os.environ.get("DISABLE_NESTED_DELEGATE", "false").lower() == "true":
+                if tc.tool_id == "delegate" and os.environ.get("DISABLE_NESTED_DELEGATE", "false").lower() == "true":
                     continue
                 if tc.tool_type == "mcp" and tc.mcp_server_name:
                     mcp_by_server.setdefault(tc.mcp_server_name, []).append(tc.name)
@@ -429,6 +485,7 @@ class HandlerInferMixin:
             model_id=body["model_id"],
             model_config_override=model_override,
             tool_ids=tool_ids,
+            tools=remote_selected,
             messages=assembled_messages,
             text=body.get("text"),
             stream=True,
@@ -457,10 +514,12 @@ class HandlerInferMixin:
             all_agent_ids=agent_ids,
             mentioned_agent_ids=mentioned_agent_ids,
             model_id=body["model_id"],
+            remote_env=remote_env_id,
+            remote_tool_proxy=remote_proxy,
         )
 
         agent_nickname = agent.get("nickname") if agent else None
-        return body, request, session_id, use_session, original_messages, context_manager, agent_ids, agent_nickname, body["model_id"], tool_ids, workspace
+        return body, request, session_id, use_session, original_messages, context_manager, agent_ids, agent_nickname, body["model_id"], tool_ids, workspace, remote_proxy
 
     def _finalize_file_journal(self) -> None:
         """Best-effort turn-level reconciliation of registered file changes."""
@@ -487,9 +546,10 @@ class HandlerInferMixin:
             "file_journal_holder", "file_journal_session_id",
             "file_journal_session_dir", "file_journal_user_message_timestamp",
             "file_journal_timestamp_fallback_used",
+            "remote_env", "remote_tool_proxy",
         ])
 
-    def _persist_conversation(self, context_manager, session_id, original_messages, collected_messages, agent_ids=None, agent_nickname=None, model_id=None, tool_ids=None, workspace=None, compress=True, update_title=True):
+    def _persist_conversation(self, context_manager, session_id, original_messages, collected_messages, agent_ids=None, agent_nickname=None, model_id=None, tool_ids=None, workspace=None, remote_env=None, compress=True, update_title=True):
         if session_id is None:
             return None
         exc = persist_conversation(
@@ -503,6 +563,7 @@ class HandlerInferMixin:
             model_id=model_id,
             tool_ids=tool_ids,
             workspace=workspace,
+            extra_meta={"remote_env": remote_env} if remote_env else None,
             compress=compress,
             update_title=update_title,
         )
@@ -557,7 +618,7 @@ class HandlerInferMixin:
         result = self._prepare_infer_request()
         if result is None:
             return
-        _body, request, session_id, use_session, original_messages, context_manager, agent_ids, agent_nickname, model_id, tool_ids, workspace = result
+        _body, request, session_id, use_session, original_messages, context_manager, agent_ids, agent_nickname, model_id, tool_ids, workspace, remote_proxy = result
 
         api_inference = self._enter_api_inference()
         try:
@@ -601,7 +662,7 @@ class HandlerInferMixin:
                             msg.name = agent_nickname
 
             if use_session:
-                persist_exc = self._persist_conversation(context_manager, session_id, original_messages, collected_messages, agent_ids, agent_nickname, model_id, tool_ids, workspace)
+                persist_exc = self._persist_conversation(context_manager, session_id, original_messages, collected_messages, agent_ids, agent_nickname, model_id, tool_ids, workspace, remote_env=str(_body.get("remote_env") or ""))
                 if persist_exc is not None:
                     self._send_json_error(500, f"Failed to save conversation: {persist_exc}")
                     return
@@ -669,7 +730,7 @@ class HandlerInferMixin:
         result = self._prepare_infer_request()
         if result is None:
             return
-        _body, request, session_id, use_session, original_messages, context_manager, agent_ids, agent_nickname, model_id, tool_ids, workspace = result
+        _body, request, session_id, use_session, original_messages, context_manager, agent_ids, agent_nickname, model_id, tool_ids, workspace, remote_proxy = result
 
         api_inference = self._enter_api_inference()
         self.send_response(200)
@@ -899,6 +960,7 @@ class HandlerInferMixin:
             model_id=model_id,
             tool_ids=tool_ids,
             workspace=workspace,
+            extra_meta={"remote_env": _body["remote_env"]} if _body.get("remote_env") else None,
             is_active=lambda: self._is_active_stream(session_id, cancel_event),
             on_incremental_persist=lambda: mark_session_stream_persisted(
                 session_id, latest_stream_seq, owner_event=cancel_event,
@@ -1220,6 +1282,12 @@ class HandlerInferMixin:
         Expects JSON body with tool_id and arguments.
         Optional 'format' field: if 'json', the result is returned as a parsed JSON object
         instead of a raw string.
+        Optional 'session_id' / 'user_message_timestamp': attach the calling
+        session's context (file journal holder, session dir, server singletons)
+        so session-scoped tools (write_file journal, exec_cli terminal, undo,
+        delegate sub-sessions) run against that session. Used by the parent
+        environment's remote tool proxy; the field-less path is unchanged for
+        direct local callers.
 
         When format='json', the method attempts to extract valid JSON from the result.
         It handles: direct JSON, markdown code blocks, escaped JSON, and embedded JSON
@@ -1241,8 +1309,39 @@ class HandlerInferMixin:
 
         fmt = body.get("format", "text")
 
+        session_id = body.get("session_id") or None
+        user_message_timestamp = body.get("user_message_timestamp") or None
+
         runtime = self._get_runtime()
-        result = runtime.call_tool(tool_id, arguments)
+        if session_id:
+            # 远程代理调用（母环境转发）：带上会话上下文，使本端（子端）的
+            # 文件 journal / 终端 / delegate 子会话与母端会话同 id。
+            context_manager = self.server.context_manager  # type: ignore[attr-defined]
+            session_dir = os.path.dirname(context_manager._conversation_path(session_id))
+            set_request_context(
+                session_id=session_id,
+                session_dir=session_dir,
+                user_message_timestamp=user_message_timestamp,
+                file_journal_holder=_FileJournalManagerHolder(),
+                file_journal_manager=None,
+                context_manager=context_manager,
+                session_manager=self.server.session_manager,  # type: ignore[attr-defined]
+                agent_manager=self.server.agent_manager,  # type: ignore[attr-defined]
+                depth=0,
+            )
+            try:
+                result = runtime.call_tool(tool_id, arguments)
+            finally:
+                # 与推理路径一致：响应前先 finalize 本轮文件 journal
+                self._finalize_file_journal()
+                clear_request_context([
+                    "session_id", "session_dir", "user_message_timestamp",
+                    "file_journal_holder", "file_journal_manager",
+                    "context_manager", "session_manager", "agent_manager",
+                    "depth",
+                ])
+        else:
+            result = runtime.call_tool(tool_id, arguments)
 
         # If result starts with "Error:", treat as error
         if result.startswith("Error:"):

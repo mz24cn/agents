@@ -151,6 +151,45 @@ class HandlerApiMixin:
         data = [t.to_dict() for t in tools]
         self._send_json_response(200, {"tools": data})
 
+    def _handle_get_skill_body(self, tool_id: str) -> None:
+        """GET /v1/tools/skill/{tool_id} — 返回技能 SKILL.md 正文与工作目录。
+
+        供母环境的远程技能渐进式披露调用：母端推理循环检测到（namespaced）
+        技能调用后，从本端获取正文注入到母端会话。逻辑与母端
+        ``Runtime._get_skill_body_and_dir`` 一致（skill_manager 优先，
+        SKILL.md 回退）。
+        """
+        runtime = self._get_runtime()
+        skill_manager = getattr(runtime, "_skill_manager", None)
+        body = None
+        skill_dir = None
+        if skill_manager is not None and skill_manager.is_skill(tool_id):
+            body = skill_manager.get_skill_body(tool_id)
+            skill_dir = skill_manager.get_skill_dir(tool_id)
+        if body is None:
+            tool_config = runtime._tool_registry.get(tool_id)
+            if tool_config is not None and tool_config.tool_type == "skill" and tool_config.skill_dir:
+                expanded_dir = os.path.expanduser(tool_config.skill_dir)
+                skill_md_path = os.path.join(expanded_dir, "SKILL.md")
+                try:
+                    with open(skill_md_path, "r", encoding="utf-8") as fh:
+                        content = fh.read().strip()
+                    if content.startswith("---"):
+                        end_idx = content.find("---", 3)
+                        if end_idx != -1:
+                            body = content[end_idx + 3:].strip()
+                            skill_dir = expanded_dir
+                except OSError:
+                    pass
+        if body is None:
+            self._send_json_error(404, f"Skill not found: {tool_id}")
+            return
+        self._send_json_response(200, {
+            "tool_id": tool_id,
+            "body": body,
+            "skill_dir": skill_dir,
+        })
+
     def _handle_list_prompt_templates(self) -> None:
         """GET /v1/prompt-templates — list all prompt templates.
 
@@ -1193,6 +1232,10 @@ class HandlerApiMixin:
                     "message": f"Cannot reach child environment: {exc}",
                 })
                 return
+        if payload.get("updated"):
+            # 推送后子端工具清单可能变化（新增 skill / MCP / 工具配置）：
+            # 失效共享代理的工具缓存，下一次推理重新拉取。
+            manager.invalidate_tools_cache(env_id)
         self._send_json_response(200, {
             "ok": True,
             "updated": bool(payload.get("updated")),
@@ -2252,8 +2295,17 @@ class HandlerApiMixin:
     def _handle_session_log_dir(self, session_id: str) -> None:
         """GET /v1/sessions/{session_id}/log-dir — 返回该会话日志目录的绝对路径。
 
-        该路径即 conversation.json 所在目录（DATA_DIR/chat_data/{session_id}），
-        用于前端文件管理器直接定位到该目录。
+        会话目录即 conversation.json 所在目录（DATA_DIR/chat_data/{session_id}），
+        用于前端文件管理器直接定位。推理在本端（父端）发生，会话目录始终位于
+        本端且必然存在——即使会话绑定了远程环境（file journal 在子端），
+        本端点仍返回本地路径；子端没有 file journal 时不创建会话目录
+        （保持原行为）。
+
+        会话绑定远程环境时额外探测子端**严格** log-dir（无 ensure、无建目录
+        副作用）：子端存在 file journal（会话目录在）时响应附带
+        ``remote_journal: {env_id, path}``，前端在本地会话目录里渲染一条指向
+        子端会话目录的"软链接"条目。探测失败（记录缺失 / 子端不可达 / 离线 /
+        无 journal）只是不附该字段，不影响主响应。
         """
         session_manager = self.server.session_manager  # type: ignore[attr-defined]
         try:
@@ -2264,7 +2316,45 @@ class HandlerApiMixin:
         except ValueError as exc:
             self._send_json_error(400, str(exc))
             return
-        self._send_json_response(200, {"path": path, "session_id": session_id})
+        result: dict = {"path": str(path), "session_id": session_id}
+        env_id = self._session_remote_env(session_id)
+        if env_id:
+            journal = self._probe_child_journal(session_id, env_id)
+            if journal is not None:
+                result["remote_journal"] = journal
+        self._send_json_response(200, result)
+
+    def _probe_child_journal(self, session_id: str, env_id: str):
+        """探测子端是否存在该会话的 file journal，存在时返回 ``{env_id, path}``。
+
+        调用子端严格模式 ``GET /v1/sessions/{id}/log-dir``：子端目录不存在时
+        404（不创建目录），200 即代表 file journal 已存在。环境记录缺失 /
+        子端不可达 / 隧道离线 / 404 一律返回 None——log-dir 主响应不受影响。
+        使用 5 秒短网络超时，避免目标不可达时拖慢主响应。
+        """
+        from runtime.remote_tool_proxy import RemoteToolCallError
+        manager = getattr(self.server, "remote_env_manager", None)
+        if manager is None:
+            return None
+        try:
+            manager.get(env_id)
+        except KeyError:
+            return None
+        try:
+            proxy = manager.get_proxy(
+                env_id, tunnel_manager=getattr(self.server, "tunnel_manager", None))
+            status, data = proxy.http_json(
+                f"/v1/sessions/{urllib.parse.quote(session_id)}/log-dir",
+                method="GET",
+                timeout=5.0,
+            )
+        except (urllib.error.URLError, OSError, RemoteToolCallError) as exc:
+            logger.debug("child journal probe failed (env=%s session=%s): %s",
+                         env_id, session_id, exc)
+            return None
+        if status == 200 and isinstance(data, dict) and data.get("path"):
+            return {"env_id": env_id, "path": str(data["path"])}
+        return None
 
     def _handle_session_execution_analysis(self, session_id: str) -> None:
         """GET /v1/sessions/{session_id}/execution-analysis — 分析主/子会话执行耗时。"""
@@ -2316,6 +2406,8 @@ class HandlerApiMixin:
 
     def _handle_delete_session(self, session_id: str) -> None:
         """DELETE /v1/sessions/{session_id} — 删除指定会话目录。"""
+        # 先读取远程绑定（目录删除后 meta 不可读）
+        remote_env_id = self._session_remote_env(session_id)
         session_manager = self.server.session_manager  # type: ignore[attr-defined]
         try:
             session_manager.delete_session(session_id)
@@ -2327,7 +2419,36 @@ class HandlerApiMixin:
             return
         # index.json 中对应条目已移除：一并清理内存中的飞行模式状态
         set_session_flight_mode(session_id, False)
+        # 远程会话：子端存在同 id 的孤儿会话目录（文件 journal / delegate 子会话）。
+        # fire-and-forget 清理，不阻塞删除响应，也不因清理失败而报错。
+        if remote_env_id:
+            self._cleanup_remote_session(session_id, remote_env_id)
         self._send_json_response(200, {"status": "deleted", "session_id": session_id})
+
+    def _cleanup_remote_session(self, session_id: str, env_id: str) -> None:
+        """Best-effort deletion of the child session dir (orphan journals)."""
+        manager = getattr(self.server, "remote_env_manager", None)
+        if manager is None:
+            return
+        try:
+            env = manager.get(env_id)
+        except KeyError:
+            return
+        proxy = manager.get_proxy(
+            env_id, tunnel_manager=getattr(self.server, 'tunnel_manager', None))
+
+        def _run() -> None:
+            try:
+                proxy.http_json(
+                    f"/v1/sessions/{urllib.parse.quote(session_id)}",
+                    method="DELETE",
+                )
+            except Exception as exc:
+                logger.debug("remote session cleanup skipped (%s): %s", session_id, exc)
+
+        threading.Thread(
+            target=_run, name="remote-session-cleanup", daemon=True,
+        ).start()
 
     def _handle_generate_session_title(self, session_id: str) -> None:
         """POST /v1/sessions/{session_id}/generate-title — 设定或生成会话标题。
@@ -2401,6 +2522,80 @@ class HandlerApiMixin:
             )
             self._send_json_error(500, f"Failed to regenerate summary for session: {session_id}")
 
+    # ------------------------------------------------------------------
+    # Remote execution helpers (session-bound remote_env)
+    # ------------------------------------------------------------------
+
+    def _session_remote_env(self, session_id: str):
+        """Return the remote environment id bound to a session, or None."""
+        try:
+            meta = self.server.context_manager.get_session_meta(session_id)  # type: ignore[attr-defined]
+        except Exception:
+            return None
+        env_id = meta.get("remote_env")
+        return str(env_id) if env_id else None
+
+    def _revoke_remote_journal(
+        self, session_id: str, env_id: str,
+        timestamp: str, forced: bool, keep_files: bool,
+    ) -> bool:
+        """Call the child environment's ``revoke?journal_only=true``.
+
+        Returns True on success. On failure the appropriate error response
+        (409 conflict / 400 / 404 / 502) has already been sent and False is
+        returned so the caller can skip the local (message) revoke.
+        """
+        manager = getattr(self.server, "remote_env_manager", None)
+        if manager is None:
+            return True
+        try:
+            env = manager.get(env_id)
+        except KeyError:
+            self._send_json_error(404, f"Remote environment not found: {env_id}")
+            return False
+        proxy = manager.get_proxy(
+            env_id, tunnel_manager=getattr(self.server, 'tunnel_manager', None))
+        query = urllib.parse.urlencode({"journal_only": "true"})
+        from runtime.remote_tool_proxy import RemoteToolCallError
+        try:
+            status, data = proxy.http_json(
+                f"/v1/sessions/{urllib.parse.quote(session_id)}/revoke?{query}",
+                method="POST",
+                payload={
+                    "timestamp": timestamp,
+                    "forced": forced,
+                    "keep_files": keep_files,
+                },
+            )
+        except (urllib.error.URLError, OSError, RemoteToolCallError) as exc:
+            # RemoteToolCallError covers tunnel-transport failures (offline
+            # child / WS error): without it the exception would escape the
+            # handler and drop the connection instead of a clean 502.
+            self._send_json_error(
+                502, f"Cannot reach remote environment for revoke: {exc}"
+            )
+            return False
+        if status == 200:
+            return True
+        if status == 409:
+            # 与本地 JournalConflictError.to_dict() 同构，前端冲突对话框可直接复用
+            conflict = dict(data)
+            conflict.setdefault("error", "JournalConflict")
+            conflict.setdefault("can_force", True)
+            self._send_json_response(409, conflict)
+            return False
+        if status in (400, 404):
+            self._send_json_error(
+                status, data.get("error") or data.get("message") or f"remote revoke HTTP {status}"
+            )
+            return False
+        self._send_json_error(
+            502,
+            f"Remote environment revoke failed (HTTP {status}): "
+            f"{data.get('error') or data.get('message') or ''}",
+        )
+        return False
+
     def _handle_revoke_session(self, session_id: str) -> None:
         """POST /v1/sessions/{session_id}/revoke — 撤回指定用户消息及其后的所有消息。"""
         body = self._read_json_body()
@@ -2414,6 +2609,59 @@ class HandlerApiMixin:
 
         forced = bool(body.get("forced", False))
         keep_files = bool(body.get("keep_files", False))
+
+        # journal_only=true：由母环境远程会话调用，只还原本端（子端）文件
+        # 变更，不触碰会话历史（历史在母端）。冲突时返回与本地 revoke 同构
+        # 的 409 结构，供母端原样转发给前端。
+        if self._get_query_param("journal_only") == "true":
+            from runtime.common import get_workspace
+            from runtime.context_manager import revoke_session_file_changes
+            context_manager = self.server.context_manager  # type: ignore[attr-defined]
+            session_dir = os.path.dirname(context_manager._conversation_path(session_id))
+            try:
+                journal_result = revoke_session_file_changes(
+                    get_workspace(),
+                    session_dir,
+                    session_id,
+                    timestamp,
+                    force=forced,
+                    keep_files=keep_files,
+                )
+            except Exception as exc:
+                self._send_json_error(500, str(exc))
+                return
+            if isinstance(journal_result, dict) and journal_result.get("error"):
+                if journal_result.get("error") == "JournalConflict":
+                    self._send_json_response(409, {
+                        "error": "JournalConflict",
+                        "message": journal_result.get("message") or "Current files do not match journal after-state",
+                        "files": list(journal_result.get("files") or []),
+                        "can_force": True,
+                    })
+                    return
+                self._send_json_error(
+                    400,
+                    journal_result.get("message") or journal_result["error"],
+                )
+                return
+            self._send_json_response(200, {
+                "status": "success",
+                "session_id": session_id,
+                "journal_only": True,
+                "journal": journal_result,
+            })
+            return
+
+        # === 远程会话：先还原子端文件，再删本地消息 ===
+        # 会话绑定 remote_env 时，文件 journal 在子端会话目录：先调子端
+        # journal_only revoke。子端冲突时 409 原样上抛（本地消息不删，
+        # 与本地语义一致）；成功后本地 revoke 的 journal 部分自然 no-op。
+        remote_env_id = self._session_remote_env(session_id)
+        if remote_env_id:
+            if not self._revoke_remote_journal(
+                session_id, remote_env_id, timestamp, forced, keep_files,
+            ):
+                return
 
         context_manager = self.server.context_manager  # type: ignore[attr-defined]
         try:

@@ -172,6 +172,12 @@ class RemoteEnvManager:
     def __init__(self, path: str) -> None:
         self._path = path
         self._lock = threading.Lock()
+        # 工具代理论缓存：env_id -> (url, RemoteToolProxy)。代理无每请求状态
+        # （地址 + 传输 + 工具清单 TTL 缓存），同一环境的全部调用方（推理、
+        # talk_to/delegate、管理调用）共享同一实例，避免每轮推理重新拉取
+        # 子端 /v1/tools。
+        self._proxy_lock = threading.Lock()
+        self._proxies: dict[str, tuple[str, object]] = {}
 
     # ------------------------------------------------------------------
     # 公共方法
@@ -303,7 +309,36 @@ class RemoteEnvManager:
             if len(kept) == len(envs):
                 raise KeyError(env_id)
             self._write_locked(kept)
-            return kept
+        with self._proxy_lock:
+            self._proxies.pop(env_id, None)
+        return kept
+
+    # ------------------------------------------------------------------
+    # 工具代理（按环境共享，见 get_proxy）
+    # ------------------------------------------------------------------
+
+    def get_proxy(self, env_id: str, tunnel_manager=None):
+        """返回该环境的 RemoteToolProxy（按 env_id 缓存，跨请求共享）。
+
+        环境 URL 变化时重建。记录不存在时抛 KeyError。
+        """
+        from runtime.remote_tool_proxy import RemoteToolProxy
+        record = self.get(env_id)
+        url = str(record.get("url") or "")
+        with self._proxy_lock:
+            cached = self._proxies.get(env_id)
+            if cached is not None and cached[0] == url:
+                return cached[1]
+            proxy = RemoteToolProxy(record, tunnel_manager=tunnel_manager)
+            self._proxies[env_id] = (url, proxy)
+            return proxy
+
+    def invalidate_tools_cache(self, env_id: str) -> None:
+        """失效该环境代理的工具清单/技能正文缓存（push-update、隧道重连后调用）。"""
+        with self._proxy_lock:
+            cached = self._proxies.get(env_id)
+        if cached is not None:
+            cached[1].invalidate_tools()
 
     # ------------------------------------------------------------------
     # 私有方法

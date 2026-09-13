@@ -1149,3 +1149,46 @@ class TestUnifiedOnlineField:
         assert "status" not in envs[0]
         # direct record without an online field defaults to False
         assert envs[1]["online"] is False
+
+
+class TestSharedProxyCache:
+    def _manager(self, tmp_path):
+        return RemoteEnvManager(str(tmp_path / "remote_envs.json"))
+
+    def test_get_proxy_cached_per_env(self, tmp_path):
+        manager = self._manager(tmp_path)
+        manager.upsert("http://10.0.0.7:7988/", None)
+        p1 = manager.get_proxy("http://10.0.0.7:7988")
+        p2 = manager.get_proxy("http://10.0.0.7:7988")
+        assert p1 is p2
+        assert p1.env_id == "http://10.0.0.7:7988"
+
+    def test_get_proxy_rebuilt_on_url_change(self, tmp_path):
+        manager = self._manager(tmp_path)
+        manager.upsert("http://10.0.0.7:7988/", None)
+        p1 = manager.get_proxy("http://10.0.0.7:7988")
+        manager.upsert("http://10.0.0.7:7988/v1/setup?token=zz", None)
+        p2 = manager.get_proxy("http://10.0.0.7:7988")
+        assert p2 is not p1
+
+    def test_get_proxy_missing_env_raises(self, tmp_path):
+        manager = self._manager(tmp_path)
+        with pytest.raises(KeyError):
+            manager.get_proxy("http://10.9.9.9:1")
+
+    def test_invalidate_tools_cache(self, tmp_path):
+        manager = self._manager(tmp_path)
+        manager.upsert("http://10.0.0.7:7988/", None)
+        proxy = manager.get_proxy("http://10.0.0.7:7988")
+        proxy._tools_cache = [{"tool_id": "stale"}]
+        proxy._tools_fetched_at = time.monotonic()
+        manager.invalidate_tools_cache("http://10.0.0.7:7988")
+        assert proxy._tools_cache is None
+        assert proxy._tools_fetched_at == 0.0
+
+    def test_remove_drops_proxy(self, tmp_path):
+        manager = self._manager(tmp_path)
+        manager.upsert("http://10.0.0.7:7988/", None)
+        manager.get_proxy("http://10.0.0.7:7988")
+        manager.remove("http://10.0.0.7:7988")
+        assert manager._proxies == {}

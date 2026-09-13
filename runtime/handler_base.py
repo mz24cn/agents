@@ -78,6 +78,7 @@ _ROUTES: dict[str, list] = {
     "GET": [
         (re.compile(r"^/v1/models$"), "_handle_list_models", ()),
         (re.compile(r"^/v1/tools$"), "_handle_list_tools", ()),
+        (re.compile(r"^/v1/tools/skill/([^/]+)$"), "_handle_get_skill_body", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/mcp-servers$"), "_handle_list_mcp_servers", ()),
         (re.compile(r"^/v1/prompt-templates$"), "_handle_list_prompt_templates", ()),
         (re.compile(r"^/v1/env$"), "_handle_get_env", ()),

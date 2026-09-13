@@ -25,6 +25,7 @@ from runtime.common import (
     _thread_local,
     now_iso as _now_iso,
     is_likely_base64,
+    get_request_context,
     snapshot_request_context,
     restore_request_context,
     estimate_chat_prompt_tokens,
@@ -792,11 +793,16 @@ class Runtime:
         inference_model_config = model_config.resolved_for_inference()
 
         # 2. Get tool configs
-        tools: list[ToolConfig] = []
-        for tool_id in request.tool_ids:
-            tool_config = self._tool_registry.get(tool_id)
-            if tool_config is not None:
-                tools.append(tool_config)
+        # request.tools 携带现成的 ToolConfig（远程代理工具：子端原始 ID/名，
+        # 不在母端 registry）时直接使用；否则按 ID 查 registry。
+        if request.tools is not None:
+            tools: list[ToolConfig] = list(request.tools)
+        else:
+            tools = []
+            for tool_id in request.tool_ids:
+                tool_config = self._tool_registry.get(tool_id)
+                if tool_config is not None:
+                    tools.append(tool_config)
 
         # 3. Select protocol adapter
         protocol_name = model_config.api_protocol
@@ -984,7 +990,7 @@ class Runtime:
                 len(tool_calls_to_execute), tool_round, _get_tool_exec_workers(),
             )
             if not any(
-                self._is_skill_tool(fn_call.get("name", ""))
+                self._is_skill_tool(fn_call.get("name", ""), tools)
                 for fn_call in tool_calls_to_execute
             ):
                 for tool_msg in self._execute_tool_call_round(
@@ -999,13 +1005,26 @@ class Runtime:
                 arguments_str = fn_call.get("arguments", "{}")
 
                 # Check if this is a Skill — trigger progressive disclosure
-                if self._is_skill_tool(tool_name):
-                    # Progressive disclosure: inject SKILL.md body + built-in tools
-                    skill_body, skill_dir = self._get_skill_body_and_dir(tool_name)
-
-                    # Change working directory to the skill's directory
-                    if skill_dir:
-                        os.chdir(skill_dir)
+                if self._is_skill_tool(tool_name, tools):
+                    # Progressive disclosure: inject SKILL.md body (+ built-in
+                    # tools locally; remote skills fetch the body from the
+                    # child environment and never chdir).
+                    skill_body, skill_dir, skill_error = self._disclose_skill(
+                        tool_name, tools,
+                    )
+                    if skill_error is not None:
+                        messages.append(
+                            Message(
+                                role="tool",
+                                name=tool_name,
+                                tool_use_id=fn_call.get("id") or fn_call.get("tool_use_id"),
+                                content=skill_error,
+                            )
+                        )
+                        tools = [t for t in tools if t.tool_id != tool_name and t.name != tool_name]
+                        tool_round -= 1
+                        skill_triggered = True
+                        continue
 
                     # Inject the full SKILL.md body as a function/tool result message
                     if skill_body:
@@ -1022,9 +1041,6 @@ class Runtime:
                                 ),
                             )
                         )
-
-                    # Add built-in tools (write_file, exec_shell) to the tools list
-                    self._ensure_builtin_tools(tools)
 
                     # Remove the Skill itself from tools to avoid re-selection
                     tools = [t for t in tools if t.tool_id != tool_name and t.name != tool_name]
@@ -1083,25 +1099,30 @@ class Runtime:
         """Directly call a tool by its tool_id, bypassing model inference.
 
         Args:
-            tool_id: The unique identifier of the tool to call.
+            tool_id: The unique identifier (or name) of the tool to call.
             arguments: The arguments dict to pass to the tool.
 
         Returns:
             The tool result as a string, or an error message string.
+
+        The call runs through the SAME per-call pipeline as the inference
+        loop (``_execute_tool_call``): argument-name normalization, MCP
+        base64 pre-processing (file path -> base64) and post-processing
+        (long base64 payloads saved to a local file and replaced with the
+        path), compatibility notes and the result length guard.  This keeps
+        direct calls (in particular the child environment's
+        ``POST /v1/tools/call`` behind the remote tool proxy) behaviorally
+        identical to a local inference round, so remote tool execution gets
+        the same pre/post handling as local execution: base64 input files
+        are read from, and intercepted base64 results are saved on, the
+        machine that actually runs the tool.
         """
-        tool_config = self._tool_registry.get(tool_id)
-        if tool_config is None:
-            # Also try by name
-            tool_config = self._find_tool_by_name(tool_id)
+        tool_config = self._find_tool_by_name(tool_id)
         if tool_config is None:
             return f"Error: tool '{tool_id}' not found in registry"
 
-        if tool_config.tool_type == "function":
-            return self._execute_function_tool(tool_config, arguments)
-        elif tool_config.tool_type == "mcp":
-            return self._execute_mcp_tool(tool_config, arguments)
-        else:
-            return f"Error: unsupported tool_type '{tool_config.tool_type}' for tool '{tool_id}'"
+        result_str, _ = self._execute_tool_call(tool_id, arguments)
+        return result_str
 
     # ------------------------------------------------------------------
     # Tool execution helpers
@@ -1209,7 +1230,7 @@ class Runtime:
         # When a tool returns an excessively long result it can blow up the
         # model context.  Save oversized results to a temp file and return a
         # hint so the model can fetch slices with read_file / exec_shell.
-        result_str = self._guard_tool_result_length(result_str)
+        result_str = self._guard_tool_result_length(result_str, tool_config)
 
         return result_str, tool_config
 
@@ -1218,7 +1239,7 @@ class Runtime:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _guard_tool_result_length(result_str: str) -> str:
+    def _guard_tool_result_length(result_str: str, tool_config=None) -> str:
         """Cap oversized tool results by writing them to a temp file.
 
         The threshold is controlled by the TOOL_RESULT_MAX_LENGTH environment
@@ -1227,16 +1248,36 @@ class Runtime:
         instead, telling the caller how many characters / lines were produced
         and where the file was saved.
 
+        Remote proxy tools (is_remote_proxy=True) execute in the child
+        environment, which cannot read the parent's /tmp: those results are
+        truncated to an inline preview instead, with a hint to re-run the
+        command with bounded output.
+
         Args:
             result_str: The original tool result string.
+            tool_config: Optional ToolConfig; used to detect remote proxy tools.
 
         Returns:
             The original string when under the threshold, or a short hint
-            pointing at a temp file.
+            pointing at a temp file (local tools) / an inline preview
+            (remote proxy tools).
         """
         max_len = env_int("TOOL_RESULT_MAX_LENGTH", 262144)
         if len(result_str) <= max_len:
             return result_str
+
+        if tool_config is not None and getattr(tool_config, "is_remote_proxy", False):
+            preview_len = env_int("TOOL_RESULT_REMOTE_PREVIEW_LENGTH", 8000)
+            chars = len(result_str)
+            lines = result_str.count("\n") + 1
+            preview = result_str[:preview_len]
+            return (
+                f"工具返回了长度超长的内容（{chars}字符，{lines}行），仅返回前 {preview_len} 字符：\n"
+                f"{preview}\n"
+                f"...（其余已省略）。当前为远程执行环境，内容保存在子环境而非母端，"
+                f"无法通过母端临时文件读取；请缩小输出范围重试"
+                f"（如 exec_shell 追加 head/tail/sed 限制行数、read_file 用 start_line/end_line 分段）。"
+            )
 
         import tempfile
         fd, tmp_path = tempfile.mkstemp(
@@ -1397,6 +1438,38 @@ class Runtime:
 
         return None
 
+    def _disclose_skill(
+        self, tool_name: str, tools: list,
+    ) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        """Skill 渐进式披露的准备步骤（本地与远程会话共用）。
+
+        本地技能：读取 SKILL.md 正文、chdir 到技能目录，并把 write_file /
+        exec_shell 注入 tools。
+
+        远程技能（会话绑定 remote_env，模型以子端原始技能名调用）：正文
+        从子环境 ``GET /v1/tools/skill/{id}`` 获取（本地同名技能不参与）；
+        **不** chdir（子端路径对母端进程不可达，模型经子端 exec_shell cd）、
+        **不**注入本地内置工具（远程内置工具已以代理条目在 tools 中）。
+
+        Returns:
+            (skill_body, skill_dir, error)；error 非 None 时前两者无意义。
+        """
+        remote_proxy = get_request_context("remote_tool_proxy")
+        if remote_proxy is not None:
+            # 远程会话：工具清单全部来自子端，技能调用只可能指向子端技能；
+            # 正文统一从子端获取（不查本地 skill_manager / registry）。
+            from runtime.remote_tool_proxy import RemoteToolCallError
+            try:
+                skill_body, skill_dir = remote_proxy.fetch_skill_body(tool_name)
+            except RemoteToolCallError as exc:
+                return None, None, f"Error: 远程技能正文获取失败: {exc}"
+            return skill_body, skill_dir, None
+        skill_body, skill_dir = self._get_skill_body_and_dir(tool_name)
+        if skill_dir:
+            os.chdir(skill_dir)
+        self._ensure_builtin_tools(tools)
+        return skill_body, skill_dir, None
+
     def _ensure_builtin_tools(self, tools: list) -> None:
         """Ensure built-in tools (write_file, exec_shell) are registered and in the tools list.
 
@@ -1462,10 +1535,21 @@ class Runtime:
 
         return None, None
 
-    def _is_skill_tool(self, tool_name: str) -> bool:
-        """Check if tool_name refers to a skill, using both skill_manager and ToolRegistry."""
+    def _is_skill_tool(self, tool_name: str, tools: Optional[list] = None) -> bool:
+        """Check if tool_name refers to a skill.
+
+        When *tools* (the current request's tool list) is given it is the
+        authoritative allow-list: remote proxy tools are not in the parent
+        ToolRegistry, so the registry fallback would miss them; local skill
+        disclosure for unselected skills still works via skill_manager.
+        """
         if self._skill_manager and self._skill_manager.is_skill(tool_name):
             return True
+        if tools is not None:
+            for tc in tools:
+                if (tc.name == tool_name or tc.tool_id == tool_name) and tc.tool_type == "skill":
+                    return True
+            return False
         tool_config = self._find_tool_by_name(tool_name)
         return tool_config is not None and tool_config.tool_type == "skill"
 
@@ -1510,11 +1594,12 @@ class Runtime:
             return tool_name, {}, tool_use_id, tool_config, arguments, []
         return tool_name, arguments, tool_use_id, tool_config, None, compat_notes
 
-    def _postprocess_tool_result(self, result_str: str, compat_notes: list) -> str:
+    def _postprocess_tool_result(self, result_str: str, compat_notes: list,
+                                 tool_config=None) -> str:
         """Apply the common result transforms after a concrete tool finishes."""
         if compat_notes:
             result_str = self._append_compat_notes(result_str, compat_notes)
-        return self._guard_tool_result_length(result_str)
+        return self._guard_tool_result_length(result_str, tool_config)
 
     @staticmethod
     def _tool_message(
@@ -1571,11 +1656,12 @@ class Runtime:
                 next_index += 1
 
         for index, (tool_name, arguments, tool_use_id, tool_config, compat_notes) in enumerate(prepared_calls):
-            callable_fn = self._tool_registry.get_callable(tool_config.tool_id)
+            callable_fn = self._resolve_tool_callable(tool_config)
             if callable_fn is None:
                 result_str = self._postprocess_tool_result(
                     f"Error: no callable registered for tool '{tool_config.tool_id}'",
                     compat_notes,
+                    tool_config,
                 )
                 ready_messages[index] = self._tool_message(
                     tool_name, tool_use_id, result_str, tool_config, timestamp=timestamp,
@@ -1584,7 +1670,7 @@ class Runtime:
 
             validation_error = self._validate_talk_to_target(tool_config, arguments)
             if validation_error is not None:
-                result_str = self._postprocess_tool_result(validation_error, compat_notes)
+                result_str = self._postprocess_tool_result(validation_error, compat_notes, tool_config)
                 ready_messages[index] = self._tool_message(
                     tool_name, tool_use_id, result_str, tool_config, timestamp=timestamp,
                 )
@@ -1592,6 +1678,12 @@ class Runtime:
 
             caller_ctx = _snapshot_tool_request_context()
             caller_ctx["tool_use_id"] = tool_use_id
+            # 工具级有效超时随上下文传给工具 worker：远程代理工具以它作为
+            # 网络层超时（见 RemoteToolProxy.call），长执行工具不会被固定
+            # 网络超时砍断；本地工具不使用该键。
+            caller_ctx["tool_exec_timeout"] = _get_effective_tool_exec_timeout(
+                tool_config, arguments
+            )
             runnable_calls.append((
                 index,
                 tool_name,
@@ -1601,7 +1693,7 @@ class Runtime:
                 compat_notes,
                 callable_fn,
                 caller_ctx,
-                _get_effective_tool_exec_timeout(tool_config, arguments),
+                caller_ctx["tool_exec_timeout"],
             ))
 
         yield from _yield_ready_in_order()
@@ -1626,7 +1718,7 @@ class Runtime:
                     _caller_ctx, _timeout,
                 ) = specs[index]
                 result_str = self._postprocess_tool_result(
-                    result_str, compat_notes,
+                    result_str, compat_notes, tool_config,
                 )
                 with execution_started_lock:
                     started = execution_started.get(index)
@@ -1748,7 +1840,7 @@ class Runtime:
                     immediate_by_index[batch_index] = self._tool_message(
                         tool_name,
                         tool_use_id,
-                        self._postprocess_tool_result(immediate_result, compat_notes),
+                        self._postprocess_tool_result(immediate_result, compat_notes, tool_config),
                         tool_config,
                         timestamp=timestamp,
                     )
@@ -1844,6 +1936,18 @@ class Runtime:
                 )
         return None
 
+    def _resolve_tool_callable(self, tool_config: ToolConfig):
+        """Resolve the callable that executes a function tool.
+
+        Remote proxy tools carry the callable on the config itself (they are
+        not present in the parent ToolRegistry); local tools are looked up
+        in the registry by tool_id.
+        """
+        callable_fn = getattr(tool_config, "callable_fn", None)
+        if callable_fn is not None:
+            return callable_fn
+        return self._tool_registry.get_callable(tool_config.tool_id)
+
     def _execute_function_tool(
         self,
         tool_config: ToolConfig,
@@ -1865,7 +1969,8 @@ class Runtime:
         if validation_error is not None:
             return validation_error
 
-        callable_fn = self._tool_registry.get_callable(tool_config.tool_id)
+        # 远程代理工具的 callable 挂在 config 上（不在母端 registry）；本地工具查 registry。
+        callable_fn = self._resolve_tool_callable(tool_config)
         if callable_fn is None:
             return f"Error: no callable registered for tool '{tool_config.tool_id}'"
 
@@ -1875,6 +1980,8 @@ class Runtime:
         # from the inference loop and makes the direct-call path consistent with
         # round-level parallel execution.
         caller_ctx = _snapshot_tool_request_context()
+        # 远程代理工具以该超时作为网络层超时（见 RemoteToolProxy.call）。
+        caller_ctx["tool_exec_timeout"] = timeout
 
         def _run_with_context() -> str:
             restore_request_context(caller_ctx)
@@ -2121,11 +2228,16 @@ class Runtime:
         # The registry/override object retains its original placeholder text.
         inference_model_config = model_config.resolved_for_inference()
 
-        tools: list[ToolConfig] = []
-        for tool_id in request.tool_ids:
-            tc = self._tool_registry.get(tool_id)
-            if tc is not None:
-                tools.append(tc)
+        # request.tools 携带现成的 ToolConfig（远程代理工具：子端原始 ID/名，
+        # 不在母端 registry）时直接使用；否则按 ID 查 registry。
+        if request.tools is not None:
+            tools: list[ToolConfig] = list(request.tools)
+        else:
+            tools = []
+            for tool_id in request.tool_ids:
+                tc = self._tool_registry.get(tool_id)
+                if tc is not None:
+                    tools.append(tc)
 
         protocol_name = model_config.api_protocol
         protocol_cls = PROTOCOL_MAP.get(protocol_name)
@@ -2676,7 +2788,7 @@ class Runtime:
             # results as individual callables complete.
             skill_triggered = False
             if not any(
-                self._is_skill_tool(fn_call.get("name", ""))
+                self._is_skill_tool(fn_call.get("name", ""), tools)
                 for fn_call in tool_calls_to_execute
             ):
                 _logger.info(
@@ -2695,12 +2807,24 @@ class Runtime:
                 arguments_str = fn_call.get("arguments", "{}")
 
                 # Skill progressive disclosure
-                if self._is_skill_tool(tool_name):
-                    skill_body, skill_dir = self._get_skill_body_and_dir(tool_name)
-
-                    # Change working directory to the skill's directory
-                    if skill_dir:
-                        os.chdir(skill_dir)
+                if self._is_skill_tool(tool_name, tools):
+                    skill_body, skill_dir, skill_error = self._disclose_skill(
+                        tool_name, tools,
+                    )
+                    if skill_error is not None:
+                        err_msg = Message(
+                            role="tool",
+                            timestamp=_now_iso(),
+                            name=tool_name,
+                            tool_use_id=fn_call.get("id") or fn_call.get("tool_use_id"),
+                            content=skill_error,
+                        )
+                        messages.append(err_msg)
+                        yield err_msg
+                        tools = [t for t in tools if t.tool_id != tool_name and t.name != tool_name]
+                        tool_round -= 1
+                        skill_triggered = True
+                        continue
 
                     # Inject the full SKILL.md body as a function/tool result message
                     if skill_body:
@@ -2719,7 +2843,6 @@ class Runtime:
                         messages.append(fn_msg)
                         yield fn_msg
 
-                    self._ensure_builtin_tools(tools)
                     tools = [t for t in tools if t.tool_id != tool_name and t.name != tool_name]
                     tool_round -= 1
                     skill_triggered = True

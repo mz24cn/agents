@@ -1501,6 +1501,25 @@ class ContextManager:
         except (ValueError, OSError):
             return None
 
+    def get_session_meta(self, session_id: str) -> dict:
+        """Return the ``meta`` object from ``conversation.json``.
+
+        Returns an empty dict when the file does not exist or is malformed.
+        Used e.g. by the remote-execution handlers to read the session's
+        ``remote_env`` binding (the child environment that owns this
+        session's file journals).
+        """
+        conv_path = self._conversation_path(session_id)
+        if not os.path.isfile(conv_path):
+            return {}
+        try:
+            with open(conv_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            meta = data.get("meta") if isinstance(data, dict) else None
+            return meta if isinstance(meta, dict) else {}
+        except (ValueError, OSError):
+            return {}
+
     def update_rolling_summary(
         self, session_id: str, turns: list[ConversationTurn],
         last_total_tokens: Optional[int] = None,

@@ -194,9 +194,14 @@ def _make_delegate_fn(runtime, thread_local):
                     messages.append(Message(role="system", content=context))
 
             messages.append(Message(role="user", content=task, images=images))
+            # 直传 scope 中选中的 ToolConfig：远程代理工具的 callable 挂在
+            # config 上（不在母端 registry）；本地会话中它们与 registry
+            # 里的对象相同。
+            scope_by_id = {tc.tool_id: tc for tc in tool_scope}
             request = InferenceRequest(
                 model_id=model_id,
                 tool_ids=resolved_ids,
+                tools=[scope_by_id[i] for i in resolved_ids if i in scope_by_id] or None,
                 messages=messages,
                 max_tool_rounds=env_int("MAX_TOOL_ROUNDS", 200)
             )
@@ -440,15 +445,24 @@ def _make_talk_to_fn(runtime, thread_local):
             # Conversation persistence still uses the independent sub_session_id
             # below; only the file journal belongs to the initiating user turn.
             child_context = dict(parent_request_context)
-            tool_registry = getattr(runtime, "_tool_registry", None)
-            target_tool_scope = (
-                [
-                    tc for tid in agent_tool_ids
-                    if (tc := tool_registry.get(tid)) is not None
+            remote_proxy = parent_request_context.get("remote_tool_proxy")
+            if remote_proxy is not None:
+                # 远程会话：目标 agent 的工具全部取自子端代理条目（按子端
+                # 原始 tool_id 匹配）；本地工具不参与。
+                target_tool_scope = [
+                    tc for tc in remote_proxy.list_tool_configs()
+                    if tc.tool_id in agent_tool_ids
                 ]
-                if tool_registry is not None
-                else []
-            )
+            else:
+                tool_registry = getattr(runtime, "_tool_registry", None)
+                target_tool_scope = (
+                    [
+                        tc for tid in agent_tool_ids
+                        if (tc := tool_registry.get(tid)) is not None
+                    ]
+                    if tool_registry is not None
+                    else []
+                )
             child_context.update({
                 "depth": parent_depth + 1,
                 "session_id": sub_session_id,
@@ -528,6 +542,7 @@ def _make_talk_to_fn(runtime, thread_local):
             request = InferenceRequest(
                 model_id=model_id,
                 tool_ids=agent_tool_ids,
+                tools=target_tool_scope if remote_proxy is not None else None,
                 messages=messages,
                 max_tool_rounds=env_int("MAX_TOOL_ROUNDS", 200)
             )

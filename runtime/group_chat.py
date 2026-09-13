@@ -933,15 +933,23 @@ def _run_group_chat_stream_gen(
             nickname: str = agent.get("nickname", agent_id)
             agent_model_id: str = agent.get("model_id", model_id)
             agent_tool_ids: list[str] = agent.get("tool_ids", tool_ids)
-            tool_registry = getattr(runtime, "_tool_registry", None)
-            agent_tool_scope = (
-                [
-                    tc for tid in agent_tool_ids
-                    if (tc := tool_registry.get(tid)) is not None
+            base_tools = getattr(base_request, "tools", None)
+            if base_tools is not None:
+                # 远程会话：子 agent 的工具全部取自子端代理条目（按子端原始
+                # tool_id 匹配）；本地工具不参与。
+                agent_tool_scope = [
+                    tc for tc in base_tools if tc.tool_id in agent_tool_ids
                 ]
-                if tool_registry is not None
-                else []
-            )
+            else:
+                tool_registry = getattr(runtime, "_tool_registry", None)
+                agent_tool_scope = (
+                    [
+                        tc for tid in agent_tool_ids
+                        if (tc := tool_registry.get(tid)) is not None
+                    ]
+                    if tool_registry is not None
+                    else []
+                )
             set_request_context(
                 tool_scope=agent_tool_scope,
                 available_tool_ids=agent_tool_ids,
@@ -997,6 +1005,7 @@ def _run_group_chat_stream_gen(
             request = InferenceRequest(
                 model_id=agent_model_id,
                 tool_ids=agent_tool_ids,
+                tools=agent_tool_scope if base_tools is not None else None,
                 messages=agent_messages,
                 stream=True,
                 max_tool_rounds=base_request.max_tool_rounds,

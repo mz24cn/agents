@@ -292,6 +292,10 @@ class InferenceRequest:
             for this request. If provided, runtime should prefer this over
             registry lookup.
         tool_ids: List of tool IDs to make available during inference.
+        tools: Optional ready-made list of ToolConfig objects (remote proxy
+            tools with the child's original IDs/names that are not present in
+            the parent ToolRegistry). When set, the runtime uses it directly
+            as the tool set exposed to the model.
         messages: Optional pre-built message list.
         text: Optional plain text input (convenience shortcut).
         stream: Whether to use streaming response mode.
@@ -301,6 +305,7 @@ class InferenceRequest:
     model_id: str
     model_config_override: Optional[ModelConfig] = None
     tool_ids: list = field(default_factory=list)
+    tools: Optional[list] = None
     messages: Optional[list] = None
     text: Optional[str] = None
     stream: bool = False
