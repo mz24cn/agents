@@ -1,9 +1,12 @@
 <script>
   import { onMount, onDestroy } from 'svelte';
   import { copyToClipboard } from '$lib/clipboard.js';
+  import { buildRemoteWsUrl } from '$lib/remote-execution.svelte.js';
   import '@xterm/xterm/css/xterm.css';
 
-  let { sessionId, workspace = '', visible = true, onStatusChange = null } = $props();
+  // remote: { base, token, host } — when set, the terminal connects directly
+  // to the child environment's /v1/terminals/ws (remote exec mode).
+  let { sessionId, workspace = '', visible = true, onStatusChange = null, remote = null } = $props();
 
   let termEl;
   let term;
@@ -26,6 +29,14 @@
   }
 
   function getWsUrl(sid) {
+    // 远程执行：直接连接子环境 WebSocket（携带 token 查询参数鉴权）。
+    if (remote) {
+      return buildRemoteWsUrl('/v1/terminals/ws', {
+        terminal_id: sid,
+        ...(workspace ? { workspace: workspace } : {}),
+        ...(term && fitAddon ? { cols: term.cols, rows: term.rows } : {}),
+      });
+    }
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     let url = `${proto}//${location.host}/v1/terminals/ws?terminal_id=${sid}`;
     if (workspace) {
@@ -231,8 +242,20 @@
     });
   });
 
+  // 连接目标 = 执行环境（本地/子端）+ 会话。目标变化（切换执行环境、
+  // 绑定异步解析完成）时关闭旧连接并重新连接到新目标；首次挂载时也走这里。
+  let wsTarget = ''
   $effect(() => {
+    const target = `${remote?.host ?? ''}\u0000${sessionId ?? ''}`
     if (visible && sessionId && !destroyed) {
+      if (target !== wsTarget) {
+        wsTarget = target
+        if (ws && ws.readyState !== WebSocket.CLOSED) {
+          try { ws.close(); } catch {}
+        }
+        const timer = setTimeout(() => connect(), 0);
+        return () => clearTimeout(timer);
+      }
       if (!ws || ws.readyState === WebSocket.CLOSED) {
         const timer = setTimeout(() => connect(), 0);
         return () => clearTimeout(timer);

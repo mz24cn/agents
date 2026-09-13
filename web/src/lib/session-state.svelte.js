@@ -32,7 +32,11 @@ export const terminalOpen = $state({ sessionId: null, token: 0 })
 // sessionId: string | null — 要打开终端的会话 ID
 // token: number — 每次点击递增，确保重复打开也能响应
 
-// 会话日志目录打开请求：Sidebar 菜单触发，ChatPage 监听并打开文件管理器导航到该目录
-export const openSessionLogDir = $state({ path: null, token: 0 })
-// path: string | null — 会话日志目录（conversation.json 所在目录）的绝对路径
+// 会话日志目录打开请求：Sidebar 菜单触发，ChatPage 监听并打开文件管理器导航到该目录。
+// 会话目录始终在本地（父端）：推理在父端发生，conversation.json 所在目录必然存在，
+// 即使会话绑定远程环境（file journal 在子端）也打开本地会话目录。
+export const openSessionLogDir = $state({ path: null, remoteJournal: null, token: 0 })
+// path: string | null — 本地会话日志目录（conversation.json 所在目录）的绝对路径
+// remoteJournal: { env_id: string, path: string } | null — 会话绑定远程环境且
+//   子端已有 file journal 时，父端 log-dir 响应附带的"软链接"信息（子端会话目录）
 // token: number — 每次点击递增，确保重复打开也能响应

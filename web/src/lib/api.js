@@ -287,6 +287,14 @@ export const env = {
   detect: ()              => request('POST',   '/v1/env/detect'),
 }
 
+/** 隧道（WS 反向隧道）子端管理 — 本环境作为子端注册到母环境。 */
+export const tunnel = {
+  parentStatus:     () => request('GET',  '/v1/tunnel/parent/status'),
+  /** parent 非空时后端会校验并持久化为 SETUP_SOURCE，再用它注册。 */
+  parentRegister:   (parent = '') => request('POST', '/v1/tunnel/parent/register', { parent }),
+  parentUnregister: () => request('POST', '/v1/tunnel/parent/unregister'),
+}
+
 /** 会话 API */
 export const sessions = {
   list:          (page = 1, pageSize = 100, category = '') => request('GET', `/v1/sessions?page=${encodeURIComponent(page)}&page_size=${encodeURIComponent(pageSize)}${category ? `&category=${encodeURIComponent(category)}` : ''}`),
@@ -613,12 +621,22 @@ export const build = {
  */
 export const remoteEnv = {
   list: () => request('GET', '/v1/remote-envs'),
-  add: (url, snapshot = null) =>
-    request('POST', '/v1/remote-envs', { url, ...(snapshot ? { snapshot } : {}) }),
-  updateSnapshot: (id, snapshot) =>
-    request('PUT', `/v1/remote-envs/${encodeURIComponent(id)}`, { snapshot }),
+  // online：状态检查/更新时的可达性，随快照一起持久化到 remote_envs.json
+  add: (url, snapshot = null, online = null) =>
+    request('POST', '/v1/remote-envs', {
+      url,
+      ...(snapshot ? { snapshot } : {}),
+      ...(typeof online === 'boolean' ? { online } : {}),
+    }),
+  updateSnapshot: (id, snapshot = null, online = null) =>
+    request('PUT', `/v1/remote-envs/${encodeURIComponent(id)}`, {
+      ...(snapshot ? { snapshot } : {}),
+      ...(typeof online === 'boolean' ? { online } : {}),
+    }),
   /** 推送更新：母环境构建增量并 POST 到该环境的 /v1/setup?op=push。 */
   pushUpdate: (id) => request('POST', `/v1/remote-envs/${encodeURIComponent(id)}/push-update`, null),
+  /** 刷新该环境的版本快照（隧道环境经反向隧道）。 */
+  hello: (id) => request('POST', `/v1/remote-envs/${encodeURIComponent(id)}/hello`, null),
   remove: (id) => request('DELETE', `/v1/remote-envs/${encodeURIComponent(id)}`),
 }
 

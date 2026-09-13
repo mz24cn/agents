@@ -2,11 +2,27 @@
   import { catalog, loadTools } from '../../lib/catalog-state.svelte.js'
   import { t } from '../../lib/i18n.svelte.js'
 
-  let { selectedToolIds = $bindable([]), onchange, disabled = false } = $props()
+  // toolsOverride: 远程会话时由父组件传入子环境工具列表（覆盖本地 catalog）。
+  // null = 使用本地 catalog（默认）；
+  // 'loading' = 正在拉取子环境工具列表（显示加载态，不显示本地工具）；
+  // Array = 仅显示子环境工具。
+  let {
+    selectedToolIds = $bindable([]),
+    onchange,
+    disabled = false,
+    toolsOverride = null,
+  } = $props()
 
-  let toolList = $derived(catalog.tools.items)
-  let loading = $derived(catalog.tools.loading && !catalog.tools.loaded)
-  let error = $derived(catalog.tools.error)
+  let toolList = $derived(
+    Array.isArray(toolsOverride) ? toolsOverride
+      : (toolsOverride === 'loading' ? [] : catalog.tools.items)
+  )
+  let loading = $derived(
+    toolsOverride === 'loading'
+      ? true
+      : (Array.isArray(toolsOverride) ? false : (catalog.tools.loading && !catalog.tools.loaded))
+  )
+  let error = $derived(toolsOverride ? null : catalog.tools.error)
   let expanded = $state(false)
   let expandedGroups = $state(new Set())
 
@@ -83,7 +99,10 @@
 
   // 过滤掉已不存在的工具 ID，避免选中已删除的工具；共享列表刷新后即时生效。
   $effect(() => {
-    if (!catalog.tools.loaded) return
+    const listReady = toolsOverride === 'loading'
+      ? false
+      : (Array.isArray(toolsOverride) ? true : catalog.tools.loaded)
+    if (!listReady) return
     const validIds = new Set(toolList.map(t => t.tool_id))
     const filtered = selectedToolIds.filter(id => validIds.has(id))
     if (filtered.length !== selectedToolIds.length) {

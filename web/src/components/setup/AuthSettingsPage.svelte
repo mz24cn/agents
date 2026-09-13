@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte'
-  import { auth, build, env, remoteEnv, buildSetupRequestUrl, extractSetupSnapshot, fetchRemoteJson, subscribeSessionEvents, remoteEnvHomeUrl, isRemoteLogoImage, resolveRemoteEnvLogo } from '../../lib/api.js'
+  import { auth, build, env, remoteEnv, tunnel, buildSetupRequestUrl, extractSetupSnapshot, fetchRemoteJson, subscribeSessionEvents, remoteEnvHomeUrl, isRemoteLogoImage, resolveRemoteEnvLogo } from '../../lib/api.js'
   import { copyToClipboard } from '../../lib/clipboard.js'
   import { t } from '../../lib/i18n.svelte.js'
 
@@ -72,6 +72,15 @@
   let canAddEnv = $derived(!!newEnvUrl.trim() && !addingEnv && !checkingAllEnvs && !updatingAllEnvs)
   let canCheckAllEnvs = $derived(envList.length > 0 && !checkingAllEnvs && !updatingAllEnvs)
   let canUpdateAllEnvs = $derived(envList.length > 0 && !checkingAllEnvs && !updatingAllEnvs)
+
+  // ---- 隧道连接（本环境作为子环境反向隧道到母环境；地址复用 SETUP_SOURCE 输入框） ----
+  let tunnelStatus = $state(null)  // { configured, parent, tunnel_id, enabled, state, env_id, detail }
+  let tunnelBusy = $state(false)
+  let tunnelError = $state('')
+  let tunnelConnected = $derived(!!tunnelStatus && tunnelStatus.state === 'online')
+  // 注册：仅在未连接且地址输入非空时有效；注销：仅在隧道已连接时有效
+  let canTunnelRegister = $derived(!!setupSource.trim() && !tunnelConnected && !tunnelBusy)
+  let canTunnelUnregister = $derived(tunnelConnected && !tunnelBusy)
 
   function pad2(value) {
     return String(value).padStart(2, '0')
@@ -353,6 +362,9 @@
       updating: false,
       status: '',
       statusIsError: false,
+      // 在线状态：直连与隧道环境统一用 online 布尔（remote_envs.json 持久化：
+      // 直连 = 最近一次状态检查结果；隧道 = 隧道 attach/detach 事件驱动）
+      online: !!entry.online,
     }))
   }
 
@@ -377,7 +389,8 @@
       // 与构建版本页一致：先请求目标环境的 /v1/setup?op=hello 拿版本号
       const data = await fetchRemoteJson(buildSetupRequestUrl(url, { op: 'hello' }))
       const snapshot = extractSetupSnapshot(data)
-      const res = await remoteEnv.add(url, snapshot)
+      // hello 成功即在线：online 随快照一起持久化，刷新页面后列表仍显示上次状态
+      const res = await remoteEnv.add(url, snapshot, true)
       envList = normalizeEnvEntries(res?.envs)
       newEnvUrl = ''
     } catch (err) {
@@ -394,20 +407,39 @@
     if (entry.refreshing) return false
     entry.refreshing = true
     try {
+      if (String(entry.id || '').startsWith('tunnel:')) {
+        // 隧道环境：hello 经反向隧道（后端 /hello 端点）
+        const res = await remoteEnv.hello(entry.id)
+        if (res?.snapshot) Object.assign(entry, res.snapshot)
+        const rec = (res?.envs || []).find((e) => e.id === entry.id)
+        if (rec) entry.online = !!rec.online
+        if (!silent) {
+          entry.status = ''
+          entry.statusIsError = false
+        }
+        return true
+      }
       const data = await fetchRemoteJson(buildSetupRequestUrl(entry.url, { op: 'hello' }))
       const snapshot = extractSetupSnapshot(data)
-      await remoteEnv.updateSnapshot(entry.id, snapshot)
+      // 快照 + 在线状态一起落盘（remote_envs.json），刷新页面后仍显示上次结果
+      await remoteEnv.updateSnapshot(entry.id, snapshot, true)
       Object.assign(entry, snapshot)
+      entry.online = true
       if (!silent) {
         entry.status = ''
         entry.statusIsError = false
       }
       return true
     } catch (err) {
+      entry.online = false
       entry.status = err?.status === 401
         ? t('remoteEnvAuthRequired')
         : t('remoteEnvCheckFailed', { error: err?.message || err })
       entry.statusIsError = true
+      // 离线状态同样持久化（隧道环境的在线状态由隧道事件驱动，不在此写）
+      if (!String(entry.id || '').startsWith('tunnel:')) {
+        await remoteEnv.updateSnapshot(entry.id, null, false).catch(() => {})
+      }
       return false
     } finally {
       entry.refreshing = false
@@ -435,13 +467,19 @@
     entry.updating = true
     entry.status = ''
     entry.statusIsError = false
+    const isTunnel = String(entry.id || '').startsWith('tunnel:')
     try {
       const result = await remoteEnv.pushUpdate(entry.id)
       // 后端返回了推送前读到的目标环境快照：先落到行上并持久化，
-      // 重启等待期间也能展示最新基线
+      // 重启等待期间也能展示最新基线；后端 hello 成功即在线，一并落盘
       if (result?.remote) {
         Object.assign(entry, result.remote)
-        await remoteEnv.updateSnapshot(entry.id, result.remote).catch(() => {})
+        if (isTunnel) {
+          await remoteEnv.updateSnapshot(entry.id, result.remote).catch(() => {})
+        } else {
+          entry.online = true
+          await remoteEnv.updateSnapshot(entry.id, result.remote, true).catch(() => {})
+        }
       }
       if (result && result.updated === false) {
         entry.status = t('remoteEnvUpToDate')
@@ -451,20 +489,34 @@
       if (result?.restart_backend) {
         entry.status = t('remoteEnvRestarting')
         entry.statusIsError = false
+        if (isTunnel) {
+          // 隧道环境：子端重启后会自动重新拨号隧道，无法直连轮询；
+          // 在线状态由隧道 attach/detach 事件更新（刷新列表可见）。
+          return
+        }
         const ready = await waitForRemoteReady(entry)
         if (!ready) {
           entry.status = t('remoteEnvRestartTimeout')
           entry.statusIsError = true
+          // 子环境重启后仍未恢复：持久化离线状态
+          entry.online = false
+          await remoteEnv.updateSnapshot(entry.id, null, false).catch(() => {})
           return
         }
       }
-      if (postRefresh) {
+      if (postRefresh && !isTunnel) {
         // 单独更新：完成后立即刷新一次，展示该环境更新后的版本
+        // （隧道环境的快照已包含在推送响应里，且重启期间隧道不可用）
         await refreshRemoteEnv(entry, { silent: true })
       }
     } catch (err) {
       entry.status = remoteEnvUpdateError(err)
       entry.statusIsError = true
+      // 后端连不上子环境 -> 持久化离线状态（隧道环境由隧道事件更新状态）
+      if (err?.code === 'child_unreachable' && !isTunnel) {
+        entry.online = false
+        await remoteEnv.updateSnapshot(entry.id, null, false).catch(() => {})
+      }
     } finally {
       entry.updating = false
     }
@@ -513,6 +565,22 @@
     }
   }
 
+
+  // 可升级：三个版本任一比本地（母环境）更新时，显示与构建版本一致的蓝色升级图标
+  function envHasUpgrade(entry) {
+    return [
+      [frontend, entry.frontend_build],
+      [backend, entry.backend_build],
+      [lastConfig, entry.last_config],
+    ].some(([local, there]) => !!local && (!there || local > there))
+  }
+
+  // 在线：直连与隧道环境统一看 online 字段（见 normalizeEnvEntries）
+  function envOnline(entry) {
+    return !!entry.online
+  }
+
+
   async function removeRemoteEnv(entry) {
     if (checkingAllEnvs || updatingAllEnvs) return
     if (!window.confirm(t('remoteEnvDeleteConfirm', { address: entry.id }))) return
@@ -523,6 +591,67 @@
       envsError = t('remoteEnvRemoveFailed', { error: err?.message || err })
     }
   }
+
+  // ---- 隧道连接（子环境 → 母环境反向隧道） ----
+  async function fetchTunnelStatus() {
+    try {
+      tunnelStatus = await tunnel.parentStatus()
+      tunnelError = ''
+    } catch (err) {
+      tunnelError = err.message || t('fetchTunnelStatusFailed')
+    }
+  }
+
+  function tunnelStateLabel(st) {
+    const map = {
+      idle: t('tunnelStateIdle'),
+      registering: t('tunnelStateRegistering'),
+      connecting: t('tunnelStateConnecting'),
+      online: t('tunnelStateOnline'),
+      unregistered: t('tunnelStateUnregistered'),
+      error: t('tunnelStateError'),
+    }
+    return map[st] || st
+  }
+
+  async function handleTunnelRegister() {
+    if (!setupSource.trim()) return
+    tunnelBusy = true
+    tunnelError = ''
+    try {
+      // 地址随请求下发：后端校验后持久化为 SETUP_SOURCE 再注册
+      const data = await tunnel.parentRegister(setupSource.trim())
+      if (!data.ok) tunnelError = data.error || t('tunnelRegisterFailed')
+    } catch (err) {
+      tunnelError = err.message || t('tunnelRegisterFailed')
+    } finally {
+      tunnelBusy = false
+      fetchTunnelStatus()
+    }
+  }
+
+  async function handleTunnelUnregister() {
+    tunnelBusy = true
+    tunnelError = ''
+    try {
+      const data = await tunnel.parentUnregister()
+      if (!data.ok) tunnelError = data.error || t('tunnelUnregisterFailed')
+    } catch (err) {
+      tunnelError = err.message || t('tunnelUnregisterFailed')
+    } finally {
+      tunnelBusy = false
+      fetchTunnelStatus()
+    }
+  }
+
+  $effect(() => {
+    fetchTunnelStatus()
+    // 配置了母环境地址时轮询连接状态（拨号/重连/掉线反馈）
+    const id = setInterval(() => {
+      if (tunnelStatus && tunnelStatus.configured) fetchTunnelStatus()
+    }, 4000)
+    return () => clearInterval(id)
+  })
 
   async function loadConfig() {
     loading = true
@@ -852,12 +981,18 @@
                   <span>{t('buildBackend')}</span>
                   <span>{t('buildConfig')}</span>
                   <span>{t('remoteEnvInference')}</span>
+                  <span>{t('remoteEnvUpgradeCol')}</span>
+                  <span>{t('remoteEnvOnlineCol')}</span>
                   <span></span>
                 </div>
                 {#each envList as entry (entry.id)}
                   <div class="remote-env-item">
                     <div class="remote-env-row">
-                      <a class="remote-env-address" href={remoteEnvHomeUrl(entry.url)} target="_blank" rel="noopener noreferrer" title={entry.url}>{entry.id}</a>
+                      {#if entry.id.startsWith('tunnel:') && !entry.url}
+                        <span class="remote-env-address tunnel-address" title={t('tunnelEnvHint')}>🛰️ {entry.id}</span>
+                      {:else}
+                        <a class="remote-env-address" href={remoteEnvHomeUrl(entry.url)} target="_blank" rel="noopener noreferrer" title={entry.url}>{entry.id}</a>
+                      {/if}
                       <span class="remote-env-app">
                         {#if isRemoteLogoImage(entry.app_logo)}
                           <img class="remote-env-logo" src={resolveRemoteEnvLogo(entry.id, entry.app_logo)} alt="" loading="lazy" />
@@ -873,6 +1008,12 @@
                       <span class="inference-pill" class:busy={entry.inference_active}>
                         <span class="dot"></span>
                         {entry.inference_active ? t('remoteEnvInferenceActive') : t('remoteEnvIdle')}
+                      </span>
+                      <span class="remote-env-upgrade" title={envHasUpgrade(entry) ? t('remoteEnvUpgradeHint') : ''}>
+                        {#if envHasUpgrade(entry)}<span class="sync-up">⏫</span>{/if}
+                      </span>
+                      <span class="remote-env-online" title={envOnline(entry) ? t('remoteEnvOnline') : t('remoteEnvOffline')}>
+                        {#if envOnline(entry)}<span class="env-check">✓</span>{/if}
                       </span>
                       <span class="remote-env-actions">
                         <button
@@ -906,6 +1047,44 @@
               </div>
             </div>
           {/if}
+        </section>
+
+        <section class="card tunnel-conn-card">
+          <div class="card-header compact">
+            <div>
+              <h3>{t('tunnelTitle')}</h3>
+            </div>
+          </div>
+          <p>{t('tunnelConnDesc')}</p>
+          <div class="tunnel-conn-row">
+            <input
+              class="tunnel-conn-input"
+              aria-label={t('tunnelParent')}
+              placeholder={t('setupSourcePlaceholder')}
+              bind:value={setupSource}
+              oninput={resetUpdateState}
+              spellcheck="false"
+            />
+            <span class="tunnel-conn-state" class:online={tunnelConnected} title={tunnelStatus?.detail || ''}>
+              <span class="dot"></span>
+              {tunnelStatus ? tunnelStateLabel(tunnelStatus.state) : t('tunnelStateIdle')}
+            </span>
+            <button
+              class="btn btn-primary"
+              type="button"
+              title={t('tunnelRegisterHint')}
+              onclick={handleTunnelRegister}
+              disabled={!canTunnelRegister}
+            >
+              {tunnelBusy ? t('tunnelBusy') : t('tunnelRegister')}
+            </button>
+            <button class="btn btn-secondary" type="button" title={t('tunnelUnregisterHint')} onclick={handleTunnelUnregister} disabled={!canTunnelUnregister}>
+              {t('tunnelUnregister')}
+            </button>
+            {#if tunnelError}
+              <span class="tunnel-conn-error" title={tunnelError}>{tunnelError}</span>
+            {/if}
+          </div>
         </section>
 
         {#if hasPassword}
@@ -1315,6 +1494,47 @@
   .remote-envs-error {
     margin-bottom: 10px;
   }
+  .tunnel-conn-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: nowrap;
+    gap: 10px;
+  }
+  .tunnel-conn-input {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .tunnel-conn-state {
+    display: inline-flex;
+    align-items: center;
+    flex: 0 0 auto;
+    gap: 6px;
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+    white-space: nowrap;
+  }
+  .tunnel-conn-state .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--text-secondary);
+    display: inline-block;
+  }
+  .tunnel-conn-state.online {
+    color: var(--success);
+  }
+  .tunnel-conn-state.online .dot {
+    background: var(--success);
+  }
+  .tunnel-conn-error {
+    flex: 0 1 auto;
+    min-width: 0;
+    font-size: 0.8rem;
+    color: var(--danger);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
   .remote-envs-list {
     border: 1px solid var(--border);
     border-radius: 8px;
@@ -1322,7 +1542,7 @@
   }
   .remote-envs-scroll {
     display: grid;
-    grid-template-columns: minmax(150px, max-content) minmax(120px, max-content) max-content repeat(3, 130px) max-content 1fr;
+    grid-template-columns: minmax(150px, max-content) minmax(120px, max-content) max-content repeat(3, 130px) max-content max-content max-content 1fr;
     column-gap: 12px;
     width: max-content;
     min-width: 100%;
@@ -1339,8 +1559,8 @@
   /* Chromium 会忽略 subgrid 容器上的 justify-items，逐列对齐改在单元格上做：
      表头单元格拉伸占满轨道宽，用 text-align 对齐文字（前两列默认即左对齐）；
      数据行单元格用 justify-self 收缩为内容宽——地址(id)与标题列左对齐，
-     架构/系统、前端、后端、配置、状态列右对齐（状态列宽度由最长的三字
-     "推理中"胶囊撑开），操作列保持右对齐 */
+     架构/系统、前端、后端、配置、状态、升级、在线列右对齐（状态列宽度由
+     最长的三字"推理中"胶囊撑开；升级/在线列由表头文字撑开），操作列保持右对齐 */
   .remote-env-head {
     text-align: right;
     /* 负 margin 抵消容器左右 padding，使灰色表头条横贯整个列表且不影响轨道对齐 */
@@ -1358,7 +1578,9 @@
   .remote-env-platform,
   .remote-env-actions,
   .remote-env-row .build-value,
-  .remote-env-row .inference-pill {
+  .remote-env-row .inference-pill,
+  .remote-env-row .remote-env-upgrade,
+  .remote-env-row .remote-env-online {
     justify-self: end;
   }
   .remote-env-item + .remote-env-item {
@@ -1383,6 +1605,24 @@
   .remote-env-address:hover {
     color: var(--primary-hover);
     text-decoration: underline;
+  }
+  .tunnel-address {
+    cursor: default;
+    color: var(--text);
+  }
+  .remote-env-upgrade {
+    min-width: 14px;
+    line-height: 1;
+  }
+  .remote-env-upgrade .sync-up {
+    margin-left: 0;
+  }
+  .remote-env-online {
+    line-height: 1;
+  }
+  .env-check {
+    color: var(--success);
+    font-weight: 600;
   }
   .remote-env-app {
     display: inline-flex;

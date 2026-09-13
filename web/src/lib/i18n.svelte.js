@@ -142,6 +142,12 @@ const translations = {
     remoteEnvUpdateAll: '一键更新',
     remoteEnvUpdatingAll: '更新中...',
     remoteEnvEmpty: '暂无远程环境。在上方输入环境地址后点击"添加环境"。',
+    tunnelEnvHint: '隧道环境：经反向隧道连接，无需直连地址。',
+    remoteEnvUpgradeCol: '升级',
+    remoteEnvOnlineCol: '在线',
+    remoteEnvOnline: '在线',
+    remoteEnvOffline: '离线',
+    remoteEnvUpgradeHint: '本地（母环境）版本更新，可推送升级',
     remoteEnvAddress: '地址',
     remoteEnvTitle: '标题',
     remoteEnvPlatform: '架构 / 系统',
@@ -434,6 +440,12 @@ const translations = {
     functionTools: '函数工具',
     skillTools: '技能工具',
 
+    // 执行环境（远程执行）
+    executionEnv: '执行环境',
+    localEnv: '本地',
+    remoteEnvNotFound: '远程环境不存在或已被删除',
+    remoteToolsLoadFailed: '加载远程工具列表失败',
+
     // ModelForm
     editModel: '编辑模型',
     registerModel: '注册模型',
@@ -535,6 +547,7 @@ const translations = {
     analysisNoData: '暂无可分析的执行记录',
     openSessionLogDir: '打开会话日志目录',
     openSessionLogDirFailed: '打开会话日志目录失败',
+    remoteJournalLink: '子端 file journal',
     searchSessions: '搜索最近会话，回车执行；空白回车取消',
     searchSessionsTooltip: '搜索最近会话\n空格=AND，|=OR\n例: error timeout（同时包含）\n    error|timeout（包含任一）',
 
@@ -559,6 +572,24 @@ const translations = {
     detectedUnsetKeys: '检测到以下未配置的变量：',
     noUnsetKeys: '所有检测到的变量均已配置',
     envKeyRequired: '变量名不能为空',
+    // Tunnel（子端 → 母环境反向隧道）
+    tunnelTitle: '隧道连接',
+    tunnelConnDesc: '当前环境将作为子环境，主动向母环境建立隧道，并把自己注册进母环境的远程环境列表。适用于子环境无法被母环境直接访问（如处于内网、NAT 之后），但能访问到母环境地址的场景。',
+    tunnelParent: '母环境',
+    tunnelRegister: '注册到母环境',
+    tunnelRegisterHint: '把本环境注册到母环境，地址保存为 SETUP_SOURCE 变量',
+    tunnelUnregister: '注销',
+    tunnelUnregisterHint: '把本环境从母环境注销并断开隧道',
+    tunnelBusy: '操作中…',
+    tunnelRegisterFailed: '注册失败',
+    tunnelUnregisterFailed: '注销失败',
+    fetchTunnelStatusFailed: '获取隧道状态失败',
+    tunnelStateIdle: '未启用',
+    tunnelStateRegistering: '注册中…',
+    tunnelStateConnecting: '连接中…',
+    tunnelStateOnline: '已连接',
+    tunnelStateUnregistered: '已被母环境移除',
+    tunnelStateError: '出错',
 
     // ToolDetail
     toolDetail: '工具详情',
@@ -755,6 +786,12 @@ const translations = {
     remoteEnvUpdateAll: 'Update all',
     remoteEnvUpdatingAll: 'Updating...',
     remoteEnvEmpty: 'No remote environments yet. Enter an environment URL above and click "Add environment".',
+    tunnelEnvHint: 'Tunnel environment: connected over the reverse tunnel, no direct URL needed.',
+    remoteEnvUpgradeCol: 'Upgrade',
+    remoteEnvOnlineCol: 'Online',
+    remoteEnvOnline: 'Online',
+    remoteEnvOffline: 'Offline',
+    remoteEnvUpgradeHint: 'The parent has a newer version; an upgrade can be pushed',
     remoteEnvAddress: 'Address',
     remoteEnvTitle: 'Title',
     remoteEnvPlatform: 'Arch / OS',
@@ -1047,6 +1084,12 @@ const translations = {
     functionTools: 'Functions',
     skillTools: 'Skills',
 
+    // Execution environment (remote execution)
+    executionEnv: 'Exec Env',
+    localEnv: 'Local',
+    remoteEnvNotFound: 'Remote environment not found or removed',
+    remoteToolsLoadFailed: 'Failed to load remote tools',
+
     // ModelForm
     editModel: 'Edit Model',
     registerModel: 'Register Model',
@@ -1148,6 +1191,7 @@ const translations = {
     analysisNoData: 'No execution records available',
     openSessionLogDir: 'Open session log directory',
     openSessionLogDirFailed: 'Failed to open session log directory',
+    remoteJournalLink: 'Remote file journal',
     searchSessions: 'Search recent sessions; Enter to run, blank to reset',
     searchSessionsTooltip: 'Search recent sessions\nSpace=AND, |=OR\nEg: error timeout (both)\n    error|timeout (either)',
 
@@ -1172,6 +1216,24 @@ const translations = {
     detectedUnsetKeys: 'Detected unconfigured variables:',
     noUnsetKeys: 'All detected variables are configured',
     envKeyRequired: 'Key is required',
+    // Tunnel (child -> parent reverse tunnel)
+    tunnelTitle: 'Tunnel Connection',
+    tunnelConnDesc: 'This environment acts as the child: it dials out to the parent and registers itself in the parent\'s remote environment list. Useful when the parent cannot reach this environment directly (e.g. it is behind a NAT or firewall) but can reach the parent\'s address.',
+    tunnelParent: 'Parent',
+    tunnelRegister: 'Register to parent',
+    tunnelRegisterHint: 'Register this environment to its parent; the address is stored as the SETUP_SOURCE variable',
+    tunnelUnregister: 'Unregister',
+    tunnelUnregisterHint: 'Remove this environment from the parent and disconnect the tunnel',
+    tunnelBusy: 'Working…',
+    tunnelRegisterFailed: 'Registration failed',
+    tunnelUnregisterFailed: 'Unregistration failed',
+    fetchTunnelStatusFailed: 'Failed to fetch tunnel status',
+    tunnelStateIdle: 'Idle',
+    tunnelStateRegistering: 'Registering…',
+    tunnelStateConnecting: 'Connecting…',
+    tunnelStateOnline: 'Online',
+    tunnelStateUnregistered: 'Removed by parent',
+    tunnelStateError: 'Error',
 
     // ToolDetail
     toolDetail: 'Tool Detail',

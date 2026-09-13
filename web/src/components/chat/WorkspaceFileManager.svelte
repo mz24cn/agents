@@ -2,6 +2,7 @@
   import { tick } from 'svelte'
   import { t } from '../../lib/i18n.svelte.js'
   import { workspace as workspaceApi } from '../../lib/api.js'
+  import { remoteWorkspace } from '../../lib/remote-execution.svelte.js'
   import { marked } from 'marked'
   import { highlight, escapeHtml, getFileLang, isMarkdownFile } from '../../lib/highlight.js'
   import { copyToClipboard } from '../../lib/clipboard.js'
@@ -25,8 +26,16 @@
     navigateTarget = $bindable(null),
     onWorkspaceChange,
     onSelectFiles,
-    onClose
+    onClose,
+    remote = null,
+    // 子端 file journal 软链接条目（"打开会话日志目录"本地模式 + 父端探测到子端
+    // 已有 journal 时非空）：{ envId, path, envName }
+    logDirRemoteJournal = null,
+    onOpenRemoteJournal,
   } = $props()
+
+  // 远程执行模式：全部 workspace 请求直连子环境（避免经母端转发）。
+  let wsApi = $derived(remote ? remoteWorkspace : workspaceApi)
 
   const SORT_TIME_DESC_STORAGE_KEY = 'workspace_file_manager_sort_time_desc'
   const NAME_FILTER_STORAGE_KEY = 'workspace_file_manager_name_filter'
@@ -107,6 +116,11 @@
   let treeInitialized = false
   // 跟踪上次的工作区路径，用于检测外部变化
   let trackedWorkspace = $state('')
+  // 环境身份（remote env id）："相同目录 → 跳过加载"的优化只在同一环境内成立；
+  // 切换环境（含本地 ↔ 远程）意味着不同文件系统，即使路径相同也要整树重建
+  let trackedRemoteEnvKey = $state('')
+  // 树代际：环境切换时使在途的树初始化/导航失效，防止旧环境节点插入新树
+  let treeGen = 0
   let uploadTasks = $state([])
   let uploadQueueRunning = false
   // Backend-approved clipboard/upload directory (/tmp on Unix, OS temp on
@@ -118,7 +132,7 @@
     if (pasteDirectoryPath || pasteDirectoryLoading) return
     pasteDirectoryLoading = true
     try {
-      const result = await workspaceApi.pasteDir()
+      const result = await wsApi.pasteDir()
       pasteDirectoryPath = result?.path || ''
     } catch (err) {
       // Keep normal workspace operations available if this optional endpoint
@@ -307,8 +321,28 @@
   // 跟踪上次的面板打开状态，用于打开时滚动工作区节点
   let prevOpen = false
 
+  // 树操作在途检查：环境已切换（treeGen 变化）时返回 GEN_CHANGED，调用方放弃本次遍历
+  const GEN_CHANGED = Symbol('tree-gen-changed')
+  async function awaitTreeOp(gen, promise) {
+    const result = await promise
+    return gen !== treeGen ? GEN_CHANGED : result
+  }
+
   // 初始化：加载工作区根目录
   $effect(() => {
+    // 环境切换（含本地 ↔ 远程）：旧树节点属于旧环境的文件系统，不能复用；
+    // 重置树状态后，下方逻辑会在路径不变的情况下重新加载。
+    const remoteEnvKey = remote ? (remote.id || 'remote') : 'local'
+    if (remoteEnvKey !== trackedRemoteEnvKey) {
+      trackedRemoteEnvKey = remoteEnvKey
+      treeGen++
+      treeInitPromise = null
+      treeInitialized = false
+      treeNodes = []
+      currentPath = ''
+      files = []
+    }
+
     // 检测工作区路径是否从外部变化
     if (workspacePath !== trackedWorkspace) {
       trackedWorkspace = workspacePath
@@ -356,7 +390,7 @@
     loading = true
     error = ''
     try {
-      const data = await workspaceApi.list(dirPath, page, pageSize, false, {
+      const data = await wsApi.list(dirPath, page, pageSize, false, {
         sort: getSortMode(),
         nameFilter: nameFilterQuery.trim(),
       })
@@ -388,16 +422,17 @@
   // 初始化目录树：从根节点逐级展开到工作区路径
   let treeInitPromise = null
   async function initTree(wsPath) {
+    const gen = treeGen
     treeNodes = []
     // 1. 加载根节点（Windows 下可能是多个盘符，Unix 下是 ['/']）
     let roots
     try {
-      roots = await workspaceApi.children('')
+      roots = await awaitTreeOp(gen, wsApi.children(''))
     } catch (err) {
       console.error('Failed to load roots:', err)
       return
     }
-    if (!roots || roots.length === 0) return
+    if (roots === GEN_CHANGED || !roots || roots.length === 0) return
 
     // 为所有根节点创建树节点（depth=0）
     const normalizedWs = wsPath.replace(/\\/g, '/').toLowerCase()
@@ -427,8 +462,8 @@
       const firstRoot = treeNodes[0]
       firstRoot.expanded = true
       try {
-        const children = await workspaceApi.children(firstRoot.path)
-        insertChildren(0, firstRoot.path, children, wsPath)
+        const children = await awaitTreeOp(gen, wsApi.children(firstRoot.path))
+        if (children !== GEN_CHANGED) insertChildren(0, firstRoot.path, children, wsPath)
       } catch {}
       treeNodes = [...treeNodes]
       return
@@ -441,11 +476,12 @@
     // 加载根的子目录
     let children
     try {
-      children = await workspaceApi.children(wsRoot.path)
+      children = await awaitTreeOp(gen, wsApi.children(wsRoot.path))
     } catch {
       treeNodes = [...treeNodes]
       return
     }
+    if (children === GEN_CHANGED) return
     insertChildren(wsRootIdx, wsRoot.path, children, wsPath)
 
     // 从根到工作区的路径段，逐级展开
@@ -470,7 +506,8 @@
 
       // 加载该段的子目录
       try {
-        const subChildren = await workspaceApi.children(segPath)
+        const subChildren = await awaitTreeOp(gen, wsApi.children(segPath))
+        if (subChildren === GEN_CHANGED) return
         insertChildren(nodeIdx, segPath, subChildren, wsPath)
       } catch {
         break
@@ -517,6 +554,7 @@
 
   // 增量导航到新工作区路径：复用已加载的树节点，仅加载缺失的层级
   async function navigateTreeToPath(wsPath) {
+    const gen = treeGen
     if (treeNodes.length === 0) {
       return ensureTreeInit(wsPath)
     }
@@ -544,7 +582,8 @@
     wsRoot.expanded = true
     if (!hasChildrenLoaded(wsRootIdx)) {
       try {
-        const children = await workspaceApi.children(wsRoot.path)
+        const children = await awaitTreeOp(gen, wsApi.children(wsRoot.path))
+        if (children === GEN_CHANGED) return
         insertChildren(wsRootIdx, wsRoot.path, children, wsPath)
       } catch { return }
     }
@@ -567,7 +606,8 @@
       if (nodeIdx === -1) {
         // 节点不在树中，重新加载父节点的子节点
         try {
-          const subChildren = await workspaceApi.children(parentPath)
+          const subChildren = await awaitTreeOp(gen, wsApi.children(parentPath))
+          if (subChildren === GEN_CHANGED) return
           insertChildren(parentIdx, parentPath, subChildren, wsPath)
         } catch { break }
         nodeIdx = treeNodes.findIndex(n => pathsEqual(n.path, segPath))
@@ -580,7 +620,8 @@
       // 加载子节点（如果尚未加载）
       if (!hasChildrenLoaded(nodeIdx)) {
         try {
-          const subChildren = await workspaceApi.children(segPath)
+          const subChildren = await awaitTreeOp(gen, wsApi.children(segPath))
+          if (subChildren === GEN_CHANGED) return
           insertChildren(nodeIdx, segPath, subChildren, wsPath)
         } catch { break }
       }
@@ -602,6 +643,7 @@
   // 展开目录树到任意目录（不改变 workspace 标记，仅展开路径节点）
   // 用于从会话日志目录等外部路径进入时，让左侧列表与右侧树保持一致
   async function expandTreeToPath(dirPath) {
+    const gen = treeGen
     if (!dirPath) return
     if (treeNodes.length === 0) {
       await ensureTreeInit(workspacePath)
@@ -622,7 +664,8 @@
     root.expanded = true
     if (!hasChildrenLoaded(rootIdx)) {
       try {
-        const children = await workspaceApi.children(root.path)
+        const children = await awaitTreeOp(gen, wsApi.children(root.path))
+        if (children === GEN_CHANGED) return
         insertChildren(rootIdx, root.path, children, workspacePath)
       } catch { return }
     }
@@ -643,7 +686,8 @@
       if (nodeIdx === -1) {
         // 节点不在树中，重新加载父节点的子节点
         try {
-          const subChildren = await workspaceApi.children(parentPath)
+          const subChildren = await awaitTreeOp(gen, wsApi.children(parentPath))
+          if (subChildren === GEN_CHANGED) return
           insertChildren(parentIdx, parentPath, subChildren, workspacePath)
         } catch { break }
         nodeIdx = treeNodes.findIndex(n => pathsEqual(n.path, segPath))
@@ -655,7 +699,8 @@
       // 加载子节点（如果尚未加载）
       if (!hasChildrenLoaded(nodeIdx)) {
         try {
-          const subChildren = await workspaceApi.children(segPath)
+          const subChildren = await awaitTreeOp(gen, wsApi.children(segPath))
+          if (subChildren === GEN_CHANGED) return
           insertChildren(nodeIdx, segPath, subChildren, workspacePath)
         } catch { break }
       }
@@ -752,7 +797,13 @@
       treeNodes[idx].loading = true
       treeNodes = [...treeNodes]
       try {
-        const children = await workspaceApi.children(node.path)
+        const gen = treeGen
+        const children = await awaitTreeOp(gen, wsApi.children(node.path))
+        if (children === GEN_CHANGED) {
+          treeNodes[idx].loading = false
+          treeNodes = [...treeNodes]
+          return
+        }
         insertChildren(idx, node.path, children, workspacePath)
         treeNodes[idx].expanded = true
         treeNodes[idx].loading = false
@@ -768,6 +819,7 @@
   // 设置目录为新工作区
   function setAsWorkspace(dirPath) {
     trackedWorkspace = dirPath   // 防止 $effect 重复触发
+    treeGen++                    // 在途树遍历失效（新工作区）
     workspacePath = dirPath
     currentPath = dirPath
     page = 1
@@ -809,7 +861,7 @@
     const idx = treeNodes.findIndex(n => pathsEqual(n.path, dirPath))
     if (idx === -1 || !treeNodes[idx].expanded) return
     try {
-      const children = await workspaceApi.children(dirPath)
+      const children = await wsApi.children(dirPath)
       insertChildren(idx, dirPath, children, workspacePath)
       treeNodes = [...treeNodes]
     } catch (err) {
@@ -865,7 +917,7 @@
     searchMode = true
     loading = true
     try {
-      const results = await workspaceApi.search(currentPath, searchQuery.trim(), nameFilterQuery.trim())
+      const results = await wsApi.search(currentPath, searchQuery.trim(), nameFilterQuery.trim())
       searchResults = results
     } catch (err) {
       error = err.message
@@ -951,7 +1003,7 @@
     }, 500)
 
     try {
-      const response = await fetch(workspaceApi.content(file.path, false), { signal: controller.signal })
+      const response = await fetch(wsApi.content(file.path, false), { signal: controller.signal })
       if (!response.ok) throw new Error('Failed to load file content')
 
       const total = Number.parseInt(response.headers.get('Content-Length') || '0', 10) || 0
@@ -1198,7 +1250,7 @@
       // data URI 保持不变
       if (/^data:/i.test(src)) return src
       // 绝对路径（以 / 开头）直接用 workspace API
-      if (src.startsWith('/')) return workspaceApi.content(src, false)
+      if (src.startsWith('/')) return wsApi.content(src, false)
       // 相对路径：相对于 markdown 文件所在目录解析
       const dir = getMarkdownDir()
       if (!dir) return src // 无法解析目录，保持原样
@@ -1212,7 +1264,7 @@
       }
       // Unix 绝对路径需要前导 /，Windows 路径（如 C:）已包含在 resolved[0]
       const absolutePath = (filePath.startsWith('/') ? '/' : '') + resolved.join('/')
-      return workspaceApi.content(absolutePath, false)
+      return wsApi.content(absolutePath, false)
     }
 
     if (forcePlainText) {
@@ -1251,7 +1303,7 @@
   // 下载文件
   function downloadFile(file) {
     const link = document.createElement('a')
-    link.href = workspaceApi.download(file.path, false)
+    link.href = wsApi.download(file.path, false)
     link.download = file.name
     link.click()
   }
@@ -1329,7 +1381,7 @@
     const files = getSelectedFiles().filter(f => !f.is_dir)
     for (const file of files) {
       const link = document.createElement('a')
-      link.href = workspaceApi.download(file.path, false)
+      link.href = wsApi.download(file.path, false)
       link.download = file.name
       link.click()
     }
@@ -1357,7 +1409,7 @@
     const files = getSelectedFiles().filter(f => !f.is_dir)
     for (const file of files) {
       try {
-        await workspaceApi.duplicate(file.path)
+        await wsApi.duplicate(file.path)
       } catch (err) {
         error = err.message
       }
@@ -1372,7 +1424,7 @@
     if (!confirm(`${t('confirmDeleteFile')} (${files.length} ${t('files')}: ${names})`)) return
     for (const file of files) {
       try {
-        await workspaceApi.delete(file.path)
+        await wsApi.delete(file.path)
       } catch (err) {
         error = err.message
       }
@@ -1421,7 +1473,7 @@
     if (!newName || newName === file.name) return
     
     try {
-      await workspaceApi.rename(file.path, newName)
+      await wsApi.rename(file.path, newName)
       loadFiles(currentPath)
     } catch (err) {
       console.error('Rename error:', err)
@@ -1433,7 +1485,7 @@
   // 创建副本
   async function duplicateFile(file) {
     try {
-      await workspaceApi.duplicate(file.path)
+      await wsApi.duplicate(file.path)
       loadFiles(currentPath)
     } catch (err) {
       error = err.message
@@ -1446,7 +1498,7 @@
     if (!confirm(t('confirmDeleteNamedFile').replace('{name}', file.name))) return
     
     try {
-      await workspaceApi.delete(file.path)
+      await wsApi.delete(file.path)
       loadFiles(currentPath)
     } catch (err) {
       error = err.message
@@ -1571,7 +1623,7 @@
    */
   async function executeMoveOrCopy(paths, destPath, operation, overwrite = false) {
     try {
-      const apiMethod = operation === 'copy' ? workspaceApi.copy : workspaceApi.move
+      const apiMethod = operation === 'copy' ? wsApi.copy : wsApi.move
       const result = await apiMethod(paths, destPath, overwrite)
       
       // 检查是否有冲突
@@ -1645,7 +1697,7 @@
     if (!name) return
 
     try {
-      await workspaceApi.mkdir(targetDirPath, name)
+      await wsApi.mkdir(targetDirPath, name)
       if (pathsEqual(currentPath, targetDirPath)) reloadCurrentDirectory()
       await refreshTreeNodeChildren(targetDirPath)
     } catch (err) {
@@ -1715,7 +1767,7 @@
       task.status = 'initializing'
       task.error = ''
       refreshUploads()
-      const init = await workspaceApi.uploadInit({
+      const init = await wsApi.uploadInit({
         workspace_id: 'default',
         file_name: task.file_name,
         file_size: task.file_size,
@@ -1741,7 +1793,7 @@
 
       task.status = 'completing'
       refreshUploads()
-      await workspaceApi.uploadComplete(task.upload_id)
+      await wsApi.uploadComplete(task.upload_id)
       task.status = 'completed'
       task.chunks.forEach((chunk) => {
         chunk.uploaded = chunk.size
@@ -1781,7 +1833,7 @@
     chunk.status = 'uploading'
     chunk.uploaded = 0
     const body = task.file.slice(chunk.offset, chunk.offset + chunk.size)
-    const request = workspaceApi.uploadChunk(task.upload_id, chunk, body, (uploaded) => {
+    const request = wsApi.uploadChunk(task.upload_id, chunk, body, (uploaded) => {
       chunk.uploaded = uploaded
       refreshUploads()
     })
@@ -1823,7 +1875,7 @@
     task.status = 'completing'
     refreshUploads()
     try {
-      await workspaceApi.uploadComplete(task.upload_id)
+      await wsApi.uploadComplete(task.upload_id)
       task.status = 'completed'
       refreshUploads()
       if (pathsEqual(currentPath, task.target_dir_path)) loadFiles(currentPath)
@@ -1843,7 +1895,7 @@
     refreshUploads()
     if (task.upload_id) {
       try {
-        await workspaceApi.uploadCancel(task.upload_id)
+        await wsApi.uploadCancel(task.upload_id)
       } catch (err) {
         console.warn('Failed to cancel upload:', err)
       }
@@ -2186,6 +2238,21 @@
               </button>
             {/if}
 
+            <!-- 子端 file journal 软链接：仅在"打开会话日志目录"本地模式且父端
+                 探测到子端已有 journal 时显示；点击切换到子端环境并跳转子端会话目录 -->
+            {#if logDirRemoteJournal && logDirRemoteJournal.path && !searchMode}
+              <button
+                class="file-item remote-journal-link"
+                title={logDirRemoteJournal.path}
+                onclick={() => onOpenRemoteJournal?.()}
+              >
+                <span class="file-icon">🔗</span>
+                <span class="file-name">{t('remoteJournalLink')} · {logDirRemoteJournal.envName}</span>
+                <span class="file-size"></span>
+                <span class="file-date"></span>
+              </button>
+            {/if}
+
             <!-- 文件列表视图 -->
             {#if viewMode === 'list'}
               {#each displayedFiles as file (file.path)}
@@ -2228,7 +2295,7 @@
                     ondragend={handleFileDragEnd}
                   >
                     {#if file.is_image}
-                      <div class="grid-thumbnail" style="background-image: url({workspaceApi.thumbnail(file.path, false)})"></div>
+                      <div class="grid-thumbnail" style="background-image: url({wsApi.thumbnail(file.path, false)})"></div>
                     {:else}
                       <div class="grid-icon">{getFileIcon(file)}</div>
                     {/if}
@@ -2349,7 +2416,7 @@
           </div>
         </div>
         {#if previewFile.is_image}
-          <div class="preview-content"><img src={workspaceApi.content(previewFile.path, false)} alt={previewFile.name} /></div>
+          <div class="preview-content"><img src={wsApi.content(previewFile.path, false)} alt={previewFile.name} /></div>
         {:else if previewFile.is_video}
           <div class="preview-content">
             {#if previewObjectUrl}
@@ -2357,9 +2424,9 @@
             {/if}
           </div>
         {:else if previewFile.is_audio}
-          <div class="preview-content"><audio src={workspaceApi.content(previewFile.path, false)} controls></audio></div>
+          <div class="preview-content"><audio src={wsApi.content(previewFile.path, false)} controls></audio></div>
         {:else if previewFile.is_pdf || previewFile.is_docx}
-          <DocumentPreview file={previewFile} url={workspaceApi.content(previewFile.path, false)} />
+          <DocumentPreview file={previewFile} url={wsApi.content(previewFile.path, false)} />
         {:else if previewFile.is_text}
           <div class="text-preview" bind:this={textPreviewEl}>{@html renderPreviewHtml(previewContent, previewFile.name, previewFile.forcePlainText, previewFile.path)}</div>
         {/if}
@@ -2806,6 +2873,15 @@
 
   .file-item.directory .file-name {
     font-weight: 500;
+  }
+
+  /* 子端 file journal 软链接（虚拟条目，点击跳转子端会话目录） */
+  .remote-journal-link .file-name {
+    color: var(--primary);
+  }
+
+  .remote-journal-link:hover .file-name {
+    text-decoration: underline;
   }
 
   .file-icon {

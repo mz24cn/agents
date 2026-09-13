@@ -806,8 +806,9 @@
     terminalOpen.token++
   }
 
-  // 打开会话日志目录：请求后端返回 conversation.json 所在目录，
-  // 通知 ChatPage 显示文件管理器面板并导航到该目录
+  // 打开会话日志目录：取本地（父端）log-dir 端点（conversation.json 所在目录），
+  // 通知 ChatPage 显示文件管理器面板并导航。会话目录始终在本地——即使会话绑定
+  // 远程环境（file journal 在子端）也打开本地会话目录。
   async function handleOpenSessionLogDir(e, sessionId) {
     e.stopPropagation()
     closeMenu()
@@ -815,6 +816,8 @@
       const data = await sessions.logDir(sessionId)
       if (!data?.path) throw new Error(t('openSessionLogDirFailed') || 'Failed to resolve log directory')
       openSessionLogDir.path = data.path
+      // 子端 file journal 软链接（父端探测结果）：无 journal / 本地会话时为 null
+      openSessionLogDir.remoteJournal = data.remote_journal || null
       openSessionLogDir.token++
     } catch (err) {
       restoreError = err.message || t('openSessionLogDirFailed')

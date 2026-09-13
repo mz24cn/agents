@@ -1,7 +1,7 @@
 <script>
   import { onMount, onDestroy, setContext, untrack } from 'svelte'
   import { writable } from 'svelte/store'
-  import { inferStream, abortInferStream, subscribeSessionEvents, subscribeSessionStream, agents as agentsApi, sessions as sessionsApi } from '../../lib/api.js'
+  import { inferStream, abortInferStream, subscribeSessionEvents, subscribeSessionStream, agents as agentsApi, sessions as sessionsApi, remoteEnv as remoteEnvApi } from '../../lib/api.js'
   import { catalog, loadAgents, loadTools, loadEnvVars, refreshAgents } from '../../lib/catalog-state.svelte.js'
   import ModelSelector from './ModelSelector.svelte'
   import ToolSelector from './ToolSelector.svelte'
@@ -22,6 +22,16 @@
   import DownloadProgress from './DownloadProgress.svelte'
   import { collapseSidebar } from '../../lib/sidebar-width.svelte.js'
   import Terminal from '../Terminal.svelte'
+  import {
+    remoteExecution,
+    bindSessionToRemoteEnv,
+    clearRemoteBinding,
+    fetchRemoteEnvList,
+    fetchRemoteTools,
+    fetchRemoteWorkspacePath,
+    remoteSessions,
+    destroyRemoteTerminal,
+  } from '../../lib/remote-execution.svelte.js'
 
   const STORAGE_MODEL_KEY = 'chat_selected_model'
   const STORAGE_TOOLS_KEY = 'chat_selected_tools'
@@ -291,28 +301,85 @@
     }
   })
 
-  // Listen for "打开会话日志目录" requests from sidebar: show the file manager
-  // panel and navigate it to the session's conversation.json directory.
+  // Listen for "打开会话日志目录" requests from the sidebar: show the file manager
+  // panel and navigate it to the LOCAL session log directory (the conversation.json
+  // directory). 会话目录始终在本地（父端）：即使会话绑定远程环境（file journal
+  // 在子端），也打开本地会话目录，文件管理器需临时锁定本地环境（logDirLocalMode）。
   let lastOpenLogDirToken = 0
   $effect(() => {
     const req = openSessionLogDir
     if (!req.token || req.token === lastOpenLogDirToken || !req.path) return
     lastOpenLogDirToken = req.token
+    logDirLocalMode = true
+    // 子端 file journal 软链接（父端 log-dir 探测结果）：本地会话 / 子端无 journal 为 null
+    const rj = req.remoteJournal
+    if (rj && rj.path) {
+      const boundEnv = (sessionId && remoteExecution.sessionId === sessionId) ? remoteExecution.env : null
+      const envRec = remoteEnvs.find(e => e.id === rj.env_id)
+      logDirRemoteJournal = {
+        envId: rj.env_id,
+        path: rj.path,
+        envName: (boundEnv && boundEnv.id === rj.env_id && boundEnv.title)
+          || (envRec ? envDisplayName(envRec) : rj.env_id),
+      }
+    } else {
+      logDirRemoteJournal = null
+    }
     // 切换到聊天页，确保文件管理器面板可见
     navigate('#/chat')
     if (window.innerWidth < 1024) {
       collapseSidebar()
     }
     workspacePanelOpen = true
-    // 若工作区路径尚未加载（首次打开），先拉取再导航
-    if (!workspacePath) {
-      fetchWorkspacePath().then(() => {
-        fileManagerNavigateTarget = { path: req.path, token: req.token }
-      })
-    } else {
+    const doNavigate = () => {
       fileManagerNavigateTarget = { path: req.path, token: req.token }
     }
+    // 会话绑定远程环境时 workspacePath 是子端工作区路径：先切回本地工作区再导航
+    const sessionBoundRemote = !!(sessionId && remoteExecution.sessionId === sessionId && remoteExecution.env)
+    if (!workspacePath || sessionBoundRemote) {
+      fetchWorkspacePath().then(() => {
+        if (openSessionLogDir.token !== req.token) return // 已被更新的请求取代
+        doNavigate()
+      })
+    } else {
+      doNavigate()
+    }
   })
+
+  // 切换当前会话时清除 logDirLocalMode：文件管理器回到当前会话绑定环境
+  let lastLogDirModeSessionId = sessionId
+  $effect(() => {
+    if (sessionId !== lastLogDirModeSessionId) {
+      lastLogDirModeSessionId = sessionId
+      if (logDirLocalMode) {
+        logDirLocalMode = false
+      }
+      if (logDirRemoteJournal) {
+        logDirRemoteJournal = null
+      }
+    }
+  })
+
+  // 打开子端 file journal "软链接"：文件管理器切回会话绑定的远程环境
+  // （环境切换会整树重建），工作区指向子端，然后导航到子端会话目录。
+  async function openSessionRemoteJournal() {
+    const rj = logDirRemoteJournal
+    if (!rj || !rj.path) return
+    const sid = sessionId
+    logDirRemoteJournal = null
+    if (!remoteExecution.env || remoteExecution.sessionId !== sid) {
+      errorMsg = t('remoteEnvNotFound')
+      return
+    }
+    let ws = ''
+    try { ws = await fetchRemoteWorkspacePath() } catch { /* 工作区路径仅用于展示，失败不影响导航 */ }
+    if (sessionId !== sid) return // 请求期间切换了会话
+    // 环境切换 + 工作区切换 + 导航必须在同一帧完成：先 await 会让文件管理器
+    // 带着旧的本地路径指向子端环境（瞬时错误）
+    logDirLocalMode = false
+    if (ws) workspacePath = ws
+    fileManagerNavigateTarget = { path: rj.path, token: Date.now() }
+  }
 
   function openTerminal(sid) {
     if (!sid) return
@@ -355,9 +422,13 @@
     if (termData?.ref?.destroy) {
       termData.ref.destroy()
     }
-    // Call backend API to destroy terminal session
-    fetch(`/v1/terminals/${encodeURIComponent(sid)}`, { method: 'DELETE' })
-      .catch(err => console.warn('Failed to delete terminal:', err))
+    // 销毁执行环境侧的终端会话（本地=母端；远程=子端，终端运行在子端）
+    if (remoteExecution.sessionId === sid && remoteExecution.env) {
+      destroyRemoteTerminal(sid)
+    } else {
+      fetch(`/v1/terminals/${encodeURIComponent(sid)}`, { method: 'DELETE' })
+        .catch(err => console.warn('Failed to delete terminal:', err))
+    }
     // Remove from local state
     const newTerminals = new Map(terminals)
     newTerminals.delete(sid)
@@ -501,6 +572,107 @@
   let selectedAgentId = $derived(selectedAgentIds.length === 1 ? selectedAgentIds[0] : '') // 向后兼容单选场景
   let loadingAgents = $derived(catalog.agents.loading && !catalog.agents.loaded)
 
+  // ── 执行环境（远程执行 / remote execution）────────────────────────────
+  // 会话级绑定：默认本地；选择子环境后，该会话的全部工具在子环境执行，
+  // 推理（模型 + 会话历史）仍在母环境。绑定持久化到会话 meta.remote_env。
+  let remoteEnvs = $state([])          // 已登记的子环境列表
+  let remoteEnvsLoading = $state(false)
+  let remoteEnvDropdownOpen = $state(false)
+  let selectedRemoteEnvId = $state('') // '' = 本地
+  // ToolSelector 覆盖：null=本地 catalog；'loading'=拉取子环境工具中；Array=子环境工具
+  let remoteToolsOverride = $state(null)
+
+  let isRemoteMode = $derived(!!selectedRemoteEnvId && !!remoteExecution.env)
+  let selectedRemoteEnv = $derived(remoteEnvs.find(e => e.id === selectedRemoteEnvId) || null)
+  // 显示名：title [id]，无标题时只显示 id。id 放最后，移动端按钮宽度受限时先露出可区分的标题，
+  // 而不是所有环境雷同的 id 前缀（如 http://172.28.x.x:port）
+  function envDisplayName(e) {
+    return e.app_title ? `${e.app_title} [${e.id}]` : e.id
+  }
+  // 当前会话绑定的远程环境（供 Terminal / WorkspaceFileManager 直连子端）
+  let currentRemoteEnv = $derived(
+    sessionId && remoteExecution.sessionId === sessionId && remoteExecution.env
+      ? remoteExecution.env
+      : null
+  )
+  // "打开会话日志目录"本地锁定：会话日志目录始终在本地（父端），绑定远程环境
+  // 的会话也要显示本地会话目录，故临时断开文件管理器的远程环境（终端仍按
+  // currentRemoteEnv 匹配，互不干扰）。切换会话或关闭面板时清除。
+  let logDirLocalMode = $state(false)
+  // 子端 file journal "软链接"：父端 log-dir 探测到子端已有 journal 时非空
+  // （{ envId, path, envName }），文件管理器在本地会话目录里渲染跳转条目。
+  let logDirRemoteJournal = $state(null)
+  // 文件管理器实际使用的远程环境：logDirLocalMode 生效时为 null（本地），
+  // 否则跟随当前可见会话的绑定。
+  let workspacePanelRemoteEnv = $derived(
+    logDirLocalMode
+      ? null
+      : (sessionId && remoteExecution.sessionId === sessionId && remoteExecution.env
+          ? remoteExecution.env
+          : null)
+  )
+
+  async function loadRemoteEnvs() {
+    if (remoteEnvsLoading) return
+    remoteEnvsLoading = true
+    try {
+      remoteEnvs = await fetchRemoteEnvList(true)
+    } catch {
+      // 拉取失败保留已有列表，避免选择器闪烁消失
+    } finally {
+      remoteEnvsLoading = false
+    }
+  }
+
+  // 切换执行环境：重置工具选择、工作区路由与终端连接（决策：切换即重置）。
+  async function handleRemoteEnvChange(envId) {
+    if (envId === selectedRemoteEnvId) return
+    // 环境切换使日志目录面板里的子端 journal 软链接失效（它指向旧环境）
+    logDirRemoteJournal = null
+    remoteEnvDropdownOpen = false
+    selectedRemoteEnvId = envId
+    selectedToolIds = []
+    localStorage.setItem(STORAGE_TOOLS_KEY, '[]')
+    // 终端连接目标随执行环境变化：销毁当前会话终端（重新打开会连新目标）
+    if (sessionId && terminals.has(sessionId)) destroyTerminal(sessionId)
+
+    if (!envId) {
+      remoteToolsOverride = null
+      await bindSessionToRemoteEnv(sessionId, '')
+      if (defaultWorkspacePath) workspacePath = defaultWorkspacePath
+      return
+    }
+    const env = await bindSessionToRemoteEnv(sessionId, envId)
+    if (!env) {
+      // 环境记录不存在（可能已被删除）：回退本地
+      selectedRemoteEnvId = ''
+      remoteToolsOverride = null
+      errorMsg = t('remoteEnvNotFound')
+      return
+    }
+    remoteToolsOverride = 'loading'
+    try {
+      const tools = await fetchRemoteTools()
+      if (selectedRemoteEnvId !== envId) return // 期间又切换了环境
+      remoteToolsOverride = tools
+      // 默认全选子环境工具（delegate / talk_to / skill 不过滤，能力对齐母端）
+      selectedToolIds = tools.map(x => x.tool_id)
+      localStorage.setItem(STORAGE_TOOLS_KEY, JSON.stringify(selectedToolIds))
+    } catch (err) {
+      if (selectedRemoteEnvId === envId) {
+        remoteToolsOverride = []
+        errorMsg = err?.message || t('remoteToolsLoadFailed')
+      }
+    }
+    // 工作区指向子环境默认工作区（文件管理器直连子环境）
+    if (selectedRemoteEnvId === envId) {
+      try {
+        const ws = await fetchRemoteWorkspacePath()
+        if (selectedRemoteEnvId === envId && ws) workspacePath = ws
+      } catch { /* 工作区路径仅用于展示，失败不影响执行 */ }
+    }
+  }
+
   function toggleTemplatePanel() {
     templatePanelOpen = !templatePanelOpen
   }
@@ -508,6 +680,11 @@
   // 工作区文件管理器相关函数
   function toggleWorkspacePanel() {
     workspacePanelOpen = !workspacePanelOpen
+    // 关闭时清除 logDirLocalMode：面板回到当前会话绑定环境
+    if (!workspacePanelOpen && logDirLocalMode) {
+      logDirLocalMode = false
+      logDirRemoteJournal = null
+    }
     // 从环境变量获取工作区路径
     if (workspacePanelOpen && !workspacePath) {
       fetchWorkspacePath()
@@ -703,6 +880,15 @@
       reqBody.workspace = workspacePath
     }
     reqBody.session_id = sessionId ?? 'new'
+    // 远程执行：remote_env = 子环境 id（后端持久化到 meta.remote_env；
+    // 会话工具全部来自子端，保持子端原始工具名）。终端运行在子端，
+    // 本地终端注册表没有该状态，exec_cli 由前端按终端面板状态追加。
+    if (selectedRemoteEnvId) {
+      reqBody.remote_env = selectedRemoteEnvId
+      if (terminalVisible && currentTerminalData && !reqBody.tool_ids.includes('exec_cli')) {
+        reqBody.tool_ids = [...reqBody.tool_ids, 'exec_cli']
+      }
+    }
     // 记录本次发送的第一条用户消息，用于新会话的临时标题
     const pendingFirstUserMsg = !sessionId
       ? (apiMessages.find(m => m.role === 'user')?.content || null)
@@ -723,6 +909,12 @@
         if (Number.isFinite(seq)) directStreamLastSeq.set(initData.session_id, seq)
         sessionId = initData.session_id
         currentSession.sessionId = initData.session_id
+        // 新远程会话：会话 ID 由后端分配后，把执行环境绑定同步到真实会话 ID
+        //（选择环境时 sessionId 可能还是 null）。
+        if (selectedRemoteEnvId && remoteExecution.env
+            && remoteExecution.sessionId !== initData.session_id) {
+          remoteExecution.sessionId = initData.session_id
+        }
       }
       // 通知 Sidebar 有新会话创建（仅当之前没有 sessionId 时）
       if (!newSessionCreated.sessionId && initData.session_id) {
@@ -1389,6 +1581,15 @@
     revokeConflict = null
   }
 
+  // 会话的远程执行环境（用于把 file-journals / diff 查询直连子端）。
+  // 会话恢复流程先同步设置 selectedRemoteEnvId，绑定记录异步解析；
+  // 这里按需补齐绑定，保证 loadFileJournals 调用时已有 env 记录。
+  async function _remoteEnvFor(sid) {
+    if (!selectedRemoteEnvId || sid !== sessionId) return null
+    if (remoteExecution.sessionId === sid && remoteExecution.env) return remoteExecution.env
+    return await bindSessionToRemoteEnv(sid, selectedRemoteEnvId)
+  }
+
   async function handleToggleFileDiff(turnKey) {
     if (!sessionId || !turnKey) return
     // If already visible, hide it
@@ -1401,7 +1602,10 @@
     // Fetch diff data if not cached
     if (!fileDiffCache[turnKey]) {
       try {
-        const data = await sessionsApi.fileJournalDiff(sessionId, turnKey)
+        const env = await _remoteEnvFor(sessionId)
+        const data = env
+          ? await remoteSessions.fileJournalDiff(sessionId, turnKey)
+          : await sessionsApi.fileJournalDiff(sessionId, turnKey)
         fileDiffCache = { ...fileDiffCache, [turnKey]: data }
       } catch (err) {
         errorMsg = err?.message || 'Failed to load file diff'
@@ -1418,8 +1622,12 @@
   async function loadFileJournals(sid) {
     if (!sid) return
     const loadVersion = ++fileJournalLoadVersion
+    // 远程会话：file journal 保存在子端会话目录，直连子端查询
+    const env = await _remoteEnvFor(sid)
     try {
-      const data = await sessionsApi.fileJournals(sid)
+      const data = env
+        ? await remoteSessions.fileJournals(sid)
+        : await sessionsApi.fileJournals(sid)
       if (loadVersion !== fileJournalLoadVersion || sid !== sessionId) return
       fileJournalTurnKeyMap = buildFileJournalTurnKeyMap(data.turn_keys || [])
       // Reset diff state for new session
@@ -1482,9 +1690,6 @@
       sessionRestored = true
       shouldScrollToBottom = false
 
-      // Load file journals for this session
-      loadFileJournals(sid)
-
       // 优先使用 meta 中的设置（向下兼容：旧会话可能没有 meta）
       if (meta) {
         // 恢复AI代理选择
@@ -1501,8 +1706,41 @@
           selectedModelId = meta.model_id
           localStorage.setItem(STORAGE_MODEL_KEY, meta.model_id)
         }
-        // 恢复工具选择
-        if (meta.tool_ids) {
+        // 恢复执行环境绑定（meta.remote_env = 子环境 id）
+        const restoredRemoteEnvId = typeof meta.remote_env === 'string' ? meta.remote_env : ''
+        if (restoredRemoteEnvId) {
+          selectedRemoteEnvId = restoredRemoteEnvId
+          remoteToolsOverride = 'loading'
+          bindSessionToRemoteEnv(sid, restoredRemoteEnvId).then(env => {
+            if (!env) {
+              if (sessionId === sid) { selectedRemoteEnvId = ''; remoteToolsOverride = null }
+              return
+            }
+            if (sessionId !== sid) return
+            // 工具选择：meta.tool_ids 是子端原始工具名，直接恢复。
+            fetchRemoteTools().then(tools => {
+              if (sessionId !== sid || selectedRemoteEnvId !== restoredRemoteEnvId) return
+              remoteToolsOverride = tools
+              if (meta.tool_ids) {
+                selectedToolIds = meta.tool_ids.map(String)
+                localStorage.setItem(STORAGE_TOOLS_KEY, JSON.stringify(selectedToolIds))
+              }
+            }).catch(() => {
+              if (sessionId === sid && selectedRemoteEnvId === restoredRemoteEnvId) remoteToolsOverride = []
+            })
+            // 工作区：优先恢复 meta.workspace（子端路径）；缺失时取子端默认工作区
+            fetchRemoteWorkspacePath().then(ws => {
+              if (sessionId !== sid || selectedRemoteEnvId !== restoredRemoteEnvId) return
+              if (ws && !meta.workspace && ws !== workspacePath) workspacePath = ws
+            }).catch(() => {})
+          })
+        } else {
+          selectedRemoteEnvId = ''
+          remoteToolsOverride = null
+          bindSessionToRemoteEnv(sid, '')
+        }
+        // 恢复工具选择（本地模式；远程模式在子端工具列表拉取后恢复）
+        if (meta.tool_ids && !restoredRemoteEnvId) {
           selectedToolIds = meta.tool_ids
           localStorage.setItem(STORAGE_TOOLS_KEY, JSON.stringify(meta.tool_ids))
         }
@@ -1512,6 +1750,10 @@
           workspacePath = newWorkspace
         }
       } else {
+        // 无 meta 的旧会话：本地执行
+        selectedRemoteEnvId = ''
+        remoteToolsOverride = null
+        bindSessionToRemoteEnv(sid, '')
         // 无 meta 的旧会话，工作区回退到默认值
         if (defaultWorkspacePath && defaultWorkspacePath !== workspacePath) {
           workspacePath = defaultWorkspacePath
@@ -1528,6 +1770,9 @@
         }
         // 模型和工具选中状态维持不变（使用 localStorage 中的值）
       }
+
+      // Load file journals for this session（远程会话直连子端查询）
+      loadFileJournals(sid)
     }
   })
 
@@ -1538,6 +1783,10 @@
     currentSession.sessionId = null
     shouldScrollToBottom = false
     workspacePath = defaultWorkspacePath
+    // 新会话默认本地执行（决策：会话级绑定不跨会话继承）
+    selectedRemoteEnvId = ''
+    remoteToolsOverride = null
+    clearRemoteBinding()
     fileJournalLoadVersion += 1
     fileJournalTurnKeyMap = {}
     fileDiffCache = {}
@@ -1568,6 +1817,12 @@
       errorMsg = ''
       sessionId = null
       shouldScrollToBottom = false
+      // 被删会话若是远程会话：解除绑定（子端孤儿目录由母端 DELETE 异步清理）
+      if (remoteExecution.sessionId === deletedSid) {
+        selectedRemoteEnvId = ''
+        remoteToolsOverride = null
+        clearRemoteBinding()
+      }
     }
   })
 
@@ -1658,6 +1913,7 @@
   let _unsubscribeSessionEvents = null
   onMount(() => {
     fetchWorkspacePath()
+    loadRemoteEnvs()
     _unsubscribeSessionEvents = subscribeSessionEvents(
       (data) => {
         if (data.event === 'init') {
@@ -1699,6 +1955,12 @@
   })
 </script>
 
+<!-- 点击外部 / Esc 关闭执行环境下拉 -->
+<svelte:window
+  onclick={(ev) => { if (remoteEnvDropdownOpen && !ev.target?.closest?.('.env-selector')) remoteEnvDropdownOpen = false }}
+  onkeydown={(ev) => { if (ev.key === 'Escape') remoteEnvDropdownOpen = false }}
+/>
+
 <div class="chat-page">
   <div class="selection-bar">
     <div class="selector-wrapper" class:disabled={selectedAgentIds.length > 0}>
@@ -1707,8 +1969,49 @@
     </div>
     <div class="selector-wrapper" class:disabled={selectedAgentIds.length > 0}>
       🛠️<a href="#/setup?tab=tools" class="nav-link">{t('tools')}</a>
-      <ToolSelector bind:selectedToolIds onchange={(ids) => localStorage.setItem(STORAGE_TOOLS_KEY, JSON.stringify(ids))} disabled={selectedAgentIds.length > 0} />
+      <ToolSelector
+        bind:selectedToolIds
+        toolsOverride={remoteToolsOverride}
+        onchange={(ids) => localStorage.setItem(STORAGE_TOOLS_KEY, JSON.stringify(ids))}
+        disabled={selectedAgentIds.length > 0}
+      />
     </div>
+    <!-- 执行环境选择器：存在已登记子环境时显示；默认本地执行 -->
+    {#if remoteEnvs.length > 0}
+      <div class="selector-wrapper env-selector">
+        🌐<a href="#/setup?tab=auth" class="nav-link">{t('executionEnv')}</a>
+        <div class="env-dropdown">
+          <button
+            type="button"
+            class="toggle-btn"
+            onclick={() => { remoteEnvDropdownOpen = !remoteEnvDropdownOpen; if (remoteEnvDropdownOpen) loadRemoteEnvs() }}
+          >
+            <span class="env-label">{selectedRemoteEnv ? envDisplayName(selectedRemoteEnv) : t('localEnv')}</span>
+            <span class="arrow">{remoteEnvDropdownOpen ? '▲' : '▼'}</span>
+          </button>
+          {#if remoteEnvDropdownOpen}
+            <div class="env-list">
+              <label class="env-item">
+                <input type="radio" checked={selectedRemoteEnvId === ''} onchange={() => handleRemoteEnvChange('')} />
+                <span class="env-name">{t('localEnv')}</span>
+              </label>
+              {#each remoteEnvs as e (e.id)}
+                <label class="env-item">
+                  <input type="radio" checked={selectedRemoteEnvId === e.id} onchange={() => handleRemoteEnvChange(e.id)} />
+                  <span class="env-name" title={envDisplayName(e)}>
+                    {#if e.id.startsWith('tunnel:')}
+                      <span class="tunnel-dot" class:online={!!e.online}
+                            title={e.online ? 'tunnel online' : 'tunnel offline'}></span>
+                    {/if}
+                    {envDisplayName(e)}
+                  </span>
+                </label>
+              {/each}
+            </div>
+          {/if}
+        </div>
+      </div>
+    {/if}
     {#if isWorkspaceCustom}
       <div class="workspace-indicator" title={workspacePath} onclick={toggleWorkspacePanel}>
         <span class="workspace-icon">📁</span>
@@ -1842,6 +2145,7 @@
           bind:this={termData.ref}
           sessionId={termId}
           workspace={workspacePath}
+          remote={termId === sessionId ? currentRemoteEnv : null}
           visible={terminalVisible && termId === sessionId}
           onStatusChange={(status) => handleTerminalStatusChange(termId, status)}
         />
@@ -1861,6 +2165,9 @@
         onWorkspaceChange={handleWorkspaceChange}
         onSelectFiles={handleSelectFiles}
         onClose={toggleWorkspacePanel}
+        remote={workspacePanelRemoteEnv}
+        logDirRemoteJournal={logDirRemoteJournal}
+        onOpenRemoteJournal={openSessionRemoteJournal}
       />
     </div>
 
@@ -2002,6 +2309,69 @@
     min-width: 0;
   }
   .agent-selector-wrapper { display: flex; align-items: center; gap: 8px; }
+
+  /* Execution environment selector (remote execution) */
+  .env-selector .env-dropdown { position: relative; }
+  .env-dropdown .toggle-btn {
+    padding: 6px 12px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+    font-size: 0.85rem;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    max-width: 260px;
+  }
+  .env-dropdown .toggle-btn:hover { background: var(--bg-secondary); }
+  .env-dropdown .arrow { font-size: 0.7rem; }
+  .env-dropdown .env-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .env-list {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    margin-top: 4px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px;
+    min-width: 260px;
+    max-height: 320px;
+    overflow-y: auto;
+    z-index: 100;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+  }
+  .env-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 6px;
+    cursor: pointer;
+    font-size: 0.82rem;
+    color: var(--text);
+    border-radius: 4px;
+  }
+  .env-item:hover { background: var(--bg-secondary); }
+  .env-name {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .tunnel-dot {
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--border, #888);
+    margin-right: 5px;
+  }
+  .tunnel-dot.online { background: #2ea043; }
 
   /* Terminal close button in header */
   .terminal-control {
@@ -2289,5 +2659,9 @@
       flex-wrap: wrap;
       column-gap: 6px;
     }
+    /* 执行环境选择器：窄屏占满整行并撑开按钮，尽量多显示名称 */
+    .env-selector { flex: 1 1 100%; }
+    .env-dropdown .toggle-btn { max-width: 100%; }
+    .env-list { max-width: calc(100vw - 24px); }
   }
 </style>

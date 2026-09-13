@@ -36,6 +36,11 @@ export default defineConfig({
         target: 'ws://localhost:7988',
         ws: true
       },
+      // Tunnel browser bridge (terminal WS + HTTP) into registered children.
+      '/v1/tunnel-proxy': {
+        target: 'ws://localhost:7988',
+        ws: true
+      },
       '/v1': {
         target: 'http://localhost:7988',
         changeOrigin: true
