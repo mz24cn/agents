@@ -2,7 +2,10 @@
 
 从当前（母）环境的视角管理其派生出的子环境，读写 DATA_DIR/remote_envs.json。
 每条记录包含环境地址（URL）以及最近一次状态检查得到的版本 / 推理状态快照
-（frontend_build / backend_build / last_config / inference_active 等）。
+（frontend_build / backend_build / last_config / inference_active 等）；
+两类环境的在线状态统一用 online 布尔持久化：直连环境记录最近一次
+状态检查/更新的结果（前端回写），隧道环境由隧道 attach/detach 事件驱动
+写入（last_seen 记录最后一次被观察到在线的时间）。
 
 更新采用**推送**模型：母环境把增量 tar 直接 POST 到子环境的
 ``/v1/setup?op=push``，子环境无需知道（更无需能访问）母环境地址——
@@ -43,7 +46,8 @@ SNAPSHOT_VERSION_KEYS = ("frontend_build", "backend_build", "last_config", "serv
 SNAPSHOT_FLAG_KEYS = ("inference_active", "api_inference_active", "session_inference_active")
 # 应用 / 平台信息字段：同样取自 op=hello 响应（app_title / app_logo / arch / os），
 # 在远程环境列表中展示环境的应用标识与运行平台。
-SNAPSHOT_TEXT_KEYS = ("app_title", "app_logo", "arch", "os")
+# 工作区路径（workspace）：远程执行时供母端 UI 展示子端工作区。
+SNAPSHOT_TEXT_KEYS = ("app_title", "app_logo", "arch", "os", "workspace")
 
 
 def normalize_setup_url(url: str) -> dict:
@@ -155,6 +159,7 @@ class RemoteEnvManager:
             "app_logo": "...",
             "arch": "x86_64",
             "os": "linux",
+            "online": true,
             "checked_at": "2025-09-08T15:30:00"
           }
         ]
@@ -186,11 +191,17 @@ class RemoteEnvManager:
             raise KeyError(env_id)
         return dict(record)
 
-    def upsert(self, url: str, snapshot: dict | None = None) -> list[dict]:
+    def upsert(
+        self,
+        url: str,
+        snapshot: dict | None = None,
+        online: bool | None = None,
+    ) -> list[dict]:
         """新增或更新一条环境记录（按 ``id`` 去重），返回完整列表。
 
         ``snapshot`` 为前端查询目标环境 ``op=hello`` 的结果；提供时立即
-        落盘为版本快照。
+        落盘为版本快照。``online`` 为最近一次状态检查/更新时的可达性
+        （前端回写）；提供时落盘为在线状态。
         """
         normalized = normalize_setup_url(url)  # 非法 URL 在这里抛 ValueError
         canonical = canonical_setup_url(url)
@@ -206,20 +217,83 @@ class RemoteEnvManager:
                 envs.append(record)
             else:
                 record["url"] = canonical
+            self._apply_online(record, online)
             self._apply_snapshot(record, snapshot)
             self._write_locked(envs)
             return envs
 
-    def update_snapshot(self, env_id: str, snapshot: dict) -> list[dict]:
-        """更新指定环境的版本快照（刷新 / 更新完成后由前端回写），返回完整列表。"""
+    def update_snapshot(
+        self,
+        env_id: str,
+        snapshot: dict | None = None,
+        online: bool | None = None,
+    ) -> list[dict]:
+        """更新指定环境的版本快照与在线状态（刷新 / 更新完成后由前端回写）。
+
+        ``snapshot`` 为 None / 空时保留已有快照字段；``online`` 为 None 时
+        保留已有在线状态；调用方至少提供一项。返回完整列表。
+        """
         with self._lock:
             envs = self._read_locked()
             record = next((e for e in envs if e.get("id") == env_id), None)
             if record is None:
                 raise KeyError(env_id)
+            self._apply_online(record, online)
             self._apply_snapshot(record, snapshot)
             self._write_locked(envs)
             return envs
+
+    def upsert_tunnel(
+        self,
+        tunnel_id: str,
+        snapshot: dict | None = None,
+        url_hint: str = "",
+    ) -> list[dict]:
+        """新增或更新一条**隧道**环境记录（子环境注册到母环境）。
+
+        记录按 ``tunnel:<16hex>`` id 去重；``url`` 字段保存子环境自报的
+        直连地址（可空，仅参考——隧道模式不依赖它可达）。
+        """
+        from runtime.tunnel_protocol import tunnel_env_id
+        env_id = tunnel_env_id(tunnel_id)
+        with self._lock:
+            envs = self._read_locked()
+            record = next((e for e in envs if e.get("id") == env_id), None)
+            if record is None:
+                record = {
+                    "id": env_id,
+                    "url": url_hint or "",
+                    "transport": "ws-tunnel",
+                    "tunnel_id": tunnel_id,
+                    "created_at": now_iso(),
+                    "online": False,
+                    "last_seen": "",
+                }
+                envs.append(record)
+            else:
+                record["transport"] = "ws-tunnel"
+                record["tunnel_id"] = tunnel_id
+                if url_hint:
+                    record["url"] = url_hint
+            self._apply_snapshot(record, snapshot)
+            self._write_locked(envs)
+            return envs
+
+    def update_tunnel_status(self, env_id: str, online: bool) -> None:
+        """更新隧道环境的在线状态（隧道连接建立/断开时调用）。
+
+        与直连环境一样使用 online 布尔；``last_seen`` 记录最后一次被观察到
+        在线的时间，仅在上线时刷新（断开不刷新，避免变成"最后事件时间"）。
+        """
+        with self._lock:
+            envs = self._read_locked()
+            record = next((e for e in envs if e.get("id") == env_id), None)
+            if record is None:
+                return
+            record["online"] = bool(online)
+            if online:
+                record["last_seen"] = now_iso()
+            self._write_locked(envs)
 
     def remove(self, env_id: str) -> list[dict]:
         """删除一条环境记录，返回剩余列表。记录不存在时抛 KeyError。"""
@@ -247,6 +321,17 @@ class RemoteEnvManager:
             record[key] = str(snapshot.get(key, "") or "")
         record["checked_at"] = now_iso()
 
+    @staticmethod
+    def _apply_online(record: dict, online: bool | None) -> None:
+        """持久化普通（直连）环境的在线状态。
+
+        隧道环境的在线状态由隧道 attach/detach 事件写入 status / last_seen
+        （见 update_tunnel_status），不走这里。
+        """
+        if online is None:
+            return
+        record["online"] = bool(online)
+
     def _read_locked(self) -> list[dict]:
         """读取文件；兼容早期版本写出的 ``{"envs": [...]}`` 对象格式。"""
         if not os.path.isfile(self._path):
@@ -269,7 +354,18 @@ class RemoteEnvManager:
         if not isinstance(raw_envs, list):
             logger.warning("remote_envs.json 的 envs 字段不是数组，按空列表处理")
             return []
-        return [e for e in raw_envs if isinstance(e, dict) and e.get("id")]
+        records = []
+        for e in raw_envs:
+            if not isinstance(e, dict) or not e.get("id"):
+                continue
+            # 早期版本隧道记录用 status 字段记录在线状态；统一为 online
+            # 布尔（与直连环境同一字段），下次写入时自然落盘新格式。
+            if "status" in e:
+                e.setdefault("online", e.get("status") == "online")
+                e.pop("status", None)
+            e.setdefault("online", False)
+            records.append(e)
+        return records
 
     def _write_locked(self, envs: list[dict]) -> None:
         from runtime.common import atomic_write_text

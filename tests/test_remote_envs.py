@@ -139,6 +139,7 @@ class TestSnapshotFromHello:
             "app_logo": "/logo.png",
             "arch": "aarch64",
             "os": "macOS",
+            "workspace": "/srv/agent",
         })
         assert snap == {
             "frontend_build": "a",
@@ -152,6 +153,7 @@ class TestSnapshotFromHello:
             "app_logo": "/logo.png",
             "arch": "aarch64",
             "os": "macOS",
+            "workspace": "/srv/agent",
         }
 
     def test_none_safe(self):
@@ -255,7 +257,26 @@ class TestRemoteEnvManager:
         with pytest.raises(KeyError):
             manager.update_snapshot("http://10.9.9.9:1", {"backend_build": "x"})
 
+    def test_upsert_persists_online(self, tmp_path):
+        manager = self._manager(tmp_path)
+        envs = manager.upsert("http://10.0.0.5:7988/", {"frontend_build": "v1"}, True)
+        assert envs[0]["online"] is True
+        on_disk = json.loads((tmp_path / "remote_envs.json").read_text(encoding="utf-8"))
+        assert on_disk[0]["online"] is True
+
+    def test_update_snapshot_online_only_keeps_versions(self, tmp_path):
+        manager = self._manager(tmp_path)
+        manager.upsert("http://10.0.0.5:7988/", {"backend_build": "b1"}, True)
+        # 检查失败时只回写在线状态：已有的版本快照字段必须保留
+        envs = manager.update_snapshot("http://10.0.0.5:7988", None, False)
+        assert envs[0]["online"] is False
+        assert envs[0]["backend_build"] == "b1"
+        envs = manager.update_snapshot("http://10.0.0.5:7988", None, True)
+        assert envs[0]["online"] is True
+        assert envs[0]["backend_build"] == "b1"
+
     def test_remove(self, tmp_path):
+
         manager = self._manager(tmp_path)
         manager.upsert("http://10.0.0.5:7988/", None)
         assert manager.remove("http://10.0.0.5:7988") == []
@@ -495,7 +516,42 @@ class TestRemoteEnvsEndpoints:
         assert body["envs"][0]["backend_build"] == "b9"
         assert body["envs"][0]["inference_active"] is False
 
+    def test_add_persists_online(self, server):
+        status, body = _request(server, "POST", "/v1/remote-envs", {
+            "url": "http://10.0.0.5:7988/",
+            "snapshot": {"frontend_build": "v1"},
+            "online": True,
+        })
+        assert status == 200
+        assert body["envs"][0]["online"] is True
+
+    def test_update_online_only_keeps_snapshot(self, server):
+        _request(server, "POST", "/v1/remote-envs", {
+            "url": "http://10.0.0.5:7988/",
+            "snapshot": {"backend_build": "b1"},
+            "online": True,
+        })
+        status, body = _request(
+            server, "PUT", "/v1/remote-envs/http://10.0.0.5:7988",
+            {"online": False},
+        )
+        assert status == 200
+        assert body["envs"][0]["online"] is False
+        # 只回写在线状态时版本快照不清空
+        assert body["envs"][0]["backend_build"] == "b1"
+
+    def test_update_snapshot_and_online(self, server):
+        _request(server, "POST", "/v1/remote-envs", {"url": "http://10.0.0.5:7988/"})
+        status, body = _request(
+            server, "PUT", "/v1/remote-envs/http://10.0.0.5:7988",
+            {"snapshot": {"backend_build": "b9"}, "online": True},
+        )
+        assert status == 200
+        assert body["envs"][0]["backend_build"] == "b9"
+        assert body["envs"][0]["online"] is True
+
     def test_update_snapshot_requires_body(self, server):
+
         _request(server, "POST", "/v1/remote-envs", {"url": "http://10.0.0.5:7988/"})
         status, _ = _request(server, "PUT", "/v1/remote-envs/http://10.0.0.5:7988", {})
         assert status == 400
@@ -1043,3 +1099,53 @@ class TestRemoteEnvPushUpdate:
             assert not any(r[2].get("op") == "update" for r in child.requests)
         finally:
             child.stop()
+
+
+# ---------------------------------------------------------------------------
+# Unified online field + shared tool proxy cache
+# ---------------------------------------------------------------------------
+
+class TestUnifiedOnlineField:
+    def _manager(self, tmp_path):
+        return RemoteEnvManager(str(tmp_path / "remote_envs.json"))
+
+    def test_tunnel_record_uses_online_bool(self, tmp_path):
+        manager = self._manager(tmp_path)
+        envs = manager.upsert_tunnel("a" * 16, None, "")
+        rec = envs[0]
+        assert rec["online"] is False
+        assert "status" not in rec
+        assert rec["last_seen"] == ""
+
+    def test_update_tunnel_status_last_seen_only_when_online(self, tmp_path):
+        manager = self._manager(tmp_path)
+        manager.upsert_tunnel("b" * 16, None, "")
+        manager.update_tunnel_status("tunnel:" + "b" * 16, True)
+        envs = manager.read()
+        assert envs[0]["online"] is True
+        first_seen = envs[0]["last_seen"]
+        assert first_seen
+        time.sleep(0.01)
+        # detach: online -> False, last_seen keeps the last ONLINE time
+        manager.update_tunnel_status("tunnel:" + "b" * 16, False)
+        envs = manager.read()
+        assert envs[0]["online"] is False
+        assert envs[0]["last_seen"] == first_seen
+        manager.update_tunnel_status("tunnel:" + "b" * 16, True)
+        envs = manager.read()
+        assert envs[0]["online"] is True
+        assert envs[0]["last_seen"] >= first_seen
+
+    def test_legacy_status_record_normalized_on_read(self, tmp_path):
+        path = tmp_path / "remote_envs.json"
+        path.write_text(json.dumps([
+            {"id": "tunnel:" + "c" * 16, "url": "", "transport": "ws-tunnel",
+             "tunnel_id": "c" * 16, "status": "online", "last_seen": "x"},
+            {"id": "http://10.0.0.9:7988", "url": "http://10.0.0.9:7988/v1/setup"},
+        ]), encoding="utf-8")
+        manager = self._manager(tmp_path)
+        envs = manager.read()
+        assert envs[0]["online"] is True
+        assert "status" not in envs[0]
+        # direct record without an online field defaults to False
+        assert envs[1]["online"] is False

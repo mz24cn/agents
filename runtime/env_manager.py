@@ -29,6 +29,67 @@ _BACKEND_MTIME_TTL = 5.0
 _BACKEND_MTIME_CACHE: dict = {}
 
 
+def compute_setup_versions(env_manager: "EnvManager", data_dir: str) -> dict:
+    """Compute this environment's advertised build versions.
+
+    Returns a dict with ``frontend_build`` / ``backend_build`` /
+    ``last_config`` (each ``""`` when not determinable).  Shared by the
+    ``op=hello`` probe, the parent-side push-update flow (which must compare
+    and baseline against exactly the numbers the delta builder and the child
+    would see), and the tunnel client's registration/hello snapshot.
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))  # runtime/
+    project_root = os.path.dirname(script_dir)
+
+    frontend = ""
+    build_version_path = os.path.join(project_root, "web", "dist", "build_version")
+    try:
+        with open(build_version_path, "r") as f:
+            frontend = f.read().strip()
+    except (OSError, IOError):
+        pass
+
+    # Backend version covers every deployable non-web project file,
+    # including accessories extensions and skill assets.  Otherwise an
+    # accessories-only change would never be advertised to online update.
+    latest_mtime = env_manager.get_backend_build_mtime(project_root)
+
+    backend = ""
+    if latest_mtime > 0:
+        backend = datetime.datetime.fromtimestamp(latest_mtime).strftime("%y%m%d_%H%M%S")
+
+    config_mtime: float = 0.0
+    config_paths = [
+        os.path.join(data_dir, "models.json"),
+        os.path.join(data_dir, "tools.json"),
+        os.path.join(data_dir, "mcp_servers.json"),
+        os.path.join(data_dir, "prompt_templates.json"),
+    ]
+    agents_dir = os.path.join(data_dir, "agents")
+    if os.path.isdir(agents_dir):
+        for root, _dirs, files in os.walk(agents_dir):
+            config_paths.extend(
+                os.path.join(root, filename)
+                for filename in files
+                if filename.endswith(".json")
+            )
+    for path in config_paths:
+        try:
+            if os.path.isfile(path):
+                config_mtime = max(config_mtime, os.path.getmtime(path))
+        except OSError:
+            continue
+    last_config = ""
+    if config_mtime > 0:
+        last_config = datetime.datetime.fromtimestamp(config_mtime).strftime("%y%m%d_%H%M%S")
+
+    return {
+        "frontend_build": frontend,
+        "backend_build": backend,
+        "last_config": last_config,
+    }
+
+
 class EnvManager:
     """管理 env.json 文件的读写及 os.environ 同步。
 

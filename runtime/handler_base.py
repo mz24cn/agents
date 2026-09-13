@@ -38,6 +38,7 @@ else:
     import fcntl
     import termios
 
+from runtime import wsutil
 from runtime.auth_manager import AuthManager, COOKIE_NAME
 from runtime.runtime import Runtime
 from runtime.server_state import (
@@ -84,6 +85,7 @@ _ROUTES: dict[str, list] = {
         (re.compile(r"^/v1/remote-envs$"), "_handle_remote_envs_list", ()),
         (re.compile(r"^/v1/auth/config$"), "_handle_auth_config_get", ()),
         (re.compile(r"^/v1/setup$"), "_handle_setup_script", ()),
+        (re.compile(r"^/v1/tunnel/parent/status$"), "_handle_tunnel_parent_status", ()),
         (re.compile(r"^/v1/sessions/tree$"), "_handle_session_category_tree", ()),
         (re.compile(r"^/v1/sessions$"), "_handle_list_sessions", ()),
         (re.compile(r"^/v1/sessions/search$"), "_handle_search_sessions", ()),
@@ -104,6 +106,8 @@ _ROUTES: dict[str, list] = {
         (re.compile(r"^/v1/sessions/([^/]+)/file-journals/([^/]+)$"), "_handle_get_file_journal_diff", (urllib.parse.unquote, urllib.parse.unquote)),
         (re.compile(r"^/v1/sessions/([^/]+)/file-journals$"), "_handle_get_file_journals", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/terminals$"), "_handle_list_terminals", ()),
+        # Parent-side browser bridge: env_id in path, rest forwarded to child.
+        (re.compile(r"^/v1/tunnel-proxy/([^/]+)(?:/.*)?$"), "_handle_tunnel_proxy", (urllib.parse.unquote,)),
     ],
     "POST": [
         (re.compile(r"^/v1/auth/login$"), "_handle_auth_login", ()),
@@ -125,6 +129,10 @@ _ROUTES: dict[str, list] = {
         (re.compile(r"^/v1/env$"), "_handle_set_env", ()),
         (re.compile(r"^/v1/remote-envs$"), "_handle_remote_envs_add", ()),
         (re.compile(r"^/v1/remote-envs/(.+)/push-update$"), "_handle_remote_envs_push_update", (urllib.parse.unquote,)),
+        (re.compile(r"^/v1/remote-envs/([^/]+)/hello$"), "_handle_remote_envs_hello", (urllib.parse.unquote,)),
+        (re.compile(r"^/v1/tunnel/register$"), "_handle_tunnel_register", ()),
+        (re.compile(r"^/v1/tunnel/parent/register$"), "_handle_tunnel_parent_register", ()),
+        (re.compile(r"^/v1/tunnel/parent/unregister$"), "_handle_tunnel_parent_unregister", ()),
         (re.compile(r"^/v1/env/detect$"), "_handle_detect_env", ()),
         (re.compile(r"^/v1/sessions/([^/]+)/generate-title$"), "_handle_generate_session_title", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/sessions/([^/]+)/regenerate-summary$"), "_handle_regenerate_session_summary", (urllib.parse.unquote,)),
@@ -139,6 +147,7 @@ _ROUTES: dict[str, list] = {
         (re.compile(r"^/v1/workspace/copy$"), "_handle_workspace_copy", ()),
         (re.compile(r"^/v1/workspace/upload/init$"), "_handle_workspace_upload_init", ()),
         (re.compile(r"^/v1/workspace/upload/([^/]+)/complete$"), "_handle_workspace_upload_complete", (urllib.parse.unquote,)),
+        (re.compile(r"^/v1/tunnel-proxy/([^/]+)(?:/.*)?$"), "_handle_tunnel_proxy", (urllib.parse.unquote,)),
     ],
     "PUT": [
         (re.compile(r"^/v1/models/([^/]+)$"), "_handle_update_model", ()),
@@ -148,6 +157,7 @@ _ROUTES: dict[str, list] = {
         (re.compile(r"^/v1/agents/([^/]+)$"), "_handle_update_agent", ()),
         (re.compile(r"^/v1/remote-envs/(.+)$"), "_handle_remote_envs_update", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/workspace/upload/([^/]+)/chunk/(\d+)$"), "_handle_workspace_upload_chunk", (urllib.parse.unquote, int)),
+        (re.compile(r"^/v1/tunnel-proxy/([^/]+)(?:/.*)?$"), "_handle_tunnel_proxy", (urllib.parse.unquote,)),
     ],
     "DELETE": [
         (re.compile(r"^/v1/models/([^/]+)$"), "_handle_delete_model", ()),
@@ -157,11 +167,13 @@ _ROUTES: dict[str, list] = {
         (re.compile(r"^/v1/prompt-templates/([^/]+)$"), "_handle_delete_prompt_template", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/env/([^/]+)$"), "_handle_delete_env", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/remote-envs/(.+)$"), "_handle_remote_envs_delete", (urllib.parse.unquote,)),
+        (re.compile(r"^/v1/tunnel/register$"), "_handle_tunnel_unregister", ()),
         (re.compile(r"^/v1/sessions/([^/]+)$"), "_handle_delete_session", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/agents/([^/]+)$"), "_handle_delete_agent", ()),
         (re.compile(r"^/v1/workspace/delete$"), "_handle_workspace_delete", ()),
         (re.compile(r"^/v1/workspace/upload/([^/]+)$"), "_handle_workspace_upload_cancel", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/terminals/([^/]+)$"), "_handle_delete_terminal", ()),
+        (re.compile(r"^/v1/tunnel-proxy/([^/]+)(?:/.*)?$"), "_handle_tunnel_proxy", (urllib.parse.unquote,)),
     ],
 }
 
@@ -393,12 +405,37 @@ class HandlerBaseMixin:
             ):
                 return True
 
+        # GET /v1/* additionally accepts the ``token`` query parameter (setup
+        # token st_... or API key as_...). Browsers cannot attach an
+        # Authorization header to <img>/<audio>/<video>/iframe/PDF resources
+        # or to WebSocket handshakes, so remote execution (file-manager
+        # resources, xterm terminal WS, file-journal reads) authenticates via
+        # the query parameter. The token is the same credential the setup
+        # link already carries, so this adds no new privilege; it does show
+        # up in access logs, which is acceptable for LAN deployments.
+        if method == "GET":
+            parsed = urllib.parse.urlparse(self.path)
+            params = urllib.parse.parse_qs(parsed.query)
+            token = params.get("token", [""])[0]
+            if token and (
+                auth_manager.verify_setup_token(token)
+                or auth_manager.verify_api_key(token)
+            ):
+                return True
+
         session_token = self._request_cookie(COOKIE_NAME)
         if session_token and auth_manager.verify_session_token(session_token):
             return True
 
         bearer = self._bearer_token()
-        if bearer and auth_manager.verify_api_key(bearer):
+        # Bearer accepts the long-lived API key and the setup token: the
+        # parent's remote tool proxy and the browser's cross-origin
+        # POST/PUT/DELETE (uploads, workspace ops) present the same token
+        # from the registered env URL via the Authorization header.
+        if bearer and (
+            auth_manager.verify_api_key(bearer)
+            or auth_manager.verify_setup_token(bearer)
+        ):
             return True
 
         return False
@@ -471,6 +508,26 @@ class HandlerBaseMixin:
             # Credentials are already enforced by the /v1/ gate above.
             if path == "/v1/terminals/ws" and self.headers.get("Upgrade", "").lower() == "websocket":
                 self._handle_websocket()
+                return
+            # Tunnel data channel (child → parent reverse tunnel). Like the
+            # terminal endpoint it is a plain GET with an Upgrade header and
+            # must be handled before the JSON route table; credentials are
+            # enforced by the /v1/ gate above (GET ?token= or session cookie).
+            # Trust boundary: with parent auth DISABLED there are no
+            # credentials to check, so /v1/tunnel/* and /v1/tunnel-proxy/*
+            # are open to anyone who can reach this port (a connected
+            # tunnel can execute the child's local tools). Keep the port
+            # off untrusted networks when the parent has no password set.
+            if path == "/v1/tunnel/ws" and self.headers.get("Upgrade", "").lower() == "websocket":
+                self._handle_tunnel_ws()
+                return
+            # Tunnel browser bridge terminal WS: /v1/tunnel-proxy/{env}/v1/terminals/ws
+            if path.startswith("/v1/tunnel-proxy/") and path.endswith("/v1/terminals/ws") \
+                    and self.headers.get("Upgrade", "").lower() == "websocket":
+                # 浏览器用 encodeURIComponent 构造桥接 URL（tunnel%3A...），
+                # 原始路径里 env id 仍是百分号编码 —— 先 unquote 再交给处理器。
+                env_id = urllib.parse.unquote(path[len("/v1/tunnel-proxy/"):].split("/", 1)[0])
+                self._handle_tunnel_proxy_ws(env_id)
                 return
             if not self._dispatch_route("GET", path):
                 self._send_json_error(404, f"Not found: {self.path}")
@@ -1005,17 +1062,7 @@ class HandlerBaseMixin:
             _set_ctx(workspace=workspace)
 
         # Perform WebSocket handshake
-        magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-        accept_key = base64.b64encode(
-            hashlib.sha1((key + magic).encode("utf-8")).digest()
-        ).decode()
-
-        response = (
-            "HTTP/1.1 101 Switching Protocols\r\n"
-            "Upgrade: websocket\r\n"
-            "Connection: Upgrade\r\n"
-            f"Sec-WebSocket-Accept: {accept_key}\r\n\r\n"
-        )
+        response = wsutil.ws_handshake_response(key)
         sock = self.connection
         # The socket inherits the HTTP handler's idle timeout (self.timeout=30,
         # applied in BaseHTTPRequestHandler.setup for keep-alive connections).
@@ -1035,54 +1082,31 @@ class HandlerBaseMixin:
     @staticmethod
     def _ws_send_frame(sock, text: str) -> None:
         """Encode and send a WebSocket text frame."""
-        data = text.encode("utf-8", errors="replace")
-        length = len(data)
-        frame = bytearray([0x81])  # FIN + TEXT
-
-        if length <= 125:
-            frame.append(length)
-        elif length <= 65535:
-            frame.append(126)
-            frame.extend(struct.pack("!H", length))
-        else:
-            frame.append(127)
-            frame.extend(struct.pack("!Q", length))
-
-        frame.extend(data)
         try:
-            sock.sendall(frame)
+            wsutil.ws_send_text(sock, text)
         except OSError:
             pass
 
     @staticmethod
     def _ws_recv_frame(sock) -> Optional[str]:
-        """Receive and decode a WebSocket frame."""
-        try:
-            header = sock.recv(2)
-            if not header:
+        """Receive and decode the next text frame from a WebSocket client.
+
+        Built on ``wsutil.ws_recv_frame`` (robust against short reads).
+        Ping frames are answered with pong, pong/continuation frames are
+        dropped, and close/EOF yield None.  Binary frames are decoded as
+        UTF-8 text so a client choosing binary still drives the PTY.
+        """
+        while True:
+            frame = wsutil.ws_recv_frame(sock, expect_masked=True)
+            if frame is None:
                 return None
-            b1, b2 = header[0], header[1]
-
-            opcode = b1 & 0x0F
-            if opcode == 8:  # Close frame
-                return None
-
-            payload_len = b2 & 0x7F
-            if payload_len == 126:
-                payload_len = struct.unpack("!H", sock.recv(2))[0]
-            elif payload_len == 127:
-                payload_len = struct.unpack("!Q", sock.recv(8))[0]
-
-            masking_key = sock.recv(4)
-            raw_data = sock.recv(payload_len)
-
-            # Unmask data
-            unmasked = bytearray(
-                b ^ masking_key[i % 4] for i, b in enumerate(raw_data)
-            )
-            return unmasked.decode("utf-8", errors="ignore")
-        except (OSError, struct.error):
-            return None
+            opcode, payload = frame
+            if opcode == wsutil.OP_PING:
+                wsutil.ws_send_pong(sock, payload)
+                continue
+            if opcode in (wsutil.OP_PONG, wsutil.OP_CONT):
+                continue
+            return payload.decode("utf-8", errors="ignore")
 
     def _start_pty_session(self, sock, terminal_id: Optional[str] = None,
                             initial_cols: Optional[int] = None,

@@ -129,7 +129,10 @@ from runtime.server_state import (
 from runtime.handler_api import HandlerApiMixin
 from runtime.handler_base import HandlerBaseMixin
 from runtime.handler_infer import HandlerInferMixin
+from runtime.handler_tunnel import HandlerTunnelMixin
 from runtime.handler_workspace import HandlerWorkspaceMixin
+from runtime.tunnel_client import TunnelClient
+from runtime.tunnel_manager import TunnelManager
 
 
 class _RuntimeRequestHandler(
@@ -137,6 +140,7 @@ class _RuntimeRequestHandler(
     HandlerInferMixin,
     HandlerWorkspaceMixin,
     HandlerApiMixin,
+    HandlerTunnelMixin,
     BaseHTTPRequestHandler,
 ):
     """HTTP request handler that routes requests to the Runtime instance.
@@ -666,6 +670,15 @@ class RuntimeHTTPServer:
         self._server.prompt_templates_path = _PROMPT_TEMPLATES_PATH  # type: ignore[attr-defined]
         self._server.data_dir = _DATA_DIR  # type: ignore[attr-defined]
         self._server.ssl_context = ssl_context  # type: ignore[attr-defined]
+        # Tunnel (parent/child WS reverse tunnel): every agent runs both
+        # sides.  The manager accepts child data channels (parent role);
+        # the client dials a parent when env.json has SETUP_SOURCE +
+        # TUNNEL_ENABLED (child role) and idles otherwise.
+        self._tunnel_manager = TunnelManager(self._remote_env_manager)
+        self._tunnel_client = TunnelClient(self, data_dir=_DATA_DIR)
+        self._server.tunnel_manager = self._tunnel_manager  # type: ignore[attr-defined]
+        self._server.tunnel_client = self._tunnel_client  # type: ignore[attr-defined]
+        self._tunnel_client.start()
         logger.info(
             "HTTP server bound to %s:%s (protocol=%s, domain=%s)",
             self._bind_host, self._server.server_address[1], self._protocol, self._host,
@@ -731,6 +744,10 @@ class RuntimeHTTPServer:
         if self._thread is not None:
             self._thread.join(timeout=5)
             self._thread = None
+        if getattr(self, "_tunnel_client", None) is not None:
+            self._tunnel_client.stop()
+        if getattr(self, "_tunnel_manager", None) is not None:
+            self._tunnel_manager.stop()
 
     @property
     def port(self) -> int:
