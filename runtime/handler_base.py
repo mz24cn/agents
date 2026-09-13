@@ -18,7 +18,6 @@ import logging
 import mimetypes
 import os
 import re
-import select
 import struct
 import sys
 import threading
@@ -1207,34 +1206,38 @@ class HandlerBaseMixin:
         Supports session persistence: if a terminal session with the same ID already exists,
         reconnect to it instead of creating a new one.
         """
-        # Get or create terminal
+        # Get or create terminal.  The PTY is drained by exactly one reader
+        # thread, owned by get_or_create_terminal; it fans output out to the
+        # currently attached browser (send_output) and to exec_cli's
+        # output_buffer.  Starting a second reader here would race os.read()
+        # on the same master_fd and silently drop whichever chunks the other
+        # thread wins, so attaching only (re)binds the socket.
         session_id = terminal_id.split(":")[0] if terminal_id else None
         if session_id:
             terminal_info = get_or_create_terminal(
                 session_id,
                 cols=initial_cols or 80,
                 rows=initial_rows or 24,
+                send_output=lambda data: self._ws_send_frame(sock, data),
             )
         else:
             terminal_info = None
-        
+
         if not terminal_info:
             self._ws_send_frame(sock, '{"error": "Failed to create terminal"}')
             return
-        
+
         master_fd = terminal_info.get("master_fd")
-        
-        # Attach socket to terminal
+
+        # Attach this socket as the current output target.  Do not flip the
+        # shared "active" flag: it gates the persistent reader and is cleared
+        # only when the session is torn down, so toggling it per attach would
+        # (racily) terminate the reader.
         with _terminal_sessions_lock:
-            terminal_info["active"] = False  # Signal old read_pty to stop
             terminal_info["sock"] = sock
             terminal_info["disconnected_at"] = None
-        
-        time.sleep(0.1)
-        
-        with _terminal_sessions_lock:
-            terminal_info["active"] = True
-        
+            terminal_info["send_output"] = lambda data: self._ws_send_frame(sock, data)
+
         # Resize PTY to match the client's terminal dimensions on reconnect
         if master_fd and initial_cols and initial_rows:
             try:
@@ -1246,31 +1249,6 @@ class HandlerBaseMixin:
         # Send terminal_id to client
         if terminal_id:
             self._ws_send_frame(sock, json.dumps({"__terminal_id": terminal_id}))
-        
-        def read_pty():
-            """Read from PTY and send to WebSocket."""
-            while terminal_info.get("active", True):
-                try:
-                    ready, _, _ = select.select([master_fd], [], [], 0.1)
-                    if ready:
-                        data = os.read(master_fd, 1024)
-                        if not data:
-                            break
-                        data = data.decode("utf-8", errors="replace")
-                        if data:
-                            current_sock = terminal_info.get("sock")
-                            if current_sock:
-                                try:
-                                    self._ws_send_frame(current_sock, data)
-                                except Exception:
-                                    pass
-                            if "buffer_lock" in terminal_info:
-                                with terminal_info["buffer_lock"]:
-                                    terminal_info["output_buffer"].append(data)
-                except OSError:
-                    break
-
-        threading.Thread(target=read_pty, daemon=True).start()
 
         def set_winsize(fd, rows, cols):
             winsize = struct.pack("HHHH", rows, cols, 0, 0)
@@ -1294,14 +1272,17 @@ class HandlerBaseMixin:
                 # Regular keyboard input
                 os.write(master_fd, user_input.encode("utf-8"))
         finally:
-            # On disconnect: don't kill the PTY process, just mark as disconnected
-            # The session will stay alive for potential reconnection
+            # On disconnect: don't kill the PTY process, just detach this
+            # socket so the session stays alive for reconnection.  Only clear
+            # the output target if no newer socket has taken over meanwhile
+            # (a reconnect may already have rebound it).
             if terminal_info:
                 with _terminal_sessions_lock:
-                    terminal_info["active"] = False  # Mark this connection as inactive
-                    terminal_info["disconnected_at"] = time.monotonic()
-                    terminal_info["sock"] = None
-            
+                    if terminal_info.get("sock") is sock:
+                        terminal_info["disconnected_at"] = time.monotonic()
+                        terminal_info["sock"] = None
+                        terminal_info["send_output"] = None
+
             sock.close()
             logger.info("Terminal session disconnected: %s (session stays alive for reconnection)", terminal_id)
 

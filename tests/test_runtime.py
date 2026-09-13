@@ -9,6 +9,7 @@ messages list.
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+import os
 from runtime.models import InferenceRequest, Message, ModelConfig
 from runtime.runtime import Runtime
 from runtime.registry import ModelRegistry, ToolRegistry
@@ -1667,6 +1668,98 @@ def test_exec_cli_reuses_persistent_terminal_across_calls(monkeypatch, session_c
         f"exec_cli 未通过 session_id 定位持久终端: {looked_up_sessions!r}")
     assert created_sessions == ["sess-1"], (
         f"持久终端未按会话复用，每次调用都新建: {created_sessions!r}")
+
+
+def test_unix_pty_single_reader_fans_out_to_browser_and_buffer(monkeypatch):
+    """回归：Unix 终端的 PTY 输出必须由*一个* reader 扇出。
+
+    旧实现里 `get_or_create_terminal` 起了一个常驻 reader，而每次 WebSocket
+    attach 又新建一个 reader，两者对同一个 `master_fd` 竞争 `os.read()`：
+    谁抢到某个 chunk，谁就消费掉它 —— 常驻 reader 只写 `output_buffer`、
+    attach reader 才发给浏览器，于是浏览器只看到最初几个突发、之后输出被吞。
+    这里验证常驻 reader 会把同一段输出同时发给 attach 的 send_output 与
+    exec_cli 依赖的 output_buffer。
+    """
+    import sys
+    import time
+
+    if sys.platform == "win32":
+        pytest.skip("unix PTY path")
+
+    from runtime import server_state as ss
+
+    fake_fd = 987654
+    chunks = [b"hello-from-pty\r\n", b""]  # b"" -> EOF，reader 自行退出
+
+    monkeypatch.setattr(ss.pty, "fork", lambda: (4242, fake_fd))
+    monkeypatch.setattr(ss.os, "read", lambda fd, n: chunks.pop(0) if chunks else b"")
+    monkeypatch.setattr(ss.select, "select", lambda r, w, x, t: (list(r), [], []))
+
+    collected: list = []
+    info = ss.get_or_create_terminal(
+        "single-reader", cols=80, rows=24,
+        send_output=lambda data: collected.append(data))
+    try:
+        assert info is not None
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not collected:
+            time.sleep(0.02)
+        assert "".join(collected) == "hello-from-pty\r\n"
+        assert "".join(info["output_buffer"]) == "hello-from-pty\r\n"
+    finally:
+        monkeypatch.setattr(ss.os, "kill", lambda *a, **k: None)
+        ss.unregister_terminal_session("single-reader:auto")
+
+
+def test_unix_terminal_attach_does_not_start_second_reader(monkeypatch):
+    """回归：终端 WebSocket attach 只重绑 socket，不再新建 PTY 读取线程。
+
+    两个 reader 竞争 `master_fd` 是上面输出被吞的根因；attach 阶段不得再启动
+    任何读取线程（输出扇出由 `get_or_create_terminal` 的常驻 reader 负责）。
+    """
+    import sys
+
+    if sys.platform == "win32":
+        pytest.skip("unix PTY path")
+
+    from runtime import server_state as ss
+    from runtime import handler_base as hb
+
+    fake_fd = 987655
+    chunks = [b""]  # 常驻 reader 立即 EOF，避免遗留线程
+
+    monkeypatch.setattr(ss.pty, "fork", lambda: (4243, fake_fd))
+    monkeypatch.setattr(ss.os, "read", lambda fd, n: chunks.pop(0) if chunks else b"")
+    monkeypatch.setattr(ss.select, "select", lambda r, w, x, t: (list(r), [], []))
+
+    info = ss.get_or_create_terminal("attach-once", cols=80, rows=24)
+    assert info is not None
+
+    started: list = []
+
+    class _RecordingThread:
+        def __init__(self, target=None, daemon=None, name=None):
+            self._target = target
+        def start(self):
+            started.append(self._target)
+
+    class _FakeSock:
+        def sendall(self, data):
+            pass
+        def recv(self, n):
+            return b""
+        def close(self):
+            pass
+
+    monkeypatch.setattr(ss.os, "kill", lambda *a, **k: None)
+    monkeypatch.setattr(hb.threading, "Thread", _RecordingThread)
+    try:
+        handler = hb.HandlerBaseMixin.__new__(hb.HandlerBaseMixin)
+        handler._start_pty_session_unix(_FakeSock(), "attach-once", 80, 24)
+    finally:
+        ss.unregister_terminal_session("attach-once:auto")
+
+    assert started == [], f"attach 不应新建 PTY 读取线程: {started!r}"
 
 
 def test_exec_shell_runs_in_session_workspace(monkeypatch, session_ctx, tmp_path):

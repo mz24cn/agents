@@ -1353,9 +1353,16 @@ def get_or_create_terminal(
                     "output_buffer": [],
                     "buffer_lock": threading.Lock(),
                     "shell_kind": os.path.basename(shell or "/bin/bash"),
+                    "send_output": send_output,
                 }
             
-            # Start background thread to drain PTY output into buffer
+            # Start background thread to drain PTY output.  This must be the
+            # *only* reader of master_fd: os.read() on a shared PTY master
+            # hands each chunk to whichever thread wins the race, so a second
+            # reader (started on WebSocket attach) silently swallows (or is
+            # swallowed by) this one and output stops reaching the browser.
+            # Fan the single stream out to the attached browser and to
+            # exec_cli's output_buffer, mirroring the win32 reader.
             terminal_info = _terminal_sessions[terminal_id]
             def read_pty():
                 logger.debug("read_pty thread started for %s", terminal_id)
@@ -1366,8 +1373,15 @@ def get_or_create_terminal(
                             if ready:
                                 data = os.read(master_fd, 4096)
                                 if data:
+                                    text = data.decode(get_system_encoding(), errors='replace')
+                                    send_output = terminal_info.get("send_output")
+                                    if send_output:
+                                        try:
+                                            send_output(text)
+                                        except Exception:
+                                            pass
                                     with terminal_info["buffer_lock"]:
-                                        terminal_info["output_buffer"].append(data.decode(get_system_encoding(), errors='replace'))
+                                        terminal_info["output_buffer"].append(text)
                                 else:
                                     logger.debug("read_pty: EOF for %s", terminal_id)
                                     break
