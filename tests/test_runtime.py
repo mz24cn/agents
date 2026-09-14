@@ -1878,9 +1878,9 @@ def test_file_tools_share_request_journal_holder_across_worker_calls(
 
 
 # ---------------------------------------------------------------------------
-# call_tool runs the same per-call pipeline as the inference loop
-# (base64 pre/post processing for MCP tools) — this is what makes remote
-# tool execution (child POST /v1/tools/call) behave like local execution.
+# POST /v1/tools/call (Runtime.call_tool) is a RAW API, while the inference
+# loop owns MCP base64 pre/post processing.  Remote (child) tool execution
+# therefore marshals base64 on the parent: the child endpoint stays verbatim.
 # ---------------------------------------------------------------------------
 
 class _FakeMcpManager:
@@ -1918,27 +1918,25 @@ def _runtime_with_mcp(result):
     ), mgr
 
 
-def test_call_tool_mcp_preprocesses_path_to_base64(tmp_path):
-    """A path in a *base64* argument is read from the local filesystem and
-    converted before dispatch — identical to a local inference round."""
-    import base64
+def test_call_tool_does_not_preprocess_base64_arguments(tmp_path):
+    """No base64 *pre*-processing on the /v1/tools/call API: a path-like
+    argument stays a path \u2014 interpreting it is the caller's business (and the
+    file may well live on the caller's machine, not here)."""
     f = tmp_path / "pic.bin"
     f.write_bytes(b"\x89PNG\x00fake-image-bytes")
     runtime, mgr = _runtime_with_mcp('{"ok": true}')
+
     out = runtime.call_tool("mcp_shot", {"base64_content": str(f)})
-    sent = mgr.received["arguments"]["base64_content"]
-    assert sent != str(f)
-    assert base64.b64decode(sent) == f.read_bytes()
+
+    assert mgr.received["arguments"]["base64_content"] == str(f)
     assert out == '{"ok": true}'
 
 
-def test_call_tool_mcp_intercepts_base64_result(tmp_path):
-    """Long base64 payloads in the MCP result are saved to a local file and
-    replaced with the path (BASE64_CHECK_THRESHOLD gate), same as local
-    inference — remote children run this same code, so remote results
-    arrive pre-intercepted."""
+def test_call_tool_does_not_intercept_base64_results():
+    """No base64 *post*-processing on the /v1/tools/call API: callers get the
+    real payload, never a server-local file path they cannot read.  The
+    parent's remote tool proxy calls the child's endpoint exactly this way."""
     import base64
-    import re
     payload = base64.b64encode(b"\x89PNG" + b"x" * 2000).decode()
     os.environ["BASE64_CHECK_THRESHOLD"] = "1024"
     try:
@@ -1946,8 +1944,137 @@ def test_call_tool_mcp_intercepts_base64_result(tmp_path):
         out = runtime.call_tool("mcp_shot", {})
     finally:
         del os.environ["BASE64_CHECK_THRESHOLD"]
+
+    assert out == f'{{"screenshot": "{payload}"}}'
+    assert "filePath" not in out
+
+
+def test_inference_tool_call_preprocesses_base64_path(tmp_path):
+    """The inference loop reads a base64 argument's file path locally before
+    dispatch (local execution)."""
+    import base64
+    f = tmp_path / "pic.bin"
+    f.write_bytes(b"\x89PNG\x00fake-image-bytes")
+    runtime, mgr = _runtime_with_mcp('{"ok": true}')
+
+    out, config = runtime._execute_tool_call("mcp_shot", {"base64_content": str(f)})
+
+    sent = mgr.received["arguments"]["base64_content"]
+    assert sent != str(f)
+    assert base64.b64decode(sent) == f.read_bytes()
+    assert out == '{"ok": true}'
+    assert config.tool_id == "mcp_shot"
+
+
+def test_inference_tool_call_intercepts_base64_result():
+    """Long base64 MCP results are saved locally and replaced with the path in
+    the inference loop (BASE64_CHECK_THRESHOLD gate)."""
+    import base64
+    import re
+    payload = base64.b64encode(b"\x89PNG" + b"x" * 2000).decode()
+    os.environ["BASE64_CHECK_THRESHOLD"] = "1024"
+    try:
+        runtime, _mgr = _runtime_with_mcp(f'{{"screenshot": "{payload}"}}')
+        out, _config = runtime._execute_tool_call("mcp_shot", {})
+    finally:
+        del os.environ["BASE64_CHECK_THRESHOLD"]
+
     assert payload not in out
     m = re.search(r'"filePath":\s*"([^"]+)"', out)
     assert m, out
     saved = open(m.group(1), "rb").read()
     assert saved == b"\x89PNG" + b"x" * 2000
+
+
+def _remote_proxy_config(child_type, proxy_callable=None):
+    """Build a parent-side remote proxy entry the way
+    ``RemoteToolProxy.list_tool_configs`` does: the child's original type is
+    recorded in ``remote_child_tool_type`` while the parent entry is a
+    ``function`` carrying the forwarding callable."""
+    from runtime.models import ToolConfig
+    config = ToolConfig(
+        tool_id="mcp_remote",
+        tool_type="skill" if child_type == "skill" else "function",
+        name="mcp_remote",
+        description="remote child tool",
+        parameters={
+            "type": "object",
+            "properties": {"base64_content": {"type": "string"}},
+        },
+    )
+    config.is_remote_proxy = True
+    config.remote_child_tool_type = child_type
+    if proxy_callable is not None:
+        config.callable_fn = proxy_callable
+    return config
+
+
+def test_remote_proxy_mcp_preprocesses_base64_path_on_parent(tmp_path):
+    """A remote MCP tool's base64 input file is read by the PARENT before
+    forwarding: the child's /v1/tools/call executes verbatim."""
+    import base64
+    f = tmp_path / "shot.bin"
+    f.write_bytes(b"\x89PNGremote")
+    seen = {}
+
+    def _proxy(**arguments):
+        seen.update(arguments)
+        return '{"ok": true}'
+
+    config = _remote_proxy_config("mcp", _proxy)
+    runtime = Runtime(model_registry=ModelRegistry(), tool_registry=ToolRegistry())
+
+    out, _ = runtime._execute_tool_call(
+        "mcp_remote", {"base64_content": str(f)}, tool_scope=[config])
+
+    assert base64.b64decode(seen["base64_content"]) == f.read_bytes()
+    assert out == '{"ok": true}'
+
+
+def test_remote_proxy_mcp_intercepts_base64_result_on_parent():
+    """A long base64 result of a remote MCP tool is saved on the PARENT and
+    replaced with a parent-local path \u2014 the child cannot do this for the
+    parent's model context, and a child path would be meaningless here."""
+    import base64
+    import re
+    payload = base64.b64encode(b"\x89PNG" + b"y" * 2000).decode()
+    config = _remote_proxy_config("mcp", lambda **a: f'{{"screenshot": "{payload}"}}')
+    runtime = Runtime(model_registry=ModelRegistry(), tool_registry=ToolRegistry())
+
+    os.environ["BASE64_CHECK_THRESHOLD"] = "1024"
+    try:
+        out, _ = runtime._execute_tool_call("mcp_remote", {}, tool_scope=[config])
+    finally:
+        del os.environ["BASE64_CHECK_THRESHOLD"]
+
+    assert payload not in out
+    m = re.search(r'"filePath":\s*"([^"]+)"', out)
+    assert m, out
+    assert open(m.group(1), "rb").read() == b"\x89PNG" + b"y" * 2000
+
+
+def test_remote_proxy_non_mcp_tool_leaves_base64_untouched(tmp_path):
+    """Remote function tools keep raw arguments and raw results: only child
+    MCP tools get parent-side base64 marshalling."""
+    import base64
+    f = tmp_path / "x.bin"
+    f.write_bytes(b"hello")
+    payload = base64.b64encode(b"z" * 2000).decode()
+    seen = {}
+
+    def _proxy(**arguments):
+        seen.update(arguments)
+        return payload
+
+    config = _remote_proxy_config("function", _proxy)
+    runtime = Runtime(model_registry=ModelRegistry(), tool_registry=ToolRegistry())
+
+    os.environ["BASE64_CHECK_THRESHOLD"] = "1024"
+    try:
+        out, _ = runtime._execute_tool_call(
+            "mcp_remote", {"base64_content": str(f)}, tool_scope=[config])
+    finally:
+        del os.environ["BASE64_CHECK_THRESHOLD"]
+
+    assert seen["base64_content"] == str(f)
+    assert out == payload

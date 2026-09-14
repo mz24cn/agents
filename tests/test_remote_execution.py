@@ -233,6 +233,63 @@ class TestProxyAgainstRealChild:
         assert not result2.startswith("Error:"), result2
         assert (child_ws / "via_callable.txt").read_text(encoding="utf-8") == "via-callable"
 
+    def test_child_mcp_tool_is_base64_marshalled_by_parent(self, parent, child):
+        """Remote MCP tools: the child executes verbatim and the parent owns
+        base64 marshalling.
+
+        ``list_tool_configs`` exposes a child MCP tool as a parent ``function``
+        entry, records the child's original type, and the parent inference
+        pipeline then reads base64 input files from / saves long base64
+        results to the *parent* filesystem around the forwarded call.
+        """
+        import base64
+        import re
+
+        from runtime.models import ToolConfig
+
+        payload = base64.b64encode(b"\x89PNG" + b"m" * 2000).decode()
+        child_runtime = child[0]._server.runtime  # type: ignore[attr-defined]
+        child_runtime._tool_registry.register(ToolConfig(  # type: ignore[attr-defined]
+            tool_id="mcp_shot",
+            tool_type="mcp",
+            name="mcp_shot",
+            description="fake child mcp tool",
+            parameters={"type": "object", "properties": {}},
+            mcp_server_name="fake-srv",
+            tool_name="shot",
+        ))
+
+        class _FakeMcpManager:
+            def call_tool(self, server_name, tool_name, arguments, timeout=None):
+                return f'{{"screenshot": "{payload}"}}'
+
+        child_runtime._mcp_manager = _FakeMcpManager()  # type: ignore[attr-defined]
+
+        proxy = RemoteToolProxy({
+            "id": f"http://127.0.0.1:{child[0].port}",
+            "url": f"http://127.0.0.1:{child[0].port}/v1/setup",
+        })
+        cfg = next(c for c in proxy.list_tool_configs() if c.tool_id == "mcp_shot")
+        assert cfg.tool_type == "function"
+        assert cfg.remote_child_tool_type == "mcp"
+
+        # 1. Child endpoint (what the parent forwards to) is verbatim.
+        raw = proxy.call("mcp_shot", {})
+        assert payload in raw and "filePath" not in raw
+
+        # 2. The parent interception saves the base64 locally instead.
+        parent_runtime = parent[0]._server.runtime  # type: ignore[attr-defined]
+        os.environ["BASE64_CHECK_THRESHOLD"] = "1024"
+        try:
+            out, _config = parent_runtime._execute_tool_call(  # type: ignore[attr-defined]
+                "mcp_shot", {}, tool_scope=[cfg])
+        finally:
+            del os.environ["BASE64_CHECK_THRESHOLD"]
+        assert payload not in out
+        match = re.search(r'"filePath":\s*"([^"]+)"', out)
+        assert match, out
+        assert open(match.group(1), "rb").read() == b"\x89PNG" + b"m" * 2000
+
     def test_call_failure_returns_error_text(self, child):
         p = RemoteToolProxy({"id": f"http://127.0.0.1:{child[0].port}",
                              "url": f"http://127.0.0.1:{child[0].port}/v1/setup"})

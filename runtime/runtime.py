@@ -1105,24 +1105,34 @@ class Runtime:
         Returns:
             The tool result as a string, or an error message string.
 
-        The call runs through the SAME per-call pipeline as the inference
-        loop (``_execute_tool_call``): argument-name normalization, MCP
-        base64 pre-processing (file path -> base64) and post-processing
-        (long base64 payloads saved to a local file and replaced with the
-        path), compatibility notes and the result length guard.  This keeps
-        direct calls (in particular the child environment's
-        ``POST /v1/tools/call`` behind the remote tool proxy) behaviorally
-        identical to a local inference round, so remote tool execution gets
-        the same pre/post handling as local execution: base64 input files
-        are read from, and intercepted base64 results are saved on, the
-        machine that actually runs the tool.
+        The call is deliberately *raw*: it does NOT apply the inference-loop
+        pre/post processing (base64 file-path -> content conversion, long
+        base64 payload interception, argument notes, result length guard).
+        API callers of ``POST /v1/tools/call`` get the tool's actual output,
+        so an MCP tool that returns base64 still returns base64 instead of a
+        server-local file path the caller cannot read (and a path-like
+        argument is still forwarded as a path).
+
+        Base64 marshalling for remote execution is therefore owned by the
+        *parent* side: when a child MCP tool is called through the remote
+        tool proxy, ``Runtime._execute_tool_call`` performs the conversion
+        here, around the forwarded call (see
+        :meth:`_needs_mcp_base64_handling`), so the child's
+        ``POST /v1/tools/call`` stays a verbatim executor.
         """
-        tool_config = self._find_tool_by_name(tool_id)
+        tool_config = self._tool_registry.get(tool_id)
+        if tool_config is None:
+            # Also try by name
+            tool_config = self._find_tool_by_name(tool_id)
         if tool_config is None:
             return f"Error: tool '{tool_id}' not found in registry"
 
-        result_str, _ = self._execute_tool_call(tool_id, arguments)
-        return result_str
+        if tool_config.tool_type == "function":
+            return self._execute_function_tool(tool_config, arguments)
+        elif tool_config.tool_type == "mcp":
+            return self._execute_mcp_tool(tool_config, arguments)
+        else:
+            return f"Error: unsupported tool_type '{tool_config.tool_type}' for tool '{tool_id}'"
 
     # ------------------------------------------------------------------
     # Tool execution helpers
@@ -1182,6 +1192,17 @@ class Runtime:
             # _normalize_argument_names returned error -> arguments is the error string
             return arguments, tool_config
 
+        # --- MCP base64 pre-processing (parent side) ---
+        # 检测参数中的 base64_content 等字段，如果值看起来是文件路径（非 base64），
+        # 则自动读取文件并转换为 base64，避免大模型处理长 base64 字符串。
+        # 本地 MCP 工具与「子端 MCP 工具的母端代理」都在母端做这件事：子端
+        # ``/v1/tools/call`` 只作为正确执行者返回真实内容（其直接 API 调用方拿到的
+        # 仍是真实 base64），而母端才是拥有模型上下文、需要拦截长 base64 的一侧。
+        mcp_base64 = self._needs_mcp_base64_handling(tool_config)
+        if mcp_base64:
+            from runtime.tools import process_tool_arguments_for_base64
+            arguments = process_tool_arguments_for_base64(arguments)
+
         had_tool_use_id = hasattr(_thread_local, "tool_use_id")
         previous_tool_use_id = getattr(_thread_local, "tool_use_id", None)
         _thread_local.tool_use_id = tool_use_id
@@ -1191,24 +1212,9 @@ class Runtime:
                     tool_config, arguments, on_started=on_started,
                 )
             elif tool_config.tool_type == "mcp":
-                # --- Base64 file path auto-conversion (for file transfer MCP) ---
-                # 检测参数中的 base64_content 等字段，如果值看起来是文件路径（非 base64），
-                # 则自动读取文件并转换为 base64，避免大模型处理长 base64 字符串。
-                from runtime.tools import process_tool_arguments_for_base64
-                arguments = process_tool_arguments_for_base64(arguments)
-            
                 if on_started is not None:
                     on_started(_now_precise_iso())
                 result_str = self._execute_mcp_tool(tool_config, arguments)
-
-                # --- Base64 image interception (inference loop only) ---
-                # Long base64 payloads (e.g. screenshots from windows-mcp / chrome-devtools)
-                # are harmful to the model context. Replace them with saved file paths.
-                if len(result_str) > env_int("BASE64_CHECK_THRESHOLD", 1024):
-                    if is_likely_base64(result_str):
-                        result_str = '{"data":"' + result_str + '"}'
-                    from runtime.tools import save_and_replace_base64
-                    result_str = save_and_replace_base64(result_str)
             elif tool_config.tool_type == "skill":
                 result_str = f"Error: skill '{tool_name}' should be triggered via progressive disclosure, not direct execution"
             else:
@@ -1221,6 +1227,18 @@ class Runtime:
                     delattr(_thread_local, "tool_use_id")
                 except AttributeError:
                     pass
+
+        # --- Long base64 payload interception (inference loop only) ---
+        # Long base64 payloads (e.g. screenshots from windows-mcp /
+        # chrome-devtools) are harmful to the model context.  Replace them
+        # with saved file paths *before* the oversized-result guard, which
+        # would otherwise reduce a remote (child) result to an inline
+        # preview because the child cannot read the parent's /tmp.
+        if mcp_base64 and len(result_str) > env_int("BASE64_CHECK_THRESHOLD", 1024):
+            if is_likely_base64(result_str):
+                result_str = '{"data":"' + result_str + '"}'
+            from runtime.tools import save_and_replace_base64
+            result_str = save_and_replace_base64(result_str)
 
         # Append compatibility notes if any argument names were corrected
         if compat_notes:
@@ -1237,6 +1255,33 @@ class Runtime:
     # ------------------------------------------------------------------
     # Tool result post-processing
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _needs_mcp_base64_handling(tool_config: ToolConfig) -> bool:
+        """Whether parent-side MCP base64 pre/post processing applies.
+
+        True for:
+
+        * local MCP tools (``tool_type == "mcp"``), whose MCP call runs here;
+        * remote proxy entries whose *child* tool is an MCP tool.  Remote
+          tools are exposed on the parent as ``function`` configs carrying a
+          proxy callable, and the child's ``POST /v1/tools/call`` executes
+          the tool verbatim — its own direct API callers must keep receiving
+          real base64, never a server-local path.  The parent therefore owns
+          the base64 marshalling around the forwarded call: input file paths
+          are read here (parent filesystem) and long base64 results are saved
+          here, so huge payloads never reach the model context while the
+          child stays a raw executor.
+
+        ``RemoteToolProxy.list_tool_configs`` records the child's original
+        tool type on the config as ``remote_child_tool_type``.
+        """
+        if tool_config.tool_type == "mcp":
+            return True
+        return (
+            getattr(tool_config, "is_remote_proxy", False)
+            and getattr(tool_config, "remote_child_tool_type", None) == "mcp"
+        )
 
     @staticmethod
     def _guard_tool_result_length(result_str: str, tool_config=None) -> str:

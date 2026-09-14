@@ -318,6 +318,50 @@ class TestToolCall:
         # Tool call now returns plain text; _post parses via json.loads -> int
         assert body == 5
 
+    def test_call_mcp_tool_is_raw_both_ways(self, server, runtime):
+        """POST /v1/tools/call executes verbatim: no base64 pre/post handling.
+
+        The parent environment calls this endpoint (via its remote tool proxy)
+        and owns the base64 marshalling itself, so a caller must keep getting
+        the real payload - never a server-local file path it cannot read - and
+        a path-like argument must be forwarded untouched.
+        """
+        import base64
+
+        payload = base64.b64encode(b"\x89PNG" + b"x" * 2000).decode()
+        seen: dict = {}
+
+        class _FakeMcpManager:
+            def call_tool(self, server_name, tool_name, arguments, timeout=None):
+                seen.update(arguments)
+                return f'{{"screenshot": "{payload}"}}'
+
+        config = ToolConfig(
+            tool_id="shot",
+            tool_type="mcp",
+            name="shot",
+            description="fake mcp tool",
+            parameters={"type": "object", "properties": {
+                "base64_content": {"type": "string"}}},
+            mcp_server_name="fake-srv",
+            tool_name="shot",
+        )
+        runtime._tool_registry.register(config)
+        runtime._mcp_manager = _FakeMcpManager()
+
+        os.environ["BASE64_CHECK_THRESHOLD"] = "1024"
+        try:
+            status, raw = _post_raw(server, "/v1/tools/call", {
+                "tool_id": "shot",
+                "arguments": {"base64_content": "/tmp/not-a-file.png"},
+            })
+        finally:
+            del os.environ["BASE64_CHECK_THRESHOLD"]
+
+        assert status == 200
+        assert seen["base64_content"] == "/tmp/not-a-file.png"
+        assert raw.decode("utf-8") == f'{{"screenshot": "{payload}"}}'
+
     def test_tool_not_found(self, server):
         status, body = _post(server, "/v1/tools/call", {"tool_id": "nonexistent", "arguments": {}})
         assert status == 400

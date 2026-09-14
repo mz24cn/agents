@@ -282,6 +282,10 @@ class RemoteToolProxy:
             )
             # 标记远程代理工具：超长结果守护据此改为内联截断（子端读不到母端 /tmp）。
             config.is_remote_proxy = True
+            # 子端原始 tool_type：MCP 工具在母端以 function 形式转发，但 base64
+            # 前后置处理仍由母端负责（子端 /v1/tools/call 原样执行），母端据此
+            # 判定是否需要 base64 编解码。
+            config.remote_child_tool_type = original_type
             if tool_type != "skill":
                 child_id = original_id
                 proxy = self
