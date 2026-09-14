@@ -55,6 +55,10 @@ class MCPClientManager:
         self._connections: dict[str, dict] = {}
         self._request_id: int = 0
         self._lock = threading.Lock()
+        # Serializes (re)connection of each MCP server so concurrent callers
+        # never spawn two processes for the same server and a handshake can
+        # never overlap with an in-flight exchange on the same StreamReader.
+        self._reconnect_lock = threading.RLock()
         self._idle_timeout = idle_timeout
         # Dedicated event loop running in a background thread.
         # All asyncio subprocess operations are funnelled here so that
@@ -163,6 +167,30 @@ class MCPClientManager:
             # non-JSON line — log to stderr and keep reading
             import sys as _sys
             print(f"[mcp_client] skipping non-JSON stdout: {stripped[:120]}", file=_sys.stderr)
+
+    async def _stdio_send_serialized(self, conn: dict, request: dict,
+                                     timeout: float | None = None) -> dict:
+        """Run a stdio JSON-RPC exchange under the per-connection IO lock.
+
+        The HTTP server is threaded, so several ``call_tool()`` /
+        ``get_tools()`` calls can target the same stdio MCP server at the
+        same time.  ``asyncio.StreamReader`` allows only ONE pending
+        reader: a second concurrent ``readline()`` (used by
+        ``_stdio_send``) raises
+        ``RuntimeError: readuntil() called while another coroutine is
+        already waiting for incoming data``.  All stdio exchanges for one
+        connection are therefore funnelled through this wrapper, which
+        serializes them on the dedicated event loop.  The lock lives on
+        the ``conn`` dict so it is recreated together with the process on
+        reconnect; creating/reading it inside the coroutine keeps the
+        access single-threaded (loop thread only).
+        """
+        lock = conn.get("_io_lock")
+        if lock is None:
+            lock = asyncio.Lock()
+            conn["_io_lock"] = lock
+        async with lock:
+            return await self._stdio_send(conn, request, timeout=timeout)
 
     async def _stdio_initialize(self, conn: dict) -> None:
         request = self._build_jsonrpc("initialize", {
@@ -471,10 +499,16 @@ class MCPClientManager:
         if server_name in self._connections:
             if self._connections[server_name].get("connected"):
                 return
-        self._run_async(
-            self._async_connect_stdio(server_name, command, args, env),
-            timeout=timeout,
-        )
+        with self._reconnect_lock:
+            # Re-check under the lock: another thread may have connected
+            # while we were waiting (e.g. a concurrent reconnect).
+            if server_name in self._connections:
+                if self._connections[server_name].get("connected"):
+                    return
+            self._run_async(
+                self._async_connect_stdio(server_name, command, args, env),
+                timeout=timeout,
+            )
 
     async def _async_connect_stdio(
         self,
@@ -509,7 +543,11 @@ class MCPClientManager:
             "args": args or [],
             "env": env,
             "process": process,
-            "connected": True,
+            # False until the initialize handshake completes: concurrent
+            # call_tool() callers must queue in _ensure_connected instead
+            # of starting an exchange on a stream the handshake is still
+            # reading from (that would race on the same StreamReader).
+            "connected": False,
             "server_info": {},
             "tools_cache": None,
             "last_used": time.monotonic(),
@@ -524,6 +562,7 @@ class MCPClientManager:
             await self._async_disconnect_stdio(conn)
             conn["connected"] = False
             raise
+        conn["connected"] = True
 
     def connect_url(
         self,
@@ -548,23 +587,29 @@ class MCPClientManager:
         if server_name in self._connections:
             if self._connections[server_name].get("connected"):
                 return
-        conn: dict = {
-            "type": "url",
-            "server_name": server_name,
-            "url": url,
-            "headers": headers,
-            "session_id": None,
-            "connected": True,
-            "server_info": {},
-            "tools_cache": None,
-            "last_used": time.monotonic(),
-        }
-        self._connections[server_name] = conn
-        try:
-            self._http_initialize(conn, timeout=timeout)
-        except Exception:
-            conn["connected"] = False
-            raise
+        with self._reconnect_lock:
+            # Re-check under the lock: another thread may have connected
+            # while we were waiting (e.g. a concurrent reconnect).
+            if server_name in self._connections:
+                if self._connections[server_name].get("connected"):
+                    return
+            conn: dict = {
+                "type": "url",
+                "server_name": server_name,
+                "url": url,
+                "headers": headers,
+                "session_id": None,
+                "connected": True,
+                "server_info": {},
+                "tools_cache": None,
+                "last_used": time.monotonic(),
+            }
+            self._connections[server_name] = conn
+            try:
+                self._http_initialize(conn, timeout=timeout)
+            except Exception:
+                conn["connected"] = False
+                raise
 
     # ------------------------------------------------------------------
     # Public API: get_tools, call_tool
@@ -582,7 +627,7 @@ class MCPClientManager:
         request = self._build_jsonrpc("tools/list")
         if conn["type"] == "stdio":
             response = self._run_async(
-                self._stdio_send(conn, request, timeout=timeout),
+                self._stdio_send_serialized(conn, request, timeout=timeout),
                 timeout=timeout,
             )
         else:
@@ -610,7 +655,7 @@ class MCPClientManager:
         request = self._build_jsonrpc("tools/call", params)
         if conn["type"] == "stdio":
             response = self._run_async(
-                self._stdio_send(conn, request, timeout=timeout), timeout=timeout)
+                self._stdio_send_serialized(conn, request, timeout=timeout), timeout=timeout)
         else:
             response = self._http_send(conn, request, timeout=timeout)
         self._touch(conn)
@@ -689,16 +734,20 @@ class MCPClientManager:
 
     def reconnect(self, server_name: str) -> None:
         """Reconnect to a previously registered MCP server."""
-        conn = self._connections.get(server_name)
-        if conn is None:
-            raise RuntimeError(f"No connection info for server '{server_name}', cannot reconnect")
-        self.disconnect(server_name)
-        if conn["type"] == "stdio":
-            self.connect_stdio(server_name, conn["command"], conn.get("args"), conn.get("env"))
-        elif conn["type"] == "url":
-            self.connect_url(server_name, conn["url"], conn.get("headers"))
-        else:
-            raise RuntimeError(f"Unknown connection type: {conn['type']}")
+        # RLock: connect_stdio/connect_url below re-acquire the same lock to
+        # serialize the whole disconnect+connect against concurrent
+        # reconnections from other threads.
+        with self._reconnect_lock:
+            conn = self._connections.get(server_name)
+            if conn is None:
+                raise RuntimeError(f"No connection info for server '{server_name}', cannot reconnect")
+            self.disconnect(server_name)
+            if conn["type"] == "stdio":
+                self.connect_stdio(server_name, conn["command"], conn.get("args"), conn.get("env"))
+            elif conn["type"] == "url":
+                self.connect_url(server_name, conn["url"], conn.get("headers"))
+            else:
+                raise RuntimeError(f"Unknown connection type: {conn['type']}")
 
     # ------------------------------------------------------------------
     # Convenience: load from config dict
@@ -782,17 +831,29 @@ class MCPClientManager:
         conn = self._connections.get(server_name)
         if conn is None:
             raise RuntimeError(f"MCP server '{server_name}' is not registered")
+        if self._is_stale(conn):
+            # Reaped, dead process, or never started — reconnect transparently.
+            # Serialize under the lock and re-check afterwards: another
+            # thread may have reconnected while we were waiting for it.
+            with self._reconnect_lock:
+                conn = self._connections.get(server_name)
+                if conn is None:
+                    raise RuntimeError(f"MCP server '{server_name}' is not registered")
+                if self._is_stale(conn):
+                    self.reconnect(server_name)
+                    conn = self._connections[server_name]
+        return conn
+
+    @staticmethod
+    def _is_stale(conn: dict) -> bool:
+        """True when the connection needs (re)establishment."""
         if not conn.get("connected"):
-            # Process was reaped or never started — reconnect transparently
-            self.reconnect(server_name)
-            conn = self._connections[server_name]
-        # Also check if stdio process has died unexpectedly
+            return True
         if conn["type"] == "stdio":
             process = conn.get("process")
             if process is None or process.returncode is not None:
-                self.reconnect(server_name)
-                conn = self._connections[server_name]
-        return conn
+                return True
+        return False
 
     def _convert_tools(self, server_name: str, raw_tools: list) -> list:
         now = datetime.datetime.now().isoformat()

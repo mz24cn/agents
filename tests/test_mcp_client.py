@@ -648,3 +648,129 @@ class _FastEchoHandler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, *args) -> None:  # silence request logging
         pass
+
+
+# ------------------------------------------------------------------
+# stdio transport concurrency tests
+# ------------------------------------------------------------------
+
+# A tiny MCP server over stdio.  ``initialize`` and ``tools/call`` both
+# sleep so that concurrent exchanges overlap on the process's stdout pipe.
+_STDIO_ECHO_SERVER = r"""
+import sys, json, time
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n"); sys.stdout.flush()
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    if req.get("method") == "initialize":
+        time.sleep(0.2)
+        send({"jsonrpc": "2.0", "id": req["id"], "result": {
+            "protocolVersion": "2025-03-26", "capabilities": {},
+            "serverInfo": {"name": "echo"}}})
+    elif req.get("method") == "tools/call":
+        time.sleep(0.15)
+        send({"jsonrpc": "2.0", "id": req["id"],
+              "result": {"content": [{"type": "text",
+                                      "text": "ok-" + str(req["id"])}]}})
+"""
+
+
+class TestStdioConcurrency:
+    """Regression tests for concurrent stdio MCP exchanges.
+
+    The HTTP server is threaded, so several /v1/tools/call requests can
+    hit the same stdio MCP server at the same time.  Before the fix, the
+    second concurrent exchange on the same ``asyncio.StreamReader`` raised
+    ``RuntimeError: readuntil() called while another coroutine is already
+    waiting for incoming data`` and the request failed with HTTP 400.
+    """
+
+    def _start(self, mgr, name="echo"):
+        mgr.connect_stdio(name, "python3", ["-c", _STDIO_ECHO_SERVER])
+
+    def test_concurrent_call_tool_no_readuntil_race(self):
+        """Concurrent call_tool() on one stdio server must all succeed
+        (serialized on the per-connection IO lock), not fail with the
+        StreamReader 'readuntil' race."""
+        import concurrent.futures
+        mgr = MCPClientManager()
+        self._start(mgr)
+        errors = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            futures = [
+                pool.submit(mgr.call_tool, "echo", "tool", {}, 30)
+                for _ in range(8)
+            ]
+            for f in futures:
+                try:
+                    result = f.result(timeout=60)
+                    assert result.startswith("ok-")
+                except Exception as exc:
+                    errors.append(exc)
+        assert not errors, f"concurrent exchanges failed: {errors}"
+
+    def test_concurrent_reconnect_after_process_death(self):
+        """Several threads racing to use a server whose process just died
+        must end up on ONE healthy reconnection (serialized on
+        _reconnect_lock), without double-spawning or read races."""
+        import concurrent.futures
+        import os
+        import signal
+        mgr = MCPClientManager()
+        self._start(mgr)
+        assert mgr.call_tool("echo", "tool", {}, 30).startswith("ok-")
+        conn = mgr._connections["echo"]
+        os.killpg(os.getpgid(conn["process"].pid), signal.SIGKILL)
+        for _ in range(10000):
+            if conn["process"].returncode is not None:
+                break
+            time.sleep(0.001)
+        assert conn["process"].returncode is not None
+        errors = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            futures = [
+                pool.submit(mgr.call_tool, "echo", "tool", {}, 60)
+                for _ in range(6)
+            ]
+            for f in futures:
+                try:
+                    result = f.result(timeout=90)
+                    assert result.startswith("ok-")
+                except Exception as exc:
+                    errors.append(exc)
+        assert not errors, f"racing reconnects failed: {errors}"
+        # Exactly one live process for the server after the race.
+        new_conn = mgr._connections["echo"]
+        assert new_conn is not conn
+        assert new_conn["process"].returncode is None
+
+    def test_call_tool_racing_initial_handshake(self):
+        """A call_tool() that starts while the very first connect is still
+        handshaking must queue (connected stays False until the handshake
+        completes) instead of racing the handshake on the same stream."""
+        mgr = MCPClientManager()
+        connector_errors = []
+
+        def connector():
+            try:
+                mgr.connect_stdio("echo", "python3", ["-c", _STDIO_ECHO_SERVER],
+                                  timeout=30)
+            except Exception as exc:
+                connector_errors.append(exc)
+
+        t = threading.Thread(target=connector)
+        t.start()
+        # Wait until the conn entry exists (process spawned, handshake running).
+        for _ in range(10000):
+            if "echo" in mgr._connections:
+                break
+            time.sleep(0.001)
+        assert "echo" in mgr._connections
+        result = mgr.call_tool("echo", "tool", {}, 60)
+        t.join(timeout=60)
+        assert not t.is_alive()
+        assert not connector_errors, connector_errors
+        assert result.startswith("ok-")
