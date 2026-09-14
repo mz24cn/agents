@@ -1,5 +1,5 @@
 <script>
-  import { router, getQueryParam } from '../../lib/router.svelte.js'
+  import { router, getQueryParam, navigate } from '../../lib/router.svelte.js'
   import ThemeToggle from '../ThemeToggle.svelte'
   import AuthSettingsPage from './AuthSettingsPage.svelte'
   import { t, i18n, setLang } from '../../lib/i18n.svelte.js'
@@ -65,6 +65,23 @@
     })()
     if (validTabs.includes(tabParam)) {
       activeTab = tabParam
+    }
+  })
+
+  // activeTab -> URL：切换 tab 时同步更新地址栏的 tab 参数（保留 templateId 等其他参数），
+  // 这样刷新页面后会停留在当前 tab，而不是跳回 URL 里旧的 tab。
+  // URL 中的 tab 与 activeTab 一致时跳过，避免多余的导航和历史记录。
+  $effect(() => {
+    const tab = activeTab
+    const hash = router.current || ''
+    const [base, query] = hash.slice(1).split('?')
+    const params = new URLSearchParams(query || '')
+    if (base === 'setup' && params.get('tab') === tab) return
+    if (base === 'setup') {
+      params.set('tab', tab)
+      navigate(`#/setup?${params.toString()}`)
+    } else {
+      navigate(`#/setup?tab=${encodeURIComponent(tab)}`)
     }
   })
 

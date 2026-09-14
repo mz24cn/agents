@@ -590,7 +590,9 @@
   function envDisplayName(e) {
     return e.app_title ? `${e.app_title} [${e.id}]` : e.id
   }
-  // 当前会话绑定的远程环境（供 Terminal / WorkspaceFileManager 直连子端）
+  // 当前会话绑定的远程环境（供 Terminal 直连子端）。
+  // 终端总是会话级（无会话时没有终端），故这里严格要求存在会话；文件管理器可
+  // 在无会话时使用，走 workspacePanelRemoteEnv。
   let currentRemoteEnv = $derived(
     sessionId && remoteExecution.sessionId === sessionId && remoteExecution.env
       ? remoteExecution.env
