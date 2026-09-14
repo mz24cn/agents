@@ -155,6 +155,27 @@ export function isRemoteSession(sessionId = null) {
 }
 
 /**
+ * Resolve the remote env a panel targets, following the active binding.
+ *
+ * Unlike the terminal (always session-scoped, only reachable from a session),
+ * the workspace file manager can be opened *before* the first message creates
+ * a session.  In that state ``handleRemoteEnvChange`` binds the selected env
+ * with ``sessionId = null``, so comparing ``remoteExecution.sessionId ===
+ * sessionId`` (both null) already matches and the panel follows the
+ * execution-environment selector instead of silently falling back to local.
+ *
+ * @param {string|null} sessionId currently displayed session (null = none yet)
+ * @param {boolean} [localMode] force local (e.g. "open session log dir")
+ * @returns {object|null} env record to target, or null for the local env
+ */
+export function resolvePanelRemoteEnv(sessionId = null, localMode = false) {
+  if (localMode || !remoteExecution.env) return null
+  return remoteExecution.sessionId === (sessionId ?? null)
+    ? remoteExecution.env
+    : null
+}
+
+/**
  * Build an absolute child URL for a /v1/ path, appending the token.
  * Suitable for fetch() and for media src attributes (img/audio/video/
  * document previews) — the token query param is the URL auth channel.

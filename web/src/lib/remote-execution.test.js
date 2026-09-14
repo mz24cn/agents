@@ -11,6 +11,7 @@ import {
   resolveRemoteEnv,
   bindSessionToRemoteEnv,
   clearRemoteBinding,
+  resolvePanelRemoteEnv,
   buildRemoteUrl,
   buildRemoteWsUrl,
   remoteRequest,
@@ -167,6 +168,41 @@ describe('buildRemoteUrl / buildRemoteWsUrl', () => {
   it('throws when nothing is bound', () => {
     expect(() => buildRemoteUrl('/v1/tools')).toThrow()
     expect(() => buildRemoteWsUrl('/v1/terminals/ws')).toThrow()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// resolvePanelRemoteEnv (file manager env resolution)
+// ---------------------------------------------------------------------------
+
+describe('resolvePanelRemoteEnv', () => {
+  it('follows the selector when no session exists yet', async () => {
+    // handleRemoteEnvChange binds with sessionId=null before the first message.
+    vi.stubGlobal('fetch', mockFetch(ENV_RECORDS))
+    const env = await bindSessionToRemoteEnv(null, 'http://10.0.0.5:7988')
+    expect(resolvePanelRemoteEnv(null)).toBe(env)
+    expect(resolvePanelRemoteEnv(undefined)).toBe(env)
+  })
+
+  it('follows the session binding when a session exists', async () => {
+    vi.stubGlobal('fetch', mockFetch(ENV_RECORDS))
+    const env = await bindSessionToRemoteEnv('sess-1', 'http://10.0.0.5:7988')
+    expect(resolvePanelRemoteEnv('sess-1')).toBe(env)
+  })
+
+  it('stays local for a session that is not the bound one', async () => {
+    vi.stubGlobal('fetch', mockFetch(ENV_RECORDS))
+    await bindSessionToRemoteEnv('sess-1', 'http://10.0.0.5:7988')
+    expect(resolvePanelRemoteEnv('sess-2')).toBeNull()
+    // ...and a pre-session panel must not pick up another session's binding.
+    expect(resolvePanelRemoteEnv(null)).toBeNull()
+  })
+
+  it('stays local when nothing is bound or in forced-local mode', async () => {
+    expect(resolvePanelRemoteEnv(null)).toBeNull()
+    vi.stubGlobal('fetch', mockFetch(ENV_RECORDS))
+    await bindSessionToRemoteEnv(null, 'http://10.0.0.5:7988')
+    expect(resolvePanelRemoteEnv(null, true)).toBeNull()
   })
 })
 

@@ -31,6 +31,7 @@
     fetchRemoteWorkspacePath,
     remoteSessions,
     destroyRemoteTerminal,
+    resolvePanelRemoteEnv,
   } from '../../lib/remote-execution.svelte.js'
 
   const STORAGE_MODEL_KEY = 'chat_selected_model'
@@ -602,14 +603,12 @@
   // 子端 file journal "软链接"：父端 log-dir 探测到子端已有 journal 时非空
   // （{ envId, path, envName }），文件管理器在本地会话目录里渲染跳转条目。
   let logDirRemoteJournal = $state(null)
-  // 文件管理器实际使用的远程环境：logDirLocalMode 生效时为 null（本地），
-  // 否则跟随当前可见会话的绑定。
+  // 文件管理器实际使用的远程环境：logDirLocalMode 生效时固定本地（null）；
+  // 否则跟随「当前会话」的绑定 —— 尚未创建会话时（sessionId 与绑定均为 null）
+  // 跟随执行环境下拉框，使发送首条消息前打开文件管理器也能直连所选远端环境，
+  // 而不是误开本地环境。
   let workspacePanelRemoteEnv = $derived(
-    logDirLocalMode
-      ? null
-      : (sessionId && remoteExecution.sessionId === sessionId && remoteExecution.env
-          ? remoteExecution.env
-          : null)
+    resolvePanelRemoteEnv(sessionId, logDirLocalMode)
   )
 
   async function loadRemoteEnvs() {
