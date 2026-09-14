@@ -882,10 +882,12 @@
     reqBody.session_id = sessionId ?? 'new'
     // 远程执行：remote_env = 子环境 id（后端持久化到 meta.remote_env；
     // 会话工具全部来自子端，保持子端原始工具名）。终端运行在子端，
-    // 本地终端注册表没有该状态，exec_cli 由前端按终端面板状态追加。
+    // 本地终端注册表没有该状态——后端会问子端 /v1/terminals 自动追加
+    // exec_cli；这里在前端也按“会话已有终端”补一次，作为兜底并让工具
+    // 计数立即可见（与本地执行一致：终端存在即暴露，不要求面板可见）。
     if (selectedRemoteEnvId) {
       reqBody.remote_env = selectedRemoteEnvId
-      if (terminalVisible && currentTerminalData && !reqBody.tool_ids.includes('exec_cli')) {
+      if (currentTerminalData && !reqBody.tool_ids.includes('exec_cli')) {
         reqBody.tool_ids = [...reqBody.tool_ids, 'exec_cli']
       }
     }

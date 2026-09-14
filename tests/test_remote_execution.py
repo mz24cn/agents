@@ -747,6 +747,105 @@ class TestRemoteInferEndToEnd:
         assert getattr(local_wf, "is_remote_proxy", False) is False
         assert all("__" not in t.tool_id for t in parent_runtime._tool_registry.list_all())  # type: ignore[attr-defined]
 
+    def test_remote_infer_auto_exposes_exec_cli_for_open_child_terminal(
+        self, parent, child, tmp_path
+    ):
+        """A remote session whose child has a live terminal auto-exposes
+        exec_cli — parity with local execution, driven by the parent backend
+        rather than relying on the web frontend to append it."""
+        import threading
+
+        from runtime.models import ModelConfig
+        from runtime.server_state import _terminal_sessions, _terminal_sessions_lock
+
+        env_id = _add_env(parent, f"http://127.0.0.1:{child[0].port}/v1/setup")
+        parent_runtime = parent[0]._server.runtime  # type: ignore[attr-defined]
+        parent_runtime._model_registry.register(  # type: ignore[attr-defined]
+            ModelConfig(
+                model_id="e2e-model",
+                api_base="http://model.invalid",
+                model_name="e2e",
+                api_protocol="openai",
+            )
+        )
+
+        captured: dict = {}
+
+        def _tool_names():
+            names = []
+            for tool in (captured.get("body") or {}).get("tools") or []:
+                fn = tool.get("function") if isinstance(tool, dict) else None
+                names.append((fn or {}).get("name"))
+            return names
+
+        def _sse(lines):
+            return io.BytesIO("".join(lines).encode("utf-8"))
+
+        final_chunk = json.dumps({"choices": [{"delta": {"content": "ok"}}]})
+        real_urlopen = urllib.request.urlopen
+
+        def selective_urlopen(req, **kwargs):
+            url = req.full_url if isinstance(req, urllib.request.Request) else str(req)
+            if url.startswith("http://model.invalid"):
+                try:
+                    captured["body"] = json.loads(req.data.decode("utf-8"))
+                except Exception:
+                    captured["body"] = {}
+                stream = _sse([f"data: {final_chunk}\n\n", "data: [DONE]\n\n"])
+                mock_resp = MagicMock()
+                mock_resp.__iter__ = lambda self: iter(stream.readlines())
+                mock_resp.read = stream.read
+                mock_resp.close = MagicMock()
+                mock_resp.__enter__ = lambda s: s
+                mock_resp.__exit__ = MagicMock(return_value=False)
+                return mock_resp
+            return real_urlopen(req, **kwargs)
+
+        # 1. No child terminal yet -> exec_cli is NOT auto-exposed.
+        captured["body"] = None
+        with patch("urllib.request.urlopen", side_effect=selective_urlopen):
+            status, body = _request(parent[0], "POST", "/v1/infer", {
+                "model_id": "e2e-model",
+                "tool_ids": [],
+                "messages": [{"role": "user", "content": "hi"}],
+                "session_id": "new",
+                "remote_env": env_id,
+            })
+        assert status == 200, body
+        sid = body.get("session_id")
+        assert sid
+        assert "exec_cli" not in _tool_names()
+
+        # The terminal runs on the child; inject one directly (in-process the
+        # child shares the module-level registry, so /v1/terminals reports it).
+        terminal_id = f"{sid}:auto"
+        with _terminal_sessions_lock:
+            _terminal_sessions[terminal_id] = {
+                "session_id": sid,
+                "active": True,
+                "disconnected_at": None,
+                "output_buffer": [],
+                "buffer_lock": threading.Lock(),
+                "sock": None,
+            }
+        try:
+            # 2. Same session, now with a live child terminal -> exec_cli
+            #    appears in the model's tool list without the frontend.
+            captured["body"] = None
+            with patch("urllib.request.urlopen", side_effect=selective_urlopen):
+                status, body = _request(parent[0], "POST", "/v1/infer", {
+                    "model_id": "e2e-model",
+                    "tool_ids": [],
+                    "messages": [{"role": "user", "content": "again"}],
+                    "session_id": sid,
+                    "remote_env": env_id,
+                })
+            assert status == 200, body
+            assert "exec_cli" in _tool_names()
+        finally:
+            with _terminal_sessions_lock:
+                _terminal_sessions.pop(terminal_id, None)
+
     def test_remote_infer_skips_local_file_ref_expansion(self, parent, child):
         """Remote sessions must not expand <file> refs against the parent workspace."""
         from runtime.models import ModelConfig

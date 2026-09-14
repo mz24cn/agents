@@ -59,6 +59,44 @@ def _add_exec_cli_for_open_terminal(
     return [*tool_ids, "exec_cli"]
 
 
+def _remote_session_has_terminal(
+    remote_proxy,
+    session_id: Optional[str],
+    is_group_chat: bool,
+) -> bool:
+    """Whether a remote session already has a live terminal on the child.
+
+    In remote execution the persistent terminal runs in the *child*
+    environment, so the parent's local terminal registry has no entry for the
+    session (that is why ``_add_exec_cli_for_open_terminal`` cannot be reused
+    as-is).  Ask the child's ``GET /v1/terminals`` instead so remote sessions
+    get the same "a session with an open terminal exposes exec_cli" behaviour
+    as local ones.
+
+    Reaching the child is best-effort: any failure degrades to "no terminal"
+    (exec_cli simply stays hidden) rather than breaking inference.
+    """
+    if is_group_chat or not session_id:
+        return False
+    try:
+        status, data = remote_proxy.http_json("/v1/terminals", timeout=5)
+    except Exception:  # noqa: BLE001 - never let the probe break inference
+        return False
+    if status != 200 or not isinstance(data, dict):
+        return False
+    for term in data.get("terminals") or []:
+        if not isinstance(term, dict):
+            continue
+        terminal_id = str(term.get("terminal_id") or "")
+        term_session = str(term.get("session_id") or "")
+        # Child terminals are keyed by ``{session_id}:auto`` and also carry a
+        # (possibly ``:``-stripped) session_id, so match either form.
+        if terminal_id == session_id or term_session == session_id \
+                or terminal_id.startswith(f"{session_id}:"):
+            return True
+    return False
+
+
 _stream_batch_is_protocol_complete = stream_batch_is_protocol_complete
 
 
@@ -388,8 +426,7 @@ class HandlerInferMixin:
             # 远程模式：工具清单全部来自子端，保持子端原始 tool_id/name
             # （远程与本地工具从不在同一会话混用，无冲突，不注册母端
             # registry）：代理条目经 InferenceRequest.tools 直传推理循环。
-            # 子端不存在的工具直接丢弃（无法在那里执行）；exec_cli 由前端
-            # 按终端面板状态追加（终端运行在子端，本地终端注册表无此状态）。
+            # 子端不存在的工具直接丢弃（无法在那里执行）。
             from runtime.remote_tool_proxy import RemoteToolCallError
             try:
                 remote_configs = remote_proxy.list_tool_configs()
@@ -400,6 +437,18 @@ class HandlerInferMixin:
                 return None
             available_ids = {c.tool_id for c in remote_configs}
             tool_ids = [tid for tid in tool_ids if tid in available_ids]
+            # 与本地执行保持一致：会话已打开终端时自动暴露 exec_cli。
+            # 终端运行在子端，父端本地终端注册表没有该状态，因此改问子端的
+            # /v1/terminals；这样非 Web 客户端（API）与恢复后的会话也能拿到
+            # exec_cli，而不是只依赖前端按面板状态追加。
+            if (
+                "exec_cli" in available_ids
+                and "exec_cli" not in tool_ids
+                and _remote_session_has_terminal(
+                    remote_proxy, session_id, is_group_chat
+                )
+            ):
+                tool_ids = [*tool_ids, "exec_cli"]
             remote_selected = [c for c in remote_configs if c.tool_id in set(tool_ids)]
         # Keep the normalized/augmented selection on the request body so retry
         # logging and conversation metadata reflect the actual inference tools.
