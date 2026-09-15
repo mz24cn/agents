@@ -29,7 +29,69 @@ _BACKEND_MTIME_TTL = 5.0
 _BACKEND_MTIME_CACHE: dict = {}
 
 
-def compute_setup_versions(env_manager: "EnvManager", data_dir: str) -> dict:
+# Asset references emitted into web/dist/index.html by the build (script src /
+# stylesheet href).  Used to tell a complete frontend build from a partial one.
+_FRONTEND_ASSET_REF_RE = re.compile(r"""(?:src|href)\s*=\s*["'](/[^"'>\s]*)["']""")
+
+
+def frontend_build_version(project_root: str) -> str:
+    """Derive the advertised ``frontend_build`` from web/dist as it is on disk.
+
+    The version has two jobs: it is the baseline of the mtime-filtered delta
+    builder (:meth:`EnvManager.build_delta_tar`) and it decides whether a child
+    is "behind".  Both are about *files*, so the version must be derived from
+    the same files instead of trusting a stamp that may not describe them.
+
+    ``web/dist/build_version`` alone is not enough: it is written by the Vite
+    plugin, and a failed build still refreshes it while leaving the previous
+    dist in place.  That advertised a frontend newer than anything on disk, so
+    the pushed delta contained the lone stamp (no index.html, no assets) — and
+    the receiver, which replaces web/dist wholesale whenever the delta has any
+    frontend file, deleted the working frontend and served nothing.
+
+    The newest mtime under web/dist is exactly what the delta filter compares,
+    which keeps "is there an update?" and "what does the delta carry?"
+    consistent.  ``""`` means *not determinable* and is returned when web/dist
+    is missing, has no ``index.html``, or references assets it does not
+    contain.  An empty version makes every parent with a real build push its
+    complete dist, which repairs such an environment.
+    """
+    dist_dir = os.path.join(os.path.realpath(project_root), "web", "dist")
+    try:
+        with open(os.path.join(dist_dir, "index.html"), "r", encoding="utf-8",
+                  errors="replace") as fh:
+            index_html = fh.read()
+    except OSError:
+        return ""
+
+    latest_mtime = 0.0
+    for dirpath, dirnames, filenames in os.walk(dist_dir):
+        dirnames[:] = [
+            name for name in dirnames
+            if not os.path.islink(os.path.join(dirpath, name))
+        ]
+        for filename in filenames:
+            fpath = os.path.join(dirpath, filename)
+            try:
+                if os.path.islink(fpath):
+                    continue
+                latest_mtime = max(latest_mtime, os.path.getmtime(fpath))
+            except OSError:
+                continue
+    if latest_mtime <= 0:
+        return ""
+
+    for reference in _FRONTEND_ASSET_REF_RE.findall(index_html):
+        if reference.startswith("//"):  # protocol-relative: not a local asset
+            continue
+        if not os.path.isfile(os.path.join(dist_dir, reference.lstrip("/"))):
+            return ""
+
+    return datetime.datetime.fromtimestamp(latest_mtime).strftime("%y%m%d_%H%M%S")
+
+
+def compute_setup_versions(env_manager: "EnvManager", data_dir: str,
+                           project_root: str | None = None) -> dict:
     """Compute this environment's advertised build versions.
 
     Returns a dict with ``frontend_build`` / ``backend_build`` /
@@ -37,17 +99,17 @@ def compute_setup_versions(env_manager: "EnvManager", data_dir: str) -> dict:
     ``op=hello`` probe, the parent-side push-update flow (which must compare
     and baseline against exactly the numbers the delta builder and the child
     would see), and the tunnel client's registration/hello snapshot.
-    """
-    script_dir = os.path.dirname(os.path.abspath(__file__))  # runtime/
-    project_root = os.path.dirname(script_dir)
 
-    frontend = ""
-    build_version_path = os.path.join(project_root, "web", "dist", "build_version")
-    try:
-        with open(build_version_path, "r") as f:
-            frontend = f.read().strip()
-    except (OSError, IOError):
-        pass
+    ``project_root`` defaults to the tree this module lives in; it is a
+    parameter so tests can point at a throwaway copy.
+    """
+    if project_root is None:
+        script_dir = os.path.dirname(os.path.abspath(__file__))  # runtime/
+        project_root = os.path.dirname(script_dir)
+
+    # Newest file in web/dist, so the advertised version always matches what a
+    # delta built against it would actually carry (see frontend_build_version).
+    frontend = frontend_build_version(project_root)
 
     # Backend version covers every deployable non-web project file,
     # including accessories extensions and skill assets.  Otherwise an
@@ -348,6 +410,28 @@ class EnvManager:
                         continue
                     relative = os.path.relpath(fpath, agents_dir).replace("\\", "/")
                     collected[f"agents_runtime/agents/{relative}"] = fpath
+
+        # web/dist is *replaced wholesale* on the receiver (content-hashed
+        # assets would otherwise pile up forever), so a partial dist is never
+        # valid: as soon as one dist file crosses the frontend threshold, ship
+        # the complete current dist.  Selecting per file is only sound for the
+        # sources, which are merged into the target tree.  Without this, any
+        # dist whose mtimes are not uniform (a failed build refreshing only
+        # build_version, a hand-patched file, a clock skew between the two
+        # hosts) produced a delta that wiped the child's frontend.
+        if any(arcname.startswith("web/dist/") for arcname in collected):
+            for dirpath, dirnames, filenames in os.walk(web_dist_real):
+                dirnames[:] = [
+                    d for d in dirnames
+                    if not os.path.islink(os.path.join(dirpath, d))
+                ]
+                for filename in filenames:
+                    fpath = os.path.join(dirpath, filename)
+                    if os.path.islink(fpath):
+                        continue
+                    arcname = os.path.relpath(fpath, project_root).replace("\\", "/")
+                    if arcname not in collected:
+                        collected[arcname] = fpath
 
         if not collected:
             return None

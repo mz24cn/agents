@@ -1762,6 +1762,7 @@ class HandlerApiMixin:
         restart_backend = False
         config_updated = False
         updated_files: list[str] = []
+        staging_web_dist = ""
         try:
             with tempfile.TemporaryDirectory(prefix="agent-update-") as tmp_dir:
                 archive_path = os.path.join(tmp_dir, "update.tar.gz")
@@ -1788,6 +1789,12 @@ class HandlerApiMixin:
                 # delta into the existing web/dist would leave obsolete hashes
                 # behind indefinitely, so replace the whole compiled frontend
                 # directory whenever this delta contains frontend output.
+                #
+                # Stage the replacement instead of deleting the live dist up
+                # front: the old code rmtree'd web/dist before copying anything,
+                # so a delta that turned out to be incomplete (or a copy that
+                # failed halfway) left the environment serving nothing but
+                # {"error": "Not found: /"}.
                 frontend_delta_dir = os.path.join(extract_dir, "web", "dist")
                 has_frontend_update = False
                 if os.path.isdir(frontend_delta_dir):
@@ -1795,13 +1802,16 @@ class HandlerApiMixin:
                         if files:
                             has_frontend_update = True
                             break
+                target_web_dist = os.path.realpath(os.path.join(project_root, "web", "dist"))
                 if has_frontend_update:
-                    target_web_dist = os.path.realpath(os.path.join(project_root, "web", "dist"))
                     if (os.path.commonpath([project_root, target_web_dist]) != project_root
                             or os.path.relpath(target_web_dist, project_root).replace("\\", "/") != "web/dist"):
                         raise ValueError("Invalid frontend target directory")
-                    if os.path.isdir(target_web_dist):
-                        shutil.rmtree(target_web_dist)
+                    # Same filesystem as the target, so the final swap is a
+                    # rename.  Dot-prefixed, so it stays out of later deltas.
+                    os.makedirs(os.path.dirname(target_web_dist), exist_ok=True)
+                    staging_web_dist = tempfile.mkdtemp(
+                        prefix=".dist-staging-", dir=os.path.dirname(target_web_dist))
 
                 for dirpath, _dirnames, filenames in os.walk(extract_dir):
                     for filename in filenames:
@@ -1815,6 +1825,12 @@ class HandlerApiMixin:
                             if os.path.commonpath([target_root, target_path]) != target_root:
                                 raise ValueError(f"Update config escapes DATA_DIR: {relative}")
                             config_updated = True
+                        elif has_frontend_update and relative_posix.startswith("web/dist/"):
+                            target_root = staging_web_dist
+                            target_path = os.path.realpath(os.path.join(
+                                target_root, relative_posix[len("web/dist/"):]))
+                            if os.path.commonpath([target_root, target_path]) != target_root:
+                                raise ValueError(f"Update file escapes frontend staging: {relative}")
                         else:
                             target_root = project_root
                             target_path = os.path.realpath(os.path.join(target_root, relative))
@@ -1825,6 +1841,27 @@ class HandlerApiMixin:
                         updated_files.append(relative_posix)
                         if not relative_posix.startswith("agents_runtime/") and relative_posix.endswith(".py"):
                             restart_backend = True
+
+                # Only swap in a frontend that can actually be served, and swap
+                # as a rename so the environment is never left without a dist
+                # even if the copy above failed or the caller is an older
+                # parent whose delta carries a partial web/dist.
+                if has_frontend_update:
+                    if not os.path.isfile(os.path.join(staging_web_dist, "index.html")):
+                        raise ValueError(
+                            "Frontend delta is incomplete (no index.html): refusing to "
+                            "replace web/dist — rebuild the frontend on the update source"
+                        )
+                    backup_web_dist = staging_web_dist + ".previous"
+                    if os.path.isdir(target_web_dist):
+                        os.replace(target_web_dist, backup_web_dist)
+                    try:
+                        os.replace(staging_web_dist, target_web_dist)
+                    except OSError:
+                        if os.path.isdir(backup_web_dist) and not os.path.isdir(target_web_dist):
+                            os.replace(backup_web_dist, target_web_dist)
+                        raise
+                    shutil.rmtree(backup_web_dist, ignore_errors=True)
 
                 # Match the self-extracting install order: after replacing
                 # web/dist and copying the downloaded frontend, re-apply the
@@ -1858,6 +1895,8 @@ class HandlerApiMixin:
                                 if patch_relative_posix.endswith(".py"):
                                     restart_backend = True
         except (OSError, tarfile.TarError, ValueError) as exc:
+            if staging_web_dist:
+                shutil.rmtree(staging_web_dist, ignore_errors=True)
             release_update_lock()
             logger.exception("Failed to apply update: %s", exc)
             self._send_json_error(500, f"Failed to apply update: {exc}")

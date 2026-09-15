@@ -18,6 +18,7 @@ import contextlib
 import http.server
 import io
 import json
+import os
 import tarfile
 import threading
 import time
@@ -30,6 +31,7 @@ import pytest
 
 from runtime.auth_manager import AuthManager
 from runtime.env_manager import EnvManager
+import runtime.handler_api as handler_api_module
 from runtime.handler_api import _platform_arch, _platform_os
 from runtime.remote_env_manager import (
     RemoteEnvManager,
@@ -628,6 +630,18 @@ def write_env_json(data):
 # ---------------------------------------------------------------------------
 
 
+# The downgrade guard only fires for axes whose *local* version is
+# non-empty.  The local frontend version is derived from this checkout's
+# web/dist (env_manager.frontend_build_version), which test checkouts may
+# not have built.  Pin the local versions so the frontend-axis guard tests
+# below pass with or without a frontend build in the worktree.
+_LOCAL_PUSH_VERSIONS = {
+    "frontend_build": "260209_000000",
+    "backend_build": "260209_000000",
+    "last_config": "260209_000000",
+}
+
+
 class TestSetupPushOp:
     def test_requires_post(self, server):
         status, _ = _request(server, "GET", "/v1/setup?op=push")
@@ -652,11 +666,13 @@ class TestSetupPushOp:
 
     def test_rejects_invalid_target_version(self, server):
         tar = _make_tar_bytes({"agents_runtime/models.json": "[]"})
-        status, body = _request_raw(
-            server, "POST",
-            "/v1/setup?op=push&frontend_build=not_a_version",
-            tar,
-        )
+        with patch("runtime.env_manager.compute_setup_versions",
+                   return_value=_LOCAL_PUSH_VERSIONS):
+            status, body = _request_raw(
+                server, "POST",
+                "/v1/setup?op=push&frontend_build=not_a_version",
+                tar,
+            )
         assert status == 400
         assert "frontend_build" in body["error"]
 
@@ -707,12 +723,15 @@ class TestSetupPushOp:
         )
         assert status == 401
         # Valid token -> auth passes; the downgrade guard then rejects the
-        # deliberately old target versions.
-        status, body = _request_raw(
-            server, "POST",
-            f"/v1/setup?op=push&token={token}&frontend_build=250101_000000",
-            tar,
-        )
+        # deliberately old target versions (local versions pinned, see
+        # _LOCAL_PUSH_VERSIONS).
+        with patch("runtime.env_manager.compute_setup_versions",
+                   return_value=_LOCAL_PUSH_VERSIONS):
+            status, body = _request_raw(
+                server, "POST",
+                f"/v1/setup?op=push&token={token}&frontend_build=250101_000000",
+                tar,
+            )
         assert status == 400
         assert "older than local" in body["error"]
 
@@ -733,14 +752,17 @@ class TestSetupPushOp:
         assert "frontend_build" in body
 
         # op=push is authorized the same way; the downgrade guard then
-        # rejects the deliberately old target versions.
+        # rejects the deliberately old target versions (local versions
+        # pinned, see _LOCAL_PUSH_VERSIONS).
         tar = _make_tar_bytes({"agents_runtime/models.json": "[]"})
-        status, body = _request_raw(
-            server,
-            "POST",
-            f"/v1/setup?op=push&token={api_key}&frontend_build=250101_000000",
-            tar,
-        )
+        with patch("runtime.env_manager.compute_setup_versions",
+                   return_value=_LOCAL_PUSH_VERSIONS):
+            status, body = _request_raw(
+                server,
+                "POST",
+                f"/v1/setup?op=push&token={api_key}&frontend_build=250101_000000",
+                tar,
+            )
         assert status == 400
         assert "older than local" in body["error"]
 
@@ -790,6 +812,148 @@ class TestSetupPushOp:
         assert "." in legacy  # sanity: this is the old signed-JSON shape
         status, _ = _request(server, "GET", f"/v1/setup?op=hello&token={legacy}")
         assert status == 401
+
+
+# ---------------------------------------------------------------------------
+# op=push: replacing the compiled frontend (web/dist)
+# ---------------------------------------------------------------------------
+
+
+def _write_text(path, content):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+class TestSetupPushFrontendDist:
+    """A pushed frontend must never leave the environment without a dist.
+
+    Regression: the receiver rmtree'd web/dist *before* copying anything, so a
+    delta carrying only web/dist/build_version — what a parent whose failed
+    build refreshed the stamp without producing output used to send — deleted
+    the child's whole frontend and the UI answered {"error": "Not found: /"}.
+    """
+
+    # A target version far ahead of any real build, so the downgrade guard passes.
+    _PUSH_PATH = "/v1/setup?op=push&frontend_build=300101_000000"
+
+    @staticmethod
+    def _make_project(tmp_path):
+        project = tmp_path / "target"
+        dist = project / "web" / "dist"
+        _write_text(dist / "index.html", "<p>old</p>\n")
+        _write_text(dist / "assets" / "index-old.js", "old\n")
+        return project, dist
+
+    @staticmethod
+    def _push(server, project, tar):
+        # _apply_setup_delta resolves the project root from __file__; point it
+        # at the throwaway tree so the test never touches the real web/dist.
+        with patch.object(
+            handler_api_module, "__file__",
+            str(project / "runtime" / "handler_api.py"),
+        ):
+            return _request_raw(server, "POST", TestSetupPushFrontendDist._PUSH_PATH, tar)
+
+    @staticmethod
+    def _staging_leftovers(project):
+        return [
+            entry.name for entry in (project / "web").iterdir()
+            if entry.name.startswith(".dist-staging-")
+        ]
+
+    def test_incomplete_dist_is_refused_and_the_old_frontend_survives(self, server, tmp_path):
+        project, dist = self._make_project(tmp_path)
+        # The stamp a failed build leaves behind: no index.html, no assets.
+        tar = _make_tar_bytes({"web/dist/build_version": "260915_165601"})
+
+        status, body = self._push(server, project, tar)
+
+        assert status == 500
+        assert "index.html" in body["error"]
+        assert (dist / "index.html").read_text(encoding="utf-8") == "<p>old</p>\n"
+        assert (dist / "assets" / "index-old.js").is_file()
+        assert self._staging_leftovers(project) == []
+
+    def test_complete_dist_replaces_the_whole_web_dist(self, server, tmp_path):
+        project, dist = self._make_project(tmp_path)
+        tar = _make_tar_bytes({
+            "web/dist/index.html": "<p>new</p>\n",
+            "web/dist/assets/index-fresh.js": "fresh\n",
+            "web/dist/build_version": "260915_170000",
+        })
+
+        status, body = self._push(server, project, tar)
+
+        assert status == 200
+        assert body["updated"] is True
+        assert body["restart_backend"] is False
+        assert sorted(body["updated_files"]) == [
+            "web/dist/assets/index-fresh.js",
+            "web/dist/build_version",
+            "web/dist/index.html",
+        ]
+        assert (dist / "index.html").read_text(encoding="utf-8") == "<p>new</p>\n"
+        assert (dist / "assets" / "index-fresh.js").is_file()
+        # Content-hashed leftovers from the previous build are dropped.
+        assert not (dist / "assets" / "index-old.js").exists()
+        assert self._staging_leftovers(project) == []
+
+    def test_update_slot_is_released_after_a_refused_frontend_delta(self, server, tmp_path):
+        project, dist = self._make_project(tmp_path)
+        status, _body = self._push(
+            server, project, _make_tar_bytes({"web/dist/build_version": "260915_165601"}),
+        )
+        assert status == 500
+
+        # A refusal must not leave the environment marked "update in progress".
+        status, body = self._push(
+            server, project, _make_tar_bytes({"web/dist/index.html": "<p>new</p>\n"}),
+        )
+
+        assert status == 200
+        assert body["updated"] is True
+        assert (dist / "index.html").read_text(encoding="utf-8") == "<p>new</p>\n"
+
+    def test_delta_from_a_parent_with_a_stale_dist_stamp_installs_whole_dist(
+        self, server, tmp_path,
+    ):
+        """End-to-end reproduction of the reported breakage.
+
+        The parent's dist looks exactly like one left behind by a *failed*
+        build: every asset is old, only the build_version stamp is fresh.  The
+        delta must still carry the whole dist, because the receiver replaces
+        the directory — this shipped the stamp alone before the fix, which
+        deleted the child's index.html and assets.
+        """
+        parent = tmp_path / "parent-project"
+        parent_dist = parent / "web" / "dist"
+        _write_text(parent_dist / "index.html", "<p>parent</p>\n")
+        _write_text(parent_dist / "assets" / "index-parent.js", "parent\n")
+        _write_text(parent_dist / "build_version", "260915_170000")
+
+        old, changed = 1_500_000_000, 1_700_000_000
+        for path in parent.rglob("*"):
+            if path.is_file():
+                os.utime(path, (old, old))
+        os.utime(parent_dist / "build_version", (changed, changed))
+
+        tar = EnvManager(env_path=str(tmp_path / "parent-env.json")).build_delta_tar(
+            project_root=str(parent),
+            data_dir=str(tmp_path / "parent-data"),
+            frontend_since=1_600_000_000,
+            backend_since=1_600_000_000,
+            config_since=1_600_000_000,
+        )
+        assert tar is not None
+
+        project, dist = self._make_project(tmp_path)
+        status, body = self._push(server, project, tar)
+
+        assert status == 200
+        assert body["updated"] is True
+        assert (dist / "index.html").read_text(encoding="utf-8") == "<p>parent</p>\n"
+        assert (dist / "assets" / "index-parent.js").is_file()
+        assert not (dist / "assets" / "index-old.js").exists()
 
 
 # ---------------------------------------------------------------------------

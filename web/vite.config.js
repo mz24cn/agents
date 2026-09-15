@@ -21,7 +21,13 @@ function buildTimestamp() {
 function buildVersionPlugin() {
   return {
     name: 'build-version',
-    closeBundle() {
+    // writeBundle, not closeBundle: closeBundle also runs when the build
+    // failed, so a syntax error while editing used to stamp a *newer*
+    // dist/build_version over an untouched dist.  That stamp is the newest
+    // entry in dist — i.e. what the runtime advertises as frontend_build — so
+    // a failed build made the environment look like it had a frontend that
+    // nothing on disk backed, and a pushed delta then carried the lone stamp.
+    writeBundle() {
       const ts = buildTimestamp()
       writeFileSync(resolve(__dirname, 'dist/build_version'), ts, 'utf-8')
     }
