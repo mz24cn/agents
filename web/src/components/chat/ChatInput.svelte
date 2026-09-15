@@ -3,6 +3,7 @@
   import { t } from '../../lib/i18n.svelte.js'
   import { extractPastedFiles, buildFileRefs } from '../../lib/clipboard-paste.js'
   import { uploadFilesToPasteDir } from '../../lib/workspace-upload.js'
+  import { serializeEditor } from '../../lib/chat-input-serialize.js'
 
   let { disabled = false, onSend, onStop, onStopForce, onToggleTemplatePanel, onToggleWorkspacePanel, workspacePanelOpen = false, templatePanelOpen = false, text = $bindable(''), isStreaming = false, selectedAgentIds = [], agentList = [], onError = () => {} } = $props()
 
@@ -69,40 +70,6 @@
     lastRenderedText = source
   }
 
-  function serializeNode(node) {
-    if (node.nodeType === Node.TEXT_NODE) return node.nodeValue ?? ''
-    if (node.nodeType !== Node.ELEMENT_NODE) return ''
-
-    const el = node
-    if (el.dataset?.fileRef) {
-      return `<file>${el.dataset.fileRef}</file>`
-    }
-    if (el.tagName === 'BR') return '\n'
-
-    let out = ''
-    for (const child of el.childNodes) out += serializeNode(child)
-    if (el.tagName === 'DIV' || el.tagName === 'P') out += '\n'
-    return out
-  }
-
-  function serializeEditor() {
-    if (!editorEl) return text
-    let out = ''
-    for (const child of editorEl.childNodes) {
-      // When a <div>/<p> follows a text node (e.g. first line is bare text,
-      // subsequent lines wrapped in <div> by the browser), insert a newline
-      // before the <div> to prevent lines from merging.
-      if (out && !out.endsWith('\n') &&
-        child.nodeType === Node.ELEMENT_NODE &&
-        (child.tagName === 'DIV' || child.tagName === 'P')) {
-        out += '\n'
-      }
-      out += serializeNode(child)
-    }
-    // Normalize line endings (CRLF / CR → LF), then strip trailing newline
-    return out.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\n$/g, '')
-  }
-
   function placeCaretAtEnd() {
     if (!editorEl) return
     const range = document.createRange()
@@ -114,7 +81,7 @@
   }
 
   function syncTextFromEditor() {
-    const serialized = serializeEditor()
+    const serialized = serializeEditor(editorEl, text)
     text = serialized
     lastRenderedText = serialized
   }
