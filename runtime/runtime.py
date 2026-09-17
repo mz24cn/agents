@@ -193,21 +193,27 @@ def _get_tool_exec_workers() -> int:
     The value is read dynamically so deployments can tune it without changing
     Runtime construction.  ``1`` preserves declaration-order execution while
     still running every function callable on its isolated worker thread.
-    Invalid and non-positive values fall back to the safe default of ``1``.
+    The default is half the logical CPU count (rounded down), clamped to 1..4.
+    Invalid and non-positive values fall back to this automatic default;
+    explicit positive overrides are not capped.
     """
-    raw = os.environ.get("TOOL_EXEC_WORKERS", "1").strip()
+    default_workers = max(1, min(4, (os.cpu_count() or 1) // 2))
+    raw = os.environ.get("TOOL_EXEC_WORKERS")
+    if raw is None:
+        return default_workers
+    raw = raw.strip()
     try:
         workers = int(raw)
     except (TypeError, ValueError):
         _logger.warning(
-            "invalid TOOL_EXEC_WORKERS=%r; using default 1", raw,
+            "invalid TOOL_EXEC_WORKERS=%r; using default %d", raw, default_workers,
         )
-        return 1
+        return default_workers
     if workers <= 0:
         _logger.warning(
-            "non-positive TOOL_EXEC_WORKERS=%r; using default 1", raw,
+            "non-positive TOOL_EXEC_WORKERS=%r; using default %d", raw, default_workers,
         )
-        return 1
+        return default_workers
     return workers
 
 

@@ -8,6 +8,7 @@ messages list.
 
 from hypothesis import given, settings
 from hypothesis import strategies as st
+import pytest
 
 import os
 from runtime.models import InferenceRequest, Message, ModelConfig
@@ -1287,20 +1288,34 @@ def test_function_tool_guard_disabled_still_runs_on_worker(monkeypatch) -> None:
     assert worker_threads and worker_threads[0] != caller_thread
 
 
-def test_tool_exec_workers_parsing(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    "cpu_count, expected",
+    [(None, 1), (0, 1), (1, 1), (2, 1), (3, 1), (4, 2), (6, 3), (7, 3), (8, 4), (64, 4)],
+)
+def test_tool_exec_workers_cpu_default(monkeypatch, cpu_count, expected) -> None:
     from runtime.runtime import _get_tool_exec_workers
 
     monkeypatch.delenv("TOOL_EXEC_WORKERS", raising=False)
-    assert _get_tool_exec_workers() == 1
+    monkeypatch.setattr("runtime.runtime.os.cpu_count", lambda: cpu_count)
+    assert _get_tool_exec_workers() == expected
 
-    monkeypatch.setenv("TOOL_EXEC_WORKERS", "4")
-    assert _get_tool_exec_workers() == 4
 
-    monkeypatch.setenv("TOOL_EXEC_WORKERS", "bad")
-    assert _get_tool_exec_workers() == 1
+@pytest.mark.parametrize("raw", ["bad", "", " ", "0", "-2", "1.5"])
+def test_tool_exec_workers_invalid_uses_cpu_default(monkeypatch, raw) -> None:
+    from runtime.runtime import _get_tool_exec_workers
 
-    monkeypatch.setenv("TOOL_EXEC_WORKERS", "0")
-    assert _get_tool_exec_workers() == 1
+    monkeypatch.setattr("runtime.runtime.os.cpu_count", lambda: 6)
+    monkeypatch.setenv("TOOL_EXEC_WORKERS", raw)
+    assert _get_tool_exec_workers() == 3
+
+
+@pytest.mark.parametrize("raw, expected", [("1", 1), ("4", 4), ("8", 8), (" 2 ", 2)])
+def test_tool_exec_workers_explicit_override(monkeypatch, raw, expected) -> None:
+    from runtime.runtime import _get_tool_exec_workers
+
+    monkeypatch.setattr("runtime.runtime.os.cpu_count", lambda: 6)
+    monkeypatch.setenv("TOOL_EXEC_WORKERS", raw)
+    assert _get_tool_exec_workers() == expected
 
 
 def test_function_tool_round_workers_one_preserves_serial_execution(monkeypatch) -> None:
