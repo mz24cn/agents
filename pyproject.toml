@@ -1,0 +1,17 @@
+# Metadata for the Linglong Agent Service.
+#
+# NOTE: this project is deployed by running ``python3 app.py`` directly. The
+# core runtime is pure standard library and is NOT distributed as an
+# installable package (there is intentionally no build backend here), so this
+# file exists only to declare the minimum supported interpreter so that
+# editors / linters / packaging tools (pip, uv, ...) can read it.
+#
+# See README ("Environment") for the full requirements. Note that the
+# accessories/ directory pulls in heavier, newer-runtime dependencies
+# (e.g. fastmcp) and is outside this floor.
+
+[project]
+name = "linglong-agent-service"
+version = "0.1.0"
+description = "Minimal, zero-third-party-dependency agent service built on the Python standard library."
+requires-python = ">=3.7"

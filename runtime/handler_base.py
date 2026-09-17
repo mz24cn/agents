@@ -8,6 +8,8 @@ the WebSocket/PTY terminal support and the auth handlers.
 Zero third-party dependencies — only Python standard library.
 """
 
+from __future__ import annotations
+
 import base64
 import datetime
 import gzip

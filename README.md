@@ -16,6 +16,7 @@
 
 - **TUI 对话客户端（`tui.py`）** — 纯 Python 标准库实现的本地终端对话客户端：终端内流式对话、斜杠命令管理、会话管理，零第三方依赖，SSH 登录服务器后 `python tui.py` 即开即聊，用法见 [docs/introduce-tui.md](docs/introduce-tui.md)；其主要用途之一是子端隧道注册，`/tunnel register <url>` 将本机 agent 注册到母端，供远程访问。
 
+- **Python 兼容下延至 3.7** — 扩大兼容范围：运行时支持下延到 Python 3.7；在 3.7 上仅支持「本地直接推理对话」或「作为远程执行环境」两种用法，完整功能（Web UI、群聊、MCP / accessory 工具等）仍需 Python 3.10+。
 
 ### 2026-09-13
 

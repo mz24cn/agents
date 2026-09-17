@@ -6,6 +6,8 @@ PromptTemplateManager.
 Zero third-party dependencies — only Python standard library.
 """
 
+from __future__ import annotations
+
 import datetime
 import json
 import os

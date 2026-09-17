@@ -6,6 +6,8 @@ an OpenAI function calling compatible ToolConfig, then registers it in a
 ToolRegistry.
 """
 
+from __future__ import annotations
+
 import inspect
 import re
 import base64

@@ -12,6 +12,8 @@ The tool configs and callables are aggregated and registered by
 ``runtime.builtin_tools`` (the facade module).
 """
 
+from __future__ import annotations
+
 import base64
 import fnmatch
 import gzip

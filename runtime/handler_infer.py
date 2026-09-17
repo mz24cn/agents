@@ -5,6 +5,8 @@ Part of the ``_RuntimeRequestHandler`` decomposition in ``runtime.server``.
 Zero third-party dependencies — only Python standard library.
 """
 
+from __future__ import annotations
+
 import copy
 import json
 import logging
@@ -465,10 +467,11 @@ class HandlerInferMixin:
                 # 远程会话：选中的工具条目已是子端代理条目（不在母端 registry）
                 scope_configs = remote_selected
             else:
-                scope_configs = [
-                    tc for tid in tool_ids
-                    if (tc := runtime._tool_registry.get(tid)) is not None
-                ]
+                scope_configs = []
+                for tid in tool_ids:
+                    tc = runtime._tool_registry.get(tid)
+                    if tc is not None:
+                        scope_configs.append(tc)
             for tc in scope_configs:
                 tool_scope.append(tc)
                 if tc.tool_id == "delegate" and os.environ.get("DISABLE_NESTED_DELEGATE", "false").lower() == "true":
@@ -985,6 +988,11 @@ class HandlerInferMixin:
         if session_id is not None:
             transition_session_stream_status(session_id, cancel_event, "streaming")
 
+        usage_tools = []
+        for tool_id in request.tool_ids:
+            tool = runtime._tool_registry.get(tool_id)
+            if tool is not None:
+                usage_tools.append(tool)
         usage_estimator = StreamUsageEstimator(
             context_manager=context_manager if use_session else None,
             session_id=session_id if use_session else None,
@@ -993,11 +1001,7 @@ class HandlerInferMixin:
             # handed to Runtime, unlike ``original_messages`` which normally
             # contains only this HTTP request's new user turn.
             request_messages=request.messages,
-            tools=[
-                tool
-                for tool_id in request.tool_ids
-                if (tool := runtime._tool_registry.get(tool_id)) is not None
-            ],
+            tools=usage_tools,
         )
         conversation_persister = IncrementalConversationPersister(
             context_manager=context_manager,

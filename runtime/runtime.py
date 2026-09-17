@@ -5,6 +5,8 @@ Supports dynamic composition of models and tools at runtime, with automatic
 tool call loop handling. Only uses Python standard library modules.
 """
 
+from __future__ import annotations
+
 import concurrent.futures
 import datetime
 import json

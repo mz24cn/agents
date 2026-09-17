@@ -942,14 +942,14 @@ def _run_group_chat_stream_gen(
                 ]
             else:
                 tool_registry = getattr(runtime, "_tool_registry", None)
-                agent_tool_scope = (
-                    [
-                        tc for tid in agent_tool_ids
-                        if (tc := tool_registry.get(tid)) is not None
-                    ]
-                    if tool_registry is not None
-                    else []
-                )
+                if tool_registry is not None:
+                    agent_tool_scope = []
+                    for tid in agent_tool_ids:
+                        tc = tool_registry.get(tid)
+                        if tc is not None:
+                            agent_tool_scope.append(tc)
+                else:
+                    agent_tool_scope = []
             set_request_context(
                 tool_scope=agent_tool_scope,
                 available_tool_ids=agent_tool_ids,

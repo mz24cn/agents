@@ -17,6 +17,8 @@ e.g. ``monkeypatch.setattr(_bt.subprocess, "run", ...)`` and
 ``patch("runtime.builtin_tools.shutil.which", ...)``.
 """
 
+from __future__ import annotations
+
 import logging
 import shutil  # noqa: F401  (re-exported so tests can patch through the facade)
 import subprocess  # noqa: F401  (re-exported so tests can patch through the facade)

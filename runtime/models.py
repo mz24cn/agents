@@ -4,6 +4,8 @@ Defines Message, ModelConfig, ToolConfig, InferenceRequest, and InferenceResult
 as dataclasses with JSON serialization/deserialization support.
 """
 
+from __future__ import annotations
+
 import os
 import re
 from dataclasses import dataclass, field, replace

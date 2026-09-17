@@ -6,6 +6,8 @@ prompt templates. Follows the same patterns as ModelRegistry in runtime/registry
 Zero third-party dependencies — only Python standard library.
 """
 
+from __future__ import annotations
+
 import datetime
 import json
 import os

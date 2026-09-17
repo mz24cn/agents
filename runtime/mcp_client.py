@@ -13,6 +13,8 @@ Idle process reaping:
     next call_tool() / get_tools() call.
 """
 
+from __future__ import annotations
+
 import asyncio
 import concurrent.futures
 import datetime

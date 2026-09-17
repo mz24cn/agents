@@ -5,6 +5,8 @@ for constructing API requests and parsing responses from different LLM backends.
 Only uses Python standard library modules.
 """
 
+from __future__ import annotations
+
 import json
 import uuid
 from abc import ABC, abstractmethod

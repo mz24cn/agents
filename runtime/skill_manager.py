@@ -15,6 +15,8 @@ implementation of a skill is entirely determined by the SKILL.md content
 and the LLM's judgment after reading it.
 """
 
+from __future__ import annotations
+
 import datetime
 import os
 import re

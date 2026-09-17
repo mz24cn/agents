@@ -10,6 +10,8 @@ The tool configs and factory functions are consumed by
 ``register_builtin_tools`` in ``runtime.builtin_tools`` (the facade module).
 """
 
+from __future__ import annotations
+
 import copy
 import json
 import logging
@@ -455,14 +457,14 @@ def _make_talk_to_fn(runtime, thread_local):
                 ]
             else:
                 tool_registry = getattr(runtime, "_tool_registry", None)
-                target_tool_scope = (
-                    [
-                        tc for tid in agent_tool_ids
-                        if (tc := tool_registry.get(tid)) is not None
-                    ]
-                    if tool_registry is not None
-                    else []
-                )
+                if tool_registry is not None:
+                    target_tool_scope = []
+                    for tid in agent_tool_ids:
+                        tc = tool_registry.get(tid)
+                        if tc is not None:
+                            target_tool_scope.append(tc)
+                else:
+                    target_tool_scope = []
             child_context.update({
                 "depth": parent_depth + 1,
                 "session_id": sub_session_id,

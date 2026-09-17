@@ -5,6 +5,8 @@ Supports listing, searching, previewing, downloading, and managing files in the 
 Also provides utilities for expanding workspace file references (<file>...</file>) in user prompts.
 """
 
+from __future__ import annotations
+
 import os
 import re
 import shutil

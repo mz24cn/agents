@@ -12,6 +12,8 @@ public name so ``from runtime.server import ...`` keeps working.
 Zero third-party dependencies — only Python standard library.
 """
 
+from __future__ import annotations
+
 import importlib.util
 import json
 import logging

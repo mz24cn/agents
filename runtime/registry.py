@@ -4,6 +4,8 @@ Provides ModelRegistry for model endpoint management with JSON persistence.
 ToolRegistry will be added in a subsequent task.
 """
 
+from __future__ import annotations
+
 import json
 import os
 from typing import Optional
