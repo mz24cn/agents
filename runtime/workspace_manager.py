@@ -14,6 +14,7 @@ import mimetypes
 import math
 import tempfile
 import uuid
+import threading
 from pathlib import Path
 from typing import Optional, List, Dict, Any, BinaryIO, Iterable
 import logging
@@ -815,6 +816,11 @@ class WorkspaceManager:
         upload_id = uuid.uuid4().hex
         return {
             "upload_id": upload_id,
+            # Serializes chunk writes for this upload so a concurrent or
+            # retransmitted PUT for the same chunk (flaky mobile networks
+            # duplicate idempotent requests) can never write the same temp
+            # file twice or clobber a finished chunk's status.
+            "lock": threading.Lock(),
             "workspace_id": "default",
             "file_name": file_name,
             "file_size": file_size,

@@ -379,3 +379,161 @@ class TestKeepAliveBodyDrain:
             assert status == 200
         finally:
             conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Retransmitted / duplicate chunk PUTs (mobile browser upload regression)
+# ---------------------------------------------------------------------------
+
+
+class TestRetransmittedChunkPut:
+    """Flaky mobile networks routinely retransmit idempotent requests: a
+    chunk PUT whose 200 the client already consumed arrives a second time
+    (sometimes truncated, when the connection dropped mid-body).
+
+    Before the fix the duplicate PUT re-ran the chunk write and, when its
+    body was interrupted, reset the chunk status from 'uploaded' back to
+    'pending' -- so the following upload/complete failed with
+    409 "UPLOAD_NOT_READY: some chunks are missing" even though the client
+    had already seen 100% progress (phone screenshot upload bug).
+    """
+
+    def _init(self, conn, file_name, size):
+        conn.request(
+            "POST",
+            "/v1/workspace/upload/init",
+            body=json.dumps({
+                "workspace_id": "default",
+                "file_name": file_name,
+                "file_size": size,
+                "target_path": file_name,
+                "target_dir_path": "/tmp",
+            }),
+            headers={"Content-Type": "application/json"},
+        )
+        resp = conn.getresponse()
+        assert resp.status == 200, resp.read()
+        return json.loads(resp.read())["upload_id"]
+
+    def _put_chunk(self, conn, upload_id, content, parallel_id=0):
+        conn.request(
+            "PUT",
+            f"/v1/workspace/upload/{upload_id}/chunk/{parallel_id}",
+            body=content,
+            headers={
+                "Content-Type": "application/octet-stream",
+                "X-Upload-Offset": "0",
+                "X-Upload-Size": str(len(content)),
+                "X-File-Size": str(len(content)),
+            },
+        )
+        resp = conn.getresponse()
+        body = resp.read()
+        return resp.status, body
+
+    @staticmethod
+    def _put_chunk_truncated(port, upload_id, content, partial, parallel_id=0):
+        """Send a chunk PUT whose body is cut off mid-stream, then drop the
+        connection -- simulating a retransmit on a network that resets."""
+        import socket
+        raw = socket.create_connection(("127.0.0.1", port), timeout=10)
+        try:
+            head = (
+                f"PUT /v1/workspace/upload/{upload_id}/chunk/{parallel_id} HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{port}\r\n"
+                "Content-Type: application/octet-stream\r\n"
+                f"Content-Length: {len(content)}\r\n"
+                "X-Upload-Offset: 0\r\n"
+                f"X-Upload-Size: {len(content)}\r\n"
+                f"X-File-Size: {len(content)}\r\n"
+                "Connection: close\r\n\r\n"
+            ).encode("ascii")
+            raw.sendall(head)
+            raw.sendall(content[:partial])
+        finally:
+            raw.close()
+
+    def test_truncated_retransmit_keeps_chunk_uploaded(self, server):
+        content = b"\x89PNG\r\n\x1a\n" + b"m" * 2048
+        conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=10)
+        try:
+            upload_id = self._init(conn, "retrans-a.png", len(content))
+            status, body = self._put_chunk(conn, upload_id, content)
+            assert status == 200, body
+
+            # The mobile network retransmits the PUT; the duplicate body is
+            # interrupted mid-stream. This must NOT clobber the finished
+            # chunk's status.
+            self._put_chunk_truncated(server.port, upload_id, content, len(content) // 2)
+
+            status, raw = self._complete(conn, upload_id)
+            assert status == 200, raw
+            assert os.path.isfile("/tmp/retrans-a.png")
+            with open("/tmp/retrans-a.png", "rb") as f:
+                assert f.read() == content
+        finally:
+            conn.close()
+            if os.path.isfile("/tmp/retrans-a.png"):
+                os.remove("/tmp/retrans-a.png")
+
+    def test_duplicate_full_retransmit_is_idempotent(self, server):
+        content = b"PK\x03\x04" + b"d" * 4096
+        conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=10)
+        try:
+            upload_id = self._init(conn, "retrans-b.docx", len(content))
+            status, body = self._put_chunk(conn, upload_id, content)
+            assert status == 200, body
+            status, body = self._put_chunk(conn, upload_id, content)
+            assert status == 200, body
+            status, raw = self._complete(conn, upload_id)
+            assert status == 200, raw
+            with open("/tmp/retrans-b.docx", "rb") as f:
+                assert f.read() == content
+        finally:
+            conn.close()
+            if os.path.isfile("/tmp/retrans-b.docx"):
+                os.remove("/tmp/retrans-b.docx")
+
+    def test_concurrent_duplicate_chunk_puts_do_not_corrupt_file(self, server):
+        """Two overlapping PUTs for the same chunk (original + retransmit)
+        must serialize on the per-task lock, never write the temp file at
+        the same time, and leave the file intact."""
+        content = b"\x00\x01" * 10240
+        conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=10)
+        try:
+            upload_id = self._init(conn, "retrans-c.bin", len(content))
+            results = []
+
+            def put():
+                c = http.client.HTTPConnection("127.0.0.1", server.port, timeout=15)
+                try:
+                    status, body = self._put_chunk(c, upload_id, content)
+                    results.append(status)
+                finally:
+                    c.close()
+
+            threads = [threading.Thread(target=put) for _ in range(3)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            assert results == [200, 200, 200], results
+
+            status, raw = self._complete(conn, upload_id)
+            assert status == 200, raw
+            with open("/tmp/retrans-c.bin", "rb") as f:
+                assert f.read() == content
+        finally:
+            conn.close()
+            if os.path.isfile("/tmp/retrans-c.bin"):
+                os.remove("/tmp/retrans-c.bin")
+
+    def _complete(self, conn, upload_id):
+        conn.request(
+            "POST",
+            f"/v1/workspace/upload/{upload_id}/complete",
+            body="{}",
+            headers={"Content-Type": "application/json"},
+        )
+        resp = conn.getresponse()
+        return resp.status, resp.read()

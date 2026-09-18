@@ -436,7 +436,17 @@ class HandlerWorkspaceMixin:
         try:
             content_length = int(self.headers.get('Content-Length', '0'))
         except ValueError:
+            self.close_connection = True  # framing is untrustworthy
             self._send_json_error(400, "CHUNK_SIZE_MISMATCH: invalid Content-Length")
+            return
+        # A few mobile browsers send Blob PUT bodies with
+        # Transfer-Encoding: chunked (no Content-Length). The stdlib handler
+        # cannot frame that body, so reject with a clear error and close the
+        # connection (draining is impossible; keeping it would desync the
+        # next request on the same socket).
+        if 'chunked' in (self.headers.get('Transfer-Encoding') or '').lower():
+            self.close_connection = True
+            self._send_json_error(400, "CHUNK_SIZE_MISMATCH: chunked transfer encoding is not supported for upload chunks")
             return
 
         with lock:
@@ -483,39 +493,77 @@ class HandlerWorkspaceMixin:
                 self._send_json_error(400, "CHUNK_SIZE_MISMATCH: X-File-Size mismatch")
                 self._drain_request_body()
                 return
-            chunk['status'] = 'uploading'
-            task['status'] = 'uploading'
+            # Per-task write lock (created with the task by
+            # create_upload_task): serializes chunk writes for this upload so
+            # a concurrent PUT for the same chunk can never write the same
+            # temp file at the same time.
+            task_lock = task.get('lock')
+            if task_lock is None:
+                task['lock'] = task_lock = threading.Lock()
 
-        try:
-            received = workspace_mgr.write_upload_chunk(upload_id, parallel_id, self.rfile, content_length)
+        with task_lock:
             with lock:
-                task = uploads.get(upload_id)
-                if task is None or task.get('status') == 'cancelled':
-                    workspace_mgr.cleanup_upload_temp(upload_id, {"chunks": [{"parallel_id": parallel_id}], "target_path": ""})
+                # Re-check under the upload lock: the chunk may have finished
+                # while we waited for the per-task lock, or the upload may
+                # have been cancelled in the meantime.
+                if task.get('status') == 'cancelled':
                     self._send_json_error(409, "UPLOAD_CANCELLED: upload has been cancelled")
+                    self._drain_request_body()
                     return
-                for chunk in task['chunks']:
-                    if chunk['parallel_id'] == parallel_id:
-                        chunk['status'] = 'uploaded'
-                        break
-            self._send_json_response(200, {
-                "upload_id": upload_id,
-                "parallel_id": parallel_id,
-                "received": received,
-                "status": "uploaded",
-            })
-        except (ConnectionError, ValueError) as e:
+            if chunk.get('status') == 'uploaded':
+                # Idempotent success for a duplicate / retransmitted PUT
+                # (flaky mobile networks routinely resend idempotent
+                # requests after the original already succeeded). Consume
+                # the body and confirm without touching the chunk file or
+                # its status -- a truncated duplicate body must NOT reset an
+                # uploaded chunk (regression: complete then failed with
+                # "UPLOAD_NOT_READY: some chunks are missing").
+                self._drain_request_body()
+                self._send_json_response(200, {
+                    "upload_id": upload_id,
+                    "parallel_id": parallel_id,
+                    "received": chunk['size'],
+                    "status": "uploaded",
+                })
+                return
             with lock:
-                task = uploads.get(upload_id)
-                if task:
-                    for chunk in task['chunks']:
-                        if chunk['parallel_id'] == parallel_id:
-                            chunk['status'] = 'pending'
-                            break
-            self._send_json_error(self._upload_error_status(str(e)), str(e))
-        except Exception as e:
-            logger.error(f"Workspace upload chunk error: {e}")
-            self._send_json_error(500, "SERVER_ERROR: internal server error")
+                chunk['status'] = 'uploading'
+                task['status'] = 'uploading'
+
+            try:
+                received = workspace_mgr.write_upload_chunk(upload_id, parallel_id, self.rfile, content_length)
+            except (ConnectionError, ValueError) as e:
+                # Only revert a chunk this request actually owns: never
+                # clobber the status of a chunk that already finished.
+                with lock:
+                    if chunk.get('status') == 'uploading':
+                        chunk['status'] = 'pending'
+                self._send_json_error(self._upload_error_status(str(e)), str(e))
+                return
+            except Exception as e:
+                with lock:
+                    if chunk.get('status') == 'uploading':
+                        chunk['status'] = 'pending'
+                logger.error(f"Workspace upload chunk error: {e}")
+                self._send_json_error(500, "SERVER_ERROR: internal server error")
+                return
+
+        with lock:
+            task = uploads.get(upload_id)
+            if task is None or task.get('status') == 'cancelled':
+                workspace_mgr.cleanup_upload_temp(upload_id, {"chunks": [{"parallel_id": parallel_id}], "target_path": ""})
+                self._send_json_error(409, "UPLOAD_CANCELLED: upload has been cancelled")
+                return
+            for item in task['chunks']:
+                if item['parallel_id'] == parallel_id:
+                    item['status'] = 'uploaded'
+                    break
+        self._send_json_response(200, {
+            "upload_id": upload_id,
+            "parallel_id": parallel_id,
+            "received": received,
+            "status": "uploaded",
+        })
 
     def _handle_workspace_upload_complete(self, upload_id: str) -> None:
         uploads, lock = self._get_workspace_upload_state()
@@ -533,6 +581,20 @@ class HandlerWorkspaceMixin:
             if task.get('status') == 'cancelled':
                 self._send_json_error(409, "UPLOAD_CANCELLED: upload has been cancelled")
                 return
+            # Rescue chunks whose in-memory status was lost (for example
+            # clobbered by a retransmitted PUT on a flaky mobile network
+            # before the per-task lock serialized it): if the chunk temp
+            # file is already on disk with the exact expected size, the data
+            # is complete and the chunk counts as uploaded.
+            for chunk in task['chunks']:
+                if chunk.get('status') == 'uploaded':
+                    continue
+                chunk_path = workspace_mgr.upload_chunk_path(upload_id, chunk['parallel_id'])
+                try:
+                    if os.path.getsize(chunk_path) == chunk['size']:
+                        chunk['status'] = 'uploaded'
+                except OSError:
+                    pass
             if any(chunk.get('status') == 'uploading' for chunk in task['chunks']):
                 self._send_json_error(409, "UPLOAD_NOT_READY: some chunks are still uploading")
                 return
