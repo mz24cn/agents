@@ -36,6 +36,8 @@
 
   const STORAGE_MODEL_KEY = 'chat_selected_model'
   const STORAGE_TOOLS_KEY = 'chat_selected_tools'
+  const STORAGE_DRAFT_KEY = 'chat_input_draft'
+  const DRAFT_SAVE_DELAY_MS = 3000
   
   // 应用配置 store
   const appLogoStore = writable('') // 初始为空，等待异步加载
