@@ -46,8 +46,44 @@
   let selectedModelId = $state(localStorage.getItem(STORAGE_MODEL_KEY) ?? '')
   let selectedToolIds = $state(JSON.parse(localStorage.getItem(STORAGE_TOOLS_KEY) ?? '[]'))
   let errorMsg = $state('')
-  let inputText = $state('')
+  // 输入草稿：从本地存储初始化，新打开页面 / 切换到会话页时还原未发送的输入（含 <file> 引用文本）
+  let inputText = $state(localStorage.getItem(STORAGE_DRAFT_KEY) ?? '')
   let sessionId = $state(null)   // currently displayed session ID
+
+  // ── 输入草稿保护 ─────────────────────────────────────────────────────────────
+  // inputText 的任何变更（键入 / 粘贴 / 工作区选文件 / 撤销回填 / 发送后清空）
+  // 都重置 3 秒延迟后再写入 localStorage，保证只落盘最后一次输入的最终状态；
+  // 输入框清空时立即删除 key，避免下次加载时还原出已发送的内容。
+  let draftSaveTimer = null
+  let draftPending = null
+  $effect(() => {
+    const draft = inputText
+    if (draftSaveTimer) {
+      clearTimeout(draftSaveTimer)
+      draftSaveTimer = null
+    }
+    draftPending = draft
+    if (!draft) {
+      try { localStorage.removeItem(STORAGE_DRAFT_KEY) } catch { /* 忽略存储异常 */ }
+      return
+    }
+    draftSaveTimer = setTimeout(() => {
+      draftSaveTimer = null
+      draftPending = null
+      try { localStorage.setItem(STORAGE_DRAFT_KEY, draft) } catch { /* 忽略存储异常 */ }
+    }, DRAFT_SAVE_DELAY_MS)
+  })
+  // 同步落盘尚未写入的草稿；页面隐藏（关闭/刷新）与组件销毁时调用
+  function flushDraftNow() {
+    if (draftSaveTimer) {
+      clearTimeout(draftSaveTimer)
+      draftSaveTimer = null
+    }
+    if (draftPending) {
+      try { localStorage.setItem(STORAGE_DRAFT_KEY, draftPending) } catch { /* 忽略存储异常 */ }
+      draftPending = null
+    }
+  }
 
   // Per-session state store: each session's messages & streaming state live independently.
   // Key = session ID (or '__new__' before backend assigns one).
@@ -1917,6 +1953,8 @@
   onMount(() => {
     fetchWorkspacePath()
     loadRemoteEnvs()
+    // 页面隐藏（关闭/刷新/切后台）时，同步落盘 3 秒延迟窗口内尚未写入的草稿
+    window.addEventListener('pagehide', flushDraftNow)
     _unsubscribeSessionEvents = subscribeSessionEvents(
       (data) => {
         if (data.event === 'init') {
@@ -1949,6 +1987,9 @@
     )
   })
   onDestroy(() => {
+    window.removeEventListener('pagehide', flushDraftNow)
+    // SPA 路由离开聊天页时也落盘草稿，再次进入聊天页可还原
+    flushDraftNow()
     if (_unsubscribeSessionEvents) {
       _unsubscribeSessionEvents()
       _unsubscribeSessionEvents = null
