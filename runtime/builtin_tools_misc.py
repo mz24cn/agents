@@ -25,6 +25,8 @@ import urllib.error
 
 from runtime.common import (
     SYSTEM_ENCODING,
+    heal_std_handles,
+    is_windows_handle_error,
     get_request_context,
     convert_image_to_base64,
     env_float,
@@ -77,11 +79,22 @@ def _exec_cli(
 
     # Fallback for contexts without a terminal session.
     try:
-        result = subprocess.run(
-            command, shell=True, capture_output=True, text=True,
-            encoding=SYSTEM_ENCODING, errors='replace',
-            timeout=timeout, cwd=cwd if cwd else None,
-        )
+        try:
+            result = subprocess.run(
+                command, shell=True, capture_output=True, text=True,
+                encoding=SYSTEM_ENCODING, errors='replace',
+                timeout=timeout, cwd=cwd if cwd else None,
+            )
+        except Exception as spawn_exc:
+            # [Fix] stale/invalid std handles (WinError 6 句柄无效) make every
+            # spawn with stdin=None fail; heal once and retry.
+            if not (is_windows_handle_error(spawn_exc) and heal_std_handles()):
+                raise
+            result = subprocess.run(
+                command, shell=True, capture_output=True, text=True,
+                encoding=SYSTEM_ENCODING, errors='replace',
+                timeout=timeout, cwd=cwd if cwd else None,
+            )
         output = (result.stdout or "").strip()
         err = (result.stderr or "").strip()
         if err:

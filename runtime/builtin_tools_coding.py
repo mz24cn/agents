@@ -48,6 +48,8 @@ from runtime.common import (
     sha256_bytes as _sha256_bytes,
     safe_rel_path as _safe_rel_path,
     atomic_write_json as _atomic_write_json,
+    heal_std_handles,
+    is_windows_handle_error,
     kill_process_group,
     env_int,
 )
@@ -1882,6 +1884,36 @@ def _grep_exclude_args(patterns: list[str]) -> list[str]:
     return args
 
 
+def _run_search_process(cmd: list[str], workspace: str) -> subprocess.CompletedProcess:
+    """Run the rg/grep search subprocess with stale-std-handle recovery.
+
+    When the server process's std handles are invalid (launching console
+    destroyed, or no console at all — see :func:`heal_std_handles`), every
+    ``subprocess.run`` with the default ``stdin=None`` fails with
+    ``OSError: [WinError 6] 句柄无效``.  On that specific failure, heal the
+    process's std handles once and retry; any other exception is re-raised
+    unchanged.
+    """
+    try:
+        return subprocess.run(
+            cmd,
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            encoding=SYSTEM_ENCODING, errors='replace',
+        )
+    except Exception as exc:
+        if not (is_windows_handle_error(exc) and heal_std_handles()):
+            raise
+        return subprocess.run(
+            cmd,
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            encoding=SYSTEM_ENCODING, errors='replace',
+        )
+
+
 def _search_code(query: str, include: Optional[str] = None, exclude: Optional[str] = None) -> str:
     """Search the workspace codebase for a regex pattern using ripgrep or grep.
 
@@ -1930,13 +1962,7 @@ def _search_code(query: str, include: Optional[str] = None, exclude: Optional[st
         cmd += ["-e", query, "."]
 
         try:
-            result = subprocess.run(
-                cmd,
-                cwd=workspace,
-                capture_output=True,
-                text=True,
-                encoding=SYSTEM_ENCODING, errors='replace',
-            )
+            result = _run_search_process(cmd, workspace)
         except Exception as exc:
             return json.dumps({"error": "SearchToolNotFound", "message": str(exc)})
 
@@ -2023,13 +2049,7 @@ def _search_code(query: str, include: Optional[str] = None, exclude: Optional[st
         cmd += ["-I", "-E", "-e", query, "."]
 
         try:
-            result = subprocess.run(
-                cmd,
-                cwd=workspace,
-                capture_output=True,
-                text=True,
-                encoding=SYSTEM_ENCODING, errors='replace',
-            )
+            result = _run_search_process(cmd, workspace)
         except Exception as exc:
             return json.dumps({"error": "SearchToolNotFound", "message": str(exc)})
 
@@ -2237,21 +2257,34 @@ def _exec_shell(command: str, timeout: Optional[int] = None, background: bool = 
     # the entire process group via kill_active_process().
     session_id = get_request_context("session_id")
     creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
-    try:
-        proc = subprocess.Popen(
-            command,
-            shell=True,
-            cwd=workspace,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding=SYSTEM_ENCODING, errors='replace',
-            start_new_session=sys.platform != "win32",
-            creationflags=creationflags,
-        )
-    except Exception as exc:
-        return json.dumps({"error": "SpawnFailed", "message": str(exc)})
+    proc = None
+    spawn_error = None
+    for _attempt in (1, 2):
+        try:
+            proc = subprocess.Popen(
+                command,
+                shell=True,
+                cwd=workspace,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding=SYSTEM_ENCODING, errors='replace',
+                start_new_session=sys.platform != "win32",
+                creationflags=creationflags,
+            )
+            spawn_error = None
+            break
+        except Exception as exc:
+            spawn_error = exc
+            # [Fix] stale/invalid std handles (WinError 6 句柄无效) make every
+            # Popen with stdin=None fail; heal the process's std handles once
+            # and retry so a single dead launcher console cannot brick the
+            # whole tool forever.
+            if not (is_windows_handle_error(exc) and heal_std_handles()):
+                break
+    if spawn_error is not None:
+        return json.dumps({"error": "SpawnFailed", "message": str(spawn_error)})
 
     # Register so the abort handler can kill it from another thread.
     if session_id:

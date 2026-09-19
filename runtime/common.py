@@ -903,14 +903,30 @@ def search_files(
 
     # ---- helpers ----------------------------------------------------------
     def _run(cmd: list[str]) -> set[str]:
-        proc = _subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-        )
+        try:
+            proc = _subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+            )
+        except Exception as exc:
+            # [Fix] A stale/invalid std handle (WinError 6) makes every
+            # spawn fail; heal the process's std handles once and retry so
+            # file search degrades visibly instead of returning silent
+            # empty results forever.
+            if not (is_windows_handle_error(exc) and heal_std_handles()):
+                raise
+            proc = _subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+            )
         if proc.returncode not in (0, 1):          # 1 = no matches
             return set()
         return {line.strip() for line in (proc.stdout or "").splitlines() if line.strip()}
@@ -990,6 +1006,113 @@ def search_files(
         return set()
 
     return _filter_search_paths(result, root, globs, exclude_dirs)
+
+
+# ---------------------------------------------------------------------------
+# Windows standard-handle healing (fixes WinError 6 / "句柄无效" spawn failures)
+# ---------------------------------------------------------------------------
+
+_std_handle_heal_lock = threading.Lock()
+
+
+def is_windows_handle_error(exc: BaseException) -> bool:
+    """Whether *exc* is a Windows invalid-handle subprocess spawn failure.
+
+    ``winerror`` 6 = ERROR_INVALID_HANDLE (the typical error when a stale
+    standard handle is passed to SetHandleInformation); 87 =
+    ERROR_INVALID_PARAMETER (CreateProcess rejecting an invalid inherited
+    handle).  Used only as a trigger for :func:`heal_std_handles` retries.
+    """
+    return (
+        sys.platform == "win32"
+        and isinstance(exc, OSError)
+        and getattr(exc, "winerror", 0) in (6, 87)
+    )
+
+
+def heal_std_handles() -> bool:
+    """Repair the current process's std handles on Windows; True if any replaced.
+
+    A process's STD_INPUT/OUTPUT/ERROR handle values are fixed at spawn time
+    and become permanently invalid in two situations:
+
+      1. Spawned from a console window (RDP / bat / launcher): the std
+         handles are copies of the console's handles; when that console is
+         destroyed (window closed, RDP disconnected, launcher exited) they
+         turn stale.
+      2. No console at all (Session 0 service, pythonw, scheduled task):
+         the std handles are INVALID_HANDLE_VALUE from the start.
+
+    CPython's subprocess with ``stdin=None`` (the default) picks up the
+    process's own STD_INPUT_HANDLE and calls SetHandleInformation on it;
+    with an invalid handle that raises ``OSError: [WinError 6] 句柄无效``
+    every single time, so every spawning tool (exec_shell / search_code /
+    exec_cli / linter / git baseline) either fails outright or silently
+    degrades.
+
+    Repair: verify the three std handles with GetFileType and replace any
+    invalid one with a freshly opened NUL handle via SetStdHandle.  A
+    healthy console process has valid handles and is left untouched; after
+    healing, child stdin is NUL (immediate EOF) which is the standard
+    behaviour of a detached process.  NUL never goes stale, so the heal is
+    permanent for the process lifetime.
+
+    Idempotent and thread-safe; always returns False on non-Windows.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        import ctypes.wintypes as _wt
+
+        k32 = ctypes.windll.kernel32
+        k32.GetStdHandle.argtypes = [ctypes.c_int]
+        k32.GetStdHandle.restype = _wt.HANDLE
+        k32.SetStdHandle.argtypes = [ctypes.c_int, _wt.HANDLE]
+        k32.SetStdHandle.restype = _wt.HANDLE
+        k32.GetFileType.argtypes = [_wt.HANDLE]
+        k32.GetFileType.restype = _wt.DWORD
+        k32.CreateFileW.argtypes = [
+            _wt.LPCWSTR, _wt.DWORD, _wt.DWORD, _wt.LPVOID,
+            _wt.DWORD, _wt.DWORD, _wt.HANDLE,
+        ]
+        k32.CreateFileW.restype = _wt.HANDLE
+
+        _INVALID = 0xFFFFFFFF
+        _GENERIC_RW = 0x80000000 | 0x40000000
+        _SHARE_RW = 3  # FILE_SHARE_READ | FILE_SHARE_WRITE
+        _OPEN_EXISTING = 3
+
+        healed = False
+        with _std_handle_heal_lock:
+            for std_index in (-10, -11, -12):  # STD_INPUT/OUTPUT/ERROR
+                handle = k32.GetStdHandle(std_index)
+                handle = int(handle) if handle is not None else _INVALID
+                if handle != _INVALID and handle != 0:
+                    if k32.GetFileType(ctypes.c_void_p(handle)) != 0:
+                        continue  # valid handle — leave it alone
+                nul = k32.CreateFileW(
+                    "NUL", _GENERIC_RW, _SHARE_RW, None, _OPEN_EXISTING, 0, None
+                )
+                nul = int(nul) if nul is not None else _INVALID
+                if nul == _INVALID:
+                    continue
+                # Do NOT CloseHandle(nul): the std table takes ownership of
+                # the handle value; closing it would invalidate the std
+                # handle just installed.  At most three NUL handles are held
+                # for the process lifetime — negligible.
+                if k32.SetStdHandle(std_index, ctypes.c_void_p(nul)):
+                    healed = True
+        return healed
+    except Exception:
+        return False
+
+
+# Heal at import time: every process that imports the runtime (app.py,
+# service wrappers, tests) gets its std handles repaired before the first
+# subprocess spawn.  No-op on healthy consoles; permanent fix otherwise
+# (NUL handles cannot go stale when the launching console later dies).
+heal_std_handles()
 
 
 # ---------------------------------------------------------------------------
