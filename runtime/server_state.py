@@ -1264,6 +1264,11 @@ def get_or_create_terminal(
             # Resolve the workspace directory for this terminal session.
             from runtime.common import get_workspace as _get_ws
             workspace_dir = _get_ws()
+            if not os.path.isdir(workspace_dir):
+                # Session workspace missing on this host (e.g. a stale
+                # parent-side path): start in the inherited cwd instead of
+                # failing to spawn. Mirrors the Unix PTY (chdir fallback).
+                workspace_dir = os.getcwd()
             proc = PtyProcess.spawn("powershell.exe", dimensions=(rows, cols), cwd=workspace_dir)
             with _terminal_sessions_lock:
                 _terminal_sessions[terminal_id] = {

@@ -353,12 +353,6 @@ export async function fetchRemoteWorkspacePath(envOverride = null) {
   return (data?.env || {}).AGENTS_WORKSPACE || ''
 }
 
-/** Fetch the child's tool list (for the ToolSelector override). */
-export async function fetchRemoteTools() {
-  const data = await remoteRequest('GET', '/v1/tools')
-  return data?.tools || data?.items || []
-}
-
 /**
  * Destroy the child terminal for a session (the terminal runs on the child).
  */

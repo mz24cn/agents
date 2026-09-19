@@ -449,12 +449,17 @@ def _make_talk_to_fn(runtime, thread_local):
             child_context = dict(parent_request_context)
             remote_proxy = parent_request_context.get("remote_tool_proxy")
             if remote_proxy is not None:
-                # 远程会话：目标 agent 的工具全部取自子端代理条目（按子端
-                # 原始 tool_id 匹配）；本地工具不参与。
-                target_tool_scope = [
-                    tc for tc in remote_proxy.list_tool_configs()
-                    if tc.tool_id in agent_tool_ids
-                ]
+                # 远程会话（简化设计）：目标 agent 的工具清单只取母端
+                # registry（与本地一致），每次调用转发到子端执行。
+                tool_registry = getattr(runtime, "_tool_registry", None)
+                target_tool_scope = []
+                if tool_registry is not None:
+                    scope_configs = []
+                    for tid in agent_tool_ids:
+                        tc = tool_registry.get(tid)
+                        if tc is not None:
+                            scope_configs.append(tc)
+                    target_tool_scope = remote_proxy.wrap_parent_configs(scope_configs)
             else:
                 tool_registry = getattr(runtime, "_tool_registry", None)
                 if tool_registry is not None:

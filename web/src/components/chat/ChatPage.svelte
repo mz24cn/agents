@@ -27,7 +27,6 @@
     bindSessionToRemoteEnv,
     clearRemoteBinding,
     fetchRemoteEnvList,
-    fetchRemoteTools,
     fetchRemoteWorkspacePath,
     remoteSessions,
     destroyRemoteTerminal,
@@ -618,9 +617,9 @@
   let remoteEnvsLoading = $state(false)
   let remoteEnvDropdownOpen = $state(false)
   let selectedRemoteEnvId = $state('') // '' = 本地
-  // ToolSelector 覆盖：null=本地 catalog；'loading'=拉取子环境工具中；Array=子环境工具
-  let remoteToolsOverride = $state(null)
 
+  // 简化设计：工具清单无论本地/远程执行都只取母环境（catalog），切换执行
+  // 环境不改变工具选择，浏览器也无需直连子端拉 /v1/tools。
   let isRemoteMode = $derived(!!selectedRemoteEnvId && !!remoteExecution.env)
   let selectedRemoteEnv = $derived(remoteEnvs.find(e => e.id === selectedRemoteEnvId) || null)
   // 显示名：title [id]，无标题时只显示 id。id 放最后，移动端按钮宽度受限时先露出可区分的标题，
@@ -663,20 +662,19 @@
     }
   }
 
-  // 切换执行环境：重置工具选择、工作区路由与终端连接（决策：切换即重置）。
+  // 切换执行环境：工作区路由与终端连接随环境变化（决策：切换即重置）。
+  // 工具选择不受影响——简化设计下工具清单只取母环境（与本地一致），
+  // 执行环境只决定工具在哪里运行。
   async function handleRemoteEnvChange(envId) {
     if (envId === selectedRemoteEnvId) return
     // 环境切换使日志目录面板里的子端 journal 软链接失效（它指向旧环境）
     logDirRemoteJournal = null
     remoteEnvDropdownOpen = false
     selectedRemoteEnvId = envId
-    selectedToolIds = []
-    localStorage.setItem(STORAGE_TOOLS_KEY, '[]')
     // 终端连接目标随执行环境变化：销毁当前会话终端（重新打开会连新目标）
     if (sessionId && terminals.has(sessionId)) destroyTerminal(sessionId)
 
     if (!envId) {
-      remoteToolsOverride = null
       await bindSessionToRemoteEnv(sessionId, '')
       if (defaultWorkspacePath) workspacePath = defaultWorkspacePath
       return
@@ -685,23 +683,8 @@
     if (!env) {
       // 环境记录不存在（可能已被删除）：回退本地
       selectedRemoteEnvId = ''
-      remoteToolsOverride = null
       errorMsg = t('remoteEnvNotFound')
       return
-    }
-    remoteToolsOverride = 'loading'
-    try {
-      const tools = await fetchRemoteTools()
-      if (selectedRemoteEnvId !== envId) return // 期间又切换了环境
-      remoteToolsOverride = tools
-      // 默认全选子环境工具（delegate / talk_to / skill 不过滤，能力对齐母端）
-      selectedToolIds = tools.map(x => x.tool_id)
-      localStorage.setItem(STORAGE_TOOLS_KEY, JSON.stringify(selectedToolIds))
-    } catch (err) {
-      if (selectedRemoteEnvId === envId) {
-        remoteToolsOverride = []
-        errorMsg = err?.message || t('remoteToolsLoadFailed')
-      }
     }
     // 工作区指向子环境默认工作区（文件管理器直连子环境）
     if (selectedRemoteEnvId === envId) {
@@ -1751,24 +1734,12 @@
         const restoredRemoteEnvId = typeof meta.remote_env === 'string' ? meta.remote_env : ''
         if (restoredRemoteEnvId) {
           selectedRemoteEnvId = restoredRemoteEnvId
-          remoteToolsOverride = 'loading'
           bindSessionToRemoteEnv(sid, restoredRemoteEnvId).then(env => {
             if (!env) {
-              if (sessionId === sid) { selectedRemoteEnvId = ''; remoteToolsOverride = null }
+              if (sessionId === sid) selectedRemoteEnvId = ''
               return
             }
             if (sessionId !== sid) return
-            // 工具选择：meta.tool_ids 是子端原始工具名，直接恢复。
-            fetchRemoteTools().then(tools => {
-              if (sessionId !== sid || selectedRemoteEnvId !== restoredRemoteEnvId) return
-              remoteToolsOverride = tools
-              if (meta.tool_ids) {
-                selectedToolIds = meta.tool_ids.map(String)
-                localStorage.setItem(STORAGE_TOOLS_KEY, JSON.stringify(selectedToolIds))
-              }
-            }).catch(() => {
-              if (sessionId === sid && selectedRemoteEnvId === restoredRemoteEnvId) remoteToolsOverride = []
-            })
             // 工作区：优先恢复 meta.workspace（子端路径）；缺失时取子端默认工作区
             fetchRemoteWorkspacePath().then(ws => {
               if (sessionId !== sid || selectedRemoteEnvId !== restoredRemoteEnvId) return
@@ -1777,11 +1748,11 @@
           })
         } else {
           selectedRemoteEnvId = ''
-          remoteToolsOverride = null
           bindSessionToRemoteEnv(sid, '')
         }
-        // 恢复工具选择（本地模式；远程模式在子端工具列表拉取后恢复）
-        if (meta.tool_ids && !restoredRemoteEnvId) {
+        // 恢复工具选择（本地与远程统一：工具清单只取母环境，meta.tool_ids 直接
+        // 恢复；失效 id 由 ToolSelector 在 catalog 加载后过滤掉）
+        if (meta.tool_ids) {
           selectedToolIds = meta.tool_ids
           localStorage.setItem(STORAGE_TOOLS_KEY, JSON.stringify(meta.tool_ids))
         }
@@ -1793,7 +1764,6 @@
       } else {
         // 无 meta 的旧会话：本地执行
         selectedRemoteEnvId = ''
-        remoteToolsOverride = null
         bindSessionToRemoteEnv(sid, '')
         // 无 meta 的旧会话，工作区回退到默认值
         if (defaultWorkspacePath && defaultWorkspacePath !== workspacePath) {
@@ -1826,7 +1796,6 @@
     workspacePath = defaultWorkspacePath
     // 新会话默认本地执行（决策：会话级绑定不跨会话继承）
     selectedRemoteEnvId = ''
-    remoteToolsOverride = null
     clearRemoteBinding()
     fileJournalLoadVersion += 1
     fileJournalTurnKeyMap = {}
@@ -1861,7 +1830,6 @@
       // 被删会话若是远程会话：解除绑定（子端孤儿目录由母端 DELETE 异步清理）
       if (remoteExecution.sessionId === deletedSid) {
         selectedRemoteEnvId = ''
-        remoteToolsOverride = null
         clearRemoteBinding()
       }
     }
@@ -2017,7 +1985,6 @@
       🛠️<a href="#/setup?tab=tools" class="nav-link">{t('tools')}</a>
       <ToolSelector
         bind:selectedToolIds
-        toolsOverride={remoteToolsOverride}
         onchange={(ids) => localStorage.setItem(STORAGE_TOOLS_KEY, JSON.stringify(ids))}
         disabled={selectedAgentIds.length > 0}
       />

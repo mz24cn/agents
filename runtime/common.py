@@ -710,6 +710,110 @@ def restore_request_context(ctx: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Remote request-context forwarding
+# ---------------------------------------------------------------------------
+#
+# A remote tool call runs on a child host, yet the tool must observe the same
+# per-request context it would have locally.  ``_thread_local`` mixes three
+# kinds of state, which are handled differently:
+#
+# 1. **Portable request data** - replicated on the child
+#    (``FORWARDED_CONTEXT_KEYS``) because it changes what a tool does and
+#    cannot be derived on the child:
+#
+#    ``workspace``                        exec_shell cwd, read/write/edit_file,
+#                                         search_code, exec_cli terminal, undo
+#    ``session_id``                       file journal, exec_cli terminal, undo,
+#                                         delegate / talk_to sub-session naming
+#    ``user_message_timestamp``           file-journal turn key
+#    ``user_message_timestamp_fallback_used``  file-journal turn key
+#    ``depth``                            delegate / talk_to recursion guard
+#    ``agent_id``                         talk_to self-target guard, delegate tag
+#    ``agent_ids`` / ``all_agent_ids``    talk_to target validation, delegate meta
+#    ``model_id``                         delegate sub-session meta
+#    ``available_tool_ids``               child rebuilds ``tool_scope`` from
+#                                         these (delegate / talk_to resolve
+#                                         sub-tools against the child registry)
+#
+# 2. **Recomputed on the child** - host-specific paths derived from
+#    ``session_id`` against the child's own ContextManager; never forwarded:
+#    ``session_dir``, ``file_journal_session_id``, ``file_journal_session_dir``,
+#    ``file_journal_user_message_timestamp``.
+#
+# 3. **Host-local** - never transferred; the child builds its own:
+#    ``file_journal_holder`` / ``file_journal_manager`` (journal
+#    infrastructure), ``context_manager`` / ``session_manager`` /
+#    ``agent_manager`` (server singletons), ``sse_callback`` /
+#    ``cancel_event`` (parent stream + abort), ``remote_tool_proxy``
+#    (parent-only), ``tool_use_id`` / ``_vlm_fallback_depth`` /
+#    ``last_session_id`` (transient internals) and ``api_inference`` /
+#    ``mentioned_agent_ids`` / ``remote_env`` / ``tool_exec_timeout`` /
+#    ``tool_scope`` (parent-inference concerns).
+#
+# The portable subset travels as one base64url-encoded JSON object in the
+# transport-layer header ``X-Agents-Request-Context`` (a sibling of the auth
+# header), keeping the ``POST /v1/tools/call`` payload a pure tool-call
+# contract (``tool_id`` + ``arguments``).
+FORWARDED_CONTEXT_HEADER = "X-Agents-Request-Context"
+
+FORWARDED_CONTEXT_KEYS = (
+    "workspace",
+    "session_id",
+    "user_message_timestamp",
+    "user_message_timestamp_fallback_used",
+    "depth",
+    "agent_id",
+    "agent_ids",
+    "all_agent_ids",
+    "model_id",
+    "available_tool_ids",
+)
+
+
+def build_forwarded_context() -> dict:
+    """Return the portable subset of the current request context.
+
+    Only keys that are actually present (non-``None``) are included, so an
+    absent value is never overwritten on the child.
+    """
+    out: dict = {}
+    for key in FORWARDED_CONTEXT_KEYS:
+        value = get_request_context(key)
+        if value is not None:
+            out[key] = value
+    return out
+
+
+def encode_forwarded_context(ctx: dict) -> str:
+    """Encode *ctx* for the ``X-Agents-Request-Context`` header.
+
+    base64url keeps the value ASCII so non-ASCII workspace paths survive both
+    the HTTP (latin-1) and tunnel (JSON) transports intact.
+    """
+    raw = json.dumps(ctx, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def decode_forwarded_context(raw: Optional[str]) -> dict:
+    """Decode a header written by :func:`encode_forwarded_context`.
+
+    Tolerant by design: a missing / malformed header or unknown keys yield an
+    empty (or filtered) dict rather than raising, so an old or hostile peer
+    can never break a tool call.
+    """
+    if not raw:
+        return {}
+    try:
+        decoded = base64.urlsafe_b64decode(str(raw).encode("ascii"))
+        parsed = json.loads(decoded.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return {k: v for k, v in parsed.items() if k in FORWARDED_CONTEXT_KEYS}
+
+
+# ---------------------------------------------------------------------------
 # Workspace resolution
 # ---------------------------------------------------------------------------
 

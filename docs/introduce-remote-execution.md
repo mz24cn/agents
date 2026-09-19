@@ -221,7 +221,9 @@ http://host:7988/v1/setup?token=...
 
 - 会话绑定子端后，该会话的**全部工具**来自子端：工具 ID / 名称保留子端原名（`exec_shell`、`write_file`、`exec_cli`……），**与本地执行观感完全一致**；远程工具不注册进母端全局工具注册表，同一会话内远程与本地工具绝不混用；
 - **推理留在母端**：模型调用、会话历史、上下文管理全部发生在母端；
-- 每次工具调用被转发到子端 `POST /v1/tools/call`，并携带母端的 `session_id` 与用户消息时间戳——**子端的文件 journal、终端、delegate 子会话与母端会话同 id**：在子端发生的文件变更，能在母端 UI 里以同一会话追溯。
+- 每次工具调用被转发到子端 `POST /v1/tools/call`，并携带母端请求上下文中**可移植的部分**（`workspace` / `session_id` / `user_message_timestamp` / `depth` / `agent_id` / `agent_ids` / `all_agent_ids` / `model_id` / `available_tool_ids`），统一编码为 `X-Agents-Request-Context` header 里的**一个 base64url JSON 值**（与 Bearer 认证头同级的传输层上下文；`/v1/tools/call` 的 payload 保持 `tool_id` + `arguments` 的纯工具调用契约）——**子端的文件 journal、终端、delegate 子会话与母端会话同 id**：在子端发生的文件变更，能在母端 UI 里以同一会话追溯。host 相关的 `session_dir`、文件 journal holder 与各服务器单例**由子端按自身重建**，不转发。
+
+- **会话上下文只走 header、绝不放 body**：`X-Agents-Request-Context` 是唯一的传输通道，`POST /v1/tools/call` 的 JSON body 只承载 `tool_id` + `arguments`（直连调用方也一样——把 `workspace` / `session_id` / `user_message_timestamp` 塞进 body 会被忽略，工具只在子端默认工作区里执行）。
 
 ### 6.3 截图演示：工具确实在子端跑
 
@@ -239,7 +241,7 @@ http://host:7988/v1/setup?token=...
 
 ### 6.5 工作区文件管理器
 
-绑定子端后，工作区文件管理器指向**子端的默认工作区**（`/root/workspace`）：目录树、搜索、重命名、上传下载全部作用于子端文件，当前工作区徽标标明路由目标。**会话日志目录始终在母端**（母端 UI 打开日志目录时会临时锁定本地环境），而子端发生的文件变更通过 file journal 在母端侧可见，子端 journal 条目带有「软链接」入口。
+绑定子端后，工作区文件管理器指向**子端的默认工作区**（`/root/workspace`）：目录树、搜索、重命名、上传下载全部作用于子端文件，当前工作区徽标标明路由目标。**顶栏徽标与文件管理器始终显示前端设置的会话工作区**（唯一事实来源）：母端推理请求把会话工作区带入母端请求上下文（`_thread_local`），每次工具调用把该值与其他可移植上下文一起、经 `X-Agents-Request-Context` header（base64url JSON 单值）转发到子端（不放进 `/v1/tools/call` 的 JSON payload，payload 保持 tool_id + arguments 的工具调用契约）：目录在子端存在时，`exec_shell` 的 cwd、相对文件路径与持久化终端都固定在该目录，子端执行环境复现母端上下文；不存在时（例如绑定环境时暂不可达、残留了母端路径）子端回退默认工作区（`AGENTS_WORKSPACE` 环境变量，未设置时为进程启动目录）并记录告警日志。**会话日志目录始终在母端**（母端 UI 打开日志目录时会临时锁定本地环境），而子端发生的文件变更通过 file journal 在母端侧可见，子端 journal 条目带有「软链接」入口。
 
 > ![远程工作区](images/chat-remote-workspace.png)
 >
@@ -249,7 +251,7 @@ http://host:7988/v1/setup?token=...
 
 远程执行不是"只能跑 shell"的简化形态，会话级能力完整随迁到子端：
 
-- **talk_to / delegate / 群聊**：子代理与子会话在子端执行，子会话 id 同样挂在母端会话下；
+- **talk_to / delegate / 群聊**：子代理与子会话在子端执行，子会话 id 同样挂在母端会话下；请求上下文里的 `depth` / `agent_id` / `agent_ids` / `all_agent_ids` 会一并转发，`tool_scope` 由子端按转发的 `available_tool_ids` 在**自身 registry** 上重建（子工具在子端解析）。注意：**agent 名册本身不跨主机同步**，子端需具备与母端一致的 agent 定义，否则 talk_to 在子端解析目标会失败；
 - **Skill 渐进披露**：披露由**母端**推理循环触发（子端 `/v1/tools/call` 不执行 skill 条目），`SKILL.md` 正文从子端 `GET /v1/tools/skill/{id}` 拉取并**缓存 300s**；
 - **MCP 工具**：以 function 条目形式代理，由子端执行；base64 前后置（把 `base64` 参数里的文件路径读成内容、把过长的 base64 结果落盘换成本机路径）由**母端**负责——子端 `/v1/tools/call` 始终原样执行，其直接 API 调用方拿到的仍是真实 base64，而不是服务器上的文件路径；
 - **工具列表缓存 TTL 30s**：子端工具集变化（如隧道重连、推送更新后）会在 TTL 过期时自动失效刷新；

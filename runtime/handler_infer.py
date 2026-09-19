@@ -18,6 +18,8 @@ from typing import Optional
 
 from runtime.common import (
     clear_request_context,
+    decode_forwarded_context,
+    FORWARDED_CONTEXT_HEADER,
     get_request_context,
     now_iso,
     set_request_context,
@@ -233,8 +235,9 @@ class HandlerInferMixin:
         # === Remote execution environment binding ===
         # remote_env 是 remote_envs.json 中的环境 id。绑定时，本会话的全部
         # 工具（tool_ids 中的每一个）都转发到子环境执行，不与本地工具混用：
-        # 推理仍在母环境进行（母环境模型 + 会话历史），工具清单、工作区、
-        # 终端与文件 journal 都归属子环境。
+        # 推理仍在母环境进行（母环境模型 + 会话历史），工具清单只取母环境
+        # registry（简化设计，前端与模型均不再拉取子端 /v1/tools），工作区、
+        # 终端与文件 journal 归属子环境。
         remote_env_id = str(body.get("remote_env") or "").strip() or None
         remote_proxy = None
         if remote_env_id:
@@ -425,33 +428,32 @@ class HandlerInferMixin:
             )
         remote_selected: Optional[list] = None
         if remote_proxy is not None:
-            # 远程模式：工具清单全部来自子端，保持子端原始 tool_id/name
-            # （远程与本地工具从不在同一会话混用，无冲突，不注册母端
-            # registry）：代理条目经 InferenceRequest.tools 直传推理循环。
-            # 子端不存在的工具直接丢弃（无法在那里执行）。
-            from runtime.remote_tool_proxy import RemoteToolCallError
-            try:
-                remote_configs = remote_proxy.list_tool_configs()
-            except RemoteToolCallError as exc:
-                self._send_json_error(
-                    502, f"Cannot load tools from remote environment: {exc}"
-                )
-                return None
-            available_ids = {c.tool_id for c in remote_configs}
-            tool_ids = [tid for tid in tool_ids if tid in available_ids]
+            # 远程模式（简化设计）：工具清单只取母端 registry，与本地模式
+            # 完全一致；选中工具包装为子端转发 callable（子端按母端 tool_id
+            # 执行，子端没有该工具时由子端返回错误，模型自行处理）。因此
+            # 不再拉取子端 /v1/tools：子端宕机只影响个别工具调用，不阻断
+            # 推理请求（不再 502）。
+            runtime = self._get_runtime()
+            selected_configs = []
+            for tid in tool_ids:
+                tc = runtime._tool_registry.get(tid)
+                if tc is not None:
+                    selected_configs.append(tc)
             # 与本地执行保持一致：会话已打开终端时自动暴露 exec_cli。
             # 终端运行在子端，父端本地终端注册表没有该状态，因此改问子端的
             # /v1/terminals；这样非 Web 客户端（API）与恢复后的会话也能拿到
             # exec_cli，而不是只依赖前端按面板状态追加。
             if (
-                "exec_cli" in available_ids
-                and "exec_cli" not in tool_ids
+                "exec_cli" not in tool_ids
                 and _remote_session_has_terminal(
                     remote_proxy, session_id, is_group_chat
                 )
             ):
                 tool_ids = [*tool_ids, "exec_cli"]
-            remote_selected = [c for c in remote_configs if c.tool_id in set(tool_ids)]
+                tc = runtime._tool_registry.get("exec_cli")
+                if tc is not None:
+                    selected_configs.append(tc)
+            remote_selected = remote_proxy.wrap_parent_configs(selected_configs)
         # Keep the normalized/augmented selection on the request body so retry
         # logging and conversation metadata reflect the actual inference tools.
         body["tool_ids"] = tool_ids
@@ -1335,12 +1337,23 @@ class HandlerInferMixin:
         Expects JSON body with tool_id and arguments.
         Optional 'format' field: if 'json', the result is returned as a parsed JSON object
         instead of a raw string.
-        Optional 'session_id' / 'user_message_timestamp': attach the calling
-        session's context (file journal holder, session dir, server singletons)
-        so session-scoped tools (write_file journal, exec_cli terminal, undo,
-        delegate sub-sessions) run against that session. Used by the parent
-        environment's remote tool proxy; the field-less path is unchanged for
-        direct local callers.
+
+        Remote-execution context: the parent's remote tool proxy forwards
+        the portable subset of its request context (workspace /
+        session_id / user_message_timestamp / depth / agent_id / agent_ids
+        / all_agent_ids / model_id / available_tool_ids) as one base64url
+        JSON value in the ``X-Agents-Request-Context`` header (a sibling
+        of the auth header; the JSON payload stays a pure tool-call
+        contract). This handler decodes it and rebuilds the calling
+        session's context on THIS host: the workspace pins exec_shell cwd,
+        relative file paths and the PTY terminal; session_id drives the
+        file journal, terminal and delegate sub-session ids; the agent
+        fields drive talk_to / delegate. Host-specific values (session_dir,
+        the server singletons, the file-journal holder) are rebuilt here
+        from this server, never forwarded. The session context comes
+        *only* from the header: direct callers of this endpoint (curl /
+        MCP adapters) pass just ``tool_id`` + ``arguments`` and run against
+        the child's default workspace.
 
         When format='json', the method attempts to extract valid JSON from the result.
         It handles: direct JSON, markdown code blocks, escaped JSON, and embedded JSON
@@ -1362,39 +1375,85 @@ class HandlerInferMixin:
 
         fmt = body.get("format", "text")
 
-        session_id = body.get("session_id") or None
-        user_message_timestamp = body.get("user_message_timestamp") or None
+        # ---- Remote-execution request context ------------------------
+        # The whole session context travels in one transport-layer header
+        # written by the parent's remote tool proxy; the JSON body carries
+        # only the tool call itself (tool_id + arguments).
+        fwd = decode_forwarded_context(self.headers.get(FORWARDED_CONTEXT_HEADER))
+
+        # Workspace: pin only when the directory exists on *this* host. A
+        # stale parent-side path (or a temporarily unreachable child) falls
+        # back to the child default workspace instead of failing Popen / writes.
+        workspace = str(fwd.get("workspace") or "").strip()
+        workspace_applied = False
+        if workspace:
+            if os.path.isdir(workspace):
+                set_request_context(workspace=workspace)
+                workspace_applied = True
+            else:
+                logger.warning(
+                    "tools/call: forwarded workspace %s not found on this "
+                    "host; falling back to the child default workspace",
+                    workspace,
+                )
+
+        session_id = fwd.get("session_id") or None
+        user_message_timestamp = fwd.get("user_message_timestamp") or None
 
         runtime = self._get_runtime()
-        if session_id:
-            # 远程代理调用（母环境转发）：带上会话上下文，使本端（子端）的
-            # 文件 journal / 终端 / delegate 子会话与母端会话同 id。
-            context_manager = self.server.context_manager  # type: ignore[attr-defined]
-            session_dir = os.path.dirname(context_manager._conversation_path(session_id))
-            set_request_context(
-                session_id=session_id,
-                session_dir=session_dir,
-                user_message_timestamp=user_message_timestamp,
-                file_journal_holder=_FileJournalManagerHolder(),
-                file_journal_manager=None,
-                context_manager=context_manager,
-                session_manager=self.server.session_manager,  # type: ignore[attr-defined]
-                agent_manager=self.server.agent_manager,  # type: ignore[attr-defined]
-                depth=0,
-            )
-            try:
+        # Everything set for a session-scoped call, cleared afterwards.
+        session_keys = [
+            "session_id", "session_dir", "user_message_timestamp",
+            "user_message_timestamp_fallback_used", "file_journal_holder",
+            "file_journal_manager", "context_manager", "session_manager",
+            "agent_manager", "depth", "agent_id", "agent_ids",
+            "all_agent_ids", "model_id", "tool_scope", "available_tool_ids",
+        ]
+        try:
+            if session_id:
+                # 远程代理调用（母环境转发）：带上前向的会话上下文，使本端（子端）的
+                # 文件 journal / 终端 / delegate 子会话与母端会话同 id；host 相关的
+                # session_dir 与服务器单例在此按子端自身重建。
+                context_manager = self.server.context_manager  # type: ignore[attr-defined]
+                session_dir = os.path.dirname(context_manager._conversation_path(session_id))
+                # 依前向的工具 id 重建 tool_scope，使 delegate / talk_to 在本端
+                # registry 上解析子工具（子代理仍在子端执行）。
+                scope = []
+                registry = getattr(runtime, "_tool_registry", None)
+                for tid in fwd.get("available_tool_ids") or []:
+                    tc = registry.get(tid) if registry is not None else None
+                    if tc is not None:
+                        scope.append(tc)
+                set_request_context(
+                    session_id=session_id,
+                    session_dir=session_dir,
+                    user_message_timestamp=user_message_timestamp,
+                    user_message_timestamp_fallback_used=bool(
+                        fwd.get("user_message_timestamp_fallback_used")),
+                    file_journal_holder=_FileJournalManagerHolder(),
+                    file_journal_manager=None,
+                    context_manager=context_manager,
+                    session_manager=self.server.session_manager,  # type: ignore[attr-defined]
+                    agent_manager=self.server.agent_manager,  # type: ignore[attr-defined]
+                    depth=fwd.get("depth") or 0,
+                    agent_id=fwd.get("agent_id"),
+                    agent_ids=fwd.get("agent_ids"),
+                    all_agent_ids=fwd.get("all_agent_ids"),
+                    model_id=fwd.get("model_id"),
+                    tool_scope=scope,
+                    available_tool_ids=fwd.get("available_tool_ids"),
+                )
+                try:
+                    result = runtime.call_tool(tool_id, arguments)
+                finally:
+                    # 与推理路径一致：响应前先 finalize 本轮文件 journal
+                    self._finalize_file_journal()
+                    clear_request_context(session_keys)
+            else:
                 result = runtime.call_tool(tool_id, arguments)
-            finally:
-                # 与推理路径一致：响应前先 finalize 本轮文件 journal
-                self._finalize_file_journal()
-                clear_request_context([
-                    "session_id", "session_dir", "user_message_timestamp",
-                    "file_journal_holder", "file_journal_manager",
-                    "context_manager", "session_manager", "agent_manager",
-                    "depth",
-                ])
-        else:
-            result = runtime.call_tool(tool_id, arguments)
+        finally:
+            if workspace_applied:
+                clear_request_context(["workspace"])
 
         # If result starts with "Error:", treat as error
         if result.startswith("Error:"):

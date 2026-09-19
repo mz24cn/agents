@@ -801,8 +801,8 @@ class Runtime:
         inference_model_config = model_config.resolved_for_inference()
 
         # 2. Get tool configs
-        # request.tools 携带现成的 ToolConfig（远程代理工具：子端原始 ID/名，
-        # 不在母端 registry）时直接使用；否则按 ID 查 registry。
+        # request.tools 携带现成的 ToolConfig（远程代理工具：母端定义 +
+        # 子端转发 callable）时直接使用；否则按 ID 查母端 registry。
         if request.tools is not None:
             tools: list[ToolConfig] = list(request.tools)
         else:
@@ -2281,8 +2281,8 @@ class Runtime:
         # The registry/override object retains its original placeholder text.
         inference_model_config = model_config.resolved_for_inference()
 
-        # request.tools 携带现成的 ToolConfig（远程代理工具：子端原始 ID/名，
-        # 不在母端 registry）时直接使用；否则按 ID 查 registry。
+        # request.tools 携带现成的 ToolConfig（远程代理工具：母端定义 +
+        # 子端转发 callable）时直接使用；否则按 ID 查母端 registry。
         if request.tools is not None:
             tools: list[ToolConfig] = list(request.tools)
         else:

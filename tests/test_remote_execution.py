@@ -5,15 +5,25 @@ child environment while inference (parent model + conversation history) stays
 in the parent:
 
 * ``POST /v1/infer`` body field ``remote_env`` (env id from remote_envs.json)
-  binds the session to the child: the tool list and every tool call come
-  from the child with the child's original tool IDs/names (remote sessions
-  look like local ones). Remote tools are never registered in the parent
-  ToolRegistry (remote and local tools never mix in one session) — they
-  travel as ToolConfigs on the InferenceRequest; the binding is persisted
-  into conversation.json ``meta.remote_env``.
-* Tool calls are forwarded to the child's ``POST /v1/tools/call`` with the
-  parent ``session_id`` + user-message timestamp, so the child's file
-  journals / terminals / delegate sub-sessions share the parent session id.
+  binds the session to the child.  Simplified design: the tool list is taken
+  ONLY from the parent registry (the model sees exactly the same names /
+  parameters / descriptions as local mode; the web UI never talks to the
+  child for tools).  Every selected tool is wrapped with a forwarding
+  callable so each call executes in the child under the parent's tool_id
+  (a tool missing on the child yields a child error result, handled by the
+  model).  Wrapped configs travel as ToolConfigs on the InferenceRequest and
+  never register into the parent ToolRegistry (the shared registry objects
+  are copied, not mutated); the binding is persisted into conversation.json
+  ``meta.remote_env``.  A dead child no longer blocks request preparation
+  (no 502) — only individual tool calls fail.
+* Tool calls are forwarded to the child's ``POST /v1/tools/call`` carrying
+  the portable subset of the parent request context (workspace / session_id
+  / user-message timestamp / depth / agent_id / agent_ids / all_agent_ids /
+  model_id / available_tool_ids) as one base64url JSON value in the
+  ``X-Agents-Request-Context`` header; the JSON payload stays a pure
+  tool-call contract (tool_id + arguments).  The child rebuilds the session
+  context on its own host, so its file journals / terminals / delegate
+  sub-sessions share the parent session id.
 * Skill progressive disclosure stays in the parent loop; the SKILL.md body
   is fetched from the child via ``GET /v1/tools/skill/{id}``.
 * ``revoke`` first restores the child's files (``revoke?journal_only=true``),
@@ -94,6 +104,49 @@ def _wait_hello(server):
     raise AssertionError("server never came up")
 
 
+def _forwarded_headers(**ctx):
+    """Build the ``X-Agents-Request-Context`` header the parent proxy sends.
+
+    Mirrors ``RemoteToolProxy.call`` so child-side tests exercise the real
+    transport without spinning up a parent inference request.
+    """
+    from runtime.common import FORWARDED_CONTEXT_HEADER, encode_forwarded_context
+    return {FORWARDED_CONTEXT_HEADER: encode_forwarded_context(ctx)}
+
+
+def _register_child_probe(child):
+    """Register a child function tool that echoes its request context."""
+    from runtime.models import ToolConfig
+    from runtime.common import get_request_context
+
+    def _probe() -> str:
+        scope = get_request_context("tool_scope") or []
+        return json.dumps({
+            "workspace": get_request_context("workspace"),
+            "session_id": get_request_context("session_id"),
+            "session_dir": get_request_context("session_dir"),
+            "user_message_timestamp": get_request_context("user_message_timestamp"),
+            "depth": get_request_context("depth"),
+            "agent_id": get_request_context("agent_id"),
+            "agent_ids": get_request_context("agent_ids"),
+            "all_agent_ids": get_request_context("all_agent_ids"),
+            "tool_scope": [getattr(tc, "tool_id", None) for tc in scope],
+            "has_agent_manager": get_request_context("agent_manager") is not None,
+        })
+
+    child[0]._server.runtime._tool_registry.register(  # type: ignore[attr-defined]
+        ToolConfig(
+            tool_id="ctx_probe",
+            tool_type="function",
+            name="ctx_probe",
+            description="echo request context",
+            parameters={"type": "object", "properties": {}},
+        ),
+        callable_fn=_probe,
+    )
+    return _probe
+
+
 @contextlib.contextmanager
 def _real_server(tmp_path, name="data", workspace=None):
     """Start a real RuntimeHTTPServer (builtins registered, isolated paths)."""
@@ -141,19 +194,65 @@ def _add_env(parent, url):
 
 
 def _child_write_file(child, session_id, path, content, timestamp=TURN_TS, token=None):
-    """Call the child's write_file via /v1/tools/call with session context."""
+    """Call the child's write_file via /v1/tools/call with session context.
+
+    Session context travels in the ``X-Agents-Request-Context`` header; the
+    JSON body carries only ``tool_id`` + ``arguments`` (no session fields).
+    """
     payload = {
         "tool_id": "write_file",
         "arguments": {"path": path, "content": content},
-        "session_id": session_id,
-        "user_message_timestamp": timestamp,
     }
-    headers = {}
+    headers = _forwarded_headers(session_id=session_id, user_message_timestamp=timestamp)
     if token:
         headers["Authorization"] = f"Bearer {token}"
     status, text = _request_text(child[0], "POST", "/v1/tools/call", payload, headers)
     assert status == 200, text
     return text
+
+
+# ---------------------------------------------------------------------------
+# Request-context codec (unified X-Agents-Request-Context header)
+# ---------------------------------------------------------------------------
+
+class TestForwardedContextCodec:
+    def test_round_trip_preserves_unicode_workspace(self):
+        from runtime.common import (
+            encode_forwarded_context, decode_forwarded_context,
+        )
+        ctx = {"workspace": r"D:\项目\子目录", "session_id": "s-1",
+               "depth": 0, "agent_ids": ["a", "b"]}
+        raw = encode_forwarded_context(ctx)
+        assert raw.isascii()
+        assert decode_forwarded_context(raw) == ctx
+
+    def test_unknown_keys_are_dropped_on_decode(self):
+        from runtime.common import (
+            encode_forwarded_context, decode_forwarded_context,
+        )
+        raw = encode_forwarded_context({"session_id": "s", "sse_callback": "x"})
+        assert decode_forwarded_context(raw) == {"session_id": "s"}
+
+    def test_malformed_header_is_tolerated(self):
+        from runtime.common import decode_forwarded_context
+        assert decode_forwarded_context(None) == {}
+        assert decode_forwarded_context("") == {}
+        assert decode_forwarded_context("not-base64!!") == {}
+        assert decode_forwarded_context("aGVsbG8=") == {}  # "hello", not a dict
+
+    def test_build_forwarded_context_uses_the_allow_list(self):
+        from runtime.common import (
+            build_forwarded_context, clear_request_context,
+            FORWARDED_CONTEXT_KEYS, set_request_context,
+        )
+        set_request_context(session_id="sess-1", workspace="/w")
+        try:
+            fwd = build_forwarded_context()
+        finally:
+            clear_request_context(["session_id", "workspace"])
+        assert fwd["session_id"] == "sess-1"
+        assert fwd["workspace"] == "/w"
+        assert set(fwd) <= set(FORWARDED_CONTEXT_KEYS)
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +331,27 @@ class TestProxyAgainstRealChild:
         assert (child_ws / "proxy_ok.txt").read_text(encoding="utf-8") == "via-proxy"
         assert not result2.startswith("Error:"), result2
         assert (child_ws / "via_callable.txt").read_text(encoding="utf-8") == "via-callable"
+
+    def test_call_forwards_workspace_from_context(self, child, tmp_path):
+        """The parent request-context workspace (the session workspace held
+        in the parent's _thread_local in remote mode) travels to the child
+        inside the X-Agents-Request-Context header (not in the
+        /v1/tools/call JSON payload) and pins the child's execution to it."""
+        child_ws = tmp_path / "child_ws"
+        sub = child_ws / "sub2"
+        sub.mkdir()
+        p = RemoteToolProxy({"id": f"http://127.0.0.1:{child[0].port}",
+                             "url": f"http://127.0.0.1:{child[0].port}/v1/setup"})
+        from runtime.common import set_request_context, clear_request_context
+        set_request_context(session_id="sess-ws-3", user_message_timestamp=TURN_TS,
+                            workspace=str(sub))
+        try:
+            result = p.call("write_file", {"path": "fwd.txt", "content": "fwd"})
+        finally:
+            clear_request_context(["session_id", "user_message_timestamp", "workspace"])
+        assert not result.startswith("Error:"), result
+        assert (sub / "fwd.txt").read_text(encoding="utf-8") == "fwd"
+        assert not (child_ws / "fwd.txt").exists()
 
     def test_child_mcp_tool_is_base64_marshalled_by_parent(self, parent, child):
         """Remote MCP tools: the child executes verbatim and the parent owns
@@ -328,6 +448,103 @@ class TestChildToolCallSessionContext:
         assert status == 200
         assert (tmp_path / "child_ws" / "plain.txt").read_text(encoding="utf-8") == "no-session"
 
+    def test_tool_call_honors_forwarded_workspace(self, child, tmp_path):
+        """The X-Agents-Request-Context workspace forwarded by the parent's
+        remote tool proxy pins the tool call (relative paths and exec_shell
+        cwd resolve against it), replicating the parent's context on the
+        child."""
+        child_ws = tmp_path / "child_ws"
+        sub = child_ws / "sub"
+        sub.mkdir()
+        payload = {
+            "tool_id": "write_file",
+            "arguments": {"path": "in_sub.txt", "content": "ws"},
+        }
+        status, text = _request_text(
+            child[0], "POST", "/v1/tools/call", payload,
+            headers=_forwarded_headers(
+                workspace=str(sub), session_id="sess-ws-1",
+                user_message_timestamp=TURN_TS,
+            ),
+        )
+        assert status == 200, text
+        assert (sub / "in_sub.txt").read_text(encoding="utf-8") == "ws"
+        assert not (child_ws / "in_sub.txt").exists()
+
+    def test_tool_call_ignores_body_session_context(self, child, tmp_path):
+        """Session context is read *only* from the X-Agents-Request-Context
+        header; the same keys in the JSON body are ignored. A direct caller
+        that stuffs them into the body therefore runs against the child's
+        default workspace instead of the (untrusted) body path."""
+        child_ws = tmp_path / "child_ws"
+        sub = child_ws / "sub3"
+        sub.mkdir()
+        payload = {
+            "tool_id": "write_file",
+            "arguments": {"path": "direct.txt", "content": "direct"},
+            "workspace": str(sub),
+            "session_id": "should-be-ignored",
+            "user_message_timestamp": TURN_TS,
+        }
+        status, text = _request_text(child[0], "POST", "/v1/tools/call", payload)
+        assert status == 200, text
+        # body workspace / session_id are ignored -> child default workspace
+        assert (child_ws / "direct.txt").read_text(encoding="utf-8") == "direct"
+        assert not (sub / "direct.txt").exists()
+
+    def test_tool_call_ignores_missing_workspace(self, child, tmp_path):
+        """A forwarded workspace that does not exist on the child (e.g. a
+        stale parent-side path) falls back to the child default instead of
+        failing the call."""
+        child_ws = tmp_path / "child_ws"
+        payload = {
+            "tool_id": "write_file",
+            "arguments": {"path": "fallback.txt", "content": "fb"},
+        }
+        status, text = _request_text(
+            child[0], "POST", "/v1/tools/call", payload,
+            headers=_forwarded_headers(
+                workspace=str(tmp_path / "does_not_exist"),
+                session_id="sess-ws-2", user_message_timestamp=TURN_TS,
+            ),
+        )
+        assert status == 200, text
+        assert (child_ws / "fallback.txt").read_text(encoding="utf-8") == "fb"
+
+    def test_forwarded_context_rebuilds_child_request_context(self, child, tmp_path):
+        """The X-Agents-Request-Context header carries the portable subset
+        (session_id / timestamp / depth / agent_id / agent_ids /
+        available_tool_ids); the child applies them and rebuilds the
+        host-specific parts (session_dir, tool_scope, server singletons)
+        from its own host."""
+        _register_child_probe(child)
+        status, text = _request_text(
+            child[0], "POST", "/v1/tools/call",
+            {"tool_id": "ctx_probe", "arguments": {}},
+            headers=_forwarded_headers(
+                session_id="sess-ctx-1",
+                user_message_timestamp=TURN_TS,
+                depth=2,
+                agent_id="agent-x",
+                agent_ids=["agent-x", "agent-y"],
+                all_agent_ids=["agent-x", "agent-y"],
+                available_tool_ids=["write_file"],
+            ),
+        )
+        assert status == 200, text
+        seen = json.loads(text)
+        assert seen["session_id"] == "sess-ctx-1"
+        assert seen["user_message_timestamp"] == TURN_TS
+        assert seen["depth"] == 2
+        assert seen["agent_id"] == "agent-x"
+        assert seen["agent_ids"] == ["agent-x", "agent-y"]
+        assert seen["all_agent_ids"] == ["agent-x", "agent-y"]
+        # tool_scope is rebuilt from THIS host's registry
+        assert seen["tool_scope"] == ["write_file"]
+        # host-specific values are child-derived, not forwarded
+        assert seen["session_dir"]
+        assert seen["has_agent_manager"] is True
+
     def test_undo_restores_child_file(self, child, tmp_path):
         child_ws = tmp_path / "child_ws"
         _child_write_file(child, "sess-j-2", "undo_me.txt", "v1")
@@ -337,7 +554,8 @@ class TestChildToolCallSessionContext:
         assert (child_ws / "undo_me.txt").read_text(encoding="utf-8") == "v2"
         status, text = _request_text(
             child[0], "POST", "/v1/tools/call",
-            {"tool_id": "undo", "arguments": {}, "session_id": "sess-j-2"},
+            {"tool_id": "undo", "arguments": {}},
+            headers=_forwarded_headers(session_id="sess-j-2"),
         )
         assert status == 200, text
         assert (child_ws / "undo_me.txt").read_text(encoding="utf-8") == "v1"
@@ -377,16 +595,16 @@ class TestChildAuth:
         status, text = _request_text(
             child[0], "POST", "/v1/tools/call",
             {"tool_id": "write_file",
-             "arguments": {"path": "bearer.txt", "content": "ok"},
-             "session_id": "sess-auth-2"},
-            headers={"Authorization": f"Bearer {token}"},
+             "arguments": {"path": "bearer.txt", "content": "ok"}},
+            headers={"Authorization": f"Bearer {token}",
+                     **_forwarded_headers(session_id="sess-auth-2")},
         )
         assert status == 200, text
         status, _ = _request_text(
             child[0], "POST", "/v1/tools/call",
             {"tool_id": "write_file",
-             "arguments": {"path": "bearer.txt", "content": "ok"},
-             "session_id": "sess-auth-2"},
+             "arguments": {"path": "bearer.txt", "content": "ok"}},
+            headers=_forwarded_headers(session_id="sess-auth-2"),
         )
         assert status == 401
 
@@ -622,22 +840,71 @@ class TestParentRemoteRouting:
         )
         assert status == 404
 
-    def test_infer_dead_child_502(self, parent):
+    def test_infer_dead_child_degrades_to_tool_call_error(self, parent):
+        """Simplified design: the tool list comes only from the parent
+        registry, so an unreachable child no longer fails request
+        preparation with 502 — the model still gets the parent's tools, and
+        only the actual tool call returns an error result."""
+        from runtime.models import ModelConfig
+
         status, body = _request(parent[0], "POST", "/v1/remote-envs", {
             "url": "http://127.0.0.1:1/v1/setup",
         })
         assert status == 200
         env_id = body["envs"][0]["id"]
-        status, body = _request(
-            parent[0], "POST", "/v1/infer/stream",
-            {
-                "model_id": "m",
-                "messages": [{"role": "user", "content": "hi"}],
+
+        parent_runtime = parent[0]._server.runtime  # type: ignore[attr-defined]
+        parent_runtime._model_registry.register(  # type: ignore[attr-defined]
+            ModelConfig(
+                model_id="e2e-model",
+                api_base="http://model.invalid",
+                model_name="e2e",
+                api_protocol="openai",
+            )
+        )
+
+        tool_call_chunk = json.dumps({
+            "choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "call_1",
+                 "function": {"name": "write_file",
+                              "arguments": json.dumps(
+                                  {"path": "x.txt", "content": "x"})}},
+            ]}}],
+        })
+        final_chunk = json.dumps({"choices": [{"delta": {"content": "done"}}]})
+        streams = [
+            io.BytesIO(f"data: {tool_call_chunk}\n\ndata: [DONE]\n\n".encode()),
+            io.BytesIO(f"data: {final_chunk}\n\ndata: [DONE]\n\n".encode()),
+        ]
+        real_urlopen = urllib.request.urlopen
+
+        def selective_urlopen(req, **kwargs):
+            url = req.full_url if isinstance(req, urllib.request.Request) else str(req)
+            if url.startswith("http://model.invalid"):
+                stream = streams.pop(0)
+                mock_resp = MagicMock()
+                mock_resp.__iter__ = lambda self: iter(stream.readlines())
+                mock_resp.read = stream.read
+                mock_resp.close = MagicMock()
+                mock_resp.__enter__ = lambda s: s
+                mock_resp.__exit__ = MagicMock(return_value=False)
+                return mock_resp
+            # proxy -> dead child: real connection attempt (refused)
+            return real_urlopen(req, **kwargs)
+
+        with patch("urllib.request.urlopen", side_effect=selective_urlopen):
+            status, body = _request(parent[0], "POST", "/v1/infer", {
+                "model_id": "e2e-model",
+                "tool_ids": ["write_file"],
+                "messages": [{"role": "user", "content": "write a file"}],
                 "session_id": "new",
                 "remote_env": env_id,
-            },
-        )
-        assert status == 502
+            })
+        assert status == 200, body
+        assert body.get("success") is True, body
+        tool_msgs = [m for m in body.get("messages", []) if m.get("role") == "tool"]
+        assert tool_msgs, body.get("messages")
+        assert tool_msgs[0].get("content", "").startswith("Error:"), tool_msgs[0]
 
 
 # ---------------------------------------------------------------------------
@@ -746,6 +1013,85 @@ class TestRemoteInferEndToEnd:
         assert local_wf is not None
         assert getattr(local_wf, "is_remote_proxy", False) is False
         assert all("__" not in t.tool_id for t in parent_runtime._tool_registry.list_all())  # type: ignore[attr-defined]
+
+    def test_remote_infer_forwards_session_workspace(self, parent, child, tmp_path):
+        """Full chain: the parent infer body's ``workspace`` (the session
+        workspace shown in the top bar, a child-side path in remote mode)
+        reaches the child's tool execution, so relative paths land there."""
+        from runtime.models import ModelConfig
+
+        env_id = _add_env(parent, f"http://127.0.0.1:{child[0].port}/v1/setup")
+        child_ws = tmp_path / "child_ws"
+        sub = child_ws / "session_ws"
+        sub.mkdir()
+
+        parent_runtime = parent[0]._server.runtime  # type: ignore[attr-defined]
+        parent_runtime._model_registry.register(  # type: ignore[attr-defined]
+            ModelConfig(
+                model_id="e2e-model-ws",
+                api_base="http://model.invalid",
+                model_name="e2e",
+                api_protocol="openai",
+            )
+        )
+
+        def _sse(lines):
+            return io.BytesIO("".join(lines).encode("utf-8"))
+
+        tool_call_chunk = json.dumps({
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_1",
+                                "function": {
+                                    "name": "write_file",
+                                    "arguments": json.dumps(
+                                        {"path": "ws_e2e.txt", "content": "in-session-ws"}
+                                    ),
+                                },
+                            },
+                        ],
+                    },
+                },
+            ],
+        })
+        final_chunk = json.dumps({"choices": [{"delta": {"content": "done"}}]})
+        streams = [
+            _sse([f"data: {tool_call_chunk}\n\n", "data: [DONE]\n\n"]),
+            _sse([f"data: {final_chunk}\n\n", "data: [DONE]\n\n"]),
+        ]
+        real_urlopen = urllib.request.urlopen
+
+        def selective_urlopen(req, **kwargs):
+            url = req.full_url if isinstance(req, urllib.request.Request) else str(req)
+            if url.startswith("http://model.invalid"):
+                stream = streams.pop(0)
+                mock_resp = MagicMock()
+                mock_resp.__iter__ = lambda self: iter(stream.readlines())
+                mock_resp.read = stream.read
+                mock_resp.close = MagicMock()
+                mock_resp.__enter__ = lambda s: s
+                mock_resp.__exit__ = MagicMock(return_value=False)
+                return mock_resp
+            return real_urlopen(req, **kwargs)
+
+        with patch("urllib.request.urlopen", side_effect=selective_urlopen):
+            status, body = _request(parent[0], "POST", "/v1/infer", {
+                "model_id": "e2e-model-ws",
+                "tool_ids": ["write_file"],
+                "messages": [{"role": "user", "content": "write a file"}],
+                "session_id": "new",
+                "remote_env": env_id,
+                "workspace": str(sub),
+            })
+        assert status == 200, body
+        assert body.get("success") is True, body
+        # the file landed in the forwarded session workspace on the CHILD
+        assert (sub / "ws_e2e.txt").read_text(encoding="utf-8") == "in-session-ws"
+        assert not (child_ws / "ws_e2e.txt").exists()
 
     def test_remote_infer_auto_exposes_exec_cli_for_open_child_terminal(
         self, parent, child, tmp_path
@@ -1041,6 +1387,62 @@ class TestProxyCallTimeout:
             "url": "http://10.0.0.8:7988/v1/setup",
         })
 
+    def test_call_forwards_portable_context_in_header(self):
+        """RemoteToolProxy.call ships the portable context subset as one
+        X-Agents-Request-Context header and leaves the payload pure."""
+        from runtime.common import (
+            clear_request_context, decode_forwarded_context,
+            FORWARDED_CONTEXT_HEADER, set_request_context,
+        )
+
+        proxy = RemoteToolProxy({
+            "id": "http://10.0.0.9:7988",
+            "url": "http://10.0.0.9:7988/v1/setup",
+        })
+        seen = {}
+
+        def _fake_http(url, *, method="GET", body=None, bearer=False,
+                       timeout=None, extra_headers=None):
+            seen["headers"] = extra_headers or {}
+            seen["body"] = json.loads(body.decode("utf-8"))
+            return 200, b"ok"
+
+        set_request_context(
+            workspace="/srv/ws", session_id="sess-fwd",
+            user_message_timestamp=TURN_TS, depth=1, agent_id="agent-a",
+            agent_ids=["agent-a"], all_agent_ids=["agent-a"],
+            model_id="gpt-x", available_tool_ids=["write_file"],
+            remote_tool_proxy=object(), sse_callback=lambda *a: None,
+        )
+        try:
+            with patch.object(proxy, "_http_request", _fake_http):
+                proxy.call("write_file", {"path": "a.txt", "content": "x"})
+        finally:
+            clear_request_context([
+                "workspace", "session_id", "user_message_timestamp", "depth",
+                "agent_id", "agent_ids", "all_agent_ids", "model_id",
+                "available_tool_ids", "remote_tool_proxy", "sse_callback",
+            ])
+
+        # payload stays a pure tool-call contract
+        assert seen["body"] == {
+            "tool_id": "write_file",
+            "arguments": {"path": "a.txt", "content": "x"},
+        }
+        fwd = decode_forwarded_context(seen["headers"][FORWARDED_CONTEXT_HEADER])
+        assert fwd["workspace"] == "/srv/ws"
+        assert fwd["session_id"] == "sess-fwd"
+        assert fwd["user_message_timestamp"] == TURN_TS
+        assert fwd["depth"] == 1
+        assert fwd["agent_id"] == "agent-a"
+        assert fwd["agent_ids"] == ["agent-a"]
+        assert fwd["all_agent_ids"] == ["agent-a"]
+        assert fwd["model_id"] == "gpt-x"
+        assert fwd["available_tool_ids"] == ["write_file"]
+        # host-local / parent-only keys never leak into the header
+        assert "remote_tool_proxy" not in fwd
+        assert "sse_callback" not in fwd
+
     def test_uses_tool_exec_timeout_from_request_context(self):
         """Long-running tools (exec_shell with a big timeout, remote
         delegate/talk_to) must not be cut at the fixed network timeout:
@@ -1052,7 +1454,8 @@ class TestProxyCallTimeout:
         proxy = self._proxy()
         seen = {}
 
-        def _fake_http(url, *, method="GET", body=None, bearer=False, timeout=None):
+        def _fake_http(url, *, method="GET", body=None, bearer=False, timeout=None,
+                       extra_headers=None):
             seen["timeout"] = timeout
             return 200, b"ok"
 

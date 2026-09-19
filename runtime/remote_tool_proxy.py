@@ -1,21 +1,23 @@
-"""RemoteToolProxy — 把子环境（child）的工具暴露给母环境的推理循环。
+"""RemoteToolProxy — 把远程会话的工具调用转发到子环境（child）执行。
 
-当一个会话绑定到远程环境时，该会话使用的全部工具都来自子环境：工具 ID /
-名称保持子端原样（``exec_shell``、``write_file`` …），与本地执行完全一致，
-前端紧凑显示按原名改写。远程工具**不注册进母端全局 ToolRegistry**（远程与
-本地工具从不在同一会话混用，无 ID 冲突）：每次推理请求由代理构建
-ToolConfig 条目（原名 + 转发 callable），经 ``InferenceRequest.tools`` 直传
-推理循环与子代理（group chat / talk_to / delegate）。
+简化设计：会话绑定到远程环境时，**工具清单只取母环境 registry**（模型与
+本地模式看到完全一致的 name / parameters / description）；每个选中工具挂上
+转发 callable，经 ``InferenceRequest.tools`` 直传推理循环与子代理（group
+chat / talk_to / delegate）。每次工具调用被转发到子环境的
+``POST /v1/tools/call``，按母端 tool_id 在子端执行（子端没有该工具时由子端
+返回错误，模型自行处理）。远程工具**不注册进母端全局 ToolRegistry**（包装
+发生在每次推理请求，母端 registry 原对象不被修改）。
 
-每次工具调用被转发到子环境的 ``POST /v1/tools/call``，并携带母端
-``session_id`` 与用户消息时间戳，使子端的文件 journal、终端、delegate 子会话
-都挂在同一个 session id 下。
+每次工具调用被转发到子环境的 ``POST /v1/tools/call``，并携带母端请求上下文
+中可移植的部分（``workspace`` / ``session_id`` / ``user_message_timestamp`` /
+``depth`` / ``agent_id`` / ``agent_ids`` / ``all_agent_ids`` / ``model_id`` /
+``available_tool_ids``，统一编码在 ``X-Agents-Request-Context`` header 里），
+使子端的文件 journal、终端、delegate 子会话与子代理都复现母端上下文。
 
 设计要点：
 
-* **不做工具过滤**：子环境由母环境 setup 包安装，通常保留母环境的模型、
-  工具与 AI 代理配置；skill / delegate / talk_to / exec_cli / undo / MCP
-  工具全部代理过去，由子端执行。
+* **工具清单只取母环境**：前端与模型都不再拉取子端 /v1/tools，浏览器无需
+  直连子端；子端宕机只影响个别工具调用（返回错误文本），不阻断推理请求。
 * **skill 渐进式披露**：子端 ``/v1/tools/call`` 无法执行 skill（skill 是
   披露型条目），因此 skill 条目保持 ``tool_type="skill"``，由母端推理循环
   触发披露；SKILL.md 正文通过子端 ``GET /v1/tools/skill/{tool_id}``
@@ -25,6 +27,7 @@ ToolConfig 条目（原名 + 转发 callable），经 ``InferenceRequest.tools``
 
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import logging
 import threading
@@ -116,7 +119,8 @@ class RemoteToolProxy:
     def _http_request(self, url: str, *, method: str = "GET",
                       body: Optional[bytes] = None,
                       bearer: bool = False,
-                      timeout: Optional[float] = None) -> tuple[int, bytes]:
+                      timeout: Optional[float] = None,
+                      extra_headers: Optional[dict] = None) -> tuple[int, bytes]:
         """执行一次子端 HTTP 请求，返回 (status, body_bytes)。
 
         GET 优先把 token 放进查询参数（子端 GET 授权支持 token 查询参数）；
@@ -126,7 +130,8 @@ class RemoteToolProxy:
         effective = timeout if timeout else _HTTP_TIMEOUT_SECONDS
         if self.is_tunnel:
             return self._tunnel_request(url, method=method, body=body,
-                                        bearer=bearer, timeout=effective)
+                                        bearer=bearer, timeout=effective,
+                                        extra_headers=extra_headers)
         headers = {
             "User-Agent": "agent-service-remote-proxy/1.0",
         }
@@ -134,6 +139,8 @@ class RemoteToolProxy:
             headers["Authorization"] = f"Bearer {self.token}"
         if body is not None:
             headers["Content-Type"] = "application/json"
+        if extra_headers:
+            headers.update(extra_headers)
         req = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
             with urllib.request.urlopen(req, timeout=effective) as resp:
@@ -144,7 +151,8 @@ class RemoteToolProxy:
     def _tunnel_request(self, path: str, *, method: str = "GET",
                         body: Optional[bytes] = None,
                         bearer: bool = False,
-                        timeout: Optional[float] = None) -> tuple[int, bytes]:
+                        timeout: Optional[float] = None,
+                        extra_headers: Optional[dict] = None) -> tuple[int, bytes]:
         """隧道传输：经母端 TunnelManager 把请求转发到子端本地服务。"""
         from runtime.tunnel_manager import TunnelError, TunnelOfflineError
         if self.tunnel_manager is None:
@@ -158,6 +166,8 @@ class RemoteToolProxy:
         headers = {"User-Agent": "agent-service-remote-proxy/1.0"}
         if body is not None:
             headers["Content-Type"] = "application/json"
+        if extra_headers:
+            headers.update(extra_headers)
         try:
             status, _resp_headers, payload = self.tunnel_manager.call_env(
                 self.env_id, method, path, headers, body,
@@ -297,6 +307,41 @@ class RemoteToolProxy:
             configs.append(config)
         return configs
 
+    def wrap_parent_configs(self, configs: list[ToolConfig]) -> list[ToolConfig]:
+        """把母端 ToolConfig 包装为远程执行代理条目（简化设计）。
+
+        工具清单只取母环境：name / parameters / description 保持母端原样
+        （模型与本地模式看到完全一致的清单）。非 skill 条目复制后挂上转发
+        callable（``tool_type`` 改为 ``function``，避免母端走本地
+        ``_execute_mcp_tool`` / registry callable），每次调用经
+        ``POST /v1/tools/call`` 转发到子端按母端 tool_id 执行；子端没有该
+        工具时由子端返回错误，模型自行处理。skill 条目原样返回（母端推理
+        循环触发渐进式披露，见 ``Runtime._disclose_skill``）。
+
+        母端 registry 的共享对象不被修改（每次推理请求复制一份）。
+        """
+        wrapped: list[ToolConfig] = []
+        for tc in configs:
+            if tc.tool_type == "skill":
+                wrapped.append(tc)
+                continue
+            original_type = tc.tool_type
+            w = replace(tc, tool_type="function")
+            # 标记远程代理工具：超长结果守护据此改为内联截断（子端读不到母端 /tmp）。
+            w.is_remote_proxy = True
+            # 母端原始 tool_type：MCP 工具以 function 形式转发，但 base64 前后
+            # 置处理仍由母端负责（与 list_tool_configs 一致）。
+            w.remote_child_tool_type = original_type
+            child_id = tc.tool_id
+            proxy = self
+
+            def _proxy_callable(_id=child_id, _p=proxy, **arguments) -> str:
+                return _p.call(_id, arguments)
+
+            w.callable_fn = _proxy_callable
+            wrapped.append(w)
+        return wrapped
+
     def invalidate_tools(self) -> None:
         """失效工具清单与技能正文缓存（push-update / 隧道重连后调用）。"""
         with self._lock:
@@ -364,14 +409,27 @@ class RemoteToolProxy:
     def call(self, child_tool_id: str, arguments: dict) -> str:
         """转发一次工具调用到子端 ``POST /v1/tools/call``，返回结果文本。
 
-        session_id 与 user_message_timestamp 从请求上下文读取（由
+        可移植的请求上下文（``workspace`` / ``session_id`` /
+        ``user_message_timestamp`` / ``depth`` / ``agent_id`` /
+        ``agent_ids`` / ``all_agent_ids`` / ``model_id`` /
+        ``available_tool_ids``）从母端请求上下文收集（由
         ``_prepare_infer_request`` 设置，工具 worker 线程通过上下文快照
-        继承），使子端文件 journal / 终端 / 子会话与母端会话同 id。
+        继承），经 ``X-Agents-Request-Context`` HTTP header 以 base64url
+        编码的 JSON 单值转发——它是传输层的会话上下文（与 Bearer 认证头
+        同级），不放进 ``/v1/tools/call`` 的 JSON payload（payload 保持
+        ``tool_id`` + ``arguments`` 的纯工具调用契约）。子端据此复现母端
+        请求上下文：workspace 决定 exec_shell cwd / 相对文件路径 / 终端
+        目录，session_id 决定 file journal / 终端 / delegate 子会话 id，
+        depth / agent_id / roster 决定 talk_to / delegate 行为；host 相关
+        的 session_dir 与服务器管理器由子端自行重建（见
+        :mod:`runtime.common` 的转发说明）。
         """
-        from runtime.common import get_request_context
-
-        session_id = get_request_context("session_id")
-        user_message_timestamp = get_request_context("user_message_timestamp")
+        from runtime.common import (
+            build_forwarded_context,
+            encode_forwarded_context,
+            get_request_context,
+            FORWARDED_CONTEXT_HEADER,
+        )
         # 网络层超时跟随工具级有效超时（TOOL_EXEC_TIMEOUT 基线 / 长执行标签 /
         # 参数 timeout，由母端推理循环经请求上下文传入）：长执行工具
         # （exec_shell 长超时、远程 delegate/talk_to）不会被固定 180s 砍断；
@@ -388,16 +446,19 @@ class RemoteToolProxy:
             "tool_id": child_tool_id,
             "arguments": arguments if isinstance(arguments, dict) else {},
         }
-        if session_id:
-            payload["session_id"] = session_id
-        if user_message_timestamp:
-            payload["user_message_timestamp"] = user_message_timestamp
 
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         url = self._build_url("/v1/tools/call")
+        extra_headers = None
+        forwarded = build_forwarded_context()
+        if forwarded:
+            extra_headers = {
+                FORWARDED_CONTEXT_HEADER: encode_forwarded_context(forwarded)
+            }
         status, payload_bytes = self._http_request(
             url, method="POST", body=body, bearer=bool(self.token),
             timeout=effective_timeout,
+            extra_headers=extra_headers,
         )
         if status == 200:
             return payload_bytes.decode("utf-8", errors="replace")

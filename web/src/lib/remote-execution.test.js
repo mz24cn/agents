@@ -18,7 +18,6 @@ import {
   remoteWorkspace,
   remoteSessions,
   fetchRemoteWorkspacePath,
-  fetchRemoteTools,
 } from './remote-execution.svelte.js'
 
 function mockFetch(data, status = 200) {
@@ -262,14 +261,6 @@ describe('remoteRequest / remoteWorkspace / remoteSessions', () => {
     await bindSessionToRemoteEnv('sess-1', 'http://10.0.0.5:7988')
     vi.stubGlobal('fetch', mockFetch({ env: { AGENTS_WORKSPACE: '/opt/child-ws' } }))
     await expect(fetchRemoteWorkspacePath()).resolves.toBe('/opt/child-ws')
-  })
-
-  it('fetchRemoteTools returns the child tool list', async () => {
-    vi.stubGlobal('fetch', mockFetch(ENV_RECORDS))
-    await bindSessionToRemoteEnv('sess-1', 'http://10.0.0.5:7988')
-    const tools = [{ tool_id: 'write_file', name: 'write_file', tool_type: 'function' }]
-    vi.stubGlobal('fetch', mockFetch({ tools }))
-    await expect(fetchRemoteTools()).resolves.toEqual(tools)
   })
 
   it('remoteRequest throws a readable error on a 2xx non-JSON body (never returns null)', async () => {
