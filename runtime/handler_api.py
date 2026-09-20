@@ -59,6 +59,7 @@ from runtime.server_state import (
     flight_sessions_snapshot,
     register_session_stream_with_snapshot,
     set_session_flight_mode,
+    snapshot_session_titles,
     unsubscribe_session_stream,
 )
 
@@ -1988,8 +1989,13 @@ class HandlerApiMixin:
 
         On connect:
           1. Send an `init` event containing the current snapshot of all
-             active (streaming) sessions and all unread sessions combined.
+             active (streaming) sessions and all unread sessions combined,
+             plus the canonical titles (index.json) for those sessions.
           2. Subsequently send `message` events for every status change.
+             Terminal ``done_*`` events additionally carry the session's
+             canonical ``title`` / ``title_given`` so the frontend can
+             restore the sidebar title (auto-generated or original) without
+             an extra list request.
 
         A periodic heartbeat keeps proxies from silently dropping this otherwise
         idle control stream. Write failure removes the subscriber.
@@ -2038,11 +2044,14 @@ class HandlerApiMixin:
                 event_subscriber_count, len(snapshot),
             )
 
-        # Events broadcast after the snapshot are now already queued. Send the
-        # baseline first, then drain the queue in normal order.
+        # Attach canonical titles from index.json so a newly connected client
+        # (e.g. after an SSE reconnect) can re-sync sidebar titles for the
+        # sessions in this snapshot — it may have missed the terminal events
+        # that carried their titles.
         init_payload = json.dumps({
             "event": "init",
             "sessions": snapshot,
+            "titles": snapshot_session_titles(snapshot.keys()),
             "flight_sessions": flight_sessions_snapshot(),
         }, ensure_ascii=False)
         try:

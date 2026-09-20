@@ -985,3 +985,25 @@ class SessionManager:
             )
 
         return data
+
+    def get_title_info(self, session_id: str) -> Optional[dict]:
+        """返回会话在 index.json 中的标题信息 ``{"title": ..., "title_given": ...}``。
+
+        供终态 done_* 状态广播附带权威标题：广播 done 状态时最终持久化
+        （含自动标题生成）已经完成，index 中的标题即最终标题，前端可仅凭
+        事件恢复侧边栏标题，无需再请求会话列表。
+
+        Args:
+            session_id: 会话标识符。
+
+        Returns:
+            含 ``title`` / ``title_given`` 的 dict；会话不在 index 中或无
+            标题时返回 None。
+        """
+        entry = self._read_index().get(session_id)
+        if not isinstance(entry, dict):
+            return None
+        title = str(entry.get("title") or "").strip()
+        if not title:
+            return None
+        return {"title": title, "title_given": bool(entry.get("title_given"))}

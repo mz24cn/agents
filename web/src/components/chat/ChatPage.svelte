@@ -208,7 +208,8 @@
     const aIdxRef = { value: -1, groupMode: false, groupMap: {} }
     const frameBatcher = createStreamFrameBatcher((msg) => {
       const { __streamSeq: _streamSeq, ...frame } = msg
-      onStreamMsg(frame, aIdxRef, null, keyRef)
+      // 保留流订阅的总是已有会话，wasNewSession 恒为 false。
+      onStreamMsg(frame, aIdxRef, null, false, keyRef)
     })
     const existing = sessionStore[sid]
     const existingMessages = existing?.messages || []
@@ -913,8 +914,12 @@
         reqBody.tool_ids = [...reqBody.tool_ids, 'exec_cli']
       }
     }
-    // 记录本次发送的第一条用户消息，用于新会话的临时标题
-    const pendingFirstUserMsg = !sessionId
+    // 仅当发送时还没有 sessionId 才视为新会话；本次发送的第一条用户消息
+    // 用作新会话的临时标题。已有会话绝不能通知 Sidebar"新会话创建"，
+    // 否则条目标题会被 init 帧的预览标题（当前这条用户消息）覆盖，
+    // 推理结束后也无法恢复为原标题（需要刷新页面）。
+    const wasNewSession = !sessionId
+    const pendingFirstUserMsg = wasNewSession
       ? (apiMessages.find(m => m.role === 'user')?.content || null)
       : null
 
@@ -940,8 +945,9 @@
           remoteExecution.sessionId = initData.session_id
         }
       }
-      // 通知 Sidebar 有新会话创建（仅当之前没有 sessionId 时）
-      if (!newSessionCreated.sessionId && initData.session_id) {
+      // 通知 Sidebar 有新会话创建（仅当本次请求就是新会话时；
+      // 已有会话的后续轮次不能覆盖条目标题）
+      if (wasNewSession && !newSessionCreated.sessionId && initData.session_id) {
         newSessionCreated.sessionId = initData.session_id
         newSessionCreated.firstUserMessage = pendingFirstUserMsg ?? null
         if (initData.title) {
@@ -998,7 +1004,7 @@
     // retained session stream in the meantime.
     if (sessionId) markSessionDirectlyConsumed(sessionId)
 
-    const frameBatcher = createStreamFrameBatcher((msg) => onStreamMsg(msg, aIdxRef, pendingFirstUserMsg, keyRef))
+    const frameBatcher = createStreamFrameBatcher((msg) => onStreamMsg(msg, aIdxRef, pendingFirstUserMsg, wasNewSession, keyRef))
     inferStream(
       reqBody,
       (msg, eventName) => frameBatcher.push(eventName === 'usage'
@@ -1080,7 +1086,7 @@
     }
   }
 
-  function onStreamMsg(msg, aIdxRef, pendingFirstUserMsg, keyRef) {
+  function onStreamMsg(msg, aIdxRef, pendingFirstUserMsg, wasNewSession = false, keyRef) {
     streamUiDebug('apply_begin', {
       storeKey: keyRef.key,
       role: msg?.role,
@@ -1096,8 +1102,9 @@
       keyRef.key = migrateSessionStoreKey(keyRef.key, msg.session_id)
       sessionId = msg.session_id
       currentSession.sessionId = msg.session_id
-      // 通知 Sidebar 有新会话创建（仅当之前没有 sessionId 时才视为新会话）
-      if (!newSessionCreated.sessionId) {
+      // 通知 Sidebar 有新会话创建（仅当本次请求就是新会话时；
+      // 已有会话的后续轮次不能覆盖条目标题）
+      if (wasNewSession && !newSessionCreated.sessionId) {
         newSessionCreated.sessionId = msg.session_id
         newSessionCreated.firstUserMessage = pendingFirstUserMsg ?? null
       }

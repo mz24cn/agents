@@ -890,8 +890,41 @@ _unread_sessions: dict[str, str] = {}
 # List of subscriber callbacks for session-event SSE connections.
 # Each entry is a callable(data: dict) -> bool; returns False if write failed (caller removes).
 _session_event_subscribers: list = []
+# Optional callback (registered by runtime/server.py once the SessionManager is
+# ready): session_id -> {"title": ..., "title_given": ...} | None.
+# Terminal done_* status events use it to attach the canonical title from
+# index.json. By the time a done status is broadcast, final persistence
+# (including any auto title generation) has already completed, so the index
+# title is the final title and clients can restore the sidebar title from the
+# event alone — no extra list request needed.
+_session_title_provider: Optional[Callable[[str], Optional[dict]]] = None
 # Lock protecting all the above shared state.
 _session_state_lock = threading.Lock()
+
+
+def set_session_title_provider(provider: Optional[Callable[[str], Optional[dict]]]) -> None:
+    """Register the callback used to attach canonical session titles to SSE events."""
+    global _session_title_provider
+    _session_title_provider = provider
+
+
+def snapshot_session_titles(session_ids) -> dict:
+    """Return ``{sid: {"title": ..., "title_given": ...}}`` for the given sessions.
+
+    Only sessions present in the index with a non-empty title are returned.
+    Returns an empty dict when no provider is registered yet.
+    """
+    titles: dict = {}
+    if _session_title_provider is None:
+        return titles
+    for sid in session_ids:
+        try:
+            info = _session_title_provider(sid)
+        except Exception:
+            info = None
+        if isinstance(info, dict) and str(info.get("title") or ""):
+            titles[sid] = {"title": str(info["title"]), "title_given": bool(info.get("title_given"))}
+    return titles
 
 # Per-session inference message broker. Frames are retained for the lifetime of
 # the inference and fanned out to every browser that has opened the session.
@@ -1484,8 +1517,20 @@ def _broadcast_session_status(session_id: str, status: str) -> None:
     Called with _session_state_lock held (or outside if safe).  Here we
     iterate a *snapshot* of the subscriber list so we can safely remove
     dead entries without holding the lock during I/O.
+
+    Terminal ``done_*`` events additionally carry the canonical title
+    (``title`` / ``title_given``) from index.json.  Persistence (including
+    any auto title generation) has already completed before these statuses
+    are broadcast, so the frontend can restore the sidebar title directly
+    from the event.
     """
-    _broadcast_session_event(session_id, "message", {"status": status})
+    data = {"status": status}
+    if status in ("done_success_unread", "done_error_unread"):
+        info = snapshot_session_titles([session_id]).get(session_id)
+        if info is not None:
+            data["title"] = info["title"]
+            data["title_given"] = info["title_given"]
+    _broadcast_session_event(session_id, "message", data)
 
 
 def _broadcast_session_event(session_id: str, event_type: str, data: dict) -> None:

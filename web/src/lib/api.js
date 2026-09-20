@@ -520,8 +520,11 @@ export function subscribeSessionStream(sessionId, onMessage, onDone, onError, on
  * Subscribe to session status events via SSE (GET /v1/sessions/events).
  *
  * @param {function} onEvent  Called with each parsed event object:
- *   - init:         { event: 'init', sessions: { <sid>: <status>, ... } }
+ *   - init:         { event: 'init', sessions: { <sid>: <status>, ... },
+ *                     titles: { <sid>: { title, title_given }, ... } }
  *   - message:      { event: 'message', session_id: '<sid>', status: '<status>' }
+ *                  (terminal done_* events also carry the canonical
+ *                   title: '<title>' and title_given: <boolean>)
  *   - title_update: { event: 'title_update', session_id: '<sid>', title: '<title>' }
  * @param {function} onError  Called on fetch or stream errors (except AbortError).
  * @returns {function}        Call to close/abort the SSE connection.

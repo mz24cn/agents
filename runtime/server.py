@@ -118,6 +118,7 @@ from runtime.server_state import (
     merge_stream_messages,
     persist_conversation,
     register_terminal_session,
+    set_session_title_provider,
     unregister_terminal_session,
     stream_batch_is_protocol_complete,
 )
@@ -607,6 +608,10 @@ class RuntimeHTTPServer:
             broadcast_fn=_broadcast_session_event,
             model_registry=self._runtime._model_registry,
         )
+        # 注册标题提供者：终态 done_* 状态事件（及 SSE init 快照）附带
+        # index.json 中的权威标题，前端可直接凭事件恢复侧边栏标题，
+        # 避免临时用户消息标题一直留存到刷新页面。
+        set_session_title_provider(self._session_manager.get_title_info)
         # 恢复持久化的飞行模式设定：重启后老的飞行模式会话继续对话时
         # 仍保持飞行模式（无浏览器连接也允许推理继续）。
         load_flight_sessions(self._session_manager.flight_sessions())

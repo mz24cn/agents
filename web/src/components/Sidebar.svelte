@@ -96,6 +96,30 @@
     }
   }
 
+  // 经 SSE 收到的权威标题（title_update / 终态 done_* 事件 / init 快照）。
+  // 应用整表列表响应时与请求发起时间比较，防止陈旧响应（在标题生成完成
+  // 前取数）覆盖更新的 SSE 标题，让临时用户消息标题残留到刷新页面。
+  // sid -> { title, titleGiven: boolean|null, at: number }
+  let sseTitles = {}
+
+  function applySseTitle(sid, title, titleGiven) {
+    if (!sid || !title) return
+    sseTitles[sid] = {
+      title,
+      titleGiven: typeof titleGiven === 'boolean' ? titleGiven : null,
+      at: Date.now(),
+    }
+    sessionList = sessionList.map(s =>
+      s.session_id === sid
+        ? {
+            ...s,
+            title,
+            title_given: typeof titleGiven === 'boolean' ? titleGiven : s.title_given,
+          }
+        : s
+    )
+  }
+
   let _unsubscribeSessionEvents = null
 
   onMount(() => {
@@ -105,31 +129,29 @@
         if (data.event === 'init') {
           // Merge all statuses from init snapshot
           const sids = data.sessions || {}
+          const titles = data.titles || {}
           flightSessions = new Set(data.flight_sessions || [])
           for (const [sid, status] of Object.entries(sids)) {
             _applyStatusToSessionList(sid, status)
+            // init 快照附带权威标题：重连后补回那些错过了终态事件的
+            // 会话的侧边栏标题。
+            const info = titles[sid]
+            if (info && info.title) applySseTitle(sid, info.title, info.title_given)
           }
         } else if (data.event === 'message') {
           _applyStatusToSessionList(data.session_id, data.status)
+          // 终态事件携带后端权威标题（AI 生成或原始标题）：推理结束后
+          // 恢复侧边栏条目的标题，避免临时用户消息标题残留到刷新页面。
+          if (data.title && typeof data.status === 'string' && data.status.startsWith('done_')) {
+            applySseTitle(data.session_id, data.title, data.title_given)
+          }
         } else if (data.event === 'flight_mode') {
           const next = new Set(flightSessions)
           if (data.enabled) next.add(data.session_id)
           else next.delete(data.session_id)
           flightSessions = next
         } else if (data.event === 'title_update') {
-          const sid = data.session_id
-          const newTitle = data.title
-          if (sid && newTitle) {
-            sessionList = sessionList.map(s =>
-              s.session_id === sid
-                ? {
-                    ...s,
-                    title: newTitle,
-                    title_given: typeof data.title_given === 'boolean' ? data.title_given : s.title_given,
-                  }
-                : s
-            )
-          }
+          applySseTitle(data.session_id, data.title, data.title_given)
         }
       },
       (_err) => {
@@ -172,6 +194,10 @@
     if (append && (!sessionHasMore || sessionLoading || sessionLoadingMore)) return
 
     const requestToken = ++sessionLoadToken
+    // 请求发起时刻：用于与 SSE 标题的接收时间比较——若请求期间收到更新的
+    // SSE 标题（title_update / 终态 done 事件），说明响应可能在标题生成
+    // 完成前取数，属于陈旧数据。
+    const requestedAt = Date.now()
     const requestedCategory = directoryOpen ? selectedCategory : ''
     const requestedSearch = activeSearchQuery
     const nextPage = append ? sessionPage + 1 : 1
@@ -193,12 +219,22 @@
       // status. Preserve the SSE snapshot/events that may have arrived while
       // this request was in flight; otherwise replacing sessionList briefly or
       // permanently drops the streaming style.
-      const incoming = (data.sessions ?? []).map(entry => ({
-        ...entry,
-        _status: sessionStatuses[entry.session_id]
-          || sessionList.find(current => current.session_id === entry.session_id)?._status
-          || entry._status,
-      }))
+      const incoming = (data.sessions ?? []).map(entry => {
+        // 请求发起后经 SSE 收到更新的标题时优先使用它，避免陈旧响应
+        // 把已恢复的权威标题覆盖回临时用户消息标题。
+        const live = sseTitles[entry.session_id]
+        const liveFresh = live && live.at > requestedAt
+        return {
+          ...entry,
+          title: liveFresh ? live.title : entry.title,
+          title_given: liveFresh && live.titleGiven !== null
+            ? live.titleGiven
+            : entry.title_given,
+          _status: sessionStatuses[entry.session_id]
+            || sessionList.find(current => current.session_id === entry.session_id)?._status
+            || entry._status,
+        }
+      })
       if (append) {
         sessionList = mergeSessionLists(sessionList, incoming)
       } else {
