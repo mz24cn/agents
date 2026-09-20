@@ -3,7 +3,7 @@
  * Validates: Requirements 6.1–6.6, 4.1, 5.5, 5.6
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { env, sessions, subscribeSessionStream, remoteEnv, buildSetupRequestUrl, extractSetupSnapshot, fetchRemoteJson, remoteEnvHomeUrl, isRemoteLogoImage, resolveRemoteEnvLogo } from './api.js'
+import { env, sessions, subscribeSessionStream, remoteEnv, buildSetupRequestUrl, extractSetupSnapshot, fetchRemoteJson, remoteEnvHomeUrl, isRemoteLogoImage, resolveRemoteEnvLogo, tools } from './api.js'
 
 // ---------------------------------------------------------------------------
 // Helper: create a mock fetch that returns the given data with the given status

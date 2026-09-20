@@ -1,16 +1,24 @@
 <script>
   import { t } from '../../lib/i18n.svelte.js'
   import { highlight } from '../../lib/highlight.js'
-  let { tool, onClose } = $props()
+  let { tool, onClose, onTestCall = null } = $props()
 
   let parametersJson = $derived(JSON.stringify(tool.parameters, null, 2))
   let parametersHighlighted = $derived(highlight(parametersJson, 'json'))
+  // 调用测试入口放在详情面板头部（关闭按钮之前）：必须先看过工具详情才能发起调用。
+  // skill 工具只是把 SKILL.md 读入上下文、没有真实调用，不显示入口。
+  let canTestCall = $derived(tool.tool_type === 'function' || tool.tool_type === 'mcp')
 </script>
 
 <div class="tool-detail">
   <div class="detail-header">
     <h3>{t('toolDetail')}</h3>
-    <button class="btn btn-close" onclick={onClose}>{t('close')}</button>
+    <div class="header-actions">
+      {#if canTestCall && onTestCall}
+        <button class="btn btn-test" onclick={() => onTestCall(tool)}>{t('toolTestButton')}</button>
+      {/if}
+      <button class="btn btn-close" onclick={onClose}>{t('close')}</button>
+    </div>
   </div>
 
   <div class="detail-body">
@@ -56,6 +64,9 @@
   .tool-detail { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 24px; margin-bottom: 20px; }
   .detail-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
   h3 { margin: 0; color: var(--text); }
+  .header-actions { display: flex; align-items: center; gap: 8px; }
+  .btn-test { padding: 6px 16px; border-radius: 6px; border: none; background: var(--primary, #4a9eff); color: #fff; cursor: pointer; font-size: 0.85rem; }
+  .btn-test:hover { opacity: 0.85; }
   .btn-close { padding: 6px 16px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg-secondary); color: var(--text); cursor: pointer; font-size: 0.85rem; }
   .btn-close:hover { opacity: 0.8; }
   .badge-builtin { display: inline-block; font-size: 0.7rem; padding: 1px 6px; border-radius: 4px; font-weight: 700; background: #16a34a22; color: #16a34a; margin-left: 6px; }

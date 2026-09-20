@@ -649,6 +649,17 @@ const translations = {
     deleteMcpServerTitle: '删除整个 MCP Server 及其所有工具',
     confirmDeleteMcpServer: '确定要删除 MCP Server「{label}」的全部 {count} 个工具吗？',
     confirmDeleteTool: '确定要删除工具「{id}」吗？',
+    toolTestButton: '测试',
+    toolTestTitle: '工具调用测试',
+    toolTestArgs: '调用参数',
+    toolTestSubmit: '发起调用',
+    toolTestRunning: '调用中…',
+    toolTestSuccess: '调用成功',
+    toolTestFailed: '调用失败',
+    toolTestMcpRoute: 'MCP 路由',
+    toolTestWorkspaceHint: '测试调用在服务器默认工作区执行，不携带会话上下文',
+    toolTestBase64Auto: 'base64 自动编码/解码',
+    toolTestBase64AutoHint: '勾选后与大模型调用工具行为一致：base64 参数可填文件路径（自动读取并编码）；结果中的长 base64 自动存为本地文件并替换成路径',
   },
 
   en: {

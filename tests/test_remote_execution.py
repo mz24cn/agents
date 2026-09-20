@@ -233,6 +233,16 @@ class TestForwardedContextCodec:
         raw = encode_forwarded_context({"session_id": "s", "sse_callback": "x"})
         assert decode_forwarded_context(raw) == {"session_id": "s"}
 
+    def test_base64_auto_flag_round_trips(self):
+        # The web tool-call test page sends {"base64":"auto"} in the header
+        # to opt into inference-loop base64 marshalling; the key must
+        # survive the allow-list filter.
+        from runtime.common import (
+            encode_forwarded_context, decode_forwarded_context,
+        )
+        raw = encode_forwarded_context({"base64": "auto"})
+        assert decode_forwarded_context(raw) == {"base64": "auto"}
+
     def test_malformed_header_is_tolerated(self):
         from runtime.common import decode_forwarded_context
         assert decode_forwarded_context(None) == {}

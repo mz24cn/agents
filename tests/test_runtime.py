@@ -2093,3 +2093,202 @@ def test_remote_proxy_non_mcp_tool_leaves_base64_untouched(tmp_path):
 
     assert seen["base64_content"] == str(f)
     assert out == payload
+
+
+def test_call_tool_base64_auto_marshals_like_inference_loop(tmp_path):
+    """call_tool(base64_auto=True) -- the web tool-call test page's
+    X-Agents-Request-Context {"base64":"auto"} opt-in -- applies the same
+    base64 pre/post processing as the inference loop, while the default
+    stays raw."""
+    import base64
+    import re
+    f = tmp_path / "shot.png"
+    f.write_bytes(b"\x89PNG" + b"y" * 2000)
+    payload = base64.b64encode(b"z" * 2000).decode()
+    seen = {}
+
+    def _proxy(**arguments):
+        seen.update(arguments)
+        return payload
+
+    config = _remote_proxy_config("mcp", _proxy)
+    registry = ToolRegistry()
+    registry.register(config)
+    runtime = Runtime(model_registry=ModelRegistry(), tool_registry=registry)
+
+    os.environ["BASE64_CHECK_THRESHOLD"] = "1024"
+    try:
+        # Default: raw executor -- path in, base64 out.
+        out = runtime.call_tool("mcp_remote", {"base64_content": str(f)})
+        assert seen["base64_content"] == str(f)
+        assert out == payload
+        # Opt-in: path -> base64 into the tool, long base64 result ->
+        # saved file path out.
+        out = runtime.call_tool(
+            "mcp_remote", {"base64_content": str(f)}, base64_auto=True)
+    finally:
+        del os.environ["BASE64_CHECK_THRESHOLD"]
+
+    assert base64.b64decode(seen["base64_content"]) == f.read_bytes()
+    m = re.search(r'"filePath":\s*"([^"]+)"', out)
+    assert m, out
+    assert open(m.group(1), "rb").read() == b"z" * 2000
+
+
+# ---------------------------------------------------------------------------
+# Batch tool-call round (model loop): MCP base64 marshalling must survive
+# both batch code paths, which the single-call _execute_tool_call tests above
+# do not exercise.
+# ---------------------------------------------------------------------------
+
+
+def _plain_function_config(name):
+    from runtime.models import ToolConfig
+    return ToolConfig(
+        tool_id=name,
+        tool_type="function",
+        name=name,
+        description=name,
+        parameters={
+            "type": "object",
+            "properties": {"base64_content": {"type": "string"}},
+        },
+    )
+
+
+def _named_remote_proxy_config(name, child_type, proxy_callable):
+    """A remote proxy entry with a distinct tool name (``_remote_proxy_config``
+    hard-codes ``mcp_remote``, which collides when several share a batch)."""
+    config = _remote_proxy_config(child_type, proxy_callable)
+    config.tool_id = name
+    config.name = name
+    return config
+
+
+def test_function_batch_round_marshals_child_mcp_base64(monkeypatch, tmp_path):
+    """The all-function (parallel) batch path keeps parent-side base64
+    marshalling for a remote child MCP tool.
+
+    This path splits work the single-call tests cover in one place:
+    ``_prepare_tool_call`` runs the base64 *pre*-processing on the scheduling
+    thread, and ``_execute_function_tool_calls._finalize`` runs the long-result
+    interception on the worker-completion path.  Neither is asserted anywhere
+    else.  A neighbouring remote *function* tool (and a plain function tool)
+    in the same batch must stay raw -- the gate is per-call, not per-batch.
+    """
+    import base64
+    import json
+    import re
+
+    monkeypatch.setenv("BASE64_CHECK_THRESHOLD", "1024")
+
+    src = tmp_path / "shot.bin"
+    src.write_bytes(b"\x89PNG" + b"batch" * 400)
+    payload = base64.b64encode(b"\x89PNG" + b"m" * 2000).decode()
+
+    mcp_seen = {}
+
+    def _mcp_proxy(**arguments):
+        mcp_seen.update(arguments)
+        return f'{{"screenshot": "{payload}"}}'
+
+    fn_seen = {}
+
+    def _fn_proxy(**arguments):
+        fn_seen.update(arguments)
+        return payload
+
+    mcp_config = _named_remote_proxy_config("remote_mcp", "mcp", _mcp_proxy)
+    fn_config = _named_remote_proxy_config("remote_fn", "function", _fn_proxy)
+    plain_config = _plain_function_config("plain_ok")
+
+    registry = ToolRegistry()
+    registry.register(plain_config, callable_fn=lambda: "plain-result")
+    runtime = Runtime(model_registry=ModelRegistry(), tool_registry=registry)
+
+    messages = list(runtime._execute_tool_call_round(
+        [
+            {"id": "call-mcp", "name": "remote_mcp",
+             "arguments": json.dumps({"base64_content": str(src)})},
+            {"id": "call-fn", "name": "remote_fn",
+             "arguments": json.dumps({"base64_content": str(src)})},
+            {"id": "call-plain", "name": "plain_ok", "arguments": "{}"},
+        ],
+        [mcp_config, fn_config, plain_config],
+        timestamp=False,
+    ))
+
+    assert [message.tool_use_id for message in messages] == [
+        "call-mcp", "call-fn", "call-plain",
+    ]
+
+    # Child MCP tool: the path was read on the parent before dispatch...
+    assert "base64_content" in mcp_seen, mcp_seen
+    assert base64.b64decode(mcp_seen["base64_content"]) == src.read_bytes()
+    # ...and the long base64 result was saved and replaced with a parent path.
+    assert payload not in messages[0].content
+    match = re.search(r'"filePath":\s*"([^"]+)"', messages[0].content)
+    assert match, messages[0].content
+    assert open(match.group(1), "rb").read() == b"\x89PNG" + b"m" * 2000
+
+    # Child function tool: no marshalling on either side of the call.
+    assert fn_seen["base64_content"] == str(src)
+    assert messages[1].content == payload
+
+    # Unrelated function tool in the same batch is untouched.
+    assert messages[2].content == "plain-result"
+
+
+def test_mixed_batch_keeps_declaration_order_and_marshals_local_mcp(
+    monkeypatch, tmp_path,
+):
+    """A batch holding a non-function (MCP) call is not parallelized: the
+    declaration-order fallback dispatches each call through
+    ``_execute_tool_call``, which must still marshal base64 for the MCP entry
+    while leaving its function neighbour raw -- and emit results in the
+    declared order regardless of which entry is the MCP one."""
+    import base64
+    import json
+    import re
+
+    monkeypatch.setenv("BASE64_CHECK_THRESHOLD", "1024")
+
+    src = tmp_path / "pic.bin"
+    src.write_bytes(b"\x89PNGlocal-mcp")
+    payload = base64.b64encode(b"\x89PNG" + b"z" * 2000).decode()
+
+    runtime, mgr = _runtime_with_mcp(f'{{"screenshot": "{payload}"}}')
+
+    echo_seen = {}
+
+    def _echo(**arguments):
+        echo_seen.update(arguments)
+        return payload
+
+    echo_config = _plain_function_config("echo_raw")
+    runtime._tool_registry.register(echo_config, callable_fn=_echo)
+    mcp_config = runtime._tool_registry.get("mcp_shot")
+
+    messages = list(runtime._execute_tool_call_round(
+        [
+            {"id": "call-echo", "name": "echo_raw",
+             "arguments": json.dumps({"base64_content": str(src)})},
+            {"id": "call-mcp", "name": "mcp_shot",
+             "arguments": json.dumps({"base64_content": str(src)})},
+        ],
+        [echo_config, mcp_config],
+        timestamp=False,
+    ))
+
+    assert [message.tool_use_id for message in messages] == ["call-echo", "call-mcp"]
+
+    # Function neighbour first, in declaration order, raw on both sides.
+    assert echo_seen["base64_content"] == str(src)
+    assert messages[0].content == payload
+
+    # Local MCP tool second: path in, long base64 replaced by a local path.
+    assert base64.b64decode(mgr.received["arguments"]["base64_content"]) == src.read_bytes()
+    assert payload not in messages[1].content
+    match = re.search(r'"filePath":\s*"([^"]+)"', messages[1].content)
+    assert match, messages[1].content
+    assert open(match.group(1), "rb").read() == b"\x89PNG" + b"z" * 2000

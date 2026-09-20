@@ -734,6 +734,13 @@ def restore_request_context(ctx: dict) -> None:
 #    ``available_tool_ids``               child rebuilds ``tool_scope`` from
 #                                         these (delegate / talk_to resolve
 #                                         sub-tools against the child registry)
+#    ``base64``                           "auto": the receiver applies the
+#                                         inference-loop base64 marshalling
+#                                         around the call (path-like base64
+#                                         arguments are read + encoded, long
+#                                         base64 results are saved to a local
+#                                         file and replaced by the path) --
+#                                         sent by the web tool-call test
 #
 # 2. **Recomputed on the child** - host-specific paths derived from
 #    ``session_id`` against the child's own ContextManager; never forwarded:
@@ -767,6 +774,7 @@ FORWARDED_CONTEXT_KEYS = (
     "all_agent_ids",
     "model_id",
     "available_tool_ids",
+    "base64",
 )
 
 

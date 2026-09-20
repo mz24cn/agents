@@ -1,7 +1,7 @@
 <script>
   import { highlight } from '../lib/highlight.js'
 
-  let { value = $bindable(''), rows = 8, placeholder = '', id = '', disabled = false } = $props()
+  let { value = $bindable(''), rows = 8, placeholder = '', id = '', disabled = false, autoResize = false, maxHeightVh = 40 } = $props()
 
   let textareaEl = $state(null)
   let scrollTop = $state(0)
@@ -19,6 +19,23 @@
     scrollTop = e.target.scrollTop
     scrollLeft = e.target.scrollLeft
   }
+
+  // Auto-grow the textarea with its content, capped at maxHeightVh of the viewport.
+  // Measure with height 1px: a textarea with `height: auto` sticks to its `rows`
+  // attribute, so scrollHeight would never report content shorter than that.
+  function fitHeight() {
+    const el = textareaEl
+    if (!el) return
+    el.style.height = '1px'
+    const cap = Math.floor(window.innerHeight * maxHeightVh / 100)
+    el.style.height = Math.min(el.scrollHeight, cap) + 'px'
+  }
+
+  $effect(() => {
+    if (!autoResize) return
+    value // reactive dependency: re-fit whenever content changes
+    fitHeight()
+  })
 </script>
 
 <div class="json-editor" class:valid={isValid === true} class:invalid={isValid === false}>
@@ -32,6 +49,7 @@
     {disabled}
     {placeholder}
     {rows}
+    class:autosized={autoResize}
     bind:value
     bind:this={textareaEl}
     onscroll={onScroll}

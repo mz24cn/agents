@@ -74,5 +74,14 @@ export default defineConfig({
   test: {
     environment: 'node',
     globals: false,
+    alias: [
+      // Svelte 5 publishes `browser` / `default(server)` entries; Vitest's
+      // node-side resolver picks the server build, where mount()/unmount()
+      // throw `lifecycle_function_unavailable`.  Component tests (jsdom)
+      // need the client runtime, so resolve the bare specifier to the file
+      // directly -- exact match only, to leave deep `svelte/internal/*`
+      // imports alone (a package-less path escapes the `exports` map).
+      { find: /^svelte$/, replacement: resolve(__dirname, 'node_modules/svelte/src/index-client.js') },
+    ],
   }
 })

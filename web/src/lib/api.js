@@ -133,6 +133,21 @@ export const models = {
   delete: (modelId)           => request('DELETE', `/v1/models/${modelId}`),
 }
 
+/**
+ * JSON -> base64url header value for the transport-layer request context.
+ *
+ * Padding is kept on purpose: the Python side decodes this header with
+ * ``base64.urlsafe_b64decode``, which rejects an unpadded value with
+ * "Incorrect padding" (verified against runtime/common.py
+ * ``decode_forwarded_context``).
+ */
+function base64UrlEncodeJson(value) {
+  const bytes = new TextEncoder().encode(JSON.stringify(value))
+  let binary = ''
+  for (const byte of bytes) binary += String.fromCharCode(byte)
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_')
+}
+
 /** Tool CRUD helpers. */
 export const tools = {
   list:        (from_disk = false)    => request('GET',    '/v1/tools' + (from_disk ? '?from_disk=true' : '')),
@@ -143,6 +158,33 @@ export const tools = {
   update:      (toolId, config)    => request('PUT',    `/v1/tools/${toolId}`, config),
   delete:      (toolId)            => request('DELETE', `/v1/tools/${toolId}`),
   batchDelete: (toolIds)           => request('DELETE', '/v1/tools/batch', { tool_ids: toolIds }),
+  /**
+   * Direct tool call test (POST /v1/tools/call).
+   * Unlike the other helpers: on success the backend returns the raw result
+   * text (default format=text/plain), not JSON, so this cannot reuse
+   * request() (which forces JSON parsing).
+   * @param {string} toolId  tool id
+   * @param {object} args    argument object
+   * @param {{base64Auto?: boolean}} [options]  when base64Auto, send the
+   *   X-Agents-Request-Context header ({"base64":"auto"} base64url-encoded)
+   *   so the server applies the same base64 marshalling as model tool calls:
+   *   path-like base64 arguments are read & encoded, long base64 results are
+   *   saved to a server-local file and replaced by its path.
+   * @returns {Promise<string>} raw tool result text
+   */
+  async call(toolId, args, { base64Auto = false } = {}) {
+    const headers = { 'Content-Type': 'application/json' }
+    if (base64Auto) {
+      headers['X-Agents-Request-Context'] = base64UrlEncodeJson({ base64: 'auto' })
+    }
+    const res = await apiFetch('/v1/tools/call', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ tool_id: toolId, arguments: args ?? {} }),
+    })
+    if (res.ok) return res.text()
+    throwResponseError(res, await readJsonMaybe(res))
+  },
 }
 
 /** MCP server helpers. */

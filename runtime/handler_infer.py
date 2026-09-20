@@ -1381,6 +1381,10 @@ class HandlerInferMixin:
         # only the tool call itself (tool_id + arguments).
         fwd = decode_forwarded_context(self.headers.get(FORWARDED_CONTEXT_HEADER))
 
+        # "base64": "auto" -- direct callers (web tool-call test) opt into
+        # the inference-loop base64 pre/post processing around the call.
+        base64_auto = fwd.get("base64") == "auto"
+
         # Workspace: pin only when the directory exists on *this* host. A
         # stale parent-side path (or a temporarily unreachable child) falls
         # back to the child default workspace instead of failing Popen / writes.
@@ -1444,13 +1448,13 @@ class HandlerInferMixin:
                     available_tool_ids=fwd.get("available_tool_ids"),
                 )
                 try:
-                    result = runtime.call_tool(tool_id, arguments)
+                    result = runtime.call_tool(tool_id, arguments, base64_auto=base64_auto)
                 finally:
                     # 与推理路径一致：响应前先 finalize 本轮文件 journal
                     self._finalize_file_journal()
                     clear_request_context(session_keys)
             else:
-                result = runtime.call_tool(tool_id, arguments)
+                result = runtime.call_tool(tool_id, arguments, base64_auto=base64_auto)
         finally:
             if workspace_applied:
                 clear_request_context(["workspace"])

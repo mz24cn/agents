@@ -5,7 +5,7 @@
   import ConfirmDialog from '../ConfirmDialog.svelte'
   import { t } from '../../lib/i18n.svelte.js'
 
-  let { onEdit = null, onEditMcpTool = null, sortByTimeDesc = false } = $props()
+  let { onEdit = null, onEditMcpTool = null, onTestCall = null, sortByTimeDesc = false } = $props()
 
   let toolList = $derived.by(() => {
     const items = [...catalog.tools.items]
@@ -144,7 +144,7 @@
 
   <div class="page-content">
     {#if detailTool}
-      <ToolDetail tool={detailTool} onClose={handleCloseDetail} />
+      <ToolDetail tool={detailTool} onClose={handleCloseDetail} onTestCall={onTestCall} />
     {/if}
 
     {#if loading}

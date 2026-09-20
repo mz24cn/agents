@@ -12,6 +12,7 @@
   import ModelForm from '../models/ModelForm.svelte'
   import ToolForm from '../tools/ToolForm.svelte'
   import McpToolForm from '../tools/McpToolForm.svelte'
+  import ToolCallTestPage from '../tools/ToolCallTestPage.svelte'
   import PromptForm from '../prompts/PromptForm.svelte'
   import AgentForm from '../agents/AgentForm.svelte'
   import { mcpServers } from '../../lib/api.js'
@@ -53,6 +54,7 @@
   let editingModel = $state(null)
   let editingTool = $state(null)
   let editingMcpTool = $state(null)
+  let testingTool = $state(null)
   let editingPrompt = $state(null)
   let editingAgent = $state(null)
 
@@ -106,6 +108,7 @@
     editingTool = null
     editingPrompt = null
     editingAgent = null
+    testingTool = null
   }
 
   $effect(() => {
@@ -214,7 +217,7 @@
 
   function handleFormCancel() {
     if (activeTab === 'model-add' || activeTab === 'model-edit') activeTab = 'models'
-    else if (activeTab === 'tool-add' || activeTab === 'tool-edit' || activeTab === 'mcp-tool-edit') activeTab = 'tools'
+    else if (activeTab === 'tool-add' || activeTab === 'tool-edit' || activeTab === 'mcp-tool-edit' || activeTab === 'tool-test') activeTab = 'tools'
     else if (activeTab === 'prompt-add' || activeTab === 'prompt-edit') activeTab = 'prompts'
     else if (activeTab === 'agent-add' || activeTab === 'agent-edit') activeTab = 'agents'
     editingModel = null
@@ -222,6 +225,7 @@
     editingMcpTool = null
     editingPrompt = null
     editingAgent = null
+    testingTool = null
   }
 
   function handleEditModel(model) {
@@ -258,6 +262,11 @@
   function handleEditMcpTool(tool) {
     editingMcpTool = tool
     activeTab = 'mcp-tool-edit'
+  }
+
+  function handleTestTool(tool) {
+    testingTool = tool
+    activeTab = 'tool-test'
   }
 
   function handleEditPrompt(prompt) {
@@ -348,7 +357,7 @@
         <ModelForm model={editingModel} onSuccess={handleModelFormSuccess} onCancel={handleFormCancel} />
       </div>
     {:else if activeTab === 'tools'}
-      <ToolsPage onEdit={handleEditTool} onEditMcpTool={handleEditMcpTool} sortByTimeDesc={sortByTimeDesc} />
+      <ToolsPage onEdit={handleEditTool} onEditMcpTool={handleEditMcpTool} onTestCall={handleTestTool} sortByTimeDesc={sortByTimeDesc} />
     {:else if activeTab === 'tool-add'}
       <div class="form-wrapper">
         <ToolForm onSuccess={handleToolFormSuccess} onCancel={handleFormCancel} />
@@ -361,6 +370,14 @@
       <div class="form-wrapper">
         <McpToolForm tool={editingMcpTool} onSuccess={handleToolFormSuccess} onCancel={handleFormCancel} />
       </div>
+    {:else if activeTab === 'tool-test'}
+      {#if testingTool}
+        <div class="form-wrapper">
+          <ToolCallTestPage tool={testingTool} onCancel={handleFormCancel} />
+        </div>
+      {:else}
+        <ToolsPage onEdit={handleEditTool} onEditMcpTool={handleEditMcpTool} onTestCall={handleTestTool} sortByTimeDesc={sortByTimeDesc} />
+      {/if}
     {:else if activeTab === 'prompts'}
       <PromptsPage onEdit={handleEditPrompt} onCopy={handleCopyPrompt} sortByTimeDesc={sortByTimeDesc} />
     {:else if activeTab === 'prompt-add'}
