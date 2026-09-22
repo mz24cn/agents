@@ -70,6 +70,161 @@ logger = logging.getLogger(__name__)
 _model = None
 _model_lock = threading.Lock()
 
+
+# ---------------------------------------------------------------------------
+# 请求体大小限制（MCP SDK >= 2.0 默认 4 MiB，对 base64 图片太小）
+# ---------------------------------------------------------------------------
+# FastMCP 4.x 依赖的 mcp SDK >= 2.0 内置 RequestBodyLimitMiddleware：请求体
+# 超过上限（默认 4 MiB）时直接回 413，但 *不读完* 剩余请求体 —— uvicorn
+# 随后带着未读数据关闭 socket（TCP RST），客户端永远看不到 413，只能收到
+# "[Errno 104] Connection reset by peer"，与服务端日志的
+# "413 Content Too Large" 对不上。这里做两件事：
+#   1. 把 SDK 的上限提到 OCR_MAX_REQUEST_BODY_SIZE（base64 图片动辄 5-20MB）；
+#   2. 外套一层 drain 中间件：声明大小超限时先读完整请求体再回 413，
+#      保证客户端收到干净的 413 响应而不是 TCP reset。
+# 默认 32 MiB：1080p+ JPEG 约 1-3 MB，base64 膨胀 ~33%，留足余量又不放任
+# 数百 MB 的上传。
+DEFAULT_OCR_MAX_REQUEST_BODY_SIZE = 32 * 1024 * 1024
+
+# drain 时最多缓冲这么多字节；超过视为病态请求，不再 drain 直接 413
+# （那种情况下连接可能被 reset，可以接受）。
+DRAIN_CEILING = 64 * 1024 * 1024
+
+
+def parse_body_limit(raw, default):
+    """解析 OCR_MAX_REQUEST_BODY_SIZE：纯字节数，或带 K/M 后缀。
+
+    <=0 表示完全禁用限制（中间件变为直通）。
+    """
+    if raw is None or str(raw).strip() == "":
+        return default
+    s = str(raw).strip().upper()
+    mult = 1
+    if s.endswith("M"):
+        mult, s = 1024 * 1024, s[:-1]
+    elif s.endswith("K"):
+        mult, s = 1024, s[:-1]
+    try:
+        return int(float(s) * mult)
+    except ValueError:
+        logger.warning("OCR_MAX_REQUEST_BODY_SIZE invalid value: %r; using %d",
+                       raw, default)
+        return default
+
+
+def read_body_limit_from_env(default=DEFAULT_OCR_MAX_REQUEST_BODY_SIZE):
+    """从环境变量读取 OCR_MAX_REQUEST_BODY_SIZE，缺省用合理默认值。"""
+    return parse_body_limit(os.environ.get("OCR_MAX_REQUEST_BODY_SIZE"), default)
+
+
+def raise_mcp_body_limit(limit, logger_=None):
+    """若已安装的 mcp SDK 支持配置请求体上限（mcp >= 2.0），则把它提到
+    *limit*；否则只打一行日志并原样返回。
+
+    FastMCP 4.x 的 ``FastMCPStreamableHTTPSessionManager`` 构造 SDK 的
+    ``StreamableHTTPSessionManager`` 时没有传 ``max_request_body_size``，
+    所以唯一注入点是基类 ``__init__``。补丁幂等，且不会覆盖调用方显式
+    传入的值。
+    """
+    log = logger_ or logger
+    if limit <= 0:
+        return False
+    try:
+        import inspect
+        from mcp.server import streamable_http_manager as _shm
+        _SM = _shm.StreamableHTTPSessionManager
+        # 幂等优先：打过补丁后 __init__ 变为 (*args, **kwargs)，
+        # 不再暴露该参数，下面的签名检查在第二次调用时会误报"不支持"。
+        if getattr(_SM.__init__, "_ocr_body_limit_patched", False):
+            return True
+        if "max_request_body_size" not in inspect.signature(_SM.__init__).parameters:
+            log.info("installed mcp SDK has no request-body limit; nothing to raise")
+            return False
+        _orig_init = _SM.__init__
+
+        def _patched_init(self, *args, **kwargs):
+            kwargs.setdefault("max_request_body_size", limit)
+            return _orig_init(self, *args, **kwargs)
+
+        _patched_init._ocr_body_limit_patched = True
+        _SM.__init__ = _patched_init
+        log.info("mcp SDK request-body limit raised to %d bytes "
+                 "(OCR_MAX_REQUEST_BODY_SIZE)", limit)
+        return True
+    except Exception as e:
+        log.warning("could not raise mcp SDK request-body limit "
+                    "(falling back to the SDK default): %s", e)
+        return False
+
+
+class OversizedBodyDrainMiddleware:
+    """ASGI 中间件：先抽干超大的请求体，再回 413。
+
+    位于 mcp SDK 自带的 ``RequestBodyLimitMiddleware`` 之外（fastmcp 的
+    ``middleware=`` 参数包在整颗 Starlette app 外面，SDK 限制在 session
+    manager 里面）。对声明 ``Content-Length`` 超限的请求，先把请求体完整
+    消费掉（上限 :data:`DRAIN_CEILING`），再回一个带详细原因的 413，
+    这样客户端的上传得以完成、连接保持存活，收到的是干净的
+    ``413 Content Too Large`` 而不是 ``Connection reset by peer``。
+
+    * ``max_body_size <= 0``：直通（禁用限制）。
+    * chunked 请求（无 Content-Length）原样放行，SDK 自己的流式检查仍然
+      对其生效。
+    """
+
+    def __init__(self, app, max_body_size):
+        self.app = app
+        self.max_body_size = max_body_size
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or self.max_body_size <= 0:
+            await self.app(scope, receive, send)
+            return
+
+        from starlette.datastructures import Headers
+        cl = Headers(scope=scope).get("content-length")
+        try:
+            declared = int(cl) if cl else 0
+        except ValueError:
+            declared = 0
+        if declared <= self.max_body_size:
+            await self.app(scope, receive, send)
+            return
+
+        drained = 0
+        if declared <= DRAIN_CEILING:
+            # 消费掉客户端仍在上传的数据，让下面的 413 能够送达、
+            # 连接可以干净地关闭。
+            while True:
+                message = await receive()
+                if message.get("type") != "http.request":
+                    break  # http.disconnect 等：客户端中断了上传
+                drained += len(message.get("body", b""))
+                if not message.get("more_body", False):
+                    break
+
+        body = (
+            f"Request body too large: declared {declared:,} bytes exceeds "
+            f"the {self.max_body_size:,} byte limit "
+            f"(set OCR_MAX_REQUEST_BODY_SIZE to raise it)"
+        ).encode("utf-8")
+        logger.warning(
+            "rejected oversized request: declared=%d bytes drained=%d "
+            "limit=%d bytes", declared, drained, self.max_body_size)
+        await send({
+            "type": "http.response.start",
+            "status": 413,
+            "headers": [
+                [b"content-type", b"text/plain; charset=utf-8"],
+                [b"content-length", str(len(body)).encode("ascii")],
+                [b"connection", b"close"],
+            ],
+        })
+        await send({"type": "http.response.body", "body": body})
+
+OCR_MAX_REQUEST_BODY_SIZE = parse_body_limit(
+    os.environ.get("OCR_MAX_REQUEST_BODY_SIZE"), DEFAULT_OCR_MAX_REQUEST_BODY_SIZE)
+
 # ---- 按日卸载显存配置 ----
 # OFFLOAD_MEMORY_HOUR: 每天几点执行模型卸载，取值 0-23，默认 2（凌晨2点）
 # 取值不在 0-23 范围内则禁用按日卸载
@@ -820,8 +975,20 @@ def main():
         logger.info(f"监听地址: {args.host}:{args.port}")
         logger.info(f"挂载路径: {args.mount_path}")
         logger.info(f"访问地址: http://{args.host}:{args.port}{args.mount_path}")
-
-    server.run(transport=args.transport, host=args.host, port=args.port, path=args.mount_path)
+        # 请求体限制：提升 SDK 默认上限 + drain 中间件（详见上方说明）
+        raise_mcp_body_limit(OCR_MAX_REQUEST_BODY_SIZE)
+        run_kwargs = {}
+        if OCR_MAX_REQUEST_BODY_SIZE > 0:
+            from starlette.middleware import Middleware
+            run_kwargs["middleware"] = [
+                Middleware(OversizedBodyDrainMiddleware,
+                           max_body_size=OCR_MAX_REQUEST_BODY_SIZE),
+            ]
+        server.run(transport=args.transport, host=args.host, port=args.port,
+                   path=args.mount_path, **run_kwargs)
+    else:
+        # stdio 传输不接受 host/port/path 参数
+        server.run(transport=args.transport)
 
 
 if __name__ == "__main__":
