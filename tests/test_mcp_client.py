@@ -774,3 +774,188 @@ class TestStdioConcurrency:
         assert not t.is_alive()
         assert not connector_errors, connector_errors
         assert result.startswith("ok-")
+
+
+# ------------------------------------------------------------------
+# HTTP error surfacing (413 / connection reset) tests
+# ------------------------------------------------------------------
+
+class _Handler413ReadsBody(http.server.BaseHTTPRequestHandler):
+    """MCP-over-HTTP server that reads the full body, then answers 413 with a
+    descriptive body for oversized requests (the *well-behaved* case -- what
+    the OCR drain middleware produces).  Small requests (initialize / a
+    normal tools/call) get a normal 200 reply so the handshake succeeds."""
+
+    LIMIT = 1 * 1024 * 1024  # 1 MiB
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length)  # always drain first
+        if length > self.LIMIT:
+            body = (f"Request body too large: declared {length} bytes "
+                    f"exceeds the {self.LIMIT} byte limit").encode("utf-8")
+            self.send_response(413)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        try:
+            req = json.loads(raw.decode("utf-8")) if raw else {}
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            req = {}
+        method = req.get("method")
+        if method == "initialize":
+            result = {"protocolVersion": "2025-03-26", "capabilities": {},
+                      "serverInfo": {"name": "big"}}
+        elif method == "tools/call":
+            result = {"content": [{"type": "text", "text": "ok"}]}
+        else:
+            result = {}
+        payload = json.dumps({"jsonrpc": "2.0", "id": req.get("id"),
+                              "result": result}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *args) -> None:
+        pass
+
+
+class _Handler413NoDrain(http.server.BaseHTTPRequestHandler):
+    """Mimics the mcp SDK (>= 2.0) RequestBodyLimitMiddleware: oversized
+    requests get a 413 answered *without reading the body*, then the
+    connection closes (uvicorn-style RST race on the client side)."""
+
+    LIMIT = 1 * 1024 * 1024  # 1 MiB
+    oversized_count = 0
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > self.LIMIT:
+            _Handler413NoDrain.oversized_count += 1
+            body = b"Request body too large"
+            self.send_response(413)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+            return  # deliberately does NOT read the body
+        raw = self.rfile.read(length)
+        try:
+            req = json.loads(raw.decode("utf-8")) if raw else {}
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            req = {}
+        method = req.get("method")
+        if method == "initialize":
+            result = {"protocolVersion": "2025-03-26", "capabilities": {},
+                      "serverInfo": {"name": "nd"}}
+        elif method == "tools/call":
+            result = {"content": [{"type": "text", "text": "ok"}]}
+        else:
+            result = {}
+        payload = json.dumps({"jsonrpc": "2.0", "id": req.get("id"),
+                              "result": result}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *args) -> None:
+        pass
+
+
+class TestHTTPErrorSurfacing:
+    def test_413_no_drain_rst_race_still_locatable(self, monkeypatch) -> None:
+        """Reproduces the production symptom: the server logs 413 but the
+        client's socket is reset mid-upload.  Whichever side of the race wins,
+        the final error must be locatable: either the raw 413 status (client
+        read the response) or the request-body size + '413 Content Too Large'
+        hint (client only saw the reset)."""
+        monkeypatch.setenv("TOOL_EXEC_TIMEOUT", "15")
+        _Handler413NoDrain.oversized_count = 0
+        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0),
+                                                _Handler413NoDrain)
+        httpd.daemon_threads = True
+        t = threading.Thread(target=httpd.serve_forever, daemon=True)
+        t.start()
+        url = f"http://127.0.0.1:{httpd.server_address[1]}/mcp"
+        try:
+            mgr = MCPClientManager()
+            mgr.connect_url("nd", url)
+            big = "x" * 2_000_000  # ~2 MiB request body
+            with pytest.raises(RuntimeError) as ei:
+                mgr.call_tool("nd", "detect_text_blocks",
+                              {"base64_content": big})
+            msg = str(ei.value)
+            assert "413" in msg, msg
+            assert url in msg, msg
+            # at most one controlled retry after re-initialization
+            assert 1 <= _Handler413NoDrain.oversized_count <= 2
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_clean_413_surfaces_status_and_body(self, monkeypatch) -> None:
+        """A 413 answered *with* the body drained must surface the raw status
+        and the server's response body in the error -- not a generic failure."""
+        monkeypatch.setenv("TOOL_EXEC_TIMEOUT", "10")
+        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0),
+                                                _Handler413ReadsBody)
+        httpd.daemon_threads = True
+        t = threading.Thread(target=httpd.serve_forever, daemon=True)
+        t.start()
+        url = f"http://127.0.0.1:{httpd.server_address[1]}/mcp"
+        try:
+            mgr = MCPClientManager()
+            mgr.connect_url("big", url)
+            # ~1.6 MiB argument -> request body > 1 MiB limit
+            big = "x" * (1_600_000)
+            with pytest.raises(RuntimeError) as ei:
+                mgr.call_tool("big", "detect_text_blocks",
+                              {"base64_content": big})
+            msg = str(ei.value)
+            assert "413" in msg, msg
+            assert "Content Too Large" in msg, msg
+            assert "Request body too large" in msg, msg
+            assert "big" in msg and url in msg, msg
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_exchange_error_describe_413(self):
+        from runtime.mcp_client import MCPHTTPExchangeError
+        err = MCPHTTPExchangeError(
+            "http://h/mcp", "OCR", code=413, reason="Content Too Large",
+            body_snippet="Request body too large: declared 5,000,000 bytes",
+            request_body_size=5_000_000)
+        d = err.describe()
+        assert "413" in d and "Content Too Large" in d
+        assert "Request body too large" in d
+        assert "OCR" in d and "http://h/mcp" in d
+
+    def test_exchange_error_describe_conn_reset_large_body(self):
+        from runtime.mcp_client import MCPHTTPExchangeError
+        import errno
+        err = MCPHTTPExchangeError(
+            "http://h/mcp", "OCR", conn_error=ConnectionResetError(errno.ECONNRESET,
+                                                                   "Connection reset by peer"),
+            request_body_size=5_000_000)
+        d = err.describe()
+        assert "connection error" in d
+        assert "5,000,000" in d
+        # large body -> hint that points at the server-side 413
+        assert "413 Content Too Large" in d
+
+    def test_exchange_error_describe_conn_reset_small_body(self):
+        from runtime.mcp_client import MCPHTTPExchangeError
+        err = MCPHTTPExchangeError(
+            "http://h/mcp", "OCR", conn_error="refused", request_body_size=100)
+        d = err.describe()
+        assert "100-byte" in d
+        # small body -> no oversized-request hint
+        assert "413 Content Too Large" not in d

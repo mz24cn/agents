@@ -39,6 +39,67 @@ _DEFAULT_IDLE_TIMEOUT = 300
 _DEFAULT_CONNECT_TIMEOUT = 30.0
 
 
+class MCPHTTPExchangeError(Exception):
+    """Normalized failure of a single HTTP exchange with an MCP server.
+
+    Carries everything the client knows about the failure so the eventual
+    error message is self-explanatory:
+
+    * the server answered with a non-2xx status -> ``code`` / ``reason``
+      plus a snippet of the server's response body (``body_snippet``),
+      which often states the real reason (e.g. 413 "Request body too large");
+    * the connection dropped -> ``conn_error`` (errno message) plus the size
+      of the request body that was being sent (``request_body_size``).
+
+    The body size matters because an oversized request is the most common
+    reason an MCP server resets the connection instead of answering: the
+    MCP SDK's ``RequestBodyLimitMiddleware`` (mcp >= 2.0, default 4 MiB)
+    replies 413 *without reading the rest of the body*, so the server closes
+    the socket with unread data still buffered (a TCP RST) and the client
+    only ever sees ``[Errno 104] Connection reset by peer``.  Reporting the
+    body size (and, for large bodies, a hint pointing at the server log)
+    makes the client-side symptom match the server-side 413.
+    """
+
+    def __init__(
+        self,
+        url: str,
+        server_name: str,
+        *,
+        code: Optional[int] = None,
+        reason: Optional[str] = None,
+        body_snippet: Optional[str] = None,
+        conn_error: Optional[object] = None,
+        request_body_size: Optional[int] = None,
+    ) -> None:
+        self.url = url
+        self.server_name = server_name
+        self.code = code
+        self.reason = reason
+        self.body_snippet = body_snippet
+        self.conn_error = conn_error
+        self.request_body_size = request_body_size
+        super().__init__(self.describe())
+
+    def describe(self) -> str:
+        where = f"MCP server '{self.server_name}' ({self.url})"
+        if self.code is not None:
+            msg = f"{where} answered HTTP {self.code} ({self.reason})"
+            if self.body_snippet:
+                msg += f"; response body: {self.body_snippet.strip()[:512]!r}"
+        else:
+            msg = f"{where} connection error: {self.conn_error}"
+            if self.request_body_size:
+                msg += f" while sending {self.request_body_size:,}-byte request body"
+                if self.request_body_size > 1_000_000:
+                    msg += (
+                        " -- the server may have rejected the oversized request "
+                        "before reading it (check the server log for the HTTP "
+                        "status, e.g. 413 Content Too Large)"
+                    )
+        return msg
+
+
 class MCPClientManager:
     """Singleton MCP Client manager supporting stdio and Streamable HTTP transports."""
 
@@ -129,7 +190,9 @@ class MCPClientManager:
     async def _stdio_send(self, conn: dict, request: dict, timeout: float | None = None) -> dict:
         process: asyncio.subprocess.Process = conn["process"]
         if process.stdin is None or process.stdout is None:
-            raise RuntimeError("stdio pipes not available")
+            raise RuntimeError(
+                f"stdio pipes not available on server '{conn.get('server_name')}'"
+            )
         payload = json.dumps(request) + "\n"
         process.stdin.write(payload.encode("utf-8"))
         await process.stdin.drain()
@@ -153,12 +216,15 @@ class MCPClientManager:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise RuntimeError(
-                        f"MCP stdio tool call timed out after {t:.0f}s"
+                        f"MCP stdio tool call on server "
+                        f"'{conn.get('server_name')}' timed out after {t:.0f}s"
                     )
             line = await asyncio.wait_for(
                 process.stdout.readline(), timeout=remaining)
             if not line:
-                raise RuntimeError("MCP server closed stdout unexpectedly")
+                raise RuntimeError(
+                    f"MCP server '{conn.get('server_name')}' closed stdout unexpectedly"
+                )
             stripped = line.decode("utf-8").strip()
             if stripped.startswith("{"):
                 parsed = json.loads(stripped)
@@ -234,51 +300,61 @@ class MCPClientManager:
         )
         reinit_lock = conn.setdefault("_reinit_lock", threading.Lock())
         with reinit_lock:
-            # If another thread already recovered, just retry with the new session.
-            if conn.get("connected") and conn.get("session_id") != session_id:
-                headers2 = dict(conn.get("headers") or {})
-                headers2.setdefault("Content-Type", "application/json")
-                headers2.setdefault("Accept", "application/json, text/event-stream")
-                new_sid = conn.get("session_id")
-                if new_sid:
-                    headers2["mcp-session-id"] = new_sid
-                try:
-                    req2 = urllib.request.Request(url, data=body, headers=headers2, method="POST")
-                    with urllib.request.urlopen(req2, timeout=socket_timeout) as resp2:
-                        new_session_id2 = resp2.headers.get("mcp-session-id")
-                        if new_session_id2:
-                            conn["session_id"] = new_session_id2
-                        ct2 = resp2.headers.get("Content-Type", "")
-                        if "text/event-stream" in ct2:
-                            return self._read_sse_stream(resp2, abort_event)
-                        return json.loads(resp2.read().decode("utf-8"))
-                except Exception:
-                    pass  # fall through to full re-initialize below
-            conn["session_id"] = None
-            conn["tools_cache"] = None
+            # Re-entrancy guard: the re-initialization itself issues HTTP
+            # requests (initialize + retry of the original body).  If one of
+            # THOSE hits a connection error, _http_send_impl must propagate
+            # it instead of recursing into another re-initialization -- the
+            # recursion would block on this non-reentrant lock until the
+            # outer wall-clock deadline fired, turning a fast network error
+            # into a multi-minute hang.
+            conn["_reinit_in_progress"] = True
             try:
-                self._http_initialize(conn)
-                # Retry the original request with the fresh session
-                headers2 = dict(conn.get("headers") or {})
-                headers2.setdefault("Content-Type", "application/json")
-                headers2.setdefault("Accept", "application/json, text/event-stream")
-                new_sid = conn.get("session_id")
-                if new_sid:
-                    headers2["mcp-session-id"] = new_sid
-                req2 = urllib.request.Request(url, data=body, headers=headers2, method="POST")
-                with urllib.request.urlopen(req2, timeout=socket_timeout) as resp2:
-                    new_session_id2 = resp2.headers.get("mcp-session-id")
-                    if new_session_id2:
-                        conn["session_id"] = new_session_id2
-                    ct2 = resp2.headers.get("Content-Type", "")
-                    if "text/event-stream" in ct2:
-                        return self._read_sse_stream(resp2, abort_event)
-                    return json.loads(resp2.read().decode("utf-8"))
-            except Exception as retry_exc:
-                conn["connected"] = False
-                raise RuntimeError(
-                    f"MCP re-initialize after {reason} failed: {retry_exc}"
-                ) from retry_exc
+                server_name = conn.get("server_name", url)
+                # If another thread already recovered, just retry with the new session.
+                if conn.get("connected") and conn.get("session_id") != session_id:
+                    headers2 = dict(conn.get("headers") or {})
+                    headers2.setdefault("Content-Type", "application/json")
+                    headers2.setdefault("Accept", "application/json, text/event-stream")
+                    new_sid = conn.get("session_id")
+                    if new_sid:
+                        headers2["mcp-session-id"] = new_sid
+                    try:
+                        return self._http_post_once(
+                            url, body, headers2, socket_timeout, server_name,
+                            conn=conn, abort_event=abort_event)
+                    except Exception:
+                        pass  # fall through to full re-initialize below
+                conn["session_id"] = None
+                conn["tools_cache"] = None
+                try:
+                    self._http_initialize(conn)
+                    # Retry the original request with the fresh session.
+                    # _http_post_once normalizes failures into
+                    # MCPHTTPExchangeError, whose message carries the raw
+                    # HTTP status + response body (e.g. 413 Content Too
+                    # Large) or the errno + request-body size, so the
+                    # RuntimeError raised below is self-explanatory.
+                    headers2 = dict(conn.get("headers") or {})
+                    headers2.setdefault("Content-Type", "application/json")
+                    headers2.setdefault("Accept", "application/json, text/event-stream")
+                    new_sid = conn.get("session_id")
+                    if new_sid:
+                        headers2["mcp-session-id"] = new_sid
+                    return self._http_post_once(
+                        url, body, headers2, socket_timeout, server_name,
+                        conn=conn, abort_event=abort_event)
+                except Exception as retry_exc:
+                    conn["connected"] = False
+                    logger.warning(
+                        "MCP re-initialize after %s failed for %s (%s): %s",
+                        reason, conn.get("server_name", url), url, retry_exc,
+                    )
+                    raise RuntimeError(
+                        f"MCP server '{conn.get('server_name', url)}' ({url}) "
+                        f"re-initialize after {reason} failed: {retry_exc}"
+                    ) from retry_exc
+            finally:
+                conn["_reinit_in_progress"] = False
 
     def _http_send(self, conn: dict, request: dict, timeout: float | None = None) -> dict:
         """Send a JSON-RPC request over Streamable HTTP and return the response.
@@ -337,7 +413,8 @@ class MCPClientManager:
         if not done.wait(t):
             abort.set()
             raise RuntimeError(
-                f"MCP HTTP tool call timed out after {t:g}s"
+                f"MCP HTTP tool call timed out after {t:g}s on server "
+                f"'{conn.get('server_name', conn['url'])}' ({conn['url']})"
             ) from None
         if "error" in state:
             raise state["error"]
@@ -354,6 +431,7 @@ class MCPClientManager:
         stop and close the socket so the worker thread can terminate.
         """
         url = conn["url"]
+        server_name = conn.get("server_name", url)
         headers = dict(conn.get("headers") or {})
         headers.setdefault("Content-Type", "application/json")
         headers.setdefault("Accept", "application/json, text/event-stream")
@@ -362,18 +440,11 @@ class MCPClientManager:
         if session_id:
             headers["mcp-session-id"] = session_id
         body = json.dumps(request).encode("utf-8")
-        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=socket_timeout) as resp:
-                # Capture session ID from response headers (set during initialize)
-                new_session_id = resp.headers.get("mcp-session-id")
-                if new_session_id:
-                    conn["session_id"] = new_session_id
-                content_type = resp.headers.get("Content-Type", "")
-                if "text/event-stream" in content_type:
-                    return self._read_sse_stream(resp, abort_event)
-                return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
+            return self._http_post_once(
+                url, body, headers, socket_timeout, server_name,
+                conn=conn, abort_event=abort_event)
+        except MCPHTTPExchangeError as exc:
             # 404 with stale session_id means the server restarted or the
             # session expired.  Clear the stale session and re-initialize,
             # then retry the original request exactly once.
@@ -381,13 +452,82 @@ class MCPClientManager:
                 return self._http_reinitialize_and_retry(
                     conn, body, "session expired (404)", socket_timeout,
                     abort_event)
-            raise RuntimeError(f"MCP HTTP error {exc.code}: {exc.reason}") from exc
-        except urllib.error.URLError as exc:
-            # Connection-level error (e.g. server restarted, connection reset).
+            # Connection-level failure (reset / refused / broken pipe).
             # Re-initialize once so subsequent calls transparently reconnect.
-            return self._http_reinitialize_and_retry(
-                conn, body, f"connection error: {exc.reason}", socket_timeout,
-                abort_event)
+            # While a re-initialization is already in progress (this request
+            # is part of one) propagate the error instead of recursing:
+            # the recursion would block on the non-reentrant reinit lock
+            # until the outer wall-clock deadline.
+            if exc.code is None:
+                if conn.get("_reinit_in_progress"):
+                    raise RuntimeError(str(exc)) from exc
+                return self._http_reinitialize_and_retry(
+                    conn, body, f"connection error: {exc.conn_error}",
+                    socket_timeout, abort_event)
+            # Any other HTTP status (400/401/413/5xx): a deterministic
+            # server answer -- retrying would fail the same way.  Surface
+            # the raw status + response body verbatim.
+            raise RuntimeError(str(exc)) from exc
+
+    def _http_post_once(
+        self, url: str, body: bytes, headers: dict, socket_timeout: float | None,
+        server_name: str, conn: Optional[dict] = None,
+        abort_event: "threading.Event | None" = None,
+    ) -> dict:
+        """Perform ONE POST exchange and return the parsed JSON-RPC response.
+
+        When *conn* is given, a fresh ``mcp-session-id`` response header is
+        stored on it.  Handles plain JSON responses and SSE streams.  Every
+        failure is raised as :class:`MCPHTTPExchangeError` carrying the full
+        context (HTTP status + response-body snippet, or errno + request
+        body size) so callers can build a self-explanatory error message.
+        """
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=socket_timeout) as resp:
+                # Capture session ID from response headers (set during initialize)
+                new_session_id = resp.headers.get("mcp-session-id")
+                if conn is not None and new_session_id:
+                    conn["session_id"] = new_session_id
+                content_type = resp.headers.get("Content-Type", "")
+                if "text/event-stream" in content_type:
+                    return self._read_sse_stream(resp, abort_event)
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            # The server answered with a non-2xx status.  The response body
+            # often states the real reason (e.g. "Request body too large"
+            # for 413) -- read a snippet for the error message.
+            raise MCPHTTPExchangeError(
+                url, server_name, code=exc.code, reason=exc.reason,
+                body_snippet=self._read_error_body(exc),
+                request_body_size=len(body),
+            ) from exc
+        except urllib.error.URLError as exc:
+            # Connection-level error (connect failure / reset while the body
+            # was still being sent).
+            raise MCPHTTPExchangeError(
+                url, server_name, conn_error=exc.reason,
+                request_body_size=len(body),
+            ) from exc
+        except OSError as exc:
+            # Reset / broken pipe observed while reading the response
+            # (http.client raises these raw, not wrapped in a URLError).
+            # (HTTPError and URLError are OSError subclasses handled above.)
+            raise MCPHTTPExchangeError(
+                url, server_name, conn_error=exc,
+                request_body_size=len(body),
+            ) from exc
+
+    @staticmethod
+    def _read_error_body(exc, limit: int = 512) -> Optional[str]:
+        """Best-effort read of an HTTPError's response body for error messages."""
+        try:
+            raw = exc.read(limit)
+        except Exception:
+            return None
+        if not raw:
+            return None
+        return raw.decode("utf-8", errors="replace")[:limit]
 
     def _read_sse_stream(self, resp, abort_event: "threading.Event | None" = None) -> dict:
         """Read an SSE stream line-by-line and return the first JSON-RPC response.
@@ -635,7 +775,9 @@ class MCPClientManager:
         else:
             response = self._http_send(conn, request, timeout=timeout)
         if "error" in response:
-            raise RuntimeError(f"MCP tools/list failed: {response['error']}")
+            raise RuntimeError(
+                f"MCP tools/list failed on server '{server_name}': {response['error']}"
+            )
         raw_tools = response.get("result", {}).get("tools", [])
         tools = self._convert_tools(server_name, raw_tools)
         conn["tools_cache"] = tools
@@ -664,7 +806,10 @@ class MCPClientManager:
         if "error" in response:
             error = response["error"]
             msg = error.get("message", str(error)) if isinstance(error, dict) else str(error)
-            raise RuntimeError(f"MCP tool call failed: {msg}")
+            raise RuntimeError(
+                f"MCP tool call failed on server '{server_name}' "
+                f"({conn.get('url', 'stdio transport')}): {msg}"
+            )
         result = response.get("result", {})
         content_list = result.get("content", [])
         parts = []
