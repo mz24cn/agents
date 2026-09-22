@@ -420,6 +420,78 @@ class TestProxyAgainstRealChild:
         assert match, out
         assert open(match.group(1), "rb").read() == b"\x89PNG" + b"m" * 2000
 
+    def test_child_resolves_base64_path_when_parent_forwards_intent(self, child, tmp_path):
+        """A path-like base64 argument that only exists on the *child* is read
+        there when the parent forwards ``{"base64":"auto"}``.
+
+        The parent's own pre-processing only rewrites paths it can read
+        locally, so a child-workspace path would otherwise reach the MCP tool
+        verbatim and fail (the OCR tool's "Incorrect padding").  The runtime
+        sets ``base64`` in the request context for remote MCP tools
+        (``Runtime._forwards_base64_intent``); this asserts the proxy carries
+        it and the child converts the path against its own filesystem.
+        """
+        import base64
+
+        from runtime.common import (
+            clear_request_context, set_request_context,
+        )
+        from runtime.models import ToolConfig
+
+        child_ws = tmp_path / "child_ws"
+        img = child_ws / "shot.png"
+        img.write_bytes(b"\x89PNGchild-only")
+
+        seen: dict = {}
+
+        class _FakeMcpManager:
+            def call_tool(self, server_name, tool_name, arguments, timeout=None):
+                seen.update(arguments)
+                return json.dumps({"success": True, "full_text": "ok"})
+
+        child_runtime = child[0]._server.runtime  # type: ignore[attr-defined]
+        child_runtime._tool_registry.register(ToolConfig(  # type: ignore[attr-defined]
+            tool_id="mcp_ocr",
+            tool_type="mcp",
+            name="mcp_ocr",
+            description="fake child mcp ocr",
+            parameters={"type": "object", "properties": {
+                "base64_content": {"type": "string"}}},
+            mcp_server_name="fake-ocr",
+            tool_name="ocr",
+        ))
+        child_runtime._mcp_manager = _FakeMcpManager()  # type: ignore[attr-defined]
+
+        proxy = RemoteToolProxy({
+            "id": f"http://127.0.0.1:{child[0].port}",
+            "url": f"http://127.0.0.1:{child[0].port}/v1/setup",
+        })
+
+        # Parent request context as the runtime sets it around a remote MCP
+        # tool call (Runtime._forwards_base64_intent).
+        set_request_context(
+            session_id="sess-b64-1", user_message_timestamp=TURN_TS,
+            base64="auto",
+        )
+        try:
+            result = proxy.call("mcp_ocr", {"base64_content": str(img)})
+        finally:
+            clear_request_context(
+                ["session_id", "user_message_timestamp", "base64"])
+
+        assert not result.startswith("Error:"), result
+        # The child read its OWN file and handed the MCP tool real base64.
+        assert base64.b64decode(seen["base64_content"]) == img.read_bytes()
+
+        # Without the forwarded intent the child stays a raw executor.
+        seen.clear()
+        status, text = _request_text(
+            child[0], "POST", "/v1/tools/call",
+            {"tool_id": "mcp_ocr", "arguments": {"base64_content": str(img)}},
+        )
+        assert status == 200, text
+        assert seen["base64_content"] == str(img)
+
     def test_call_failure_returns_error_text(self, child):
         p = RemoteToolProxy({"id": f"http://127.0.0.1:{child[0].port}",
                              "url": f"http://127.0.0.1:{child[0].port}/v1/setup"})

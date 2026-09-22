@@ -2135,6 +2135,131 @@ def test_call_tool_base64_auto_marshals_like_inference_loop(tmp_path):
     assert open(m.group(1), "rb").read() == b"z" * 2000
 
 
+def test_remote_proxy_mcp_forwards_base64_intent_to_child():
+    """The parent pads the forwarded context with {"base64":"auto"} for a
+    remote *MCP* tool, so the child resolves path-like base64 arguments on its
+    own filesystem (the parent cannot read a child-only path, and its local
+    pre-processing silently leaves such paths untouched)."""
+    from runtime.common import build_forwarded_context
+
+    captured: dict = {}
+
+    def _proxy(**arguments):
+        captured.update(build_forwarded_context())
+        return '{"ok": true}'
+
+    config = _remote_proxy_config("mcp", _proxy)
+    runtime = Runtime(model_registry=ModelRegistry(), tool_registry=ToolRegistry())
+
+    # Model loop path shares the same intent-forwarding wrapper.
+    out, _ = runtime._execute_tool_call("mcp_remote", {}, tool_scope=[config])
+    assert out == '{"ok": true}'
+    assert captured.get("base64") == "auto"
+
+
+def test_remote_proxy_function_tool_does_not_forward_base64_intent():
+    """Only child MCP tools get the base64 intent: a remote *function* tool is
+    raw in and out, so forwarding the marker would only make the child rewrite
+    arguments the tool expects verbatim."""
+    from runtime.common import build_forwarded_context
+
+    captured: dict = {"base64": "sentinel"}
+
+    def _proxy(**arguments):
+        captured.clear()
+        captured.update(build_forwarded_context())
+        return '{"ok": true}'
+
+    config = _remote_proxy_config("function", _proxy)
+    runtime = Runtime(model_registry=ModelRegistry(), tool_registry=ToolRegistry())
+
+    out, _ = runtime._execute_tool_call("mcp_remote", {}, tool_scope=[config])
+    assert out == '{"ok": true}'
+    assert captured.get("base64") is None
+
+
+def test_function_batch_round_forwards_remote_mcp_base64_intent():
+    """The parallel (all-function) batch path forwards the same base64 intent
+    for a remote child MCP tool, and NOT for a neighbouring remote function
+    tool in the same batch (per-call, not per-batch)."""
+    from runtime.common import build_forwarded_context
+
+    seen: dict = {}
+
+    def _mcp_proxy(**arguments):
+        seen["mcp"] = build_forwarded_context().get("base64")
+        return '{"ok": true}'
+
+    def _fn_proxy(**arguments):
+        seen["fn"] = build_forwarded_context().get("base64")
+        return "plain"
+
+    mcp_config = _named_remote_proxy_config("remote_mcp", "mcp", _mcp_proxy)
+    fn_config = _named_remote_proxy_config("remote_fn", "function", _fn_proxy)
+    runtime = Runtime(model_registry=ModelRegistry(), tool_registry=ToolRegistry())
+
+    list(runtime._execute_tool_call_round(
+        [
+            {"id": "call_m", "name": "remote_mcp",
+             "arguments": json.dumps({})},
+            {"id": "call_f", "name": "remote_fn",
+             "arguments": json.dumps({})},
+        ],
+        tool_scope=[mcp_config, fn_config],
+        timestamp=False,
+    ))
+
+    assert seen["mcp"] == "auto"
+    assert seen.get("fn") is None
+
+
+def test_process_tool_arguments_resolves_relative_path_against_workspace(
+    monkeypatch, tmp_path,
+):
+    """A relative base64 argument resolves against the request workspace, not
+    the process CWD -- matching common.convert_image_to_base64, and letting a
+    child resolve relative paths against the forwarded session workspace."""
+    import base64
+
+    from runtime.common import clear_request_context, set_request_context
+    from runtime.tools import process_tool_arguments_for_base64
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    img = ws / "shot.png"
+    img.write_bytes(b"\x89PNGws")
+
+    monkeypatch.setenv("BASE64_CHECK_THRESHOLD", "1024")
+    monkeypatch.chdir(tmp_path)  # CWD deliberately != workspace
+    set_request_context(workspace=str(ws))
+    try:
+        out = process_tool_arguments_for_base64({"base64_content": "shot.png"})
+    finally:
+        clear_request_context(["workspace"])
+
+    assert base64.b64decode(out["base64_content"]) == img.read_bytes()
+
+
+def test_process_tool_arguments_leaves_unresolvable_relative_path(
+    monkeypatch, tmp_path,
+):
+    """A relative path that does not exist in the workspace stays untouched
+    (the tool still receives the original value)."""
+    from runtime.common import clear_request_context, set_request_context
+    from runtime.tools import process_tool_arguments_for_base64
+
+    ws = tmp_path / "ws2"
+    ws.mkdir()
+    monkeypatch.chdir(tmp_path)
+    set_request_context(workspace=str(ws))
+    try:
+        out = process_tool_arguments_for_base64({"base64_content": "nope.png"})
+    finally:
+        clear_request_context(["workspace"])
+
+    assert out["base64_content"] == "nope.png"
+
+
 # ---------------------------------------------------------------------------
 # Batch tool-call round (model loop): MCP base64 marshalling must survive
 # both batch code paths, which the single-call _execute_tool_call tests above

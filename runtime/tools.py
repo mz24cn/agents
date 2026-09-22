@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 from runtime.models import ToolConfig
 from runtime.registry import ToolRegistry
-from runtime.common import is_likely_base64
+from runtime.common import is_likely_base64, get_workspace
 
 # Python type -> JSON Schema type mapping
 _TYPE_MAP: dict[type, str] = {
@@ -188,7 +188,8 @@ def convert_file_path_to_base64(value: str) -> tuple[str, bool]:
     """尝试将文件路径转换为 base64 编码内容。
 
     如果输入看起来不是 base64（长度较短），则尝试将其作为文件路径打开，
-    成功则返回 base64 编码内容。
+    成功则返回 base64 编码内容。相对路径按当前请求工作区解析
+    （``common.get_workspace()``），与 ``common.convert_image_to_base64`` 一致。
 
     Args:
         value: 可能是文件路径的字符串
@@ -198,15 +199,24 @@ def convert_file_path_to_base64(value: str) -> tuple[str, bool]:
         - 如果转换成功：(base64_content, True)
         - 如果无需转换或失败：(original_value, False)
     """
+    if not isinstance(value, str) or not value:
+        return value, False
+
     # 如果已经是 base64，直接返回
     if is_likely_base64(value):
         return value, False
-    
+
     # 尝试作为文件路径打开
     try:
         # 处理路径：支持正斜杠和反斜杠
         file_path = value.replace('/', os.sep).replace('\\', os.sep)
-        
+
+        # 相对路径按当前请求工作区解析（与 common.convert_image_to_base64 一致）：
+        # 远程执行时子端的请求上下文里是转发过来的会话工作区，模型给出的相对
+        # 路径应相对它解析，而不是相对进程启动目录。
+        if not os.path.isabs(file_path):
+            file_path = os.path.join(get_workspace(), file_path)
+
         # 检查文件是否存在
         if not os.path.exists(file_path):
             return value, False

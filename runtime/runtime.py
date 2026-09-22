@@ -1311,11 +1311,16 @@ class Runtime:
           tools are exposed on the parent as ``function`` configs carrying a
           proxy callable, and the child's ``POST /v1/tools/call`` executes
           the tool verbatim — its own direct API callers must keep receiving
-          real base64, never a server-local path.  The parent therefore owns
-          the base64 marshalling around the forwarded call: input file paths
-          are read here (parent filesystem) and long base64 results are saved
-          here, so huge payloads never reach the model context while the
-          child stays a raw executor.
+          real base64, never a server-local path.  The parent therefore keeps
+          the base64 result interception around the forwarded call (so huge
+          payloads never reach the model context) and converts any input path
+          it can read on its *own* filesystem.
+
+          A path-like argument that only exists on the child is resolved on
+          the child instead: :meth:`_forwards_base64_intent` sends
+          ``{"base64": "auto"}`` in the forwarded context so the child applies
+          the same pre-processing against its own filesystem (see
+          :meth:`_forwards_base64_intent` for why the parent cannot read it).
 
         ``RemoteToolProxy.list_tool_configs`` records the child's original
         tool type on the config as ``remote_child_tool_type``.
@@ -1325,6 +1330,33 @@ class Runtime:
         return (
             getattr(tool_config, "is_remote_proxy", False)
             and getattr(tool_config, "remote_child_tool_type", None) == "mcp"
+        )
+
+    @staticmethod
+    def _forwards_base64_intent(tool_config: ToolConfig) -> bool:
+        """Whether the parent forwards its base64-marshalling intent to the child.
+
+        A remote proxy entry whose child tool is an MCP tool executes on the
+        *child* host.  A path-like ``base64`` argument therefore usually names
+        a file on the child's filesystem, which the parent cannot read: the
+        parent-side pre-processing (``process_tool_arguments_for_base64``)
+        only rewrites paths that exist locally and otherwise leaves the raw
+        path untouched.  Without help that raw path reaches the child's MCP
+        tool, which tries to base64-decode a filename and fails (e.g. the OCR
+        tool's ``Incorrect padding``).
+
+        The fix keeps the child a raw executor for its direct API callers
+        while letting the *parent* opt the forwarded call into the same
+        marshalling: ``{"base64": "auto"}`` travels in the
+        ``X-Agents-Request-Context`` header, so the child's ``POST
+        /v1/tools/call`` reads path-like base64 arguments on its own
+        filesystem before invoking the tool.  The parent still owns result
+        interception, so a payload already rewritten by the child is simply
+        left alone here.
+        """
+        return (
+            getattr(tool_config, "is_remote_proxy", False)
+            and Runtime._needs_mcp_base64_handling(tool_config)
         )
 
     @staticmethod
@@ -1779,6 +1811,10 @@ class Runtime:
             caller_ctx["tool_exec_timeout"] = _get_effective_tool_exec_timeout(
                 tool_config, arguments
             )
+            # 远程 MCP 代理：把 base64 编解码意图随上下文转发给子端，让子端
+            # 用它自己的文件系统解析路径型 base64 参数（父端读不到子端文件）。
+            if self._forwards_base64_intent(tool_config):
+                caller_ctx["base64"] = "auto"
             runnable_calls.append((
                 index,
                 tool_name,
@@ -2090,6 +2126,10 @@ class Runtime:
         caller_ctx = _snapshot_tool_request_context()
         # 远程代理工具以该超时作为网络层超时（见 RemoteToolProxy.call）。
         caller_ctx["tool_exec_timeout"] = timeout
+        # 远程 MCP 代理：把 base64 编解码意图随上下文转发给子端，让子端用它
+        # 自己的文件系统解析路径型 base64 参数（父端读不到子端文件）。
+        if self._forwards_base64_intent(tool_config):
+            caller_ctx["base64"] = "auto"
 
         def _run_with_context() -> str:
             restore_request_context(caller_ctx)

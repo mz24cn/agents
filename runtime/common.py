@@ -737,10 +737,15 @@ def restore_request_context(ctx: dict) -> None:
 #    ``base64``                           "auto": the receiver applies the
 #                                         inference-loop base64 marshalling
 #                                         around the call (path-like base64
-#                                         arguments are read + encoded, long
-#                                         base64 results are saved to a local
-#                                         file and replaced by the path) --
-#                                         sent by the web tool-call test
+#                                         arguments are read + encoded on the
+#                                         receiver's filesystem, long base64
+#                                         results are saved to a local file
+#                                         and replaced by the path) --
+#                                         sent by the web tool-call test, and
+#                                         forwarded by the parent for remote
+#                                         MCP tools so a path that only exists
+#                                         on the child is resolved there
+#                                         (see Runtime._forwards_base64_intent)
 #
 # 2. **Recomputed on the child** - host-specific paths derived from
 #    ``session_id`` against the child's own ContextManager; never forwarded:

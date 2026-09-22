@@ -253,7 +253,7 @@ http://host:7988/v1/setup?token=...
 
 - **talk_to / delegate / 群聊**：子代理与子会话在子端执行，子会话 id 同样挂在母端会话下；请求上下文里的 `depth` / `agent_id` / `agent_ids` / `all_agent_ids` 会一并转发，`tool_scope` 由子端按转发的 `available_tool_ids` 在**自身 registry** 上重建（子工具在子端解析）。注意：**agent 名册本身不跨主机同步**，子端需具备与母端一致的 agent 定义，否则 talk_to 在子端解析目标会失败；
 - **Skill 渐进披露**：披露由**母端**推理循环触发（子端 `/v1/tools/call` 不执行 skill 条目），`SKILL.md` 正文从子端 `GET /v1/tools/skill/{id}` 拉取并**缓存 300s**；
-- **MCP 工具**：以 function 条目形式代理，由子端执行；base64 前后置（把 `base64` 参数里的文件路径读成内容、把过长的 base64 结果落盘换成本机路径）由**母端**负责——子端 `/v1/tools/call` 始终原样执行，其直接 API 调用方拿到的仍是真实 base64，而不是服务器上的文件路径；
+- **MCP 工具**：以 function 条目形式代理，由子端执行；base64 前后置（把 `base64` 参数里的文件路径读成内容、把过长的 base64 结果落盘换成本机路径）由**母端**负责——子端 `/v1/tools/call` 始终原样执行，其直接 API 调用方拿到的仍是真实 base64，而不是服务器上的文件路径。**路径型 `base64` 参数若只存在于子端**（母端读不到），母端会把 `{"base64": "auto"}` 随 `X-Agents-Request-Context` 转发给子端，由子端用自己的文件系统把该路径读成 base64 后再交给（子端本地）MCP 工具；过长 base64 结果的落盘仍由母端完成；
 - **工具列表缓存 TTL 30s**：子端工具集变化（如隧道重连、推送更新后）会在 TTL 过期时自动失效刷新；
 - **浏览器数据路径**：
   - **直连** = 浏览器直连子端（token 只出现在 URL 查询参数 / header 中，大负载不经过母端）；
