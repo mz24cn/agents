@@ -598,8 +598,18 @@ class HandlerWorkspaceMixin:
             if any(chunk.get('status') == 'uploading' for chunk in task['chunks']):
                 self._send_json_error(409, "UPLOAD_NOT_READY: some chunks are still uploading")
                 return
-            if any(chunk.get('status') != 'uploaded' for chunk in task['chunks']):
-                self._send_json_error(409, "UPLOAD_NOT_READY: some chunks are missing")
+            missing = [chunk['parallel_id'] for chunk in task['chunks']
+                       if chunk.get('status') != 'uploaded']
+            if missing:
+                # missing_chunks tells the client exactly which chunks to
+                # re-upload (it still holds the data locally), so a flaky
+                # link -- or a remote child running an older backend whose
+                # duplicate-PUT handling can lose chunk state -- self-heals
+                # on retry instead of failing the task.
+                self._send_json_response(409, {
+                    "error": "UPLOAD_NOT_READY: some chunks are missing",
+                    "missing_chunks": missing,
+                })
                 return
             task['status'] = 'completing'
 

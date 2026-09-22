@@ -12,6 +12,8 @@ import {
   pasteTimestamp,
   resetPasteDirCache,
   resetPasteStamp,
+  isMissingChunksError,
+  missingChunkIds,
 } from './workspace-upload.js'
 
 vi.mock('./api.js', () => ({
@@ -117,6 +119,82 @@ describe('uploadFileToDir', () => {
     await expect(uploadFileToDir(file, '/tmp')).rejects.toThrow('boom')
     expect(workspace.uploadCancel).toHaveBeenCalledWith('upload-1')
     expect(workspace.uploadComplete).not.toHaveBeenCalled()
+  })
+
+  it('re-uploads the reported missing chunks and retries complete (flaky-link self-heal)', async () => {
+    mockUploadInit({ chunks: [
+      { parallel_id: 0, offset: 0, size: 5 },
+      { parallel_id: 1, offset: 5, size: 5 },
+    ] })
+    mockUploadChunk()
+    const missingErr = {
+      status: 409,
+      code: 'UPLOAD_NOT_READY: some chunks are missing',
+      data: { error: 'UPLOAD_NOT_READY: some chunks are missing', missing_chunks: [1] },
+    }
+    workspace.uploadComplete
+      .mockRejectedValueOnce(missingErr)
+      .mockResolvedValue({ status: 'completed' })
+
+    const file = makeFile('photo.png', 'image/png', 10)
+    const path = await uploadFileToDir(file, '/tmp')
+
+    // 2 initial chunks + exactly 1 re-upload (only the reported chunk).
+    expect(workspace.uploadChunk).toHaveBeenCalledTimes(3)
+    const reup = workspace.uploadChunk.mock.calls[2][1]
+    expect(reup).toMatchObject({ parallel_id: 1, offset: 5, size: 5, file_size: 10 })
+    expect(workspace.uploadComplete).toHaveBeenCalledTimes(2)
+    expect(workspace.uploadCancel).not.toHaveBeenCalled()
+    expect(path).toBe('/tmp/photo.png')
+  })
+
+  it('re-uploads every chunk when the backend reports no missing_chunks list', async () => {
+    mockUploadInit({ chunks: [
+      { parallel_id: 0, offset: 0, size: 5 },
+      { parallel_id: 1, offset: 5, size: 5 },
+    ] })
+    mockUploadChunk()
+    workspace.uploadComplete
+      .mockRejectedValueOnce({ status: 409, code: 'UPLOAD_NOT_READY: some chunks are missing' })
+      .mockResolvedValue({ status: 'completed' })
+
+    const file = makeFile('photo.png', 'image/png', 10)
+    const path = await uploadFileToDir(file, '/tmp')
+
+    // 2 initial chunks + 2 re-uploads (no list -> re-send everything).
+    expect(workspace.uploadChunk).toHaveBeenCalledTimes(4)
+    expect(workspace.uploadComplete).toHaveBeenCalledTimes(2)
+    expect(path).toBe('/tmp/photo.png')
+  })
+
+  it('does not heal a non-missing complete error (still cancels and throws)', async () => {
+    mockUploadInit({ chunks: [{ parallel_id: 0, offset: 0, size: 5 }] })
+    mockUploadChunk()
+    workspace.uploadComplete.mockRejectedValue({ status: 500, code: 'SERVER_ERROR: internal server error' })
+    workspace.uploadCancel.mockResolvedValue({ status: 'cancelled' })
+
+    const file = makeFile('x.png', 'image/png', 5)
+    await expect(uploadFileToDir(file, '/tmp')).rejects.toThrow()
+    // No re-upload on a non-missing failure.
+    expect(workspace.uploadChunk).toHaveBeenCalledTimes(1)
+    expect(workspace.uploadComplete).toHaveBeenCalledTimes(1)
+    expect(workspace.uploadCancel).toHaveBeenCalledWith('upload-1')
+  })
+})
+
+describe('isMissingChunksError / missingChunkIds', () => {
+  it('detects the 409 missing-chunks error by code or message', () => {
+    expect(isMissingChunksError({ status: 409, code: 'UPLOAD_NOT_READY: some chunks are missing' })).toBe(true)
+    expect(isMissingChunksError({ status: 409, message: 'UPLOAD_NOT_READY: some chunks are missing' })).toBe(true)
+    expect(isMissingChunksError({ status: 409, code: 'UPLOAD_CANCELLED: upload has been cancelled' })).toBe(false)
+    expect(isMissingChunksError({ status: 500, code: 'some chunks are missing' })).toBe(false)
+    expect(isMissingChunksError(null)).toBe(false)
+  })
+
+  it('extracts the missing parallel_ids and falls back to null', () => {
+    expect(missingChunkIds({ data: { missing_chunks: [1, 2] } })).toEqual([1, 2])
+    expect(missingChunkIds({ data: {} })).toBeNull()
+    expect(missingChunkIds({})).toBeNull()
   })
 })
 

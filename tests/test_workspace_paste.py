@@ -11,6 +11,7 @@ import http.client
 import io
 import json
 import os
+import tempfile
 import threading
 import urllib.error
 import urllib.request
@@ -537,3 +538,46 @@ class TestRetransmittedChunkPut:
         )
         resp = conn.getresponse()
         return resp.status, resp.read()
+
+    def test_complete_reports_missing_chunk_ids_for_client_self_heal(self, server):
+        """A 409 "some chunks are missing" must list the missing parallel_ids
+        so the client can re-upload exactly those chunks and retry (the data
+        is still local). This is how flaky links -- and remote children
+        running a backend older than the idempotent-PUT fix -- self-heal.
+        """
+        content = b"\x89PNG\r\n\x1a\n" + b"n" * 2048
+        conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=10)
+        try:
+            upload_id = self._init(conn, "missing-list.png", len(content))
+            status, body = self._put_chunk(conn, upload_id, content)
+            assert status == 200, body
+
+            # Simulate genuine server-side loss (older backend + duplicate
+            # PUT whose clobber the current disk-rescue cannot save, e.g. the
+            # temp file is also gone): the chunk is not uploaded and no
+            # temp file remains.
+            http_srv = server._server
+            with http_srv.workspace_uploads_lock:
+                for chunk in http_srv.workspace_uploads[upload_id]["chunks"]:
+                    chunk["status"] = "pending"
+            chunk_path = os.path.join(
+                tempfile.gettempdir(), f"{upload_id}-0")
+            if os.path.isfile(chunk_path):
+                os.remove(chunk_path)
+
+            status, raw = self._complete(conn, upload_id)
+            assert status == 409, raw
+            data = json.loads(raw)
+            assert data["error"] == "UPLOAD_NOT_READY: some chunks are missing"
+            assert data["missing_chunks"] == [0]
+
+            # Client-side heal: re-upload the reported chunk, retry complete.
+            status, body = self._put_chunk(conn, upload_id, content)
+            assert status == 200, body
+            status, raw = self._complete(conn, upload_id)
+            assert status == 200, raw
+            assert os.path.isfile("/tmp/missing-list.png")
+        finally:
+            conn.close()
+            if os.path.isfile("/tmp/missing-list.png"):
+                os.remove("/tmp/missing-list.png")

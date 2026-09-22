@@ -18,6 +18,31 @@ function normalizeUploadPath(path) {
     .join('/')
 }
 
+/**
+ * True when an upload-complete error means the server no longer has one or
+ * more chunks that the client believes it already uploaded.
+ *
+ * This happens when a flaky link (mobile networks retransmit chunk PUTs; a
+ * remote child running an older backend may let a retransmitted PUT reset an
+ * already-uploaded chunk's state) desynchronizes server and client. The
+ * client still holds the file data, so it can re-upload the missing chunks
+ * and retry instead of failing the task.
+ */
+export function isMissingChunksError(err) {
+  if (!err || err.status !== 409) return false
+  const code = err.code || err.message || ''
+  return /some chunks are missing/i.test(String(code))
+}
+
+/**
+ * parallel_ids the server reports as missing, or null when the backend is
+ * too old to include the list (callers must then re-upload every chunk).
+ */
+export function missingChunkIds(err) {
+  const ids = err?.data?.missing_chunks
+  return Array.isArray(ids) ? ids : null
+}
+
 /** Join a directory path and a filename, preserving the directory's separator style. */
 export function joinPath(dir, name) {
   if (!dir) return name
@@ -56,7 +81,23 @@ export async function uploadFileToDir(file, targetDirPath, { onProgress } = {}) 
       })
       await request.promise
     }
-    await workspace.uploadComplete(upload_id)
+    try {
+      await workspace.uploadComplete(upload_id)
+    } catch (err) {
+      if (!isMissingChunksError(err)) throw err
+      // The file data is still local: re-upload exactly the chunks the
+      // server reports as missing (all of them when the backend does not
+      // report which) and retry complete once.
+      const ids = missingChunkIds(err)
+      const retry = ids
+        ? sizedChunks.filter((chunk) => ids.includes(chunk.parallel_id))
+        : sizedChunks
+      for (const chunk of retry) {
+        const body = file.slice(chunk.offset, chunk.offset + chunk.size)
+        await workspace.uploadChunk(upload_id, chunk, body).promise
+      }
+      await workspace.uploadComplete(upload_id)
+    }
     return joinPath(targetDirPath, file.name)
   } catch (err) {
     try { await workspace.uploadCancel(upload_id) } catch { /* best-effort cleanup */ }

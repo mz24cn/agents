@@ -3,6 +3,7 @@
   import { t } from '../../lib/i18n.svelte.js'
   import { workspace as workspaceApi } from '../../lib/api.js'
   import { remoteWorkspace } from '../../lib/remote-execution.svelte.js'
+  import { isMissingChunksError, missingChunkIds } from '../../lib/workspace-upload.js'
   import { marked } from 'marked'
   import { highlight, escapeHtml, getFileLang, isMarkdownFile } from '../../lib/highlight.js'
   import { copyToClipboard } from '../../lib/clipboard.js'
@@ -1793,7 +1794,12 @@
 
       task.status = 'completing'
       refreshUploads()
-      await wsApi.uploadComplete(task.upload_id)
+      try {
+        await wsApi.uploadComplete(task.upload_id)
+      } catch (err) {
+        if (!isMissingChunksError(err)) throw err
+        if (!(await healMissingChunks(task, err))) return
+      }
       task.status = 'completed'
       task.chunks.forEach((chunk) => {
         chunk.uploaded = chunk.size
@@ -1846,6 +1852,39 @@
     refreshUploads()
   }
 
+  /**
+   * Self-heal a complete that failed with "some chunks are missing".
+   *
+   * A flaky link (mobile networks retransmit chunk PUTs; a remote child
+   * running an older backend may let a retransmitted PUT reset an
+   * already-uploaded chunk's state) can leave the server missing chunks the
+   * client already uploaded. The file data is still local, so re-PUT exactly
+   * the reported missing chunks (all of them when the backend does not
+   * report which) and retry complete once.
+   *
+   * @returns {Promise<boolean>} true when complete succeeded after healing;
+   *   false when the task is paused/cancelled or the re-upload failed (the
+   *   task is already marked failed by uploadPendingChunks).
+   */
+  async function healMissingChunks(task, err) {
+    const ids = missingChunkIds(err)
+    const missingChunks = ids
+      ? task.chunks.filter((chunk) => ids.includes(chunk.parallel_id))
+      : task.chunks
+    for (const chunk of missingChunks) {
+      chunk.status = 'pending'
+      chunk.uploaded = 0
+    }
+    refreshUploads()
+    const completed = await uploadPendingChunks(task)
+    if (!completed) return false
+    if (task.status === 'paused' || task.status === 'cancelled') return false
+    task.status = 'completing'
+    refreshUploads()
+    await wsApi.uploadComplete(task.upload_id)
+    return true
+  }
+
   function pauseUpload(task) {
     task.status = 'paused'
     for (const chunk of task.chunks) {
@@ -1875,7 +1914,14 @@
     task.status = 'completing'
     refreshUploads()
     try {
-      await wsApi.uploadComplete(task.upload_id)
+      try {
+        await wsApi.uploadComplete(task.upload_id)
+      } catch (err) {
+        // A task that already failed with "some chunks are missing" (e.g.
+        // before the client-side healing existed) heals on retry the same way.
+        if (!isMissingChunksError(err)) throw err
+        if (!(await healMissingChunks(task, err))) return
+      }
       task.status = 'completed'
       refreshUploads()
       if (pathsEqual(currentPath, task.target_dir_path)) loadFiles(currentPath)
