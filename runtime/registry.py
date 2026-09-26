@@ -10,7 +10,7 @@ import json
 import os
 from typing import Optional
 
-from runtime.models import ModelConfig
+from runtime.models import ModelConfig, _resolve_env_placeholders
 
 
 class ModelRegistry:
@@ -80,6 +80,18 @@ class ModelRegistry:
         config = self._models.get(model_id)
         if config is not None:
             return config
+        # Support ``{{KEY}}`` environment placeholders in model IDs (e.g. an
+        # AI agent configured with model_id "prod-{{ENV_SUFFIX}}").  Resolve
+        # the placeholders from backend environment variables and retry,
+        # mirroring how model endpoint fields are resolved at inference time.
+        resolved_id = _resolve_env_placeholders(model_id)
+        if resolved_id and resolved_id != model_id:
+            config = self._models.get(resolved_id)
+            if config is not None:
+                return config
+            ids = self._labels_index.get(resolved_id)
+            if ids:
+                return self._models.get(next(iter(ids)))
         # Fallback: search by label
         ids = self._labels_index.get(model_id)
         if ids:

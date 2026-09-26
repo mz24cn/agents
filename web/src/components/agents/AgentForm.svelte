@@ -195,6 +195,7 @@
       </div>
     </div>
     {#if errors.modelId}<span class="field-error">{errors.modelId}</span>{/if}
+    <span class="field-hint">{t('modelEnvPlaceholderHint')}</span>
   </div>
 
   <div class="form-group">

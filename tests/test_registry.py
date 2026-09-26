@@ -132,6 +132,46 @@ class TestModelRegistryPersistence:
             assert os.path.exists(path)
 
 
+class TestModelRegistryEnvPlaceholderModelId:
+    """``{{KEY}}`` env placeholders in model IDs (e.g. agent model_id)."""
+
+    def test_get_resolves_env_placeholder_model_id(self, monkeypatch):
+        monkeypatch.setenv("ENV_SUFFIX", "prod")
+        reg = ModelRegistry()
+        cfg = _make_config("qwen-prod")
+        reg.register(cfg)
+        assert reg.get("qwen-{{ENV_SUFFIX}}") is cfg
+
+    def test_get_placeholder_with_multiple_placeholders(self, monkeypatch):
+        monkeypatch.setenv("GPT_NAME", "gpt")
+        monkeypatch.setenv("ENV_SUFFIX", "9b")
+        reg = ModelRegistry()
+        cfg = _make_config("gpt-9b")
+        reg.register(cfg)
+        assert reg.get("{{GPT_NAME}}-{{ENV_SUFFIX}}") is cfg
+
+    def test_get_placeholder_missing_env_returns_none(self, monkeypatch):
+        monkeypatch.delenv("NOT_SET_ENV", raising=False)
+        reg = ModelRegistry()
+        reg.register(_make_config("real-model"))
+        # resolves to "" -> no match
+        assert reg.get("{{NOT_SET_ENV}}") is None
+
+    def test_get_plain_id_unchanged_when_no_placeholders(self):
+        reg = ModelRegistry()
+        reg.register(_make_config("m1"))
+        assert reg.get("m1") is not None
+        assert reg.get("no-such-model") is None
+
+    def test_get_resolves_placeholder_to_labeled_model(self, monkeypatch):
+        monkeypatch.setenv("ENV_TAG", "vlm")
+        reg = ModelRegistry()
+        cfg = _make_config("real-vlm", labels=["vlm"])
+        reg.register(cfg)
+        # Placeholder resolves to a label, not a model_id
+        assert reg.get("{{ENV_TAG}}") is cfg
+
+
 from runtime.models import ToolConfig
 from runtime.registry import ToolRegistry
 
