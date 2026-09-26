@@ -5,12 +5,9 @@
   import { copyToClipboard } from '$lib/clipboard.js'
 
   import { extractMath, renderMathElements } from '$lib/math.js'
+  import { extractMermaidFences, renderMermaidElements } from '$lib/mermaid.js'
 
   let { content = '' } = $props()
-
-  // Mermaid 渲染结果缓存（code -> SVG）：流式重渲染会重建 DOM，
-  // 同一图命中缓存后同步回填，避免每个 chunk 都重新请求 mermaid.ink
-  const mermaidCache = new Map()
 
   // Simple HTML escaper for XSS prevention — applied after marked renders
   function sanitizeHtml(html) {
@@ -24,15 +21,10 @@
   const renderer = new marked.Renderer()
 
   // Code blocks: render with language label, syntax highlighting, and copy button
-  // Mermaid diagrams are rendered asynchronously in the $effect below (dynamic import)
+  // Mermaid 围栏已被 extractMermaidFences 提前替换为占位符；
+  // 此处仍可能遇到未闭合的 ```mermaid（流式中）→ 按普通代码块展示，闭合后升级渲染
   renderer.code = function ({ text, lang }) {
     const normalizedLang = (lang || '').toLowerCase()
-    // Mermaid: output placeholder; actual rendering happens in $effect via dynamic import()
-    if (normalizedLang === 'mermaid') {
-      const encoded = btoa(unescape(encodeURIComponent(text)))
-      const escaped = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-      return `<div class="code-block mermaid-placeholder" data-mermaid-code="${encoded}"><pre><code>${escaped}</code></pre></div>`
-    }
     const highlightedHtml = highlight(text, normalizedLang)
     const rawBase64 = btoa(unescape(encodeURIComponent(text)))
     const langLabel = normalizedLang
@@ -57,7 +49,7 @@
   function renderMarkdown(src) {
     if (!src) return ''
     try {
-      const raw = marked.parse(extractMath(src), markedOptions)
+      const raw = marked.parse(extractMermaidFences(extractMath(src)), markedOptions)
       return sanitizeHtml(raw)
     } catch {
       return src
@@ -70,16 +62,6 @@
   let html = $derived(renderMarkdown(content))
 
   let markdownContainer
-
-  // Encode mermaid code for mermaid.ink API (base64url, no pako needed for typical diagrams)
-  function encodeForMermaidInk(code) {
-    try {
-      const raw = unescape(encodeURIComponent(code))
-      return btoa(raw).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
-    } catch {
-      return ''
-    }
-  }
 
   $effect(() => {
     void html
@@ -102,29 +84,17 @@
           }
         })
       })
-      // --- Mermaid rendering via mermaid.ink (zero local deps) ---
-      const placeholders = markdownContainer.querySelectorAll('.mermaid-placeholder:not([data-mermaid-rendered])')
-      for (const el of placeholders) {
-        el.dataset.mermaidRendered = '1'
-        const code = decodeURIComponent(escape(atob(el.dataset.mermaidCode)))
-        const cachedSvg = mermaidCache.get(code)
-        if (cachedSvg) {
-          el.innerHTML = cachedSvg
-          el.classList.add('mermaid-rendered')
-          continue
-        }
-        const encoded = encodeForMermaidInk(code)
-        if (!encoded) { el.classList.add('mermaid-error'); continue }
-        const url = `https://mermaid.ink/svg/${encoded}`
-        fetch(url)
-          .then(r => { if (!r.ok) throw new Error(r.status); return r.text() })
-          .then(svg => {
-            if (mermaidCache.size >= 100) mermaidCache.clear()
-            mermaidCache.set(code, svg)
-            el.innerHTML = svg
-            el.classList.add('mermaid-rendered')
-          })
-          .catch(() => { el.classList.add('mermaid-error') })
+      // --- Mermaid 图表：mermaid UMD CDN 按需本地渲染（零打包成本，无 CORS 问题） ---
+      const mermaidEls = markdownContainer.querySelectorAll('.mermaid-pending:not([data-mermaid-done])')
+      if (mermaidEls.length) {
+        void renderMermaidElements([...mermaidEls], {
+          labels: {
+            zoomIn: t('mermaidZoomIn'),
+            zoomOut: t('mermaidZoomOut'),
+            downloadSvg: t('mermaidDownloadSvg'),
+            downloadPng: t('mermaidDownloadPng'),
+          },
+        })
       }
       // --- Math rendering via KaTeX CDN (on-demand download, zero bundle size) ---
       const mathEls = markdownContainer.querySelectorAll('.math-pending:not([data-math-done])')
@@ -301,20 +271,59 @@
     border-radius: 4px;
   }
 
-  /* Mermaid diagram containers */
-  .markdown-content :global(.mermaid-placeholder) {
-    display: flex;
-    justify-content: center;
-  }
+  /* Mermaid diagram containers（占位符为 inline span，与 KaTeX 一致） */
+  .markdown-content :global(.mermaid-pending),
   .markdown-content :global(.mermaid-rendered) {
-    display: flex;
-    justify-content: center;
+    display: block;
+    position: relative; /* 工具栏绝对定位的锚点 */
+    text-align: center;
     padding: 0.6em 0;
     overflow-x: auto;
+    white-space: pre;
+  }
+  .markdown-content :global(.mermaid-rendered) {
+    white-space: normal;
   }
   .markdown-content :global(.mermaid-rendered svg) {
     max-width: 100%;
     height: auto;
+  }
+
+  /* Mermaid 工具栏：放大/缩小 + 导出（悬停显示，避免长图视觉干扰） */
+  .markdown-content :global(.mermaid-toolbar) {
+    position: absolute;
+    top: 0.35em;
+    right: 0.5em;
+    display: flex;
+    gap: 4px;
+    z-index: 2;
+    opacity: 0;
+    transition: opacity 0.15s ease;
+  }
+  .markdown-content :global(.mermaid-pending:hover .mermaid-toolbar),
+  .markdown-content :global(.mermaid-rendered:hover .mermaid-toolbar),
+  .markdown-content :global(.mermaid-toolbar:focus-within) {
+    opacity: 1;
+  }
+  .markdown-content :global(.mermaid-tbtn) {
+    padding: 2px 8px;
+    font-size: 0.72em;
+    line-height: 1.5;
+    color: var(--text-secondary, #888);
+    background: var(--bg-secondary, rgba(0,0,0,0.06));
+    border: 1px solid var(--border, rgba(0,0,0,0.1));
+    border-radius: 4px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: color 0.1s, background 0.1s;
+  }
+  .markdown-content :global(.mermaid-tbtn:hover) {
+    color: var(--text-primary, #333);
+    background: var(--bg-tertiary, rgba(0,0,0,0.12));
+  }
+  .markdown-content :global(.mermaid-tbtn:active) {
+    color: #fff;
+    background: var(--primary, #4a9eff);
   }
   .markdown-content :global(.mermaid-error) {
     opacity: 0.7;

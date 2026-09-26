@@ -277,6 +277,12 @@ const translations = {
     // CopyButton / MarkdownRenderer
     copy: '复制',
 
+    // Mermaid 图表工具栏（放大 / 导出）
+    mermaidZoomIn: '放大',
+    mermaidZoomOut: '缩小',
+    mermaidDownloadSvg: '下载 SVG',
+    mermaidDownloadPng: '下载 PNG',
+
     // FileUpload
     uploadFile: '上传文件',
     removeFile: '移除 {name}',
@@ -931,6 +937,12 @@ const translations = {
 
     // CopyButton / MarkdownRenderer
     copy: 'Copy',
+
+    // Mermaid toolbar (zoom / export)
+    mermaidZoomIn: 'Zoom in',
+    mermaidZoomOut: 'Zoom out',
+    mermaidDownloadSvg: 'Download SVG',
+    mermaidDownloadPng: 'Download PNG',
 
     // FileUpload
     uploadFile: 'Upload file',
