@@ -3,7 +3,7 @@
  * Validates: Requirements 6.1–6.6, 4.1, 5.5, 5.6
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { env, sessions, subscribeSessionStream, remoteEnv, buildSetupRequestUrl, extractSetupSnapshot, fetchRemoteJson, remoteEnvHomeUrl, isRemoteLogoImage, resolveRemoteEnvLogo, tools } from './api.js'
+import { env, sessions, subscribeSessionStream, subscribeSessionEvents, __resetSessionEventsHubForTests, remoteEnv, buildSetupRequestUrl, extractSetupSnapshot, fetchRemoteJson, remoteEnvHomeUrl, isRemoteLogoImage, resolveRemoteEnvLogo, tools } from './api.js'
 
 // ---------------------------------------------------------------------------
 // Helper: create a mock fetch that returns the given data with the given status
@@ -173,6 +173,135 @@ describe('subscribeSessionStream', () => {
     vi.useRealTimers()
   })
 })
+
+// ---------------------------------------------------------------------------
+// subscribeSessionEvents — 每 tab 单条共享 SSE 连接（hub）
+// ---------------------------------------------------------------------------
+// 背景：浏览器对同一 origin 的 HTTP/1.1 并发连接上限是 6 条。旧实现里
+// Sidebar / ChatPage / AuthSettingsPage 各自开一条永不释放的
+// /v1/sessions/events 长连接，3 个以上 tab 快速打开时连接池占满，
+// 其余请求全部排队"卡死"。hub 保证同 tab 只有一条连接，并保留
+// "每个订阅者都能拿到 init 快照"的语义。
+
+
+function sseEventStream(chunks) {
+  const encoder = new TextEncoder()
+  return new Response(new ReadableStream({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(encoder.encode(chunk))
+      controller.close()
+    },
+  }), { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+}
+
+describe('subscribeSessionEvents (shared hub)', () => {
+  beforeEach(() => {
+    __resetSessionEventsHubForTests()
+  })
+
+  it('多个订阅者共享一条 SSE 连接，全部取消订阅后才断开', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(
+      sseEventStream(['data: {"event":"init","sessions":{"s1":"streaming"},"titles":{}}\n\n']))
+    )
+    const seen1 = []
+    const seen2 = []
+    const un1 = subscribeSessionEvents((e) => seen1.push(e), () => {})
+    const un2 = subscribeSessionEvents((e) => seen2.push(e), () => {})
+    await flushPromises()
+
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(fetch.mock.calls[0][0]).toBe('/v1/sessions/events')
+    expect(seen1[0].event).toBe('init')
+    expect(seen2[0].event).toBe('init')
+
+    un1()
+    // 还有一位订阅者：不应重连，也不应断开
+    await flushPromises()
+    un2()
+    await flushPromises()
+    expect(fetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('晚到的订阅者先收到 init 快照及缓冲事件（与独立连接语义一致）', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(
+      sseEventStream([
+        'data: {"event":"init","sessions":{"s1":"streaming"},"titles":{}}\n\n',
+        'data: {"event":"message","session_id":"s1","status":"done_success"}\n\n',
+      ])
+    ))
+    const first = []
+    const un1 = subscribeSessionEvents((e) => first.push(e), () => {})
+    await flushPromises()
+
+    const late = []
+    const un2 = subscribeSessionEvents((e) => late.push(e), () => {})
+    expect(late.map((e) => e.event)).toEqual(['init', 'message'])
+    expect(late[0].sessions).toEqual({ s1: 'streaming' })
+    un1(); un2()
+  })
+
+  it('订阅时连接尚未到达 init：缓冲事件在 init 后按序补发', async () => {
+    let resolveFetch
+    const fetchMock = vi.fn().mockImplementation(
+      () => new Promise((resolve) => { resolveFetch = () => resolve(sseEventStream([
+        'data: {"event":"init","sessions":{},"titles":{}}\n\n',
+        'data: {"event":"message","session_id":"a","status":"streaming"}\n\n',
+      ])) }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const late = []
+    const un2 = subscribeSessionEvents((e) => late.push(e), () => {})
+    await flushPromises()
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(late).toEqual([])
+
+    resolveFetch()
+    await flushPromises()
+    expect(late.map((e) => [e.event, e.session_id ?? null])).toEqual([
+      ['init', null],
+      ['message', 'a'],
+    ])
+    un2()
+  })
+
+  it('流异常后延迟 1 秒重连，事件继续送达', async () => {
+    vi.useFakeTimers()
+    const first = sseEventStream(['data: {"event":"init","sessions":{},"titles":{}}\n\n'])
+    const second = sseEventStream([
+      'data: {"event":"init","sessions":{},"titles":{}}\n\n',
+      'data: {"event":"message","session_id":"b","status":"streaming"}\n\n',
+    ])
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce(first)
+      .mockResolvedValueOnce(second))
+    const events = []
+    const un = subscribeSessionEvents((e) => events.push(e), () => {})
+    await flushPromises()
+
+    await vi.advanceTimersByTimeAsync(1000)
+    await flushPromises()
+
+    expect(fetch).toHaveBeenCalledTimes(2)
+    expect(events.some((e) => e.event === 'message' && e.session_id === 'b')).toBe(true)
+    un()
+    vi.useRealTimers()
+  })
+
+  it('监听器抛错不影响 hub 及其他监听者', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(
+      sseEventStream(['data: {"event":"init","sessions":{},"titles":{}}\n\n'])
+    ))
+    const good = []
+    const un1 = subscribeSessionEvents(() => { throw new Error('boom') }, () => {})
+    const un2 = subscribeSessionEvents((e) => good.push(e), () => {})
+    await flushPromises()
+
+    expect(good.length).toBe(1)
+    expect(good[0].event).toBe('init')
+    un1(); un2()
+  })
+})
+
 
 // ---------------------------------------------------------------------------
 // env.set — POST /v1/env with { key, value }

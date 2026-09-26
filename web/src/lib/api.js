@@ -517,7 +517,205 @@ export function subscribeSessionStream(sessionId, onMessage, onDone, onError, on
 }
 
 /**
+ * 会话事件共享 Hub（GET /v1/sessions/events 的 SSE 单例）。
+ *
+ * 同一浏览器对同一 origin 的 HTTP/1.1 并发连接上限是 6 条。旧实现里
+ * Sidebar / ChatPage / AuthSettingsPage 等每个组件各自开一条永不释放的
+ * SSE 长连接：3 个以上 tab 快速打开时 6 条连接瞬间占满，其余所有
+ * 普通请求（文件管理器、会话列表……）在浏览器侧排队等空闲连接而
+ * "卡死"，关掉任意一个 tab 释放一条连接后立即恢复。
+ *
+ * 修复：每个 tab 全局只维护这一条 SSE 连接；组件调用
+ * subscribeSessionEvents() 只是在 hub 上注册监听器，全部取消订阅后
+ * 连接才关闭。晚到的监听者会先收到最近一次的 init 快照 + 缓冲的事件，
+ * 语义与旧实现（每个订阅者都有独立 init）保持一致。
+ */
+const sessionEventsHub = {
+  listeners: new Map(),
+  controller: null,
+  reconnectTimer: null,
+  watchdogTimer: null,
+  generation: 0,
+  connecting: false,
+  lastInit: null,
+  pending: new Map(),   // 等待 init 的迟到监听者：sid -> [event, ...]
+  buffer: [],           // init 之后到达的近期事件（有界），供迟到监听者补发
+  bufferInitSeq: -1,    // buffer 所基于的 init 的 generation
+  lastError: null,
+}
+const HUB_WATCHDOG_MS = 45_000
+const HUB_BUFFER_MAX = 1000
+
+function hubClearWatchdog() {
+  if (sessionEventsHub.watchdogTimer) clearTimeout(sessionEventsHub.watchdogTimer)
+  sessionEventsHub.watchdogTimer = null
+}
+
+function hubArmWatchdog(generation) {
+  hubClearWatchdog()
+  sessionEventsHub.watchdogTimer = setTimeout(() => {
+    if (generation !== sessionEventsHub.generation) return
+    streamDebug('events_watchdog', { generation })
+    sessionEventsHub.controller?.abort()
+  }, HUB_WATCHDOG_MS)
+}
+
+/** 把事件分发给全体监听器；init 之前到达的事件为等待者缓存。 */
+function hubDispatch(event) {
+  if (event?.event === 'init') {
+    sessionEventsHub.lastInit = event
+    sessionEventsHub.buffer = []
+    sessionEventsHub.bufferInitSeq = sessionEventsHub.generation
+  } else {
+    sessionEventsHub.buffer.push(event)
+    if (sessionEventsHub.buffer.length > HUB_BUFFER_MAX) sessionEventsHub.buffer.shift()
+  }
+  for (const entry of sessionEventsHub.listeners.values()) {
+    try {
+      entry.onEvent(event)
+    } catch (err) {
+      console.warn('[sessionEventsHub] listener error', err)
+    }
+  }
+  if (event?.event === 'init') {
+    // init 之后，等待中的迟到监听者进入常规分发：只补发 init 前缓存
+    // 的那部分事件（此时恰是 pending 队列中的内容），init 本身由上面的
+    // 主循环正常分发，避免重复。
+    for (const [sid, queue] of sessionEventsHub.pending) {
+      sessionEventsHub.pending.delete(sid)
+      const entry = sessionEventsHub.listeners.get(sid)
+      if (!entry) continue
+      for (const ev of queue) {
+        try { entry.onEvent(ev) } catch (err) { console.warn('[sessionEventsHub] listener error', err) }
+      }
+    }
+  } else {
+    for (const queue of sessionEventsHub.pending.values()) {
+      queue.push(event)
+    }
+  }
+}
+
+function hubDispatchError(err) {
+  if (err?.name === 'AbortError') return
+  streamDebug('events_error', { error: String(err) })
+  for (const entry of sessionEventsHub.listeners.values()) {
+    const { onError } = entry
+    try {
+      onError?.(err)
+    } catch {
+      // a listener throwing must not break hub delivery
+    }
+  }
+}
+
+function hubDeliverLate(sid, entry) {
+  const queue = sessionEventsHub.pending.get(sid) || []
+  sessionEventsHub.pending.delete(sid)
+  const { onEvent, onError } = entry
+  const lastError = sessionEventsHub.lastError
+  // 顺序与"当时立即订阅"一致：init（若已到达）→ init 后已缓冲的事件 → 错误
+  if (sessionEventsHub.lastInit && sessionEventsHub.bufferInitSeq === sessionEventsHub.generation) {
+    const replay = (ev) => {
+      try { onEvent(ev) } catch (err) { console.warn('[sessionEventsHub] listener error', err) }
+    }
+    replay(sessionEventsHub.lastInit)
+    for (const ev of sessionEventsHub.buffer) replay(ev)
+  }
+  for (const ev of queue) {
+    try { onEvent(ev) } catch (err) { console.warn('[sessionEventsHub] listener error', err) }
+  }
+  if (lastError) {
+    try { onError?.(lastError) } catch { /* ignore */ }
+  }
+}
+
+function hubConnect() {
+  const hub = sessionEventsHub
+  if (hub.connecting) return
+  if (hub.listeners.size === 0) return
+  hub.connecting = true
+  const generation = ++hub.generation
+  hub.controller = new AbortController()
+  streamDebug('events_connect', { generation })
+  hubArmWatchdog(generation)
+  apiFetch('/v1/sessions/events', { signal: hub.controller.signal })
+    .then((res) => {
+      if (generation !== hub.generation) return
+      if (!res.ok) throw new Error(`Session events request failed: ${res.status}`)
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      const pump = () => reader.read().then(({ done, value }) => {
+        if (generation !== hub.generation) return
+        if (done) {
+          hubClearWatchdog()
+          streamDebug('events_eof', { generation })
+          hub.connecting = false
+          hub.lastError = new Error('Session events stream closed')
+          hubDispatchError(hub.lastError)
+          if (hub.listeners.size > 0) hub.scheduleReconnect()
+          return
+        }
+        // Includes SSE comment heartbeats. Any bytes prove that this
+        // connection is still delivering data through the proxy/browser.
+        hubArmWatchdog(generation)
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() || ''
+        for (const line of lines) {
+          const trimmed = line.trim()
+          if (trimmed.startsWith('data: ')) {
+            const payload = trimmed.slice(6).trim()
+            try {
+              const event = JSON.parse(payload)
+              streamDebug('events_event', {
+                generation,
+                event: event?.event,
+                sessionId: event?.session_id,
+                status: event?.status,
+                sessions: event?.event === 'init' ? Object.keys(event?.sessions || {}).length : undefined,
+              })
+              hubDispatch(event)
+            } catch {
+              // skip malformed JSON
+            }
+          }
+        }
+        return pump()
+      })
+
+      hub.connecting = false
+      return pump()
+    })
+    .catch((err) => {
+      if (generation !== hub.generation) return
+      hubClearWatchdog()
+      if (err.name !== 'AbortError') {
+        hub.lastError = err
+        hubDispatchError(err)
+      }
+      if (hub.listeners.size > 0) hub.scheduleReconnect()
+    })
+}
+
+sessionEventsHub.scheduleReconnect = () => {
+  const hub = sessionEventsHub
+  if (hub.reconnectTimer) return
+  hub.reconnectTimer = setTimeout(() => {
+    hub.reconnectTimer = null
+    hub.connecting = false
+    if (hub.listeners.size > 0) hubConnect()
+  }, 1000)
+}
+
+/**
  * Subscribe to session status events via SSE (GET /v1/sessions/events).
+ *
+ * All subscribers within this tab share a single SSE connection (see the
+ * sessionEventsHub above); the returned unsubscribe removes only this
+ * listener and closes the connection when it is the last one.
  *
  * @param {function} onEvent  Called with each parsed event object:
  *   - init:         { event: 'init', sessions: { <sid>: <status>, ... },
@@ -527,111 +725,75 @@ export function subscribeSessionStream(sessionId, onMessage, onDone, onError, on
  *                   title: '<title>' and title_given: <boolean>)
  *   - title_update: { event: 'title_update', session_id: '<sid>', title: '<title>' }
  * @param {function} onError  Called on fetch or stream errors (except AbortError).
- * @returns {function}        Call to close/abort the SSE connection.
+ * @returns {function}        Call to remove this listener (and close the
+ *                            shared connection when it was the last one).
  */
 export function subscribeSessionEvents(onEvent, onError) {
-  let stopped = false
-  let controller = null
-  let reconnectTimer = null
-  let watchdogTimer = null
-  let connectionGeneration = 0
-  const WATCHDOG_MS = 45_000
-
-  const clearWatchdog = () => {
-    if (watchdogTimer) clearTimeout(watchdogTimer)
-    watchdogTimer = null
+  const hub = sessionEventsHub
+  if (hub.listeners.size === 0 && !hub.reconnectTimer) {
+    // Fresh hub: the first listener gets the "just connected" experience —
+    // lastError starts clean for it.
+    hub.lastError = null
   }
-
-  const armWatchdog = (generation) => {
-    clearWatchdog()
-    watchdogTimer = setTimeout(() => {
-      if (stopped || generation !== connectionGeneration) return
-      streamDebug('events_watchdog', { generation })
-      controller?.abort()
-      scheduleReconnect()
-    }, WATCHDOG_MS)
+  const sid = Math.random().toString(16).slice(2)
+  hub.listeners.set(sid, { sid, onEvent, onError })
+  if (hub.lastInit && hub.bufferInitSeq === hub.generation) {
+    // Connected (or reconnecting with a fresh init): deliver immediately.
+    try { onEvent(hub.lastInit) } catch (err) { console.warn('[sessionEventsHub] listener error', err) }
+    for (const ev of hub.buffer) {
+      try { onEvent(ev) } catch (err) { console.warn('[sessionEventsHub] listener error', err) }
+    }
+  } else {
+    hub.pending.set(sid, [])
   }
-
-  const scheduleReconnect = () => {
-    if (stopped || reconnectTimer) return
-    reconnectTimer = setTimeout(() => {
-      reconnectTimer = null
-      connect()
-    }, 1000)
+  const lastError = hub.lastError
+  if (lastError) {
+    try { onError?.(lastError) } catch { /* ignore */ }
   }
-
-  const connect = () => {
-    if (stopped) return
-    const generation = ++connectionGeneration
-    controller = new AbortController()
-    streamDebug('events_connect', { generation })
-    armWatchdog(generation)
-    apiFetch('/v1/sessions/events', { signal: controller.signal })
-      .then((res) => {
-        if (!res.ok) throw new Error(`Session events request failed: ${res.status}`)
-        const reader = res.body.getReader()
-        const decoder = new TextDecoder()
-        let buffer = ''
-
-        const pump = () => reader.read().then(({ done, value }) => {
-          if (generation !== connectionGeneration) return
-          if (done) {
-            clearWatchdog()
-            streamDebug('events_eof', { generation })
-            scheduleReconnect()
-            return
-          }
-          // Includes SSE comment heartbeats. Any bytes prove that this
-          // connection is still delivering data through the proxy/browser.
-          armWatchdog(generation)
-          buffer += decoder.decode(value, { stream: true })
-          const lines = buffer.split('\n')
-          buffer = lines.pop() || ''
-          for (const line of lines) {
-            const trimmed = line.trim()
-            if (trimmed.startsWith('data: ')) {
-              const payload = trimmed.slice(6).trim()
-              try {
-                const event = JSON.parse(payload)
-                streamDebug('events_event', {
-                  generation,
-                  event: event?.event,
-                  sessionId: event?.session_id,
-                  status: event?.status,
-                  sessions: event?.event === 'init' ? Object.keys(event?.sessions || {}).length : undefined,
-                })
-                onEvent(event)
-              } catch {
-                // skip malformed JSON
-              }
-            }
-          }
-          return pump()
-        })
-
-        return pump()
-      })
-      .catch((err) => {
-        if (generation !== connectionGeneration || stopped) return
-        clearWatchdog()
-        if (err.name !== 'AbortError') {
-          streamDebug('events_error', { generation, error: String(err) })
-          onError?.(err)
-        }
-        scheduleReconnect()
-      })
-  }
-
-  connect()
+  hubConnect()
   return () => {
-    stopped = true
-    connectionGeneration += 1
-    clearWatchdog()
-    if (reconnectTimer) clearTimeout(reconnectTimer)
-    reconnectTimer = null
-    controller?.abort()
+    hub.listeners.delete(sid)
+    hub.pending.delete(sid)
+    if (hub.listeners.size === 0) {
+      // Last listener left: tear the shared connection down.
+      hub.generation += 1
+      hubClearWatchdog()
+      if (hub.reconnectTimer) {
+        clearTimeout(hub.reconnectTimer)
+        hub.reconnectTimer = null
+      }
+      hub.controller?.abort()
+      hub.controller = null
+      hub.connecting = false
+      hub.lastInit = null
+      hub.buffer = []
+      hub.bufferInitSeq = -1
+      hub.lastError = null
+      hub.pending.clear()
+    }
   }
 }
+
+/** Test helper: fully reset the shared hub between test cases. */
+export function __resetSessionEventsHubForTests() {
+  const hub = sessionEventsHub
+  hub.generation += 1
+  hubClearWatchdog()
+  if (hub.reconnectTimer) {
+    clearTimeout(hub.reconnectTimer)
+    hub.reconnectTimer = null
+  }
+  hub.controller?.abort()
+  hub.controller = null
+  hub.connecting = false
+  hub.listeners.clear()
+  hub.lastInit = null
+  hub.buffer = []
+  hub.bufferInitSeq = -1
+  hub.lastError = null
+  hub.pending.clear()
+}
+
 
 export const auth = {
   config: () => request('GET', '/v1/auth/config'),
