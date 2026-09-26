@@ -1012,6 +1012,7 @@ def publish_session_stream_frame(
     """
     if not session_id:
         return 0
+    debug_info = None
     with _session_stream_lock:
         stream = _session_streams.get(session_id)
         if stream is None:
@@ -1029,11 +1030,21 @@ def publish_session_stream_frame(
         stream["frames"].append(envelope)
         subscribers = list(stream["subscribers"])
         if _session_stream_debug_enabled():
-            logging.getLogger("runtime.server").warning(
-                "session_stream publish sid=%s seq=%s persisted=%s subscribers=%s starter=%s %s",
-                session_id, seq, stream["persisted_seq"], len(subscribers),
-                stream["starter_connected"], _session_stream_frame_summary(frame),
+            # Capture the fields under the lock but log only after release:
+            # this is the per-frame hot path and logging may block on a slow
+            # stderr; it must not hold the per-frame lock.
+            debug_info = (
+                seq,
+                stream["persisted_seq"],
+                len(subscribers),
+                stream["starter_connected"],
+                _session_stream_frame_summary(frame),
             )
+    if debug_info is not None:
+        logging.getLogger("runtime.server").warning(
+            "session_stream publish sid=%s seq=%s persisted=%s subscribers=%s starter=%s %s",
+            session_id, *debug_info,
+        )
     dead = []
     for send_fn in subscribers:
         try:
@@ -1093,11 +1104,21 @@ def transition_session_stream_status(
 ) -> bool:
     """Set/broadcast status only for the current inference generation.
 
-    The stream-owner check, state mutation and event enqueue are serialized
-    against ``begin_session_stream``. This guarantees that an old request cannot
-    broadcast ``done_error_unread`` after a newer request for the same session
-    has already announced ``streaming``.
+    The owner check, state mutation and event enqueue are serialized against
+    ``begin_session_stream`` (all under ``_session_stream_lock``). This
+    guarantees that an old request cannot enqueue ``done_error_unread`` after a
+    newer request for the same session has already announced ``streaming``.
+
+    The SSE frame itself — canonical title lookup (a disk read of index.json
+    for done_* statuses) plus JSON encoding — is built *before* the locks are
+    taken, and the enqueue is a non-blocking queue put, so the critical
+    section performs no I/O and no serialization work.
     """
+    # Built without holding any lock: for done_* statuses this reads the
+    # session title from index.json. Persistence (including auto title
+    # generation) has already completed before this transition is reached, so
+    # the title is final whether it is read before or after the mutation.
+    frame = _build_session_status_frame(session_id, status)
     with _session_stream_lock:
         stream = _session_streams.get(session_id)
         if stream is None or stream.get("cancel_event") is not owner_event:
@@ -1110,7 +1131,9 @@ def transition_session_stream_status(
                 _unread_sessions.pop(session_id, None)
         # Keep the stream-generation lock through enqueueing. A replacement
         # begin/status transition therefore always appears after this event.
-        _broadcast_session_status(session_id, status)
+        # send_fn implementations are non-blocking queue puts, so no I/O
+        # happens here.
+        _enqueue_session_event_frame(frame)
         return True
 
 
@@ -1122,13 +1145,21 @@ def get_session_stream_snapshot(session_id: str, after_seq: int = -1) -> dict:
         # Negative means "conversation.json is the baseline": replay only frames
         # produced after the latest successful incremental persistence.
         effective_after = stream["persisted_seq"] if after_seq < 0 else after_seq
-        return {
-            "active": not stream["done"],
-            "done": stream["done"],
-            "persisted_seq": stream["persisted_seq"],
-            "latest_seq": stream["next_seq"] - 1,
-            "frames": [item.copy() for item in stream["frames"] if item["seq"] > effective_after],
-        }
+        active = not stream["done"]
+        done = stream["done"]
+        persisted_seq = stream["persisted_seq"]
+        latest_seq = stream["next_seq"] - 1
+        # Pointer snapshot only: retained frames are append-only and envelopes
+        # are never mutated in place, so the per-frame copies can safely be
+        # built outside the lock.
+        frames_snapshot = list(stream["frames"])
+    return {
+        "active": active,
+        "done": done,
+        "persisted_seq": persisted_seq,
+        "latest_seq": latest_seq,
+        "frames": [item.copy() for item in frames_snapshot if item["seq"] > effective_after],
+    }
 
 
 def subscribe_session_stream(session_id: str, send_fn) -> bool:
@@ -1201,7 +1232,14 @@ def flight_sessions_snapshot() -> list[str]:
 
 
 def register_session_stream_with_snapshot(session_id: str, send_fn, after_seq: int = -1) -> tuple[bool, dict]:
-    """Atomically register a subscriber and take its replay snapshot."""
+    """Atomically register a subscriber and take its replay snapshot.
+
+    Registration and the frame *pointer* snapshot are atomic under the lock so
+    no frame can fall into the replay/live hand-off gap. The per-frame dict
+    copies are built afterwards, outside the lock: retained frames are
+    append-only and envelopes are never mutated in place, so a pointer copy
+    taken at registration time is a stable snapshot.
+    """
     with _session_stream_lock:
         stream = _session_streams.get(session_id)
         if stream is None:
@@ -1210,21 +1248,29 @@ def register_session_stream_with_snapshot(session_id: str, send_fn, after_seq: i
         if registered:
             stream["subscribers"].append(send_fn)
         effective_after = stream["persisted_seq"] if after_seq < 0 else after_seq
-        snapshot = {
-            "active": registered,
-            "done": stream["done"],
-            "persisted_seq": stream["persisted_seq"],
-            "latest_seq": stream["next_seq"] - 1,
-            "frames": [item.copy() for item in stream["frames"] if item["seq"] > effective_after],
-        }
+        done = stream["done"]
+        persisted_seq = stream["persisted_seq"]
+        latest_seq = stream["next_seq"] - 1
+        frames_snapshot = list(stream["frames"])
         if _session_stream_debug_enabled():
-            logging.getLogger("runtime.server").warning(
-                "session_stream register sid=%s requested_after=%s effective_after=%s active=%s "
-                "persisted=%s latest=%s replay=%s subscribers=%s",
-                session_id, after_seq, effective_after, registered, stream["persisted_seq"],
-                snapshot["latest_seq"], len(snapshot["frames"]), len(stream["subscribers"]),
-            )
-        return registered, snapshot
+            debug_info = (after_seq, effective_after, registered, persisted_seq,
+                          latest_seq, len(stream["subscribers"]))
+        else:
+            debug_info = None
+    replay = [item.copy() for item in frames_snapshot if item["seq"] > effective_after]
+    if debug_info is not None:
+        logging.getLogger("runtime.server").warning(
+            "session_stream register sid=%s requested_after=%s effective_after=%s active=%s "
+            "persisted=%s latest=%s replay=%s subscribers=%s",
+            session_id, *debug_info, len(replay),
+        )
+    return registered, {
+        "active": registered,
+        "done": done,
+        "persisted_seq": persisted_seq,
+        "latest_seq": latest_seq,
+        "frames": replay,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1511,18 +1557,24 @@ _cleanup_thread = threading.Thread(target=cleanup_expired_terminal_sessions, dae
 _cleanup_thread.start()
 
 
-def _broadcast_session_status(session_id: str, status: str) -> None:
-    """Broadcast a session status change to all SSE subscribers.
+def _build_session_event_frame(session_id: str, event_type: str, data: dict) -> str:
+    """Build the SSE wire format for a session event (pure CPU work)."""
+    payload = {"event": event_type, "session_id": session_id, **data}
+    event_payload = json.dumps(payload, ensure_ascii=False)
+    return f"data: {event_payload}\n\n"
 
-    Called with _session_state_lock held (or outside if safe).  Here we
-    iterate a *snapshot* of the subscriber list so we can safely remove
-    dead entries without holding the lock during I/O.
+
+def _build_session_status_frame(session_id: str, status: str) -> str:
+    """Build the SSE frame for a session status change.
 
     Terminal ``done_*`` events additionally carry the canonical title
     (``title`` / ``title_given``) from index.json.  Persistence (including
     any auto title generation) has already completed before these statuses
     are broadcast, so the frontend can restore the sidebar title directly
     from the event.
+
+    This may perform disk I/O (title lookup) and must therefore be called
+    *without* holding ``_session_stream_lock`` / ``_session_state_lock``.
     """
     data = {"status": status}
     if status in ("done_success_unread", "done_error_unread"):
@@ -1530,28 +1582,26 @@ def _broadcast_session_status(session_id: str, status: str) -> None:
         if info is not None:
             data["title"] = info["title"]
             data["title_given"] = info["title_given"]
-    _broadcast_session_event(session_id, "message", data)
+    return _build_session_event_frame(session_id, "message", data)
 
 
-def _broadcast_session_event(session_id: str, event_type: str, data: dict) -> None:
-    """Broadcast an arbitrary session event to all SSE subscribers.
+def _enqueue_session_event_frame(frame: str) -> None:
+    """Enqueue a pre-built SSE frame to every global event subscriber.
 
-    Args:
-        session_id: The session this event belongs to.
-        event_type: Event type string (e.g. 'message', 'title_update').
-        data: Extra key-value pairs merged into the event payload.
+    The subscriber list is snapshotted under ``_session_state_lock``; the
+    ``send_fn`` calls are non-blocking queue puts, so this helper performs no
+    I/O and is safe (and cheap) to call while the caller holds
+    ``_session_stream_lock`` — the status transition path relies on that to
+    keep the enqueue ordered against ``begin_session_stream``.  Dead
+    subscribers are removed afterwards, outside the enqueue.
     """
-    payload = {"event": event_type, "session_id": session_id, **data}
-    event_payload = json.dumps(payload, ensure_ascii=False)
-    frame = f"data: {event_payload}\n\n"
-
     # Take snapshot of subscriber list under lock
     with _session_state_lock:
         subscribers_snapshot = list(_session_event_subscribers)
     if _session_stream_debug_enabled():
         logging.getLogger("runtime.server").warning(
-            "session_events publish sid=%s event=%s status=%s subscribers=%s",
-            session_id, event_type, data.get("status"), len(subscribers_snapshot),
+            "session_events publish frame_len=%s subscribers=%s",
+            len(frame), len(subscribers_snapshot),
         )
 
     dead: list = []
@@ -1570,4 +1620,25 @@ def _broadcast_session_event(session_id: str, event_type: str, data: dict) -> No
                     _session_event_subscribers.remove(fn)
                 except ValueError:
                     pass
+
+
+def _broadcast_session_status(session_id: str, status: str) -> None:
+    """Broadcast a session status change to all SSE subscribers.
+
+    The frame (including any disk-backed title lookup) is built before the
+    subscriber snapshot is taken, so no I/O runs while any session lock is
+    held.
+    """
+    _enqueue_session_event_frame(_build_session_status_frame(session_id, status))
+
+
+def _broadcast_session_event(session_id: str, event_type: str, data: dict) -> None:
+    """Broadcast an arbitrary session event to all SSE subscribers.
+
+    Args:
+        session_id: The session this event belongs to.
+        event_type: Event type string (e.g. 'message', 'title_update').
+        data: Extra key-value pairs merged into the event payload.
+    """
+    _enqueue_session_event_frame(_build_session_event_frame(session_id, event_type, data))
 
