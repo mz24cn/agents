@@ -3,7 +3,9 @@
 简化设计：会话绑定到远程环境时，**工具清单只取母环境 registry**（模型与
 本地模式看到完全一致的 name / parameters / description）；每个选中工具挂上
 转发 callable，经 ``InferenceRequest.tools`` 直传推理循环与子代理（group
-chat / talk_to / delegate）。每次工具调用被转发到子环境的
+chat / talk_to / delegate）；但编排工具（``PARENT_SIDE_TOOLS``：talk_to /
+delegate）不转发，保持母端本地执行——它们依赖母端的 AgentManager 与群聊
+编排上下文，必须在母端解析目标 agent。每次工具调用被转发到子环境的
 ``POST /v1/tools/call``，按母端 tool_id 在子端执行（子端没有该工具时由子端
 返回错误，模型自行处理）。远程工具**不注册进母端全局 ToolRegistry**（包装
 发生在每次推理请求，母端 registry 原对象不被修改）。
@@ -51,6 +53,17 @@ _HTTP_TIMEOUT_SECONDS = 180.0
 # 工具调用转发在拿不到工具级有效超时时的兜底网络超时（秒）：TOOL_EXEC_TIMEOUT
 # 被禁用（None）或非推理路径调用时不会无限阻塞，等待子端自身超时/隧道判死。
 _TOOL_CALL_FALLBACK_TIMEOUT = 3600.0
+
+# 编排类工具（agent orchestration）：即便会话绑定到远程环境，也始终在母端
+# （父端）本地执行，不转发到子端。原因：
+#   * talk_to / delegate 依赖母端的 AgentManager（本群聊 / 会话选中的 agent
+#     注册表）与群聊编排上下文；子端是独立环境，没有本群聊的 agent 信息，
+#     转发过去既无法解析目标 agent，也会让编排逻辑散落两端。
+#   * 它们的工具清单与子 agent 的推理同样按母端 registry 构建（与本地一致），
+#     真正需要落到子端执行的文件 / 终端 / MCP 工具再由子 agent 的代理条目转发。
+# 因此 wrap_parent_configs 对这批工具原样保留母端配置（本地 callable），
+# 其余工具照常被包成子端转发代理。
+PARENT_SIDE_TOOLS = frozenset({"talk_to", "delegate"})
 
 
 class RemoteToolProxy:
@@ -318,11 +331,17 @@ class RemoteToolProxy:
         工具时由子端返回错误，模型自行处理。skill 条目原样返回（母端推理
         循环触发渐进式披露，见 ``Runtime._disclose_skill``）。
 
+        编排工具（``PARENT_SIDE_TOOLS``：talk_to / delegate）原样保留母端配置（本地 callable），不包成子端代理——它们依赖母端的 AgentManager 与群聊编排上下文，必须在母端执行。
+
         母端 registry 的共享对象不被修改（每次推理请求复制一份）。
         """
         wrapped: list[ToolConfig] = []
         for tc in configs:
             if tc.tool_type == "skill":
+                wrapped.append(tc)
+                continue
+            if tc.tool_id in PARENT_SIDE_TOOLS:
+                # 编排工具保持母端本地执行（callable 走母端 registry），不转发子端
                 wrapped.append(tc)
                 continue
             original_type = tc.tool_type

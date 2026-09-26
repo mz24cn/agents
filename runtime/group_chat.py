@@ -934,9 +934,21 @@ def _run_group_chat_stream_gen(
             agent_model_id: str = agent.get("model_id", model_id)
             agent_tool_ids: list[str] = agent.get("tool_ids", tool_ids)
             base_tools = getattr(base_request, "tools", None)
-            if base_tools is not None:
-                # 远程会话：子 agent 的工具全部取自子端代理条目（按子端原始
-                # tool_id 匹配）；本地工具不参与。
+            remote_proxy = get_request_context("remote_tool_proxy")
+            is_remote = remote_proxy is not None or base_tools is not None
+            if remote_proxy is not None:
+                # 远程会话（简化机制）：与本地一致，按 agent 自身 tool_ids 从
+                # 母端 registry 取工具；编排工具（talk_to / delegate）保持母端
+                # 本地执行，其余包成子端转发代理。
+                tool_registry = getattr(runtime, "_tool_registry", None)
+                configs = []
+                if tool_registry is not None:
+                    for tid in agent_tool_ids:
+                        tc = tool_registry.get(tid)
+                        if tc is not None:
+                            configs.append(tc)
+                agent_tool_scope = remote_proxy.wrap_parent_configs(configs)
+            elif base_tools is not None:
                 agent_tool_scope = [
                     tc for tc in base_tools if tc.tool_id in agent_tool_ids
                 ]
@@ -1005,7 +1017,7 @@ def _run_group_chat_stream_gen(
             request = InferenceRequest(
                 model_id=agent_model_id,
                 tool_ids=agent_tool_ids,
-                tools=agent_tool_scope if base_tools is not None else None,
+                tools=agent_tool_scope if is_remote else None,
                 messages=agent_messages,
                 stream=True,
                 max_tool_rounds=base_request.max_tool_rounds,
