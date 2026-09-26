@@ -204,12 +204,17 @@ def _env_patches(fake, ocr_responder=None):
 def _with_env(fake, ocr_responder=None):
     class Ctx:
         def __enter__(self):
-            self._ms = [p.start() for p in _env_patches(fake, ocr_responder)]
+            # Keep the *patchers*, not the mocks they return: calling stop()
+            # on a Mock is a no-op and would leak every patch (notably the
+            # global ``time.sleep`` one) into the rest of the test session.
+            self._ps = _env_patches(fake, ocr_responder)
+            for p in self._ps:
+                p.start()
             m._discover_cache.clear()
             return self
 
         def __exit__(self, *exc):
-            for p in reversed(self._ms):
+            for p in reversed(self._ps):
                 p.stop()
             m._discover_cache.clear()
             return False
