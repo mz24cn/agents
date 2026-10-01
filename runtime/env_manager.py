@@ -302,9 +302,12 @@ class EnvManager:
     def _scan_backend_build_mtime(self, project_root: str) -> float:
         """Uncached implementation of :meth:`get_backend_build_mtime`."""
         web_root_real = os.path.realpath(os.path.join(project_root, "web"))
+        # Deployable trees only.  docs/, tests/ and examples/ are dev-only:
+        # they are not shipped by _copy_project or build_delta_tar, so edits
+        # to them must not bump the advertised backend build either.
         exclude_dirs = {".git", "__pycache__", ".pytest_cache", ".hypothesis", ".mypy_cache",
                         ".ruff_cache", "node_modules", "dist", "build", ".venv", "venv",
-                        "workspace"}
+                        "workspace", "docs", "tests", "examples"}
         latest_mtime = 0.0
         for dirpath, dirnames, filenames in os.walk(project_root):
             dir_real = os.path.realpath(dirpath)
@@ -337,9 +340,13 @@ class EnvManager:
         project_root = os.path.realpath(project_root)
         data_dir = os.path.realpath(data_dir)
         web_dist_real = os.path.realpath(os.path.join(project_root, "web", "dist"))
+        # Keep in sync with _copy_project (full setup) and
+        # _scan_backend_build_mtime: dev-only trees are never shipped, so
+        # they must never enter a delta either.  (docs/ used to sneak in
+        # here because it was missing from this list.)
         exclude_dirs = {".git", "__pycache__", ".pytest_cache", ".hypothesis", ".mypy_cache",
                         ".ruff_cache", "node_modules", "dist", "build", ".venv", "venv",
-                        "workspace"}
+                        "workspace", "docs", "tests", "examples"}
 
         def should_exclude(path_real: str, name: str) -> bool:
             if path_real == web_dist_real:
@@ -497,9 +504,12 @@ class EnvManager:
 
     def _copy_project(self, src: str, dst: str) -> None:
         import shutil
+        # Installed instances only need what runs the service.  docs/,
+        # tests/ and examples/ are dev-only and would otherwise bloat every
+        # full setup payload by ~1.3 MB uncompressed.
         exclude_dirs = {".git", "__pycache__", ".pytest_cache", ".hypothesis", ".mypy_cache",
                         ".ruff_cache", "node_modules", "dist", "build", ".venv", "venv",
-                        "workspace", "docs"}
+                        "workspace", "docs", "tests", "examples"}
         exclude_files = {".DS_Store"}
         src_real = os.path.realpath(src)
         web_dist_real = os.path.join(src_real, "web", "dist")

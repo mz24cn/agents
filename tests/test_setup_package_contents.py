@@ -68,6 +68,79 @@ def test_full_setup_payload_contains_frontend_sources_and_accessories(tmp_path: 
     assert "app/web/node_modules/ignored.js" not in names
 
 
+def test_full_setup_payload_excludes_dev_only_trees(tmp_path: Path) -> None:
+    """docs/, tests/ and examples/ must never enter the full setup payload.
+
+    An installed instance only needs what runs the service; shipping the
+    test suite and example scripts added ~1.3 MB (uncompressed) to every
+    full setup download for no runtime benefit.
+    """
+    project, data, manager = _sample_project(tmp_path)
+    _write(project / "tests" / "test_backend.py", "def test_x():\n    pass\n")
+    _write(project / "examples" / "demo.py", "print('demo')\n")
+    _write(project / "docs" / "guide.md", "# guide\n")
+
+    payload = manager._build_setup_payload(
+        project_root=str(project),
+        data_dir=str(data),
+        runtime=None,
+        prompt_template_manager=None,
+        agent_manager=None,
+        include_project=True,
+        include_env=False,
+    )
+    names = _tar_names(payload)
+
+    assert not any(name.startswith("app/tests/") for name in names)
+    assert not any(name.startswith("app/examples/") for name in names)
+    assert not any(name.startswith("app/docs/") for name in names)
+    # Deployable trees are still shipped.
+    assert "app/runtime/server.py" in names
+    assert "app/web/src/App.svelte" in names
+    assert "app/accessories/extension.py" in names
+
+
+def test_delta_excludes_dev_only_trees_even_when_newest(tmp_path: Path) -> None:
+    """A delta carries only deployable files, whatever their mtime.
+
+    docs/ used to be missing from the delta's exclude list, so an edited
+    document could drag ~17 MB of docs into an update delta.
+    """
+    project, data, manager = _sample_project(tmp_path)
+    old = 1_000_000_000
+    new = 2_000_000_000
+
+    for path in project.rglob("*"):
+        if path.is_file():
+            os.utime(path, (old, old))
+
+    # Dev-only files crossing the threshold must not be collected ...
+    _write(project / "tests" / "test_new.py", "def test_y():\n    pass\n")
+    _write(project / "examples" / "new_demo.py", "print(1)\n")
+    _write(project / "docs" / "new.md", "# new\n")
+    # ... but a real change next to them must still be delivered.
+    _write(project / "runtime" / "runtime.py", "# backend v2\n")
+    for path in (project / "tests" / "test_new.py",
+                 project / "examples" / "new_demo.py",
+                 project / "docs" / "new.md",
+                 project / "runtime" / "runtime.py"):
+        os.utime(path, (new, new))
+
+    delta = manager.build_delta_tar(
+        project_root=str(project),
+        data_dir=str(data),
+        frontend_since=old,
+        backend_since=old,
+        config_since=old,
+    )
+    assert delta is not None
+    names = _tar_names(delta)
+    assert "runtime/runtime.py" in names
+    assert not any(name.startswith("tests/") for name in names)
+    assert not any(name.startswith("examples/") for name in names)
+    assert not any(name.startswith("docs/") for name in names)
+
+
 def test_delta_contains_changed_frontend_sources_and_accessories(tmp_path: Path) -> None:
     project, data, manager = _sample_project(tmp_path)
     old = 1_000_000_000
@@ -112,6 +185,30 @@ def test_backend_build_mtime_includes_accessories_assets_but_not_web(tmp_path: P
     os.utime(project / "web" / "src" / "App.svelte", (web_newest, web_newest))
 
     assert manager.get_backend_build_mtime(str(project)) == accessory_new
+
+
+def test_backend_build_mtime_ignores_dev_only_trees(tmp_path: Path) -> None:
+    """Editing docs/tests/examples must not bump the advertised build.
+
+    Those trees are not shipped, so a version bump they cause would
+    advertise an update that carries no deployable file.
+    """
+    project, _data, manager = _sample_project(tmp_path)
+    old = 1_500_000_000
+    dev_new = 1_700_000_000
+    code_new = 1_900_000_000
+
+    for path in project.rglob("*"):
+        if path.is_file():
+            os.utime(path, (old, old))
+    _write(project / "docs" / "new.md", "# new\n")
+    _write(project / "tests" / "test_new.py", "def test_z():\n    pass\n")
+    os.utime(project / "docs" / "new.md", (dev_new, dev_new))
+    os.utime(project / "tests" / "test_new.py", (dev_new, dev_new))
+
+    assert manager._scan_backend_build_mtime(str(project)) == old
+    os.utime(project / "runtime" / "server.py", (code_new, code_new))
+    assert manager._scan_backend_build_mtime(str(project)) == code_new
 
 
 def test_delta_sends_only_changed_web_and_accessories_files(tmp_path: Path) -> None:
