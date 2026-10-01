@@ -486,7 +486,7 @@ def materialize_blob(blob_ref: dict, target_path: str, workspace: str, journal_d
         if uid is not None and gid is not None:
             try:
                 os.chown(target_path, uid, gid)
-            except OSError:
+            except (OSError, AttributeError):
                 pass
     finally:
         if tmp_path:

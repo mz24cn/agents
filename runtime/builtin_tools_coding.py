@@ -321,15 +321,16 @@ def _apply_file_metadata(
     the pre-write stat values so the original metadata can be reapplied.
 
     Failures are swallowed on purpose: metadata restoration must never turn
-    a successful write into an error, and chown is not available to
-    non-root callers anyway.
+    a successful write into an error.  chown is not available to
+    non-root callers anyway, and on Windows ``os.chown`` does not exist at
+    all (accessing it raises ``AttributeError``).
     """
     try:
         if mode is not None:
             os.chmod(path, mode)
         if uid is not None and gid is not None:
             os.chown(path, uid, gid)
-    except OSError as exc:
+    except (OSError, AttributeError) as exc:
         logger.debug("Could not restore metadata for %s: %s", path, exc)
 
 
