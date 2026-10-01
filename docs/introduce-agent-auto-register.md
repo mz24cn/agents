@@ -10,7 +10,7 @@
 
 在这个演示里，模型打开和风天气（QWeather）开发者平台的注册页后，自动填写注册信息；收到验证邮件后，自动提取 6 位验证码并回填；随后进入手机号绑定，通过 adb 操作连接 USB 的手机读取短信验证码并回填；最终注册出一个完整可用的网站开发者账号。整个流程**无加速、无剪辑、一镜到底**。
 
-> ![全流程画面总览](images/auto-register-frames-contact-sheet.png)
+> ![全流程画面总览](images/auto-register-frames-contact-sheet.jpg)
 >
 > *图 1：全流程画面总览——从代理 GUI 控制台、邮箱验证、手机号绑定、短信验证到注册成功的完整流程一图纵览。*
 
@@ -22,7 +22,7 @@
 - **工具配置**：Agent Service 管理控制台为模型配备了**操作 email、安卓手机和 chrome 浏览器的 MCP 工具**，模型既能在左侧的任务对话中调用这些工具，也能在右侧实时看到它们对浏览器产生的效果。
 - **观察视角**：为了同时看到「Agent 的调度」与「浏览器里的实际动作」，演示采用**「代理 GUI + 受控浏览器」双窗口同屏**——一个窗口展示模型的思考与工具调用日志，另一个窗口实时展示浏览器里的页面变化。
 
-> ![代理 GUI 与 MCP 工具](images/auto-register-frame-2.png)
+> ![代理 GUI 与 MCP 工具](images/auto-register-frame-2.jpg)
 >
 > *图 2：Agent Service 管理控制台——顶部绿色标题「我们为任务配备了操作 email、安卓手机和 chrome 浏览器的 MCP 工具」；左侧为模型（MimoPro）的任务对话与 MCP 工具调用日志，右侧为受控浏览器窗口，已打开 dev.qweather.com。*
 
@@ -32,7 +32,7 @@
 
 任务开始后，模型在控制台中阅读任务说明，调用 `new_page` 工具打开和风天气开发者平台的注册入口，正式进入「任务说明 → 执行」的链路。控制台与受控浏览器同屏呈现，方便实时观察 Agent 的每一步动作。
 
-> ![开场与任务说明](images/auto-register-frame-1.png)
+> ![开场与任务说明](images/auto-register-frame-1.jpg)
 >
 > *图 3：开场画面——Agent Service 管理控制台与受控浏览器窗口同屏，任务说明文字清晰可见，助手已准备打开和风天气开发者平台的注册页面。*
 
@@ -40,7 +40,7 @@
 
 注册链路的第一道验证是**邮箱验证**。提交注册信息后，平台向注册邮箱发送一封验证邮件。Agent 调用邮件相关的 MCP 工具（list_available_accounts / list_emails_metadata）查收邮件、解析正文，从中提取出 6 位验证码 **866729**，再逐位填入浏览器的验证码输入框并点击 Next——「收邮件、读验证码、回填表单」这一整段，全程由 Agent 自动完成。
 
-> ![邮箱验证画面](images/auto-register-frame-7.png)
+> ![邮箱验证画面](images/auto-register-frame-7.jpg)
 >
 > *图 4：邮箱验证环节——浏览器显示「A verification email has been sent to you, please enter the code」，下方为验证码输入框与 Next 按钮，控制台可见 Agent 正在逐位填入邮箱验证码。*
 
@@ -48,13 +48,13 @@
 
 邮箱验证通过后，页面跳转到**手机号绑定**步骤。Agent 在绑定表单中填入手机号，点击「发送验证码」，触发平台向该手机号下发短信验证码，为下一步通过 adb 取码做好准备。
 
-> ![手机号绑定步骤](images/auto-register-frame-3.png)
+> ![手机号绑定步骤](images/auto-register-frame-3.jpg)
 >
 > *图 5：手机号绑定步骤——浏览器显示 QWeather 注册页「Enter phone number」、国家码 +86 与 Send Code 按钮；控制台快照说明「验证码输入成功，现在页面跳转到了手机号绑定页面」。*
 
 进入绑定表单后，Agent 填写手机号 **1352…4000**，并点击「发送验证码」按钮——控制台中可以看到它对页面元素（uid 5_16）的点击操作。
 
-> ![注册表单填写（手机号绑定）](images/auto-register-frame-4.png)
+> ![注册表单填写（手机号绑定）](images/auto-register-frame-4.jpg)
 >
 > *图 6：注册表单填写——浏览器地址栏为 id.qweather.com/#/begin/process/bind/phone/...，已填写手机号 1352…4000，Agent 正在点击「发送验证码」按钮。*
 
@@ -62,7 +62,7 @@
 
 短信验证码落在手机上。手机通过 **USB 数据线**连接电脑，模型通过 **adb（Android Debug Bridge）命令行**操作手机：先用 `run_adb_command` 在手机上取出短信验证码（输出如 **25098RA90C**），再由 `read_verification_code` 解析短信内容、读出验证码，随后回填到浏览器的验证码输入框。值得注意的是，电脑上同时连接了两台手机，模型需要依据任务提示词中的指定信息甄别目标设备，再对其执行读取。
 
-> ![手机短信验证画面](images/auto-register-frame-5.png)
+> ![手机短信验证画面](images/auto-register-frame-5.jpg)
 >
 > *图 7：手机短信验证——控制台显示 run_adb_command 输出验证码 25098RA90C，随后 read_verification_code（device_id 0043d38b0504）读取短信验证码；浏览器显示「A verification message has been sent to your phone, please enter the code」、验证码输入框与 Next 按钮。*
 
@@ -70,7 +70,7 @@
 
 至此，邮箱验证 + 手机短信验证的完整注册链路全部走通。浏览器进入开发者信息页，展示注册成功的账户信息，标志着网站用户全自动注册完成。
 
-> ![注册成功画面](images/auto-register-frame-6.png)
+> ![注册成功画面](images/auto-register-frame-6.jpg)
 >
 > *图 8：注册成功——代理消息区显示「我已经成功在 dev.qweather.com 上为您注册了账户」；浏览器展示开发者信息页——登录邮箱 agents26@163.com、开发者 ID Q07E4F11A5、API Host np6yw2vya3.re.qweatherapi.com，手机号已隐藏。*
 
