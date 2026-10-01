@@ -80,6 +80,9 @@
   let searchQuery = $state('')
   let searchResults = $state([])
   let searchInputEl = $state(null)
+  // 搜索发起时所在目录：搜索结果列表中"目录"列的相对基准（与工作区无关，
+  // 搜索本身可以在工作区外进行）
+  let searchBasePath = $state('')
   let nameFilterQuery = $state(readLocalStorage(NAME_FILTER_STORAGE_KEY, ''))
   let sortByTimeDesc = $state(readLocalStorage(SORT_TIME_DESC_STORAGE_KEY, '0') === '1')
   let nameFilterTimer = null
@@ -729,6 +732,12 @@
     searchOpen = false
     searchQuery = ''
     searchResults = []
+    searchBasePath = ''
+    // 文件名过滤框里的关键词若不清掉，loadFiles 会带着 nameFilter 请求后端，
+    // 目标目录里匹配不到就显示空列表（"打开所在目录"实测问题的根因）
+    if (nameFilterTimer) { clearTimeout(nameFilterTimer); nameFilterTimer = null }
+    nameFilterQuery = ''
+    writeLocalStorage(NAME_FILTER_STORAGE_KEY, '')
     selectedFiles.clear()
     selectedFiles = new Set(selectedFiles)
     currentPath = dirPath
@@ -897,6 +906,7 @@
       if (nameFilterTimer) clearTimeout(nameFilterTimer)
       searchMode = false
       searchResults = []
+      searchBasePath = ''
       reloadCurrentDirectory()
     }
   }
@@ -912,10 +922,13 @@
     if (!searchQuery.trim() && !nameFilterQuery.trim()) {
       searchMode = false
       searchResults = []
+      searchBasePath = ''
       return
     }
     
     searchMode = true
+    // 记录搜索发起时所在目录，作为结果列表"目录"列的相对基准
+    searchBasePath = currentPath
     loading = true
     try {
       const results = await wsApi.search(currentPath, searchQuery.trim(), nameFilterQuery.trim())
@@ -949,6 +962,43 @@
       searchQuery = ''
       searchResults = []
     }
+  }
+
+  // 搜索结果列表"目录"列：文件所在目录相对于搜索发起目录的相对路径。
+  // 文件就在搜索发起目录下时返回 ''（留空显示）。
+  function searchRelativeDir(file) {
+    const filePath = file?.path || ''
+    if (!filePath) return ''
+    // 去掉文件名，得到所在目录（跨平台分隔符）
+    const normalized = filePath.replace(/\\/g, '/')
+    const lastSlash = normalized.lastIndexOf('/')
+    const dir = lastSlash > 0 ? normalized.slice(0, lastSlash) : ''
+    if (!dir) return ''
+    const base = (searchBasePath || '').replace(/\\/g, '/')
+    if (!base || dir === base) return ''
+    if (dir.startsWith(base + '/')) {
+      return dir.slice(base.length + 1)
+    }
+    // 文件在搜索发起目录之外（向上或别处）：给出 ../ 相对路径
+    const dirParts = dir.split('/').filter(Boolean)
+    const baseParts = base.split('/').filter(Boolean)
+    let common = 0
+    while (
+      common < dirParts.length &&
+      common < baseParts.length &&
+      dirParts[common] === baseParts[common]
+    ) common++
+    const upCount = baseParts.length - common
+    const remaining = dirParts.slice(common).join('/')
+    return ('../'.repeat(upCount) + remaining) || '..'
+  }
+
+  // 文件所在目录的绝对路径（用于"打开所在目录"菜单项）
+  function fileContainingDir(file) {
+    const filePath = (file?.path || '').replace(/\\/g, '/')
+    const lastSlash = filePath.lastIndexOf('/')
+    if (lastSlash <= 0) return filePath // 盘符/根目录下
+    return filePath.slice(0, lastSlash)
   }
 
   // 进入目录
@@ -1318,6 +1368,13 @@
   // - Shift+点击：范围选择（从上次选中到当前）
  function handleFileClick(file, event) {
     // 目录与文件一样：单击仅选中（双击才进入目录，见 handleDoubleClick）
+     // 长按弹出菜单后，松手派发的合成 click 需吞掉，防止误切换选中
+     if (longPressFired) {
+       longPressFired = false
+       event.preventDefault()
+       return
+     }
+
     if (event.shiftKey && lastSelectedFile) {
      // Shift+点击：范围选择（含目录，与 Windows 资源管理器一致）
       const currentFiles = displayedFiles
@@ -1438,6 +1495,8 @@
   // 右键菜单操作
   function showContextMenu(e, file) {
     e.preventDefault()
+    // 移动端长按可能同时触发自身计时器与浏览器原生 contextmenu，同文件去重
+    if (contextMenu.visible && contextMenu.file && contextMenu.file.path === file.path) return
     const menuHeight = 250 // estimated before render; refined after tick
     let x = e.clientX
     let y = e.clientY
@@ -1466,6 +1525,73 @@
 
   function hideContextMenu() {
     contextMenu = { visible: false, x: 0, y: 0, file: null }
+  }
+
+  // ==================== 长按弹出菜单（移动端） ====================
+  // 只有精确指针设备（鼠标）启用 HTML5 拖放。
+  // 关键：触摸设备必须禁用 draggable——否则长按 draggable 元素时浏览器会接管触摸
+  // 进入拖拽模式（屏幕上出现跟随手指的文件名幽灵框）并派发 touchcancel，
+  // 直接取消下面的 500ms 长按定时器，导致真机长按菜单永远无法弹出。
+  const isFinePointer =
+    typeof matchMedia === 'function' &&
+    matchMedia('(hover: hover) and (pointer: fine)').matches
+
+  // 移动端没有鼠标右键：按住文件项 500ms 后弹出上下文菜单（行为同安卓文件管理器）
+  const LONG_PRESS_DELAY = 500
+  const LONG_PRESS_MOVE_TOLERANCE = 16
+  let longPressTimer = null
+  let longPressInfo = null   // { file, x, y, startX, startY }
+  let longPressFired = false // 长按已触发；用于吞掉松手后的合成 click
+  let suppressMenuRelease = false // 长按松手时手指正压在菜单上：抑制这次合成 mousedown，防止误触菜单项或误关菜单
+  let longPressActive = false // 正在按住（菜单未弹出前）：给目标项按压高亮，也便于确认功能已生效
+
+  function startFileLongPress(e, file) {
+    if (e.touches.length > 1) return
+    const touch = e.touches[0]
+    if (!touch) return
+    longPressInfo = { file, x: touch.clientX, y: touch.clientY, startX: touch.clientX, startY: touch.clientY }
+    longPressActive = true
+    longPressTimer = setTimeout(() => {
+      longPressTimer = null
+      const info = longPressInfo
+      longPressInfo = null
+      if (!info) return
+      longPressActive = false
+      longPressFired = true
+      // 松手时手指正压在菜单上：抑制这次合成 mousedown，防止误触发菜单项或误关菜单
+      suppressMenuRelease = true
+      setTimeout(() => { suppressMenuRelease = false }, 5000) // 保险复位
+      // 保险：若浏览器未派发合成 click，400ms 后自动复位，避免吞掉下一次正常点击
+      setTimeout(() => { longPressFired = false }, 400)
+      if (navigator.vibrate) navigator.vibrate(15) // 震动反馈，提示菜单已弹出
+      showContextMenu({ preventDefault: () => {}, clientX: info.x, clientY: info.y }, info.file)
+    }, LONG_PRESS_DELAY)
+  }
+
+  function moveFileLongPress(e) {
+    if (!longPressInfo || !e.touches[0]) return
+    const dx = e.touches[0].clientX - longPressInfo.startX
+    const dy = e.touches[0].clientY - longPressInfo.startY
+    if (Math.hypot(dx, dy) > LONG_PRESS_MOVE_TOLERANCE) cancelFileLongPress() // 用户开始滚动，取消
+  }
+
+  function cancelFileLongPress() {
+    if (longPressTimer) {
+      clearTimeout(longPressTimer)
+      longPressTimer = null
+    }
+    longPressInfo = null
+    longPressActive = false
+  }
+
+  function endFileLongPress() {
+    cancelFileLongPress()
+  }
+
+  // 遮罩点击关闭菜单；长按松手产生的合成 mousedown 不关闭（由 suppressMenuRelease 标记）
+  function handleBackdropMousedown() {
+    if (suppressMenuRelease) return
+    hideContextMenu()
   }
 
   // 重命名文件
@@ -2308,16 +2434,27 @@
                   class:directory={file.is_dir}
                   class:outside-workspace={!file.is_dir && !isAllowedFileArea(file.path)}
                   class:dragging={dragState.isDragging && dragState.dragPaths.includes(file.path)}
-                  draggable="true"
+                  class:long-pressing={longPressActive && longPressInfo?.file === file}
+                  draggable={isFinePointer}
                  onclick={(e) => handleFileClick(file, e)}
                   ondblclick={() => handleDoubleClick(file)}
                   oncontextmenu={(e) => showContextMenu(e, file)}
+                  ontouchstart={(e) => startFileLongPress(e, file)}
+                  ontouchmove={moveFileLongPress}
+                  ontouchend={endFileLongPress}
+                  ontouchcancel={endFileLongPress}
                   ondragstart={(e) => handleFileDragStart(e, file)}
                   ondrag={handleFileDrag}
                   ondragend={handleFileDragEnd}
                 >
                   <span class="file-icon" role="img" aria-label={file.symlink_target ? getFileSecondaryTitle(file) : undefined} title={file.symlink_target ? getFileSecondaryTitle(file) : undefined}>{getFileIcon(file)}</span>
                   <span class="file-name">{file.name}</span>
+                  {#if searchMode}
+                    <!-- 目录列：仅搜索结果列表显示，值为相对"搜索发起目录"的相对目录，留空表示就在该目录下 -->
+                    <span class="file-dir" class:has-dir={!!searchRelativeDir(file)} title={searchRelativeDir(file) || fileContainingDir(file)}>{searchRelativeDir(file)}</span>
+                  {:else}
+                    <span class="file-dir"></span>
+                  {/if}
                   <span class="file-size" title={getFileSecondaryTitle(file)}>{getFileSecondaryText(file)}</span>
                   <span class="file-date">{formatFileTime(file.modified)}</span>
                 </button>
@@ -2332,10 +2469,15 @@
                     class:selected={selectedFiles.has(file.path)}
                     class:outside-workspace={!file.is_dir && !isAllowedFileArea(file.path)}
                     class:dragging={dragState.isDragging && dragState.dragPaths.includes(file.path)}
-                    draggable="true"
+                    class:long-pressing={longPressActive && longPressInfo?.file === file}
+                    draggable={isFinePointer}
                    onclick={(e) => handleFileClick(file, e)}
                     ondblclick={() => handleDoubleClick(file)}
                     oncontextmenu={(e) => showContextMenu(e, file)}
+                   ontouchstart={(e) => startFileLongPress(e, file)}
+                   ontouchmove={moveFileLongPress}
+                   ontouchend={endFileLongPress}
+                   ontouchcancel={endFileLongPress}
                     ondragstart={(e) => handleFileDragStart(e, file)}
                     ondrag={handleFileDrag}
                     ondragend={handleFileDragEnd}
@@ -2484,11 +2626,13 @@
 {#if contextMenu.visible}
   {@const menuFile = contextMenu.file}
   {@const isMulti = selectedFiles.size > 1 && selectedFiles.has(menuFile?.path)}
-  <div class="context-menu-backdrop" onmousedown={hideContextMenu}></div>
+  <div class="context-menu-backdrop" onmousedown={handleBackdropMousedown} ontouchstart={() => { suppressMenuRelease = false }}></div>
   <div
     class="context-menu"
     style="left: {contextMenu.x}px; top: {contextMenu.y}px"
+    onmousedowncapture={(e) => { if (suppressMenuRelease) { e.stopPropagation(); e.preventDefault() } }}
     onmousedown={(e) => e.stopPropagation()}
+    ontouchstart={() => { suppressMenuRelease = false }}
   >
     <!-- 预览：多选时置灰 -->
     {#if isPreviewable(menuFile)}
@@ -2532,6 +2676,16 @@
     }}>
       {t('copyRelativePath')}{isMulti ? ` (${selectedFiles.size})` : ''}
     </button>
+    <!-- 打开所在目录：仅搜索结果列表可用（目录列为相对"搜索发起目录"，
+         这里导航到文件实际所在目录并退出搜索模式） -->
+    {#if searchMode}
+      <button
+        disabled={isMulti}
+        onmousedown={() => { if (!isMulti) { navigateToDirectory(fileContainingDir(menuFile)); hideContextMenu() } }}
+      >
+        {t('openContainingDir')}
+      </button>
+    {/if}
     <!-- 重命名：多选时置灰 -->
     <button 
       disabled={isMulti}
@@ -2893,9 +3047,19 @@
     text-align: left;
     transition: all 0.15s;
     font-size: 0.82rem;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
   }
 
   .file-item:hover {
+    background: var(--bg-secondary);
+    border-color: var(--border);
+  }
+
+  /* 移动端长按进行中（菜单弹出前）的按压高亮 */
+  .file-item.long-pressing,
+  .grid-item.long-pressing {
     background: var(--bg-secondary);
     border-color: var(--border);
   }
@@ -2980,6 +3144,9 @@
     background: var(--bg);
     cursor: pointer;
     transition: all 0.2s;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
   }
 
   .grid-item:hover {
@@ -3582,6 +3749,11 @@
     .filename-filter-input { flex: 1 1 90px; width: auto; min-width: 70px; }
     .inline-search-input { flex: 1 1 90px; width: auto; min-width: 70px; }
     .upload-group { margin-left: 4px; padding-left: 4px; }
+
+    /* 小屏：优先保证文件名与目录列可见，size/date 空间不足时自然裁掉 */
+    .file-dir { max-width: 30vw; flex-basis: 30vw; }
+    .file-size { max-width: 70px; min-width: 0; }
+    .file-date { max-width: 64px; min-width: 0; overflow: hidden; }
 
     /* 目录树开关按钮：仅移动端显示（选中态高亮由 .header-btn.active 提供） */
     .tree-toggle-btn { display: inline-flex; align-items: center; justify-content: center; }
