@@ -31,7 +31,7 @@ def _restore_os_environ():
     environment, so the property tests below (which use random
     keys/values) would otherwise leak hundreds of synthetic variables
     into os.environ.  Leftover garbage breaks later tests that parse
-    numeric env vars (e.g. CLI_EXEC_TIMEOUT) and is inherited by any
+    numeric env vars (e.g. TOOL_EXEC_TIMEOUT) and is inherited by any
     subprocess they start.  Snapshotting/restoring around each test
     keeps the suite hermetic without changing what the tests assert.
     """

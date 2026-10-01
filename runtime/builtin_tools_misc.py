@@ -40,21 +40,28 @@ def _exec_cli(
     command: str,
     cwd: str = "",
     prompt_pattern: str = "",
-    idle_timeout: int = 1000,
+    timeout: int = 1000,
     read_after_delay: int = 0,
 ) -> str:
     """Execute input via a persistent CLI terminal and return observed screen output.
 
     Completion is driven by provided parameters:
     - prompt_pattern: regex that completes when it matches visible output.
-    - idle_timeout: milliseconds of no new output before returning.
+      When omitted, it defaults to the terminal's own prompt marker
+      (user@hostname, e.g. ``^root@cc``) when the shell prompt carries one,
+      so the call returns as soon as the command finishes and the shell is
+      back at a prompt; otherwise completion stays idle-based.
+    - timeout: milliseconds of no new output before returning (idle-based
+      completion: the call ends early once output has been quiet this long).
+      The runtime also reads this value to extend the wall-clock deadline
+      allowed for the whole tool call, so large values let long-running
+      commands run past the default tool timeout.
     - read_after_delay: milliseconds to read before returning regardless of output.
 
     An empty command reads the latest terminal progress without sending input.
-    timeout is intentionally not a tool parameter; CLI_EXEC_TIMEOUT is the
-    hard safety cap for all completion conditions.
+    There is no internal hard cap: the TOOL_EXEC_TIMEOUT guard is the single
+    safety net bounding how long the caller waits for this tool call.
     """
-    timeout = env_int("CLI_EXEC_TIMEOUT", 300)
     session_id = get_request_context("session_id")
     if session_id:
         try:
@@ -63,12 +70,21 @@ def _exec_cli(
             if terminal_info:
                 if cwd and command:
                     command = f"cd {shlex.quote(cwd)} && {command}"
+                if not prompt_pattern:
+                    # Default completion signal: the shell's own prompt marker
+                    # (user@hostname), derived from the terminal output buffer
+                    # when detectable.  For an empty command (progress read)
+                    # only reuse a previously derived pattern -- a fresh
+                    # derivation could block on shell startup for nothing.
+                    if command:
+                        prompt_pattern = _derive_prompt_pattern(terminal_info)
+                    else:
+                        prompt_pattern = terminal_info.get("prompt_pattern") or ""
                 result = execute_command_in_terminal(
                     session_id,
                     command,
                     timeout=timeout,
                     prompt_pattern=prompt_pattern,
-                    idle_timeout=idle_timeout,
                     read_after_delay=read_after_delay,
                 )
                 if not result.startswith("Error:"):
@@ -77,13 +93,15 @@ def _exec_cli(
         except Exception as e:
             logger.debug("Terminal execution failed, falling back to subprocess: %s", e)
 
-    # Fallback for contexts without a terminal session.
+    # Fallback for contexts without a terminal session.  No internal timeout:
+    # the TOOL_EXEC_TIMEOUT guard bounds the caller's wait, and the worker
+    # keeps running on its daemon thread until the command finishes.
     try:
         try:
             result = subprocess.run(
                 command, shell=True, capture_output=True, text=True,
                 encoding=SYSTEM_ENCODING, errors='replace',
-                timeout=timeout, cwd=cwd if cwd else None,
+                timeout=None, cwd=cwd if cwd else None,
             )
         except Exception as spawn_exc:
             # [Fix] stale/invalid std handles (WinError 6 句柄无效) make every
@@ -93,15 +111,13 @@ def _exec_cli(
             result = subprocess.run(
                 command, shell=True, capture_output=True, text=True,
                 encoding=SYSTEM_ENCODING, errors='replace',
-                timeout=timeout, cwd=cwd if cwd else None,
+                timeout=None, cwd=cwd if cwd else None,
             )
         output = (result.stdout or "").strip()
         err = (result.stderr or "").strip()
         if err:
             return (output + "\n" + err).strip()
         return output if output else "(empty output)"
-    except subprocess.TimeoutExpired:
-        return f"Error: command timed out after {timeout}s"
     except Exception as e:
         return f"Error: {type(e).__name__}: {e}"
 def _fetch_url(url: str, method: str = "GET", body: str = "",
@@ -147,8 +163,9 @@ CLI_TOOL_CONFIG = ToolConfig(
     name="exec_cli",
     description=(
         "Execute input in a persistent terminal session and return observed screen output. "
-        "Completion is driven by prompt_pattern, idle_timeout, and read_after_delay; "
-        "the first satisfied condition returns. Time values are in milliseconds."
+        "Completion is driven by prompt_pattern, timeout, and read_after_delay; "
+        "the first satisfied condition returns. Time values are in milliseconds. "
+        "A larger timeout also extends how long this tool call may run."
     ),
     parameters={
         "type": "object",
@@ -163,11 +180,21 @@ CLI_TOOL_CONFIG = ToolConfig(
             },
             "prompt_pattern": {
                 "type": "string",
-                "description": "Regex that completes output collection when it matches visible terminal output.",
+                "description": (
+                    "Regex that completes output collection when it matches visible "
+                    "terminal output. If omitted, defaults to the terminal's own "
+                    "prompt marker (user@hostname) when the shell prompt carries "
+                    "one, completing as soon as the shell returns to a prompt; "
+                    "otherwise completion is idle-based (timeout)."
+                ),
             },
-            "idle_timeout": {
+            "timeout": {
                 "type": "integer",
-                "description": "Milliseconds of no new output before returning (default 1000). Set to 0 to disable idle completion.",
+                "description": (
+                    "Milliseconds of no new output before returning (default 1000); "
+                    "set to 0 to disable idle completion. Larger values also extend "
+                    "the maximum time this tool call may run."
+                ),
             },
             "read_after_delay": {
                 "type": "integer",
@@ -230,15 +257,90 @@ def _strip_terminal_noise(text: str, command: str) -> str:
     return text.strip()
 
 
+_PROMPT_MARKER_RE = re.compile(r"([\w.-]+)@([\w.-]+)")
+
+
+def _read_terminal_buffer(terminal_info: dict) -> str:
+    """Read the terminal output buffer without draining it."""
+    with terminal_info["buffer_lock"]:
+        return "".join(terminal_info.get("output_buffer") or [])
+
+
+def _find_prompt_marker(visible_text: str) -> str:
+    """Return the user@hostname marker from the most recent prompt line.
+
+    The current prompt is the newest non-empty line, so lines are scanned
+    from the end (last 10 non-empty lines) and the first marker found wins.
+    Returns "" when no marker is present (custom prompts, PowerShell...).
+    """
+    lines = [ln for ln in visible_text.splitlines() if ln.strip()][-10:]
+    for line in reversed(lines):
+        m = _PROMPT_MARKER_RE.search(line)
+        if m:
+            return f"{m.group(1)}@{m.group(2)}"
+    return ""
+
+
+def _derive_prompt_pattern(terminal_info: dict, max_wait_ms: int = 1500) -> str:
+    """Derive exec_cli's default prompt_pattern from the shell's own prompt.
+
+    The persistent PTY shell prints its prompt at startup and after every
+    command (default bash/zsh/fish PS1s carry a ``user@hostname`` marker,
+    e.g. ``root@cc:/path# ``).  Matching that marker is a precise
+    "command finished, shell ready" completion signal, so it becomes the
+    default when the caller does not pass an explicit prompt_pattern.
+
+    The result is cached per terminal in ``terminal_info``.  Only decisive
+    outcomes are cached: "no output yet" (the shell may still be starting)
+    is left uncached so the next call retries, while "output seen but no
+    marker" (custom prompt, PowerShell, ...) is final.  Returns "" when no
+    marker is detectable; completion then stays idle-based.
+    """
+    cached = terminal_info.get("prompt_pattern")
+    if cached is not None:
+        return cached
+    try:
+        deadline = time.monotonic() + max(100, max_wait_ms) / 1000.0
+        no_marker_streak = 0
+        while True:
+            visible = _strip_terminal_noise(_read_terminal_buffer(terminal_info), "")
+            marker = _find_prompt_marker(visible)
+            if marker:
+                pattern = f"^{re.escape(marker)}"
+                terminal_info["prompt_pattern"] = pattern
+                return pattern
+            if visible.strip():
+                no_marker_streak += 1
+                # Two consecutive markerless reads confirm a custom prompt;
+                # a single one may have been a partially written prompt line.
+                if no_marker_streak >= 2:
+                    terminal_info["prompt_pattern"] = ""
+                    return ""
+            else:
+                no_marker_streak = 0
+            if time.monotonic() >= deadline:
+                return ""
+            time.sleep(0.1)
+    except Exception as e:
+        logger.debug("prompt_pattern derivation failed: %s", e)
+        return ""
+
+
 def execute_command_in_terminal(
     session_id: str,
     command: str,
-    timeout: int = 300,
+    timeout: int = 1000,
     prompt_pattern: str = "",
-    idle_timeout: int = 1000,
     read_after_delay: int = 0,
 ) -> str:
-    """Send optional input to a terminal and collect screen output."""
+    """Send optional input to a terminal and collect screen output.
+
+    ``timeout`` is the idle window in milliseconds: collection returns once
+    no new output has been observed for that long (0 disables idle
+    completion).  There is deliberately no internal hard cap here -- the
+    runtime's TOOL_EXEC_TIMEOUT guard is the single safety net bounding how
+    long the caller waits for this tool call.
+    """
     from runtime.server import get_terminal_for_session
 
     terminal_info = get_terminal_for_session(session_id)
@@ -257,7 +359,7 @@ def execute_command_in_terminal(
         write_method = lambda cmd: os.write(master_fd, f"{cmd}\n".encode("utf-8"))
 
     try:
-        idle_timeout_value = int(idle_timeout or 0)
+        idle_timeout_value = int(timeout or 0)
     except (TypeError, ValueError):
         idle_timeout_value = 1000
     try:
@@ -276,7 +378,6 @@ def execute_command_in_terminal(
     idle_timeout_seconds = max(0.1, idle_timeout_value / 1000.0)
     read_after_delay_seconds = max(0.0, read_after_delay_value / 1000.0)
     check_interval = env_float("OUTPUT_CHECK_INTERVAL", 0.05)
-    deadline = time.monotonic() + timeout
 
     if command:
         with terminal_info["buffer_lock"]:
@@ -297,7 +398,7 @@ def execute_command_in_terminal(
         except re.error as exc:
             return f"Error: invalid prompt_pattern: {exc}"
 
-    while time.monotonic() < deadline:
+    while True:
         chunk = _drain_terminal_buffer(terminal_info)
         now = time.monotonic()
         if chunk:
@@ -316,10 +417,6 @@ def execute_command_in_terminal(
             break
 
         time.sleep(check_interval)
-
-    if time.monotonic() >= deadline:
-        suffix = "" if collected else " (no output received)"
-        return f"Error: command timed out after {timeout}s{suffix}"
 
     result = _strip_terminal_noise(collected, command)
     return result if result else "(empty output)"

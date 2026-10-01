@@ -1685,6 +1685,112 @@ def test_exec_cli_reuses_persistent_terminal_across_calls(monkeypatch, session_c
         f"持久终端未按会话复用，每次调用都新建: {created_sessions!r}")
 
 
+# ------------------------------------------------------------------
+# exec_cli 默认 prompt_pattern：从 shell 自身提示符派生 user@hostname
+# ------------------------------------------------------------------
+# 持久 PTY shell（默认 bash/zsh/fish PS1）在启动和每条命令结束后都会打印
+# 形如 ``user@hostname:/path$ `` 的提示符。exec_cli 在调用方未显式传
+# prompt_pattern 时，从终端 output_buffer 派生 ``^user@host`` 作为默认完成
+# 信号（"命令结束、shell 回到提示符"），比纯静默等待更精确；自定义提示符
+# （无 user@host 标记）或 PowerShell 派生为空串，退回静默完成。
+
+def _fake_terminal(output: str = "") -> dict:
+    """构造带 output_buffer / buffer_lock 的假持久终端 terminal_info。"""
+    import threading
+    return {
+        "session_id": "sess-p-1",
+        "output_buffer": [output] if output else [],
+        "buffer_lock": threading.Lock(),
+    }
+
+
+def test_derive_prompt_pattern_from_default_shell_prompt():
+    """默认 bash 提示符（含 ANSI 转义 / OSC 标题）可派生出 ^user@host。"""
+    import runtime.builtin_tools_misc as m
+    raw = "\r\n\x1b[?2004h\x1b]0;alice@hostbox: /work\x07alice@hostbox:/work$ "
+    ti = _fake_terminal(raw)
+    pattern = m._derive_prompt_pattern(ti)
+    assert pattern == "^alice@hostbox"
+    assert ti["prompt_pattern"] == "^alice@hostbox"
+
+
+def test_derive_prompt_pattern_custom_prompt_without_marker():
+    """无 user@hostname 标记的自定义提示符派生为空串并缓存空串（后续不再等待）。"""
+    import runtime.builtin_tools_misc as m
+    ti = _fake_terminal("➜ ~ git:(main) ✗ ")
+    pattern = m._derive_prompt_pattern(ti)
+    assert pattern == ""
+    assert ti.get("prompt_pattern") == ""
+
+
+def test_derive_prompt_pattern_no_output_is_not_cached():
+    """缓冲为空（shell 尚未启动）：返回空串但不缓存，下次调用可重试派生。"""
+    import runtime.builtin_tools_misc as m
+    ti = _fake_terminal("")
+    pattern = m._derive_prompt_pattern(ti, max_wait_ms=150)
+    assert pattern == ""
+    assert "prompt_pattern" not in ti
+    # 提示符晚到后重试即可正常派生
+    with ti["buffer_lock"]:
+        ti["output_buffer"].append("bob@box:~$ ")
+    assert m._derive_prompt_pattern(ti, max_wait_ms=150) == "^bob@box"
+
+
+def test_derive_prompt_pattern_cached_result_is_reused():
+    """派生结果按终端缓存：后续即使缓冲变化也直接复用。"""
+    import runtime.builtin_tools_misc as m
+    ti = _fake_terminal("carol@dev:/x$ ")
+    assert m._derive_prompt_pattern(ti) == "^carol@dev"
+    with ti["buffer_lock"]:
+        ti["output_buffer"].clear()
+    assert m._derive_prompt_pattern(ti) == "^carol@dev"
+
+
+def test_find_prompt_marker_takes_newest_line():
+    """标记取自最新的提示行，而不是较早的输出行（如邮件地址）。"""
+    import runtime.builtin_tools_misc as m
+    text = "old output dave@mail.example.com\nroot@cc:/tmp# "
+    assert m._find_prompt_marker(text) == "root@cc"
+
+
+def test_exec_cli_defaults_to_derived_prompt_pattern(monkeypatch, session_ctx):
+    """未显式传 prompt_pattern 时，exec_cli 把派生的 ^user@host 传给终端路径；
+    显式传值优先；空命令（进度读取）只复用已缓存的派生结果。"""
+    import runtime.builtin_tools_misc as _bt_misc
+    import runtime.server as _server
+
+    ti = _fake_terminal("root@cc:/tmp# ")
+    captured: dict = {}
+
+    def fake_get_or_create_terminal(sid, cols=80, rows=24):
+        return ti
+
+    def fake_execute_command(sid, command, timeout=1000,
+                             prompt_pattern="", read_after_delay=0):
+        captured.update(timeout=timeout, prompt_pattern=prompt_pattern,
+                        command=command)
+        return "ok"
+
+    monkeypatch.setattr(_server, "get_or_create_terminal", fake_get_or_create_terminal)
+    monkeypatch.setattr(_bt_misc, "execute_command_in_terminal", fake_execute_command)
+
+    _bt_misc._exec_cli(command="echo hi", prompt_pattern="")
+    assert captured["prompt_pattern"] == "^root@cc"
+
+    # 显式 prompt_pattern 优先，不派生
+    _bt_misc._exec_cli(command="echo hi", prompt_pattern="MY-RE")
+    assert captured["prompt_pattern"] == "MY-RE"
+
+    # 空命令（进度读取）复用缓存的派生结果
+    _bt_misc._exec_cli(command="", prompt_pattern="")
+    assert captured["prompt_pattern"] == "^root@cc"
+
+    # 缓存为空串（自定义提示符）时空命令传空串
+    ti["prompt_pattern"] = ""
+    _bt_misc._exec_cli(command="", prompt_pattern="")
+    assert captured["prompt_pattern"] == ""
+
+
 def test_unix_pty_single_reader_fans_out_to_browser_and_buffer(monkeypatch):
     """回归：Unix 终端的 PTY 输出必须由*一个* reader 扇出。
 
