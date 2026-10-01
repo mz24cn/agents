@@ -159,9 +159,17 @@ class _RuntimeRequestHandler(
     # HTTP/1.1 keep-alive: reuse TCP connections across requests instead of
     # opening a new connection (and spawning a new thread) per request.
     protocol_version = "HTTP/1.1"
-    # Idle keep-alive connections are dropped after 30s so lingering client
-    # sockets do not hold request threads forever.
-    timeout = 30
+    # Per-connection socket timeout (applied to every read *and* write on the
+    # connection by StreamRequestHandler.setup).  Its visible effect: idle
+    # keep-alive connections are dropped after 60s so lingering client sockets
+    # do not hold request threads forever.  60s also bounds a single stalled
+    # read/write, so it must comfortably cover the slowest legitimate large
+    # download -- the self-extracting /v1/setup script (~2MB after packaging
+    # trim).  Note: a slow client whose write stalls longer than this value
+    # will have the transfer cut off mid-body (the original symptom that a
+    # 30s timeout caused on the ~4.7MB pre-trim script); raise this value in
+    # step if the setup payload grows again.
+    timeout = 60
 
 
 # ---------------------------------------------------------------------------

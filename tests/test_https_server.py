@@ -15,6 +15,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import re
 import socket
 import ssl
 import time
@@ -567,5 +568,109 @@ class TestWebSocketEndpointAuth:
                 set_cookie = resp.headers.get("Set-Cookie", "")
             assert "agent_service_session=" in set_cookie
             assert "Secure" in set_cookie
+        finally:
+            srv.stop()
+
+
+# ---------------------------------------------------------------------------
+# Slow-client socket timeouts (large responses to congested-line clients)
+# ---------------------------------------------------------------------------
+
+
+class TestSlowClientTimeouts:
+    """The handler uses one flat socket timeout (60s in production, shortened
+    to 2s here) for every stalled read *and* write on a connection.  That
+    means: idle keep-alive connections are dropped after the timeout, and a
+    response whose write to a slow client stalls longer than the timeout is
+    cut off mid-body.  The timeout must therefore stay comfortably above the
+    time the largest response (the /v1/setup script) needs on a congested
+    line -- see the timeout note on _RuntimeRequestHandler."""
+
+    @staticmethod
+    def _client(port, rcvbuf=None, timeout=25):
+        raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if rcvbuf is not None:
+            raw.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rcvbuf)
+        raw.settimeout(timeout)
+        raw.connect(("127.0.0.1", port))
+        return raw
+
+    def test_stalled_write_dropped_after_timeout(self, patched_paths, monkeypatch):
+        """A response write that stalls longer than ``timeout`` (2s here) is
+        cut off mid-body: large downloads must complete within the timeout."""
+        import runtime.server as server_module
+
+        monkeypatch.setattr(server_module._RuntimeRequestHandler, "timeout", 2)
+
+        # The body must be larger than the server socket's (auto-tuned,
+        # multi-MB) send buffer, otherwise the whole write is absorbed by
+        # the kernel and never blocks -- no stall to time out.
+        body = b"x" * (8 * 1024 * 1024)
+
+        def fake_do_get(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+
+        monkeypatch.setattr(server_module._RuntimeRequestHandler, "do_GET", fake_do_get)
+
+        srv = _make_server(patched_paths)
+        try:
+            raw = self._client(srv.port, rcvbuf=4096)
+            try:
+                raw.sendall(b"GET /slow HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                # Do not read: the tiny receive window fills and the
+                # server's write stalls past the 2s timeout, so the server
+                # drops the connection mid-body.
+                time.sleep(4)
+                data = b""
+                while True:
+                    chunk = raw.recv(65536)
+                    if not chunk:
+                        break
+                    data += chunk
+            finally:
+                raw.close()
+            assert f"Content-Length: {len(body)}".encode() in data
+            head, _, rest = data.partition(b"\r\n\r\n")
+            assert 0 < len(rest) < len(body), (
+                f"expected mid-body cutoff, got {len(rest)} of {len(body)} bytes"
+            )
+        finally:
+            srv.stop()
+
+    def test_idle_keepalive_dropped_after_timeout(self, patched_paths, monkeypatch):
+        """An idle keep-alive connection is dropped after ``timeout`` (2s
+        here): the wait for the next request line times out and the server
+        closes the connection."""
+        import runtime.server as server_module
+
+        monkeypatch.setattr(server_module._RuntimeRequestHandler, "timeout", 2)
+
+        srv = _make_server(patched_paths)
+        try:
+            raw = self._client(srv.port)
+            try:
+                raw.sendall(b"GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                data = b""
+                while b"\r\n\r\n" not in data:
+                    chunk = raw.recv(4096)
+                    assert chunk, "server closed while sending response head"
+                    data += chunk
+                head, _, rest = data.partition(b"\r\n\r\n")
+                length = int(re.search(rb"Content-Length: (\d+)", head).group(1))
+                while len(rest) < length:
+                    chunk = raw.recv(4096)
+                    assert chunk, "server closed while sending response body"
+                    rest += chunk
+                # Stay idle: the connection must be dropped after the
+                # keep-alive timeout, well inside this 10s window.
+                raw.settimeout(10)
+                assert raw.recv(4096) == b""
+            finally:
+                raw.close()
         finally:
             srv.stop()
