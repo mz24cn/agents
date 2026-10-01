@@ -42,7 +42,6 @@ MCP Server 配置（添加到 Agent Service）：
 
 import base64
 import os
-import sys
 import json
 import io
 import re

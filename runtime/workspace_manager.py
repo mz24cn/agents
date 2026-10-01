@@ -15,7 +15,6 @@ import math
 import tempfile
 import uuid
 import threading
-from pathlib import Path
 from typing import Optional, List, Dict, Any, BinaryIO, Iterable
 import logging
 

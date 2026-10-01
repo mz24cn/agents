@@ -10,7 +10,6 @@ Zero third-party dependencies — only Python standard library.
 
 from __future__ import annotations
 
-import base64
 import datetime
 import gzip
 import hashlib
@@ -35,7 +34,6 @@ if sys.platform == 'win32':
     except ImportError:
         PtyProcess = None
 else:
-    import pty
     import fcntl
     import termios
 

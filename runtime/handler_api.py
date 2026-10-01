@@ -1431,7 +1431,6 @@ class HandlerApiMixin:
           GET  no op               Authorized full self-extracting setup script.
         """
         import os
-        import datetime
 
         # -- op=hello: version and inference status (normal authorization) --
         op = self._get_query_param("op", "")

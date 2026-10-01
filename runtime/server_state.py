@@ -39,7 +39,6 @@ else:
 
 from runtime.common import (
     get_system_encoding,
-    SYSTEM_ENCODING,
     estimate_chat_message_tokens,
     estimate_chat_prompt_tokens,
     estimate_message_payload_tokens,

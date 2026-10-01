@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field, replace
-from typing import Optional, List
+from typing import Optional
 
 from runtime.common import parse_labels  # noqa: F401 — re-export
 

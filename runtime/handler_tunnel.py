@@ -27,9 +27,6 @@ import urllib.parse
 from runtime.remote_env_manager import snapshot_from_hello
 from runtime.tunnel_protocol import (
     OP_HELLO,
-    OP_PING,
-    OP_PONG,
-    OP_REQ,
     OP_REJECT,
     OP_RESP,
     OP_STREAM_CLOSE,
@@ -40,7 +37,6 @@ from runtime.tunnel_protocol import (
     decode_frame,
     encode_frame,
     tunnel_env_id,
-    tunnel_id_from_env_id,
 )
 from runtime import wsutil
 

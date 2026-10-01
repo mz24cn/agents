@@ -42,8 +42,6 @@ from runtime.common import atomic_write_text, get_workspace
 from runtime.remote_env_manager import normalize_setup_url
 from runtime.tunnel_protocol import (
     OP_DEREGISTER,
-    OP_PING,
-    OP_PONG,
     OP_REQ,
     OP_REJECT,
     OP_REPLACED,
@@ -63,7 +61,6 @@ from runtime.tunnel_protocol import (
     decode_frame,
     encode_frame,
     new_tunnel_id,
-    tunnel_env_id,
 )
 from runtime import wsutil
 from runtime.wsclient import WSClient, WSClientError

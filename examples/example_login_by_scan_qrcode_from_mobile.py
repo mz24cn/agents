@@ -44,7 +44,7 @@ import urllib.error
 import time
 import base64
 import io
-from typing import Optional, Dict, Any, Tuple
+from typing import Any
 from PIL import Image
 
 # ============================================================
@@ -181,7 +181,6 @@ def browser_find_and_click(keyword: str) -> dict:
     2. 调用 MCP-OCR 服务的 find_location 工具定位目标文字
     3. 使用 mcp-chrome-devtools-click_at 点击对应坐标
     """
-    import base64
     
     # 步骤 1: 截取页面截图
     screenshot_result = browser_take_screenshot()

@@ -27,7 +27,6 @@ from runtime import (
     ToolRegistry,
     Runtime,
     InferenceRequest,
-    Message,
 )
 from runtime.builtin_tools import register_builtin_tools
 

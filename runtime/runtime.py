@@ -7,7 +7,6 @@ tool call loop handling. Only uses Python standard library modules.
 
 from __future__ import annotations
 
-import concurrent.futures
 import datetime
 import json
 import logging

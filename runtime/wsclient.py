@@ -26,7 +26,6 @@ from typing import Optional, Tuple
 from runtime.wsutil import (
     OP_BINARY,
     OP_CLOSE,
-    OP_PING,
     OP_PONG,
     OP_TEXT,
     ws_accept_key,
