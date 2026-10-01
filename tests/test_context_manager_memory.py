@@ -204,7 +204,12 @@ def test_update_rolling_summary_not_triggered_when_turns_le_k():
 
 
 def test_summary_version_increments():
-    """Calling update_rolling_summary twice (both above threshold) must increment summary_version from 1 to 2."""
+    """Calling update_rolling_summary twice with NEW turns (both above threshold)
+    must increment summary_version from 1 to 2.
+
+    Compression is incremental: a call with no new turns (all already covered
+    by the previous summary) is a no-op and does not bump the version.
+    """
     with tempfile.TemporaryDirectory() as tmp_dir:
         cm = _make_cm(tmp_dir, recent_turns_k=2, max_tokens_in_context=1000)
         session_id = cm.create_session()
@@ -217,6 +222,16 @@ def test_summary_version_increments():
             f"First summary_version must be 1, got {fm1.get('summary_version')}"
         )
 
+        # No new turns — incremental compression has nothing to do.
+        cm.update_rolling_summary(session_id, turns, last_total_tokens=2000)
+        _, fm_noop = cm.get_summary(session_id)
+        assert fm_noop.get("summary_version") == 1, (
+            f"Version must NOT change when there are no new turns, "
+            f"got {fm_noop.get('summary_version')}"
+        )
+
+        # Two new turns — the delta since the previous summary triggers v2.
+        turns.extend(_make_turn(content=f"turn {i}") for i in range(4, 6))
         cm.update_rolling_summary(session_id, turns, last_total_tokens=2000)
         _, fm2 = cm.get_summary(session_id)
         assert fm2.get("summary_version") == 2, (
@@ -248,7 +263,9 @@ def test_summary_failure_preserves_old():
         assert text1.strip() == "first summary"
         assert fm1.get("summary_version") == 1
 
-        # Second call fails — old summary must be preserved
+        # Add a new turn so the second call actually attempts the LLM,
+        # which now fails — old summary must be preserved.
+        turns.append(_make_turn(content="turn 4"))
         cm.update_rolling_summary(session_id, turns, last_total_tokens=2000)
         text2, fm2 = cm.get_summary(session_id)
         assert text2.strip() == "first summary", (

@@ -356,6 +356,256 @@ def _extract_tagged_block(text: str, tag: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Compression-prompt guards
+# ---------------------------------------------------------------------------
+#
+# The compression prompt is built from the INCREMENTAL delta: only the turns
+# NOT yet covered by the previous (valid) summary are sent to the LLM.  In
+# normal operation that delta is inherently bounded, because compression is
+# triggered as soon as the inference context exceeds ``MAX_TOKENS_IN_CONTEXT``
+# (env var, default 65536) — so between two compressions at most about one
+# "trigger-threshold worth" of new turns can accumulate.  The delta is
+# therefore sent IN FULL; no artificial prompt budget is applied.
+#
+# Guards:
+#
+#   - a single pathological turn (e.g. a multi-MB tool output) is still capped
+#     at ``_SUMMARY_TURN_MAX_CHARS`` chars (head 3/4 + tail 1/4); this is a
+#     per-turn content-quality limit, not a total budget;
+#   - if the summary model rejects the request with a context-overflow error
+#     (the window is not known client-side, and the delta can grow unbounded
+#     while compression keeps failing), the prompt is rebuilt with a token
+#     budget halved from the natural prompt size (down to
+#     ``_SUMMARY_PROMPT_MIN_TOKENS``), dropping the OLDEST delta turns first
+#     (a marker documents the loss);
+#   - an ACCEPTED request that returns an EMPTY answer is also retried:
+#     when completion tokens were used (``stat.completion_tokens > 0``) a
+#     thinking model spent the remaining completion budget on reasoning and
+#     never reached the answer (the prompt nearly filled the provider's
+#     TOTAL token window) - the prompt is shrunk like an overflow retry so
+#     the model has room to both think and answer; when no completion tokens
+#     were used at all the same prompt is resent a few times;
+#   - repeated failures enter a backoff window so over-budget sessions do not
+#     hammer the summary model with the same doomed request on every turn.
+
+_SUMMARY_PROMPT_MIN_TOKENS: int = 8192
+_SUMMARY_TURN_MAX_CHARS: int = 20000
+#: Cap for the "previous summary" section when no retry budget is active; a
+#: rolling summary should be compact (quality limit, not a window constraint).
+_PREV_SUMMARY_MAX_TOKENS: int = 16384
+#: Maximum number of overflow retries (each one halves the prompt budget).
+_MAX_OVERFLOW_RETRIES: int = 12
+#: Maximum number of same-prompt retries after an empty answer that used no
+#: completion tokens at all (transient provider behavior).
+_MAX_EMPTY_OUTPUT_RETRIES: int = 2
+_MEMORY_MAX_ENTRIES: int = 200
+_COMPRESS_BACKOFF_TOKEN_GROWTH: float = 1.25
+_COMPRESS_BACKOFF_SECONDS: float = 1800.0
+_COMPRESS_BACKOFF_MIN_FAILURES: int = 3
+
+#: Fragments that reveal a summary is the compression prompt's own output-format
+#: example (persisted when a failed LLM call's input prompt was mistakenly
+#: treated as the model output).  Such files must never be injected into
+#: inference context nor trusted as "previous summary" for incremental merges.
+_PLACEHOLDER_SUMMARY_MARKERS: tuple[str, ...] = ("(concise summary prose",)
+_PLACEHOLDER_MEMORY_CONTENTS: frozenset[str] = frozenset(
+    {"self-contained descriptive sentence"}
+)
+_VALID_ENTRY_TYPES: frozenset[str] = frozenset(
+    {"fact", "preference", "decision", "entity"}
+)
+_OVERFLOW_ERROR_KEYWORDS: tuple[str, ...] = (
+    "exceed",
+    "context size",
+    "context length",
+    "context_length",
+    "too many tokens",
+    "maximum context",
+    "prompt is too long",
+    "range of input",
+    "max_tokens",
+)
+
+# Fast CJK-aware token estimate.  ``estimate_llm_tokens`` in runtime.common has
+# the same semantics but walks the text character by character in Python, which
+# is far too slow for multi-megabyte histories; the regex-based count below
+# runs in C and matches it.
+_CJK_TOKEN_CHAR_RE = re.compile(
+    "[\u2E80-\u30FF\u31F0-\u31FF\u3400-\u4DBF\u4E00-\u9FFF"
+    "\uAC00-\uD7AF\uF900-\uFAFF\U00020000-\U000323AF]"
+)
+
+
+def _estimate_tokens_fast(text: str) -> int:
+    """Fast CJK-aware token estimate (same semantics as ``estimate_llm_tokens``)."""
+    if not text:
+        return 0
+    cjk = len(_CJK_TOKEN_CHAR_RE.findall(text))
+    other = len(text) - cjk
+    return cjk + ((other + 3) // 4 if other else 0)
+
+
+def _is_placeholder_summary(text: str) -> bool:
+    """Return True when *text* is (part of) the prompt's format example.
+
+    A placeholder summary is a corrupted artifact: the model never produced
+    it, so it must be treated as "no summary exists".
+    """
+    return any(marker in text for marker in _PLACEHOLDER_SUMMARY_MARKERS)
+
+
+def _is_placeholder_memory_entry(content: str) -> bool:
+    """Return True when a memory entry is the prompt's format example."""
+    stripped = (content or "").strip()
+    return not stripped or stripped in _PLACEHOLDER_MEMORY_CONTENTS
+
+
+def _is_overflow_error(error: str) -> bool:
+    """Return True when *error* looks like a context-window overflow rejection."""
+    lowered = (error or "").lower()
+    return any(keyword in lowered for keyword in _OVERFLOW_ERROR_KEYWORDS)
+
+
+def _truncate_turn_content(content: str, max_chars: int = _SUMMARY_TURN_MAX_CHARS) -> str:
+    """Cap a single turn's content for the compression prompt.
+
+    Keeps the head (3/4) and the tail (1/4); a marker documents the omission.
+    """
+    if max_chars <= 0 or len(content) <= max_chars:
+        return content
+    head = max_chars * 3 // 4
+    tail = max_chars // 4
+    omitted = len(content) - head - tail
+    return f"{content[:head]}\n[... {omitted} characters omitted ...]\n{content[len(content) - tail:]}"
+
+
+def _truncate_to_token_budget(text: str, token_budget: int) -> str:
+    """Truncate *text* (head/tail) so its token estimate fits *token_budget*."""
+    if token_budget <= 0:
+        return ""
+    est = _estimate_tokens_fast(text)
+    if est <= token_budget:
+        return text
+    ratio = len(text) / est  # chars per estimated token
+    chars = max(1, int(token_budget * ratio))
+    if chars >= len(text):
+        return text
+    head = chars * 3 // 4
+    tail = chars // 4
+    omitted = len(text) - head - tail
+    return f"{text[:head]}\n[... {omitted} characters omitted ...]\n{text[len(text) - tail:]}"
+
+
+_COMPRESSION_PROMPT_HEAD = (
+    "You are a conversation analysis assistant. Read the conversation history "
+    "below and complete TWO tasks. Output ONLY the two tagged blocks \u2014 no other text.\n\n"
+)
+
+_COMPRESSION_PROMPT_TAIL = """
+---
+
+**Task 1 \u2014 Rolling Summary (conversation FRAMEWORK)**
+
+Focus on what determines the DIRECTION of the conversation: the user's \
+instructions and the assistant's final responses. This summary will replace the \
+original conversation in the model's context window, so it must preserve the \
+narrative arc \u2014 what was asked, what was decided, and where things stand now.
+
+Prioritise these (they define the framework):
+- **User instructions & goals**: every user message that states a request, \
+  goal, question, or feedback. Reproduce the full intent \u2014 do not reduce a \
+  detailed request to a one-liner. Pay special attention to the LAST user \
+  message, as it typically sets the current task.
+- **Assistant final responses** (marked [ASSISTANT \u2014 FINAL RESPONSE]): these \
+  are the assistant's synthesised answers, decisions, and deliverables. \
+  Capture the conclusions reached, the approach chosen, the solution delivered, \
+  and the reasoning behind key choices.
+- **Key decisions & rationale**: what was decided, by whom, and why. Include \
+  trade-offs discussed (e.g. "chose X over Y because Z").
+- **Unresolved items**: questions still open, tasks pending, explicit next \
+  steps the user or assistant committed to.
+
+Do NOT duplicate raw factual data into the summary. The following belong in \
+Task 2 (Memory), not here:
+- Tool call arguments and raw tool outputs (file listings, search result \
+  snippets, stack traces, command output).
+- Specific file paths, version numbers, port numbers, configuration values \
+  (unless essential to understanding a decision).
+- Intermediate error messages and their step-by-step resolution.
+
+If a previous summary is provided, merge it with the new turns into a single \
+coherent narrative. Do NOT just append \u2014 rewrite from scratch as one integrated \
+summary. Keep the most recent summary's information when still relevant; drop \
+only what has been superseded.
+
+**Task 2 \u2014 Structured Memory (factual DETAILS)**
+
+Extract SPECIFIC, FACTUAL details from the conversation \u2014 especially from \
+tool-call loops, tool results, and intermediate reasoning \u2014 that are useful \
+reference material for future sessions. These are the raw facts deliberately \
+left out of the summary. Be thorough \u2014 err on the side of including borderline \
+items. Assign a confidence score (0.0\u20131.0).
+
+Categories (use in entry_type):
+- "fact": objective, verifiable information (e.g. "the server runs on port \
+  8080", "database name is app_production", "error message was 'connection \
+  refused on 127.0.0.1:5432'", "file src/auth.py is 342 lines")
+- "preference": user likes/dislikes (e.g. "prefers async/await over raw \
+  promises", "dislikes ORMs, prefers raw SQL")
+- "decision": a choice made with rationale (e.g. "decided to use Redis for \
+  caching because latency must be < 5ms")
+- "entity": a named thing the user cares about (e.g. "Working on project \
+  'AcmeChat'", "Uses AWS S3 bucket 'uploads-prod'")
+
+Pay extra attention to:
+- **Tool results**: file paths discovered, search results, command output, \
+  stack traces, error messages, test failure details.
+- **Code & configuration**: specific code snippets, shell commands, SQL \
+  queries, config values, environment variables mentioned or discovered.
+- **Version / environment info**: language versions, library versions, OS \
+  details, hardware specs mentioned.
+
+For each entry:
+- Write a self-contained sentence that makes sense without surrounding context.
+- Include specific names, versions, numbers when available.
+- Skip truly trivial chit-chat ("hello", "thanks") but include anything that \
+  might be useful to recall in a future session.
+
+**Output format (strictly follow \u2014 no extra text outside the tags):**
+<summary>
+(concise summary prose, typically 2\u20135 paragraphs)
+</summary>
+<memory>
+[
+  {
+    "entry_type": "fact|preference|decision|entity",
+    "content": "self-contained descriptive sentence",
+    "source_turn_index": 0,
+    "confidence": 0.9,
+    "created_at": "{current_ts}"
+  }
+]
+</memory>
+"""
+
+
+def _turn_compression_label(turn: "ConversationTurn") -> str:
+    """Annotate a turn's type for the compression prompt."""
+    if turn.role == "user":
+        return "[USER INSTRUCTION]"
+    if turn.role == "assistant":
+        if turn.tool_calls:
+            return "[ASSISTANT \u2014 TOOL CALLS (intermediate)]"
+        return "[ASSISTANT \u2014 FINAL RESPONSE]"
+    if turn.role == "tool":
+        tool_name = f" ({turn.name})" if turn.name else ""
+        return f"[TOOL RESULT{tool_name}]"
+    if turn.role == "system":
+        return "[SYSTEM]"
+    return f"[{turn.role}]"
+
+
+# ---------------------------------------------------------------------------
 # ContextManager
 # ---------------------------------------------------------------------------
 
@@ -365,6 +615,7 @@ import logging
 import os
 import subprocess
 import tempfile
+import time
 
 from runtime.common import now_iso
 from typing import Callable, Optional
@@ -1060,6 +1311,11 @@ class ContextManager:
         # Optional model registry used to resolve SUMMARY_MODEL_ID by ID/label.
         self._model_registry = model_registry
         self._memory_store: dict[str, list[MemoryEntry]] = {}
+        # Per-session compression failure state (consecutive failures, token
+        # count and timestamp at last failure) used for backoff.
+        self._compress_failure_state: dict[str, dict] = {}
+        # Sessions for which the placeholder-summary warning was already logged.
+        self._placeholder_summary_warned: set[str] = set()
 
     # ------------------------------------------------------------------
     # Dynamic configuration properties (re-read env vars on every access)
@@ -1584,11 +1840,167 @@ class ContextManager:
     # Unified context compression (single LLM call)
     # ------------------------------------------------------------------
 
+    def _compress_backoff_active(
+        self, session_id: str, tokens: int, forced: bool = False
+    ) -> bool:
+        """Return True when compression for *session_id* is in failure backoff.
+
+        After repeated consecutive failures, further attempts are skipped until
+        the session's token count grows by 25 % or 30 minutes pass, so an
+        over-budget session does not re-send the same doomed request on every
+        turn.  ``forced=True`` bypasses the backoff.
+        """
+        if forced:
+            return False
+        state = self._compress_failure_state.get(session_id)
+        if not state or state.get("fails", 0) < _COMPRESS_BACKOFF_MIN_FAILURES:
+            return False
+        if tokens >= state.get("tokens", 0) * _COMPRESS_BACKOFF_TOKEN_GROWTH:
+            return False
+        if time.monotonic() - state.get("at", 0.0) > _COMPRESS_BACKOFF_SECONDS:
+            return False
+        return True
+
+    def _record_compress_failure(self, session_id: str, tokens: int) -> None:
+        state = self._compress_failure_state.setdefault(
+            session_id, {"fails": 0, "tokens": 0, "at": 0.0}
+        )
+        state["fails"] += 1
+        state["tokens"] = max(state.get("tokens", 0), tokens)
+        state["at"] = time.monotonic()
+
+    def _record_compress_success(self, session_id: str) -> None:
+        self._compress_failure_state.pop(session_id, None)
+        self._placeholder_summary_warned.discard(session_id)
+
+    def _merge_memory_entries(
+        self, session_id: str, new_entries: list[MemoryEntry]
+    ) -> list[MemoryEntry]:
+        """Merge *new_entries* with the session's existing memory entries.
+
+        The compression prompt does not include the existing memory file, so
+        the model only ever emits NEW entries — persisting them alone would
+        wipe everything extracted earlier.  Entries are de-duplicated by
+        ``(entry_type, content)`` and the result is capped to the most recent
+        ``_MEMORY_MAX_ENTRIES`` entries.
+        """
+        existing = [
+            e for e in self.load_memory(session_id)
+            if not _is_placeholder_memory_entry(e.content)
+        ]
+        seen = {(e.entry_type, e.content) for e in existing}
+        for entry in new_entries:
+            key = (entry.entry_type, entry.content)
+            if key not in seen:
+                seen.add(key)
+                existing.append(entry)
+        if len(existing) > _MEMORY_MAX_ENTRIES:
+            existing.sort(key=lambda e: e.created_at or "")
+            existing = existing[-_MEMORY_MAX_ENTRIES:]
+        return existing
+
+    def _build_compression_prompt(
+        self,
+        delta: list[ConversationTurn],
+        delta_start: int,
+        previous_summary: str,
+        budget_tokens: Optional[int],
+        current_ts: str,
+    ) -> str:
+        """Build the compression prompt for the delta.
+
+        ``delta`` holds the turns NOT yet covered by ``previous_summary``;
+        ``delta[i]`` is global turn index ``delta_start + i``.
+
+        ``budget_tokens=None`` (the normal case): the FULL delta is sent —
+        only pathological single turns are capped at
+        ``_SUMMARY_TURN_MAX_CHARS`` chars and the previous summary at
+        ``_PREV_SUMMARY_MAX_TOKENS`` tokens.  ``budget_tokens`` as an int
+        (overflow-retry case): the whole prompt is additionally bounded to
+        that many tokens — the previous summary is capped at 1/4 of the
+        budget, then the OLDEST turns are dropped (a marker documents the
+        loss), and as a last resort the newest turn is hard-truncated.
+        """
+        overhead = (
+            _estimate_tokens_fast(_COMPRESSION_PROMPT_HEAD)
+            + _estimate_tokens_fast(_COMPRESSION_PROMPT_TAIL)
+            + 128  # history section headers + omission marker
+        )
+
+        prev = previous_summary
+        if budget_tokens is not None:
+            prev_budget = max(2048, budget_tokens // 4)
+        else:
+            prev_budget = _PREV_SUMMARY_MAX_TOKENS
+        if prev and _estimate_tokens_fast(prev) > prev_budget:
+            prev = _truncate_to_token_budget(prev, prev_budget)
+
+        turns_budget: Optional[int]
+        if budget_tokens is not None:
+            turns_budget = max(0, budget_tokens - overhead - _estimate_tokens_fast(prev))
+        else:
+            turns_budget = None  # no total cap: send the full delta
+
+        rendered: list[str] = []
+        estimates: list[int] = []
+        for i, t in enumerate(delta):
+            content = _truncate_turn_content(t.content)
+            line = f"Turn {delta_start + i} {_turn_compression_label(t)}: {content}"
+            rendered.append(line)
+            estimates.append(_estimate_tokens_fast(line) + 1)
+
+        dropped = 0
+        if turns_budget is not None:
+            total = sum(estimates)
+            while total > turns_budget and dropped < len(rendered):
+                total -= estimates[dropped]
+                dropped += 1
+
+            if dropped == len(rendered):
+                # Not a single turn fits — keep only the most recent one,
+                # hard-truncated.
+                if turns_budget > 0:
+                    rendered = [
+                        f"Turn {delta_start + len(delta) - 1} "
+                        f"{_turn_compression_label(delta[-1])}: "
+                        + _truncate_to_token_budget(delta[-1].content, turns_budget)
+                    ]
+                    dropped = len(delta) - 1
+                else:
+                    rendered = []
+                    dropped = len(delta)
+            elif dropped > 0:
+                rendered = rendered[dropped:]
+                rendered.insert(
+                    0,
+                    f"[... {dropped} older turn(s) omitted: compression prompt "
+                    f"budget of {budget_tokens} tokens exceeded ...]",
+                )
+
+        if rendered:
+            turns_text = "\n".join(rendered)
+        else:
+            turns_text = (
+                f"[no conversation turns fit the compression prompt budget of "
+                f"{budget_tokens} tokens]"
+            )
+        if prev:
+            history_section = (
+                f"## Previous summary\n{prev}\n\n"
+                f"## New turns to incorporate\n{turns_text}"
+            )
+        else:
+            history_section = f"## Conversation turns\n{turns_text}"
+
+        prompt = _COMPRESSION_PROMPT_HEAD + history_section + _COMPRESSION_PROMPT_TAIL
+        return prompt.replace("{current_ts}", current_ts)
+
     def compress_context(
         self,
         session_id: str,
         turns: list[ConversationTurn],
         last_total_tokens: Optional[int] = None,
+        forced: bool = False,
     ) -> None:
         """Compress conversation history in a single LLM call.
 
@@ -1601,21 +2013,61 @@ class ContextManager:
         - ``SUMMARY_MODEL_ID`` resolves to a registered model (non-empty;
           default ``"summary"``).
         - ``last_total_tokens`` exceeds the effective ``MAX_TOKENS_IN_CONTEXT``
-          threshold (env var, default 65536).
+          threshold (env var, default 65536) — unless *forced* is true.
+        - There is at least one turn NOT yet covered by a valid previous
+          summary.  Compression is INCREMENTAL: only the delta since the last
+          successful summary is sent to the LLM (merged with that previous
+          summary), so the prompt stays small no matter how long the session
+          history has grown.
 
-        Both configuration values are re-read from the environment on every
+        All configuration values are re-read from the environment on every
         call so changes take effect without a restart.
 
-        If the LLM call fails entirely, a warning is logged and both files are
-        left unchanged.  If only the memory JSON is malformed, the summary is
-        still saved and a warning is logged for the memory part.
+        The delta is sent IN FULL — in normal operation it is inherently
+        bounded by the ``MAX_TOKENS_IN_CONTEXT`` trigger threshold, so an
+        extra prompt budget would only discard context the summary model
+        could handle.  The only pre-emptive limits are per pathological
+        single turns (``_SUMMARY_TURN_MAX_CHARS`` chars).  If the summary
+        model nevertheless rejects the request with a context-overflow error
+        (e.g. a very small summary-model window, or a delta that grew while
+        compression kept failing), the prompt is rebuilt with a token budget
+        halved from the natural prompt size — dropping the oldest delta turns
+        first — down to 8192 tokens.
+
+        An ACCEPTED request that still comes back with an EMPTY answer is
+        handled the same way: when the response used completion tokens (a
+        thinking model spent the remaining output budget on reasoning —
+        typical when the prompt nearly fills the provider's TOTAL token
+        window, e.g. context + output capped at 1M), the prompt is shrunk
+        like an overflow retry so the model has room to both think and
+        answer; when no completion tokens were used at all the same prompt
+        is resent up to ``_MAX_EMPTY_OUTPUT_RETRIES`` times.
+
+        Failure semantics (important):
+
+        - If the LLM call fails entirely (HTTP error, timeout, empty output,
+          or output that is the prompt's own format example), a warning is
+          logged and both files are left UNCHANGED.  A failed result object
+          must never be mistaken for model output: on errors the runtime
+          returns the INPUT messages (whose last entry is this very prompt,
+          containing the ``<summary>``/``<memory>`` format example), and
+          parsing that used to persist the template placeholders into
+          ``summary.md``/``memory.md``.
+        - Consecutive failures put the session into a short backoff window
+          (no retries until the session's token count grows by 25 % or 30
+          minutes pass) so over-budget sessions do not re-send the same
+          doomed request on every turn.
+        - If only the memory JSON is malformed, the summary is still saved
+          and a warning is logged for the memory part.
 
         Args:
             session_id: Target session.
             turns: Current full list of conversation turns.
             last_total_tokens: Total tokens (prompt + completion) from the most
                 recent inference.  When ``None``, the value is read from the
-                ``last_total_tokens`` field in ``conversation.md``.
+                ``last_total_tokens`` field in ``conversation.json``.
+            forced: When true, skip the token-threshold check and the failure
+                backoff (manual regeneration).
         """
         if not self._summary_model_id:
             return
@@ -1626,7 +2078,7 @@ class ContextManager:
             effective_tokens = self.get_last_total_tokens(session_id)
         if effective_tokens is None:
             return  # no token data available yet
-        if effective_tokens <= self._max_tokens_in_context:
+        if not forced and effective_tokens <= self._max_tokens_in_context:
             return  # still within budget
 
         # Determine which turns to compress.
@@ -1650,167 +2102,178 @@ class ContextManager:
         if summarized_up_to < 0:
             return
 
-        # Read existing summary for version tracking and incremental update
+        # Read existing summary for version tracking and incremental update.
+        # A placeholder summary (the prompt's own format example, persisted by
+        # an older bug after a failed LLM call) is NOT a valid previous
+        # summary — treat it as "no summary" so the delta restarts from turn 0.
         existing_summary, existing_fm = self.get_summary(session_id)
         existing_version: int = existing_fm.get("summary_version", 0)  # type: ignore[assignment]
         if not isinstance(existing_version, int):
             existing_version = 0
+        previous_summary = ""
+        delta_start = 0
+        if existing_summary.strip() and not _is_placeholder_summary(existing_summary):
+            previous_summary = existing_summary
+            raw_cut = existing_fm.get("summarized_up_to_turn", -1)
+            if isinstance(raw_cut, int):
+                delta_start = max(0, min(raw_cut + 1, len(turns)))
 
-        # Build the turns text for the turns being compressed.
-        # Annotate turn types so the LLM can distinguish:
-        #   - user instructions (define the conversation framework)
-        #   - assistant tool-call loops (intermediate reasoning)
-        #   - assistant final responses (synthesis / conclusions)
-        #   - tool results (raw data returned by tools)
-        lines: list[str] = []
-        for i, t in enumerate(turns[: summarized_up_to + 1]):
-            if t.role == "user":
-                label = "[USER INSTRUCTION]"
-            elif t.role == "assistant":
-                if t.tool_calls:
-                    label = "[ASSISTANT — TOOL CALLS (intermediate)]"
-                else:
-                    label = "[ASSISTANT — FINAL RESPONSE]"
-            elif t.role == "tool":
-                tool_name = f" ({t.name})" if t.name else ""
-                label = f"[TOOL RESULT{tool_name}]"
-            elif t.role == "system":
-                label = "[SYSTEM]"
-            else:
-                label = f"[{t.role}]"
-            lines.append(f"Turn {i} {label}: {t.content}")
-        turns_text = "\n".join(lines)
-
-        # Compose prompt — two clearly separated tasks with strict output format
-        if existing_summary:
-            history_section = (
-                f"## Previous summary\n{existing_summary}\n\n"
-                f"## New turns to incorporate\n{turns_text}"
+        # Incremental compression: only the turns NOT covered by the previous
+        # summary are sent to the LLM.  Sending the full history on every call
+        # made the prompt grow without bound and blow past the summary model's
+        # context window in long sessions.
+        delta = turns[delta_start: summarized_up_to + 1]
+        if not delta:
+            logging.info(
+                "compress_context: nothing new to compress for session %s "
+                "(previous summary already covers the compressible turns)",
+                session_id,
             )
-        else:
-            history_section = f"## Conversation turns\n{turns_text}"
+            return
+
+        # Backoff: after repeated failures do not re-send the same doomed
+        # request on every turn.
+        if self._compress_backoff_active(session_id, effective_tokens or 0, forced=forced):
+            logging.debug(
+                "compress_context: session %s in compression failure backoff; skipping",
+                session_id,
+            )
+            return
 
         current_ts = now_iso()
-        prompt = f"""\
-You are a conversation analysis assistant. Read the conversation history below \
-and complete TWO tasks. Output ONLY the two tagged blocks — no other text.
-
-{history_section}
-
----
-
-**Task 1 — Rolling Summary (conversation FRAMEWORK)**
-
-Focus on what determines the DIRECTION of the conversation: the user's \
-instructions and the assistant's final responses. This summary will replace the \
-original conversation in the model's context window, so it must preserve the \
-narrative arc — what was asked, what was decided, and where things stand now.
-
-Prioritise these (they define the framework):
-- **User instructions & goals**: every user message that states a request, \
-  goal, question, or feedback. Reproduce the full intent — do not reduce a \
-  detailed request to a one-liner. Pay special attention to the LAST user \
-  message, as it typically sets the current task.
-- **Assistant final responses** (marked [ASSISTANT — FINAL RESPONSE]): these \
-  are the assistant's synthesised answers, decisions, and deliverables. \
-  Capture the conclusions reached, the approach chosen, the solution delivered, \
-  and the reasoning behind key choices.
-- **Key decisions & rationale**: what was decided, by whom, and why. Include \
-  trade-offs discussed (e.g. "chose X over Y because Z").
-- **Unresolved items**: questions still open, tasks pending, explicit next \
-  steps the user or assistant committed to.
-
-Do NOT duplicate raw factual data into the summary. The following belong in \
-Task 2 (Memory), not here:
-- Tool call arguments and raw tool outputs (file listings, search result \
-  snippets, stack traces, command output).
-- Specific file paths, version numbers, port numbers, configuration values \
-  (unless essential to understanding a decision).
-- Intermediate error messages and their step-by-step resolution.
-
-If a previous summary is provided, merge it with the new turns into a single \
-coherent narrative. Do NOT just append — rewrite from scratch as one integrated \
-summary. Keep the most recent summary's information when still relevant; drop \
-only what has been superseded.
-
-**Task 2 — Structured Memory (factual DETAILS)**
-
-Extract SPECIFIC, FACTUAL details from the conversation — especially from \
-tool-call loops, tool results, and intermediate reasoning — that are useful \
-reference material for future sessions. These are the raw facts deliberately \
-left out of the summary. Be thorough — err on the side of including borderline \
-items. Assign a confidence score (0.0–1.0).
-
-Categories (use in entry_type):
-- "fact": objective, verifiable information (e.g. "the server runs on port \
-  8080", "database name is app_production", "error message was 'connection \
-  refused on 127.0.0.1:5432'", "file src/auth.py is 342 lines")
-- "preference": user likes/dislikes (e.g. "prefers async/await over raw \
-  promises", "dislikes ORMs, prefers raw SQL")
-- "decision": a choice made with rationale (e.g. "decided to use Redis for \
-  caching because latency must be < 5ms")
-- "entity": a named thing the user cares about (e.g. "Working on project \
-  'AcmeChat'", "Uses AWS S3 bucket 'uploads-prod'")
-
-Pay extra attention to:
-- **Tool results**: file paths discovered, search results, command output, \
-  stack traces, error messages, test failure details.
-- **Code & configuration**: specific code snippets, shell commands, SQL \
-  queries, config values, environment variables mentioned or discovered.
-- **Version / environment info**: language versions, library versions, OS \
-  details, hardware specs mentioned.
-
-For each entry:
-- Write a self-contained sentence that makes sense without surrounding context.
-- Include specific names, versions, numbers when available.
-- Skip truly trivial chit-chat ("hello", "thanks") but include anything that \
-  might be useful to recall in a future session.
-
-**Output format (strictly follow — no extra text outside the tags):**
-<summary>
-(concise summary prose, typically 2–5 paragraphs)
-</summary>
-<memory>
-[
-  {{
-    "entry_type": "fact|preference|decision|entity",
-    "content": "self-contained descriptive sentence",
-    "source_turn_index": 0,
-    "confidence": 0.9,
-    "created_at": "{current_ts}"
-  }}
-]
-</memory>
-"""
-
-        try:
-            from runtime.models import InferenceRequest, Message as _Message  # local import to avoid circular deps
-            infer_request = InferenceRequest(
-                model_id=self._summary_model_id,
-                messages=[_Message(role="user", content=prompt)],
+        # None = no budget: the first attempt sends the full delta.  Only a
+        # rejection installs a budget (halved from the natural size): either
+        # an overflow 400, or an accepted request that came back empty after
+        # burning its completion budget on thinking.
+        budget: Optional[int] = None
+        error = ""
+        raw_output = ""
+        success = False
+        attempt = 0
+        empty_retries = 0
+        while True:
+            attempt += 1
+            shrink = False
+            prompt = self._build_compression_prompt(
+                delta, delta_start, previous_summary, budget, current_ts
             )
-            result = self._infer_fn(infer_request)
-            raw_output: str
-            # InferenceResult: extract content from the last non-usage assistant message
-            if hasattr(result, "messages") and result.messages:
-                last_msg = next(
-                    (m for m in reversed(result.messages) if getattr(m, "role", None) not in ("usage",)),
-                    None,
+
+            result = None
+            try:
+                from runtime.models import InferenceRequest, Message as _Message  # local import to avoid circular deps
+                infer_request = InferenceRequest(
+                    model_id=self._summary_model_id,
+                    messages=[_Message(role="user", content=prompt)],
                 )
-                raw_output = (getattr(last_msg, "content", None) or "") if last_msg else ""
-            elif hasattr(result, "content"):
-                raw_output = result.content or ""
-            elif isinstance(result, dict) and "content" in result:
-                raw_output = result["content"] or ""
-            else:
-                raw_output = str(result)
-        except Exception as exc:  # noqa: BLE001
+                result = self._infer_fn(infer_request)
+                # A FAILED result must never be parsed as model output: on
+                # errors the runtime returns the INPUT messages (whose last
+                # entry is this very prompt, containing the <summary>/<memory>
+                # format example).  Parsing that used to persist the template
+                # placeholders into summary.md / memory.md.
+                if getattr(result, "success", True) is False:
+                    success = False
+                    error = str(getattr(result, "error", None) or "unknown error")
+                    raw_output = ""
+                else:
+                    # InferenceResult: extract content from the last non-usage assistant message
+                    if hasattr(result, "messages") and result.messages:
+                        last_msg = next(
+                            (m for m in reversed(result.messages) if getattr(m, "role", None) not in ("usage",)),
+                            None,
+                        )
+                        raw_output = (getattr(last_msg, "content", None) or "") if last_msg else ""
+                    elif hasattr(result, "content"):
+                        raw_output = result.content or ""
+                    elif isinstance(result, dict) and "content" in result:
+                        raw_output = result["content"] or ""
+                    else:
+                        raw_output = str(result)
+                    error = ""
+                    success = True
+            except Exception as exc:  # noqa: BLE001
+                success = False
+                error = str(exc)
+                raw_output = ""
+                logging.warning(
+                    "compress_context: LLM call failed for session %s: %s",
+                    session_id,
+                    exc,
+                )
+
+            if success and not raw_output.strip():
+                success = False
+                # The provider ACCEPTED the request but no answer came back.
+                # (a) completion tokens were used: a thinking model spent the
+                #     remaining completion budget on reasoning and never got
+                #     to the answer.  This happens when the prompt nearly
+                #     fills the provider's TOTAL token window (context +
+                #     output), leaving only a few hundred output tokens.
+                #     Shrinking the prompt gives the model room to both think
+                #     and answer, so retry with a halved budget like overflow.
+                # (b) no completion tokens at all: a transient empty
+                #     response - resend the same prompt a couple of times.
+                stat = getattr(result, "stat", None) if result is not None else None
+                used_completion = int(getattr(stat, "completion_tokens", 0) or 0)
+                if used_completion > 0:
+                    error = (
+                        "empty model output (completion budget exhausted "
+                        "by thinking)"
+                    )
+                    shrink = attempt < _MAX_OVERFLOW_RETRIES
+                elif empty_retries < _MAX_EMPTY_OUTPUT_RETRIES:
+                    empty_retries += 1
+                    logging.warning(
+                        "compress_context: empty model output for session %s "
+                        "(no completion tokens); resending the same prompt "
+                        "(%d/%d)",
+                        session_id, empty_retries, _MAX_EMPTY_OUTPUT_RETRIES,
+                    )
+                    continue
+                else:
+                    error = "empty model output"
+
+            if success:
+                break
+
+            # Context-overflow rejection (HTTP 400), or a thinking model that
+            # consumed the completion budget on reasoning without answering
+            # (accepted request, empty content): retry with a prompt budget
+            # halved from the natural prompt size, dropping the oldest delta
+            # turns first, down to _SUMMARY_PROMPT_MIN_TOKENS.
+            if (
+                not shrink
+                and error
+                and _is_overflow_error(error)
+                and attempt < _MAX_OVERFLOW_RETRIES
+            ):
+                shrink = True
+            if shrink:
+                if budget is None:
+                    budget = max(
+                        2 * _SUMMARY_PROMPT_MIN_TOKENS,
+                        _estimate_tokens_fast(prompt),
+                    )
+                next_budget = max(_SUMMARY_PROMPT_MIN_TOKENS, budget // 2)
+                if next_budget < budget:
+                    budget = next_budget
+                    logging.warning(
+                        "compress_context: prompt did not fit the summary "
+                        "model for session %s (%s); retrying with a %d-token "
+                        "prompt budget (oldest delta turns dropped)",
+                        session_id, error, budget,
+                    )
+                    continue
+            break
+
+        if not success:
             logging.warning(
-                "compress_context: LLM call failed for session %s: %s",
-                session_id,
-                exc,
+                "compress_context: LLM call failed for session %s (%s); "
+                "summary.md and memory.md left unchanged",
+                session_id, error or "unknown error",
             )
-            return  # leave both files unchanged
+            self._record_compress_failure(session_id, effective_tokens or 0)
+            return
 
         # --- Parse summary block ---
         summary_text = _extract_tagged_block(raw_output, "summary")
@@ -1822,6 +2285,17 @@ For each entry:
                 "session %s; using full output as summary",
                 session_id,
             )
+        if not summary_text or _is_placeholder_summary(summary_text):
+            # The model echoed the prompt's format example instead of a real
+            # summary (typically after a truncated or failed request).  Never
+            # persist that.
+            logging.warning(
+                "compress_context: LLM output for session %s is a placeholder "
+                "echo of the prompt format; not persisting summary/memory",
+                session_id,
+            )
+            self._record_compress_failure(session_id, effective_tokens or 0)
+            return
 
         # Persist summary
         now = now_iso()
@@ -1836,7 +2310,7 @@ For each entry:
             serialize_summary(summary_fm, summary_text),
         )
 
-        # --- Parse memory block ---
+        # --- Parse memory block (merge with existing entries) ---
         memory_json_str = _extract_tagged_block(raw_output, "memory")
         if memory_json_str:
             try:
@@ -1844,19 +2318,44 @@ For each entry:
                 if not isinstance(entries_data, list):
                     raise ValueError("Expected a JSON array inside <memory>")
                 entries: list[MemoryEntry] = []
+                rejected = 0
                 for item in entries_data:
-                    entry = MemoryEntry(
-                        entry_type=item["entry_type"],
-                        content=item["content"],
-                        source_turn_index=int(item["source_turn_index"]),
-                        confidence=float(item["confidence"]),
-                        created_at=item.get("created_at", now),
+                    if not isinstance(item, dict):
+                        rejected += 1
+                        continue
+                    entry_type = item.get("entry_type")
+                    content = str(item.get("content") or "").strip()
+                    if entry_type not in _VALID_ENTRY_TYPES \
+                            or _is_placeholder_memory_entry(content):
+                        rejected += 1
+                        continue
+                    try:
+                        source_turn_index = int(item.get("source_turn_index", 0))
+                        confidence = float(item.get("confidence", 0.0))
+                    except (TypeError, ValueError):
+                        rejected += 1
+                        continue
+                    confidence = max(0.0, min(1.0, confidence))
+                    if confidence >= self._memory_confidence_threshold:
+                        entries.append(
+                            MemoryEntry(
+                                entry_type=entry_type,
+                                content=content,
+                                source_turn_index=source_turn_index,
+                                confidence=confidence,
+                                created_at=str(item.get("created_at") or now),
+                            )
+                        )
+                if rejected:
+                    logging.warning(
+                        "compress_context: rejected %d malformed/placeholder "
+                        "memory entries for session %s",
+                        rejected, session_id,
                     )
-                    if entry.confidence >= self._memory_confidence_threshold:
-                        entries.append(entry)
+                merged = self._merge_memory_entries(session_id, entries)
                 # Persist to memory.md and update in-memory cache
-                self.save_memory(session_id, entries)
-                self._memory_store[session_id] = entries
+                self.save_memory(session_id, merged)
+                self._memory_store[session_id] = merged
             except Exception as exc:  # noqa: BLE001
                 logging.warning(
                     "compress_context: failed to parse <memory> block for "
@@ -1870,6 +2369,8 @@ For each entry:
                 "session %s; memory.md not updated",
                 session_id,
             )
+
+        self._record_compress_success(session_id)
 
     def compress_context_forced(self, session_id: str) -> None:
         """Force regeneration of summary and memory for *session_id*.
@@ -1897,10 +2398,13 @@ For each entry:
             )
             return
 
-        # Pass a large fake token count to bypass the threshold check while
-        # still going through the same code path.
+        # Pass a large fake token count and forced=True to bypass the threshold
+        # check and the failure backoff while still going through the same code
+        # path.
         fake_tokens = self._max_tokens_in_context + 1
-        self.compress_context(session_id, turns, last_total_tokens=fake_tokens)
+        self.compress_context(
+            session_id, turns, last_total_tokens=fake_tokens, forced=True
+        )
 
     def get_summary(self, session_id: str) -> tuple[str, dict]:
         """Return ``(summary_text, front_matter_dict)`` for *session_id*.
@@ -1954,6 +2458,11 @@ For each entry:
         entries = self.load_memory(session_id)
         if not entries:
             entries = self._memory_store.get(session_id, [])
+        # Drop corrupted placeholder entries (echo of the prompt's format
+        # example persisted by an older bug after a failed compression).
+        entries = [
+            e for e in entries if not _is_placeholder_memory_entry(e.content)
+        ]
         if entry_type is not None:
             entries = [e for e in entries if e.entry_type == entry_type]
         return entries
@@ -2121,6 +2630,21 @@ For each entry:
 
         # 1. Rolling summary (present only when compression has been triggered)
         summary_text, summary_fm = self.get_summary(session_id)
+        summary_present = bool(summary_text.strip())
+        if summary_present and _is_placeholder_summary(summary_text):
+            # Corrupted artifact of a failed compression (the prompt's own
+            # format example was persisted as the "summary").  Stay in the
+            # compressed branch so the full history is NOT re-injected into
+            # the inference context; only the summary part itself is dropped.
+            if session_id not in self._placeholder_summary_warned:
+                self._placeholder_summary_warned.add(session_id)
+                logger.warning(
+                    "assemble_context(session=%s): summary.md contains "
+                    "placeholder text from a failed compression; ignoring its "
+                    "content (run compress_context_forced to regenerate)",
+                    session_id,
+                )
+            summary_text = ""
         summary_msg: Optional[dict] = None
         if summary_text.strip():
             summary_msg = {
@@ -2128,7 +2652,7 @@ For each entry:
                 "content": f"## Summary\n{summary_text}",
             }
 
-        if summary_msg is None:
+        if summary_msg is None and not summary_present:
             # No compression has occurred yet — inject full history verbatim.
             turn_msgs: list[dict] = [
                 {k: v for k, v in asdict(t).items() if v is not None}
