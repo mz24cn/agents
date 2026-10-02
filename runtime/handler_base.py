@@ -64,6 +64,98 @@ _MAX_PUSH_BODY_BYTES = 512 * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
+# Streaming request-body readers
+# ---------------------------------------------------------------------------
+# The tunnel browser bridge forwards a request body to the child as it is
+# read off the browser socket, instead of buffering the whole thing first.
+# These module-level generators yield the body in bounded blocks (the caller
+# frames each block into one tunnel binary frame).  They raise instead of
+# sending a response so the caller can decide what to do (the tunnel proxy
+# has already put the request header on the wire by the time the body is read).
+
+class _BodyReaderError(Exception):
+    """The request body could not be read (malformed / truncated / closed)."""
+
+
+class _BodyTooLargeError(_BodyReaderError):
+    """The request body exceeded the configured size cap."""
+
+
+def _read_block(rfile, n: int) -> bytes:
+    """``rfile.read(n)``, mapping a socket error to ``_BodyReaderError``."""
+    try:
+        block = rfile.read(n)
+    except OSError as exc:
+        raise _BodyReaderError(str(exc)) from exc
+    if not block:
+        raise _BodyReaderError("truncated request body")
+    return block
+
+
+def _read_line(rfile, limit: int) -> bytes:
+    """``rfile.readline(limit)``, mapping a socket error to ``_BodyReaderError``."""
+    try:
+        return rfile.readline(limit)
+    except OSError as exc:
+        raise _BodyReaderError(str(exc)) from exc
+
+
+def iter_raw_body(rfile, content_length: int, max_bytes: int,
+                  block_size: int = 65536):
+    """Yield a fixed-length request body in ``block_size`` blocks.
+
+    Raises ``_BodyTooLargeError`` when the declared length exceeds
+    *max_bytes* (before reading anything) and ``_BodyReaderError`` when the
+    stream ends before *content_length* bytes arrived (client hung up).
+    """
+    if content_length > max_bytes:
+        raise _BodyTooLargeError()
+    remaining = content_length
+    while remaining > 0:
+        block = _read_block(rfile, min(block_size, remaining))
+        remaining -= len(block)
+        yield block
+
+
+def iter_chunked_body(rfile, max_bytes: int, block_size: int = 65536):
+    """Yield a ``Transfer-Encoding: chunked`` request body chunk by chunk.
+
+    Decodes the chunk framing on the fly (some mobile browsers send Blob PUT
+    bodies chunked, without a Content-Length).  Raises ``_BodyTooLargeError``
+    once the running total exceeds *max_bytes* and ``_BodyReaderError`` on any
+    malformed / truncated framing.
+    """
+    total = 0
+    while True:
+        size_line = _read_line(rfile, 65537)
+        if not size_line or b"\n" not in size_line:
+            raise _BodyReaderError("bad chunk size line")
+        size_token = size_line.strip().split(b";", 1)[0]
+        try:
+            size = int(size_token, 16)
+        except ValueError:
+            raise _BodyReaderError("bad chunk size") from None
+        if size == 0:
+            # Consume trailer headers up to the blank line.
+            while True:
+                line = _read_line(rfile, 65537)
+                if line in (b"\r\n", b"\n", b""):
+                    break
+            return
+        if total + size > max_bytes:
+            raise _BodyTooLargeError()
+        remaining = size
+        while remaining > 0:
+            block = _read_block(rfile, min(block_size, remaining))
+            total += len(block)
+            remaining -= len(block)
+            yield block
+        # RFC 7230: each chunk is followed by CRLF.
+        if _read_block(rfile, 2) != b"\r\n":
+            raise _BodyReaderError("missing chunk CRLF")
+
+
+# ---------------------------------------------------------------------------
 # Declarative route tables (precompiled regexes)
 # ---------------------------------------------------------------------------
 # Each entry is (compiled_pattern, handler_name, converters):
@@ -354,35 +446,10 @@ class HandlerBaseMixin:
         error response.
         """
         parts: list = []
-        total = 0
         try:
-            while True:
-                size_line = self.rfile.readline(65537)
-                if not size_line or b"\n" not in size_line:
-                    return None
-                size_token = size_line.strip().split(b";", 1)[0]
-                size = int(size_token, 16)
-                if size == 0:
-                    # Consume trailer headers up to the blank line.
-                    while True:
-                        line = self.rfile.readline(65537)
-                        if line in (b"\r\n", b"\n", b""):
-                            break
-                    break
-                if total + size > max_bytes:
-                    return None
-                remaining = size
-                while remaining > 0:
-                    block = self.rfile.read(min(65536, remaining))
-                    if not block:
-                        return None
-                    parts.append(block)
-                    total += len(block)
-                    remaining -= len(block)
-                # RFC 7230: each chunk is followed by CRLF.
-                if self.rfile.read(2) != b"\r\n":
-                    return None
-        except (OSError, ValueError):
+            for block in iter_chunked_body(self.rfile, max_bytes):
+                parts.append(block)
+        except _BodyReaderError:
             return None
         return b"".join(parts)
 

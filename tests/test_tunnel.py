@@ -1710,3 +1710,300 @@ def test_concurrent_request_bodies_route_by_rid(tmp_path):
     finally:
         child.__exit__(None, None, None)
         parent.__exit__(None, None, None)
+
+
+# ---------------------------------------------------------------------------
+# Streaming request bodies end-to-end
+# ---------------------------------------------------------------------------
+# The parent reads the browser request body off its socket and forwards it to
+# the child chunk by chunk (OP_REQ_CHUNK pairs), instead of buffering the
+# whole body before the first byte reaches the child.  That is what stops a
+# slow tunnel upload from sitting at "100%" on the browser while the parent
+# had long finished reading it.
+
+def _read_http_response(raw, timeout=30):
+    """Read one HTTP response off a raw socket; return (status_line, body)."""
+    raw.settimeout(timeout)
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        d = raw.recv(65536)
+        if not d:
+            break
+        buf += d
+    head, _, body = buf.partition(b"\r\n\r\n")
+    status_line = head.split(b"\r\n", 1)[0].decode("ascii", errors="replace")
+    clen = 0
+    for line in head.split(b"\r\n")[1:]:
+        if line.lower().startswith(b"content-length:"):
+            try:
+                clen = int(line.split(b":", 1)[1].strip())
+            except ValueError:
+                clen = 0
+    while len(body) < clen:
+        d = raw.recv(65536)
+        if not d:
+            break
+        body += d
+    return status_line, body
+
+
+def _raw_chunked_post(port, path, payload, piece=8192):
+    """POST a Transfer-Encoding: chunked body on a raw socket (no
+    Content-Length -- what some mobile browsers do for Blob uploads).
+    Returns (status_line, response_body)."""
+    raw = socket.create_connection(("127.0.0.1", port), timeout=120)
+    try:
+        raw.sendall((
+            f"POST {path} HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Content-Type: application/octet-stream\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "\r\n"
+        ).encode("ascii"))
+        for i in range(0, len(payload), piece):
+            p = payload[i:i + piece]
+            raw.sendall(f"{len(p):x}\r\n".encode("ascii") + p + b"\r\n")
+        raw.sendall(b"0\r\n\r\n")
+        return _read_http_response(raw)
+    finally:
+        raw.close()
+
+
+def _echo_body(base, payload, method="POST"):
+    req = urllib.request.Request(
+        base + "/v1/tunnel-test/echo", data=payload,
+        headers={"Content-Type": "application/octet-stream"}, method=method)
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        return resp.status, json.loads(resp.read())
+
+
+def test_tunnel_proxy_streams_large_body_intact(tmp_path):
+    """(i) A multi-frame body crosses the browser bridge byte-for-byte: the
+    parent streams it to the child as short {header, binary} pairs (never one
+    buffered blob, never one lock-long sequence)."""
+    from runtime.tunnel_protocol import CAP_REQ_CHUNK_ID
+    parent, child, parent_srv, child_srv, env_id = _pair_online(tmp_path)
+    try:
+        _install_echo(child_srv)
+        conn = parent_srv._tunnel_manager.conn_for_env(env_id)
+        assert CAP_REQ_CHUNK_ID in conn.caps, conn.caps
+        calls = _spy_send_frames(conn)
+        payload = os.urandom(CHUNK_SIZE * 3 + 1234)
+        base = f"http://127.0.0.1:{parent_srv.port}/v1/tunnel-proxy/{env_id}"
+        status, data = _echo_body(base, payload)
+        assert status == 200
+        assert data == {"size": len(payload),
+                        "sha256": hashlib.sha256(payload).hexdigest()}, data
+        assert max(len(c) for c in calls) <= 2, (
+            "the request body was sent as one buffered blob: "
+            f"frames per send_frames() call = {[len(c) for c in calls]}")
+    finally:
+        child.__exit__(None, None, None)
+        parent.__exit__(None, None, None)
+
+
+def test_tunnel_proxy_small_body_and_get(tmp_path):
+    """(ii) A small body still goes through the streaming path intact, and a
+    bodyless GET still works on the same bridge."""
+    parent, child, parent_srv, child_srv, env_id = _pair_online(tmp_path)
+    try:
+        _install_echo(child_srv)
+        base = f"http://127.0.0.1:{parent_srv.port}/v1/tunnel-proxy/{env_id}"
+        payload = b'{"hello":"world"}'
+        status, data = _echo_body(base, payload)
+        assert status == 200
+        assert data == {"size": len(payload),
+                        "sha256": hashlib.sha256(payload).hexdigest()}, data
+        with urllib.request.urlopen(f"{base}/v1/tools", timeout=30) as resp:
+            assert resp.status == 200
+            assert isinstance(json.loads(resp.read()), dict)
+    finally:
+        child.__exit__(None, None, None)
+        parent.__exit__(None, None, None)
+
+
+def test_tunnel_proxy_streams_chunked_body(tmp_path):
+    """(iii) A Transfer-Encoding: chunked body (no Content-Length, as some
+    mobile browsers send) is decoded on the fly and forwarded chunk by chunk;
+    the child reconstructs the exact bytes."""
+    from runtime.tunnel_protocol import CAP_REQ_CHUNK_ID
+    parent, child, parent_srv, child_srv, env_id = _pair_online(tmp_path)
+    try:
+        _install_echo(child_srv)
+        conn = parent_srv._tunnel_manager.conn_for_env(env_id)
+        assert CAP_REQ_CHUNK_ID in conn.caps
+        calls = _spy_send_frames(conn)
+        payload = os.urandom(CHUNK_SIZE + 5000)
+        status_line, body = _raw_chunked_post(
+            parent_srv.port, f"/v1/tunnel-proxy/{env_id}/v1/tunnel-test/echo", payload)
+        assert " 200 " in status_line, (status_line, body[:200])
+        assert json.loads(body) == {"size": len(payload),
+                                    "sha256": hashlib.sha256(payload).hexdigest()}
+        assert max(len(c) for c in calls) <= 2, [len(c) for c in calls]
+    finally:
+        child.__exit__(None, None, None)
+        parent.__exit__(None, None, None)
+
+
+def test_tunnel_proxy_buffers_without_req_chunk_cap(tmp_path):
+    """(iv) Backward compatibility: a child that does NOT advertise
+    CAP_REQ_CHUNK_ID gets the historical path -- the parent buffers the whole
+    body and sends it as one atomic legacy sequence."""
+    parent, child, parent_srv, child_srv, env_id = _pair_online(tmp_path)
+    try:
+        _install_echo(child_srv)
+        conn = parent_srv._tunnel_manager.conn_for_env(env_id)
+        conn.caps = set()  # as if the child were an older build
+        assert not parent_srv._tunnel_manager.env_supports_req_chunks(env_id)
+        calls = _spy_send_frames(conn)
+        payload = os.urandom(CHUNK_SIZE * 2 + 7)
+        base = f"http://127.0.0.1:{parent_srv.port}/v1/tunnel-proxy/{env_id}"
+        status, data = _echo_body(base, payload)
+        assert status == 200
+        assert data == {"size": len(payload),
+                        "sha256": hashlib.sha256(payload).hexdigest()}, data
+        # header + every body chunk + terminator in ONE send_frames() call
+        assert max(len(c) for c in calls) > 2, [len(c) for c in calls]
+    finally:
+        child.__exit__(None, None, None)
+        parent.__exit__(None, None, None)
+
+
+def test_tunnel_proxy_browser_disconnect_mid_body_aborts(tmp_path):
+    """A browser that hangs up mid-upload is aborted cleanly: the parent
+    answers 400, releases the child's half-received body, and the tunnel stays
+    usable for the next request."""
+    parent, child, parent_srv, child_srv, env_id = _pair_online(tmp_path)
+    try:
+        _install_echo(child_srv)
+        client = child_srv._server.tunnel_client
+        raw = socket.create_connection(("127.0.0.1", parent_srv.port), timeout=30)
+        path = f"/v1/tunnel-proxy/{env_id}/v1/tunnel-test/echo"
+        raw.sendall((
+            f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            "Content-Type: application/octet-stream\r\n"
+            "Content-Length: 5000000\r\n\r\n"
+        ).encode("ascii"))
+        raw.sendall(b"x" * 4096)
+        raw.shutdown(socket.SHUT_WR)  # body is short; the client is gone
+        status_line, _body = _read_http_response(raw, timeout=30)
+        raw.close()
+        assert " 400 " in status_line, status_line
+        _wait_until(lambda: not client._bodies,
+                    message="child released the aborted request body")
+        status, _env = _request(parent_srv, "GET", f"/v1/tunnel-proxy/{env_id}/v1/env")
+        assert status == 200
+    finally:
+        child.__exit__(None, None, None)
+        parent.__exit__(None, None, None)
+
+
+def test_tunnel_proxy_chunked_body_truncated_aborts(tmp_path):
+    """A chunked body that ends before its terminating chunk (client gone)
+    makes the parent drop the connection and release the child's half body,
+    without desyncing the tunnel for later requests."""
+    parent, child, parent_srv, child_srv, env_id = _pair_online(tmp_path)
+    try:
+        _install_echo(child_srv)
+        client = child_srv._server.tunnel_client
+        raw = socket.create_connection(("127.0.0.1", parent_srv.port), timeout=30)
+        path = f"/v1/tunnel-proxy/{env_id}/v1/tunnel-test/echo"
+        raw.sendall((
+            f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            "Content-Type: application/octet-stream\r\n"
+            "Transfer-Encoding: chunked\r\n\r\n"
+        ).encode("ascii"))
+        raw.sendall(b"100\r\n" + b"y" * 0x100 + b"\r\n")  # one chunk, no 0-chunk
+        raw.shutdown(socket.SHUT_WR)
+        status_line, _body = _read_http_response(raw, timeout=30)
+        raw.close()
+        assert " 400 " in status_line, status_line
+        _wait_until(lambda: not client._bodies,
+                    message="child released the truncated chunked body")
+        status, _env = _request(parent_srv, "GET", f"/v1/tunnel-proxy/{env_id}/v1/env")
+        assert status == 200
+    finally:
+        child.__exit__(None, None, None)
+        parent.__exit__(None, None, None)
+
+
+def test_tunnel_proxy_forwards_body_before_fully_read(tmp_path):
+    """The parent forwards the body *as it arrives*: a chunk reaches the
+    child (as a tunnel frame) while the browser still has bytes to send --
+    that is what makes the browser's upload progress track the real tunnel
+    rate instead of jumping to 100% immediately."""
+    parent, child, parent_srv, child_srv, env_id = _pair_online(tmp_path)
+    try:
+        _install_echo(child_srv)
+        conn = parent_srv._tunnel_manager.conn_for_env(env_id)
+        forwarded = []
+        orig = conn.send_frames
+
+        def spy(frames, refresh_activity=False):
+            for opcode, data in frames:
+                if opcode == wsutil.OP_BINARY and data:
+                    forwarded.append(len(data))
+            return orig(frames, refresh_activity=refresh_activity)
+
+        conn.send_frames = spy
+
+        total = CHUNK_SIZE * 4
+        raw = socket.create_connection(("127.0.0.1", parent_srv.port), timeout=30)
+        path = f"/v1/tunnel-proxy/{env_id}/v1/tunnel-test/echo"
+        raw.sendall((
+            f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            "Content-Type: application/octet-stream\r\n"
+            f"Content-Length: {total}\r\n\r\n"
+        ).encode("ascii"))
+        half = total // 2
+        sent = 0
+        while sent < half:
+            n = min(65536, half - sent)
+            raw.sendall(b"z" * n)
+            sent += n
+        # the parent must have pushed a body frame to the child already
+        _wait_until(lambda: forwarded, timeout=10, message="parent forwarded a body chunk")
+        assert sum(forwarded) < total  # ... while half the body was still unsent
+        while sent < total:
+            n = min(65536, total - sent)
+            raw.sendall(b"z" * n)
+            sent += n
+        status_line, body = _read_http_response(raw, timeout=60)
+        raw.close()
+        assert " 200 " in status_line, (status_line, body[:200])
+        assert json.loads(body)["size"] == total
+    finally:
+        child.__exit__(None, None, None)
+        parent.__exit__(None, None, None)
+
+
+def test_streaming_body_readers_unit():
+    """The module-level body readers: block splitting, the fixed-length and
+    chunked framing, and their failure modes."""
+    import io
+
+    from runtime.handler_base import (
+        iter_raw_body, iter_chunked_body, _BodyReaderError, _BodyTooLargeError,
+    )
+
+    # fixed length, split into blocks
+    assert b"".join(iter_raw_body(io.BytesIO(b"abcdef"), 6, 1 << 20, 4)) == b"abcdef"
+    with pytest.raises(_BodyTooLargeError):
+        list(iter_raw_body(io.BytesIO(b""), 100, 10))
+    with pytest.raises(_BodyReaderError):
+        list(iter_raw_body(io.BytesIO(b"ab"), 4, 1 << 20))  # short body
+
+    # chunked: plain, extensions, trailers, empty, and the failure modes
+    assert b"".join(
+        iter_chunked_body(io.BytesIO(b"3\r\nabc\r\n0\r\n\r\n"), 1 << 20)) == b"abc"
+    assert b"".join(iter_chunked_body(
+        io.BytesIO(b"4;ext=1\r\nabcd\r\n0\r\nX-T: 1\r\n\r\n"), 1 << 20)) == b"abcd"
+    assert list(iter_chunked_body(io.BytesIO(b"0\r\n\r\n"), 1 << 20)) == []
+    with pytest.raises(_BodyTooLargeError):
+        list(iter_chunked_body(io.BytesIO(b"100\r\n" + b"q" * 100 + b"\r\n"), 10))
+    with pytest.raises(_BodyReaderError):
+        list(iter_chunked_body(io.BytesIO(b"5\r\nhe"), 1 << 20))       # truncated
+    with pytest.raises(_BodyReaderError):
+        list(iter_chunked_body(io.BytesIO(b"5\r\nhello"), 1 << 20))    # no CRLF
+    with pytest.raises(_BodyReaderError):
+        list(iter_chunked_body(io.BytesIO(b"xyz\r\n"), 1 << 20))       # bad size

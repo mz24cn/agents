@@ -244,36 +244,63 @@ class _TunnelConn:
         capability reads bodies inline on its reader thread and still gets the
         atomic legacy sequence.
         """
-        header = {
-            "op": OP_REQ,
-            "id": rid,
-            "method": method,
-            "path": path,
-            "headers": headers,
-        }
         if CAP_REQ_CHUNK_ID not in self.caps:
-            frames = [(wsutil.OP_TEXT, encode_frame(header))]
+            frames = [(wsutil.OP_TEXT, encode_frame({
+                "op": OP_REQ,
+                "id": rid,
+                "method": method,
+                "path": path,
+                "headers": headers,
+            }))]
             if body:
                 frames.extend((wsutil.OP_BINARY, chunk) for chunk in iter_chunks(body))
             frames.append((wsutil.OP_BINARY, b""))  # body terminator
             self.send_frames(frames, refresh_activity=True)
             return
-        header["body"] = REQ_BODY_CHUNKED
-        self.send_frames([(wsutil.OP_TEXT, encode_frame(header))])
+        self._send_req_header(method, path, headers, rid)
         if body:
             for chunk in iter_chunks(body):
-                # One pair per chunk: the header must reach the child glued to
-                # its binary frame (that is how it attributes the bytes), but
-                # the lock is released in between so other traffic interleaves.
-                self.send_frames([
-                    (wsutil.OP_TEXT, encode_frame({
-                        "op": OP_REQ_CHUNK, "id": rid, "eof": False,
-                    })),
-                    (wsutil.OP_BINARY, chunk),
-                ], refresh_activity=True)
-        self.send_frames([(wsutil.OP_TEXT, encode_frame({
+                self._send_req_chunk(rid, chunk)
+        self._send_req_eof(rid)
+
+    # -- routed request framing (CAP_REQ_CHUNK_ID) -----------------------
+
+    def _send_req_header(self, method: str, path: str, headers: dict, rid: str) -> None:
+        """Send the ``OP_REQ`` header of a per-chunk (``body=chunked``)
+        request.  A control frame: it does not refresh the activity stamp."""
+        self._send_frames_checked([(wsutil.OP_TEXT, encode_frame({
+            "op": OP_REQ, "id": rid, "method": method,
+            "path": path, "headers": headers, "body": REQ_BODY_CHUNKED,
+        }))])
+
+    def _send_req_chunk(self, rid: str, chunk: bytes) -> None:
+        """Send one ``{req-chunk header, binary frame}`` pair.
+
+        The header must reach the child glued to its binary frame (that is
+        how the child attributes the bytes), so both go out under one lock
+        acquisition; the lock is released between pairs so other traffic
+        interleaves.  ``refresh_activity`` keeps the sweeper from reaping a
+        connection that is mid-upload.
+        """
+        self._send_frames_checked([
+            (wsutil.OP_TEXT, encode_frame({
+                "op": OP_REQ_CHUNK, "id": rid, "eof": False,
+            })),
+            (wsutil.OP_BINARY, chunk),
+        ], refresh_activity=True)
+
+    def _send_req_eof(self, rid: str) -> None:
+        """Terminate a per-chunk request body (control frame: no refresh)."""
+        self._send_frames_checked([(wsutil.OP_TEXT, encode_frame({
             "op": OP_REQ_CHUNK, "id": rid, "eof": True,
         }))])
+
+    def _send_frames_checked(self, frames: list, refresh_activity: bool = False) -> None:
+        """``send_frames`` mapping a socket error to ``TunnelOfflineError``."""
+        try:
+            self.send_frames(frames, refresh_activity=refresh_activity)
+        except OSError as exc:
+            raise TunnelOfflineError(f"tunnel send failed: {exc}") from exc
 
     # ------------------------------------------------------------------
     # HTTP round-trips
@@ -354,9 +381,78 @@ class _TunnelConn:
         status, hdrs = pending.result  # type: ignore[misc]
         return status, hdrs, stream_q
 
-    # ------------------------------------------------------------------
-    # Reader-loop completions
-    # ------------------------------------------------------------------
+    def call_stream_reader(
+        self,
+        method: str,
+        path: str,
+        headers: dict,
+        body_reader,
+        timeout: float = DEFAULT_CALL_TIMEOUT,
+    ):
+        """Like :meth:`call_stream`, but the request body is pulled
+        incrementally from ``body_reader`` -- a zero-argument generator that
+        yields successive body chunks -- instead of being handed over whole.
+
+        Requires CAP_REQ_CHUNK_ID (the child routes per-chunk request bodies):
+        each yielded chunk is forwarded as one ``{req-chunk, binary}`` pair
+        under its own lock acquisition, so a multi-minute upload neither
+        buffers on the parent nor holds the tunnel's send lock for its whole
+        duration (the browser bridge reads the body off the browser socket and
+        hands it over chunk by chunk this way).
+
+        If ``body_reader`` raises (the browser hung up mid-upload, malformed
+        chunked framing) the request is aborted: a best-effort eof releases
+        the child's half-received body, the in-flight slot is dropped, and the
+        exception propagates so the caller can report it.
+        """
+        rid = uuid.uuid4().hex
+        pending = _Pending()
+        stream_q: "queue.Queue" = queue.Queue()
+        pending._stream = stream_q
+        with self._in_flight_lock:
+            if self.closed:
+                raise TunnelOfflineError("tunnel connection closed")
+            if len(self._in_flight) >= INFLIGHT_MAX:
+                raise TunnelError("too many in-flight tunnel calls")
+            self._in_flight[rid] = pending
+        try:
+            self._send_req_header(method, path, headers, rid)
+            try:
+                for chunk in body_reader():
+                    if chunk:
+                        self._send_req_chunk(rid, chunk)
+            except BaseException:
+                # The body producer failed: release the child's half-received
+                # body with a best-effort eof so nothing is left dangling
+                # there, then let the caller report the failure.
+                self._abort_req_body(rid)
+                raise
+            self._send_req_eof(rid)
+        except BaseException:
+            with self._in_flight_lock:
+                self._in_flight.pop(rid, None)
+            raise
+
+        finished = pending.event.wait(timeout)
+        with self._in_flight_lock:
+            self._in_flight.pop(rid, None)
+        if not finished or pending.error is not None:
+            raise pending.error or TunnelTimeoutError(
+                f"tunnel call timed out after {timeout:.0f}s"
+            )
+        status, hdrs = pending.result  # type: ignore[misc]
+        return status, hdrs, stream_q
+
+    def _abort_req_body(self, rid: str) -> None:
+        """Best-effort eof that releases a half-sent request body on the child
+        (frees its assembly buffer / temp file), so an aborted upload does not
+        leave per-request state behind on the far side."""
+        try:
+            self.send_frames([(wsutil.OP_TEXT, encode_frame({
+                "op": OP_REQ_CHUNK, "id": rid, "eof": True,
+            }))])
+        except (OSError, TunnelError):
+            pass
 
     def complete_resp(self, header: dict) -> None:
         rid = str(header.get("id", ""))
@@ -619,6 +715,36 @@ class TunnelManager:
         if conn is None:
             raise TunnelOfflineError(f"tunnel environment is offline: {env_id}")
         return conn.call_stream(method, path, headers or {}, body, timeout=timeout)
+
+    def env_supports_req_chunks(self, env_id: str) -> bool:
+        """True when the child advertises CAP_REQ_CHUNK_ID.
+
+        The browser bridge streams a request body straight to such a child
+        (never buffering it on the parent); a child without the capability
+        needs the legacy atomic framing, so the bridge buffers instead.
+        """
+        conn = self.conn_for_env(env_id)
+        return conn is not None and CAP_REQ_CHUNK_ID in conn.caps
+
+    def call_env_stream_reader(
+        self,
+        env_id: str,
+        method: str,
+        path: str,
+        headers: Optional[dict] = None,
+        body_reader=None,
+        timeout: float = DEFAULT_CALL_TIMEOUT,
+    ):
+        """Streaming call whose request body is produced incrementally by
+        *body_reader* (see :meth:`_TunnelConn.call_stream_reader`).  Only
+        valid for a child that advertises CAP_REQ_CHUNK_ID."""
+        conn = self.conn_for_env(env_id)
+        if conn is None:
+            raise TunnelOfflineError(f"tunnel environment is offline: {env_id}")
+        if CAP_REQ_CHUNK_ID not in conn.caps:
+            raise TunnelError("child does not support routed request bodies")
+        return conn.call_stream_reader(method, path, headers or {}, body_reader,
+                                       timeout=timeout)
 
     def open_stream_env(
         self,

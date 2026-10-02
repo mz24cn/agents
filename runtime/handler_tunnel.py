@@ -331,9 +331,22 @@ class HandlerTunnelMixin:
             k: v for k, v in self.headers.items()
             if k.lower() in self._TUNNEL_PROXY_FORWARD_REQ_HEADERS
         }
+
+        # How the request body reaches the child.  A child that advertises
+        # CAP_REQ_CHUNK_ID can take the body incrementally: the parent reads
+        # it off the browser socket and forwards each block as an OP_REQ_CHUNK
+        # pair, so a slow upload no longer sits at "100%" on the browser while
+        # the parent waits to have read the whole body *and* released the
+        # tunnel's send lock.  A child without the capability reads bodies
+        # inline and needs the legacy single atomic sequence, so the whole
+        # body is buffered here exactly as before (backward compatible).
+        from runtime.handler_base import _MAX_PUSH_BODY_BYTES
+        chunked = False
+        content_length = 0
+        streaming = False
         body = None
         if self.command not in {"GET", "HEAD"}:
-            # Only buffer a body when the client actually sent one.  Many
+            # Only touch the body when the client actually sent one.  Many
             # bridged methods carry no body at all (e.g. DELETE
             # /v1/terminals/{id}); requiring Content-Length > 0 here would
             # 400 them before they ever reach the child, leaving the child
@@ -342,32 +355,45 @@ class HandlerTunnelMixin:
                 content_length = int(self.headers.get("Content-Length", 0) or 0)
             except (TypeError, ValueError):
                 content_length = 0
-            from runtime.handler_base import _MAX_PUSH_BODY_BYTES
-            if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
-                # Some mobile browsers send Blob PUT bodies with
-                # Transfer-Encoding: chunked and no Content-Length (upload
-                # chunks included).  The body must be consumed here: if it
-                # were dropped, the request would reach the child bodyless
-                # (400 on the size check) AND the unread chunked bytes would
-                # desync the keep-alive connection to the browser (the next
-                # request on it would parse chunk data as a request line).
-                body = self._read_chunked_body(_MAX_PUSH_BODY_BYTES)
-                if body is None:
-                    self.close_connection = True
-                    self._send_json_error(400, "Failed to read chunked request body")
-                    return
-            elif content_length > 0:
-                body = self._read_raw_body(_MAX_PUSH_BODY_BYTES)
-                if body is None:
-                    return
+            chunked = "chunked" in (self.headers.get("Transfer-Encoding") or "").lower()
+            if chunked or content_length > 0:
+                if tunnel_manager.env_supports_req_chunks(env_id):
+                    streaming = True
+                elif chunked:
+                    # Some mobile browsers send Blob PUT bodies with
+                    # Transfer-Encoding: chunked and no Content-Length (upload
+                    # chunks included).  The body must be consumed here: if it
+                    # were dropped, the request would reach the child bodyless
+                    # (400 on the size check) AND the unread chunked bytes would
+                    # desync the keep-alive connection to the browser (the next
+                    # request on it would parse chunk data as a request line).
+                    body = self._read_chunked_body(_MAX_PUSH_BODY_BYTES)
+                    if body is None:
+                        self.close_connection = True
+                        self._send_json_error(400, "Failed to read chunked request body")
+                        return
+                else:
+                    body = self._read_raw_body(_MAX_PUSH_BODY_BYTES)
+                    if body is None:
+                        return
 
-        body_len = len(body) if body else 0
         proxy_t0 = time.monotonic()
+        streamed_bytes = {"n": 0}
         try:
-            status, resp_headers, chunks = tunnel_manager.call_env_stream(
-                env_id, self.command, child_path, headers, body, timeout=600,
-            )
+            if streaming:
+                result = self._tunnel_proxy_stream_body(
+                    tunnel_manager, env_id, child_path, headers,
+                    chunked, content_length, streamed_bytes)
+                if result is None:
+                    return  # body read failed; error response already sent
+                status, resp_headers, chunks, body_len = result
+            else:
+                body_len = len(body) if body else 0
+                status, resp_headers, chunks = tunnel_manager.call_env_stream(
+                    env_id, self.command, child_path, headers, body, timeout=600,
+                )
         except Exception as exc:
+            body_len = streamed_bytes["n"] if streaming else body_len
             logger.warning("Tunnel proxy %s %s body=%dB -> 502 after %.0fms: %s",
                            self.command, child_path, body_len,
                            (time.monotonic() - proxy_t0) * 1000, exc)
@@ -425,6 +451,64 @@ class HandlerTunnelMixin:
         else:
             logger.info("Tunnel proxy %s %s body=%dB -> %d in %.0fms",
                         self.command, child_path, body_len, status, elapsed_ms)
+
+    def _tunnel_proxy_stream_body(self, tunnel_manager, env_id, child_path, headers,
+                                  chunked, content_length, progress):
+        """Forward the browser's request body to the child incrementally.
+
+        Reads the body straight off ``self.rfile`` and hands each block to
+        :meth:`TunnelManager.call_env_stream_reader`, which frames it into an
+        OP_REQ_CHUNK pair -- the whole body is never buffered.  *progress* is a
+        one-key dict the reader updates with the number of bytes forwarded (for
+        the log line; it reflects the partial count if the body read fails).
+
+        Returns ``(status, resp_headers, chunks, body_len)`` on success, or
+        ``None`` after sending an error response when the body cannot be read.
+        """
+        from runtime.handler_base import (
+            iter_raw_body, iter_chunked_body, _BodyReaderError, _BodyTooLargeError,
+            _MAX_PUSH_BODY_BYTES,
+        )
+        from runtime.tunnel_protocol import CHUNK_SIZE
+
+        def _fail(status: int, message: str):
+            # The browser may already be gone (it is exactly the mid-upload
+            # disconnect case that lands here), so the error write is
+            # best-effort; either way the connection must not be reused.
+            self.close_connection = True
+            try:
+                self._send_json_error(status, message)
+            except OSError:
+                pass
+            return None
+
+        if not chunked and content_length > _MAX_PUSH_BODY_BYTES:
+            # Reject before anything reaches the child: nothing to clean up
+            # there, and the unread body would desync the keep-alive link.
+            return _fail(413, "Request body too large")
+
+        def body_reader():
+            if chunked:
+                source = iter_chunked_body(self.rfile, _MAX_PUSH_BODY_BYTES)
+            else:
+                source = iter_raw_body(
+                    self.rfile, content_length, _MAX_PUSH_BODY_BYTES, CHUNK_SIZE)
+            for block in source:
+                progress["n"] += len(block)
+                yield block
+
+        try:
+            status, resp_headers, chunks = tunnel_manager.call_env_stream_reader(
+                env_id, self.command, child_path, headers, body_reader, timeout=600)
+        except _BodyTooLargeError:
+            return _fail(413, "Request body too large")
+        except _BodyReaderError:
+            # Malformed / truncated body, or the browser hung up mid-upload.
+            # The unread bytes would desync a keep-alive connection, so drop
+            # it (the child's half-received body was already released by the
+            # tunnel manager's best-effort eof).
+            return _fail(400, "Failed to read request body")
+        return status, resp_headers, chunks, progress["n"]
 
     def _handle_tunnel_proxy_ws(self, env_id: str) -> None:
         """GET /v1/tunnel-proxy/{env_id}/v1/terminals/ws — terminal bridge.
