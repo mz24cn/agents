@@ -32,20 +32,24 @@ import os
 import re
 import socket
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Optional
 
 from runtime.auth_manager import COOKIE_NAME
+from runtime.build_info import build_revision
 from runtime.common import atomic_write_text, get_workspace
 from runtime.remote_env_manager import normalize_setup_url
 from runtime.tunnel_protocol import (
+    CAP_RESP_CHUNK_ID,
     OP_DEREGISTER,
     OP_REQ,
     OP_REJECT,
     OP_REPLACED,
     OP_RESP,
+    OP_RESP_CHUNK,
     OP_STREAM_CLOSE,
     OP_STREAM_DATA,
     OP_STREAM_ERROR,
@@ -101,10 +105,17 @@ class TunnelClient:
         import queue as _queue
         self._req_queue: "_queue.Queue" = _queue.Queue()
         self._worker_pool: list[threading.Thread] = []
-        # Serializes every child->parent frame SEQUENCE: a response's header +
-        # body + terminator must not interleave with pongs or stream-data
-        # frames (the parent routes response bodies with one active-body id).
+        # Serializes child->parent frames.  When the parent does NOT
+        # advertise CAP_RESP_CHUNK_ID, a response's header + body +
+        # terminator must not interleave with pongs or stream-data frames
+        # (the parent routes bare binary body frames with one active-body id,
+        # so the whole sequence is sent under the lock -- which also means a
+        # long streaming response blocks every other response).  With the
+        # capability, per-chunk headers carry the rid and the lock is only
+        # held per frame.
         self._send_lock = threading.Lock()
+        # Capabilities of the CURRENT parent connection (welcome frame).
+        self._live_caps: set = set()
         self._state = {"state": "idle", "detail": "", "env_id": ""}
         self._state_lock = threading.Lock()
 
@@ -322,6 +333,11 @@ class TunnelClient:
             "arch": _platform_arch(),
             "os": _platform_os(),
             "workspace": get_workspace(),
+            # Which code is actually running here (the parent stamps
+            # runtime/.build_revision into push-update deltas; dev checkouts
+            # fall back to git).  Lets the UI answer "did the child really
+            # get the update?" without SSHing into it.
+            "revision": build_revision(),
         }
 
     def _set_state(self, state: str, detail: str = "", env_id: str = "") -> None:
@@ -426,6 +442,8 @@ class TunnelClient:
             op = obj.get("op")
             if op == OP_WELCOME:
                 self._set_state("online", env_id=str(obj.get("env_id", "")))
+                caps = obj.get("caps")
+                self._live_caps = set(caps) if isinstance(caps, list) else set()
             elif op == OP_REJECT:
                 if obj.get("reason") == REJECT_NOT_REGISTERED:
                     return "not-registered"
@@ -441,6 +459,7 @@ class TunnelClient:
         finally:
             if self._live_ws is ws:
                 self._live_ws = None
+                self._live_caps = set()
             try:
                 ws.close()
             except Exception:
@@ -541,16 +560,36 @@ class TunnelClient:
 
     def _send_response(self, ws: WSClient, rid: str, status: int,
                        headers_out: dict, resp) -> None:
-        """Emit one complete response frame sequence (header + body +
-        terminator) atomically.
+        """Emit one complete response (header + body + terminator).
 
-        Holding _send_lock across the whole sequence keeps pongs and
-        stream-data frames (other threads on the same tunnel) out of the
-        body: the parent reader routes response bodies with a single
-        active-body cursor, so any interleaved frame corrupts the body.
+        Two frame formats:
+
+        * the parent advertised CAP_RESP_CHUNK_ID: per-chunk headers carry
+          the rid, so the lock is only held PER FRAME.  A long streaming
+          response (a remote chat turn runs for minutes) then no longer
+          holds the tunnel hostage -- every other response (upload
+          init/PUT/complete, directory listings, ...) gets its frames out
+          in between.  Holding the lock across the whole sequence here is
+          exactly what stalled the file manager mid-upload whenever a chat
+          turn was streaming.
+        * otherwise (old parent): one atomic sequence under the lock,
+          because the old parent routes bare binary body frames with a
+          single active-body cursor -- any interleaved frame corrupts the
+          body.
         """
+        if CAP_RESP_CHUNK_ID in self._live_caps:
+            self._send_response_chunked(ws, rid, status, headers_out, resp)
+            return
+        wait_t0 = time.monotonic()
         try:
             with self._send_lock:
+                if time.monotonic() - wait_t0 > 2.0:
+                    logger.warning(
+                        "Tunnel: response %s waited %.1fs for the send lock "
+                        "(a long streaming response holds it; the parent "
+                        "does not support %s -- update the parent to "
+                        "unblock concurrent tunnel calls)",
+                        rid, time.monotonic() - wait_t0, CAP_RESP_CHUNK_ID)
                 ws.send_text(encode_frame({
                     "op": OP_RESP, "id": rid, "status": status, "headers": headers_out,
                 }).decode("utf-8"))
@@ -560,6 +599,44 @@ class TunnelClient:
                         break
                     ws.send_binary(chunk)
                 ws.send_binary(b"")  # body terminator
+        except (OSError, WSClientError):
+            pass
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+    def _send_response_chunked(self, ws: WSClient, rid: str, status: int,
+                               headers_out: dict, resp) -> None:
+        """CAP_RESP_CHUNK_ID framing: OP_RESP header, then for each body
+        chunk an OP_RESP_CHUNK header (rid + eof flag) followed by the
+        binary data; eof=true terminates the body (no following frame).
+        Each frame goes out under its own lock acquisition, so other
+        response sequences may interleave chunk by chunk; the parent's
+        reader re-derives the active-body id from each header."""
+        try:
+            with self._send_lock:
+                ws.send_text(encode_frame({
+                    "op": OP_RESP, "id": rid, "status": status, "headers": headers_out,
+                }).decode("utf-8"))
+            while True:
+                # read1: at most ONE underlying socket read per frame, so a
+                # streaming local response (SSE chat turn) emits each event
+                # promptly instead of buffering until CHUNK_SIZE accumulates.
+                chunk = resp.read1(CHUNK_SIZE)
+                if chunk:
+                    with self._send_lock:
+                        ws.send_text(encode_frame({
+                            "op": OP_RESP_CHUNK, "id": rid, "eof": False,
+                        }).decode("utf-8"))
+                        ws.send_binary(chunk)
+                else:
+                    with self._send_lock:
+                        ws.send_text(encode_frame({
+                            "op": OP_RESP_CHUNK, "id": rid, "eof": True,
+                        }).decode("utf-8"))
+                    break
         except (OSError, WSClientError):
             pass
         finally:

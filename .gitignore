@@ -1,5 +1,7 @@
 # Python
 __pycache__/
+# push-update revision stamp (written by applied deltas; dev trees use git)
+runtime/.build_revision
 *.py[cod]
 *.pyo
 *.pyd

@@ -3,7 +3,12 @@
   import { t } from '../../lib/i18n.svelte.js'
   import { workspace as workspaceApi } from '../../lib/api.js'
   import { remoteWorkspace } from '../../lib/remote-execution.svelte.js'
-  import { isMissingChunksError, missingChunkIds } from '../../lib/workspace-upload.js'
+  import {
+    isMissingChunksError,
+    isTransientUploadError,
+    missingChunkIds,
+    fileLanded,
+  } from '../../lib/workspace-upload.js'
   import { marked } from 'marked'
   import { highlight, escapeHtml, getFileLang, isMarkdownFile } from '../../lib/highlight.js'
   import { copyToClipboard } from '../../lib/clipboard.js'
@@ -1923,8 +1928,9 @@
       try {
         await wsApi.uploadComplete(task.upload_id)
       } catch (err) {
-        if (!isMissingChunksError(err)) throw err
-        if (!(await healMissingChunks(task, err))) return
+        if (isMissingChunksError(err)) {
+          if (!(await healMissingChunks(task, err))) return
+        } else if (!(await recoverCompletedUpload(task, err))) return
       }
       task.status = 'completed'
       task.chunks.forEach((chunk) => {
@@ -1965,13 +1971,29 @@
     chunk.status = 'uploading'
     chunk.uploaded = 0
     const body = task.file.slice(chunk.offset, chunk.offset + chunk.size)
-    const request = wsApi.uploadChunk(task.upload_id, chunk, body, (uploaded) => {
+    const attempt = () => wsApi.uploadChunk(task.upload_id, chunk, body, (uploaded) => {
       chunk.uploaded = uploaded
       refreshUploads()
     })
-    chunk.request = request
+    chunk.request = attempt()
     refreshUploads()
-    await request.promise
+    try {
+      await chunk.request.promise
+    } catch (err) {
+      // One retry for transient failures (network errors, 5xx, timeouts):
+      // over a tunnel the response can be lost while the child already
+      // wrote the chunk, and a duplicate PUT is idempotent server-side.
+      if (!isTransientUploadError(err) || task.status === 'paused' || task.status === 'cancelled') {
+        throw err
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000))
+      if (task.status === 'paused' || task.status === 'cancelled') return
+      chunk.status = 'uploading'
+      chunk.uploaded = 0
+      refreshUploads()
+      chunk.request = attempt()
+      await chunk.request.promise
+    }
     chunk.uploaded = chunk.size
     chunk.status = 'completed'
     chunk.request = null
@@ -2011,6 +2033,42 @@
     return true
   }
 
+  /**
+   * Recover from a complete failure that is NOT a missing-chunks verdict
+   * (5xx / timeout / network error / even a 404).  Over a tunnel the child
+   * may already have finished the merge -- file renamed into place and the
+   * upload state popped -- while the response was lost or delayed behind the
+   * connection.  Retrying the complete is safe: if the upload is still
+   * pending it completes it; if the state is gone (404) the file itself is
+   * the source of truth, so verify it landed and treat that as success.
+   *
+   * @returns {Promise<boolean>} true when the upload is confirmed done
+   */
+  async function recoverCompletedUpload(task, firstErr) {
+    await new Promise((resolve) => setTimeout(resolve, 2000))
+    if (task.status === 'paused' || task.status === 'cancelled') return false
+    let retryErr = null
+    try {
+      await wsApi.uploadComplete(task.upload_id)
+      return true
+    } catch (err) {
+      retryErr = err
+    }
+    if (retryErr?.status !== 404) throw retryErr
+    return await uploadLanded(task)
+  }
+
+  /** Did the file actually appear in its target directory (name + size)? */
+  async function uploadLanded(task) {
+    try {
+      const base = String(task.target_path || task.file_name).replace(/\\/g, '/').split('/').pop()
+      const data = await wsApi.list(task.target_dir_path, 1, 500, true, { nameFilter: base })
+      return fileLanded(data?.files, base, task.file_size)
+    } catch {
+      return false
+    }
+  }
+
   function pauseUpload(task) {
     task.status = 'paused'
     for (const chunk of task.chunks) {
@@ -2044,9 +2102,12 @@
         await wsApi.uploadComplete(task.upload_id)
       } catch (err) {
         // A task that already failed with "some chunks are missing" (e.g.
-        // before the client-side healing existed) heals on retry the same way.
-        if (!isMissingChunksError(err)) throw err
-        if (!(await healMissingChunks(task, err))) return
+        // before the client-side healing existed) heals on retry the same
+        // way; other failures get the lost-response recovery (the child may
+        // have finished the merge while the response never arrived).
+        if (isMissingChunksError(err)) {
+          if (!(await healMissingChunks(task, err))) return
+        } else if (!(await recoverCompletedUpload(task, err))) return
       }
       task.status = 'completed'
       refreshUploads()

@@ -47,7 +47,7 @@ SNAPSHOT_FLAG_KEYS = ("inference_active", "api_inference_active", "session_infer
 # 应用 / 平台信息字段：同样取自 op=hello 响应（app_title / app_logo / arch / os），
 # 在远程环境列表中展示环境的应用标识与运行平台。
 # 工作区路径（workspace）：远程执行时供母端 UI 展示子端工作区。
-SNAPSHOT_TEXT_KEYS = ("app_title", "app_logo", "arch", "os", "workspace")
+SNAPSHOT_TEXT_KEYS = ("app_title", "app_logo", "arch", "os", "workspace", "revision")
 
 
 def normalize_setup_url(url: str) -> dict:

@@ -519,6 +519,8 @@ class HandlerWorkspaceMixin:
                 # uploaded chunk (regression: complete then failed with
                 # "UPLOAD_NOT_READY: some chunks are missing").
                 self._drain_request_body()
+                logger.info("upload %s chunk #%d: duplicate PUT, already uploaded (%dB)",
+                            upload_id[:8], parallel_id, chunk['size'])
                 self._send_json_response(200, {
                     "upload_id": upload_id,
                     "parallel_id": parallel_id,
@@ -558,6 +560,8 @@ class HandlerWorkspaceMixin:
                 if item['parallel_id'] == parallel_id:
                     item['status'] = 'uploaded'
                     break
+        logger.info("upload %s chunk #%d: wrote %dB, state=uploaded",
+                    upload_id[:8], parallel_id, received)
         self._send_json_response(200, {
             "upload_id": upload_id,
             "parallel_id": parallel_id,
@@ -606,6 +610,12 @@ class HandlerWorkspaceMixin:
                 # link -- or a remote child running an older backend whose
                 # duplicate-PUT handling can lose chunk state -- self-heals
                 # on retry instead of failing the task.
+                # The per-chunk states make "missing" diagnosable from the
+                # log: pending = never written (or reset), uploading = a
+                # write is still in flight, uploaded = should never appear.
+                states = {c['parallel_id']: c.get('status') for c in task['chunks']}
+                logger.warning("upload %s complete: missing chunks %s; chunk states %s",
+                               upload_id[:8], missing, states)
                 self._send_json_response(409, {
                     "error": "UPLOAD_NOT_READY: some chunks are missing",
                     "missing_chunks": missing,

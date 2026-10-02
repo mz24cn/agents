@@ -43,6 +43,40 @@ export function missingChunkIds(err) {
   return Array.isArray(ids) ? ids : null
 }
 
+/**
+ * True when a chunk-PUT failure is TRANSIENT (worth one retry).
+ *
+ * Over a tunnel the response can be lost even though the chunk write
+ * succeeded on the child (e.g. the response sat behind a stalled
+ * connection, or the link hiccuped) -- and a duplicate PUT is idempotent
+ * server-side (an already-uploaded chunk returns 200 without touching its
+ * state).  Deterministic 4xx verdicts are not transient: retrying a 400
+ * (size mismatch) / 404 (unknown upload or chunk) / 409 (cancelled or
+ * already completing) can only fail again.
+ */
+export function isTransientUploadError(err) {
+  if (!err) return false
+  if (err.name === 'AbortError') return false
+  const status = Number(err.status || 0)
+  if (status === 400 || status === 404 || status === 409) return false
+  return true
+}
+
+/**
+ * True when a directory listing shows the uploaded file already landed
+ * (exact name + size).  Used to recover from a lost complete response:
+ * the child may have finished the merge (and popped its upload state)
+ * while the response never reached the browser.
+ */
+export function fileLanded(items, fileName, fileSize) {
+  if (!Array.isArray(items) || !fileName) return false
+  return items.some(
+    (item) => item && !item.is_dir
+      && item.name === fileName
+      && (fileSize == null || item.size === fileSize),
+  )
+}
+
 /** Join a directory path and a filename, preserving the directory's separator style. */
 export function joinPath(dir, name) {
   if (!dir) return name

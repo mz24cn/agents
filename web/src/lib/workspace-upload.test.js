@@ -13,6 +13,8 @@ import {
   resetPasteDirCache,
   resetPasteStamp,
   isMissingChunksError,
+  isTransientUploadError,
+  fileLanded,
   missingChunkIds,
 } from './workspace-upload.js'
 
@@ -195,6 +197,43 @@ describe('isMissingChunksError / missingChunkIds', () => {
     expect(missingChunkIds({ data: { missing_chunks: [1, 2] } })).toEqual([1, 2])
     expect(missingChunkIds({ data: {} })).toBeNull()
     expect(missingChunkIds({})).toBeNull()
+  })
+})
+
+describe('isTransientUploadError', () => {
+  it('treats network errors, 5xx and timeouts as transient', () => {
+    expect(isTransientUploadError(new Error('Upload network error'))).toBe(true)
+    expect(isTransientUploadError({ status: 502, message: 'child_unreachable' })).toBe(true)
+    expect(isTransientUploadError({ status: 500, message: 'boom' })).toBe(true)
+    expect(isTransientUploadError({ status: 504, message: 'gateway timeout' })).toBe(true)
+  })
+
+  it('treats deterministic 4xx verdicts as final (no retry)', () => {
+    expect(isTransientUploadError({ status: 400, message: 'CHUNK_SIZE_MISMATCH' })).toBe(false)
+    expect(isTransientUploadError({ status: 404, message: 'UPLOAD_NOT_FOUND' })).toBe(false)
+    expect(isTransientUploadError({ status: 409, message: 'UPLOAD_CANCELLED' })).toBe(false)
+    expect(isTransientUploadError({ name: 'AbortError' })).toBe(false)
+    expect(isTransientUploadError(null)).toBe(false)
+  })
+})
+
+describe('fileLanded', () => {
+  const items = [
+    { name: 'a.txt', is_dir: false, size: 12 },
+    { name: 'sub', is_dir: true, size: 0 },
+    { name: 'big.bin', is_dir: false, size: 10485760 },
+  ]
+
+  it('matches on exact name and size', () => {
+    expect(fileLanded(items, 'big.bin', 10485760)).toBe(true)
+    expect(fileLanded(items, 'big.bin', 999)).toBe(false)
+    expect(fileLanded(items, 'missing.bin', 10485760)).toBe(false)
+  })
+
+  it('ignores directories and handles empty input', () => {
+    expect(fileLanded(items, 'sub', 0)).toBe(false)
+    expect(fileLanded(null, 'a.txt', 12)).toBe(false)
+    expect(fileLanded([], 'a.txt', 12)).toBe(false)
   })
 })
 

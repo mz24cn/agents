@@ -1254,3 +1254,187 @@ def test_child_worker_pool_runs_concurrently(tmp_path):
         t.join(30)
         assert slow.get("code") == 200, slow.get("raw")
         assert b"sleep 3" in slow.get("raw", b"") or slow["code"] == 200
+
+
+# ---------------------------------------------------------------------------
+# Streaming responses must not block other calls (send-lock regression)
+# ---------------------------------------------------------------------------
+
+class _SlowStreamMixin:
+    """Handler mixin: GET /v1/tunnel-test/slow?ticks=N streams one line
+    every 0.25s with NO Content-Length (read-until-EOF, like a remote chat
+    SSE turn), then closes."""
+
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path)
+        if path.path.rstrip("/") == "/v1/tunnel-test/slow":
+            self._slow_stream()
+            return
+        super().do_GET()
+
+    def _slow_stream(self):
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        ticks = int((q.get("ticks") or ["16"])[0])
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        # No Content-Length (read-until-EOF, like a remote chat SSE turn):
+        # the body ends when the handler closes the connection.
+        self.close_connection = True
+        for i in range(ticks):
+            try:
+                self.wfile.write(f"tick-{i}\n".encode("ascii"))
+                self.wfile.flush()
+            except OSError:
+                return
+            time.sleep(0.25)
+
+
+def _install_slow_stream(child_srv):
+    """Give the child's HTTP server the slow-streaming endpoint (new
+    connections pick up the patched handler class)."""
+    base = child_srv._server.RequestHandlerClass
+    child_srv._server.RequestHandlerClass = type(
+        "SlowStreamHandler", (_SlowStreamMixin, base), {})
+
+
+def _pair_online(tmp_path):
+    parent = _real_server(tmp_path, "parent_data")
+    child = _real_server(tmp_path, "child_data", workspace=tmp_path / "child_ws")
+    parent_srv, _ = parent.__enter__()
+    child_srv, child_data = child.__enter__()
+    _set_child_source(child_srv, child_data, f"http://127.0.0.1:{parent_srv.port}/")
+    status, body = _request(child_srv, "POST", "/v1/tunnel/parent/register")
+    assert status == 200, body
+    env_id = body["env_id"]
+
+    def _online():
+        e = next((e for e in _parent_tunnel_envs(parent_srv) if e["id"] == env_id), None)
+        return e if e and e.get("online") is True else None
+    _wait_until(_online, message="tunnel env online")
+    return parent, child, parent_srv, child_srv, env_id
+
+
+def test_welcome_advertises_resp_chunk_cap(tmp_path):
+    """The parent's welcome frame advertises CAP_RESP_CHUNK_ID and the
+    child stores it for the live connection (enables per-chunk framing)."""
+    from runtime.tunnel_protocol import CAP_RESP_CHUNK_ID
+    parent, child, parent_srv, child_srv, env_id = _pair_online(tmp_path)
+    try:
+        client = child_srv._server.tunnel_client
+        assert CAP_RESP_CHUNK_ID in client._live_caps, client._live_caps
+    finally:
+        child.__exit__(None, None, None)
+        parent.__exit__(None, None, None)
+
+
+def test_streaming_response_does_not_block_other_calls(tmp_path):
+    """Remote-execution mode: a chat turn streams for minutes over the
+    tunnel while the file manager does init/PUT/complete + directory
+    listings on the SAME tunnel.  Before the fix the child held
+    _send_lock across the whole streaming response (the old parent routes
+    bare binary body frames with one active-body cursor), so every other
+    response queued behind the turn: uploads stalled at 100% (bytes sent,
+    response pending) until the 600s parent timeout, while the child's
+    local work had already completed."""
+    parent, child, parent_srv, child_srv, env_id = _pair_online(tmp_path)
+    try:
+        _install_slow_stream(child_srv)
+        manager = parent_srv._tunnel_manager
+        stream = {}
+
+        def _stream():
+            try:
+                st, _h, chunks = manager.call_env_stream(
+                    env_id, "GET", "/v1/tunnel-test/slow?ticks=20")
+                body = b""
+                while True:
+                    c = chunks.get(timeout=60)
+                    if c is None:
+                        break
+                    body += c
+                stream["status"], stream["body"] = st, body
+            except Exception as exc:  # pragma: no cover - debug aid
+                stream["error"] = repr(exc)
+
+        t = threading.Thread(target=_stream)
+        t.start()
+        time.sleep(1.5)  # mid-stream (20 ticks x 0.25s = 5s total)
+
+        t0 = time.monotonic()
+        code, headers, raw = manager.call_env(env_id, "GET", "/v1/tools")
+        elapsed = time.monotonic() - t0
+        assert code == 200, raw[:200]
+        assert b"write_file" in raw
+        assert elapsed < 2.0, (
+            f"fast call waited {elapsed:.1f}s behind the streaming response "
+            "(send-lock stall regression)")
+
+        t.join(30)
+        assert "error" not in stream, stream
+        assert stream["status"] == 200
+        body = stream["body"].decode("ascii")
+        assert body.count("tick-") == 20, body[-200:]
+        assert "tick-0\n" in body and "tick-19\n" in body
+    finally:
+        child.__exit__(None, None, None)
+        parent.__exit__(None, None, None)
+
+
+def test_upload_completes_during_active_stream(tmp_path):
+    """End-to-end (browser-style, through the parent's tunnel proxy): a
+    workspace upload must finish while a long streaming response is in
+    flight on the same tunnel -- the exact ChatPage file-manager scenario."""
+    parent, child, parent_srv, child_srv, env_id = _pair_online(tmp_path)
+    try:
+        _install_slow_stream(child_srv)
+        manager = parent_srv._tunnel_manager
+
+        def _stream():
+            st, _h, chunks = manager.call_env_stream(
+                env_id, "GET", "/v1/tunnel-test/slow?ticks=28")  # 7s
+            while True:
+                if chunks.get(timeout=60) is None:
+                    break
+
+        t = threading.Thread(target=_stream)
+        t.start()
+        time.sleep(1.0)
+
+        payload = os.urandom(2 * 1024 * 1024)
+        t0 = time.monotonic()
+        st, comp = _bridge_upload(parent_srv, env_id, "during-stream.bin", payload)
+        elapsed = time.monotonic() - t0
+        assert st == 200, (st, comp)
+        assert comp.get("status") == "completed", comp
+        assert elapsed < 4.0, (
+            f"upload took {elapsed:.1f}s while the stream was still active "
+            "(send-lock stall regression)")
+        on_disk = (tmp_path / "child_ws" / "during-stream.bin").read_bytes()
+        assert on_disk == payload
+
+        t.join(30)
+    finally:
+        child.__exit__(None, None, None)
+        parent.__exit__(None, None, None)
+
+
+def test_legacy_framing_upload_still_lands(tmp_path):
+    """Compatibility: with the child forced onto the OLD frame format
+    (no CAP_RESP_CHUNK_ID -- what a new child does against an old parent),
+    uploads over the tunnel must still complete correctly.  (They may be
+    slow while a stream is active -- that is the pre-fix behaviour -- but
+    they must not corrupt or fail.)"""
+    parent, child, parent_srv, child_srv, env_id = _pair_online(tmp_path)
+    try:
+        client = child_srv._server.tunnel_client
+        client._live_caps = set()  # simulate an old parent (no caps)
+        payload = os.urandom(512 * 1024)
+        st, comp = _bridge_upload(parent_srv, env_id, "legacy.bin", payload)
+        assert st == 200, (st, comp)
+        assert comp.get("status") == "completed", comp
+        on_disk = (tmp_path / "child_ws" / "legacy.bin").read_bytes()
+        assert on_disk == payload
+    finally:
+        child.__exit__(None, None, None)
+        parent.__exit__(None, None, None)

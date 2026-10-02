@@ -1003,7 +1003,10 @@
                       </span>
                       <span class="remote-env-platform" title={[entry.arch, entry.os].filter(Boolean).join(' / ')}>{[entry.arch, entry.os].filter(Boolean).join(' / ') || '-'}</span>
                       <code class="build-value">{entry.frontend_build || '-'}</code>
-                      <code class="build-value">{entry.backend_build || '-'}</code>
+                      <code class="build-value" title={entry.revision ? `backend revision running on this environment: ${entry.revision}` : ''}>
+                        {entry.backend_build || '-'}
+                        {#if entry.revision}<span class="env-revision-badge">{entry.revision}</span>{/if}
+                      </code>
                       <code class="build-value">{entry.last_config || '-'}</code>
                       <span class="inference-pill" class:busy={entry.inference_active}>
                         <span class="dot"></span>
@@ -1415,6 +1418,15 @@
     background: var(--bg-secondary);
     padding: 3px 8px;
     border-radius: 4px;
+  }
+  .env-revision-badge {
+    margin-left: 6px;
+    font-size: 0.72rem;
+    color: var(--text-secondary);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 0 4px;
   }
   .update-panel {
     min-width: 0;

@@ -92,6 +92,22 @@ OP_PONG = "pong"
 
 OP_REQ = "req"
 OP_RESP = "resp"
+# Per-chunk body framing (see CAP_RESP_CHUNK_ID).  A child that knows its
+# parent routes bodies by per-chunk headers may send, instead of one
+# uninterrupted header + bare-binary + empty-terminator sequence:
+#     header {"op":"resp", ...}
+#     header {"op":"resp-chunk","id":rid,"eof":false}  -> binary <data>
+#     ...
+#     header {"op":"resp-chunk","id":rid,"eof":true}   (no following binary)
+# so that several response sequences can interleave on one tunnel (a long
+# streaming response no longer blocks every other response on the lock).
+OP_RESP_CHUNK = "resp-chunk"
+
+# ---------------------------------------------------------------------------
+# Capabilities (advertised by the parent in the welcome frame)
+# ---------------------------------------------------------------------------
+
+CAP_RESP_CHUNK_ID = "resp-chunk-id"
 
 OP_STREAM_OPEN = "stream-open"
 OP_STREAM_READY = "stream-ready"

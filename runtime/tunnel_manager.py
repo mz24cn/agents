@@ -40,6 +40,7 @@ from typing import Optional, Tuple
 from runtime.tunnel_protocol import (
     DEFAULT_CALL_TIMEOUT,
     INFLIGHT_MAX,
+    CAP_RESP_CHUNK_ID,
     OP_DEREGISTER,
     OP_REQ,
     OP_REPLACED,
@@ -515,7 +516,11 @@ class TunnelManager:
         except AttributeError:
             pass
         try:
-            conn.send_json({"op": OP_WELCOME, "env_id": env_id})
+            # `caps` lets the child upgrade its response framing (per-chunk
+            # body headers, see CAP_RESP_CHUNK_ID).  Old children simply
+            # ignore the extra field.
+            conn.send_json({"op": OP_WELCOME, "env_id": env_id,
+                            "caps": [CAP_RESP_CHUNK_ID]})
         except (TunnelError, OSError):
             with self._lock:
                 if self._conns.get(tunnel_id) is conn:

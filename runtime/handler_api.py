@@ -29,6 +29,7 @@ import urllib.request
 import uuid
 
 from runtime.agent_manager import validate_agent_id
+from runtime.build_info import build_revision
 from runtime.common import get_workspace, session_timestamp
 from runtime.context_manager import JournalConflictError
 from runtime.handler_base import (
@@ -1364,7 +1365,11 @@ class HandlerApiMixin:
         except ValueError as exc:
             self._send_json_error(500, f"env.json format error: {exc}")
             return
-        self._send_json_response(200, {"env": env_map})
+        # Which code is actually running (see runtime/build_info.py) -- the
+        # UI shows it next to remote environments so an update that did not
+        # land is visible instead of a silent mystery.
+        from runtime.build_info import build_revision
+        self._send_json_response(200, {"env": env_map, "revision": build_revision()})
 
     def _handle_set_env(self) -> None:
         """POST /v1/env — 新增或更新一个环境变量。"""
@@ -1468,6 +1473,11 @@ class HandlerApiMixin:
                 # it next to the environment; remote terminals use the child
                 # default workspace (never a parent-side path).
                 "workspace": get_workspace(),
+                # Which code is actually running here (see runtime/build_info.py):
+                # push-update deltas stamp runtime/.build_revision, dev trees
+                # fall back to git.  Lets the parent show -- and the operator
+                # verify -- that an update really landed on this environment.
+                "revision": build_revision(),
             })
             return
 

@@ -29,6 +29,7 @@ from runtime.tunnel_protocol import (
     OP_HELLO,
     OP_REJECT,
     OP_RESP,
+    OP_RESP_CHUNK,
     OP_STREAM_CLOSE,
     OP_STREAM_DATA,
     OP_STREAM_ERROR,
@@ -161,7 +162,16 @@ class HandlerTunnelMixin:
         conn = manager.conn_for_env(env_id)
         if conn is None:
             return
-        logger.info("Tunnel: %s online (env %s)", tunnel_id, env_id)
+        # Persist the hello snapshot (revision, os/arch, build stamps, ...)
+        # on every (re)connect: after a push-update the child re-dials and
+        # this is how the parent learns which code it is now running.
+        snap = snapshot_from_hello(hello.get("snapshot"))
+        try:
+            manager._envs.upsert_tunnel(tunnel_id, snap)
+        except (OSError, KeyError):
+            pass
+        logger.info("Tunnel: %s online (env %s, revision %s)", tunnel_id, env_id,
+                    snap.get("revision", "?"))
         try:
             self._tunnel_ws_reader_loop(sock, conn, tunnel_id)
         finally:
@@ -193,6 +203,18 @@ class HandlerTunnelMixin:
                 if op == OP_RESP:
                     conn.complete_resp(obj)
                     conn.active_body_id = str(obj.get("id", ""))
+                elif op == OP_RESP_CHUNK:
+                    # Per-chunk body framing (CAP_RESP_CHUNK_ID): each binary
+                    # frame is preceded by its own header carrying the rid, so
+                    # multiple response bodies may interleave on one tunnel.
+                    # (Old children send bare binary frames under a single
+                    # active_body_id set by OP_RESP above.)
+                    rid = str(obj.get("id", ""))
+                    if obj.get("eof"):
+                        conn.finalize_body(rid)
+                        conn.active_body_id = None
+                    else:
+                        conn.active_body_id = rid
                 elif op in (OP_STREAM_READY, OP_STREAM_ERROR):
                     conn.complete_stream_open(obj)
                 elif op == OP_STREAM_DATA:
@@ -338,11 +360,16 @@ class HandlerTunnelMixin:
                 if body is None:
                     return
 
+        body_len = len(body) if body else 0
+        proxy_t0 = time.monotonic()
         try:
             status, resp_headers, chunks = tunnel_manager.call_env_stream(
                 env_id, self.command, child_path, headers, body, timeout=600,
             )
         except Exception as exc:
+            logger.warning("Tunnel proxy %s %s body=%dB -> 502 after %.0fms: %s",
+                           self.command, child_path, body_len,
+                           (time.monotonic() - proxy_t0) * 1000, exc)
             self._send_json_response(502, {
                 "error": "child_unreachable",
                 "message": f"Cannot reach child environment over tunnel: {exc}",
@@ -380,6 +407,13 @@ class HandlerTunnelMixin:
                 self.wfile.write(b"0\r\n\r\n")
         except OSError:
             self.close_connection = True
+        elapsed_ms = (time.monotonic() - proxy_t0) * 1000
+        if status >= 400 or elapsed_ms > 5000:
+            logger.warning("Tunnel proxy %s %s body=%dB -> %d in %.0fms",
+                           self.command, child_path, body_len, status, elapsed_ms)
+        else:
+            logger.info("Tunnel proxy %s %s body=%dB -> %d in %.0fms",
+                        self.command, child_path, body_len, status, elapsed_ms)
 
     def _handle_tunnel_proxy_ws(self, env_id: str) -> None:
         """GET /v1/tunnel-proxy/{env_id}/v1/terminals/ws — terminal bridge.

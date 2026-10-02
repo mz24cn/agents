@@ -211,6 +211,42 @@ def test_backend_build_mtime_ignores_dev_only_trees(tmp_path: Path) -> None:
     assert manager._scan_backend_build_mtime(str(project)) == code_new
 
 
+def test_revision_stamp_does_not_bump_backend_build(tmp_path: Path) -> None:
+    """The push-update revision stamp (runtime/.build_revision) is rewritten
+    by every applied delta with mtime = push time.  If it counted toward the
+    advertised backend build, a second push without new edits would look
+    'older than local' on the child and be rejected (and the upgrade hint
+    would light up forever).  It must be ignored by the version scan while
+    still being carried (synthetically) in every delta."""
+    from runtime.build_info import STAMP_FILENAME
+
+    project, data, manager = _sample_project(tmp_path)
+    old = 1_500_000_000
+    stamp_new = 1_800_000_000
+
+    for path in project.rglob("*"):
+        if path.is_file():
+            os.utime(path, (old, old))
+    _write(project / "runtime" / STAMP_FILENAME, "abc1234\n")
+    os.utime(project / "runtime" / STAMP_FILENAME, (stamp_new, stamp_new))
+
+    # The stamp is newer than every source file: it must not bump the build.
+    assert manager._scan_backend_build_mtime(str(project)) == old
+
+    # But a delta built after the stamp exists still carries a fresh stamp...
+    delta = manager.build_delta_tar(
+        project_root=str(project), data_dir=str(data),
+        frontend_since=0.0, backend_since=0.0, config_since=0.0)
+    assert delta is not None
+    names = _tar_names(delta)
+    assert f"runtime/{STAMP_FILENAME}" in names, sorted(names)
+
+    # ...and touching a real source file afterwards bumps the build normally.
+    code_new = 1_900_000_000
+    os.utime(project / "runtime" / "server.py", (code_new, code_new))
+    assert manager._scan_backend_build_mtime(str(project)) == code_new
+
+
 def test_delta_sends_only_changed_web_and_accessories_files(tmp_path: Path) -> None:
     project, data, manager = _sample_project(tmp_path)
     old = 1_000_000_000
