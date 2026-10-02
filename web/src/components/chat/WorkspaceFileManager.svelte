@@ -8,6 +8,7 @@
     isTransientUploadError,
     missingChunkIds,
     fileLanded,
+    chunkRequestPromise,
   } from '../../lib/workspace-upload.js'
   import { marked } from 'marked'
   import { highlight, escapeHtml, getFileLang, isMarkdownFile } from '../../lib/highlight.js'
@@ -1978,7 +1979,7 @@
     chunk.request = attempt()
     refreshUploads()
     try {
-      await chunk.request.promise
+      await chunkRequestPromise(chunk.request)
     } catch (err) {
       // One retry for transient failures (network errors, 5xx, timeouts):
       // over a tunnel the response can be lost while the child already
@@ -1992,7 +1993,7 @@
       chunk.uploaded = 0
       refreshUploads()
       chunk.request = attempt()
-      await chunk.request.promise
+      await chunkRequestPromise(chunk.request)
     }
     chunk.uploaded = chunk.size
     chunk.status = 'completed'
@@ -2073,7 +2074,7 @@
     task.status = 'paused'
     for (const chunk of task.chunks) {
       if (chunk.status === 'uploading') {
-        chunk.request?.abort()
+        chunk.request?.abort?.()
         chunk.status = 'paused'
       }
     }
@@ -2123,7 +2124,7 @@
   async function cancelUpload(task) {
     task.status = 'cancelled'
     for (const chunk of task.chunks) {
-      chunk.request?.abort()
+      chunk.request?.abort?.()
     }
     refreshUploads()
     if (task.upload_id) {

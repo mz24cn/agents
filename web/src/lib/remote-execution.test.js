@@ -291,3 +291,123 @@ describe('remoteRequest / remoteWorkspace / remoteSessions', () => {
     expect(lf).toHaveBeenCalledTimes(2)
   })
 })
+
+// ---------------------------------------------------------------------------
+// remoteWorkspace.uploadChunk
+// ---------------------------------------------------------------------------
+
+/** Minimal XMLHttpRequest stand-in that captures the request and replies on demand. */
+class FakeXHR {
+  static instances = []
+
+  constructor() {
+    this.headers = {}
+    this.upload = {}
+    this.method = null
+    this.url = null
+    this.body = null
+    FakeXHR.instances.push(this)
+  }
+
+  open(method, url) {
+    this.method = method
+    this.url = url
+  }
+
+  setRequestHeader(key, value) {
+    this.headers[key] = value
+  }
+
+  send(body) {
+    this.body = body
+  }
+
+  abort() {
+    this.aborted = true
+    this.onabort?.()
+  }
+
+  /** Test helper: complete the request. */
+  respond(status, text = '') {
+    this.status = status
+    this.responseText = text
+    this.onload?.()
+  }
+}
+
+describe('remoteWorkspace.uploadChunk', () => {
+  beforeEach(() => {
+    FakeXHR.instances = []
+    vi.stubGlobal('XMLHttpRequest', FakeXHR)
+    vi.stubGlobal('fetch', mockFetch(ENV_RECORDS))
+  })
+
+  async function bindTunnel() {
+    await bindSessionToRemoteEnv('sess-1', 'tunnel:0123456789abcdef')
+    return remoteExecution.env
+  }
+
+  it('returns the { promise, abort } handle the file manager awaits', async () => {
+    // Regression: a bare promise made `await request.promise` resolve on
+    // `await undefined`, so every remote chunk was marked completed the
+    // instant its PUT was *sent* and complete raced the still-in-flight
+    // upload -> "UPLOAD_NOT_READY: some chunks are missing" on the child.
+    await bindTunnel()
+    const handle = remoteWorkspace.uploadChunk(
+      'u1', { parallel_id: 0, offset: 0, size: 4, file_size: 4 }, 'data')
+
+    expect(typeof handle).toBe('object')
+    expect(handle.promise).toBeInstanceOf(Promise)
+    expect(typeof handle.abort).toBe('function')
+
+    // The handle must NOT be settled before the request completes.
+    let settled = false
+    handle.promise.then(() => { settled = true })
+    await Promise.resolve()
+    expect(settled).toBe(false)
+
+    FakeXHR.instances[0].respond(200, JSON.stringify({ status: 'uploaded' }))
+    await expect(handle.promise).resolves.toEqual({ status: 'uploaded' })
+  })
+
+  it('PUTs the chunk to the tunnel bridge with the upload headers', async () => {
+    await bindTunnel()
+    const chunk = { parallel_id: 2, offset: 8, size: 4, file_size: 12 }
+    const handle = remoteWorkspace.uploadChunk('u1', chunk, 'data', () => {})
+    const xhr = FakeXHR.instances[0]
+
+    expect(xhr.method).toBe('PUT')
+    expect(xhr.url).toBe('http://parent.local:7988/v1/tunnel-proxy/tunnel%3A0123456789abcdef'
+      + '/v1/workspace/upload/u1/chunk/2')
+    expect(xhr.headers['X-Upload-Offset']).toBe('8')
+    expect(xhr.headers['X-Upload-Size']).toBe('4')
+    expect(xhr.headers['X-File-Size']).toBe('12')
+    // Tunnel envs carry no child token: the child self-authorizes.
+    expect(xhr.headers.Authorization).toBeUndefined()
+
+    xhr.respond(200, '{}')
+    await handle.promise
+  })
+
+  it('rejects with the status on a non-2xx chunk response', async () => {
+    await bindTunnel()
+    const handle = remoteWorkspace.uploadChunk(
+      'u1', { parallel_id: 0, offset: 0, size: 4, file_size: 4 }, 'data')
+    FakeXHR.instances[0].respond(400, JSON.stringify({ error: 'CHUNK_SIZE_MISMATCH: nope' }))
+    await expect(handle.promise).rejects.toMatchObject({
+      status: 400,
+      message: 'CHUNK_SIZE_MISMATCH: nope',
+    })
+  })
+
+  it('abort() aborts the in-flight request', async () => {
+    await bindTunnel()
+    const handle = remoteWorkspace.uploadChunk(
+      'u1', { parallel_id: 0, offset: 0, size: 4, file_size: 4 }, 'data')
+    const xhr = FakeXHR.instances[0]
+    expect(xhr.aborted).toBeFalsy()
+    handle.abort()
+    expect(xhr.aborted).toBe(true)
+    await expect(handle.promise).rejects.toMatchObject({ name: 'AbortError' })
+  })
+})

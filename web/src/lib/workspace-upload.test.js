@@ -16,6 +16,7 @@ import {
   isTransientUploadError,
   fileLanded,
   missingChunkIds,
+  chunkRequestPromise,
 } from './workspace-upload.js'
 
 vi.mock('./api.js', () => ({
@@ -169,6 +170,20 @@ describe('uploadFileToDir', () => {
     expect(path).toBe('/tmp/photo.png')
   })
 
+  it('fails loudly (never completes) when uploadChunk returns a non-awaitable handle', async () => {
+    // Regression guard for the remote-upload bug where uploadChunk returned
+    // a bare promise: `await request.promise` resolved on undefined, the
+    // chunk was marked done while still in flight, and complete ran against
+    // a child that had not received the chunk yet.
+    mockUploadInit({ chunks: [{ parallel_id: 0, offset: 0, size: 5 }] })
+    workspace.uploadChunk.mockReturnValue({ status: 'uploaded' })
+    workspace.uploadCancel.mockResolvedValue({ status: 'cancelled' })
+
+    const file = makeFile('x.png', 'image/png', 5)
+    await expect(uploadFileToDir(file, '/tmp')).rejects.toThrow(/awaitable handle/)
+    expect(workspace.uploadComplete).not.toHaveBeenCalled()
+  })
+
   it('does not heal a non-missing complete error (still cancels and throws)', async () => {
     mockUploadInit({ chunks: [{ parallel_id: 0, offset: 0, size: 5 }] })
     mockUploadChunk()
@@ -197,6 +212,27 @@ describe('isMissingChunksError / missingChunkIds', () => {
     expect(missingChunkIds({ data: { missing_chunks: [1, 2] } })).toEqual([1, 2])
     expect(missingChunkIds({ data: {} })).toBeNull()
     expect(missingChunkIds({})).toBeNull()
+  })
+})
+
+describe('chunkRequestPromise', () => {
+  it('awaits the inner promise of a { promise, abort } handle', async () => {
+    const p = Promise.resolve({ status: 'uploaded' })
+    await expect(chunkRequestPromise({ promise: p, abort: () => {} })).resolves.toEqual({ status: 'uploaded' })
+  })
+
+  it('accepts a bare promise handle', async () => {
+    await expect(chunkRequestPromise(Promise.resolve('ok'))).resolves.toBe('ok')
+  })
+
+  it('throws (instead of resolving on undefined) for a non-awaitable handle', () => {
+    // `await handle.promise` on a handle without a promise resolves on
+    // undefined: the chunk is marked completed while its body is still in
+    // flight, and the next complete then reports it missing server-side.
+    expect(() => chunkRequestPromise(undefined)).toThrow(/awaitable handle/)
+    expect(() => chunkRequestPromise(null)).toThrow(/awaitable handle/)
+    expect(() => chunkRequestPromise({})).toThrow(/awaitable handle/)
+    expect(() => chunkRequestPromise({ status: 'uploaded' })).toThrow(/awaitable handle/)
   })
 })
 

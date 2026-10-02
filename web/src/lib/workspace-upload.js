@@ -63,6 +63,30 @@ export function isTransientUploadError(err) {
 }
 
 /**
+ * Await the settlement of a chunk-PUT handle.
+ *
+ * Both the parent api (`workspace.uploadChunk`) and the remote one
+ * (`remoteWorkspace.uploadChunk`) return `{ promise, abort }`; a bare
+ * promise (or any thenable) is accepted too, because awaiting it is exactly
+ * as correct.  Anything that is NOT awaitable is a bug in the caller's
+ * contract and must fail loudly: `await handle.promise` on a handle that
+ * lost its `promise` key resolves on `undefined` immediately, silently
+ * marking the chunk "completed" while its body is still in flight -- the
+ * next complete then reports the chunk as missing on the server, which no
+ * amount of re-uploading can fix.
+ *
+ * @param {{promise?: Promise<any>}|Promise<any>} request chunk-PUT handle
+ * @returns {Promise<any>}
+ */
+export function chunkRequestPromise(request) {
+  const p = (request && request.promise) || request
+  if (!p || typeof p.then !== 'function') {
+    throw new Error('uploadChunk did not return an awaitable handle (expected { promise, abort })')
+  }
+  return p
+}
+
+/**
  * True when a directory listing shows the uploaded file already landed
  * (exact name + size).  Used to recover from a lost complete response:
  * the child may have finished the merge (and popped its upload state)
@@ -113,7 +137,7 @@ export async function uploadFileToDir(file, targetDirPath, { onProgress } = {}) 
       const request = workspace.uploadChunk(upload_id, chunk, body, (uploaded) => {
         onProgress?.({ name: file.name, uploaded, size: chunk.size })
       })
-      await request.promise
+      await chunkRequestPromise(request)
     }
     try {
       await workspace.uploadComplete(upload_id)
@@ -128,7 +152,7 @@ export async function uploadFileToDir(file, targetDirPath, { onProgress } = {}) 
         : sizedChunks
       for (const chunk of retry) {
         const body = file.slice(chunk.offset, chunk.offset + chunk.size)
-        await workspace.uploadChunk(upload_id, chunk, body).promise
+        await chunkRequestPromise(workspace.uploadChunk(upload_id, chunk, body))
       }
       await workspace.uploadComplete(upload_id)
     }

@@ -290,8 +290,21 @@ export const remoteWorkspace = {
   uploadInit: (data) => remoteRequest('POST', '/v1/workspace/upload/init', data),
   uploadChunk: (uploadId, chunk, blob, onProgress) => {
     // XHR for progress reporting (mirrors parent uploadChunkWithProgress).
-    return new Promise((resolve, reject) => {
-      const xhr = new XMLHttpRequest()
+    //
+    // The return shape MUST match the parent workspace.uploadChunk
+    // (`{ promise, abort }`): callers await `request.promise` for the chunk
+    // to actually finish before they complete the upload, and abort
+    // in-flight chunks via `request.abort()` on pause/cancel.  Returning a
+    // bare promise made `await request.promise` resolve on `await undefined`
+    // -- every remote chunk was marked "completed" the moment its PUT was
+    // *sent* -- so complete ran while the chunk was still in flight and the
+    // child answered UPLOAD_NOT_READY: some chunks are missing (it had not
+    // received the chunk yet), which is unfixable by re-uploading.
+    let xhr = null
+    let rejectPromise = null
+    const promise = new Promise((resolve, reject) => {
+      rejectPromise = reject
+      xhr = new XMLHttpRequest()
       const u = new URL(buildRemoteUrl(
         `/v1/workspace/upload/${encodeURIComponent(uploadId)}/chunk/${chunk.parallel_id}`))
       xhr.open('PUT', u.toString())
@@ -321,6 +334,13 @@ export const remoteWorkspace = {
       xhr.onabort = () => reject(new DOMException('Upload aborted', 'AbortError'))
       xhr.send(blob)
     })
+    return {
+      promise,
+      abort: () => {
+        if (xhr) xhr.abort()
+        else if (rejectPromise) rejectPromise(new DOMException('Upload aborted', 'AbortError'))
+      },
+    }
   },
   uploadComplete: (uploadId) => remoteRequest('POST', `/v1/workspace/upload/${encodeURIComponent(uploadId)}/complete`, {}),
   uploadCancel: (uploadId) => remoteRequest('DELETE', `/v1/workspace/upload/${encodeURIComponent(uploadId)}`),
