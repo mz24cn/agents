@@ -39,7 +39,6 @@ import urllib.request
 from typing import Optional
 
 from runtime.auth_manager import COOKIE_NAME
-from runtime.build_info import build_revision
 from runtime.common import atomic_write_text, get_workspace
 from runtime.remote_env_manager import normalize_setup_url
 from runtime.tunnel_protocol import (
@@ -333,11 +332,6 @@ class TunnelClient:
             "arch": _platform_arch(),
             "os": _platform_os(),
             "workspace": get_workspace(),
-            # Which code is actually running here (the parent stamps
-            # runtime/.build_revision into push-update deltas; dev checkouts
-            # fall back to git).  Lets the UI answer "did the child really
-            # get the update?" without SSHing into it.
-            "revision": build_revision(),
         }
 
     def _set_state(self, state: str, detail: str = "", env_id: str = "") -> None:

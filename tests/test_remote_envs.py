@@ -142,7 +142,6 @@ class TestSnapshotFromHello:
             "arch": "aarch64",
             "os": "macOS",
             "workspace": "/srv/agent",
-            "revision": "abc1234",
         })
         assert snap == {
             "frontend_build": "a",
@@ -157,7 +156,6 @@ class TestSnapshotFromHello:
             "arch": "aarch64",
             "os": "macOS",
             "workspace": "/srv/agent",
-            "revision": "abc1234",
         }
 
     def test_none_safe(self):

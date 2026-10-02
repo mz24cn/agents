@@ -446,6 +446,10 @@ class HandlerWorkspaceMixin:
         # next request on the same socket).
         if 'chunked' in (self.headers.get('Transfer-Encoding') or '').lower():
             self.close_connection = True
+            logger.warning(
+                "upload %s chunk #%d rejected: chunked request body (the "
+                "sender could not frame the body with a Content-Length)",
+                upload_id[:8], parallel_id)
             self._send_json_error(400, "CHUNK_SIZE_MISMATCH: chunked transfer encoding is not supported for upload chunks")
             return
 
@@ -470,6 +474,9 @@ class HandlerWorkspaceMixin:
                 self._drain_request_body()
                 return
             if content_length != chunk['size']:
+                logger.warning(
+                    "upload %s chunk #%d rejected: body is %dB, expected %dB",
+                    upload_id[:8], parallel_id, content_length, chunk['size'])
                 self._send_json_error(400, "CHUNK_SIZE_MISMATCH: Content-Length does not match expected size")
                 self._drain_request_body()
                 return
@@ -540,13 +547,27 @@ class HandlerWorkspaceMixin:
                 with lock:
                     if chunk.get('status') == 'uploading':
                         chunk['status'] = 'pending'
+                # The browser only sees "the chunk failed" -- or, when its
+                # connection already dropped, nothing at all -- while THIS is
+                # the origin of a later complete reporting "some chunks are
+                # missing" (the chunk is left 'pending').  Log which chunk,
+                # what was expected, how much actually arrived, and why.
+                part_path = workspace_mgr.upload_chunk_path(upload_id, parallel_id, part=True)
+                try:
+                    partial = os.path.getsize(part_path)
+                except OSError:
+                    partial = -1
+                logger.warning(
+                    "upload %s chunk #%d write failed (expected %dB, partial %dB): %s",
+                    upload_id[:8], parallel_id, chunk['size'], partial, e)
                 self._send_json_error(self._upload_error_status(str(e)), str(e))
                 return
             except Exception as e:
                 with lock:
                     if chunk.get('status') == 'uploading':
                         chunk['status'] = 'pending'
-                logger.error(f"Workspace upload chunk error: {e}")
+                logger.exception("upload %s chunk #%d: unexpected write error",
+                                 upload_id[:8], parallel_id)
                 self._send_json_error(500, "SERVER_ERROR: internal server error")
                 return
 

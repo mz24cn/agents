@@ -308,11 +308,6 @@ class EnvManager:
         exclude_dirs = {".git", "__pycache__", ".pytest_cache", ".hypothesis", ".mypy_cache",
                         ".ruff_cache", "node_modules", "dist", "build", ".venv", "venv",
                         "workspace", "docs", "tests", "examples"}
-        # The push-update revision stamp is rewritten by every applied delta
-        # (mtime = push time), so it must never bump the advertised backend
-        # build: it would make a second push (no new edits in between) look
-        # "older" than the child and get rejected.
-        from runtime.build_info import STAMP_FILENAME
         latest_mtime = 0.0
         for dirpath, dirnames, filenames in os.walk(project_root):
             dir_real = os.path.realpath(dirpath)
@@ -324,8 +319,6 @@ class EnvManager:
                     and not os.path.islink(os.path.join(dir_real, name)))
             ]
             for filename in filenames:
-                if filename == STAMP_FILENAME:
-                    continue
                 fpath = os.path.join(dir_real, filename)
                 try:
                     if not os.path.islink(fpath):
@@ -354,8 +347,6 @@ class EnvManager:
         exclude_dirs = {".git", "__pycache__", ".pytest_cache", ".hypothesis", ".mypy_cache",
                         ".ruff_cache", "node_modules", "dist", "build", ".venv", "venv",
                         "workspace", "docs", "tests", "examples"}
-
-        from runtime.build_info import STAMP_FILENAME
 
         def should_exclude(path_real: str, name: str) -> bool:
             if path_real == web_dist_real:
@@ -390,8 +381,6 @@ class EnvManager:
             in_web = os.path.commonpath([web_root_real, dir_real]) == web_root_real
             threshold = frontend_since if in_web else backend_since
             for filename in filenames:
-                if filename == STAMP_FILENAME:
-                    continue  # re-stamped synthetically below
                 fpath = os.path.join(dir_real, filename)
                 try:
                     if os.path.islink(fpath):
@@ -461,15 +450,6 @@ class EnvManager:
                     tar.add(fpath, arcname=arcname, filter=self._setup_tar_filter)
                 except OSError as exc:
                     logger.warning("增量打包跳过 %s: %s", fpath, exc)
-            # Stamp the revision of the code being pushed so the child can
-            # report which backend it is actually running (deployed trees
-            # have no .git -- see runtime/build_info.py).
-            from runtime.build_info import build_revision
-            stamp = (build_revision() + "\n").encode("utf-8")
-            info = tarfile.TarInfo("runtime/.build_revision")
-            info.size = len(stamp)
-            info.mtime = int(time.time())
-            tar.addfile(info, BytesIO(stamp))
         return bio.getvalue()
 
     # ------------------------------------------------------------------
@@ -530,8 +510,7 @@ class EnvManager:
         exclude_dirs = {".git", "__pycache__", ".pytest_cache", ".hypothesis", ".mypy_cache",
                         ".ruff_cache", "node_modules", "dist", "build", ".venv", "venv",
                         "workspace", "docs", "tests", "examples"}
-        from runtime.build_info import STAMP_FILENAME
-        exclude_files = {".DS_Store", STAMP_FILENAME}
+        exclude_files = {".DS_Store"}
         src_real = os.path.realpath(src)
         web_dist_real = os.path.join(src_real, "web", "dist")
 

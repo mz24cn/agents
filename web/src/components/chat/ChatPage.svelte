@@ -2018,13 +2018,10 @@
               {#each remoteEnvs as e (e.id)}
                 <label class="env-item">
                   <input type="radio" checked={selectedRemoteEnvId === e.id} onchange={() => handleRemoteEnvChange(e.id)} />
-                  <span class="env-name" title={e.id.startsWith('tunnel:') && e.revision ? `${envDisplayName(e)} (backend ${e.revision})` : envDisplayName(e)}>
+                  <span class="env-name" title={envDisplayName(e)}>
                     {#if e.id.startsWith('tunnel:')}
                       <span class="tunnel-dot" class:online={!!e.online}
                             title={e.online ? 'tunnel online' : 'tunnel offline'}></span>
-                      {#if e.revision}
-                        <span class="env-revision" title="backend revision running on this child">{e.revision}</span>
-                      {/if}
                     {/if}
                     {envDisplayName(e)}
                   </span>
@@ -2395,16 +2392,6 @@
     margin-right: 5px;
   }
   .tunnel-dot.online { background: #2ea043; }
-  .env-revision {
-    display: inline-block;
-    font-size: 0.7em;
-    font-family: ui-monospace, monospace;
-    color: var(--text-secondary, #999);
-    background: var(--bg-secondary, rgba(128, 128, 128, 0.15));
-    border-radius: 4px;
-    padding: 1px 4px;
-    margin-right: 5px;
-  }
 
   /* Terminal close button in header */
   .terminal-control {

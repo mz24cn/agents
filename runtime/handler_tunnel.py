@@ -162,16 +162,15 @@ class HandlerTunnelMixin:
         conn = manager.conn_for_env(env_id)
         if conn is None:
             return
-        # Persist the hello snapshot (revision, os/arch, build stamps, ...)
-        # on every (re)connect: after a push-update the child re-dials and
-        # this is how the parent learns which code it is now running.
+        # Refresh the persisted hello snapshot on every (re)connect: an
+        # out-of-band child restart (e.g. after a manual update) is how the
+        # parent learns the build stamps it is running now.
         snap = snapshot_from_hello(hello.get("snapshot"))
         try:
             manager._envs.upsert_tunnel(tunnel_id, snap)
         except (OSError, KeyError):
             pass
-        logger.info("Tunnel: %s online (env %s, revision %s)", tunnel_id, env_id,
-                    snap.get("revision", "?"))
+        logger.info("Tunnel: %s online (env %s)", tunnel_id, env_id)
         try:
             self._tunnel_ws_reader_loop(sock, conn, tunnel_id)
         finally:
@@ -391,11 +390,18 @@ class HandlerTunnelMixin:
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
             remaining = -1
+        # Keep a short copy of an ERROR body: the child's verdict (which
+        # chunk is missing, which size mismatched, "local call failed: ...")
+        # is what makes a remote-upload failure diagnosable from the PARENT's
+        # log alone (the child may run on a machine nobody can log into).
+        peek = bytearray()
         try:
             while True:
                 chunk = chunks.get(timeout=300)
                 if chunk is None:
                     break
+                if status >= 400 and len(peek) < 256:
+                    peek.extend(chunk[: 256 - len(peek)])
                 if content_length:
                     self.wfile.write(chunk)
                     remaining -= len(chunk)
@@ -409,8 +415,11 @@ class HandlerTunnelMixin:
             self.close_connection = True
         elapsed_ms = (time.monotonic() - proxy_t0) * 1000
         if status >= 400 or elapsed_ms > 5000:
-            logger.warning("Tunnel proxy %s %s body=%dB -> %d in %.0fms",
-                           self.command, child_path, body_len, status, elapsed_ms)
+            detail = ""
+            if peek:
+                detail = " child said: " + peek.decode("utf-8", "replace").replace("\n", " ")
+            logger.warning("Tunnel proxy %s %s body=%dB -> %d in %.0fms%s",
+                           self.command, child_path, body_len, status, elapsed_ms, detail)
         else:
             logger.info("Tunnel proxy %s %s body=%dB -> %d in %.0fms",
                         self.command, child_path, body_len, status, elapsed_ms)
