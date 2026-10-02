@@ -8,6 +8,7 @@ import {
   joinPath,
   uploadFileToDir,
   uploadFilesToPasteDir,
+  getPasteDir,
   stampPastedFileNames,
   pasteTimestamp,
   resetPasteDirCache,
@@ -43,6 +44,21 @@ function mockUploadInit({ uploadId = 'upload-1', chunks = [{ parallel_id: 0, off
 
 function mockUploadChunk() {
   workspace.uploadChunk.mockReturnValue({ promise: Promise.resolve({ status: 'uploaded' }) })
+}
+
+/**
+ * A standalone mock of a remote workspace API (mirrors `remoteWorkspace`'s
+ * shape). Passed explicitly via `{ api }`, so no module mocking is needed —
+ * this is exactly how the remote target reaches the shared upload pipeline.
+ */
+function makeRemoteApi({ pasteDir = '/child/tmp' } = {}) {
+  return {
+    pasteDir: vi.fn().mockResolvedValue({ path: pasteDir }),
+    uploadInit: vi.fn().mockResolvedValue({ upload_id: 'remote-1', chunks: [{ parallel_id: 0, offset: 0, size: 10 }] }),
+    uploadChunk: vi.fn().mockReturnValue({ promise: Promise.resolve({ status: 'uploaded' }) }),
+    uploadComplete: vi.fn().mockResolvedValue({ status: 'completed' }),
+    uploadCancel: vi.fn().mockResolvedValue({ status: 'cancelled' }),
+  }
 }
 
 /** Matches a timestamped pasted-file name like `image_143025_123.png`. */
@@ -418,5 +434,131 @@ describe('uploadFilesToPasteDir', () => {
     expect(b).toEqual(['/tmp/image_143025_124.png'])
     expect(workspace.uploadInit.mock.calls[1][0].file_name).toBe('image_143025_124.png')
     nowSpy.mockRestore()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Remote paste target (ChatInput in a remote-bound session)
+// ---------------------------------------------------------------------------
+
+describe('paste upload target selection', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    resetPasteDirCache()
+    resetPasteStamp()
+    workspace.pasteDir.mockResolvedValue({ path: '/tmp' })
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('uploadFileToDir drives the passed api (remote) and returns the child path', async () => {
+    const remote = makeRemoteApi()
+
+    const file = makeFile('a.png', 'image/png', 10)
+    const path = await uploadFileToDir(file, '/child/tmp', { api: remote })
+
+    expect(remote.uploadInit).toHaveBeenCalledWith({
+      workspace_id: 'default',
+      file_name: 'a.png',
+      file_size: 10,
+      target_dir_path: '/child/tmp',
+      target_path: 'a.png',
+    })
+    expect(remote.uploadChunk).toHaveBeenCalledTimes(1)
+    expect(remote.uploadComplete).toHaveBeenCalledWith('remote-1')
+    // The parent workspace must not be touched when a remote api is passed.
+    expect(workspace.uploadInit).not.toHaveBeenCalled()
+    expect(workspace.uploadChunk).not.toHaveBeenCalled()
+    expect(path).toBe('/child/tmp/a.png')
+  })
+
+  it('uploadFileToDir falls back to the parent workspace when no api is passed', async () => {
+    mockUploadInit({ uploadId: 'p1', chunks: [{ parallel_id: 0, offset: 0, size: 10 }] })
+    mockUploadChunk()
+    workspace.uploadComplete.mockResolvedValue({ status: 'completed' })
+
+    const path = await uploadFileToDir(makeFile('a.png', 'image/png', 10), '/tmp')
+
+    expect(workspace.uploadInit).toHaveBeenCalledTimes(1)
+    expect(workspace.uploadComplete).toHaveBeenCalledWith('p1')
+    expect(path).toBe('/tmp/a.png')
+  })
+
+  it('uploadFilesToPasteDir uploads through the remote api and returns child paths', async () => {
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(FIXED_MS)
+    const remote = makeRemoteApi({ pasteDir: '/child/tmp' })
+
+    const paths = await uploadFilesToPasteDir(
+      [makeFile('img.png', 'image/png', 10)],
+      { api: remote, cacheKey: 'env-a' },
+    )
+
+    expect(remote.pasteDir).toHaveBeenCalledTimes(1)
+    expect(remote.uploadInit).toHaveBeenCalledTimes(1)
+    expect(remote.uploadInit.mock.calls[0][0].file_name).toBe('img_143025_123.png')
+    expect(remote.uploadChunk).toHaveBeenCalledTimes(1)
+    expect(remote.uploadComplete).toHaveBeenCalledWith('remote-1')
+    // Nothing leaks to the parent workspace.
+    expect(workspace.pasteDir).not.toHaveBeenCalled()
+    expect(workspace.uploadInit).not.toHaveBeenCalled()
+    expect(paths).toEqual(['/child/tmp/img_143025_123.png'])
+    nowSpy.mockRestore()
+  })
+})
+
+describe('getPasteDir per-target cache', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    resetPasteDirCache()
+    workspace.pasteDir.mockResolvedValue({ path: '/tmp' })
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('resolves parent and remote paste dirs independently (once each, no mixing)', async () => {
+    const remote = makeRemoteApi({ pasteDir: '/child/tmp' })
+
+    expect(await getPasteDir()).toBe('/tmp')
+    expect(await getPasteDir({ api: remote, cacheKey: 'env-a' })).toBe('/child/tmp')
+    // Second lookups hit the per-target cache: no extra round-trips.
+    expect(await getPasteDir()).toBe('/tmp')
+    expect(await getPasteDir({ api: remote, cacheKey: 'env-a' })).toBe('/child/tmp')
+
+    expect(workspace.pasteDir).toHaveBeenCalledTimes(1)
+    expect(remote.pasteDir).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps different child envs in separate cache slots', async () => {
+    const childA = makeRemoteApi({ pasteDir: '/a/tmp' })
+    const childB = makeRemoteApi({ pasteDir: '/b/tmp' })
+
+    expect(await getPasteDir({ api: childA, cacheKey: 'env-a' })).toBe('/a/tmp')
+    expect(await getPasteDir({ api: childB, cacheKey: 'env-b' })).toBe('/b/tmp')
+    expect(await getPasteDir({ api: childA, cacheKey: 'env-a' })).toBe('/a/tmp')
+    expect(await getPasteDir({ api: childB, cacheKey: 'env-b' })).toBe('/b/tmp')
+
+    expect(childA.pasteDir).toHaveBeenCalledTimes(1)
+    expect(childB.pasteDir).toHaveBeenCalledTimes(1)
+  })
+
+  it('resetPasteDirCache clears every target slot', async () => {
+    workspace.pasteDir
+      .mockResolvedValueOnce({ path: '/tmp' })
+      .mockResolvedValueOnce({ path: '/tmp-2' })
+    const remote = makeRemoteApi({ pasteDir: '/child/tmp' })
+
+    await getPasteDir()
+    await getPasteDir({ api: remote, cacheKey: 'env-a' })
+    resetPasteDirCache()
+
+    // Both targets re-resolve after a reset (the remote mock still returns '/child/tmp').
+    expect(await getPasteDir()).toBe('/tmp-2')
+    expect(await getPasteDir({ api: remote, cacheKey: 'env-a' })).toBe('/child/tmp')
+    expect(workspace.pasteDir).toHaveBeenCalledTimes(2)
+    expect(remote.pasteDir).toHaveBeenCalledTimes(2)
   })
 })

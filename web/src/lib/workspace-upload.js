@@ -7,7 +7,7 @@
  * "paste upload" + "select file" operations.
  */
 
-import { workspace } from './api.js'
+import { workspace as defaultWorkspace } from './api.js'
 
 /** Normalize an upload target path: strip traversal and duplicate separators. */
 function normalizeUploadPath(path) {
@@ -112,13 +112,22 @@ export function joinPath(dir, name) {
 /**
  * Upload a single File into targetDirPath using the chunked workspace upload API.
  *
+ * The API client is an explicit parameter so callers never have to guess where
+ * the file should land: the parent `workspace` (default) writes to the parent
+ * host, while `remoteWorkspace` writes straight to the bound child env.  The
+ * two expose the same `uploadInit -> uploadChunk -> uploadComplete /
+ * uploadCancel` contract, so the whole pipeline below is target-agnostic.
+ *
  * @param {File} file              File to upload
  * @param {string} targetDirPath   Absolute directory path to upload into
- * @param {{onProgress?: Function}} [options]
+ * @param {object} [options]
+ * @param {Function} [options.onProgress]
+ * @param {object} [options.api]   workspace API to drive the upload; defaults to
+ *   the parent `workspace` (pass `remoteWorkspace` to target a child env)
  * @returns {Promise<string>} Absolute path of the uploaded file
  */
-export async function uploadFileToDir(file, targetDirPath, { onProgress } = {}) {
-  const init = await workspace.uploadInit({
+export async function uploadFileToDir(file, targetDirPath, { onProgress, api = defaultWorkspace } = {}) {
+  const init = await api.uploadInit({
     workspace_id: 'default',
     file_name: file.name,
     file_size: file.size,
@@ -134,13 +143,13 @@ export async function uploadFileToDir(file, targetDirPath, { onProgress } = {}) 
   try {
     for (const chunk of sizedChunks) {
       const body = file.slice(chunk.offset, chunk.offset + chunk.size)
-      const request = workspace.uploadChunk(upload_id, chunk, body, (uploaded) => {
+      const request = api.uploadChunk(upload_id, chunk, body, (uploaded) => {
         onProgress?.({ name: file.name, uploaded, size: chunk.size })
       })
       await chunkRequestPromise(request)
     }
     try {
-      await workspace.uploadComplete(upload_id)
+      await api.uploadComplete(upload_id)
     } catch (err) {
       if (!isMissingChunksError(err)) throw err
       // The file data is still local: re-upload exactly the chunks the
@@ -152,30 +161,55 @@ export async function uploadFileToDir(file, targetDirPath, { onProgress } = {}) 
         : sizedChunks
       for (const chunk of retry) {
         const body = file.slice(chunk.offset, chunk.offset + chunk.size)
-        await chunkRequestPromise(workspace.uploadChunk(upload_id, chunk, body))
+        await chunkRequestPromise(api.uploadChunk(upload_id, chunk, body))
       }
-      await workspace.uploadComplete(upload_id)
+      await api.uploadComplete(upload_id)
     }
     return joinPath(targetDirPath, file.name)
   } catch (err) {
-    try { await workspace.uploadCancel(upload_id) } catch { /* best-effort cleanup */ }
+    try { await api.uploadCancel(upload_id) } catch { /* best-effort cleanup */ }
     throw err
   }
 }
 
-let cachedPasteDir = null
+// Pasted files land in a per-target temp dir: the parent host and every child
+// env have their own `/tmp` (or OS temp dir).  A single module-level value would
+// leak one env's paste dir into another, so switching env/session would upload
+// into the wrong host and leave the inserted `<file>` refs dangling.  Key the
+// cache by the resolved target: an explicit `cacheKey` from the caller (a child
+// env id) when given, else the API object identity (which separates the parent
+// from the remote facade).
+const pasteDirCache = new Map()
 
-/** Resolve (and cache) the clipboard paste directory from the backend. */
-export async function getPasteDir() {
-  if (cachedPasteDir) return cachedPasteDir
-  const data = await workspace.pasteDir()
-  cachedPasteDir = data.path
-  return cachedPasteDir
+function pasteDirCacheKey(api, cacheKey) {
+  if (cacheKey !== undefined && cacheKey !== null && cacheKey !== '') {
+    return `target:${cacheKey}`
+  }
+  return api
 }
 
-/** Reset the cached paste directory (mainly for tests). */
+/**
+ * Resolve (and cache per target) the clipboard paste directory from the backend.
+ *
+ * @param {object} [options]
+ * @param {object} [options.api]      workspace API to query (defaults to parent)
+ * @param {string} [options.cacheKey] stable id of the target (e.g. a child env
+ *   id) so different children never share a cached paste dir
+ * @returns {Promise<string>} Absolute paste directory path
+ */
+export async function getPasteDir({ api = defaultWorkspace, cacheKey } = {}) {
+  const key = pasteDirCacheKey(api, cacheKey)
+  const cached = pasteDirCache.get(key)
+  if (cached) return cached
+  const data = await api.pasteDir()
+  const path = data.path
+  pasteDirCache.set(key, path)
+  return path
+}
+
+/** Reset the cached paste directory for every target (mainly for tests). */
 export function resetPasteDirCache() {
-  cachedPasteDir = null
+  pasteDirCache.clear()
 }
 
 /**
@@ -222,20 +256,25 @@ export function stampPastedFileNames(files, now = Date.now) {
 
 /**
  * Upload clipboard-pasted files into the paste directory (resolved from the
- * backend: `/tmp` on Linux, OS temp dir on Windows).
+ * target backend: `/tmp` on Linux, OS temp dir on Windows).
  *
  * @param {File[]} files
- * @param {{onProgress?: Function}} [options]
+ * @param {object} [options]
+ * @param {Function} [options.onProgress]
+ * @param {object} [options.api]      workspace API to drive both the paste-dir
+ *   lookup and the chunked upload; defaults to the parent `workspace`
+ * @param {string} [options.cacheKey] stable id of the target (e.g. a child env
+ *   id) used to keep per-target paste dirs in separate cache slots
  * @returns {Promise<string[]>} Absolute paths of the uploaded files
  */
-export async function uploadFilesToPasteDir(files, { onProgress } = {}) {
-  const pasteDir = await getPasteDir()
+export async function uploadFilesToPasteDir(files, { onProgress, api = defaultWorkspace, cacheKey } = {}) {
+  const pasteDir = await getPasteDir({ api, cacheKey })
   // Timestamped names are self-unique, so each pasted file keeps its own name
   // and can never silently overwrite a previous paste of the same-named file.
   const named = stampPastedFileNames(files)
   const paths = []
   for (const file of named) {
-    paths.push(await uploadFileToDir(file, pasteDir, { onProgress }))
+    paths.push(await uploadFileToDir(file, pasteDir, { onProgress, api }))
   }
   return paths
 }

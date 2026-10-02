@@ -3,9 +3,11 @@
   import { t } from '../../lib/i18n.svelte.js'
   import { extractPastedFiles, buildFileRefs } from '../../lib/clipboard-paste.js'
   import { uploadFilesToPasteDir } from '../../lib/workspace-upload.js'
+  import { workspace as workspaceApi } from '../../lib/api.js'
+  import { remoteWorkspace } from '../../lib/remote-execution.svelte.js'
   import { serializeEditor } from '../../lib/chat-input-serialize.js'
 
-  let { disabled = false, onSend, onStop, onStopForce, onToggleTemplatePanel, onToggleWorkspacePanel, workspacePanelOpen = false, templatePanelOpen = false, text = $bindable(''), isStreaming = false, selectedAgentIds = [], agentList = [], onError = () => {} } = $props()
+  let { disabled = false, onSend, onStop, onStopForce, onToggleTemplatePanel, onToggleWorkspacePanel, workspacePanelOpen = false, templatePanelOpen = false, text = $bindable(''), isStreaming = false, selectedAgentIds = [], agentList = [], remote = null, onError = () => {} } = $props()
 
   let editorEl = $state(null)
   let lastRenderedText = ''
@@ -233,7 +235,13 @@
 
   async function handlePasteFiles(files) {
     try {
-      const paths = await uploadFilesToPasteDir(files)
+      // Paste uploads must land in the environment this session actually runs
+      // in: the parent (default) for local sessions, or the bound child env for
+      // remote ones. `remote` is the same resolved env ChatPage hands the
+      // workspace file manager, so the <file> refs we insert point at a real
+      // file on the host that will execute the message.
+      const api = remote ? remoteWorkspace : workspaceApi
+      const paths = await uploadFilesToPasteDir(files, { api, cacheKey: remote?.id })
       const refs = buildFileRefs(paths)
       // Append the file references; the $effect below re-renders them as chips
       // and moves the caret to the end (same UX as selecting files from the

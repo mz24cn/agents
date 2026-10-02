@@ -651,6 +651,14 @@
     resolvePanelRemoteEnv(sessionId, logDirLocalMode)
   )
 
+  // ChatInput 粘贴上传的目标环境：与文件管理器走同一解析（resolvePanelRemoteEnv），
+  // 但**不**带 logDirLocalMode —— 那只是文件管理器「查看本地会话日志目录」的临时锁定，
+  // 会话本身仍在子端执行；若沿用会把粘贴落到母端、插入的 <file> 引用在子端根本不存在。
+  // 无会话但已选远端环境时同样跟随（sessionId 与绑定均为 null 即匹配），不比文件管理器弱。
+  let chatInputRemoteEnv = $derived(
+    resolvePanelRemoteEnv(sessionId)
+  )
+
   async function loadRemoteEnvs() {
     if (remoteEnvsLoading) return
     remoteEnvsLoading = true
@@ -2257,6 +2265,7 @@
     bind:text={inputText}
     {selectedAgentIds}
     {agentList}
+    remote={chatInputRemoteEnv}
     onError={(msg) => errorMsg = msg}
   />
 </div>
