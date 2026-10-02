@@ -153,7 +153,9 @@ class HandlerTunnelMixin:
             self._tunnel_ws_close(sock)
             return
 
-        action, env_id = manager.attach(sock, tunnel_id)
+        caps = hello.get("caps")
+        action, env_id = manager.attach(
+            sock, tunnel_id, caps if isinstance(caps, list) else None)
         if action == "reject":
             logger.info("Tunnel: rejected hello from unregistered tunnel_id=%s", tunnel_id)
             self._tunnel_ws_send_json(sock, {"op": OP_REJECT, "reason": REJECT_NOT_REGISTERED})

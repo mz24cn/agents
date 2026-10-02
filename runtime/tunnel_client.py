@@ -42,9 +42,11 @@ from runtime.auth_manager import COOKIE_NAME
 from runtime.common import atomic_write_text, get_workspace
 from runtime.remote_env_manager import normalize_setup_url
 from runtime.tunnel_protocol import (
+    CAP_REQ_CHUNK_ID,
     CAP_RESP_CHUNK_ID,
     OP_DEREGISTER,
     OP_REQ,
+    OP_REQ_CHUNK,
     OP_REJECT,
     OP_REPLACED,
     OP_RESP,
@@ -56,6 +58,7 @@ from runtime.tunnel_protocol import (
     OP_STREAM_READY,
     OP_WELCOME,
     REJECT_NOT_REGISTERED,
+    REQ_BODY_CHUNKED,
     RECONNECT_MAX,
     RECONNECT_MIN,
     SMALL_BODY_INLINE,
@@ -75,6 +78,58 @@ _HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade", "host",
 }
+
+
+class _IncomingBody:
+    """One routed request body, assembled incrementally by the reader thread.
+
+    Used for requests framed with ``"body": "chunked"`` (OP_REQ_CHUNK), where
+    the parent may interleave other requests between the chunk pairs.  Small
+    bodies stay in memory; larger ones spill to a temp file, like the legacy
+    inline reader did.
+    """
+
+    __slots__ = ("job", "_parts", "_total", "_tmp")
+
+    def __init__(self, job: dict) -> None:
+        self.job = job
+        self._parts: list = []
+        self._total = 0
+        self._tmp = None
+
+    def append(self, data: bytes) -> None:
+        if data:
+            if self._tmp is None and self._total + len(data) > SMALL_BODY_INLINE:
+                import tempfile
+                self._tmp = tempfile.TemporaryFile("w+b")
+                self._tmp.write(b"".join(self._parts))
+                self._parts = []
+            if self._tmp is not None:
+                self._tmp.write(data)
+            else:
+                self._parts.append(data)
+            self._total += len(data)
+
+    def finish(self) -> dict:
+        """Return the job with its assembled body (bytes or a temp file)."""
+        if self._tmp is not None:
+            self._tmp.flush()
+            self._tmp.seek(0)
+            body = self._tmp
+        else:
+            body = b"".join(self._parts)
+        self._tmp = None
+        self._parts = []
+        return {**self.job, "body": body}
+
+    def discard(self) -> None:
+        if self._tmp is not None:
+            try:
+                self._tmp.close()
+            except OSError:
+                pass
+        self._tmp = None
+        self._parts = []
 
 
 class TunnelClient:
@@ -104,6 +159,13 @@ class TunnelClient:
         import queue as _queue
         self._req_queue: "_queue.Queue" = _queue.Queue()
         self._worker_pool: list[threading.Thread] = []
+        # Request bodies being assembled by the reader thread for requests
+        # framed with OP_REQ_CHUNK (the parent interleaves other requests
+        # between the chunk pairs, so the reader must not read one body
+        # inline).  ``_body_cursor`` is the rid whose binary frame is expected
+        # next; it is set by each chunk header and cleared by its frame.
+        self._bodies: dict[str, _IncomingBody] = {}
+        self._body_cursor: Optional[str] = None
         # Serializes child->parent frames.  When the parent does NOT
         # advertise CAP_RESP_CHUNK_ID, a response's header + body +
         # terminator must not interleave with pongs or stream-data frames
@@ -425,6 +487,11 @@ class TunnelClient:
                 "op": "hello",
                 "tunnel_id": tunnel_id,
                 "snapshot": self._hello_snapshot(),
+                # This child routes per-chunk request bodies (OP_REQ_CHUNK):
+                # the parent may then send a body without holding its
+                # connection-wide send lock, so an upload cannot stall every
+                # other request on the tunnel.  Old parents ignore the field.
+                "caps": [CAP_REQ_CHUNK_ID],
             })
             frame = ws.recv()
             if frame is None:
@@ -454,6 +521,7 @@ class TunnelClient:
             if self._live_ws is ws:
                 self._live_ws = None
                 self._live_caps = set()
+            self._drop_bodies()
             try:
                 ws.close()
             except Exception:
@@ -472,31 +540,53 @@ class TunnelClient:
                 continue
             if opcode == wsutil.OP_PONG:
                 continue
+            if opcode == wsutil.OP_BINARY:
+                # Routed request body (OP_REQ_CHUNK): the chunk header that
+                # preceded this frame carried the rid, so bodies of concurrent
+                # requests can interleave with everything else on the tunnel.
+                rid, self._body_cursor = self._body_cursor, None
+                body = self._bodies.get(rid) if rid is not None else None
+                if body is not None:
+                    body.append(data)
+                continue
             if opcode != wsutil.OP_TEXT:
-                continue  # stray binary outside a req body — ignore
+                continue  # stray control frame — ignore
             try:
                 obj = decode_frame(data)
             except ValueError:
                 continue
             op = obj.get("op")
             if op == OP_REQ:
-                # Read the (already-terminated) body on the reader thread,
-                # then hand the whole job to the worker pool; the reader
-                # must not stall on long local calls or pings would time out.
+                rid = str(obj.get("id", ""))
+                if obj.get("body") == REQ_BODY_CHUNKED:
+                    # Per-chunk framing (we advertise CAP_REQ_CHUNK_ID): the
+                    # body arrives as OP_REQ_CHUNK pairs that other requests
+                    # may interleave with, so it is assembled incrementally and
+                    # the job is queued when the terminator chunk arrives.
+                    # Reading it inline here would stall every other request
+                    # for as long as the upload lasts.
+                    self._bodies[rid] = _IncomingBody(self._job(obj, None))
+                    continue
+                # Legacy framing: read the (already-terminated) body on the
+                # reader thread, then hand the whole job to the worker pool;
+                # the reader must not stall on long local calls or pings would
+                # time out.
                 try:
                     body = self._read_req_body(ws)
                 except _BodyReadFailed:
-                    self._send_resp(ws, str(obj.get("id", "")), 400,
+                    self._send_resp(ws, rid, 400,
                                     {"Content-Type": "application/json"},
                                     b'{"error": "failed to read request body over tunnel"}')
                     continue
-                self._req_queue.put((ws, {
-                    "id": str(obj.get("id", "")),
-                    "method": str(obj.get("method", "GET")).upper(),
-                    "path": str(obj.get("path", "/")),
-                    "headers": obj.get("headers") or {},
-                    "body": body,
-                }))
+                self._req_queue.put((ws, self._job(obj, body)))
+            elif op == OP_REQ_CHUNK:
+                rid = str(obj.get("id", ""))
+                if obj.get("eof"):
+                    pending = self._bodies.pop(rid, None)
+                    if pending is not None:
+                        self._req_queue.put((ws, pending.finish()))
+                else:
+                    self._body_cursor = rid
             elif op == OP_STREAM_OPEN:
                 self._handle_stream_open(ws, obj)
             elif op == OP_STREAM_DATA:
@@ -519,6 +609,24 @@ class TunnelClient:
             elif op == OP_REPLACED:
                 return "replaced"
         return "closed"
+
+    @staticmethod
+    def _job(obj: dict, body) -> dict:
+        """One queued tunnel request (body is None while it is still routed)."""
+        return {
+            "id": str(obj.get("id", "")),
+            "method": str(obj.get("method", "GET")).upper(),
+            "path": str(obj.get("path", "/")),
+            "headers": obj.get("headers") or {},
+            "body": body,
+        }
+
+    def _drop_bodies(self) -> None:
+        """Discard half-received routed bodies (connection closed/replaced)."""
+        for pending in self._bodies.values():
+            pending.discard()
+        self._bodies.clear()
+        self._body_cursor = None
 
     # ------------------------------------------------------------------
     # HTTP request dispatch (serial — one local call in flight at a time)

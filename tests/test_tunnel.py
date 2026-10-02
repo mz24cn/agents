@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import contextlib
 import base64
+import hashlib
 import json
 import os
 import socket
@@ -1435,6 +1436,277 @@ def test_legacy_framing_upload_still_lands(tmp_path):
         assert comp.get("status") == "completed", comp
         on_disk = (tmp_path / "child_ws" / "legacy.bin").read_bytes()
         assert on_disk == payload
+    finally:
+        child.__exit__(None, None, None)
+        parent.__exit__(None, None, None)
+
+
+# ---------------------------------------------------------------------------
+# Request bodies must not hold the tunnel's send lock (upload stall)
+# ---------------------------------------------------------------------------
+
+def _spy_send_frames(conn):
+    """Record every send_frames() call on *conn*.
+
+    One call == one acquisition of the connection-wide send lock, so the
+    recorded shapes show exactly how long the tunnel is monopolised.
+    """
+    calls = []
+    orig = conn.send_frames
+
+    def spy(frames, refresh_activity=False):
+        calls.append(list(frames))
+        return orig(frames, refresh_activity=refresh_activity)
+
+    conn.send_frames = spy
+    return calls
+
+
+def test_send_request_framing_depends_on_child_caps():
+    """Routed framing (CAP_REQ_CHUNK_ID) emits one header/binary pair per
+    chunk, each pair under its own lock; without the capability the whole
+    header + body + terminator sequence stays atomic, because an old child
+    reads request bodies inline on its reader thread."""
+    from runtime.tunnel_manager import _TunnelConn
+    from runtime.tunnel_protocol import (
+        CAP_REQ_CHUNK_ID,
+        OP_REQ,
+        OP_REQ_CHUNK,
+        REQ_BODY_CHUNKED,
+    )
+
+    body = os.urandom(CHUNK_SIZE * 2 + 7)  # three chunks
+
+    old = _TunnelConn(_FakeSendSock(), "tid")
+    legacy_calls = _spy_send_frames(old)
+    old.send_request("PUT", "/x", {"H": "1"}, body, "rid-old")
+    assert [len(c) for c in legacy_calls] == [1 + 3 + 1], [len(c) for c in legacy_calls]
+    header = legacy_calls[0][0]
+    assert decode_frame(header[1]) == {
+        "op": OP_REQ, "id": "rid-old", "method": "PUT", "path": "/x",
+        "headers": {"H": "1"},
+    }
+    binary = [d for opcode, d in legacy_calls[0][1:] if opcode == wsutil.OP_BINARY]
+    assert binary[-1] == b""  # terminator
+    assert b"".join(binary[:-1]) == body
+
+    new = _TunnelConn(_FakeSendSock(), "tid", caps={CAP_REQ_CHUNK_ID})
+    calls = _spy_send_frames(new)
+    new.send_request("PUT", "/x", {"H": "1"}, body, "rid-new")
+    assert [len(c) for c in calls] == [1, 2, 2, 2, 1], [len(c) for c in calls]
+    assert decode_frame(calls[0][0][1])["body"] == REQ_BODY_CHUNKED
+    for head, binr in [c for c in calls if len(c) == 2]:
+        assert head[0] == wsutil.OP_TEXT and binr[0] == wsutil.OP_BINARY
+        assert decode_frame(head[1]) == {
+            "op": OP_REQ_CHUNK, "id": "rid-new", "eof": False,
+        }
+    assert decode_frame(calls[-1][0][1]) == {
+        "op": OP_REQ_CHUNK, "id": "rid-new", "eof": True,
+    }
+    assert b"".join(c[1][1] for c in calls if len(c) == 2) == body
+
+
+def test_child_advertises_req_chunk_cap(tmp_path):
+    """The child's hello advertises CAP_REQ_CHUNK_ID and the parent keeps it
+    on the live connection (that is what enables the routed framing)."""
+    from runtime.tunnel_protocol import CAP_REQ_CHUNK_ID
+    parent, child, parent_srv, child_srv, env_id = _pair_online(tmp_path)
+    try:
+        conn = parent_srv._tunnel_manager.conn_for_env(env_id)
+        assert CAP_REQ_CHUNK_ID in conn.caps, conn.caps
+    finally:
+        child.__exit__(None, None, None)
+        parent.__exit__(None, None, None)
+
+
+def test_bridge_upload_sends_body_in_per_chunk_pairs(tmp_path):
+    """End-to-end: a bridge upload's body leaves the parent as short
+    header+binary pairs, never as one lock-long sequence."""
+    parent, child, parent_srv, child_srv, env_id = _pair_online(tmp_path)
+    try:
+        conn = parent_srv._tunnel_manager.conn_for_env(env_id)
+        calls = _spy_send_frames(conn)
+        payload = os.urandom(CHUNK_SIZE * 3 + 11)
+        st, comp = _bridge_upload(parent_srv, env_id, "pairs.bin", payload)
+        assert st == 200, (st, comp)
+        assert comp.get("status") == "completed", comp
+        assert (tmp_path / "child_ws" / "pairs.bin").read_bytes() == payload
+        assert max(len(c) for c in calls) <= 2, (
+            "a request body was sent under a single lock hold: "
+            f"frames per send_frames() call = {[len(c) for c in calls]}")
+        pairs = [c for c in calls if len(c) == 2]
+        by_rid: dict = {}
+        for head, binr in pairs:
+            by_rid.setdefault(decode_frame(head[1])["id"], []).append(binr[1])
+        biggest = max(by_rid.values(), key=lambda chunks: sum(len(x) for x in chunks))
+        assert len(biggest) >= 4, {r: len(v) for r, v in by_rid.items()}
+        assert b"".join(biggest) == payload
+    finally:
+        child.__exit__(None, None, None)
+        parent.__exit__(None, None, None)
+
+
+def test_legacy_request_framing_still_lands(tmp_path):
+    """Compatibility, other direction: a child that does not advertise
+    CAP_REQ_CHUNK_ID (an older build) gets the atomic legacy sequence, and its
+    inline body reader must still assemble a multi-frame body."""
+    parent, child, parent_srv, child_srv, env_id = _pair_online(tmp_path)
+    try:
+        conn = parent_srv._tunnel_manager.conn_for_env(env_id)
+        conn.caps = set()  # as if the child were an older build
+        payload = os.urandom(CHUNK_SIZE * 2 + 5)
+        st, comp = _bridge_upload(parent_srv, env_id, "legacy-req.bin", payload)
+        assert st == 200, (st, comp)
+        assert comp.get("status") == "completed", comp
+        assert (tmp_path / "child_ws" / "legacy-req.bin").read_bytes() == payload
+    finally:
+        child.__exit__(None, None, None)
+        parent.__exit__(None, None, None)
+
+
+class _ThrottledSock:
+    """Socket proxy that delays every frame (simulates a slow tunnel link)."""
+
+    def __init__(self, sock, per_frame: float):
+        self._sock = sock
+        self._per_frame = per_frame
+
+    def sendall(self, data, *a, **k):
+        time.sleep(self._per_frame)
+        return self._sock.sendall(data, *a, **k)
+
+    def __getattr__(self, name):
+        return getattr(self._sock, name)
+
+
+def test_large_upload_does_not_stall_other_bridge_requests(tmp_path):
+    """The reported field failure: a big chunk PUT over a slow link, while the
+    file manager's own listings and /v1/env polls pile up behind it.
+
+    Before the fix the parent held the connection-wide send lock across the
+    whole body, so those requests were answered at the instant the upload
+    finished -- the user's log showed eight requests answered inside one 8ms
+    window, 129s after the PUT started, and the page reload that followed
+    killed the upload before ``complete`` was ever sent.
+    """
+    parent, child, parent_srv, child_srv, env_id = _pair_online(tmp_path)
+    try:
+        conn = parent_srv._tunnel_manager.conn_for_env(env_id)
+        conn.sock = _ThrottledSock(conn.sock, 0.03)
+        base = f"http://127.0.0.1:{parent_srv.port}/v1/tunnel-proxy/{env_id}"
+
+        def _call(method, path, data=None, headers=None):
+            req = urllib.request.Request(
+                base + path, data=data, headers=dict(headers or {}), method=method)
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                return resp.status, json.loads(resp.read() or b"null")
+
+        _st, env = _call("GET", "/v1/env")
+        ws_root = env["env"]["AGENTS_WORKSPACE"]
+        payload = os.urandom(4 * 1024 * 1024)
+        st, init = _call(
+            "POST", "/v1/workspace/upload/init",
+            json.dumps({"workspace_id": "default", "file_name": "hol.bin",
+                        "file_size": len(payload), "target_dir_path": ws_root,
+                        "target_path": "hol.bin"}).encode(),
+            {"Content-Type": "application/json"})
+        assert st == 200, init
+        chunk = init["chunks"][0]
+        put = {}
+
+        def _put():
+            t0 = time.monotonic()
+            st, body = _call(
+                "PUT",
+                f"/v1/workspace/upload/{init['upload_id']}/chunk/{chunk['parallel_id']}",
+                payload,
+                {"Content-Type": "application/octet-stream",
+                 "X-Upload-Offset": str(chunk["offset"]),
+                 "X-Upload-Size": str(chunk["size"]),
+                 "X-File-Size": str(len(payload))})
+            put["elapsed"] = time.monotonic() - t0
+            put["res"] = (st, body)
+
+        t = threading.Thread(target=_put)
+        t.start()
+        time.sleep(0.15)  # the body is on the wire by now
+        t0 = time.monotonic()
+        st_small, _ = _call("GET", "/v1/env")
+        small = time.monotonic() - t0
+        t.join(120)
+        assert st_small == 200
+        assert put.get("res", (0,))[0] == 200, put
+        assert put["elapsed"] > 0.3, put  # the throttle really was in effect
+        assert small < 0.5 * put["elapsed"], (
+            f"a small request waited {small:.2f}s behind a "
+            f"{put['elapsed']:.2f}s upload body "
+            "(send-lock head-of-line blocking regression)")
+        st, comp = _call(
+            "POST", f"/v1/workspace/upload/{init['upload_id']}/complete",
+            b"{}", {"Content-Type": "application/json"})
+        assert st == 200, (st, comp)
+        assert comp.get("status") == "completed", comp
+        assert (tmp_path / "child_ws" / "hol.bin").read_bytes() == payload
+    finally:
+        child.__exit__(None, None, None)
+        parent.__exit__(None, None, None)
+
+
+class _EchoMixin:
+    """Handler mixin: POST /v1/tunnel-test/echo -> {"size", "sha256"}."""
+
+    def do_POST(self):
+        if urllib.parse.urlparse(self.path).path.rstrip("/") == "/v1/tunnel-test/echo":
+            n = int(self.headers.get("Content-Length") or 0)
+            data = self.rfile.read(n) if n else b""
+            payload = json.dumps({
+                "size": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        super().do_POST()
+
+
+def _install_echo(child_srv):
+    base = child_srv._server.RequestHandlerClass
+    child_srv._server.RequestHandlerClass = type("EchoHandler", (_EchoMixin, base), {})
+
+
+def test_concurrent_request_bodies_route_by_rid(tmp_path):
+    """Two multi-frame request bodies in flight at once stay intact: the child
+    routes each binary frame to the rid of the chunk header that preceded it,
+    which is what lets the parent release the send lock between pairs."""
+    parent, child, parent_srv, child_srv, env_id = _pair_online(tmp_path)
+    try:
+        _install_echo(child_srv)
+        manager = parent_srv._tunnel_manager
+        bodies = {
+            "a": os.urandom(CHUNK_SIZE * 3 + 5),
+            "b": os.urandom(CHUNK_SIZE * 2 + 3),
+        }
+        results = {}
+
+        def _send(key):
+            code, _h, raw = manager.call_env(
+                env_id, "POST", "/v1/tunnel-test/echo",
+                {"Content-Type": "application/octet-stream"}, bodies[key], timeout=60)
+            results[key] = (code, json.loads(raw or b"null"))
+
+        threads = [threading.Thread(target=_send, args=(k,)) for k in bodies]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(60)
+        for key, body in bodies.items():
+            code, data = results.get(key, (None, None))
+            assert code == 200, (key, data)
+            assert data == {
+                "size": len(body), "sha256": hashlib.sha256(body).hexdigest(),
+            }, (key, data)
     finally:
         child.__exit__(None, None, None)
         parent.__exit__(None, None, None)

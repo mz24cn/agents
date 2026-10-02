@@ -40,9 +40,11 @@ from typing import Optional, Tuple
 from runtime.tunnel_protocol import (
     DEFAULT_CALL_TIMEOUT,
     INFLIGHT_MAX,
+    CAP_REQ_CHUNK_ID,
     CAP_RESP_CHUNK_ID,
     OP_DEREGISTER,
     OP_REQ,
+    OP_REQ_CHUNK,
     OP_REPLACED,
     OP_STREAM_CLOSE,
     OP_STREAM_DATA,
@@ -50,6 +52,7 @@ from runtime.tunnel_protocol import (
     OP_STREAM_READY,
     OP_WELCOME,
     PING_INTERVAL,
+    REQ_BODY_CHUNKED,
     STALE_AFTER,
     encode_frame,
     iter_chunks,
@@ -155,9 +158,12 @@ class _TunnelStream:
 class _TunnelConn:
     """State of one child tunnel connection (one WS socket)."""
 
-    def __init__(self, sock, tunnel_id: str) -> None:
+    def __init__(self, sock, tunnel_id: str, caps=None) -> None:
         self.sock = sock
         self.tunnel_id = tunnel_id
+        # Capabilities the CHILD advertised in its hello frame (e.g.
+        # CAP_REQ_CHUNK_ID: it can route interleaved request bodies).
+        self.caps = set(caps or ())
         self._send_lock = threading.Lock()
         self._in_flight: dict[str, _Pending] = {}
         self._in_flight_lock = threading.Lock()
@@ -226,21 +232,48 @@ class _TunnelConn:
     def send_request(self, method: str, path: str, headers: dict,
                      body: Optional[bytes], rid: str) -> None:
         """Send one complete ``req`` frame sequence (header + body +
-        terminator) atomically."""
-        frames = [(
-            wsutil.OP_TEXT,
-            encode_frame({
-                "op": OP_REQ,
-                "id": rid,
-                "method": method,
-                "path": path,
-                "headers": headers,
-            }),
-        )]
+        terminator).
+
+        With a child that advertises CAP_REQ_CHUNK_ID the body is sent as
+        per-chunk header/binary pairs, each pair under its own lock
+        acquisition.  Holding the connection-wide send lock across a whole
+        body (as the legacy framing must) means every other tunnel request --
+        file-manager listings, /v1/env polls, terminal input, streaming
+        responses -- waits for the entire upload to reach the child, and on a
+        slow link the parent's own pings stop too.  A child without the
+        capability reads bodies inline on its reader thread and still gets the
+        atomic legacy sequence.
+        """
+        header = {
+            "op": OP_REQ,
+            "id": rid,
+            "method": method,
+            "path": path,
+            "headers": headers,
+        }
+        if CAP_REQ_CHUNK_ID not in self.caps:
+            frames = [(wsutil.OP_TEXT, encode_frame(header))]
+            if body:
+                frames.extend((wsutil.OP_BINARY, chunk) for chunk in iter_chunks(body))
+            frames.append((wsutil.OP_BINARY, b""))  # body terminator
+            self.send_frames(frames, refresh_activity=True)
+            return
+        header["body"] = REQ_BODY_CHUNKED
+        self.send_frames([(wsutil.OP_TEXT, encode_frame(header))])
         if body:
-            frames.extend((wsutil.OP_BINARY, chunk) for chunk in iter_chunks(body))
-        frames.append((wsutil.OP_BINARY, b""))  # body terminator
-        self.send_frames(frames, refresh_activity=True)
+            for chunk in iter_chunks(body):
+                # One pair per chunk: the header must reach the child glued to
+                # its binary frame (that is how it attributes the bytes), but
+                # the lock is released in between so other traffic interleaves.
+                self.send_frames([
+                    (wsutil.OP_TEXT, encode_frame({
+                        "op": OP_REQ_CHUNK, "id": rid, "eof": False,
+                    })),
+                    (wsutil.OP_BINARY, chunk),
+                ], refresh_activity=True)
+        self.send_frames([(wsutil.OP_TEXT, encode_frame({
+            "op": OP_REQ_CHUNK, "id": rid, "eof": True,
+        }))])
 
     # ------------------------------------------------------------------
     # HTTP round-trips
@@ -477,12 +510,15 @@ class TunnelManager:
     # Attach / detach
     # ------------------------------------------------------------------
 
-    def attach(self, sock, tunnel_id: str) -> Tuple[str, Optional[str]]:
+    def attach(self, sock, tunnel_id: str, caps=None) -> Tuple[str, Optional[str]]:
         """Bind *sock* (handshake done, hello received) to *tunnel_id*.
 
         Returns ``(action, env_id)`` with action ``"welcome"`` or
         ``"reject"``.  Rejects ids with no remote-env record — the child
         may only (re)connect after an explicit registration.
+
+        *caps* are the capabilities the child advertised in its hello (see
+        ``CAP_REQ_CHUNK_ID``); unknown entries are ignored.
         """
         env_id = tunnel_env_id(tunnel_id)
         try:
@@ -492,7 +528,7 @@ class TunnelManager:
         if self._stopped:
             return ("reject", None)
 
-        conn = _TunnelConn(sock, tunnel_id)
+        conn = _TunnelConn(sock, tunnel_id, caps=caps)
         old: Optional[_TunnelConn] = None
         with self._lock:
             old = self._conns.get(tunnel_id)

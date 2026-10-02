@@ -102,12 +102,31 @@ OP_RESP = "resp"
 # so that several response sequences can interleave on one tunnel (a long
 # streaming response no longer blocks every other response on the lock).
 OP_RESP_CHUNK = "resp-chunk"
+# The same idea in the parent -> child direction (see CAP_REQ_CHUNK_ID, which
+# the CHILD advertises): a request whose header carries ``"body": "chunked"``
+# is followed by one such pair per body chunk instead of bare binary frames
+# under a single active-body cursor:
+#     header {"op":"req", ..., "body":"chunked"}
+#     header {"op":"req-chunk","id":rid,"eof":false}   -> binary <data>
+#     ...
+#     header {"op":"req-chunk","id":rid,"eof":true}    (no following binary)
+# A child that understands it routes each binary frame to the rid of the
+# chunk header that preceded it, so the parent no longer has to hold the
+# connection-wide send lock across a whole (possibly multi-minute) body: an
+# upload can no longer stall every other request/response on the tunnel.
+OP_REQ_CHUNK = "req-chunk"
+REQ_BODY_CHUNKED = "chunked"
 
 # ---------------------------------------------------------------------------
-# Capabilities (advertised by the parent in the welcome frame)
+# Capabilities
 # ---------------------------------------------------------------------------
 
+# parent -> child caps (welcome frame)
 CAP_RESP_CHUNK_ID = "resp-chunk-id"
+# child -> parent caps (hello frame): the child routes routed request bodies
+# (see OP_REQ_CHUNK).  The parent only uses that framing when the child says
+# it can take it; old children keep receiving one atomic sequence.
+CAP_REQ_CHUNK_ID = "req-chunk-id"
 
 OP_STREAM_OPEN = "stream-open"
 OP_STREAM_READY = "stream-ready"
