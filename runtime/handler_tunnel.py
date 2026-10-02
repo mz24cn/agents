@@ -319,8 +319,21 @@ class HandlerTunnelMixin:
                 content_length = int(self.headers.get("Content-Length", 0) or 0)
             except (TypeError, ValueError):
                 content_length = 0
-            if content_length > 0:
-                from runtime.handler_base import _MAX_PUSH_BODY_BYTES
+            from runtime.handler_base import _MAX_PUSH_BODY_BYTES
+            if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+                # Some mobile browsers send Blob PUT bodies with
+                # Transfer-Encoding: chunked and no Content-Length (upload
+                # chunks included).  The body must be consumed here: if it
+                # were dropped, the request would reach the child bodyless
+                # (400 on the size check) AND the unread chunked bytes would
+                # desync the keep-alive connection to the browser (the next
+                # request on it would parse chunk data as a request line).
+                body = self._read_chunked_body(_MAX_PUSH_BODY_BYTES)
+                if body is None:
+                    self.close_connection = True
+                    self._send_json_error(400, "Failed to read chunked request body")
+                    return
+            elif content_length > 0:
                 body = self._read_raw_body(_MAX_PUSH_BODY_BYTES)
                 if body is None:
                     return

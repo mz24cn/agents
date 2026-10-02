@@ -326,11 +326,65 @@ class HandlerBaseMixin:
             self._send_json_error(413, "Request body too large")
             return None
         try:
-            return self.rfile.read(content_length)
+            raw = self.rfile.read(content_length)
         except OSError:
             self.close_connection = True
             self._send_json_error(400, "Failed to read request body")
             return None
+        if len(raw) != content_length:
+            # The client closed the connection before the body was
+            # complete.  The remaining framing on this connection is
+            # untrustworthy, so reject and drop it instead of forwarding a
+            # truncated body (on the far side it would silently become a
+            # short request with a mismatched Content-Length).
+            self.close_connection = True
+            self._send_json_error(400, "Truncated request body")
+            return None
+        return raw
+
+    def _read_chunked_body(self, max_bytes: int) -> Optional[bytes]:
+        """Read a request body framed with ``Transfer-Encoding: chunked``.
+
+        Some mobile browsers send Blob PUT bodies chunked, without a
+        Content-Length.  The stdlib request handler cannot frame such a
+        body itself (it would parse the first chunk-size line as the next
+        request line and desync the keep-alive connection), so the body is
+        consumed here.  Returns ``None`` when the framing is malformed,
+        oversized, or the connection dies mid-body -- the caller sends the
+        error response.
+        """
+        parts: list = []
+        total = 0
+        try:
+            while True:
+                size_line = self.rfile.readline(65537)
+                if not size_line or b"\n" not in size_line:
+                    return None
+                size_token = size_line.strip().split(b";", 1)[0]
+                size = int(size_token, 16)
+                if size == 0:
+                    # Consume trailer headers up to the blank line.
+                    while True:
+                        line = self.rfile.readline(65537)
+                        if line in (b"\r\n", b"\n", b""):
+                            break
+                    break
+                if total + size > max_bytes:
+                    return None
+                remaining = size
+                while remaining > 0:
+                    block = self.rfile.read(min(65536, remaining))
+                    if not block:
+                        return None
+                    parts.append(block)
+                    total += len(block)
+                    remaining -= len(block)
+                # RFC 7230: each chunk is followed by CRLF.
+                if self.rfile.read(2) != b"\r\n":
+                    return None
+        except (OSError, ValueError):
+            return None
+        return b"".join(parts)
 
     def _send_json_response(self, status: int, data: object) -> None:
         """Send a JSON response with the given status code."""

@@ -834,6 +834,193 @@ def test_tunnel_envs_hello_endpoint(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Large / chunked request bodies over the browser bridge
+# ---------------------------------------------------------------------------
+
+def _bridge_upload(parent_srv, env_id, name, payload, tag=""):
+    """Browser-style workspace upload through the parent tunnel bridge:
+    init -> chunk PUTs (Content-Length framing) -> complete.  Returns the
+    (status, body) of the final complete call."""
+    base = f"http://127.0.0.1:{parent_srv.port}/v1/tunnel-proxy/{env_id}"
+
+    def _raw(method, path, data=None, headers=None):
+        req = urllib.request.Request(
+            base + path, data=data, headers=dict(headers or {}), method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                return resp.status, json.loads(resp.read() or b"null")
+        except urllib.error.HTTPError as exc:
+            raw = exc.read()
+            try:
+                return exc.code, json.loads(raw)
+            except ValueError:
+                return exc.code, {"raw": raw.decode(errors="replace")}
+
+    # target dir: the child's workspace root (discover it via the bridge)
+    _st, env = _raw("GET", "/v1/env")
+    ws_root = (env or {}).get("env", {}).get("AGENTS_WORKSPACE", "")
+    st, init = _raw("POST", "/v1/workspace/upload/init",
+                    json.dumps({"workspace_id": "default", "file_name": name,
+                                "file_size": len(payload),
+                                "target_dir_path": ws_root,
+                                "target_path": name}).encode(),
+                    {"Content-Type": "application/json"})
+    assert st == 200, (st, init)
+    for chunk in init["chunks"]:
+        st, body = _raw(
+            "PUT", f"/v1/workspace/upload/{init['upload_id']}/chunk/{chunk['parallel_id']}",
+            payload[chunk["offset"]: chunk["offset"] + chunk["size"]],
+            {"Content-Type": "application/octet-stream",
+             "X-Upload-Offset": str(chunk["offset"]),
+             "X-Upload-Size": str(chunk["size"]),
+             "X-File-Size": str(len(payload))})
+        assert st == 200, (tag, "chunk", chunk["parallel_id"], st, body)
+    return _raw("POST", f"/v1/workspace/upload/{init['upload_id']}/complete",
+                b"{}", {"Content-Type": "application/json"})
+
+
+def test_tunnel_proxy_large_chunk_upload_over_inline_limit(tmp_path):
+    """Regression (remote tunnel + ~10MB file): a chunk bigger than the
+    child's SMALL_BODY_INLINE threshold spills to a temp file; on Python
+    3.13+ http.client then framed that file body as
+    Transfer-Encoding: chunked (it no longer seeks file-like bodies to
+    derive Content-Length), which the child's stdlib http.server cannot
+    frame -- the local call 400s, the half-sent body breaks the keep-alive
+    connection (broken pipe -> 502), and upload/complete failed with
+    "some chunks are missing".  The child must now send an explicit
+    Content-Length so the upload lands intact."""
+    with _real_server(tmp_path, "parent_data") as parent, \
+         _real_server(tmp_path, "child_data", workspace=tmp_path / "child_ws") as child:
+        parent_srv, _ = parent
+        child_srv, child_data = child
+        _set_child_source(child_srv, child_data, f"http://127.0.0.1:{parent_srv.port}/")
+        status, body = _request(child_srv, "POST", "/v1/tunnel/parent/register")
+        assert status == 200, body
+        env_id = body["env_id"]
+
+        def _online():
+            e = next((e for e in _parent_tunnel_envs(parent_srv) if e["id"] == env_id), None)
+            return e if e and e.get("online") is True else None
+        _wait_until(_online, message="tunnel env online")
+
+        # 10MB single chunk: > SMALL_BODY_INLINE (8MB) on the child.
+        import random
+        random.seed(101)
+        payload = bytes(random.getrandbits(8) for _ in range(10 * 1024 * 1024))
+        st, comp = _bridge_upload(parent_srv, env_id, "large.bin", payload, tag="large")
+        assert st == 200, (st, comp)
+        assert comp.get("status") == "completed", comp
+        on_disk = (tmp_path / "child_ws" / "large.bin").read_bytes()
+        assert len(on_disk) == len(payload)
+        import hashlib
+        assert hashlib.sha256(on_disk).hexdigest() == hashlib.sha256(payload).hexdigest()
+
+
+def test_tunnel_proxy_browser_chunked_body(tmp_path):
+    """Some mobile browsers send Blob PUT bodies with
+    Transfer-Encoding: chunked and no Content-Length.  The parent bridge
+    must consume that framing (dropping it would 400 the child AND desync
+    the keep-alive connection to the browser) and forward the full body."""
+    with _real_server(tmp_path, "parent_data") as parent, \
+         _real_server(tmp_path, "child_data", workspace=tmp_path / "child_ws") as child:
+        parent_srv, _ = parent
+        child_srv, child_data = child
+        _set_child_source(child_srv, child_data, f"http://127.0.0.1:{parent_srv.port}/")
+        status, body = _request(child_srv, "POST", "/v1/tunnel/parent/register")
+        assert status == 200, body
+        env_id = body["env_id"]
+
+        def _online():
+            e = next((e for e in _parent_tunnel_envs(parent_srv) if e["id"] == env_id), None)
+            return e if e and e.get("online") is True else None
+        _wait_until(_online, message="tunnel env online")
+
+        base = f"http://127.0.0.1:{parent_srv.port}/v1/tunnel-proxy/{env_id}"
+        req = urllib.request.Request(
+            base + "/v1/env")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            ws_root = json.loads(resp.read()).get("env", {}).get("AGENTS_WORKSPACE", "")
+        payload = os.urandom(123457)  # odd size: 15 x 8192 + 2017
+        st, init = _request(
+            parent_srv, "POST", f"/v1/tunnel-proxy/{env_id}/v1/workspace/upload/init",
+            {"workspace_id": "default", "file_name": "chunked.bin",
+             "file_size": len(payload), "target_dir_path": ws_root,
+             "target_path": "chunked.bin"})
+        assert st == 200, (st, init)
+        chunk = init["chunks"][0]
+
+        # Raw socket: PUT with Transfer-Encoding: chunked, no Content-Length.
+        raw = socket.create_connection(("127.0.0.1", parent_srv.port), timeout=120)
+        req = (
+            f"PUT {base}/v1/workspace/upload/{init['upload_id']}/chunk/0 HTTP/1.1\r\n"
+            f"Host: 127.0.0.1\r\n"
+            "Content-Type: application/octet-stream\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            f"X-Upload-Offset: {chunk['offset']}\r\n"
+            f"X-Upload-Size: {chunk['size']}\r\n"
+            f"X-File-Size: {len(payload)}\r\n"
+            "\r\n"
+        ).encode("ascii")
+        raw.sendall(req)
+        for i in range(0, len(payload), 8192):
+            piece = payload[i:i + 8192]
+            raw.sendall(f"{len(piece):x}\r\n".encode("ascii") + piece + b"\r\n")
+        raw.sendall(b"0\r\n\r\n")
+        resp = b""
+        raw.settimeout(120)
+        while b"\r\n\r\n" not in resp:
+            d = raw.recv(65536)
+            if not d:
+                break
+            resp += d
+        raw.close()
+        head, _, rest = resp.partition(b"\r\n\r\n")
+        status_line = head.split(b"\r\n", 1)[0].decode("ascii", errors="replace")
+        assert " 200 " in status_line, (status_line, resp[:300])
+
+        st, comp = _request(
+            parent_srv, "POST",
+            f"/v1/tunnel-proxy/{env_id}/v1/workspace/upload/{init['upload_id']}/complete", {})
+        assert st == 200, (st, comp)
+        on_disk = (tmp_path / "child_ws" / "chunked.bin").read_bytes()
+        assert on_disk == payload
+
+
+def test_read_chunked_body_unit():
+    """_read_chunked_body framing: plain, trailers, extensions, and the
+    failure modes (bad size line, oversized, truncated mid-body)."""
+    from runtime.handler_base import HandlerBaseMixin
+
+    import io
+
+    def _host(raw: bytes):
+        class _H(HandlerBaseMixin):
+            def __init__(self):
+                self.rfile = io.BytesIO(raw)
+                self.close_connection = False
+            def _send_json_error(self, status, message):
+                pass
+        return _H()
+
+    plain = b"5\r\nhello\r\n6\r\nworld!\r\n0\r\n\r\n"
+    assert _host(plain)._read_chunked_body(1 << 20) == b"helloworld!"
+
+    trailer = b"3\r\nabc\r\n0\r\nX-Trail: 1\r\n\r\n"
+    assert _host(trailer)._read_chunked_body(1 << 20) == b"abc"
+
+    extended = b"4;ext=1\r\nabcd\r\n0\r\n\r\n"
+    assert _host(extended)._read_chunked_body(1 << 20) == b"abcd"
+
+    empty = b"0\r\n\r\n"
+    assert _host(empty)._read_chunked_body(1 << 20) == b""
+
+    assert _host(b"xyz\r\n0\r\n\r\n")._read_chunked_body(1 << 20) is None      # bad size
+    assert _host(b"5\r\nhe")._read_chunked_body(1 << 20) is None               # truncated
+    assert _host(b"5\r\nhello\r\n")._read_chunked_body(1 << 20) is None        # no terminator
+    assert _host(b"100\r\n" + b"q" * 100 + b"\r\n0\r\n\r\n")._read_chunked_body(10) is None  # oversize
+
+
+# ---------------------------------------------------------------------------
 # Frame protocol robustness (atomic request sequences, control frames)
 # ---------------------------------------------------------------------------
 

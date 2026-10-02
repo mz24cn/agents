@@ -677,10 +677,30 @@ class TunnelClient:
             headers["Cookie"] = cookie
         if isinstance(body, (bytes, bytearray)):
             conn.request(method, path, body=bytes(body) or None, headers=headers)
+        elif body is None:
+            conn.request(method, path, body=None, headers=headers)
         else:
-            # seekable temp file → http.client sets Content-Length and
-            # streams the body
-            conn.request(method, path, body=body, headers=headers)
+            # seekable temp file → stream it with an EXPLICIT Content-Length.
+            # Do not let http.client guess the framing: Python <= 3.12 seeks
+            # the file and derives Content-Length, but 3.13+ falls back to
+            # Transfer-Encoding: chunked for any file-like body -- and this
+            # service's stdlib http.server cannot frame chunked request
+            # bodies (it reads bodies via Content-Length only).  A chunked
+            # local call therefore fails the size check, the half-sent body
+            # desyncs the keep-alive connection (broken pipe -> 502 at the
+            # parent proxy), and upload/complete then fails with "some
+            # chunks are missing" even though the bytes were fine.  An
+            # explicit Content-Length header is honored on every version.
+            try:
+                body.seek(0)
+                size = body.seek(0, 2)
+                body.seek(0)
+            except (OSError, ValueError):
+                # Not seekable after all: read it in and send plain bytes.
+                conn.request(method, path, body=bytes(body.read()), headers=headers)
+            else:
+                headers["Content-Length"] = str(size)
+                conn.request(method, path, body=body, headers=headers)
         resp = conn.getresponse()
         out_headers = {
             k: v for k, v in resp.getheaders() if k.lower() not in _HOP_BY_HOP
