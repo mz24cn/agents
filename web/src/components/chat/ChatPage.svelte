@@ -35,8 +35,9 @@
 
   const STORAGE_MODEL_KEY = 'chat_selected_model'
   const STORAGE_TOOLS_KEY = 'chat_selected_tools'
-  const STORAGE_DRAFT_KEY = 'chat_input_draft'
+  const DRAFT_KEY_PREFIX = 'chat_draft_'
   const DRAFT_SAVE_DELAY_MS = 3000
+  function draftKeyFor(sid) { return DRAFT_KEY_PREFIX + (sid || 'new') }
   
   // 应用配置 store
   const appLogoStore = writable('') // 初始为空，等待异步加载
@@ -48,30 +49,56 @@
   let selectedToolIds = $state(JSON.parse(localStorage.getItem(STORAGE_TOOLS_KEY) ?? '[]'))
   let errorMsg = $state('')
   // 输入草稿：从本地存储初始化，新打开页面 / 切换到会话页时还原未发送的输入（含 <file> 引用文本）
-  let inputText = $state(localStorage.getItem(STORAGE_DRAFT_KEY) ?? '')
+  let inputText = $state('')
   let sessionId = $state(null)   // currently displayed session ID
 
   // ── 输入草稿保护 ─────────────────────────────────────────────────────────────
   // inputText 的任何变更（键入 / 粘贴 / 工作区选文件 / 撤销回填 / 发送后清空）
   // 都重置 3 秒延迟后再写入 localStorage，保证只落盘最后一次输入的最终状态；
   // 输入框清空时立即删除 key，避免下次加载时还原出已发送的内容。
+  // activeDraftSid：当前 inputText 归属的会话（null = 未分配 ID 的新会话）。
+  // 用它（而非响应式 sessionId）决定写哪个 key，避免 $effect 读取 sessionId 造成跨会话串写。
+  let activeDraftSid = null
   let draftSaveTimer = null
-  let draftPending = null
+  let draftPending = null   // { sid, text }：定时器窗口内尚未落盘的草稿
+
+  // 迁移旧版本的全局草稿（chat_input_draft）到"新会话"key，只迁移一次
+  try {
+    const legacyDraft = localStorage.getItem('chat_input_draft')
+    if (legacyDraft && !localStorage.getItem(draftKeyFor(null))) {
+      localStorage.setItem(draftKeyFor(null), legacyDraft)
+      localStorage.removeItem('chat_input_draft')
+    }
+  } catch { /* 忽略存储异常 */ }
+
+  // 初始恢复"新会话"草稿
+  inputText = localStorage.getItem(draftKeyFor(null)) ?? ''
+
+  // 切换到某个会话：先把旧会话未落盘的草稿 flush 到它自己的 key，再加载目标会话草稿
+  function loadDraftFor(sid) {
+    flushDraftNow()
+    activeDraftSid = sid
+    inputText = localStorage.getItem(draftKeyFor(sid)) ?? ''
+  }
   $effect(() => {
     const draft = inputText
+    const ownerSid = activeDraftSid
     if (draftSaveTimer) {
       clearTimeout(draftSaveTimer)
       draftSaveTimer = null
     }
-    draftPending = draft
+    draftPending = { sid: ownerSid, text: draft }
     if (!draft) {
-      try { localStorage.removeItem(STORAGE_DRAFT_KEY) } catch { /* 忽略存储异常 */ }
+      try { localStorage.removeItem(draftKeyFor(ownerSid)) } catch { /* 忽略存储异常 */ }
       return
     }
     draftSaveTimer = setTimeout(() => {
       draftSaveTimer = null
+      // 只在归属会话未变时落盘；若期间已切走，交由 loadDraftFor 的 flush 处理
+      if (draftPending && draftPending.sid === ownerSid) {
+        try { localStorage.setItem(draftKeyFor(ownerSid), draft) } catch { /* 忽略存储异常 */ }
+      }
       draftPending = null
-      try { localStorage.setItem(STORAGE_DRAFT_KEY, draft) } catch { /* 忽略存储异常 */ }
     }, DRAFT_SAVE_DELAY_MS)
   })
   // 同步落盘尚未写入的草稿；页面隐藏（关闭/刷新）与组件销毁时调用
@@ -81,8 +108,12 @@
       draftSaveTimer = null
     }
     if (draftPending) {
-      try { localStorage.setItem(STORAGE_DRAFT_KEY, draftPending) } catch { /* 忽略存储异常 */ }
+      const { sid, text } = draftPending
       draftPending = null
+      try {
+        if (text) localStorage.setItem(draftKeyFor(sid), text)
+        else localStorage.removeItem(draftKeyFor(sid))
+      } catch { /* 忽略存储异常 */ }
     }
   }
 
@@ -946,6 +977,7 @@
         if (Number.isFinite(seq)) directStreamLastSeq.set(initData.session_id, seq)
         sessionId = initData.session_id
         currentSession.sessionId = initData.session_id
+        activeDraftSid = initData.session_id
         // 新远程会话：会话 ID 由后端分配后，把执行环境绑定同步到真实会话 ID
         //（选择环境时 sessionId 可能还是 null）。
         if (selectedRemoteEnvId && remoteExecution.env
@@ -1110,6 +1142,7 @@
       keyRef.key = migrateSessionStoreKey(keyRef.key, msg.session_id)
       sessionId = msg.session_id
       currentSession.sessionId = msg.session_id
+      activeDraftSid = msg.session_id
       // 通知 Sidebar 有新会话创建（仅当本次请求就是新会话时；
       // 已有会话的后续轮次不能覆盖条目标题）
       if (wasNewSession && !newSessionCreated.sessionId) {
@@ -1728,6 +1761,7 @@
       needsRead = false
       sessionRestored = true
       shouldScrollToBottom = false
+      loadDraftFor(sid)
 
       // 优先使用 meta 中的设置（向下兼容：旧会话可能没有 meta）
       if (meta) {
@@ -1809,6 +1843,7 @@
     currentSession.sessionId = null
     shouldScrollToBottom = false
     workspacePath = defaultWorkspacePath
+    loadDraftFor(null)
     // 新会话默认本地执行（决策：会话级绑定不跨会话继承）
     selectedRemoteEnvId = ''
     clearRemoteBinding()
@@ -1839,9 +1874,12 @@
       if (terminals.has(deletedSid)) {
         destroyTerminal(deletedSid)
       }
+      // 删除该会话的草稿，并把输入框切回"新会话"草稿
+      try { localStorage.removeItem(draftKeyFor(deletedSid)) } catch { /* 忽略存储异常 */ }
       errorMsg = ''
       sessionId = null
       shouldScrollToBottom = false
+      loadDraftFor(null)
       // 被删会话若是远程会话：解除绑定（子端孤儿目录由母端 DELETE 异步清理）
       if (remoteExecution.sessionId === deletedSid) {
         selectedRemoteEnvId = ''
