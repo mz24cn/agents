@@ -482,6 +482,10 @@ const translations = {
     generateParamsPlaceholder: '{"temperature": 0.7}',
     modelEnvPlaceholderHint: '支持 {{key}} 占位符；实际推理时由后端使用同名环境变量替换。',
     generateParamsExtraBodyHint: '不要保留 extra_body 键；请将其中字段直接摊平到 JSON 顶层，否则参数可能无效。',
+    maxContext: '最大上下文长度',
+    maxContextPlaceholder: '例如: 128K、1M；留空表示不限',
+    maxContextHint: '可使用 K、M 单位（1K = 1024，1M = 1024K）。推理循环中，当某一轮的 token 数达到该值的 90% 时触发摘要与记忆；留空等于 0，表示跳过该检查。',
+    maxContextInvalid: '请输入数字，可带 K 或 M 单位',
 
     // ModelsPage
     modelsPageTitle: '模型管理',
@@ -1144,6 +1148,10 @@ const translations = {
     generateParamsPlaceholder: '{"temperature": 0.7}',
     modelEnvPlaceholderHint: 'Supports {{key}} placeholders, resolved from matching backend environment variables only during inference.',
     generateParamsExtraBodyHint: 'Do not keep an extra_body key; flatten its fields into the top level or they may be ignored.',
+    maxContext: 'Max Context Length',
+    maxContextPlaceholder: 'e.g. 128K, 1M; leave empty if unknown',
+    maxContextHint: 'K/M units are supported (1K = 1024, 1M = 1024K). Context compression is triggered mid-loop when a round reaches 90% of this value; empty means 0 and skips that check.',
+    maxContextInvalid: 'Enter a number, optionally with a K or M unit',
 
     // ModelsPage
     modelsPageTitle: 'Models',

@@ -5,6 +5,7 @@
   import JsonEditor from '../JsonEditor.svelte'
   import ConfirmDialog from '../ConfirmDialog.svelte'
   import { parseLabels } from '../../lib/labels.js'
+  import { formatMaxContext, parseMaxContext } from '../../lib/max-context.js'
 
   let { model = null, onSuccess, onCancel } = $props()
 
@@ -22,6 +23,7 @@
     _init.generate_params ? JSON.stringify(_init.generate_params, null, 2) : ''
   )
   let labelsText = $state((_init.labels ?? []).join(', '))
+  let max_context_text = $state(formatMaxContext(_init.max_context ?? 0))
 
   let errors = $state({})
   let submitError = $state('')
@@ -56,6 +58,7 @@
     if (generate_params_text.trim()) {
       try { JSON.parse(generate_params_text) } catch { e.generate_params = t('jsonInvalid') }
     }
+    if (parseMaxContext(max_context_text) === null) e.max_context = t('maxContextInvalid')
     errors = e
     return Object.keys(e).length === 0
   }
@@ -72,6 +75,7 @@
       api_protocol,
       generate_params: generate_params_text.trim() ? JSON.parse(generate_params_text) : {},
       labels: parseLabels(labelsText),
+      max_context: parseMaxContext(max_context_text),
     }
     try {
       if (isEdit) await models.update(originalModelId, config)
@@ -102,6 +106,7 @@
           api_key: api_key.trim(),
           api_protocol,
           generate_params: generate_params_text.trim() ? JSON.parse(generate_params_text) : {},
+          max_context: parseMaxContext(max_context_text),
         },
         messages: [{ role: 'user', content: userMessage }],
         stream: false,
@@ -225,6 +230,13 @@
     <JsonEditor id="generate_params" bind:value={generate_params_text} rows={4} placeholder={t('generateParamsPlaceholder')} />
     {#if errors.generate_params}<span class="field-error">{errors.generate_params}</span>{/if}
     <span class="field-hint">{t('generateParamsExtraBodyHint')}</span>
+  </div>
+
+  <div class="form-group">
+    <label for="max_context">{t('maxContext')}</label>
+    <input id="max_context" type="text" bind:value={max_context_text} placeholder={t('maxContextPlaceholder')} />
+    {#if errors.max_context}<span class="field-error">{errors.max_context}</span>{/if}
+    <span class="field-hint">{t('maxContextHint')}</span>
   </div>
 
   <div class="form-group">
