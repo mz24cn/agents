@@ -15,6 +15,34 @@ from runtime.common import parse_labels  # noqa: F401 — re-export
 
 
 _ENV_PLACEHOLDER_RE = re.compile(r"\{\{(\w+)\}\}")
+_TOKEN_COUNT_RE = re.compile(r"^\s*([0-9]*\.?[0-9]+)\s*([kKmM])?\s*$")
+
+
+def _parse_token_count(value, default: int = 0) -> int:
+    """Parse an optional token count, accepting the UI's K/M notation.
+
+    Used for ``ModelConfig.max_context``, which may arrive as an int, as a
+    string (hand edited JSON, older clients) or as ``None``.  A trailing K/M
+    suffix is honoured exactly like the Setup form's input field
+    (``1K`` = 1024, ``1M`` = 1024 * 1024, decimals allowed).  Anything that is
+    not a positive amount (absent, 0, negative, unparseable) falls back to
+    *default* — for ``max_context`` that means "window unknown".
+    """
+    if isinstance(value, bool) or value is None:
+        return default
+    if isinstance(value, int):
+        return value if value > 0 else default
+    if isinstance(value, float):
+        return int(value) if value > 0 else default
+    if not isinstance(value, str):
+        return default
+    match = _TOKEN_COUNT_RE.match(value)
+    if match is None:
+        return default
+    unit = (match.group(2) or "").lower()
+    factor = 1024 * 1024 if unit == "m" else 1024 if unit == "k" else 1
+    result = int(round(float(match.group(1)) * factor))
+    return result if result > 0 else default
 
 
 def _resolve_env_placeholders(value: str) -> str:
@@ -135,6 +163,11 @@ class ModelConfig:
         api_protocol: API protocol - "openai" or "ollama".
         generate_params: Additional generation parameters (temperature, top_p, etc.).
         labels: Tags for categorization (e.g. ["vlm"] for vision-language models).
+        max_context: Maximum context window the model accepts, in tokens
+            (0 = unknown/unset).  Used to trigger context compression from
+            inside a running inference tool loop: once a round's prompt +
+            completion tokens reach 90 % of this value the session is
+            compressed before the next round.  0 disables that check.
         created_at: ISO 8601 timestamp when this config was first created.
         last_modified: ISO 8601 timestamp of the last modification.
     """
@@ -146,11 +179,13 @@ class ModelConfig:
     api_protocol: str = "openai"
     generate_params: dict = field(default_factory=dict)
     labels: list = field(default_factory=list)
+    max_context: int = 0
     created_at: str = ""
     last_modified: str = ""
 
     def __post_init__(self):
         self.labels = parse_labels(self.labels)
+        self.max_context = _parse_token_count(self.max_context, 0)
 
     def resolved_for_inference(self) -> "ModelConfig":
         """Return an inference-only copy with environment placeholders resolved.
@@ -177,6 +212,7 @@ class ModelConfig:
             "api_protocol": self.api_protocol,
             "generate_params": dict(self.generate_params),
             "labels": list(self.labels),
+            "max_context": self.max_context,
             "created_at": self.created_at,
             "last_modified": self.last_modified,
         }
@@ -192,6 +228,7 @@ class ModelConfig:
             api_protocol=data.get("api_protocol", "openai"),
             generate_params=data.get("generate_params", {}),
             labels=parse_labels(data.get("labels", [])),
+            max_context=_parse_token_count(data.get("max_context", 0)),
             created_at=data.get("created_at", ""),
             last_modified=data.get("last_modified", ""),
         )

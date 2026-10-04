@@ -75,7 +75,7 @@ def _wait_until(predicate, timeout: float = 10.0) -> bool:
 def _blocking_stream_factory(release: threading.Event):
     """Build a fake infer_stream that blocks until *release* is set."""
 
-    def fake_infer_stream(request, cancel_event=None):
+    def fake_infer_stream(request, cancel_event=None, on_round_complete=None):
         release.wait(timeout=15)
         yield Message(role="assistant", content="done")
 

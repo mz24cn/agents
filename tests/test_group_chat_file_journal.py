@@ -34,7 +34,7 @@ class ContextManager:
 
 
 class GroupWritingRuntime:
-    def infer_stream(self, request, cancel_event=None):
+    def infer_stream(self, request, cancel_event=None, on_round_complete=None):
         agent_id = get_request_context("agent_id")
         result = json.loads(_write_file(f"{agent_id}.txt", f"written by {agent_id}"))
         assert result["journal"]["session_id"] == "group-session"
@@ -44,14 +44,14 @@ class GroupWritingRuntime:
 
 
 class TalkWritingRuntime:
-    def infer_stream(self, request, cancel_event=None):
+    def infer_stream(self, request, cancel_event=None, on_round_complete=None):
         result = json.loads(_write_file("talk-child.txt", "written by talk_to"))
         assert result["journal"]["session_id"] == "group-session"
         yield Message(role="assistant", content="child done")
 
 
 class DelegateWritingRuntime:
-    def infer_stream(self, request, cancel_event=None):
+    def infer_stream(self, request, cancel_event=None, on_round_complete=None):
         result = json.loads(_write_file("delegate-child.txt", "written by delegate"))
         assert result["journal"]["session_id"] == "group-session"
         yield Message(role="assistant", content="delegate done")

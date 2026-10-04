@@ -850,6 +850,132 @@ class IncrementalConversationPersister:
             self.persisted_until = len(collected_messages)
         return exc
 
+    def is_current(self, collected_messages: list) -> bool:
+        """Return True while every message of *collected_messages* is on disk.
+
+        Mid-loop context compression (:class:`InLoopContextCompressor`) rebuilds
+        the in-flight message list from ``conversation.json``.  That is only
+        correct while the round that just finished is already persisted —
+        otherwise the rebuilt context would silently drop the tool results the
+        model is waiting for.  False is also returned once this stream no longer
+        owns the session (its persistence is deliberately skipped from then on).
+        """
+        if self._disabled or not self._active():
+            return False
+        return self.persisted_until >= len(collected_messages)
+
+
+class InLoopContextCompressor:
+    """Compress a session mid-tool-loop and rebuild the in-flight context.
+
+    The session-completed trigger (``MAX_TOKENS_IN_CONTEXT``) only runs when an
+    inference finishes, but a single inference can run hundreds of tool rounds
+    while the whole message list is re-sent on every round.  That growth is what
+    pushes a request past the model's window mid-loop — and for a provider whose
+    hard limit is exactly the total of context + output it is invisible to the
+    overflow self-healing, because nothing is ever rejected.
+
+    ``Runtime.infer_stream`` invokes this callable after every completed tool
+    round with ``(messages, round_total_tokens, max_context)``.  When the round's
+    input + output tokens reach 90 % of the running model's context window
+    (``ModelConfig.max_context``; ``0`` means the window is unknown, which
+    disables the check) the session is compressed (summary + memory; incremental
+    exactly like every other compression) and the in-flight message list is
+    rebuilt the same way a brand-new turn is assembled:
+
+      1. one merged system message (agent/session prompt + rolling summary +
+         structured memory),
+      2. the recent verbatim window, which still contains the round that just
+         finished (the assistant tool call and its results),
+
+    so the next round starts from a small context instead of the accumulated
+    history.  Compression itself is incremental and keeps the most recent K
+    turns unsummarized, which is what guarantees the pending tool round survives
+    the rebuild.
+
+    Rebuilding uses the same read path as a new user turn
+    (``ContextManager.assemble_context``), so nothing about the request format
+    changes — only the size of the context the loop carries.
+
+    The rebuild reads the session from disk, so callers pass a ``ready``
+    predicate (normally :meth:`IncrementalConversationPersister.is_current`)
+    that must hold at call time; otherwise the hook is a no-op and the loop
+    keeps its accumulated messages.
+    """
+
+    def __init__(
+        self,
+        *,
+        context_manager,
+        session_id: Optional[str],
+        ready: Optional[Callable[[], bool]] = None,
+    ) -> None:
+        self.context_manager = context_manager
+        self.session_id = session_id
+        self.ready = ready
+
+    def __call__(
+        self,
+        messages: list,
+        round_total_tokens: int,
+        max_context: int = 0,
+    ) -> Optional[list]:
+        """Return a rebuilt message list, or None to keep the current one.
+
+        Args:
+            messages: In-flight message list of the inference loop (informational
+                — the rebuild is derived from the persisted session).
+            round_total_tokens: Prompt + completion tokens of the completed round.
+            max_context: Context window of the model running this loop, in tokens
+                (``ModelConfig.max_context``; 0 = unknown, which skips the check).
+        """
+        if self.context_manager is None or not self.session_id:
+            return None
+        if self.ready is not None and not self.ready():
+            logger.info(
+                "in-loop context compression: session %s stream is not fully "
+                "persisted; keeping the accumulated context",
+                self.session_id,
+            )
+            return None
+        context_manager = self.context_manager
+        session_id = self.session_id
+        try:
+            turns = context_manager.load_conversation(session_id)
+        except (FileNotFoundError, ValueError):
+            return None
+        # Below the model's in-loop threshold nothing is sent to the summary model.
+        if not context_manager.compress_context_in_loop(
+            session_id, turns, round_total_tokens, max_context
+        ):
+            return None
+        try:
+            assembled = context_manager.assemble_context(session_id, [])
+        except OSError as exc:
+            logger.warning(
+                "in-loop context compression: failed to rebuild the context for "
+                "session %s: %s",
+                session_id,
+                exc,
+            )
+            return None
+        if not assembled:
+            return None
+        from runtime.models import Message
+
+        rebuilt = [Message.from_dict(m) for m in assembled]
+        _, front_matter = context_manager.get_summary(session_id)
+        logger.info(
+            "in-loop context compression: session %s rebuilt %d messages after a "
+            "%d-token round (summary_version=%s, summarized_up_to_turn=%s)",
+            session_id,
+            len(rebuilt),
+            round_total_tokens,
+            front_matter.get("summary_version"),
+            front_matter.get("summarized_up_to_turn"),
+        )
+        return rebuilt
+
 
 
 

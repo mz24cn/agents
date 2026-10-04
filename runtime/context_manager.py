@@ -364,8 +364,12 @@ def _extract_tagged_block(text: str, tag: str) -> str:
 # normal operation that delta is inherently bounded, because compression is
 # triggered as soon as the inference context exceeds ``MAX_TOKENS_IN_CONTEXT``
 # (env var, default 65536) — so between two compressions at most about one
-# "trigger-threshold worth" of new turns can accumulate.  The delta is
-# therefore sent IN FULL; no artificial prompt budget is applied.
+# "trigger-threshold worth" of new turns can accumulate.  A running tool loop
+# is additionally guarded mid-request against the model's own window: when a
+# completed round reaches 90 % of ``ModelConfig.max_context`` the session is
+# compressed before the next round (see ``compress_context_in_loop``), so a
+# single inference cannot grow past the model window between two HTTP requests.
+# The delta is therefore sent IN FULL; no artificial prompt budget is applied.
 #
 # Guards:
 #
@@ -402,6 +406,12 @@ _MEMORY_MAX_ENTRIES: int = 200
 _COMPRESS_BACKOFF_TOKEN_GROWTH: float = 1.25
 _COMPRESS_BACKOFF_SECONDS: float = 1800.0
 _COMPRESS_BACKOFF_MIN_FAILURES: int = 3
+#: Fraction of a model's ``ModelConfig.max_context`` that triggers a mid-loop
+#: compression.  The check runs at the END of a completed model round, so a
+#: single round can never quite reach the model's window before the trigger
+#: fires; acting at 90 % leaves room for the next request (which re-sends a
+#: slightly larger prompt) without waiting for the provider to reject it.
+_IN_LOOP_THRESHOLD_RATIO: float = 0.9
 
 #: Fragments that reveal a summary is the compression prompt's own output-format
 #: example (persisted when a failed LLM call's input prompt was mistakenly
@@ -2001,6 +2011,7 @@ class ContextManager:
         turns: list[ConversationTurn],
         last_total_tokens: Optional[int] = None,
         forced: bool = False,
+        trigger_threshold: Optional[int] = None,
     ) -> None:
         """Compress conversation history in a single LLM call.
 
@@ -2068,6 +2079,11 @@ class ContextManager:
                 ``last_total_tokens`` field in ``conversation.json``.
             forced: When true, skip the token-threshold check and the failure
                 backoff (manual regeneration).
+            trigger_threshold: Optional override for the token threshold used by
+                the trigger check above.  The mid-loop trigger
+                (:meth:`compress_context_in_loop`) passes 90 % of the model's
+                ``ModelConfig.max_context`` so a running inference is compressed
+                even when ``MAX_TOKENS_IN_CONTEXT`` is configured larger.
         """
         if not self._summary_model_id:
             return
@@ -2078,7 +2094,12 @@ class ContextManager:
             effective_tokens = self.get_last_total_tokens(session_id)
         if effective_tokens is None:
             return  # no token data available yet
-        if not forced and effective_tokens <= self._max_tokens_in_context:
+        threshold = (
+            self._max_tokens_in_context
+            if trigger_threshold is None
+            else trigger_threshold
+        )
+        if not forced and effective_tokens <= threshold:
             return  # still within budget
 
         # Determine which turns to compress.
@@ -2371,6 +2392,73 @@ class ContextManager:
             )
 
         self._record_compress_success(session_id)
+
+    def compress_context_in_loop(
+        self,
+        session_id: str,
+        turns: list[ConversationTurn],
+        round_total_tokens: Optional[int],
+        max_context: int = 0,
+    ) -> bool:
+        """Mid-loop compression trigger driven by the model's context window.
+
+        The inference tool loop re-sends the entire message list on every round,
+        so a single HTTP inference can grow past the model's context window long
+        before the session-completed trigger (``MAX_TOKENS_IN_CONTEXT``) runs.
+        ``Runtime.infer_stream`` therefore calls this after every completed tool
+        round with that round's input + output tokens and the
+        ``ModelConfig.max_context`` of the model running the loop.
+
+        When the round reached ``max_context * 0.9`` the regular incremental
+        compression runs — same prompt, same retry/backoff/failure semantics as
+        the session-completed trigger — and the caller is expected to rebuild the
+        in-flight context from the freshly written summary/memory (see
+        :class:`runtime.server_state.InLoopContextCompressor`).
+
+        Args:
+            session_id: Target session.
+            turns: Current full list of conversation turns (as persisted).
+            round_total_tokens: Prompt + completion tokens of the completed
+                round.
+            max_context: Context window of the model used by this loop, in
+                tokens (``ModelConfig.max_context``).  ``0`` means the window is
+                unknown, which SKIPS the in-loop check entirely — the round is
+                never rejected client-side, and a wrong guess (too small) would
+                compress healthy sessions needlessly.
+
+        Returns:
+            ``True`` when the round reached the threshold, ``False`` when the
+            check is disabled or the round is still below it (nothing is sent to
+            the summary model in that case).  ``True`` tells the caller to
+            rebuild the context from the current summary/memory: a session in
+            failure backoff still returns ``True`` while skipping the LLM call,
+            and the rebuild then simply re-derives the previous state.
+        """
+        if not max_context or max_context <= 0:
+            return False  # model window unknown: no in-loop check
+        threshold = int(max_context * _IN_LOOP_THRESHOLD_RATIO)
+        if round_total_tokens is None or round_total_tokens <= threshold:
+            return False
+        logging.info(
+            "compress_context_in_loop: session %s round used %d tokens, at or "
+            "above %d (%d%% of max_context=%d); compressing mid-loop",
+            session_id,
+            round_total_tokens,
+            threshold,
+            int(_IN_LOOP_THRESHOLD_RATIO * 100),
+            max_context,
+        )
+        # The threshold is passed through explicitly so a larger
+        # MAX_TOKENS_IN_CONTEXT can never suppress the in-loop trigger.  The
+        # failure backoff still applies: a repeatedly failing compression is not
+        # retried on every round.
+        self.compress_context(
+            session_id,
+            turns,
+            last_total_tokens=round_total_tokens,
+            trigger_threshold=threshold,
+        )
+        return True
 
     def compress_context_forced(self, session_id: str) -> None:
         """Force regeneration of summary and memory for *session_id*.

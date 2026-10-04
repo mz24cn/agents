@@ -76,7 +76,7 @@ class FakeRuntime:
         self.call_count = 0
         self.seen_requests: list[InferenceRequest] = []
 
-    def infer_stream(self, request: InferenceRequest, cancel_event=None):
+    def infer_stream(self, request: InferenceRequest, cancel_event=None, on_round_complete=None):
         self.call_count += 1
         self.seen_requests.append(request)
         idx = self.call_count - 1
@@ -88,7 +88,7 @@ class FakeRuntime:
 
 
 class StartedAtRuntime:
-    def infer_stream(self, request: InferenceRequest, cancel_event=None):
+    def infer_stream(self, request: InferenceRequest, cancel_event=None, on_round_complete=None):
         yield Message(
             role="assistant",
             content="done",
@@ -114,7 +114,7 @@ class QueuedStartedAtRuntime:
         self.first_started = threading.Event()
         self.release_first = threading.Event()
 
-    def infer_stream(self, request: InferenceRequest, cancel_event=None):
+    def infer_stream(self, request: InferenceRequest, cancel_event=None, on_round_complete=None):
         with self._lock:
             self._call_count += 1
             call_number = self._call_count
@@ -145,7 +145,7 @@ class ToolRoundRuntime:
     def __init__(self, tool_name: str):
         self.tool_name = tool_name
 
-    def infer_stream(self, request: InferenceRequest, cancel_event=None):
+    def infer_stream(self, request: InferenceRequest, cancel_event=None, on_round_complete=None):
         yield Message(
             role="assistant",
             tool_calls=[{
@@ -169,7 +169,7 @@ class ToolRoundRuntime:
 class NestedStreamingToolRuntime:
     """Emits nested-tool UI frames through the request-context callback."""
 
-    def infer_stream(self, request: InferenceRequest, cancel_event=None):
+    def infer_stream(self, request: InferenceRequest, cancel_event=None, on_round_complete=None):
         yield Message(
             role="assistant",
             tool_calls=[{
@@ -215,7 +215,7 @@ class ChunkedRuntime:
         self.call_count = 0
         self.seen_requests: list[InferenceRequest] = []
 
-    def infer_stream(self, request: InferenceRequest, cancel_event=None):
+    def infer_stream(self, request: InferenceRequest, cancel_event=None, on_round_complete=None):
         self.call_count += 1
         self.seen_requests.append(request)
         idx = self.call_count - 1
@@ -281,7 +281,7 @@ def test_two_agent_roster_uses_full_group_chat_path_for_single_mention():
             self.calls = []
             self.talk_to = _make_talk_to_fn(self, _thread_local)
 
-        def infer_stream(self, request, cancel_event=None):
+        def infer_stream(self, request, cancel_event=None, on_round_complete=None):
             self.calls.append({
                 "agent_id": get_request_context("agent_id"),
                 "available_tool_ids": get_request_context("available_tool_ids"),
@@ -939,7 +939,7 @@ class HungRuntime:
         self.hang_marker = hang_marker
         self.calls: list[str] = []
 
-    def infer_stream(self, request: InferenceRequest, cancel_event=None):
+    def infer_stream(self, request: InferenceRequest, cancel_event=None, on_round_complete=None):
         system = ""
         for m in request.messages:
             if m.role == "system":
@@ -962,7 +962,7 @@ class SlowRuntime:
     def __init__(self, sleep_s: float):
         self.sleep_s = sleep_s
 
-    def infer_stream(self, request: InferenceRequest, cancel_event=None):
+    def infer_stream(self, request: InferenceRequest, cancel_event=None, on_round_complete=None):
         time.sleep(self.sleep_s)
         yield Message(role="assistant", content="\u7ec8\u4e8e\u5b8c\u6210\u4e86\u3002")
 

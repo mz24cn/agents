@@ -624,6 +624,42 @@ class TestModelCRUD:
         }
         return _post(server, "/v1/models", data)
 
+    def test_register_model_keeps_max_context(self, server, runtime):
+        """max_context round-trips through POST and GET /v1/models."""
+        data = {
+            "model_id": "ctx-model",
+            "api_base": "http://localhost:11434",
+            "model_name": "ctx:latest",
+            "max_context": 1048576,
+        }
+        status, body = _post(server, "/v1/models", data)
+        assert status == 201
+        assert runtime._model_registry.get("ctx-model").max_context == 1048576
+
+        status, body = _get(server, "/v1/models")
+        assert status == 200
+        entry = next(m for m in body["models"] if m["model_id"] == "ctx-model")
+        assert entry["max_context"] == 1048576
+
+    def test_register_model_without_max_context_defaults_to_zero(self, server, runtime):
+        """An absent max_context means "unknown window" (0), not an error."""
+        status, body = self._register_model(server, "no-ctx-model")
+        assert status == 201
+        assert runtime._model_registry.get("no-ctx-model").max_context == 0
+
+    def test_put_update_model_can_change_max_context(self, server, runtime):
+        """PUT /v1/models/{id} replaces the whole config, max_context included."""
+        self._register_model(server, "ctx-upd")
+        updated_data = {
+            "model_id": "ctx-upd",
+            "api_base": "http://localhost:11434",
+            "model_name": "test:latest",
+            "max_context": 131072,
+        }
+        status, body = _put(server, "/v1/models/ctx-upd", updated_data)
+        assert status == 200
+        assert runtime._model_registry.get("ctx-upd").max_context == 131072
+
     def test_put_update_existing_model(self, server, runtime):
         """PUT /v1/models/{id} should update an existing model and return 200."""
         # Register a model first

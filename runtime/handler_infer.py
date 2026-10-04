@@ -33,6 +33,7 @@ from runtime.server_state import (
     finish_session_stream,
     get_terminal_for_session,
     IncrementalConversationPersister,
+    InLoopContextCompressor,
     mark_session_stream_persisted,
     merge_stream_messages,
     publish_session_stream_frame,
@@ -1022,6 +1023,26 @@ class HandlerInferMixin:
             ) if session_id is not None else None,
         )
 
+        # Mid-loop compression trigger (90% of the model's ModelConfig.max_context).
+        # The tool loop re-sends the whole message list on every round, so a long
+        # tool chain can exceed the model's window before this inference finishes
+        # — the session-completed trigger only runs afterwards.  Rebuilding the
+        # context from conversation.json is only safe while this stream still owns
+        # the session and every streamed frame is already persisted (otherwise the
+        # pending tool round would be dropped), hence the ``ready`` guard.
+        context_compressor = (
+            InLoopContextCompressor(
+                context_manager=context_manager,
+                session_id=session_id,
+                ready=lambda: (
+                    self._is_active_stream(session_id, cancel_event)
+                    and conversation_persister.is_current(collected_messages)
+                ),
+            )
+            if use_session and session_id is not None
+            else None
+        )
+
         # Save the input turn before inference so conversation.json exists.
         # Continue requests have no original messages, making this a no-op.
         if use_session and original_messages:
@@ -1068,7 +1089,11 @@ class HandlerInferMixin:
                     tool_ids=tool_ids,
                 )
             else:
-                msg_gen = runtime.infer_stream(request, cancel_event=cancel_event)
+                msg_gen = runtime.infer_stream(
+                    request,
+                    cancel_event=cancel_event,
+                    on_round_complete=context_compressor,
+                )
 
             for msg in msg_gen:
                 # Agent identity is attached by group-chat workers. In the

@@ -21,7 +21,10 @@ import re
 from runtime.models import InferenceRequest, Message, ToolConfig
 from runtime.common import session_timestamp, snapshot_request_context, restore_request_context, env_int
 from runtime.group_chat import build_agents_markdown, _GC_DEFAULT_PROMPT
-from runtime.server_state import IncrementalConversationPersister
+from runtime.server_state import (
+    IncrementalConversationPersister,
+    InLoopContextCompressor,
+)
 
 logger = logging.getLogger("runtime.builtin_tools")
 
@@ -241,6 +244,7 @@ def _make_delegate_fn(runtime, thread_local):
             collected_msgs = []
             persistence_warning = ""
             conversation_persister = None
+            context_compressor = None
             if (
                 context_manager is not None
                 and session_id is not None
@@ -248,10 +252,11 @@ def _make_delegate_fn(runtime, thread_local):
                 and sub_session_id.startswith(f"{session_id}-")
             ):
                 short_sub_id = sub_session_id[len(session_id) + 1:]
+                sub_context_manager = _make_sub_context_manager(
+                    context_manager, session_id,
+                )
                 conversation_persister = IncrementalConversationPersister(
-                    context_manager=_make_sub_context_manager(
-                        context_manager, session_id,
-                    ),
+                    context_manager=sub_context_manager,
                     session_id=short_sub_id,
                     original_messages=messages,
                     session_manager=None,
@@ -259,6 +264,13 @@ def _make_delegate_fn(runtime, thread_local):
                     agent_ids=getattr(thread_local, "agent_ids", None) or None,
                     model_id=model_id or getattr(thread_local, "model_id", None) or None,
                     extra_meta={"parent_session_id": session_id},
+                )
+                # A delegated task can itself run a long tool loop; keep the
+                # SubAgent context bounded the same way the main loop is.
+                context_compressor = InLoopContextCompressor(
+                    context_manager=sub_context_manager,
+                    session_id=short_sub_id,
+                    ready=lambda: conversation_persister.is_current(collected_msgs),
                 )
                 pre_exc = conversation_persister.pre_persist()
                 if pre_exc is not None:
@@ -268,7 +280,11 @@ def _make_delegate_fn(runtime, thread_local):
                     )
             try:
                 cancel_event = getattr(thread_local, "cancel_event", None)
-                for msg in runtime.infer_stream(request, cancel_event=cancel_event):
+                for msg in runtime.infer_stream(
+                    request,
+                    cancel_event=cancel_event,
+                    on_round_complete=context_compressor,
+                ):
                     msg.agent_id = getattr(msg, "agent_id", None) or getattr(thread_local, "agent_id", None)
                     if msg.role == "usage":
                         try:
@@ -558,6 +574,7 @@ def _make_talk_to_fn(runtime, thread_local):
             collected_msgs = []
             persistence_info = None
             conversation_persister = None
+            context_compressor = None
             short_sub_id = None
             if (
                 context_manager is not None
@@ -565,10 +582,11 @@ def _make_talk_to_fn(runtime, thread_local):
                 and parent_session_id is not None
             ):
                 short_sub_id = sub_session_id[len(parent_session_id) + 1:]
+                sub_context_manager = _make_sub_context_manager(
+                    context_manager, parent_session_id,
+                )
                 conversation_persister = IncrementalConversationPersister(
-                    context_manager=_make_sub_context_manager(
-                        context_manager, parent_session_id,
-                    ),
+                    context_manager=sub_context_manager,
                     session_id=short_sub_id,
                     original_messages=messages,
                     session_manager=None,
@@ -576,6 +594,13 @@ def _make_talk_to_fn(runtime, thread_local):
                     agent_ids=[agent_id],
                     model_id=model_id,
                     extra_meta={"parent_session_id": parent_session_id},
+                )
+                # A target agent can run a long tool loop of its own; keep its
+                # context bounded the same way the main loop is.
+                context_compressor = InLoopContextCompressor(
+                    context_manager=sub_context_manager,
+                    session_id=short_sub_id,
+                    ready=lambda: conversation_persister.is_current(collected_msgs),
                 )
                 pre_exc = conversation_persister.pre_persist()
                 if pre_exc is not None:
@@ -586,7 +611,11 @@ def _make_talk_to_fn(runtime, thread_local):
 
             infer_error = None
             try:
-                for msg in runtime.infer_stream(request, cancel_event=cancel_event):
+                for msg in runtime.infer_stream(
+                    request,
+                    cancel_event=cancel_event,
+                    on_round_complete=context_compressor,
+                ):
                     msg.agent_id = getattr(msg, "agent_id", None) or agent_id
                     if msg.role == "usage":
                         try:

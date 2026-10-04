@@ -2341,7 +2341,73 @@ class Runtime:
     # Streaming inference
     # ------------------------------------------------------------------
 
-    def infer_stream(self, request: InferenceRequest, cancel_event: Optional[object] = None) -> Iterator[Message]:
+    def _maybe_refresh_context(
+        self,
+        on_round_complete: Optional[Callable[[list, int, int], Optional[list]]],
+        messages: list,
+        round_index: int,
+        round_total_tokens: int,
+        max_context: int = 0,
+        tools: Optional[list] = None,
+    ) -> list:
+        """Offer the caller a chance to rebuild the in-flight context.
+
+        See ``infer_stream(on_round_complete=...)``.  The hook may compress the
+        session and return a freshly assembled (smaller) message list for the
+        next round; ``None`` keeps the accumulated messages.  A failing hook must
+        never break the inference loop, so every error is logged and the
+        accumulated messages are kept.
+
+        Args:
+            on_round_complete: Hook given to ``infer_stream`` (may be None).
+            messages: In-flight message list of the inference loop.
+            round_index: 1-based index of the completed tool round (for logs).
+            round_total_tokens: Prompt + completion tokens of that round.
+            max_context: ``ModelConfig.max_context`` of the model running this
+                loop (0 = unknown); forwarded to the hook, which decides whether
+                the round is close enough to the model's window to compress.
+            tools: Tool schemas currently exposed (for prompt estimates only).
+
+        Returns:
+            The message list to continue with.
+        """
+        if on_round_complete is None:
+            return messages
+        try:
+            replacement = on_round_complete(messages, round_total_tokens, max_context)
+        except Exception:
+            _logger.exception(
+                "infer_stream: mid-loop context refresh failed | round=%d tokens=%d",
+                round_index, round_total_tokens,
+            )
+            return messages
+        if replacement is None:
+            return messages
+        replacement = list(replacement)
+        if not replacement:
+            # An empty replacement would silently drop the conversation; keep
+            # the accumulated messages instead.
+            _logger.warning(
+                "infer_stream: mid-loop context refresh returned no messages | "
+                "round=%d tokens=%d; keeping the accumulated context",
+                round_index, round_total_tokens,
+            )
+            return messages
+        _logger.info(
+            "infer_stream: context rebuilt mid-loop | round=%d tokens=%d "
+            "messages=%d->%d prompt_tokens=%d->%d",
+            round_index, round_total_tokens, len(messages), len(replacement),
+            estimate_chat_prompt_tokens(messages, tools if tools else None),
+            estimate_chat_prompt_tokens(replacement, tools if tools else None),
+        )
+        return replacement
+
+    def infer_stream(
+        self,
+        request: InferenceRequest,
+        cancel_event: Optional[object] = None,
+        on_round_complete: Optional[Callable[[list, int, int], Optional[list]]] = None,
+    ) -> Iterator[Message]:
         """Streaming inference with full tool call loop and Skill progressive disclosure.
 
         Each inference round streams thinking/content tokens as they arrive.
@@ -2359,6 +2425,20 @@ class Runtime:
 
         Args:
             request: The inference request.
+            cancel_event: Optional cancellation event, checked before every
+                model round.
+            on_round_complete: Optional mid-loop context hook, called with
+                ``(messages, round_total_tokens, max_context)`` after each
+                completed TOOL round (the tool results are already appended to
+                *messages* and the loop is about to start the next round).
+                ``max_context`` is the ``ModelConfig.max_context`` of the model
+                running this loop (0 = unknown).  Returning a list replaces the
+                in-flight message list for the following rounds, which lets the
+                caller rebuild a compact context (system prompt + rolling summary
+                + memory + recent turns) once the round approaches the model's
+                context window.  Returning ``None`` keeps the accumulated
+                messages.  Terminal rounds (no tool call) are not passed to the
+                hook — the session-completed trigger handles them.
 
         Yields:
             Message objects incrementally.
@@ -2947,6 +3027,14 @@ class Runtime:
                 ):
                     messages.append(tool_msg)
                     yield tool_msg
+                # The round is complete (assistant output + tool results).  Give
+                # the caller a chance to compress the session and rebuild the
+                # context before the next round re-sends it to the model.
+                messages = self._maybe_refresh_context(
+                    on_round_complete, messages, tool_round,
+                    round_prompt + round_completion,
+                    getattr(model_config, "max_context", 0), tools,
+                )
                 continue
 
             for fn_call in tool_calls_to_execute:
@@ -3022,6 +3110,13 @@ class Runtime:
                 messages.append(tool_msg)
                 yield tool_msg
 
+            # Skill rounds count as a completed tool round too: the disclosed
+            # skill body / tool result is already appended and persisted.
+            messages = self._maybe_refresh_context(
+                on_round_complete, messages, tool_round,
+                round_prompt + round_completion,
+                getattr(model_config, "max_context", 0), tools,
+            )
             if skill_triggered:
                 continue
 

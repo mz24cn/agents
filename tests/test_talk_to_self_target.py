@@ -25,7 +25,7 @@ class RecordingRuntime:
     def __init__(self):
         self.calls = []
 
-    def infer_stream(self, request, cancel_event=None):
+    def infer_stream(self, request, cancel_event=None, on_round_complete=None):
         self.calls.append({
             "request": request,
             "agent_id": get_request_context("agent_id"),
@@ -214,7 +214,7 @@ def test_talk_to_subsession_is_incrementally_persisted(tmp_path):
         def __init__(self):
             self.incremental_messages = None
 
-        def infer_stream(self, request, cancel_event=None):
+        def infer_stream(self, request, cancel_event=None, on_round_complete=None):
             yield Message(role="assistant", content="first round")
             yield Message(
                 role="usage",

@@ -12,7 +12,7 @@ from runtime.builtin_tools import _make_delegate_fn
 def test_exception_isolation_property(error_message):
     """对任意异常消息，delegate 捕获后返回包含 'Error' 的字符串，不向上传播。"""
     class FailingRuntime:
-        def infer_stream(self, request, cancel_event=None):
+        def infer_stream(self, request, cancel_event=None, on_round_complete=None):
             raise RuntimeError(error_message)
 
     thread_local = threading.local()
@@ -71,7 +71,7 @@ def test_persistence_failure_does_not_interrupt_property(task_content, error_mes
     from runtime.models import Message
 
     class SuccessRuntime:
-        def infer_stream(self, request, cancel_event=None):
+        def infer_stream(self, request, cancel_event=None, on_round_complete=None):
             yield Message(role="assistant", content=task_content)
 
     thread_local = threading.local()
@@ -96,7 +96,7 @@ def test_depth_propagation_property(initial_depth):
     from runtime.models import Message
 
     class SimpleRuntime:
-        def infer_stream(self, request, cancel_event=None):
+        def infer_stream(self, request, cancel_event=None, on_round_complete=None):
             yield Message(role="assistant", content="hello")
             yield Message(role="assistant", content=" world")
 
