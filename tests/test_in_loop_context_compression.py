@@ -306,20 +306,23 @@ def test_in_loop_compressor_rebuilds_like_a_new_turn() -> None:
         rebuilt = compressor([], 5000, max_context=1000)
 
         assert rebuilt is not None
-        assert [m.role for m in rebuilt] == ["system", "assistant", "tool"]
+        # 0. The window (last K messages) is a pure assistant/tool tail, so the
+        #    context must be anchored to the last real user turn — providers
+        #    such as Ollama reject requests without any user message.
+        assert [m.role for m in rebuilt] == ["system", "user", "assistant", "tool"]
+        assert rebuilt[1].content == "OLDER-USER-TURN"
         # 1. Merged system message: rolling summary (+ memory) and the session
         #    system prompt come from the same code path as a new turn.
         assert "## Summary" in rebuilt[0].content
         assert "summary text" in rebuilt[0].content
         # 2. The pending tool round is kept verbatim, so the next round still
         #    sees the assistant tool call and its result.
-        assert rebuilt[1].tool_calls
-        assert rebuilt[1].tool_calls[0]["id"] == "call_1"
-        assert rebuilt[2].content == "PENDING-TOOL-RESULT"
-        assert rebuilt[2].tool_use_id == "call_1"
-        # 3. The summarized turns are gone from the verbatim window.
+        assert rebuilt[2].tool_calls
+        assert rebuilt[2].tool_calls[0]["id"] == "call_1"
+        assert rebuilt[3].content == "PENDING-TOOL-RESULT"
+        assert rebuilt[3].tool_use_id == "call_1"
+        # 3. Summarized (non-anchor) turns are gone from the verbatim window.
         joined = "\n".join((m.content or "") for m in rebuilt)
-        assert "OLDER-USER-TURN" not in joined
         assert "OLDER-ASSISTANT-TURN" not in joined
         # The summary advanced to cover exactly the compressible turns.
         _, front_matter = cm.get_summary(sid)
@@ -789,14 +792,15 @@ def test_production_wiring_compresses_and_rebuilds_mid_loop(tmp_path) -> None:
     assert front_matter.get("summarized_up_to_turn") == 0
     assert os.path.isfile(os.path.join(str(tmp_path), sid, "memory.md"))
 
-    # 2. Round 2 continued on the rebuilt context: rolling summary + the pending
-    #    tool round, not the accumulated history.
+    # 2. Round 2 continued on the rebuilt context: rolling summary + user
+    #    anchor + the pending tool round, not the accumulated history.  The
+    #    user turn itself was summarized away, but the pure assistant/tool tail
+    #    still needs its user anchor or providers like Ollama reject the
+    #    request with "no user query found in messages".
     assert rounds[0] == 2
     round2_messages = bodies[1]["messages"]
-    assert [m["role"] for m in round2_messages] == ["system", "assistant", "tool"]
+    assert [m["role"] for m in round2_messages] == ["system", "user", "assistant", "tool"]
     assert "COMPRESSED-SUMMARY" in round2_messages[0]["content"]
-    assert round2_messages[2]["content"] == "PENDING-TOOL-RESULT"
-    assert all(
-        "ORIGINAL-USER-TURN" not in (m.get("content") or "") for m in round2_messages
-    )
+    assert round2_messages[1]["content"] == "ORIGINAL-USER-TURN"
+    assert round2_messages[3]["content"] == "PENDING-TOOL-RESULT"
     assert any(m.role == "assistant" and m.content == "final answer" for m in collected)

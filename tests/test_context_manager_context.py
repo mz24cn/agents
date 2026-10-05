@@ -475,6 +475,87 @@ def test_compressed_context_does_not_start_recent_window_with_tool_result():
         assert non_system[-1]["content"] == "next"
 
 
+def test_compressed_context_anchors_user_when_window_is_pure_tool_tail():
+    """A mid-loop rebuild / Continue re-send (``new_messages=[]``) over a long
+    tool loop leaves a window of assistant/tool pairs only; the context must be
+    anchored to the last user turn, otherwise Ollama-style servers reject the
+    request with "no user query found in messages"."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cm = _make_cm(tmp_dir, recent_turns_k=2)
+        session_id = cm.create_session()
+        turns = [_make_turn("user", "the original question")]
+        ts = "2026-01-01T00:00:00"
+        for i in range(10):  # a long tool loop: assistant(tool_call) + result pairs
+            turns.append(
+                ConversationTurn(
+                    role="assistant",
+                    content="",
+                    timestamp=ts,
+                    tool_calls=[{"id": f"call_{i}", "name": "read_file", "arguments": {}}],
+                )
+            )
+            turns.append(
+                ConversationTurn(
+                    role="tool",
+                    content=f"result {i}",
+                    timestamp=ts,
+                    name="read_file",
+                    tool_use_id=f"call_{i}",
+                )
+            )
+        cm.save_conversation(session_id, turns)
+        # The in-progress user turn (index 0) and most of the tool loop are
+        # already summarized; only the final assistant/tool pair is unsummarized.
+        _write_summary(cm, session_id, "Summary text.", summarized_up_to_turn=19)
+
+        result = cm.assemble_context(session_id, [])
+
+        roles = [m["role"] for m in result]
+        assert roles[0] == "system"
+        # ...yet the rebuilt context must still contain a user message.
+        user_msgs = [m for m in result if m["role"] == "user"]
+        assert len(user_msgs) == 1
+        assert user_msgs[0]["content"] == "the original question"
+        # The tool chain stays intact and ordered after the anchor.
+        non_system = [m for m in result if m["role"] != "system"]
+        assert non_system[0]["role"] == "user"
+        for msg in non_system[1:]:
+            assert msg["role"] in ("assistant", "tool")
+        # The window is still bounded: anchor + last K messages, not the whole
+        # 20-message chain.
+        assert len(non_system) == 3
+
+
+def test_compressed_context_new_user_message_needs_no_anchor():
+    """A normal new turn appends its own user message: nothing is prepended."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cm = _make_cm(tmp_dir, recent_turns_k=2)
+        session_id = cm.create_session()
+        turns = [
+            _make_turn("user", "old request"),
+            ConversationTurn(
+                role="assistant",
+                content="",
+                timestamp="2026-01-01T00:00:00",
+                tool_calls=[{"id": "c", "name": "x", "arguments": {}}],
+            ),
+            ConversationTurn(
+                role="tool",
+                content="r",
+                timestamp="2026-01-01T00:00:00",
+                name="x",
+                tool_use_id="c",
+            ),
+        ]
+        cm.save_conversation(session_id, turns)
+        _write_summary(cm, session_id, "Summary text.", summarized_up_to_turn=0)
+
+        result = cm.assemble_context(session_id, [{"role": "user", "content": "next"}])
+
+        user_msgs = [m for m in result if m["role"] == "user"]
+        assert [m["content"] for m in user_msgs] == ["next"]
+
+
 def test_assemble_context_empty_session_returns_new_messages():
     """assemble_context with empty session_id must return new_messages as-is."""
     with tempfile.TemporaryDirectory() as tmp_dir:

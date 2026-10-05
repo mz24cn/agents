@@ -2847,6 +2847,38 @@ class ContextManager:
             if t.role != "system"
         ]
 
+        # 3b. User-anchor guarantee.  Several providers (Ollama and some
+        #     OpenAI-compatible servers) reject a request whose messages contain
+        #     no user message at all ("no user query found in messages").  A
+        #     normal new turn appends the fresh user message, but a mid-loop
+        #     rebuild (``assemble_context(session_id, [])``) or a Continue
+        #     re-send can be left with a window that is nothing but the tail of
+        #     a long tool loop: the user message of the in-progress round sits
+        #     far outside the K-message window.  In that case prepend the last
+        #     real user turn so the tool chain stays anchored to the question
+        #     it is answering.
+        if not any(
+            m.get("role") == "user" for m in list(turn_msgs) + list(new_messages)
+        ):
+            last_user_idx = max(
+                (i for i, t in enumerate(turns) if t.role == "user"),
+                default=-1,
+            )
+            if last_user_idx >= 0:
+                turn_msgs = [
+                    {
+                        k: v
+                        for k, v in asdict(turns[last_user_idx]).items()
+                        if v is not None
+                    },
+                ] + turn_msgs
+                logger.info(
+                    "assemble_context(session=%s): window has no user message; "
+                    "anchored the context to the last user turn (index %d)",
+                    session_id,
+                    last_user_idx,
+                )
+
         # 4. Rolling summary (dropped when still over budget after memory).
         summary_part: Optional[str] = None
         if summary_text.strip():
