@@ -10,9 +10,10 @@
     fileLanded,
     chunkRequestPromise,
   } from '../../lib/workspace-upload.js'
-  import { marked } from 'marked'
   import { highlight, escapeHtml, getFileLang, isMarkdownFile } from '../../lib/highlight.js'
   import { copyToClipboard } from '../../lib/clipboard.js'
+  import { renderMarkdown, bindMarkdownExtras } from '../../lib/markdown.js'
+  import { computeShortEdgeZoomSize } from '../../lib/imageZoom.js'
   import ConfirmDialog from '../ConfirmDialog.svelte'
   import DocumentPreview from './DocumentPreview.svelte'
   import DownloadProgress from './DownloadProgress.svelte'
@@ -104,6 +105,14 @@
   let previewDownload = $state({ loading: false, visible: false, received: 0, total: 0, token: 0 })
   let previewObjectUrl = $state('')
   let previewAbortController = null
+  // 预览导航：进入预览时快照「当时看到的列表」（目录列表或搜索结果，含排序/过滤），
+  // 之后列表再怎么变也不影响前后翻页 —— 对应"进入预览前的列表"语义
+  let previewNavList = $state([])
+  // 图像预览双击缩放：放大到短边贴合窗口（长边溢出出现滚动条），再双击还原
+  let previewImageZoomed = $state(false)
+  let previewImageZoomSize = $state(null) // { w, h } 放大后的像素尺寸
+  let previewImageEl = $state(null)
+  let previewImageContainerEl = $state(null)
   // 选中的文件文件名加粗，前面的目录部分保持普通字重
   function getPreviewPathParts(file) {
     const path = file?.path || file?.name || ''
@@ -1112,7 +1121,10 @@
     }
     
     resetPreviewSearch()
+    resetPreviewImageZoom()
     previewReturnView = viewMode
+    // 导航列表快照：当前可见列表中所有可预览的文件（目录列表或搜索结果）
+    previewNavList = displayedFiles.filter(f => !f.is_dir && isPreviewable(f))
     previewFile = {
       ...file,
       is_pdf: isPdfFile(file.name),
@@ -1147,7 +1159,10 @@
     if (!file || file.is_dir) return
     
     resetPreviewSearch()
+    resetPreviewImageZoom()
     previewReturnView = viewMode
+    // 「按文本打开」模式下任何文件都可预览，导航列表取全部非目录文件
+    previewNavList = displayedFiles.filter(f => !f.is_dir)
     previewFile = { ...file, is_text: true, is_image: false, is_audio: false, is_video: false, forcePlainText: true }
     viewMode = 'preview'
     previewContent = ''
@@ -1158,6 +1173,44 @@
     } catch (err) {
       error = err.message
     }
+  }
+
+  // ===== 预览标题栏：上一个/下一个文件 =====
+  // 在 previewNavList（进入预览时的列表快照）中按路径定位当前文件
+
+  function previewNavIndex() {
+    if (!previewFile || !previewNavList.length) return -1
+    return previewNavList.findIndex(f => f.path === previewFile.path)
+  }
+
+  function navigatePreview(delta) {
+    const idx = previewNavIndex()
+    if (idx === -1) return
+    const target = previewNavList[idx + delta]
+    if (!target) return
+    // 「按文本打开」模式下导航保持文本模式（该模式的导航列表含全部非目录文件）
+    if (previewFile?.forcePlainText) openAsTextFile(target)
+    else previewFileContent(target)
+  }
+
+  // ===== 图像预览：双击缩放（短边贴合窗口，长边滚动）/ 再双击还原 =====
+
+  function resetPreviewImageZoom() {
+    previewImageZoomed = false
+    previewImageZoomSize = null
+  }
+
+  function toggleImageZoom() {
+    if (!previewImageEl || !previewImageContainerEl) return
+    if (previewImageZoomed) {
+      previewImageZoomed = false
+      previewImageZoomSize = null
+      return
+    }
+    // 几何计算在 lib/imageZoom.js（单测/浏览器 e2e 共用同一份）
+    previewImageZoomSize = computeShortEdgeZoomSize(previewImageContainerEl, previewImageEl)
+    if (!previewImageZoomSize) return
+    previewImageZoomed = true
   }
 
   function clearPreviewSearchHighlights() {
@@ -1179,7 +1232,15 @@
     if (!query || !textPreviewEl) return
 
     const lowerQuery = query.toLocaleLowerCase()
-    const walker = document.createTreeWalker(textPreviewEl, NodeFilter.SHOW_TEXT)
+    const walker = document.createTreeWalker(textPreviewEl, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        // 跳过 mermaid 渲染出的 SVG 内部文本：HTML <mark> 在 SVG 里不合法，
+        // 包进去会破坏已渲染的图（搜索仍覆盖正文/代码块/未渲染的占位符源码）
+        const el = node.parentElement
+        if (el && el.closest('svg')) return NodeFilter.FILTER_REJECT
+        return NodeFilter.FILTER_ACCEPT
+      },
+    })
     const textNodes = []
     let node
     while ((node = walker.nextNode())) textNodes.push(node)
@@ -1263,6 +1324,8 @@
 
   function closePreview() {
     resetPreviewSearch()
+    resetPreviewImageZoom()
+    previewNavList = []
     cancelPreviewDownload()
     clearPreviewObjectUrl()
     viewMode = previewReturnView
@@ -1328,26 +1391,10 @@
       return renderCodeWithLines(content.split('\n').map(l => escapeHtml(l)))
     }
     if (isMarkdownFile(filename)) {
-      try {
-        const renderer = new marked.Renderer()
-        renderer.code = function({ text, lang }) {
-          const normalizedLang = lang || ''
-          const highlightedHtml = highlight(text, normalizedLang)
-          return `<div class="code-block"><pre><code class="${normalizedLang ? 'language-' + normalizedLang : ''}">${highlightedHtml}</code></pre></div>`
-        }
-        renderer.link = function({ href, title, text }) {
-          const titleAttr = title ? ` title="${title}"` : ''
-          return `<a href="${href}"${titleAttr} target="_blank" rel="noopener noreferrer">${text}</a>`
-        }
-        renderer.image = function({ href, title, text }) {
-          const titleAttr = title ? ` title="${title}"` : ''
-          const src = resolveResourceUrl(href)
-          return `<img src="${src}" alt="${text}"${titleAttr} />`
-        }
-        return marked.parse(content, { renderer, gfm: true, breaks: true })
-      } catch {
-        return escapeHtml(content)
-      }
+      // 与聊天 MarkdownRenderer 同一条共享管道（lib/markdown.js）：
+      // math/mermaid 占位提取、代码块复制按钮、sanitize 只在这里实现一次；
+      // resolveResourceUrl 是预览独有的图片相对路径解析钩子
+      return renderMarkdown(content, { resolveImageSrc: resolveResourceUrl })
     }
     const lang = getFileLang(filename)
     const lines = content.split('\n')
@@ -1356,6 +1403,16 @@
     }
     return renderCodeWithLines(lines.map(l => escapeHtml(l)))
   }
+
+  // MD 预览挂载后绑定动态能力：mermaid 本地渲染 + KaTeX 数学 + 代码块复制
+  // （与聊天 MarkdownRenderer 共用 bindMarkdownExtras，幂等）。
+  // 依赖 previewContent / previewFile / textPreviewEl —— 预览切换、内容刷新都会重新触发。
+  $effect(() => {
+    const file = previewFile
+    const content = previewContent
+    if (!textPreviewEl || !file || !file.is_text || !content) return
+    bindMarkdownExtras(textPreviewEl)
+  })
 
   // 下载文件
   function downloadFile(file) {
@@ -2626,6 +2683,26 @@
             <span>{previewPathParts.directory}</span><strong>{previewPathParts.name}</strong>
           </div>
           <div class="preview-header-actions">
+            <!-- 上一个/下一个文件：在「进入预览前的列表」快照中翻页 -->
+            <div class="preview-file-nav">
+              <button
+                class="preview-file-nav-btn"
+                onclick={() => navigatePreview(-1)}
+                disabled={previewNavIndex() <= 0}
+                title={t('prevFile')}
+                aria-label={t('prevFile')}
+              >◀</button>
+              <span class="preview-file-nav-count">
+                {previewNavIndex() >= 0 ? previewNavIndex() + 1 + '/' + previewNavList.length : ''}
+              </span>
+              <button
+                class="preview-file-nav-btn"
+                onclick={() => navigatePreview(1)}
+                disabled={previewNavIndex() >= previewNavList.length - 1}
+                title={t('nextFile')}
+                aria-label={t('nextFile')}
+              >▶</button>
+            </div>
             {#if previewFile.is_text}
               <div class="preview-search-controls">
                 <button
@@ -2666,7 +2743,23 @@
           </div>
         </div>
         {#if previewFile.is_image}
-          <div class="preview-content"><img src={wsApi.content(previewFile.path, false)} alt={previewFile.name} /></div>
+          <!-- 双击放大：短边贴合窗口（长边溢出滚动），再双击还原 -->
+          <div
+            class="preview-content"
+            class:preview-image-zoomed={previewImageZoomed}
+            bind:this={previewImageContainerEl}
+          >
+            <img
+              src={wsApi.content(previewFile.path, false)}
+              alt={previewFile.name}
+              title={t('imageDoubleClickHint')}
+              bind:this={previewImageEl}
+              style={previewImageZoomed && previewImageZoomSize
+                ? 'width:' + previewImageZoomSize.w + 'px;height:' + previewImageZoomSize.h + 'px;'
+                : ''}
+              ondblclick={toggleImageZoom}
+            />
+          </div>
         {:else if previewFile.is_video}
           <div class="preview-content">
             {#if previewObjectUrl}
@@ -2678,7 +2771,8 @@
         {:else if previewFile.is_pdf || previewFile.is_docx}
           <DocumentPreview file={previewFile} url={wsApi.content(previewFile.path, false)} />
         {:else if previewFile.is_text}
-          <div class="text-preview" bind:this={textPreviewEl}>{@html renderPreviewHtml(previewContent, previewFile.name, previewFile.forcePlainText, previewFile.path)}</div>
+          <!-- md-view：嵌入内容（代码块/mermaid/数学）样式来自共享的 lib/markdown.css -->
+          <div class="text-preview md-view" bind:this={textPreviewEl}>{@html renderPreviewHtml(previewContent, previewFile.name, previewFile.forcePlainText, previewFile.path)}</div>
         {/if}
       </div>
     {/if}
@@ -3436,6 +3530,30 @@
     margin-left: 12px;
   }
 
+  /* 上一个/下一个文件（列表快照翻页） */
+  .preview-file-nav {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    margin-right: 4px;
+  }
+  .preview-file-nav-btn {
+    font-size: 0.7rem;
+    padding: 2px 4px;
+    border-radius: 4px;
+    line-height: 1;
+  }
+  .preview-file-nav-btn:hover:not(:disabled) {
+    background: var(--bg-secondary);
+  }
+  .preview-file-nav-count {
+    font-size: 0.72rem;
+    color: var(--text-secondary, #888);
+    min-width: 34px;
+    text-align: center;
+    user-select: none;
+  }
+
   .preview-search-controls {
     display: flex;
     align-items: center;
@@ -3512,6 +3630,18 @@
     max-width: 100%;
     max-height: 100%;
     object-fit: contain;
+    /* margin:auto 保证放大超出容器时两侧/上下都可滚动到（flex 居中在溢出时会裁掉一侧） */
+    margin: auto;
+    cursor: zoom-in;
+  }
+
+  /* 双击放大态：短边贴合窗口，长边溢出滚动 */
+  .preview-content.preview-image-zoomed img {
+    max-width: none;
+    max-height: none;
+    /* 显式尺寸不被 flex 主轴收缩调整，保证短边精确贴合 */
+    flex-shrink: 0;
+    cursor: zoom-out;
   }
 
   .preview-content video {
@@ -3628,23 +3758,6 @@
     font-size: 0.88em;
     font-family: 'Fira Code', 'Consolas', monospace;
   }
-  .text-preview :global(.code-block) {
-    position: relative;
-    margin: 0.6em 0;
-  }
-  .text-preview :global(.code-block pre) {
-    background: var(--bg-tertiary, rgba(0,0,0,0.08));
-    padding: 0.8em 1em;
-    border-radius: 4px;
-    overflow-x: auto;
-    margin: 0;
-  }
-  .text-preview :global(.code-block pre code) {
-    background: none;
-    padding: 0;
-    font-size: 0.85em;
-    line-height: 1.5;
-  }
   .text-preview :global(blockquote) {
     margin: 0.5em 0;
     padding: 0.3em 0.8em;
@@ -3676,34 +3789,6 @@
   }
   .text-preview :global(strong) { font-weight: 600; }
   .text-preview :global(img) { max-width: 100%; border-radius: 4px; }
-
-  /* Syntax highlighting - dark theme */
-  .text-preview :global(.hl-keyword)   { color: #c792ea; }
-  .text-preview :global(.hl-string)    { color: #c3e88d; }
-  .text-preview :global(.hl-comment)   { color: #546e7a; font-style: italic; }
-  .text-preview :global(.hl-number)    { color: #f78c6c; }
-  .text-preview :global(.hl-boolean)   { color: #ff5874; }
-  .text-preview :global(.hl-null)      { color: #ff5874; }
-  .text-preview :global(.hl-key)       { color: #82aaff; }
-  .text-preview :global(.hl-variable)  { color: #f07178; }
-  .text-preview :global(.hl-type)      { color: #ffcb6b; }
-  .text-preview :global(.hl-decorator) { color: #ffcb6b; }
-  .text-preview :global(.hl-tag)       { color: #f07178; }
-  .text-preview :global(.hl-attribute) { color: #c792ea; }
-
-  /* Syntax highlighting - light theme */
-  :root[data-theme="light"] .text-preview :global(.hl-keyword)   { color: #7c3aed; }
-  :root[data-theme="light"] .text-preview :global(.hl-string)    { color: #16a34a; }
-  :root[data-theme="light"] .text-preview :global(.hl-comment)   { color: #6b7280; font-style: italic; }
-  :root[data-theme="light"] .text-preview :global(.hl-number)    { color: #c2410c; }
-  :root[data-theme="light"] .text-preview :global(.hl-boolean)   { color: #dc2626; }
-  :root[data-theme="light"] .text-preview :global(.hl-null)      { color: #dc2626; }
-  :root[data-theme="light"] .text-preview :global(.hl-key)       { color: #1d4ed8; }
-  :root[data-theme="light"] .text-preview :global(.hl-variable)  { color: #b45309; }
-  :root[data-theme="light"] .text-preview :global(.hl-type)      { color: #b45309; }
-  :root[data-theme="light"] .text-preview :global(.hl-decorator) { color: #b45309; }
-  :root[data-theme="light"] .text-preview :global(.hl-tag)       { color: #dc2626; }
-  :root[data-theme="light"] .text-preview :global(.hl-attribute) { color: #7c3aed; }
 
   .context-menu {
     position: fixed;

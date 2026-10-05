@@ -1,0 +1,179 @@
+/*
+ * Markdown 嵌入内容共享样式（唯一出处）
+ *
+ * 聊天消息容器（.markdown-content）与文件 MD 预览容器（.text-preview）
+ * 都挂 .md-view 类，本文件负责「共享渲染管道（lib/markdown.js）产出的
+ * 嵌入内容」样式：代码块/复制按钮/语法高亮/Mermaid 容器与工具栏/数学。
+ * 基础排版（h1-p-ul-a 等）因两种语境字号行高不同，仍留在各组件。
+ */
+
+/* ===== 代码块（markdown 内的围栏代码，非文件预览的整文件行号视图） ===== */
+.md-view .code-block {
+  position: relative;
+  margin: 0.6em 0;
+}
+.md-view .code-lang {
+  position: absolute;
+  bottom: 0;
+  right: 0;
+  padding: 2px 8px;
+  font-size: 0.7em;
+  color: var(--text-secondary, #888);
+  background: var(--bg-secondary, rgba(0, 0, 0, 0.15));
+  border-radius: 4px 0 4px 0;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  z-index: 1;
+}
+.md-view .code-block > .copy-btn {
+  position: absolute;
+  top: 0;
+  right: 0;
+  z-index: 1;
+}
+.md-view .code-block pre {
+  background: var(--bg-secondary, rgba(0, 0, 0, 0.08));
+  padding: 0.8em 1em;
+  border-radius: 4px;
+  overflow-x: auto;
+  margin: 0;
+}
+.md-view .code-block pre code {
+  background: none;
+  padding: 0;
+  font-size: 0.85em;
+  line-height: 1.5;
+}
+.md-view .copy-btn {
+  padding: 2px 8px;
+  font-size: 0.7em;
+  color: var(--text-secondary, #888);
+  background: var(--bg-secondary, rgba(0, 0, 0, 0.15));
+  border: none;
+  border-radius: 0 4px 0 4px;
+  cursor: pointer;
+  line-height: 1.4;
+  transition: color 0.1s, background 0.1s;
+}
+.md-view .copy-btn:hover {
+  color: var(--text, #333);
+  background: var(--border, rgba(0, 0, 0, 0.2));
+}
+.md-view .copy-btn:active {
+  background: var(--primary, #4a9eff);
+  color: #fff;
+}
+
+/* ===== 语法高亮 token 色（与 lib/highlight.js 产出的类一一对应） ===== */
+.md-view .hl-keyword   { color: #c792ea; }
+.md-view .hl-string    { color: #c3e88d; }
+.md-view .hl-comment   { color: #546e7a; font-style: italic; }
+.md-view .hl-number    { color: #f78c6c; }
+.md-view .hl-boolean   { color: #ff5874; }
+.md-view .hl-null      { color: #ff5874; }
+.md-view .hl-key       { color: #82aaff; }
+.md-view .hl-variable  { color: #f07178; }
+.md-view .hl-type      { color: #ffcb6b; }
+.md-view .hl-decorator { color: #ffcb6b; }
+.md-view .hl-tag       { color: #f07178; }
+.md-view .hl-attribute { color: #c792ea; }
+
+:root[data-theme='light'] .md-view .hl-keyword   { color: #7c3aed; }
+:root[data-theme='light'] .md-view .hl-string    { color: #16a34a; }
+:root[data-theme='light'] .md-view .hl-comment   { color: #6b7280; font-style: italic; }
+:root[data-theme='light'] .md-view .hl-number    { color: #c2410c; }
+:root[data-theme='light'] .md-view .hl-boolean   { color: #dc2626; }
+:root[data-theme='light'] .md-view .hl-null      { color: #dc2626; }
+:root[data-theme='light'] .md-view .hl-key       { color: #1d4ed8; }
+:root[data-theme='light'] .md-view .hl-variable  { color: #b45309; }
+:root[data-theme='light'] .md-view .hl-type      { color: #b45309; }
+:root[data-theme='light'] .md-view .hl-decorator { color: #b45309; }
+:root[data-theme='light'] .md-view .hl-tag       { color: #dc2626; }
+:root[data-theme='light'] .md-view .hl-attribute { color: #7c3aed; }
+
+/* ===== Mermaid 图表容器（占位符为 inline span，与 KaTeX 一致） ===== */
+.md-view .mermaid-pending,
+.md-view .mermaid-rendered {
+  display: block;
+  position: relative; /* 工具栏绝对定位的锚点 */
+  text-align: center;
+  padding: 0.6em 0;
+  overflow-x: auto;
+  white-space: pre;
+}
+.md-view .mermaid-rendered {
+  white-space: normal;
+}
+.md-view .mermaid-rendered svg {
+  max-width: 100%;
+  height: auto;
+}
+
+/* Mermaid 工具栏：放大/缩小 + 导出（悬停显示，避免长图视觉干扰） */
+.md-view .mermaid-toolbar {
+  position: absolute;
+  top: 0.35em;
+  right: 0.5em;
+  display: flex;
+  gap: 4px;
+  z-index: 2;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+.md-view .mermaid-pending:hover .mermaid-toolbar,
+.md-view .mermaid-rendered:hover .mermaid-toolbar,
+.md-view .mermaid-toolbar:focus-within {
+  opacity: 1;
+}
+.md-view .mermaid-tbtn {
+  padding: 2px 8px;
+  font-size: 0.72em;
+  line-height: 1.5;
+  color: var(--text-secondary, #888);
+  background: var(--bg-secondary, rgba(0, 0, 0, 0.06));
+  border: 1px solid var(--border, rgba(0, 0, 0, 0.1));
+  border-radius: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color 0.1s, background 0.1s;
+}
+.md-view .mermaid-tbtn:hover {
+  color: var(--text, #333);
+  background: var(--border, rgba(0, 0, 0, 0.12));
+}
+.md-view .mermaid-tbtn:active {
+  color: #fff;
+  background: var(--primary, #4a9eff);
+}
+.md-view .mermaid-error {
+  opacity: 0.7;
+}
+.md-view .mermaid-error::after {
+  content: ' ⚠';
+  color: #f78c6c;
+  font-size: 0.8em;
+}
+
+/* ===== 数学（KaTeX 按需 CDN，零打包体积） ===== */
+.md-view .math-display {
+  display: block;
+  margin: 0.6em 0;
+  padding: 0.15em 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  text-align: center;
+}
+.md-view .katex-display {
+  /* displayMode 默认输出 <div>，在 <p> 内是无效嵌套 → 改为 inline-block（样式仍由 KaTeX CSS 的 class 提供） */
+  display: inline-block;
+  margin: 0;
+  text-align: center;
+}
+.md-view .math-error {
+  opacity: 0.7;
+}
+.md-view .math-error::after {
+  content: ' ⚠';
+  color: #f78c6c;
+  font-size: 0.8em;
+}
