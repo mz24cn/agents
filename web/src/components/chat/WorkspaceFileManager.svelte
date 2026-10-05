@@ -1122,7 +1122,9 @@
     
     resetPreviewSearch()
     resetPreviewImageZoom()
-    previewReturnView = viewMode
+    // 只在首次打开时快照返回视图；预览内 ◀/▶ 导航时 viewMode 已是 'preview'，
+    // 若覆盖会把返回视图弄丢，关闭预览后列表区永久隐藏（viewMode 卡在 'preview'）
+    if (viewMode !== 'preview') previewReturnView = viewMode
     // 导航列表快照：当前可见列表中所有可预览的文件（目录列表或搜索结果）
     previewNavList = displayedFiles.filter(f => !f.is_dir && isPreviewable(f))
     previewFile = {
@@ -1160,7 +1162,8 @@
     
     resetPreviewSearch()
     resetPreviewImageZoom()
-    previewReturnView = viewMode
+    // 同 previewFileContent：仅在非预览态时快照返回视图，避免 ◀/▶ 导航后丢失
+    if (viewMode !== 'preview') previewReturnView = viewMode
     // 「按文本打开」模式下任何文件都可预览，导航列表取全部非目录文件
     previewNavList = displayedFiles.filter(f => !f.is_dir)
     previewFile = { ...file, is_text: true, is_image: false, is_audio: false, is_video: false, forcePlainText: true }
@@ -1323,11 +1326,14 @@
   }
 
   function closePreview() {
+    if (!previewFile) return // 无预览时不重置状态（enterDirectory 也会调用本函数）
     resetPreviewSearch()
     resetPreviewImageZoom()
     previewNavList = []
     cancelPreviewDownload()
     clearPreviewObjectUrl()
+    // 只在真正关闭预览时恢复进入预览前的视图；
+    // 若无条件执行，陈旧的 previewReturnView 会在目录导航时把当前 list/grid 视图覆盖掉
     viewMode = previewReturnView
     previewFile = null
     previewContent = ''
