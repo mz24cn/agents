@@ -450,26 +450,53 @@ class TestRemoteEnvsEndpoints:
         assert status == 400
         assert body["error"]
 
-    def test_add_persists_with_snapshot(self, server, tmp_path):
+    def test_add_persists_server_side_snapshot(self, server, tmp_path):
+        # add now probes the child server-side: the snapshot comes from the
+        # child's own hello, not from the request body.
+        with _real_child_server(tmp_path) as (child, _child_data):
+            status, hello = _request(child, "GET", "/v1/setup?op=hello")
+            assert status == 200
+            status, body = _request(server, "POST", "/v1/remote-envs", {
+                "url": f"http://127.0.0.1:{child.port}/v1/setup?token=tok&op=hello",
+            })
+            assert status == 200
+            envs = body["envs"]
+            assert len(envs) == 1
+            assert envs[0]["id"] == f"http://127.0.0.1:{child.port}"
+            # The stored URL keeps the token (and drops the per-request op).
+            assert envs[0]["url"] == f"http://127.0.0.1:{child.port}/v1/setup?token=tok"
+            # The snapshot reflects the child's real hello (not a client-supplied one).
+            assert envs[0]["frontend_build"] == hello["frontend_build"]
+            assert envs[0]["online"] is True
+            assert envs[0]["checked_at"]
+            on_disk = json.loads((tmp_path / "remote_envs.json").read_text(encoding="utf-8"))
+            assert on_disk == envs
+
+    def test_add_reports_child_auth(self, server, tmp_path):
+        # Child has auth enabled but the URL carries no token: the server-side
+        # probe is rejected and the environment is NOT recorded.
+        with _real_child_server(tmp_path, name="child_auth_add") as (child, _child_data):
+            _wait_child_hello(child)
+            status, config = _request(child, "POST", "/v1/auth/config", {"password": "child-pass"})
+            assert status == 200
+            assert config.get("setup_token", "")
+            status, body = _request(server, "POST", "/v1/remote-envs", {
+                "url": f"http://127.0.0.1:{child.port}/v1/setup",
+            })
+            assert status == 400
+            assert body["error"] == "child_auth"
+            # Nothing was persisted (the probe failed).
+            status, listing = _request(server, "GET", "/v1/remote-envs")
+            assert status == 200
+            assert listing["envs"] == []
+
+    def test_add_unreachable_child(self, server):
+        # A child the server cannot route to: add reports child_unreachable.
         status, body = _request(server, "POST", "/v1/remote-envs", {
-            "url": "http://172.28.70.13:7988/v1/setup?token=tok&op=hello",
-            "snapshot": {
-                "frontend_build": "250908_120000",
-                "backend_build": "250908_120000",
-                "last_config": "",
-                "inference_active": True,
-            },
+            "url": "http://127.0.0.1:1/v1/setup",
         })
-        assert status == 200
-        envs = body["envs"]
-        assert len(envs) == 1
-        assert envs[0]["id"] == "http://172.28.70.13:7988"
-        # The stored URL keeps the token (and drops the per-request op).
-        assert envs[0]["url"] == "http://172.28.70.13:7988/v1/setup?token=tok"
-        assert envs[0]["frontend_build"] == "250908_120000"
-        assert envs[0]["inference_active"] is True
-        on_disk = json.loads((tmp_path / "remote_envs.json").read_text(encoding="utf-8"))
-        assert on_disk == envs
+        assert status == 502
+        assert body["error"] == "child_unreachable"
 
     def test_hello_reports_app_metadata_and_platform(self, server):
         # hello carries the environment's app identity (env.json) and the
@@ -498,43 +525,38 @@ class TestRemoteEnvsEndpoints:
         assert body["app_logo"] == ""
         assert body["arch"] and body["os"]
 
-    def test_add_upserts_same_host(self, server):
-        _request(server, "POST", "/v1/remote-envs", {"url": "http://10.0.0.5:7988/"})
-        status, body = _request(server, "POST", "/v1/remote-envs", {
-            "url": "http://10.0.0.5:7988/v1/setup?token=x",
-            "snapshot": {"frontend_build": "v2"},
-        })
-        assert status == 200
-        assert len(body["envs"]) == 1
-        assert body["envs"][0]["frontend_build"] == "v2"
+    def test_add_upserts_same_host(self, server, tmp_path):
+        # Adding the same host twice (reachable child) keeps a single record;
+        # the URL (token) is refreshed, the snapshot is re-probed.
+        with _real_child_server(tmp_path) as (child, _child_data):
+            url = f"http://127.0.0.1:{child.port}/v1/setup"
+            status, _ = _request(server, "POST", "/v1/remote-envs", {"url": url})
+            assert status == 200
+            status, body = _request(server, "POST", "/v1/remote-envs", {
+                "url": f"{url}?token=x",
+            })
+            assert status == 200
+            assert len(body["envs"]) == 1
+            assert body["envs"][0]["url"] == f"{url}?token=x"
+            assert body["envs"][0]["frontend_build"]
 
-    def test_update_snapshot(self, server):
-        _request(server, "POST", "/v1/remote-envs", {"url": "http://10.0.0.5:7988/"})
+    def test_update_snapshot(self, server, tmp_path):
+        env_id = _seed_env(server, "http://10.0.0.5:7988", "http://10.0.0.5:7988/")
         status, body = _request(
-            server, "PUT", "/v1/remote-envs/http://10.0.0.5:7988",
+            server, "PUT", f"/v1/remote-envs/{env_id}",
             {"snapshot": {"backend_build": "b9", "inference_active": False}},
         )
         assert status == 200
         assert body["envs"][0]["backend_build"] == "b9"
         assert body["envs"][0]["inference_active"] is False
 
-    def test_add_persists_online(self, server):
-        status, body = _request(server, "POST", "/v1/remote-envs", {
-            "url": "http://10.0.0.5:7988/",
-            "snapshot": {"frontend_build": "v1"},
-            "online": True,
-        })
-        assert status == 200
-        assert body["envs"][0]["online"] is True
-
-    def test_update_online_only_keeps_snapshot(self, server):
-        _request(server, "POST", "/v1/remote-envs", {
-            "url": "http://10.0.0.5:7988/",
-            "snapshot": {"backend_build": "b1"},
-            "online": True,
-        })
+    def test_update_online_only_keeps_snapshot(self, server, tmp_path):
+        env_id = _seed_env(
+            server, "http://10.0.0.5:7988", "http://10.0.0.5:7988/",
+            snapshot={"backend_build": "b1"}, online=True,
+        )
         status, body = _request(
-            server, "PUT", "/v1/remote-envs/http://10.0.0.5:7988",
+            server, "PUT", f"/v1/remote-envs/{env_id}",
             {"online": False},
         )
         assert status == 200
@@ -542,20 +564,19 @@ class TestRemoteEnvsEndpoints:
         # 只回写在线状态时版本快照不清空
         assert body["envs"][0]["backend_build"] == "b1"
 
-    def test_update_snapshot_and_online(self, server):
-        _request(server, "POST", "/v1/remote-envs", {"url": "http://10.0.0.5:7988/"})
+    def test_update_snapshot_and_online(self, server, tmp_path):
+        env_id = _seed_env(server, "http://10.0.0.5:7988", "http://10.0.0.5:7988/")
         status, body = _request(
-            server, "PUT", "/v1/remote-envs/http://10.0.0.5:7988",
+            server, "PUT", f"/v1/remote-envs/{env_id}",
             {"snapshot": {"backend_build": "b9"}, "online": True},
         )
         assert status == 200
         assert body["envs"][0]["backend_build"] == "b9"
         assert body["envs"][0]["online"] is True
 
-    def test_update_snapshot_requires_body(self, server):
-
-        _request(server, "POST", "/v1/remote-envs", {"url": "http://10.0.0.5:7988/"})
-        status, _ = _request(server, "PUT", "/v1/remote-envs/http://10.0.0.5:7988", {})
+    def test_update_snapshot_requires_body(self, server, tmp_path):
+        env_id = _seed_env(server, "http://10.0.0.5:7988", "http://10.0.0.5:7988/")
+        status, _ = _request(server, "PUT", f"/v1/remote-envs/{env_id}", {})
         assert status == 400
 
     def test_update_snapshot_missing(self, server):
@@ -565,12 +586,12 @@ class TestRemoteEnvsEndpoints:
         )
         assert status == 404
 
-    def test_delete(self, server):
-        _request(server, "POST", "/v1/remote-envs", {"url": "http://10.0.0.5:7988/"})
-        status, body = _request(server, "DELETE", "/v1/remote-envs/http://10.0.0.5:7988")
+    def test_delete(self, server, tmp_path):
+        env_id = _seed_env(server, "http://10.0.0.5:7988", "http://10.0.0.5:7988/")
+        status, body = _request(server, "DELETE", f"/v1/remote-envs/{env_id}")
         assert status == 200
         assert body == {"envs": []}
-        status, _ = _request(server, "DELETE", "/v1/remote-envs/http://10.0.0.5:7988")
+        status, _ = _request(server, "DELETE", f"/v1/remote-envs/{env_id}")
         assert status == 404
 
 
@@ -611,6 +632,63 @@ class TestSetupUpdateSourceFallback:
         status, body = _request(server, "GET", f"/v1/setup?{query}")
         assert status == 400
         assert "source" in body["error"]
+
+
+# ---------------------------------------------------------------------------
+# op=source-hello: server-side hello probe of an update source
+# ---------------------------------------------------------------------------
+
+
+class TestSetupSourceHello:
+    def test_returns_remote_and_local(self, server, tmp_path):
+        # A reachable source: the probe runs server-side and the response
+        # carries both the remote snapshot and this environment's local
+        # versions, so the check-update card needs a single request.
+        with _real_child_server(tmp_path) as (child, _child_data):
+            source = f"http://127.0.0.1:{child.port}/v1/setup"
+            query = urllib.parse.urlencode({"op": "source-hello", "source": source})
+            status, body = _request(server, "GET", f"/v1/setup?{query}")
+            assert status == 200
+            assert "frontend_build" in body["remote"]
+            assert "backend_build" in body["remote"]
+            assert "frontend_build" in body["local"]
+            assert "backend_build" in body["local"]
+            assert "last_config" in body["local"]
+            assert isinstance(body["local"]["inference_active"], bool)
+
+    def test_missing_source(self, server):
+        status, body = _request(server, "GET", "/v1/setup?op=source-hello")
+        assert status == 400
+        assert "source" in body["error"]
+
+    def test_invalid_source(self, server):
+        query = urllib.parse.urlencode({"op": "source-hello", "source": "nope"})
+        status, body = _request(server, "GET", f"/v1/setup?{query}")
+        assert status == 400
+        assert body["error"]
+
+    def test_unreachable_source(self, server):
+        query = urllib.parse.urlencode(
+            {"op": "source-hello", "source": "http://127.0.0.1:1/v1/setup"})
+        status, body = _request(server, "GET", f"/v1/setup?{query}")
+        assert status == 502
+        assert body["error"] == "source_unreachable"
+
+    def test_source_auth_rejected(self, server, tmp_path):
+        # The source has authorization enabled and the check carries no
+        # token: it is reported as source_auth (not source_unreachable).
+        with _real_child_server(tmp_path, name="child_source_auth") as (child, _child_data):
+            _wait_child_hello(child)
+            status, config = _request(
+                child, "POST", "/v1/auth/config", {"password": "child-pass"},
+            )
+            assert status == 200
+            assert config.get("setup_token", "")
+            query = urllib.parse.urlencode(
+                {"op": "source-hello", "source": f"http://127.0.0.1:{child.port}/v1/setup"})
+            status, body = _request(server, "GET", f"/v1/setup?{query}")
+            assert status == 400
+            assert body["error"] == "source_auth"
 
 
 # ---------------------------------------------------------------------------
@@ -1035,6 +1113,16 @@ def _add_env(server, url):
     return body["envs"][0]["id"]
 
 
+def _seed_env(server, env_id, url, snapshot=None, online=None):
+    """Record an environment directly (bypassing the server-side hello probe).
+
+    add() now requires a reachable child, so tests that only exercise the
+    snapshot/online/delete bookkeeping seed the store through the manager.
+    """
+    server._remote_env_manager.upsert(url, snapshot=snapshot, online=online)
+    return env_id
+
+
 @contextlib.contextmanager
 def _real_child_server(tmp_path, name="child_data"):
     """Start a second real RuntimeHTTPServer (isolated data dir) as the child."""
@@ -1175,11 +1263,11 @@ class TestRemoteEnvPushUpdate:
             assert result["method"] == "push"
             assert (child_data / "models.json").read_text(encoding="utf-8") == "[]"
 
-    def test_auth_enabled_child_without_token_reports_child_auth(self, server, tmp_path):
-        # The child has auth enabled but the parent registered a bare URL
-        # (no ?token=...): the hello probe is rejected and the parent reports
-        # child_auth (not child_unreachable), so the user knows to re-register
-        # the environment with the full setup link.
+    def test_bare_url_child_reports_child_auth(self, server, tmp_path):
+        # A record registered without ?token=... against an auth-enabled child
+        # (e.g. added before auth was enabled): the push probe is rejected and
+        # the parent reports child_auth (not child_unreachable), so the user
+        # knows to re-register the environment with the full setup link.
         with _real_child_server(tmp_path, name="child_data_auth") as (child, _child_data):
             _wait_child_hello(child)
             status, config = _request(
@@ -1188,7 +1276,12 @@ class TestRemoteEnvPushUpdate:
             assert status == 200
             assert config.get("setup_token", "")
 
-            env_id = _add_env(server, f"http://127.0.0.1:{child.port}/v1/setup")
+            # add() itself would now refuse this URL (child_auth); seed the
+            # pre-existing record directly to exercise the push-time path.
+            env_id = _seed_env(
+                server, f"http://127.0.0.1:{child.port}",
+                f"http://127.0.0.1:{child.port}/v1/setup",
+            )
             status, result = _request(
                 server, "POST", f"/v1/remote-envs/{env_id}/push-update",
             )
@@ -1218,8 +1311,9 @@ class TestRemoteEnvPushUpdate:
         finally:
             child.stop()
 
-    def test_child_unreachable(self, server):
-        env_id = _add_env(server, "http://127.0.0.1:1/v1/setup")
+    def test_child_unreachable(self, server, tmp_path):
+        # The recorded child is down: push reports child_unreachable.
+        env_id = _seed_env(server, "http://127.0.0.1:1", "http://127.0.0.1:1/v1/setup")
         status, result = _request(
             server, "POST", f"/v1/remote-envs/{env_id}/push-update",
         )

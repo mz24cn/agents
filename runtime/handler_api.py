@@ -13,6 +13,7 @@ Zero third-party dependencies — only Python standard library.
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import json
 import logging
@@ -45,6 +46,10 @@ from runtime.remote_env_manager import (
 )
 from runtime.skill_manager import SkillManager
 from runtime.tunnel_protocol import is_tunnel_env_id
+
+
+class _SetupHelloAuthError(Exception):
+    """A server-side /v1/setup?op=hello probe was rejected (401/403)."""
 
 _SERVER_STARTED_AT = datetime.datetime.now(datetime.timezone.utc).isoformat()
 _SERVER_INSTANCE_ID = uuid.uuid4().hex
@@ -924,6 +929,61 @@ class HandlerApiMixin:
                     env["online"] = tunnel_manager.is_online(env_id)
         self._send_json_response(200, {"envs": envs})
 
+    def _remote_setup_request(
+        self,
+        url: str,
+        method: str,
+        body: bytes | None,
+        content_type: str,
+        env_id: str | None = None,
+        timeout: int = 60,
+    ) -> tuple[int, bytes]:
+        """Issue an HTTP request against a remote environment's /v1/setup.
+
+        Tunnel environments are reached through the (parent's) tunnel manager;
+        everything else is requested directly from the backend process.  The
+        browser never needs to reach the child: it may sit on a network only
+        the server can route to.
+        """
+        if is_tunnel_env_id(env_id):
+            manager = getattr(self.server, "tunnel_manager", None)
+            if manager is None or not manager.is_online(env_id):
+                raise RuntimeError(
+                    "child tunnel is offline: it is not connected to this environment")
+            headers = {"Content-Type": content_type} if content_type else {}
+            status, _headers, data = manager.call_env(
+                env_id, method, url, headers=headers, body=body, timeout=timeout)
+            return int(status), bytes(data or b"")
+        try:
+            request = urllib.request.Request(url, data=body, method=method)
+            if body is not None:
+                request.add_header("Content-Type", content_type)
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return int(response.status), response.read()
+        except urllib.error.HTTPError as exc:
+            return int(exc.code), exc.read()
+
+    def _setup_hello_probe(self, hello_url: str, env_id: str | None = None) -> dict:
+        """Server-side /v1/setup?op=hello probe; returns the hello snapshot.
+
+        Raises _SetupHelloAuthError on 401/403 (child-side authorization
+        failed, e.g. missing ?token=) and RuntimeError when the child cannot
+        be reached or answered non-JSON.
+        """
+        status, data = self._remote_setup_request(hello_url, "GET", None, "",
+                                                  env_id=env_id, timeout=15)
+        if status in (401, 403):
+            raise _SetupHelloAuthError(f"child returned HTTP {status}")
+        if status != 200:
+            raise RuntimeError(f"child returned HTTP {status}")
+        try:
+            hello = json.loads(data.decode("utf-8", errors="replace"))
+        except ValueError:
+            raise RuntimeError("child returned non-JSON")
+        if not isinstance(hello, dict):
+            raise RuntimeError("child returned invalid JSON")
+        return hello
+
     def _handle_remote_envs_add(self) -> None:
         """POST /v1/remote-envs — 新增（或更新）一条远程环境记录。
 
@@ -931,11 +991,11 @@ class HandlerApiMixin:
             url (str, 必填): 环境地址，形态与 SETUP_SOURCE 相同
                 （http://host:7988/、http://host:7988/v1/setup、
                 http://host:7988/v1/setup?token=...）。
-            snapshot (dict, 可选): 前端查询目标环境 op=hello 的响应，
-                作为版本/推理状态快照一并落盘。
-            online (bool, 可选): 状态检查时的可达性（hello 成功即为 true），
-                与快照一并落盘。
+            snapshot (dict, 可选): 保留的兼容字段；服务端会自行向目标
+                环境发起 op=hello 探测，并以探测响应的快照为准落盘。
 
+        服务端探测成功后才落盘，并记录 online=true 与检查时间；
+        探测失败（授权被拒 / 不可达）时不记录，前端无需再做跨域请求。
         环境按 scheme://netloc 去重：重复添加同一地址时更新其
         URL 与快照，不会产生重复记录。
         """
@@ -947,23 +1007,39 @@ class HandlerApiMixin:
             self._send_json_error(400, "Missing required field: url")
             return
         try:
-            normalize_setup_url(url)
+            normalized = normalize_setup_url(url)
         except ValueError as exc:
             self._send_json_error(400, str(exc))
             return
-        snapshot = body.get("snapshot")
-        if not isinstance(snapshot, dict):
-            snapshot = None
-        online = body.get("online")
-        if not isinstance(online, bool):
-            online = None
+        env_id = normalized["id"]
+        # Server-side probe: the browser may not reach the child (CORS or a
+        # server-only route), so the backend does the hello itself and only
+        # persists a record once the child answered.
+        try:
+            hello = self._setup_hello_probe(
+                build_setup_request_url(url, {"op": "hello"}), env_id=env_id)
+        except _SetupHelloAuthError:
+            self._send_json_response(400, {
+                "error": "child_auth",
+                "message": "The environment rejected the check: it has "
+                           "authorization enabled. Add it with its full "
+                           "setup link (with ?token=...).",
+            })
+            return
+        except Exception as exc:
+            self._send_json_response(502, {
+                "error": "child_unreachable",
+                "message": f"Cannot reach the environment: {exc}",
+            })
+            return
+        snapshot = snapshot_from_hello(hello)
         manager = self.server.remote_env_manager  # type: ignore[attr-defined]
         try:
-            envs = manager.upsert(url, snapshot, online)
+            envs = manager.upsert(url, snapshot, True)
         except (OSError, ValueError) as exc:
             self._send_json_error(500, f"Failed to write remote_envs.json: {exc}")
             return
-        self._send_json_response(200, {"envs": envs})
+        self._send_json_response(200, {"envs": envs, "snapshot": snapshot})
 
     def _handle_remote_envs_update(self, env_id: str) -> None:
         """PUT /v1/remote-envs/{id} — 刷新/更新完成后回写该环境的版本快照与在线状态。
@@ -1050,65 +1126,28 @@ class HandlerApiMixin:
 
         # 1. 子环境当前版本。直连：token 保留在登记 URL 中随请求携带；
         #    隧道：经 TunnelManager 走子端反向隧道（子端自鉴权）。
-        if is_tunnel:
-            if tunnel_manager is None or not tunnel_manager.is_online(env_id):
-                self._send_json_response(502, {
-                    "error": "child_unreachable",
-                    "message": "Child tunnel is offline: it is not connected "
-                               "to this environment.",
-                })
-                return
-            try:
-                status, _h, raw = tunnel_manager.call_env(
-                    env_id, "GET", "/v1/setup?op=hello", {}, None, timeout=60,
-                )
-            except Exception as exc:
-                self._send_json_response(502, {
-                    "error": "child_unreachable",
-                    "message": f"Cannot reach child environment over tunnel: {exc}",
-                })
-                return
-            child_body = _json_or_empty(raw)
-            if status in (401, 403):
-                self._send_json_response(400, {
-                    "error": "child_auth",
-                    "message": "Child environment rejected the status check "
-                               "over the tunnel (it should self-authorize; "
-                               "check that its authorization state is sane).",
-                })
-                return
-            if status != 200:
-                self._send_child_error(status, child_body)
-                return
-            try:
-                child_data = json.loads(raw)
-            except (ValueError, UnicodeDecodeError):
-                child_data = {}
-        else:
-            hello_url = build_setup_request_url(env_url, {"op": "hello"})
-            try:
-                with urllib.request.urlopen(hello_url, timeout=30) as resp:
-                    child_data = json.loads(resp.read())
-            except urllib.error.HTTPError as exc:
-                child_body = _json_or_empty(exc.read())
-                if exc.code in (401, 403):
-                    # 子环境启用了授权，但登记的 URL 没有携带有效 token
-                    #（hello 不再是公共端点，与其他接口一致）。
-                    self._send_json_response(400, {
-                        "error": "child_auth",
-                        "message": "Child environment rejected the status check: "
-                                   "it has authorization enabled. Re-add it with "
-                                   "its full setup link (with ?token=...).",
-                    })
-                    return
-                self._send_child_error(exc.code, child_body)
-                return
-            except Exception as exc:
-                self._send_json_response(502, {
-                    "error": "child_unreachable",
-                    "message": f"Cannot reach child environment: {exc}",
-                })
-                return
+        hello_url = (
+            "/v1/setup?op=hello" if is_tunnel
+            else build_setup_request_url(env_url, {"op": "hello"})
+        )
+        try:
+            child_data = self._setup_hello_probe(hello_url, env_id=env_id)
+        except _SetupHelloAuthError:
+            self._mark_remote_env_offline(manager, env_id, is_tunnel)
+            self._send_json_response(400, {
+                "error": "child_auth",
+                "message": "Child environment rejected the status check: it has "
+                           "authorization enabled. Re-add it with its full setup "
+                           "link (with ?token=...).",
+            })
+            return
+        except Exception as exc:
+            self._mark_remote_env_offline(manager, env_id, is_tunnel)
+            self._send_json_response(502, {
+                "error": "child_unreachable",
+                "message": f"Cannot reach child environment: {exc}",
+            })
+            return
         remote = snapshot_from_hello(child_data)
         remote_versions = {
             key: remote.get(key, "") for key in ("frontend_build", "backend_build", "last_config")
@@ -1288,63 +1327,47 @@ class HandlerApiMixin:
             self._send_json_error(404, f"Remote environment not found: {env_id}")
             return
         is_tunnel = is_tunnel_env_id(env_id)
+        hello_url = (
+            "/v1/setup?op=hello" if is_tunnel
+            else build_setup_request_url(str(env.get("url", "")), {"op": "hello"})
+        )
         try:
-            if is_tunnel:
-                tunnel_manager = getattr(self.server, "tunnel_manager", None)
-                if tunnel_manager is None or not tunnel_manager.is_online(env_id):
-                    self._send_json_response(502, {
-                        "error": "child_unreachable",
-                        "message": "Child tunnel is offline: it is not connected "
-                                   "to this environment.",
-                    })
-                    return
-                status, _h, raw = tunnel_manager.call_env(
-                    env_id, "GET", "/v1/setup?op=hello", {}, None, timeout=60,
-                )
-                child_body = _json_or_empty(raw)
-                if status in (401, 403):
-                    self._send_json_response(400, {
-                        "error": "child_auth",
-                        "message": "Child environment rejected the status check "
-                                   "over the tunnel (it should self-authorize; "
-                                   "check that its authorization state is sane).",
-                    })
-                    return
-                if status != 200:
-                    self._send_child_error(status, child_body)
-                    return
-            else:
-                hello_url = build_setup_request_url(str(env.get("url", "")), {"op": "hello"})
-                with urllib.request.urlopen(hello_url, timeout=30) as resp:
-                    raw = resp.read()
-        except urllib.error.HTTPError as exc:
-            child_body = _json_or_empty(exc.read())
-            if exc.code in (401, 403):
-                self._send_json_response(400, {
-                    "error": "child_auth",
-                    "message": "Child environment rejected the status check: it has "
-                               "authorization enabled. Re-add it with its full setup "
-                               "link (with ?token=...).",
-                })
-                return
-            self._send_child_error(exc.code, child_body)
+            child_data = self._setup_hello_probe(hello_url, env_id=env_id)
+        except _SetupHelloAuthError:
+            self._mark_remote_env_offline(manager, env_id, is_tunnel)
+            self._send_json_response(400, {
+                "error": "child_auth",
+                "message": "Child environment rejected the status check: it has "
+                           "authorization enabled. Re-add it with its full setup "
+                           "link (with ?token=...).",
+            })
             return
         except Exception as exc:
+            self._mark_remote_env_offline(manager, env_id, is_tunnel)
             self._send_json_response(502, {
                 "error": "child_unreachable",
                 "message": f"Cannot reach child environment: {exc}",
             })
             return
-        try:
-            child_data = json.loads(raw)
-        except (ValueError, UnicodeDecodeError):
-            child_data = {}
         snapshot = snapshot_from_hello(child_data)
         # hello 成功即环境可达：直连环境把在线状态随快照一并落盘
         # （隧道环境的在线状态由隧道 attach/detach 事件驱动写入 online / last_seen）
         online = None if is_tunnel else True
         envs = manager.update_snapshot(env_id, snapshot, online)
         self._send_json_response(200, {"ok": True, "snapshot": snapshot, "envs": envs})
+
+    @staticmethod
+    def _mark_remote_env_offline(manager, env_id: str, is_tunnel: bool) -> None:
+        """Persist the failed check (online=false) so the list shows it.
+
+        Tunnel environments derive their online state from tunnel attach/detach
+        events, so only direct environments are flipped here.  Best effort: a
+        bookkeeping failure must not hide the probe result.
+        """
+        if is_tunnel:
+            return
+        with contextlib.suppress(Exception):
+            manager.update_snapshot(env_id, None, False)
 
     # ------------------------------------------------------------------
     # Env handlers
@@ -1425,6 +1448,9 @@ class HandlerApiMixin:
         Operations:
           GET  op=hello   Version and inference status query (normal authorization).
           GET  op=delta   Authorized minimal tar.gz delta using three version thresholds.
+          GET  op=source-hello  Authorized: server-side hello probe of an update
+                                source URL (source query param) with local
+                                versions attached.
           GET  op=update           Authorized: download remote delta and apply it locally.
           POST op=push    Authorized: apply a delta tar pushed by the parent environment.
           GET  op=restart_backend  Authorized: restart the backend without updating files.
@@ -1477,6 +1503,10 @@ class HandlerApiMixin:
 
         if op == "update":
             self._handle_setup_update()
+            return
+
+        if op == "source-hello":
+            self._handle_setup_source_hello()
             return
 
         if op == "push":
@@ -1600,6 +1630,55 @@ class HandlerApiMixin:
         timer = threading.Timer(0.5, restart_process)
         timer.daemon = True
         timer.start()
+
+    def _handle_setup_source_hello(self) -> None:
+        """GET /v1/setup?op=source-hello&source=... — 服务端代理的更新源探活。
+
+        客户端可能无法直连更新源（CORS、仅服务端可路由的内网地址等），
+        所以由后端自行请求源的 ``/v1/setup?op=hello``，并一并返回本环境
+        的本地版本，前端直接做版本比较。错误契约与远程环境 hello 一致：
+        400 ``source_auth``（源端拒绝授权）/ 502 ``source_unreachable``。
+        """
+        if self.command != "GET":
+            self._send_json_error(405, "op=source-hello requires GET")
+            return
+        source = str(self._get_query_param("source", "")).strip()
+        if not source:
+            self._send_json_error(400, "Missing required field: source")
+            return
+        try:
+            hello_url = build_setup_request_url(source, {"op": "hello"})
+        except ValueError as exc:
+            self._send_json_error(400, f"Invalid source URL: {exc}")
+            return
+        try:
+            hello = self._setup_hello_probe(hello_url)
+        except _SetupHelloAuthError:
+            self._send_json_response(400, {
+                "error": "source_auth",
+                "message": "Update source rejected the check: it has authorization "
+                           "enabled. Re-save it with its full setup link "
+                           "(with ?token=...).",
+            })
+            return
+        except Exception as exc:
+            self._send_json_response(502, {
+                "error": "source_unreachable",
+                "message": f"Cannot reach update source: {exc}",
+            })
+            return
+        local = dict(self._local_setup_versions())
+        # 与 op=hello 相同的推理状态字段，让检查更新的 UI 一次请求拿全
+        # 版本基线与推理占用。
+        local["inference_active"] = bool(getattr(self.server, "active_streams", {})) or bool(
+            int(getattr(self.server, "active_inference_count", 0) or 0)
+        )
+        local["api_inference_active"] = bool(int(getattr(self.server, "active_api_inference_count", 0) or 0))
+        local["session_inference_active"] = bool(getattr(self.server, "active_streams", {}))
+        self._send_json_response(200, {
+            "remote": snapshot_from_hello(hello),
+            "local": local,
+        })
 
     def _handle_setup_update(self) -> None:
         """Download a remote setup delta and apply it to the local environment."""

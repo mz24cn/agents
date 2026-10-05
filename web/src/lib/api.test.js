@@ -3,7 +3,7 @@
  * Validates: Requirements 6.1–6.6, 4.1, 5.5, 5.6
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { env, sessions, subscribeSessionStream, subscribeSessionEvents, __resetSessionEventsHubForTests, remoteEnv, buildSetupRequestUrl, extractSetupSnapshot, fetchRemoteJson, remoteEnvHomeUrl, isRemoteLogoImage, resolveRemoteEnvLogo, tools } from './api.js'
+import { env, sessions, subscribeSessionStream, subscribeSessionEvents, __resetSessionEventsHubForTests, remoteEnv, remoteEnvHomeUrl, isRemoteLogoImage, resolveRemoteEnvLogo, tools, build } from './api.js'
 
 // ---------------------------------------------------------------------------
 // Helper: create a mock fetch that returns the given data with the given status
@@ -613,28 +613,16 @@ describe('remoteEnv', () => {
     expect(result).toEqual({ envs: [] })
   })
 
-  it('add: POST /v1/remote-envs with url and snapshot', async () => {
+  it('add: POST /v1/remote-envs with the url only (backend probes hello)', async () => {
     vi.stubGlobal('fetch', mockFetch({ envs: [] }))
-    const snapshot = { frontend_build: '250908_120000', inference_active: true }
 
-    await remoteEnv.add('http://172.28.70.13:7988/v1/setup?token=tok', snapshot)
+    await remoteEnv.add('http://172.28.70.13:7988/v1/setup?token=tok')
 
     const [url, opts] = fetch.mock.calls[0]
     expect(url).toBe('/v1/remote-envs')
     expect(opts.method).toBe('POST')
     expect(JSON.parse(opts.body)).toEqual({
       url: 'http://172.28.70.13:7988/v1/setup?token=tok',
-      snapshot,
-    })
-  })
-
-  it('add: omits the snapshot key when null', async () => {
-    vi.stubGlobal('fetch', mockFetch({ envs: [] }))
-
-    await remoteEnv.add('http://172.28.70.13:7988/', null)
-
-    expect(JSON.parse(fetch.mock.calls[0][1].body)).toEqual({
-      url: 'http://172.28.70.13:7988/',
     })
   })
 
@@ -696,83 +684,6 @@ describe('remoteEnv', () => {
   })
 
 })
-
-// ---------------------------------------------------------------------------
-// buildSetupRequestUrl — SETUP_SOURCE-style URL normalization
-// ---------------------------------------------------------------------------
-
-describe('buildSetupRequestUrl', () => {
-  it('normalizes a bare host URL for hello', () => {
-    expect(buildSetupRequestUrl('http://172.28.70.13:7988/', { op: 'hello' }))
-      .toBe('http://172.28.70.13:7988/v1/setup?op=hello')
-  })
-
-  it('keeps the /v1/setup path and token, replaces op', () => {
-    const url = buildSetupRequestUrl(
-      'http://172.28.70.13:7988/v1/setup?token=tok&op=hello',
-      { op: 'update' },
-    )
-    expect(url).toBe('http://172.28.70.13:7988/v1/setup?token=tok&op=update')
-  })
-
-  it('truncates a path that continues past /v1/setup', () => {
-    const url = buildSetupRequestUrl('https://a.b.com:8443/sub/v1/setup/', { op: 'hello' })
-    expect(url).toBe('https://a.b.com:8443/sub/v1/setup?op=hello')
-  })
-
-  it('carries update parameters with an encoded source', () => {
-    const url = buildSetupRequestUrl('http://child:7988/v1/setup?token=c', {
-      op: 'update',
-      source: 'http://parent:7988/v1/setup?token=p',
-      frontend_build: '',
-      backend_build: '250908_120000',
-      last_config: '',
-    })
-    const parsed = new URL(url)
-    expect(parsed.searchParams.get('op')).toBe('update')
-    expect(parsed.searchParams.get('token')).toBe('c')
-    expect(parsed.searchParams.get('source')).toBe('http://parent:7988/v1/setup?token=p')
-    expect(parsed.searchParams.get('frontend_build')).toBe('')
-    expect(parsed.searchParams.get('backend_build')).toBe('250908_120000')
-  })
-
-  it('throws on an invalid URL', () => {
-    expect(() => buildSetupRequestUrl('not a url', { op: 'hello' })).toThrow()
-  })
-})
-
-// ---------------------------------------------------------------------------
-// extractSetupSnapshot — hello response → displayable snapshot
-// ---------------------------------------------------------------------------
-
-describe('extractSetupSnapshot', () => {
-  it('extracts version and inference fields', () => {
-    expect(extractSetupSnapshot({
-      frontend_build: 'f', backend_build: 'b', last_config: 'c',
-      server_instance_id: 'sid',
-      inference_active: true, api_inference_active: false,
-      session_inference_active: true, extra: 'ignored',
-      app_title: 'Demo', app_logo: '/logo.png', arch: 'x86_64', os: 'linux',
-    })).toEqual({
-      frontend_build: 'f', backend_build: 'b', last_config: 'c',
-      server_instance_id: 'sid',
-      inference_active: true, api_inference_active: false,
-      session_inference_active: true,
-      app_title: 'Demo', app_logo: '/logo.png', arch: 'x86_64', os: 'linux',
-    })
-  })
-
-  it('defaults to empty snapshot for missing data', () => {
-    expect(extractSetupSnapshot(null)).toEqual({
-      frontend_build: '', backend_build: '', last_config: '',
-      server_instance_id: '',
-      inference_active: false, api_inference_active: false,
-      session_inference_active: false,
-      app_title: '', app_logo: '', arch: '', os: '',
-    })
-  })
-})
-
 
 // ---------------------------------------------------------------------------
 // remoteEnvHomeUrl / isRemoteLogoImage / resolveRemoteEnvLogo
@@ -842,28 +753,20 @@ describe('resolveRemoteEnvLogo', () => {
 })
 
 // ---------------------------------------------------------------------------
-// fetchRemoteJson — cross-origin JSON request to a remote environment
+// build.checkSource — server-side update-source probe (op=source-hello)
 // ---------------------------------------------------------------------------
 
-describe('fetchRemoteJson', () => {
-  it('resolves the JSON body on 200', async () => {
-    vi.stubGlobal('fetch', mockFetch({ frontend_build: 'x' }))
-    await expect(fetchRemoteJson('http://child:7988/v1/setup?op=hello'))
-      .resolves.toEqual({ frontend_build: 'x' })
-  })
+describe('build.checkSource', () => {
+  it('GETs /v1/setup with op=source-hello and an encoded source', async () => {
+    vi.stubGlobal('fetch', mockFetch({ remote: {}, local: {} }))
 
-  it('throws with status and code on non-2xx', async () => {
-    vi.stubGlobal('fetch', mockFetch({ error: 'inference_active', message: 'Cannot update' }, 409))
-    const err = await fetchRemoteJson('http://child:7988/v1/setup?op=update').catch((e) => e)
-    expect(err).toBeInstanceOf(Error)
-    expect(err.status).toBe(409)
-    expect(err.code).toBe('inference_active')
-    expect(err.message).toBe('Cannot update')
-  })
+    const result = await build.checkSource('http://parent:7988/v1/setup?token=p')
 
-  it('falls back to the HTTP status text without a JSON body', async () => {
-    vi.stubGlobal('fetch', mockFetch(null, 502))
-    const err = await fetchRemoteJson('http://child:7988/v1/setup?op=update').catch((e) => e)
-    expect(err.message).toBe('HTTP 502')
+    const [url] = fetch.mock.calls[0]
+    const parsed = new URL('http://localhost' + url)
+    expect(parsed.pathname).toBe('/v1/setup')
+    expect(parsed.searchParams.get('op')).toBe('source-hello')
+    expect(parsed.searchParams.get('source')).toBe('http://parent:7988/v1/setup?token=p')
+    expect(result).toEqual({ remote: {}, local: {} })
   })
 })

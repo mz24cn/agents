@@ -850,12 +850,11 @@ class TestParentRemoteRouting:
         assert len(conv["messages"]) == 1
 
     def test_revoke_unreachable_child_is_502(self, parent):
-        # Registered env points at a dead port.
-        status, body = _request(parent[0], "POST", "/v1/remote-envs", {
-            "url": "http://127.0.0.1:1/v1/setup",
-        })
-        assert status == 200
-        env_id = body["envs"][0]["id"]
+        # Registered env points at a dead port.  add() now probes the child
+        # server-side and refuses unreachable ones (502, nothing recorded), so
+        # the record is seeded directly.
+        envs = parent[0]._remote_env_manager.upsert("http://127.0.0.1:1/v1/setup")
+        env_id = envs[0]["id"]
         sid = self._make_parent_session(parent, env_id)
         status, body = _request(
             parent[0], "POST", f"/v1/sessions/{sid}/revoke",
@@ -929,11 +928,10 @@ class TestParentRemoteRouting:
         only the actual tool call returns an error result."""
         from runtime.models import ModelConfig
 
-        status, body = _request(parent[0], "POST", "/v1/remote-envs", {
-            "url": "http://127.0.0.1:1/v1/setup",
-        })
-        assert status == 200
-        env_id = body["envs"][0]["id"]
+        # add() now probes the child server-side and refuses unreachable ones
+        # (502, nothing recorded), so the dead-port record is seeded directly.
+        envs = parent[0]._remote_env_manager.upsert("http://127.0.0.1:1/v1/setup")
+        env_id = envs[0]["id"]
 
         parent_runtime = parent[0]._server.runtime  # type: ignore[attr-defined]
         parent_runtime._model_registry.register(  # type: ignore[attr-defined]

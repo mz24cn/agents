@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte'
-  import { auth, build, env, remoteEnv, tunnel, buildSetupRequestUrl, extractSetupSnapshot, fetchRemoteJson, subscribeSessionEvents, remoteEnvHomeUrl, isRemoteLogoImage, resolveRemoteEnvLogo } from '../../lib/api.js'
+  import { auth, build, env, remoteEnv, tunnel, subscribeSessionEvents, remoteEnvHomeUrl, isRemoteLogoImage, resolveRemoteEnvLogo } from '../../lib/api.js'
   import { copyToClipboard } from '../../lib/clipboard.js'
   import { t } from '../../lib/i18n.svelte.js'
 
@@ -201,29 +201,25 @@
     }
   }
 
-  function buildHelloUrl(source) {
-    return buildSetupRequestUrl(source, { op: 'hello' })
-  }
-
   async function checkUpdate() {
     checkingUpdate = true
     updateError = ''
     updateMessage = ''
     resetUpdateState()
     try {
-      const response = await fetch(buildHelloUrl(setupSource), { cache: 'no-store' })
-      if (!response.ok) throw new Error(`HTTP ${response.status}`)
-      const data = await response.json()
-      remoteFrontend = data.frontend_build || ''
-      remoteBackend = data.backend_build || ''
-      remoteConfig = data.last_config || ''
+      // 检查更新源由后端代理探测（浏览器可能无法直连更新源：CORS、
+      // 仅服务端可路由的地址等），后端同时返回本地版本。
+      const data = await build.checkSource(setupSource)
+      remoteFrontend = data.remote?.frontend_build || ''
+      remoteBackend = data.remote?.backend_build || ''
+      remoteConfig = data.remote?.last_config || ''
       frontendSync = compareVersion(remoteFrontend, frontend)
       backendSync = compareVersion(remoteBackend, backend)
       configSync = compareVersion(remoteConfig, lastConfig)
       const hasUpgrade = frontendSync === 'upgrade' || backendSync === 'upgrade' || configSync === 'upgrade'
       const hasDowngrade = frontendSync === 'downgrade' || backendSync === 'downgrade' || configSync === 'downgrade'
       updateAvailable = hasUpgrade
-      const current = await build.info()
+      const current = data.local || {}
       overallInferenceActive = !!current.inference_active
       webInferenceActive = current.session_inference_active ?? overallInferenceActive
       apiInferenceActive = !!current.api_inference_active
@@ -233,7 +229,9 @@
         refreshUpdateMessage()
       }
     } catch (err) {
-      updateError = t('checkUpdateFailed', { error: err?.message || err })
+      updateError = err?.code === 'source_auth'
+        ? t('sourceAuthRequired')
+        : t('checkUpdateFailed', { error: err?.message || err })
     } finally {
       checkingUpdate = false
     }
@@ -386,15 +384,13 @@
     addingEnv = true
     envsError = ''
     try {
-      // 与构建版本页一致：先请求目标环境的 /v1/setup?op=hello 拿版本号
-      const data = await fetchRemoteJson(buildSetupRequestUrl(url, { op: 'hello' }))
-      const snapshot = extractSetupSnapshot(data)
-      // hello 成功即在线：online 随快照一起持久化，刷新页面后列表仍显示上次状态
-      const res = await remoteEnv.add(url, snapshot, true)
+      // 后端代理探测（浏览器可能无法直连目标环境）：hello 成功后
+      // 快照与 online=true 一并持久化；失败时不记录。
+      const res = await remoteEnv.add(url)
       envList = normalizeEnvEntries(res?.envs)
       newEnvUrl = ''
     } catch (err) {
-      envsError = err?.status === 401
+      envsError = err?.code === 'child_auth'
         ? t('remoteEnvAuthRequired')
         : t('remoteEnvAddFailed', { error: err?.message || err })
     } finally {
@@ -402,29 +398,19 @@
     }
   }
 
-  // 刷新单个环境：查询其版本 / 推理状态并回写本地快照
+  // 刷新单个环境：后端代理查询其版本 / 推理状态（浏览器可能无法直连
+  // 目标环境），成功/失败结果都由后端持久化到 remote_envs.json。
   async function refreshRemoteEnv(entry, { silent = false } = {}) {
     if (entry.refreshing) return false
     entry.refreshing = true
     try {
-      if (String(entry.id || '').startsWith('tunnel:')) {
-        // 隧道环境：hello 经反向隧道（后端 /hello 端点）
-        const res = await remoteEnv.hello(entry.id)
-        if (res?.snapshot) Object.assign(entry, res.snapshot)
-        const rec = (res?.envs || []).find((e) => e.id === entry.id)
-        if (rec) entry.online = !!rec.online
-        if (!silent) {
-          entry.status = ''
-          entry.statusIsError = false
-        }
-        return true
-      }
-      const data = await fetchRemoteJson(buildSetupRequestUrl(entry.url, { op: 'hello' }))
-      const snapshot = extractSetupSnapshot(data)
-      // 快照 + 在线状态一起落盘（remote_envs.json），刷新页面后仍显示上次结果
-      await remoteEnv.updateSnapshot(entry.id, snapshot, true)
-      Object.assign(entry, snapshot)
-      entry.online = true
+      // 隧道 / 直连统一走后端代理：隧道环境经反向隧道（子端自鉴权），
+      // 直连环境由后端请求登记 URL；成功/失败结果都由后端持久化。
+      const res = await remoteEnv.hello(entry.id)
+      if (res?.snapshot) Object.assign(entry, res.snapshot)
+      const rec = (res?.envs || []).find((e) => e.id === entry.id)
+      if (rec) entry.online = !!rec.online
+      else entry.online = true
       if (!silent) {
         entry.status = ''
         entry.statusIsError = false
@@ -432,14 +418,12 @@
       return true
     } catch (err) {
       entry.online = false
-      entry.status = err?.status === 401
+      entry.status = err?.code === 'child_auth'
         ? t('remoteEnvAuthRequired')
         : t('remoteEnvCheckFailed', { error: err?.message || err })
       entry.statusIsError = true
-      // 离线状态同样持久化（隧道环境的在线状态由隧道事件驱动，不在此写）
-      if (!String(entry.id || '').startsWith('tunnel:')) {
-        await remoteEnv.updateSnapshot(entry.id, null, false).catch(() => {})
-      }
+      // 失败时后端已把 online=false 落盘（直连环境）；隧道环境的在线
+      // 状态由隧道事件驱动，不在此写。
       return false
     } finally {
       entry.refreshing = false
@@ -451,7 +435,7 @@
     const deadline = Date.now() + timeoutMs
     while (Date.now() < deadline) {
       try {
-        await fetchRemoteJson(buildSetupRequestUrl(entry.url, { op: 'hello' }))
+        await remoteEnv.hello(entry.id)
         return true
       } catch {
         await new Promise((resolve) => window.setTimeout(resolve, 500))

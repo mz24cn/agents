@@ -817,24 +817,27 @@ export const build = {
     })
     return request('GET', `/v1/setup?${params.toString()}`)
   },
+  /** 检查更新源：由后端代理请求 source 的 op=hello，返回 {remote, local}。
+   *  400 source_auth（更新源启用授权需带 token）/ 502 source_unreachable。 */
+  checkSource: (source) => {
+    const params = new URLSearchParams({ op: 'source-hello', source })
+    return request('GET', `/v1/setup?${params.toString()}`)
+  },
 }
 
 /**
  * 远程环境管理 API（母环境视角管理的子环境，记录在 DATA_DIR/remote_envs.json）。
- * 状态检查（op=hello）由前端直接请求目标环境（跨域；目标环境启用授权时，
- * 登记的 URL 需携带 ?token=...，与其他接口一致）；
+ * 状态检查（op=hello）由后端代理发起（浏览器可能无法直连目标环境：CORS、
+ * 仅服务端可路由的地址等；目标环境启用授权时，登记的 URL 需携带 ?token=...）；
  * 更新由后端把增量推送到目标环境（POST /v1/remote-envs/{id}/push-update，
  * 目标环境无需能访问母环境地址）。
  */
 export const remoteEnv = {
   list: () => request('GET', '/v1/remote-envs'),
-  // online：状态检查/更新时的可达性，随快照一起持久化到 remote_envs.json
-  add: (url, snapshot = null, online = null) =>
-    request('POST', '/v1/remote-envs', {
-      url,
-      ...(snapshot ? { snapshot } : {}),
-      ...(typeof online === 'boolean' ? { online } : {}),
-    }),
+  // 后端自行向目标环境发起 op=hello 探测：成功后连同快照与 online=true
+  // 持久化到 remote_envs.json；失败时不记录（400 child_auth /
+  // 502 child_unreachable）。
+  add: (url) => request('POST', '/v1/remote-envs', { url }),
   updateSnapshot: (id, snapshot = null, online = null) =>
     request('PUT', `/v1/remote-envs/${encodeURIComponent(id)}`, {
       ...(snapshot ? { snapshot } : {}),
@@ -845,56 +848,6 @@ export const remoteEnv = {
   /** 刷新该环境的版本快照（隧道环境经反向隧道）。 */
   hello: (id) => request('POST', `/v1/remote-envs/${encodeURIComponent(id)}/hello`, null),
   remove: (id) => request('DELETE', `/v1/remote-envs/${encodeURIComponent(id)}`),
-}
-
-/** /v1/setup 各请求自行决定 / 传递的查询参数（与后端规则一致）。 */
-const MANAGED_SETUP_QUERY_KEYS = new Set([
-  'op', 'source', 'frontend_build', 'backend_build', 'last_config',
-])
-
-/**
- * 基于一个 SETUP_SOURCE 风格的环境 URL 构造 /v1/setup 请求 URL。
- *
- * 接受 `http://host:7988/`、`http://host:7988/v1/setup`、
- * `http://host:7988/v1/setup?token=...` 等形态：path 归一化为指向
- * /v1/setup，保留原 URL 中的鉴权类查询参数（如 token），剔除由 *params*
- * 重新决定的受管理参数（op / source / 版本基线）。
- *
- * @param {string} source 环境 URL
- * @param {Record<string, string>} params 本次请求的查询参数（如 { op: 'hello' }）
- * @returns {string} 可直接 fetch 的完整 URL
- * @throws {TypeError} source 不是合法 URL 时
- */
-export function buildSetupRequestUrl(source, params = {}) {
-  const url = new URL(String(source).trim())
-  const marker = '/v1/setup'
-  const idx = url.pathname.indexOf(marker)
-  url.pathname = idx === -1 ? marker : url.pathname.slice(0, idx + marker.length)
-  url.hash = ''
-  for (const key of [...url.searchParams.keys()]) {
-    if (MANAGED_SETUP_QUERY_KEYS.has(key)) url.searchParams.delete(key)
-  }
-  for (const [key, value] of Object.entries(params)) {
-    url.searchParams.set(key, String(value))
-  }
-  return url.toString()
-}
-
-/** 从 /v1/setup?op=hello 响应中提取版本 / 推理状态快照。 */
-export function extractSetupSnapshot(data) {
-  return {
-    frontend_build: data?.frontend_build || '',
-    backend_build: data?.backend_build || '',
-    last_config: data?.last_config || '',
-    server_instance_id: data?.server_instance_id || '',
-    inference_active: !!data?.inference_active,
-    api_inference_active: !!data?.api_inference_active,
-    session_inference_active: !!data?.session_inference_active,
-    app_title: data?.app_title || '',
-    app_logo: data?.app_logo || '',
-    arch: data?.arch || '',
-    os: data?.os || '',
-  }
 }
 
 
@@ -943,29 +896,6 @@ export function resolveRemoteEnvLogo(envId, logo) {
   if (!base) return value
   return value.startsWith('/') ? base + value : base + '/' + value
 }
-
-/**
- * 直接请求一个远程环境（跨域）并解析 JSON 响应。
- * 非 2xx 时抛出带 status / code 的 Error（code 取自响应体的 error 字段，
- * 如 inference_active / update_in_progress）。
- */
-export async function fetchRemoteJson(url) {
-  const res = await fetch(url, { cache: 'no-store' })
-  let data = null
-  try {
-    data = await res.json()
-  } catch {
-    data = null
-  }
-  if (!res.ok) {
-    const err = new Error(data?.message || data?.error || `HTTP ${res.status}`)
-    err.status = res.status
-    err.code = data?.error
-    throw err
-  }
-  return data
-}
-
 
 /** AI代理 API */
 export const agents = {
