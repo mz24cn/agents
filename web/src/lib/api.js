@@ -125,12 +125,43 @@ async function requestWithDownloadProgress(path, onProgress) {
   return data
 }
 
+/**
+ * Ask the backend to probe an upstream model endpoint's own model list.
+ *
+ * The request is issued server-side (the endpoint may only be reachable from
+ * there), and the upstream key travels in a header rather than the query
+ * string so it cannot end up in a request log.
+ *
+ * @param {string} apiBase  Upstream base URL, usually ending with "/v1"
+ * @param {string} apiKey   Upstream key (optional; {{ENV}} placeholders are
+ *                          resolved by the backend, like at inference time)
+ * @returns {Promise<{models_url: string, count: number,
+ *                    models: Array<{model_name: string, max_context: number,
+ *                                    max_context_source: string,
+ *                                    input_modalities: string[],
+ *                                    output_modalities: string[],
+ *                                    status: string, owned_by: string}>}>}
+ */
+export async function probeModels(apiBase, apiKey = '') {
+  const res = await apiFetch('/v1/models/probe?api_base=' + encodeURIComponent(apiBase), {
+    method: 'GET',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(apiKey ? { 'X-Probe-Api-Key': apiKey } : {}),
+    },
+  })
+  const data = await readJsonMaybe(res)
+  if (!res.ok) throwResponseError(res, data)
+  return data
+}
+
 /** Model CRUD helpers. */
 export const models = {
   list:   (from_disk = false)    => request('GET',    '/v1/models' + (from_disk ? '?from_disk=true' : '')),
   create: (config)            => request('POST',   '/v1/models', config),
   update: (modelId, config)   => request('PUT',    `/v1/models/${modelId}`, config),
   delete: (modelId)           => request('DELETE', `/v1/models/${modelId}`),
+  probe:  (apiBase, apiKey)   => probeModels(apiBase, apiKey),
 }
 
 /**

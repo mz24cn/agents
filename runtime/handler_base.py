@@ -168,6 +168,10 @@ def iter_chunked_body(rfile, max_bytes: int, block_size: int = 65536):
 
 _ROUTES: dict[str, list] = {
     "GET": [
+        # Probes an upstream endpoint's own model list.  Listed before the
+        # generic /v1/models entry so the more specific path wins on review;
+        # both patterns are anchored, so order is not load-bearing here.
+        (re.compile(r"^/v1/models/probe$"), "_handle_probe_models", ()),
         (re.compile(r"^/v1/models$"), "_handle_list_models", ()),
         (re.compile(r"^/v1/tools$"), "_handle_list_tools", ()),
         (re.compile(r"^/v1/tools/skill/([^/]+)$"), "_handle_get_skill_body", (urllib.parse.unquote,)),

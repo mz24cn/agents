@@ -38,7 +38,8 @@ from runtime.handler_base import (
     _SESSION_GZIP_CACHE_LOCK,
     _SESSION_GZIP_CACHE_MAX,
 )
-from runtime.models import ModelConfig, ToolConfig
+from runtime.model_probe import ModelProbeError, probe_models
+from runtime.models import ModelConfig, ToolConfig, _resolve_env_placeholders
 from runtime.remote_env_manager import (
     build_setup_request_url,
     normalize_setup_url,
@@ -129,6 +130,64 @@ class HandlerApiMixin:
         models = runtime._model_registry.list_all()
         data = [m.to_dict() for m in models]
         self._send_json_response(200, {"models": data})
+
+    def _handle_probe_models(self) -> None:
+        """GET /v1/models/probe — 向上游模型端点问一次它自己的模型列表。
+
+        用途：Setup 的模型编辑页据此展示该实例上有哪些模型、各自的最大
+        上下文窗口与输入/输出模态，从而不必手工填写 ``ModelConfig.max_context``。
+        只需要 ``api_base``（和可选的 ``api_key``）——不带 ``model_name``，
+        所以返回的就是完整列表，由前端按名称匹配。
+
+        Query params:
+            api_base (str, 必填): 上游基址，通常已含 ``/v1``
+                （如 ``http://127.0.0.1:18080/v1``）。支持 ``{{ENV}}`` 占位符，
+                与推理时 ``ModelConfig.resolved_for_inference()`` 的行为一致。
+            api_key (str, 可选): 上游密钥。推荐改用 ``X-Probe-Api-Key`` 请求头
+                传递——查询串可能进入访问日志。同样支持 ``{{ENV}}`` 占位符。
+
+        Response 200::
+
+            {"models_url": "http://.../v1/models", "count": 1,
+             "models": [{"model_name": "...", "max_context": 131072,
+                         "max_context_source": "meta.n_ctx",
+                         "max_output": 393216,
+                         "input_modalities": ["text", "image"],
+                         "output_modalities": ["text"],
+                         "features": ["tools", "reasoning"],
+                         "effort_levels": ["low", "high", "max"],
+                         "details": "27.3B · Q4_K_M · 16.5GB",
+                         "status": "loaded", "owned_by": ""}]}
+
+        ``max_context`` 为 0 表示该端点没有公布窗口（保持人工配置值）；
+        ``max_output`` / ``features`` / ``effort_levels`` / ``details`` / ``status``
+        同理，拿不到就是 0 / 空列表 / 空串，前端会把整列隐藏。
+        上游密钥只用于那次请求，不会出现在响应里。
+
+        Errors: 400 ``invalid_api_base`` / ``missing_api_base``，
+        400 ``auth_failed``（上游 401/403），502 ``unreachable`` /
+        ``invalid_response``。
+        """
+        api_base = str(self._get_query_param("api_base", "") or "").strip()
+        if not api_base:
+            self._send_json_response(400, {
+                "error": "missing_api_base",
+                "message": "Missing required query parameter: api_base",
+            })
+            return
+        api_key = self.headers.get("X-Probe-Api-Key", "") or ""
+        if not api_key:
+            api_key = str(self._get_query_param("api_key", "") or "")
+        api_base = _resolve_env_placeholders(api_base)
+        api_key = _resolve_env_placeholders(api_key)
+
+        try:
+            result = probe_models(api_base, api_key)
+        except ModelProbeError as exc:
+            status = 400 if exc.code in ("invalid_api_base", "auth_failed") else 502
+            self._send_json_response(status, {"error": exc.code, "message": str(exc)})
+            return
+        self._send_json_response(200, result)
 
     def _handle_list_tools(self) -> None:
         """GET /v1/tools — list all registered tool configurations.

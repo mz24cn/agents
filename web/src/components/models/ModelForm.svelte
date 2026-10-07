@@ -6,6 +6,8 @@
   import ConfirmDialog from '../ConfirmDialog.svelte'
   import { parseLabels } from '../../lib/labels.js'
   import { formatMaxContext, parseMaxContext } from '../../lib/max-context.js'
+  import { markProbeRows, pickProbeIndex, shouldFillProbeValue,
+           probeColumns, filterProbeRows, probeFeatureText } from '../../lib/model-probe.js'
 
   let { model = null, onSuccess, onCancel } = $props()
 
@@ -32,6 +34,16 @@
   let testDialogOpen = $state(false)
   let testDialogTitle = $state('')
   let testDialogMessage = $state('')
+
+  // "模型检查": the endpoint's own model list, fetched by the backend
+  // (GET /v1/models/probe?api_base=...) and shown as a table under the input.
+  let probing = $state(false)
+  let probeRows = $state([])
+  let probeUrl = $state('')
+  let probeError = $state('')
+  let probeNote = $state('')
+  // 有的网关一次回 200 个模型，所以表格带一个名称过滤框。
+  let probeFilter = $state('')
 
   let apiBasePlaceholder = $derived(
     api_protocol === 'anthropic'
@@ -145,6 +157,62 @@
     testDialogTitle = ''
     testDialogMessage = ''
   }
+
+  /** Mark *row* selected and copy its context window into the input.
+   *  @param {boolean} onlyIfEmpty - keep a value the user already typed. */
+  function applyProbeRow(row, { onlyIfEmpty = false } = {}) {
+    if (!row) return
+    probeRows = probeRows.map(item => ({ ...item, selected: item === row }))
+    const value = Number(row.max_context) || 0
+    if (value <= 0) {
+      probeNote = t('probeNoContext', { name: row.model_name })
+      return
+    }
+    const formatted = formatMaxContext(value)
+    if (onlyIfEmpty && !shouldFillProbeValue(max_context_text)) {
+      probeNote = t('probeKept', { name: row.model_name, value: formatted })
+      return
+    }
+    max_context_text = formatted
+    if (errors.max_context) errors.max_context = ''
+    probeNote = t('probeFilled', { name: row.model_name, value: formatted })
+  }
+
+  async function handleProbe() {
+    const base = api_base.trim()
+    probeError = ''
+    probeNote = ''
+    probeRows = []
+    probeUrl = ''
+    probeFilter = ''
+    if (!base) {
+      probeError = t('probeApiBaseRequired')
+      return
+    }
+    probing = true
+    try {
+      const data = await models.probe(base, api_key.trim())
+      const list = Array.isArray(data?.models) ? data.models : []
+      probeUrl = data?.models_url || ''
+      if (!list.length) {
+        probeError = t('probeEmpty')
+        return
+      }
+      // A single model on the endpoint can only be the one being configured;
+      // with several, the form's model_name decides which row is the current one.
+      const index = pickProbeIndex(list, model_name)
+      probeRows = markProbeRows(list, index)
+      if (index < 0) {
+        probeNote = t('probeNoMatch', { count: list.length })
+        return
+      }
+      applyProbeRow(probeRows[index], { onlyIfEmpty: true })
+    } catch (err) {
+      probeError = err?.message || t('operationFailed')
+    } finally {
+      probing = false
+    }
+  }
 </script>
 
 <form class="model-form" onsubmit={(e) => { e.preventDefault(); handleSubmit() }}>
@@ -234,9 +302,79 @@
 
   <div class="form-group">
     <label for="max_context">{t('maxContext')}</label>
-    <input id="max_context" type="text" bind:value={max_context_text} placeholder={t('maxContextPlaceholder')} />
+    <div class="field-row">
+      <input id="max_context" type="text" bind:value={max_context_text} placeholder={t('maxContextPlaceholder')} />
+      <button type="button" class="btn btn-probe" onclick={handleProbe} disabled={probing}
+              title={t('probeModelsHint')}>
+        {probing ? t('probeLoading') : t('probeModels')}
+      </button>
+    </div>
     {#if errors.max_context}<span class="field-error">{errors.max_context}</span>{/if}
     <span class="field-hint">{t('maxContextHint')}</span>
+
+    {#if probeError}
+      <div class="probe-error">{probeError}</div>
+    {:else if probeNote}
+      <div class="probe-note">{probeNote}</div>
+    {/if}
+
+    {#if probeRows.length}
+      {#if probeRows.length > 8}
+        <input class="probe-filter" type="search" bind:value={probeFilter}
+               placeholder={t('probeFilterPlaceholder')} />
+      {/if}
+      {@const visible = filterProbeRows(probeRows, probeFilter)}
+      {@const cols = probeColumns(probeRows)}
+      <div class="probe-table-wrap">
+        <table class="probe-table">
+          <thead>
+            <tr>
+              <th>{t('probeColModel')}</th>
+              <th class="num" title={t('probeColContextHint')}>{t('probeColContext')}</th>
+              {#if cols.output}
+                <th class="num" title={t('probeColMaxOutputHint')}>{t('probeColMaxOutput')}</th>
+              {/if}
+              <th>{t('probeColInput')}</th>
+              <th>{t('probeColOutput')}</th>
+              {#if cols.features}<th title={t('probeColFeaturesHint')}>{t('probeColFeatures')}</th>{/if}
+              {#if cols.status}<th>{t('probeColStatus')}</th>{/if}
+            </tr>
+          </thead>
+          <tbody>
+            {#each visible as row}
+              <tr class:selected={row.selected} tabindex="0"
+                  aria-label={t('probeRowHint')} aria-selected={row.selected}
+                  title={t('probeRowHint')}
+                  onclick={() => applyProbeRow(row)}
+                  onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); applyProbeRow(row) } }}>
+                <td class="cell-name" title={row.model_name}>
+                  <div>{row.model_name}</div>
+                  {#if row.details}<div class="cell-sub">{row.details}</div>{/if}
+                </td>
+                <td class="num" title={row.max_context_source || ''}>
+                  {row.max_context ? formatMaxContext(row.max_context) : t('probeUnknown')}
+                </td>
+                {#if cols.output}
+                  <td class="num">{row.max_output ? formatMaxContext(row.max_output) : '—'}</td>
+                {/if}
+                <td>{row.input_modalities?.length ? row.input_modalities.join(', ') : '—'}</td>
+                <td>{row.output_modalities?.length ? row.output_modalities.join(', ') : '—'}</td>
+                {#if cols.features}<td>{probeFeatureText(row) || '—'}</td>{/if}
+                {#if cols.status}<td>{row.status || '—'}</td>{/if}
+              </tr>
+            {:else}
+              <tr class="probe-no-match"><td colspan="7">{t('probeNoMatchRows')}</td></tr>
+            {/each}
+          </tbody>
+        </table>
+        <div class="probe-foot">
+          {#if probeUrl}<span class="probe-source">{probeUrl}</span>{/if}
+          {#if probeFilter}
+            <span class="probe-count">{t('probeCount', { shown: visible.length, total: probeRows.length })}</span>
+          {/if}
+        </div>
+      </div>
+    {/if}
   </div>
 
   <div class="form-group">
@@ -300,4 +438,29 @@
    .btn-test:hover:not(:disabled) { background: #d35400; }
    .btn-primary { background: var(--primary); color: #fff; }
    .btn-primary:hover:not(:disabled) { background: var(--primary-hover); }
+  /* max context: input + "模型检查" on one row, probe result table below */
+  .field-row { display: flex; gap: 8px; align-items: stretch; }
+  .field-row input { flex: 1; min-width: 0; }
+  .btn-probe { background: var(--bg-secondary); color: var(--text); border: 1px solid var(--border); padding: 8px 14px; white-space: nowrap; }
+  .btn-probe:hover:not(:disabled) { background: var(--border); }
+  .probe-error { color: var(--danger); font-size: 0.8rem; margin-top: 4px; }
+  .probe-note { color: var(--text-secondary); font-size: 0.8rem; margin-top: 4px; }
+  .probe-filter { margin-top: 8px; width: 240px; max-width: 100%; }
+  .probe-table-wrap { margin-top: 8px; border: 1px solid var(--border); border-radius: 6px; overflow-x: auto; }
+  .probe-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+  .probe-table th, .probe-table td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  .probe-table th { background: var(--bg-secondary); color: var(--text-secondary); font-weight: 600; }
+  .probe-table tbody tr:last-child td { border-bottom: none; }
+  .probe-table tbody tr { cursor: pointer; }
+  .probe-table tbody tr:hover { background: var(--bg-secondary); }
+  .probe-table tbody tr:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+  .probe-table tbody tr.selected { background: color-mix(in srgb, var(--primary) 14%, var(--bg-secondary)); }
+  .probe-table tr.probe-no-match, .probe-table tr.probe-no-match:hover { cursor: default; background: transparent; }
+  .probe-table td.cell-name { max-width: 300px; }
+  .probe-table td.cell-name > div { overflow: hidden; text-overflow: ellipsis; }
+  .probe-table td.cell-name .cell-sub { color: var(--text-secondary); font-size: 0.72rem; }
+  .probe-table th.num, .probe-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .probe-foot { display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+  .probe-source { display: block; padding: 4px 10px 6px; color: var(--text-secondary); font-size: 0.75rem; font-family: monospace; }
+  .probe-count { padding: 4px 10px 6px; color: var(--text-secondary); font-size: 0.75rem; }
 </style>
