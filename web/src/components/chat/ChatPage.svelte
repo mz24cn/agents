@@ -849,6 +849,19 @@
     handleSend(finalText)
   }
 
+  // 本轮请求上下文快照：与后端写入 conversation.json 的 messages[i].meta 一致。
+  // 模型 / 工具集 / 执行环境 / AI代理 / 工作区在下一条用户消息发送时都可能改变，
+  // 所以按轮记录；本地先挂上，重新加载会话前也能看到这一条当时用的是什么。
+  function currentTurnMeta() {
+    const meta = {}
+    if (selectedModelId) meta.model_id = selectedModelId
+    if (selectedAgentIds.length > 0) meta.agent_ids = [...selectedAgentIds]
+    meta.tool_ids = [...selectedToolIds]
+    if (selectedRemoteEnvId) meta.remote_env = selectedRemoteEnvId
+    if (workspacePath) meta.workspace = workspacePath
+    return meta
+  }
+
   function handleSend(text) {
     if (!selectedModelId && selectedAgentIds.length === 0 || isStreaming) return
     errorMsg = ''
@@ -863,7 +876,7 @@
       }
     }
     apiMessages.push({ role: 'user', content: text })
-    const pendingUserMsg = { role: 'user', content: text, timestamp: new Date().toISOString().slice(0, 19).replace('T', ' ') }
+    const pendingUserMsg = { role: 'user', content: text, timestamp: new Date().toISOString().slice(0, 19).replace('T', ' '), meta: currentTurnMeta() }
     _doSend(apiMessages, pendingUserMsg)
   }
 
@@ -911,7 +924,7 @@
       }
     }
     apiMessages.push({ role: 'user', content: '', prompt_template: templateId, arguments: args })
-    const pendingUserMsg = { role: 'user', content: '', timestamp: new Date().toISOString().slice(0, 19).replace('T', ' '), prompt_template: templateId, arguments: args }
+    const pendingUserMsg = { role: 'user', content: '', timestamp: new Date().toISOString().slice(0, 19).replace('T', ' '), prompt_template: templateId, arguments: args, meta: currentTurnMeta() }
     _doSend(apiMessages, pendingUserMsg)
   }
 

@@ -967,3 +967,56 @@ def test_continue_requires_session_id(continue_server):
     })
     assert status == 400
     assert "session_id" in err.get("error", "")
+
+
+def test_stream_persists_per_turn_meta_on_user_message(continue_server):
+    """End-to-end: the request context of a turn is snapshotted onto the
+    persisted user message, and never leaks into the model payload.
+
+    A session may switch model / tools / workspace / environment between
+    turns; the session-level meta block only keeps the latest values, so
+    each user turn carries its own copy.
+    """
+    srv = continue_server
+    sent_payloads: list[dict] = []
+
+    def model_urlopen(request, **kwargs):
+        sent_payloads.append(json.loads(request.data.decode("utf-8")))
+        return _make_resp(_openai_sse_text("Done."))
+
+    status, body = _post_stream(srv, {
+        "session_id": "new",
+        "model_id": "test-model",
+        "tool_ids": ["echo"],
+        "workspace": "/tmp/demo-workspace",
+        "messages": [
+            {"role": "user", "content": "hi", "timestamp": "260101_000001"},
+        ],
+    }, model_urlopen)
+    assert status == 200, body
+    session_id = json.loads(
+        body.split("data: ", 1)[1].split("\n", 1)[0]
+    )["session_id"]
+    assert session_id, body
+
+    status, doc = _get_session(srv, session_id)
+    assert status == 200, doc
+    user_turns = [m for m in doc["messages"] if m.get("role") == "user"]
+    assert user_turns, doc
+    meta = user_turns[0].get("meta")
+    assert isinstance(meta, dict), doc
+    assert meta["model_id"] == "test-model"
+    assert meta["tool_ids"] == ["echo"]
+    assert meta["workspace"] == "/tmp/demo-workspace"
+
+    # Only user turns carry the snapshot; assistant/tool turns do not.
+    for msg in doc["messages"]:
+        if msg.get("role") != "user":
+            assert "meta" not in msg, msg
+
+    # The snapshot is persistence-only bookkeeping: the provider payload
+    # must not contain it.
+    assert sent_payloads, body
+    for payload in sent_payloads:
+        for msg in payload.get("messages", []):
+            assert "meta" not in msg, msg

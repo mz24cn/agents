@@ -263,6 +263,7 @@ def _make_delegate_fn(runtime, thread_local):
                     tool_ids=resolved_ids,
                     agent_ids=getattr(thread_local, "agent_ids", None) or None,
                     model_id=model_id or getattr(thread_local, "model_id", None) or None,
+                    workspace=getattr(thread_local, "workspace", None) or None,
                     extra_meta={"parent_session_id": session_id},
                 )
                 # A delegated task can itself run a long tool loop; keep the
@@ -593,6 +594,7 @@ def _make_talk_to_fn(runtime, thread_local):
                     tool_ids=agent_tool_ids,
                     agent_ids=[agent_id],
                     model_id=model_id,
+                    workspace=getattr(thread_local, "workspace", None) or None,
                     extra_meta={"parent_session_id": parent_session_id},
                 )
                 # A target agent can run a long tool loop of its own; keep its

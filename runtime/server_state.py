@@ -585,6 +585,38 @@ def stream_batch_is_protocol_complete(messages: list) -> bool:
     return not pending
 
 
+def build_turn_meta(
+    model_id: Optional[str] = None,
+    tool_ids: Optional[list] = None,
+    agent_ids: Optional[list] = None,
+    workspace: Optional[str] = None,
+    extra_meta: Optional[dict] = None,
+) -> Optional[dict]:
+    """Snapshot the request context a user turn was sent with.
+
+    The session-level ``meta`` block only ever holds the *latest* values, but
+    a session can switch model / tool set / execution environment / agent /
+    workspace between turns.  The snapshot is stored on the initiating user
+    turn (``messages[i].meta``) so the settings each turn actually ran with
+    stay readable after later turns overwrite the session block.
+
+    Returns ``None`` when nothing is known, so no empty dict is persisted.
+    """
+    turn_meta: dict = {}
+    if model_id:
+        turn_meta["model_id"] = model_id
+    if tool_ids is not None:
+        turn_meta["tool_ids"] = list(tool_ids)
+    if agent_ids:
+        turn_meta["agent_ids"] = list(agent_ids)
+    if workspace:
+        turn_meta["workspace"] = workspace
+    remote_env = (extra_meta or {}).get("remote_env")
+    if remote_env:
+        turn_meta["remote_env"] = remote_env
+    return turn_meta or None
+
+
 def persist_conversation(
     context_manager: "ContextManager",
     session_id: str,
@@ -623,6 +655,11 @@ def persist_conversation(
         agent_nickname: 可选的 agent nickname，用于标记 role=assistant 的消息的 name 字段。
         model_id: 可选的模型 ID，记录到会话 meta 中，便于恢复会话设置。
 
+    会话级 meta 只保留「最新一次」的配置，而同一会话中途可能更换模型 /
+    工具集 / 执行环境 / Agent / 工作区。因此这些当时的取值同时快照到发起
+    本轮的用户消息上（``messages[i].meta``），历史轮次的设置不会被后续
+    轮次覆盖；Continue 不携带新用户消息，则刷新最后一个用户 turn 的快照。
+
     Returns:
         成功时返回 None；失败时返回捕获的异常（OSError 或其他）。
     """
@@ -637,10 +674,20 @@ def persist_conversation(
         # destructive operation (Continue or revoke). Persistence must never
         # classify and silently delete prior messages on its own.
         new_turns = list(existing_turns)
+        # What this request was configured with, recorded on the user turn it
+        # initiates (see ``build_turn_meta``).
+        turn_meta = build_turn_meta(
+            model_id=model_id,
+            tool_ids=tool_ids,
+            agent_ids=agent_ids,
+            workspace=workspace,
+            extra_meta=extra_meta,
+        )
+        new_user_turns = 0
         for m in (original_messages or []):
             # 复用 Message 自带的时间戳，无则 fallback 为当前时间
             ts = m.timestamp if m.timestamp else now_iso()
-            new_turns.append(ConversationTurn(
+            turn = ConversationTurn(
                 role=m.role,
                 content=m.content or "",
                 timestamp=ts,
@@ -654,7 +701,23 @@ def persist_conversation(
                 tool_use_id=getattr(m, "tool_use_id", None),
                 mentions=getattr(m, "mentions", None),
                 started_at=getattr(m, "started_at", None),
-            ))
+            )
+            if turn.role == "user" and turn_meta:
+                turn.meta = dict(turn_meta)
+                new_user_turns += 1
+            new_turns.append(turn)
+        if turn_meta and not new_user_turns:
+            # Continue/retry sends no new user message: it re-runs the existing
+            # user turn, possibly with a different model / tool set / agent /
+            # environment. Refresh that turn's snapshot so it keeps describing
+            # the settings the turn actually ran with. Idempotent across the
+            # incremental persistences of one request.
+            for turn in reversed(new_turns):
+                if turn.role == "user":
+                    merged_meta = dict(turn.meta or {})
+                    merged_meta.update(turn_meta)
+                    turn.meta = merged_meta
+                    break
         merged_turns, last_stat = merge_stream_messages(collected_messages)
         # 如果有 agent_ids，为所有 role=assistant 的消息设置 name（nickname）和 agent_id 字段
         if agent_ids:

@@ -65,6 +65,15 @@ class ConversationTurn:
             operation actually started. For assistant turns this is the real
             model-request send time; for tool turns it is the callable/MCP
             execution start time.
+        meta: Optional per-turn request-context snapshot, recorded on user
+            turns only.  A session may switch model / tool set / execution
+            environment / agent / workspace between turns, while the
+            top-level ``meta`` block of ``conversation.json`` only ever
+            holds the latest values.  This dict keeps what each user turn
+            was actually sent with: ``model_id``, ``tool_ids``,
+            ``agent_ids``, ``workspace``, ``remote_env``.  Persistence-only
+            bookkeeping — never sent to the model (see
+            :func:`turn_to_message_dict`).
     """
 
     role: str
@@ -84,6 +93,23 @@ class ConversationTurn:
     completed_at: Optional[str] = None
     mentions: Optional[list[str]] = None
     started_at: Optional[str] = None
+    meta: Optional[dict] = None
+
+
+def turn_to_message_dict(turn: ConversationTurn) -> dict:
+    """Serialize a turn into a model-facing message dict.
+
+    ``meta`` is persistence-only bookkeeping: the request context (model,
+    tool set, execution environment, agent, workspace) that was in effect
+    when this user turn was sent.  It describes how the session was run,
+    not what was said in it, so it must never reach the provider payload
+    nor inflate token estimates.  Every other field is passed through.
+    """
+    return {
+        k: v
+        for k, v in asdict(turn).items()
+        if v is not None and k != "meta"
+    }
 
 
 @dataclass
@@ -1545,6 +1571,7 @@ class ContextManager:
                 completed_at=msg.get("completed_at"),
                 mentions=msg.get("mentions"),
                 started_at=msg.get("started_at"),
+                meta=msg.get("meta") if isinstance(msg.get("meta"), dict) else None,
             ))
         return turns
 
@@ -2742,10 +2769,7 @@ class ContextManager:
 
         if summary_msg is None and not summary_present:
             # No compression has occurred yet — inject full history verbatim.
-            turn_msgs: list[dict] = [
-                {k: v for k, v in asdict(t).items() if v is not None}
-                for t in turns
-            ]
+            turn_msgs: list[dict] = [turn_to_message_dict(t) for t in turns]
             assembled = turn_msgs + list(new_messages)
 
             # Apply token budget if set (trim memory-less assembled list)
@@ -2777,7 +2801,7 @@ class ContextManager:
         system_parts: list[str] = []
         for t in turns:
             if t.role == "system" and (t.content or t.prompt_template):
-                msg = {k: v for k, v in asdict(t).items() if v is not None}
+                msg = turn_to_message_dict(t)
                 text = self._system_message_text(msg)
                 if text.strip():
                     system_parts.append(text.strip())
@@ -2842,7 +2866,7 @@ class ContextManager:
             recent_start += 1
         recent_turns = turns[recent_start:]
         turn_msgs = [
-            {k: v for k, v in asdict(t).items() if v is not None}
+            turn_to_message_dict(t)
             for t in recent_turns
             if t.role != "system"
         ]
@@ -2865,13 +2889,7 @@ class ContextManager:
                 default=-1,
             )
             if last_user_idx >= 0:
-                turn_msgs = [
-                    {
-                        k: v
-                        for k, v in asdict(turns[last_user_idx]).items()
-                        if v is not None
-                    },
-                ] + turn_msgs
+                turn_msgs = [turn_to_message_dict(turns[last_user_idx])] + turn_msgs
                 logger.info(
                     "assemble_context(session=%s): window has no user message; "
                     "anchored the context to the last user turn (index %d)",

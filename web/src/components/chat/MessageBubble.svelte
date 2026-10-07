@@ -124,6 +124,25 @@
     return lines.join('\n')
   }
 
+  // ── 本轮请求上下文快照（conversation.json 的 messages[i].meta）──
+  // 模型 / 工具集 / 执行环境 / AI代理 / 工作区在会话中途可能更换，会话级 meta
+  // 只保留最新一次；附着在用户消息上的快照才能回答「这一条当时用的是什么」。
+  // 不单独占位展示，挂在时间字符串上，悬停时显示完整内容（与 assistant
+  // 消息的 token 统计 tooltip 对称）。
+  const turnMeta = $derived(
+    msg.role === 'user' && msg.meta && typeof msg.meta === 'object' ? msg.meta : null
+  )
+  const turnMetaTitle = $derived.by(() => {
+    if (!turnMeta) return ''
+    const lines = []
+    if (turnMeta.model_id) lines.push(`${t('turnMetaModel')}: ${turnMeta.model_id}`)
+    if (turnMeta.agent_ids?.length) lines.push(`${t('turnMetaAgents')}: ${turnMeta.agent_ids.join(', ')}`)
+    if (turnMeta.tool_ids) lines.push(`${t('turnMetaTools')}: ${turnMeta.tool_ids.length ? turnMeta.tool_ids.join(', ') : t('turnMetaNone')}`)
+    if (turnMeta.remote_env) lines.push(`${t('turnMetaEnv')}: ${turnMeta.remote_env}`)
+    if (turnMeta.workspace) lines.push(`${t('turnMetaWorkspace')}: ${turnMeta.workspace}`)
+    return lines.join('\n')
+  })
+
   // 工具结果：按实际显示内容计算行数，超过5行默认收缩，否则默认展开。
   // JSON 会先 pretty-print，因此即使原始 JSON 是单行，也能按格式化后的行数收缩。
   // talk_to 子消息渲染时用 sub_messages[] 各自的 content；传统 tool 消息用 msg.content。
@@ -269,7 +288,7 @@
       <span>{t('roleUser')}</span>
       <div class="role-actions">
         {#if msg.timestamp}
-          <span class="timestamp">{formatTimestamp(msg.timestamp)}</span>
+          <span class="timestamp" title={turnMetaTitle || undefined}>{formatTimestamp(msg.timestamp)}</span>
         {/if}
         {#if onRevoke && msg.timestamp}
           <button class="revoke-btn" onclick={() => onRevoke(msg.timestamp, hasFileChanges)}>
