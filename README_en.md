@@ -351,7 +351,7 @@ change takes effect after a restart.
 
 > **Note:** A WebSocket terminal endpoint `WS /v1/terminals/ws` is also available for real-time terminal sessions in the browser. Like all `/v1/` endpoints, it requires authentication (session cookie or `Authorization: Bearer` API key).
 
-> **Security note (remote-environment tunnel):** the child→parent reverse-tunnel endpoints (`/v1/tunnel/*`, `/v1/tunnel-proxy/*`) sit behind the same `/v1/` authorization gate. When the parent has a password set, the child authenticates its tunnel dial with the token carried in its `SETUP_SOURCE` setup link; when the parent has no password (auth disabled), these endpoints are fully open — any client that can reach the parent's port may register a tunnel and proxy requests to the child's local endpoints (including executing the child's tools). Do not expose a parent's port to untrusted networks without a password while using remote environments.
+> **Security note (remote-environment tunnel):** the child→parent reverse-tunnel endpoints (`/v1/tunnel/*`, `/v1/env-proxy/*`) sit behind the same `/v1/` authorization gate. When the parent has a password set, the child authenticates its tunnel dial with the token carried in its `SETUP_SOURCE` setup link; when the parent has no password (auth disabled), these endpoints are fully open — any client that can reach the parent's port may register a tunnel and proxy requests to the child's local endpoints (including executing the child's tools). Do not expose a parent's port to untrusted networks without a password while using remote environments.
 
 **Streaming inference request:**
 

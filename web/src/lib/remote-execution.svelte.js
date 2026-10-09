@@ -7,10 +7,13 @@
  *
  *  - the active binding (which session + which child env), set by ChatPage
  *    on session restore / env switch,
- *  - direct browser → child request helpers (workspace files, file journals,
- *    tools, terminal WebSocket) — large payloads never pass through the
- *    parent,
- *  - URL/token helpers derived from the registered setup URL.
+ *  - child request helpers (workspace files, file journals, tools, terminal
+ *    WebSocket).  HTTP always goes through the parent's same-origin bridge
+ *    (/v1/env-proxy/{env_id}/...): the browser never needs a route to the
+ *    child, carries no child credential, and the parent picks the transport
+ *    (reverse WS tunnel or direct HTTP).  Only the interactive terminal
+ *    WebSocket still dials a direct child itself,
+ *  - URL helpers derived from the registered setup URL.
  *
  * Revoke stays on the PARENT (it coordinates child journal restore first);
  * session deletion also stays on the parent (fire-and-forget child cleanup).
@@ -20,7 +23,11 @@ import { remoteEnv } from './api.js'
 
 /** Active binding for the current chat session.
  *  sessionId: string | null — the session this binding applies to
- *  env: { id, url, base, token, host, title } | null
+ *  env: { id, url, base, host, title, prefix, wsPrefix, wsToken, transport } | null
+ *    base     — same-origin bridge prefix (…/v1/env-proxy/{env_id})
+ *    prefix   — bridge path prefix for HTTP (both transports)
+ *    wsPrefix — bridge path prefix for the terminal WS ('' = dial the child)
+ *    wsToken  — child token for a direct child's WS handshake only
  */
 export const remoteExecution = $state({ sessionId: null, env: null })
 
@@ -108,35 +115,46 @@ export async function bindSessionToRemoteEnv(sessionId, envId) {
     return null
   }
   remoteExecution.sessionId = sessionId ?? null
-  // Tunnel env (child dials into this parent over the reverse WS tunnel):
-  // the browser must NOT talk to the child directly (it may be unreachable
-  // behind NAT — that is the point of the tunnel).  Route everything through
-  // the parent's same-origin bridge /v1/tunnel-proxy/{env_id}/... instead:
-  // cookies work, no CORS, no child token in the URL (the child self-authorizes
-  // requests arriving over the tunnel).
+  // Every remote environment is reached through the parent's same-origin
+  // bridge /v1/env-proxy/{env_id}/... — the browser must NOT talk to the child
+  // directly: a direct child may be firewalled so that only the parent can
+  // reach it (that is the whole point of the tunnel variant), and going
+  // through the parent also means cookies work, there is no CORS, and the
+  // child token never appears in a browser URL (the parent injects it from
+  // the registered record).  Transport is chosen on the parent: a tunnel env
+  // is dialed over its reverse WS tunnel, a direct env with plain HTTP.
+  const prefix = `/v1/env-proxy/${encodeURIComponent(record.id)}`
+  const bridgeBase = `${location.protocol}//${location.host}${prefix}`
   const isTunnel = record.id.startsWith('tunnel:') || record.transport === 'ws-tunnel'
   if (isTunnel) {
-    const prefix = `/v1/tunnel-proxy/${encodeURIComponent(record.id)}`
     remoteExecution.env = {
       id: record.id,
       url: '',
-      base: `${location.protocol}//${location.host}${prefix}`,
-      token: '',
+      base: bridgeBase,
       host: location.host,
       title: record.app_title || record.title || '',
       prefix,
+      // Terminal WS is bridged too: the child is not reachable from here.
+      wsPrefix: prefix,
+      wsToken: '',
       transport: 'ws-tunnel',
     }
   } else {
-    const { base, token, host } = parseSetupUrl(record.url)
+    const { token, host } = parseSetupUrl(record.url)
     remoteExecution.env = {
       id: record.id,
+      // 终端 WS 仍直连子端（浏览器可达时才可用）：url 决定 ws/wss，host 是
+      // 拨号地址，wsToken 是子端 WS 握手的凭据。桥接一条长连接交互式 socket
+      // 只是多一跳，并不增加可达性。HTTP 一律走桥，子端 token 由母端注入，
+      // 不再出现在浏览器 URL / 请求头里。
       url: record.url,
-      base,
-      token,
+      base: bridgeBase,
       host,
       title: record.app_title || record.title || '',
-      prefix: '',
+      prefix,
+      wsPrefix: '',
+      wsToken: token,
+      transport: record.transport || 'http',
     }
   }
   return remoteExecution.env
@@ -176,9 +194,13 @@ export function resolvePanelRemoteEnv(sessionId = null, localMode = false) {
 }
 
 /**
- * Build an absolute child URL for a /v1/ path, appending the token.
- * Suitable for fetch() and for media src attributes (img/audio/video/
- * document previews) — the token query param is the URL auth channel.
+ * Build a same-origin bridge URL for a child /v1/ path.
+ *
+ * The URL points at the parent (/v1/env-proxy/{env_id}/...); the parent
+ * forwards it to the child and streams the answer back.  Suitable for fetch()
+ * and for media src attributes (img/audio/video/document previews): same
+ * origin, so cookies ride along, there is no CORS, and the child's token never
+ * enters a browser-visible URL.
  */
 export function buildRemoteUrl(path, { query = {} } = {}) {
   const env = remoteExecution.env
@@ -187,7 +209,6 @@ export function buildRemoteUrl(path, { query = {} } = {}) {
   for (const [k, v] of Object.entries(query)) {
     if (v !== undefined && v !== null) u.searchParams.set(k, String(v))
   }
-  if (env.token) u.searchParams.set('token', env.token)
   return u.toString()
 }
 
@@ -201,13 +222,14 @@ export function buildRemoteWsUrl(path, params = {}) {
     ? 'wss:'
     : (env.url ? 'ws:' : (location.protocol === 'https:' ? 'wss:' : 'ws:'))
   const u = new URL(`${proto}//${env.host}`)
-  // Tunnel envs: the WS path is bridged under /v1/tunnel-proxy/{env_id}/...
-  // (same origin as the page); direct envs keep the bare child path.
-  u.pathname = (env.prefix || '') + path
+  // Tunnel envs: the WS is bridged under /v1/env-proxy/{env_id}/... (same
+  // origin as the page); direct envs keep the bare child path and dial the
+  // child with its setup token.
+  u.pathname = (env.wsPrefix || '') + path
   for (const [k, v] of Object.entries(params)) {
     if (v !== undefined && v !== null) u.searchParams.set(k, String(v))
   }
-  if (env.token) u.searchParams.set('token', env.token)
+  if (env.wsToken) u.searchParams.set('token', env.wsToken)
   return u.toString()
 }
 
@@ -232,13 +254,10 @@ function throwRemoteError(res, data) {
  * @returns {Promise<any>} parsed JSON
  */
 export async function remoteRequest(method, path, body = null) {
+  // 同源桥请求：母端自身的会话凭据（cookie）就是认证，子端 token 由母端在
+  // 转发时注入，浏览器不需要携带任何子端凭据。
   const url = buildRemoteUrl(path)
-  // token 查询参数覆盖 GET（子端 GET 授权）；Authorization 头覆盖
-  // POST/PUT/DELETE（跨域浏览器请求可携带自定义头）。两者都带无副作用。
   const headers = { 'Content-Type': 'application/json' }
-  if (remoteExecution.env?.token) {
-    headers.Authorization = `Bearer ${remoteExecution.env.token}`
-  }
   const opts = { method, headers }
   if (body !== null && body !== undefined) opts.body = JSON.stringify(body)
   const res = await fetch(url, opts)
@@ -312,9 +331,6 @@ export const remoteWorkspace = {
       xhr.setRequestHeader('X-Upload-Offset', String(chunk.offset))
       xhr.setRequestHeader('X-Upload-Size', String(chunk.size))
       xhr.setRequestHeader('X-File-Size', String(chunk.file_size))
-      if (remoteExecution.env?.token) {
-        xhr.setRequestHeader('Authorization', `Bearer ${remoteExecution.env.token}`)
-      }
       xhr.upload.onprogress = (event) => {
         if (event.lengthComputable && onProgress) onProgress(event.loaded)
       }
@@ -365,9 +381,7 @@ export const remoteSessions = {
 export async function fetchRemoteWorkspacePath(envOverride = null) {
   const env = envOverride || remoteExecution.env
   if (!env) throw new Error('No remote environment bound')
-  const u = new URL(env.base + '/v1/env')
-  if (env.token) u.searchParams.set('token', env.token)
-  const res = await fetch(u.toString())
+  const res = await fetch(env.base + '/v1/env')
   const data = await res.json().catch(() => null)
   if (!res.ok) throw new Error(`Remote request failed: ${res.status}`)
   return (data?.env || {}).AGENTS_WORKSPACE || ''

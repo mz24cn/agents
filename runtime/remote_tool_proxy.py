@@ -66,6 +66,34 @@ _TOOL_CALL_FALLBACK_TIMEOUT = 3600.0
 PARENT_SIDE_TOOLS = frozenset({"talk_to", "delegate"})
 
 
+def child_endpoint(env_record: dict) -> tuple[str, str]:
+    """直连子环境的 ``(base URL, setup token)``。
+
+    登记在 remote_envs.json 里的 ``url`` 是 setup URL
+    （``http://host:7988/deploy/v1/setup?token=as_xxx``）：服务 base 取
+    ``/v1/setup`` 之前的部分（保留部署前缀），token 保留在查询参数里
+    （``st_`` / ``as_``）。隧道记录没有直连地址，返回 ``("", "")``。
+    """
+    env_url = str(env_record.get("url") or env_record.get("id") or "")
+    parsed = urllib.parse.urlsplit(env_url)
+    if not parsed.scheme or not parsed.netloc:
+        return "", ""
+    # base = scheme://netloc + 部署前缀（/v1/setup 之前的路径）
+    path = parsed.path or ""
+    marker = "/v1/setup"
+    idx = path.find(marker)
+    prefix = path[:idx] if idx != -1 else path
+    if prefix and not prefix.endswith("/"):
+        prefix += "/"
+    base = f"{parsed.scheme}://{parsed.netloc}{prefix}".rstrip("/")
+    token = ""
+    for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
+        if key == "token":
+            token = value
+            break
+    return base, token
+
+
 class RemoteToolProxy:
     """单个子环境的工具代理。
 
@@ -91,21 +119,7 @@ class RemoteToolProxy:
             self.base = ""
             self.token = ""
         else:
-            parsed = urllib.parse.urlsplit(self.env_url)
-            # base = scheme://netloc + 部署前缀（/v1/setup 之前的路径）
-            path = parsed.path or ""
-            marker = "/v1/setup"
-            idx = path.find(marker)
-            prefix = path[:idx] if idx != -1 else path
-            if prefix and not prefix.endswith("/"):
-                prefix += "/"
-            self.base = f"{parsed.scheme}://{parsed.netloc}{prefix}".rstrip("/")
-            # token 保留在登记的 URL 查询参数中（st_/as_）
-            self.token = ""
-            for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
-                if key == "token":
-                    self.token = value
-                    break
+            self.base, self.token = child_endpoint(env_record)
 
         self._lock = threading.Lock()
         self._tools_cache: Optional[list[dict]] = None

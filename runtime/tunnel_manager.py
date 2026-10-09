@@ -17,7 +17,7 @@ A lazily-started sweeper thread pings idle connections (PING_INTERVAL) and
 force-closes ones silent for longer than STALE_AFTER.
 
 Trust boundary: the tunnel endpoints (``/v1/tunnel/*``,
-``/v1/tunnel-proxy/*``) sit behind the same ``/v1/`` authorization gate as
+``/v1/env-proxy/*``) sit behind the same ``/v1/`` authorization gate as
 every other API. When the parent has auth enabled, children authenticate
 with the token carried in their ``SETUP_SOURCE`` link. When the parent has
 no password set (auth disabled), the gate passes everything: any client

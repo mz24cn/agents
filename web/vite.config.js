@@ -42,8 +42,9 @@ export default defineConfig({
         target: 'ws://localhost:7988',
         ws: true
       },
-      // Tunnel browser bridge (terminal WS + HTTP) into registered children.
-      '/v1/tunnel-proxy': {
+      // Env browser bridge (HTTP for both transports + terminal WS for
+      // tunnels) into registered children.
+      '/v1/env-proxy': {
         target: 'ws://localhost:7988',
         ws: true
       },

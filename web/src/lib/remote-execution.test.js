@@ -75,13 +75,18 @@ describe('parseSetupUrl', () => {
 // ---------------------------------------------------------------------------
 
 describe('bindSessionToRemoteEnv', () => {
-  it('resolves the env record and populates the binding', async () => {
+  it('resolves the env record and binds it to the same-origin bridge', async () => {
     vi.stubGlobal('fetch', mockFetch(ENV_RECORDS))
     const env = await bindSessionToRemoteEnv('sess-1', 'http://10.0.0.5:7988')
     expect(env).toMatchObject({
       id: 'http://10.0.0.5:7988',
-      base: 'http://10.0.0.5:7988',
-      token: 'as_abc',
+      // HTTP 不再直连子端：一律走母端同源桥，子端 token 由母端注入。
+      base: 'http://parent.local:7988/v1/env-proxy/http%3A%2F%2F10.0.0.5%3A7988',
+      prefix: '/v1/env-proxy/http%3A%2F%2F10.0.0.5%3A7988',
+      // 只有终端 WS 仍直连子端，凭据单独放在 wsToken 里。
+      wsPrefix: '',
+      wsToken: 'as_abc',
+      transport: 'http',
       title: 'Child A',
     })
     expect(remoteExecution.sessionId).toBe('sess-1')
@@ -115,53 +120,67 @@ describe('bindSessionToRemoteEnv', () => {
 // ---------------------------------------------------------------------------
 
 describe('buildRemoteUrl / buildRemoteWsUrl', () => {
-  it('appends token to child paths', async () => {
+  it('routes child paths through the bridge without a child token', async () => {
     vi.stubGlobal('fetch', mockFetch(ENV_RECORDS))
     await bindSessionToRemoteEnv('sess-1', 'http://10.0.0.5:7988')
     const url = buildRemoteUrl('/v1/tools')
-    expect(url).toBe('http://10.0.0.5:7988/v1/tools?token=as_abc')
+    expect(url).toBe(
+      'http://parent.local:7988/v1/env-proxy/http%3A%2F%2F10.0.0.5%3A7988/v1/tools')
     const withQuery = buildRemoteUrl('/v1/workspace/list', { query: { path: 'a b', page: 2 } })
     expect(withQuery).toContain('path=a+b') // URLSearchParams encodes space as +
     expect(withQuery).toContain('page=2')
-    expect(withQuery).toContain('token=as_abc')
+    expect(withQuery).not.toContain('token=')
   })
 
-  it('keeps sub-path base for ws urls', async () => {
+  it('keeps sub-path base for direct-child ws urls', async () => {
     vi.stubGlobal('fetch', mockFetch(ENV_RECORDS))
     await bindSessionToRemoteEnv('sess-2', 'https://sub.example.com:8443')
     const wsUrl = buildRemoteWsUrl('/v1/terminals/ws', { terminal_id: 't1' })
     expect(wsUrl).toBe('wss://sub.example.com:8443/v1/terminals/ws?terminal_id=t1')
   })
 
-  it('tunnel envs bind to the same-origin tunnel-proxy bridge', async () => {
+  it('direct-child ws keeps the child token, http does not', async () => {
+    // 终端 WS 直连子端（浏览器可达时才可用），握手仍需要子端 token；
+    // 同一环境的 HTTP 走桥，token 由母端注入，不出现在浏览器 URL 里。
+    vi.stubGlobal('fetch', mockFetch(ENV_RECORDS))
+    await bindSessionToRemoteEnv('sess-1', 'http://10.0.0.5:7988')
+    expect(buildRemoteWsUrl('/v1/terminals/ws', { terminal_id: 't1' })).toBe(
+      'ws://10.0.0.5:7988/v1/terminals/ws?terminal_id=t1&token=as_abc')
+    expect(buildRemoteUrl('/v1/workspace/list')).not.toContain('token=')
+  })
+
+  it('remote envs bind to the same-origin env-proxy bridge', async () => {
     vi.stubGlobal('fetch', mockFetch(ENV_RECORDS))
     const env = await bindSessionToRemoteEnv('sess-1', 'tunnel:0123456789abcdef')
     expect(env).toMatchObject({
       id: 'tunnel:0123456789abcdef',
-      base: 'http://parent.local:7988/v1/tunnel-proxy/tunnel%3A0123456789abcdef',
-      token: '',
+      base: 'http://parent.local:7988/v1/env-proxy/tunnel%3A0123456789abcdef',
+      wsToken: '',
       host: 'parent.local:7988',
-      prefix: '/v1/tunnel-proxy/tunnel%3A0123456789abcdef',
+      prefix: '/v1/env-proxy/tunnel%3A0123456789abcdef',
+      wsPrefix: '/v1/env-proxy/tunnel%3A0123456789abcdef',
       transport: 'ws-tunnel',
     })
     // HTTP through the bridge: same origin, no child token in the URL
     const url = buildRemoteUrl('/v1/workspace/list', { query: { path: '.' } })
-    expect(url).toBe('http://parent.local:7988/v1/tunnel-proxy/tunnel%3A0123456789abcdef/v1/workspace/list?path=.')
+    expect(url).toBe('http://parent.local:7988/v1/env-proxy/tunnel%3A0123456789abcdef/v1/workspace/list?path=.')
     expect(url).not.toContain('token=')
     // terminal WS through the bridge (protocol follows the page)
     const wsUrl = buildRemoteWsUrl('/v1/terminals/ws', { terminal_id: 't9' })
     expect(wsUrl).toBe(
-      'ws://parent.local:7988/v1/tunnel-proxy/tunnel%3A0123456789abcdef/v1/terminals/ws?terminal_id=t9')
+      'ws://parent.local:7988/v1/env-proxy/tunnel%3A0123456789abcdef/v1/terminals/ws?terminal_id=t9')
     // workspace media URLs point at the bridge too
     expect(remoteWorkspace.content('a.png')).toBe(
-      'http://parent.local:7988/v1/tunnel-proxy/tunnel%3A0123456789abcdef/v1/workspace/content?path=a.png&restrict=1')
+      'http://parent.local:7988/v1/env-proxy/tunnel%3A0123456789abcdef/v1/workspace/content?path=a.png&restrict=1')
   })
 
   it('tunnel id prefix without transport is also treated as tunnel', async () => {
     vi.stubGlobal('fetch', mockFetch({ envs: [{ id: 'tunnel:ffffffffffffffff', url: 'http://direct:1/v1/setup', status: 'online' }] }))
     const env = await bindSessionToRemoteEnv('sess-1', 'tunnel:ffffffffffffffff')
-    expect(env.base).toContain('/v1/tunnel-proxy/')
-    expect(env.token).toBe('')
+    expect(env.base).toContain('/v1/env-proxy/')
+    // 隧道环境的终端 WS 也只能经母端桥接，浏览器不需要子端凭据
+    expect(env.wsPrefix).toContain('/v1/env-proxy/')
+    expect(env.wsToken).toBe('')
   })
 
   it('throws when nothing is bound', () => {
@@ -218,42 +237,46 @@ describe('remoteRequest / remoteWorkspace / remoteSessions', () => {
       .rejects.toMatchObject({ status: 409, code: 'JournalConflict' })
   })
 
-  it('workspace content/download/thumbnail URLs carry the token', async () => {
+  it('workspace content/download/thumbnail URLs point at the bridge', async () => {
+    // 预览/下载是 <img src> / <a href> 这类"URL 消费"，必须每条环境各有前缀，
+    // 否则浏览器缓存会把不同环境的同名文件混在一起；token 也不出现在 URL 里。
     vi.stubGlobal('fetch', mockFetch(ENV_RECORDS))
     await bindSessionToRemoteEnv('sess-1', 'http://10.0.0.5:7988')
+    const bridge = 'http://parent.local:7988/v1/env-proxy/http%3A%2F%2F10.0.0.5%3A7988'
     expect(remoteWorkspace.content('a/b.png')).toBe(
-      'http://10.0.0.5:7988/v1/workspace/content?path=a%2Fb.png&restrict=1&token=as_abc')
+      `${bridge}/v1/workspace/content?path=a%2Fb.png&restrict=1`)
     expect(remoteWorkspace.download('x.txt', false)).toBe(
-      'http://10.0.0.5:7988/v1/workspace/download?path=x.txt&restrict=0&token=as_abc')
+      `${bridge}/v1/workspace/download?path=x.txt&restrict=0`)
     expect(remoteWorkspace.thumbnail('y.png')).toBe(
-      'http://10.0.0.5:7988/v1/workspace/thumbnail?path=y.png&restrict=1&token=as_abc')
+      `${bridge}/v1/workspace/thumbnail?path=y.png&restrict=1`)
   })
 
-  it('workspace list hits the child with full query', async () => {
+  it('workspace list hits the bridge with full query', async () => {
     vi.stubGlobal('fetch', mockFetch(ENV_RECORDS))
     await bindSessionToRemoteEnv('sess-1', 'http://10.0.0.5:7988')
     const listFetch = mockFetch({ entries: [] })
     vi.stubGlobal('fetch', listFetch)
     await remoteWorkspace.list('dir', 1, 20, true, { sort: 'time', nameFilter: 'f' })
     const [url, opts] = listFetch.mock.calls[0]
-    expect(url).toContain('/v1/workspace/list?')
+    expect(url).toContain('/v1/env-proxy/http%3A%2F%2F10.0.0.5%3A7988/v1/workspace/list?')
     expect(url).toContain('path=dir')
     expect(url).toContain('name_filter=f')
-    expect(url).toContain('token=as_abc')
+    expect(url).not.toContain('token=')
     expect(opts.method).toBe('GET')
   })
 
-  it('remoteSessions file-journals endpoints point at the child session', async () => {
+  it('remoteSessions file-journals endpoints point at the bridged child session', async () => {
     vi.stubGlobal('fetch', mockFetch(ENV_RECORDS))
     await bindSessionToRemoteEnv('sess-9', 'http://10.0.0.5:7988')
+    const bridge = 'http://parent.local:7988/v1/env-proxy/http%3A%2F%2F10.0.0.5%3A7988'
     const jf = mockFetch({ turn_keys: [] })
     vi.stubGlobal('fetch', jf)
     await remoteSessions.fileJournals('sess-9')
-    expect(jf.mock.calls[0][0]).toBe('http://10.0.0.5:7988/v1/sessions/sess-9/file-journals?token=as_abc')
+    expect(jf.mock.calls[0][0]).toBe(`${bridge}/v1/sessions/sess-9/file-journals`)
     const df = mockFetch({ diffs: {} })
     vi.stubGlobal('fetch', df)
     await remoteSessions.fileJournalDiff('sess-9', 'turn 1')
-    expect(df.mock.calls[0][0]).toBe('http://10.0.0.5:7988/v1/sessions/sess-9/file-journals/turn%201?token=as_abc')
+    expect(df.mock.calls[0][0]).toBe(`${bridge}/v1/sessions/sess-9/file-journals/turn%201`)
   })
 
   it('fetchRemoteWorkspacePath reads AGENTS_WORKSPACE from child env', async () => {
@@ -265,7 +288,7 @@ describe('remoteRequest / remoteWorkspace / remoteSessions', () => {
 
   it('remoteRequest throws a readable error on a 2xx non-JSON body (never returns null)', async () => {
     // Regression: a 200 + text/html (e.g. the SPA index.html served when the
-    // tunnel-proxy child path fell back to "/") used to surface downstream as
+    // env-proxy child path fell back to "/") used to surface downstream as
     // "Cannot read properties of null (reading 'tools')".
     vi.stubGlobal('fetch', mockFetch(ENV_RECORDS))
     await bindSessionToRemoteEnv('sess-1', 'tunnel:0123456789abcdef')
@@ -370,14 +393,14 @@ describe('remoteWorkspace.uploadChunk', () => {
     await expect(handle.promise).resolves.toEqual({ status: 'uploaded' })
   })
 
-  it('PUTs the chunk to the tunnel bridge with the upload headers', async () => {
+  it('PUTs the chunk to the env bridge with the upload headers', async () => {
     await bindTunnel()
     const chunk = { parallel_id: 2, offset: 8, size: 4, file_size: 12 }
     const handle = remoteWorkspace.uploadChunk('u1', chunk, 'data', () => {})
     const xhr = FakeXHR.instances[0]
 
     expect(xhr.method).toBe('PUT')
-    expect(xhr.url).toBe('http://parent.local:7988/v1/tunnel-proxy/tunnel%3A0123456789abcdef'
+    expect(xhr.url).toBe('http://parent.local:7988/v1/env-proxy/tunnel%3A0123456789abcdef'
       + '/v1/workspace/upload/u1/chunk/2')
     expect(xhr.headers['X-Upload-Offset']).toBe('8')
     expect(xhr.headers['X-Upload-Size']).toBe('4')
@@ -385,6 +408,22 @@ describe('remoteWorkspace.uploadChunk', () => {
     // Tunnel envs carry no child token: the child self-authorizes.
     expect(xhr.headers.Authorization).toBeUndefined()
 
+    xhr.respond(200, '{}')
+    await handle.promise
+  })
+
+  it('PUTs a direct-env chunk to the bridge too, without the child token', async () => {
+    // 直连环境的上传同样经母端桥：浏览器不需要子端凭据，母端在转发时注入
+    // 登记的 setup token（子端对桥请求按本地请求自授权）。
+    vi.stubGlobal('fetch', mockFetch(ENV_RECORDS))
+    await bindSessionToRemoteEnv('sess-1', 'http://10.0.0.5:7988')
+    const handle = remoteWorkspace.uploadChunk(
+      'u1', { parallel_id: 0, offset: 0, size: 4, file_size: 4 }, 'data')
+    const xhr = FakeXHR.instances[0]
+    expect(xhr.url).toBe('http://parent.local:7988/v1/env-proxy/http%3A%2F%2F10.0.0.5%3A7988'
+      + '/v1/workspace/upload/u1/chunk/0')
+    expect(xhr.url).not.toContain('token=')
+    expect(xhr.headers.Authorization).toBeUndefined()
     xhr.respond(200, '{}')
     await handle.promise
   })

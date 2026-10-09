@@ -22,7 +22,10 @@ import logging
 import re
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
+from typing import Iterator, Optional
 
 from runtime.remote_env_manager import snapshot_from_hello
 from runtime.tunnel_protocol import (
@@ -252,31 +255,40 @@ class HandlerTunnelMixin:
             pass
 
     # ------------------------------------------------------------------
-    # Parent side: browser bridge (tunnel-mode workspace / terminal)
+    # Parent side: browser bridge (any registered env, tunnel or direct)
     # ------------------------------------------------------------------
 
     # Response headers forwarded to the browser (everything else belongs to
     # the child's local response and would confuse keep-alive framing here).
-    _TUNNEL_PROXY_FORWARD_RESP_HEADERS = {
+    _ENV_PROXY_FORWARD_RESP_HEADERS = {
         "content-type", "content-disposition", "content-length",
         "content-encoding",
         "cache-control", "content-range", "accept-ranges",
         "etag", "last-modified",
     }
     # Browser request headers forwarded to the child (the browser cookie is
-    # not forwarded — it is meaningless to the child; auth is handled by the
-    # child itself, which self-authorizes requests arriving over the tunnel).
-    _TUNNEL_PROXY_FORWARD_REQ_HEADERS = {
+    # not forwarded -- it is meaningless to the child; auth is handled by the
+    # child itself, which self-authorizes requests arriving over the tunnel,
+    # while direct children are authenticated with the registered setup token
+    # injected by _env_proxy_direct).
+    _ENV_PROXY_FORWARD_REQ_HEADERS = {
         "content-type", "x-upload-offset", "x-upload-size", "x-file-size",
         "range",
     }
+    # Direct-child transport: read block size (a large download is streamed to
+    # the browser, never buffered whole on the parent) and network timeout.
+    _ENV_PROXY_READ_BLOCK = 64 * 1024
+    _ENV_PROXY_DIRECT_TIMEOUT = 600.0
 
-    def _tunnel_proxy_env(self, env_id: str):
-        """Validate env_id as a tunnel env with a record; returns (record, tunnel_manager)."""
-        from runtime.tunnel_protocol import is_tunnel_env_id
-        if not is_tunnel_env_id(env_id):
-            self._send_json_error(400, "Not a tunnel environment")
-            return None, None
+    def _env_proxy_env(self, env_id: str):
+        """Look *env_id* up in the remote-env registry; (record, tunnel_manager).
+
+        Every registered environment can be bridged -- tunnel **and** direct.
+        The browser never needs a route to the child (it may be behind a
+        firewall that only the parent can reach); the parent does the talking.
+        The id is resolved against the registry, so it can never be used to
+        dial an arbitrary host.
+        """
         manager = self.server.remote_env_manager  # type: ignore[attr-defined]
         try:
             record = manager.get(env_id)
@@ -285,7 +297,13 @@ class HandlerTunnelMixin:
             return None, None
         return record, getattr(self.server, "tunnel_manager", None)
 
-    def _tunnel_proxy_child_path(self, env_id: str) -> str:
+    @staticmethod
+    def _env_proxy_is_tunnel(record: dict, env_id: str) -> bool:
+        """True when the env is reached over its reverse WS tunnel."""
+        from runtime.tunnel_protocol import is_tunnel_env_id
+        return is_tunnel_env_id(env_id) or str(record.get("transport") or "") == "ws-tunnel"
+
+    def _env_proxy_child_path(self, env_id: str) -> str:
         """Rebuild the child path (+query) from the incoming request.
 
         ``env_id`` arrives already unquoted (the router decodes it), but the
@@ -296,8 +314,8 @@ class HandlerTunnelMixin:
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         for prefix in (
-            "/v1/tunnel-proxy/" + urllib.parse.quote(env_id, safe=""),
-            f"/v1/tunnel-proxy/{env_id}",
+            "/v1/env-proxy/" + urllib.parse.quote(env_id, safe=""),
+            f"/v1/env-proxy/{env_id}",
         ):
             if path.startswith(prefix):
                 path = path[len(prefix):] or "/"
@@ -308,38 +326,46 @@ class HandlerTunnelMixin:
             path = f"{path}?{parsed.query}"
         return path
 
-    def _handle_tunnel_proxy(self, env_id: str) -> None:
-        """ANY /v1/tunnel-proxy/{env_id}/{child path...} — browser bridge.
+    def _handle_env_proxy(self, env_id: str) -> None:
+        """ANY /v1/env-proxy/{env_id}/{child path...} — browser bridge.
 
         The browser talks to the parent (same origin: cookies, no CORS, no
-        child token juggling); the parent forwards the request over the
-        child's tunnel and streams the response back.  Covers workspace
+        child token juggling); the parent forwards the request to the child
+        and streams the response back.  Covers workspace
         list/search/content/download/create/move/delete and chunk uploads.
+
+        Two transports, chosen from the env record: a tunnel env is reached
+        over its reverse WS tunnel (the child may be behind NAT), a direct env
+        over plain HTTP from this process (the child may be firewalled against
+        the browser but reachable from the parent).  Everything else -- path
+        rebuilding, header whitelists, body framing, response streaming,
+        diagnostics -- is shared.
         """
-        record, tunnel_manager = self._tunnel_proxy_env(env_id)
+        record, tunnel_manager = self._env_proxy_env(env_id)
         if record is None:
             return
-        if tunnel_manager is None or not tunnel_manager.is_online(env_id):
+        is_tunnel = self._env_proxy_is_tunnel(record, env_id)
+        if is_tunnel and (tunnel_manager is None or not tunnel_manager.is_online(env_id)):
             self._send_json_response(502, {
                 "error": "child_unreachable",
                 "message": "Child tunnel is offline.",
             })
             return
 
-        child_path = self._tunnel_proxy_child_path(env_id)
+        child_path = self._env_proxy_child_path(env_id)
         headers = {
             k: v for k, v in self.headers.items()
-            if k.lower() in self._TUNNEL_PROXY_FORWARD_REQ_HEADERS
+            if k.lower() in self._ENV_PROXY_FORWARD_REQ_HEADERS
         }
 
-        # How the request body reaches the child.  A child that advertises
-        # CAP_REQ_CHUNK_ID can take the body incrementally: the parent reads
-        # it off the browser socket and forwards each block as an OP_REQ_CHUNK
-        # pair, so a slow upload no longer sits at "100%" on the browser while
-        # the parent waits to have read the whole body *and* released the
-        # tunnel's send lock.  A child without the capability reads bodies
-        # inline and needs the legacy single atomic sequence, so the whole
-        # body is buffered here exactly as before (backward compatible).
+        # How the request body reaches the child.  A tunnel child that
+        # advertises CAP_REQ_CHUNK_ID can take the body incrementally: the
+        # parent reads it off the browser socket and forwards each block as an
+        # OP_REQ_CHUNK pair, so a slow upload no longer sits at "100%" on the
+        # browser while the parent waits to have read the whole body *and*
+        # released the tunnel's send lock.  A child without the capability
+        # reads bodies inline and needs the legacy single atomic sequence, so
+        # the whole body is buffered here exactly as before.
         from runtime.handler_base import _MAX_PUSH_BODY_BYTES
         chunked = False
         content_length = 0
@@ -357,7 +383,7 @@ class HandlerTunnelMixin:
                 content_length = 0
             chunked = "chunked" in (self.headers.get("Transfer-Encoding") or "").lower()
             if chunked or content_length > 0:
-                if tunnel_manager.env_supports_req_chunks(env_id):
+                if is_tunnel and tunnel_manager.env_supports_req_chunks(env_id):
                     streaming = True
                 elif chunked:
                     # Some mobile browsers send Blob PUT bodies with
@@ -381,31 +407,37 @@ class HandlerTunnelMixin:
         streamed_bytes = {"n": 0}
         try:
             if streaming:
-                result = self._tunnel_proxy_stream_body(
+                result = self._env_proxy_stream_body(
                     tunnel_manager, env_id, child_path, headers,
                     chunked, content_length, streamed_bytes)
                 if result is None:
                     return  # body read failed; error response already sent
                 status, resp_headers, chunks, body_len = result
-            else:
+                blocks = self._tunnel_stream_blocks(chunks)
+            elif is_tunnel:
                 body_len = len(body) if body else 0
                 status, resp_headers, chunks = tunnel_manager.call_env_stream(
                     env_id, self.command, child_path, headers, body, timeout=600,
                 )
+                blocks = self._tunnel_stream_blocks(chunks)
+            else:
+                body_len = len(body) if body else 0
+                status, resp_headers, blocks = self._env_proxy_direct(
+                    record, child_path, headers, body)
         except Exception as exc:
             body_len = streamed_bytes["n"] if streaming else body_len
-            logger.warning("Tunnel proxy %s %s body=%dB -> 502 after %.0fms: %s",
+            logger.warning("Env proxy %s %s body=%dB -> 502 after %.0fms: %s",
                            self.command, child_path, body_len,
                            (time.monotonic() - proxy_t0) * 1000, exc)
             self._send_json_response(502, {
                 "error": "child_unreachable",
-                "message": f"Cannot reach child environment over tunnel: {exc}",
+                "message": f"Cannot reach child environment: {exc}",
             })
             return
 
         fwd_headers = {
             k: v for k, v in resp_headers.items()
-            if k.lower() in self._TUNNEL_PROXY_FORWARD_RESP_HEADERS
+            if k.lower() in self._ENV_PROXY_FORWARD_RESP_HEADERS
         }
         content_length = fwd_headers.get("Content-Length")
         self.send_response(status)
@@ -424,10 +456,7 @@ class HandlerTunnelMixin:
         # log alone (the child may run on a machine nobody can log into).
         peek = bytearray()
         try:
-            while True:
-                chunk = chunks.get(timeout=300)
-                if chunk is None:
-                    break
+            for chunk in blocks:
                 if status >= 400 and len(peek) < 256:
                     peek.extend(chunk[: 256 - len(peek)])
                 if content_length:
@@ -446,15 +475,69 @@ class HandlerTunnelMixin:
             detail = ""
             if peek:
                 detail = " child said: " + peek.decode("utf-8", "replace").replace("\n", " ")
-            logger.warning("Tunnel proxy %s %s body=%dB -> %d in %.0fms%s",
+            logger.warning("Env proxy %s %s body=%dB -> %d in %.0fms%s",
                            self.command, child_path, body_len, status, elapsed_ms, detail)
         else:
-            logger.info("Tunnel proxy %s %s body=%dB -> %d in %.0fms",
+            logger.info("Env proxy %s %s body=%dB -> %d in %.0fms",
                         self.command, child_path, body_len, status, elapsed_ms)
 
-    def _tunnel_proxy_stream_body(self, tunnel_manager, env_id, child_path, headers,
-                                  chunked, content_length, progress):
-        """Forward the browser's request body to the child incrementally.
+    @staticmethod
+    def _tunnel_stream_blocks(chunks) -> Iterator[bytes]:
+        """Adapt a tunnel stream queue to the block iterator the response
+        writer consumes (a ``None`` item marks end of body)."""
+        while True:
+            chunk = chunks.get(timeout=300)
+            if chunk is None:
+                return
+            yield chunk
+
+    def _env_proxy_direct(self, record: dict, child_path: str, headers: dict,
+                          body: Optional[bytes]) -> tuple[int, dict, Iterator[bytes]]:
+        """Direct (http/https) child transport for the browser bridge.
+
+        Returns ``(status, resp_headers, blocks)``.  The response is read in
+        blocks so a large preview/download is streamed to the browser instead
+        of landing whole in parent memory.  urllib raises HTTPError for
+        4xx/5xx, but the child's own verdict (409 UPLOAD_NOT_READY, 400 "file
+        does not exist", ...) is exactly what the browser needs, so an error
+        response is handed back as a normal one.
+
+        Auth: the setup token registered for this environment is presented as
+        an ``Authorization: Bearer`` header — the child only honours ``?token=``
+        for GET, while the bridge also carries PUT/POST/DELETE (uploads,
+        renames, deletes).  The browser's own cookie/Authorization never leaves
+        the parent, and the browser no longer holds the child's credential.
+        """
+        from runtime.remote_tool_proxy import child_endpoint
+        base, token = child_endpoint(record)
+        if not base:
+            raise RuntimeError(f"remote environment has no direct URL: {record.get('id')}")
+        url = base + child_path
+        req_headers = {"User-Agent": "agent-service-env-proxy/1.0"}
+        req_headers.update(headers)
+        if token and "Authorization" not in req_headers:
+            req_headers["Authorization"] = f"Bearer {token}"
+        req = urllib.request.Request(url, data=body, headers=req_headers,
+                                     method=self.command)
+
+        def _blocks(fp) -> Iterator[bytes]:
+            while True:
+                block = fp.read(self._ENV_PROXY_READ_BLOCK)
+                if not block:
+                    return
+                yield block
+
+        try:
+            resp = urllib.request.urlopen(req, timeout=self._ENV_PROXY_DIRECT_TIMEOUT)
+        except urllib.error.HTTPError as exc:
+            headers_out = dict(exc.headers.items()) if exc.headers else {}
+            return exc.code, headers_out, _blocks(exc)
+        headers_out = dict(resp.headers.items()) if resp.headers else {}
+        return resp.status, headers_out, _blocks(resp)
+
+    def _env_proxy_stream_body(self, tunnel_manager, env_id, child_path, headers,
+                               chunked, content_length, progress):
+        """Forward the browser's request body to a tunnel child incrementally.
 
         Reads the body straight off ``self.rfile`` and hands each block to
         :meth:`TunnelManager.call_env_stream_reader`, which frames it into an
@@ -510,14 +593,22 @@ class HandlerTunnelMixin:
             return _fail(400, "Failed to read request body")
         return status, resp_headers, chunks, progress["n"]
 
-    def _handle_tunnel_proxy_ws(self, env_id: str) -> None:
-        """GET /v1/tunnel-proxy/{env_id}/v1/terminals/ws — terminal bridge.
+    def _handle_env_proxy_ws(self, env_id: str) -> None:
+        """GET /v1/env-proxy/{env_id}/v1/terminals/ws — terminal bridge.
 
         Browser WebSocket ↔ parent tunnel stream ↔ child terminal WebSocket.
         Frame types are preserved (the terminal protocol speaks text).
+
+        Tunnel environments only.  A direct environment keeps the
+        browser-direct terminal WS: the browser can already reach it, and
+        bridging a long-lived interactive socket through the parent would add
+        a hop without adding reachability.
         """
-        record, tunnel_manager = self._tunnel_proxy_env(env_id)
+        record, tunnel_manager = self._env_proxy_env(env_id)
         if record is None:
+            return
+        if not self._env_proxy_is_tunnel(record, env_id):
+            self._send_json_error(400, "Not a tunnel environment")
             return
         if tunnel_manager is None or not tunnel_manager.is_online(env_id):
             self._send_json_response(502, {
@@ -543,7 +634,7 @@ class HandlerTunnelMixin:
 
         # Child terminal path (the child self-authorizes the local handshake
         # when its authorization is enabled).
-        child_path = self._tunnel_proxy_child_path(env_id)
+        child_path = self._env_proxy_child_path(env_id)
         try:
             stream = tunnel_manager.open_stream_env(
                 env_id, child_path, timeout=15,
@@ -571,7 +662,7 @@ class HandlerTunnelMixin:
                 except Exception:
                     pass
 
-        pump = threading.Thread(target=_pump_to_browser, name="tunnel-proxy-ws", daemon=True)
+        pump = threading.Thread(target=_pump_to_browser, name="env-proxy-ws", daemon=True)
         pump.start()
         try:
             while True:

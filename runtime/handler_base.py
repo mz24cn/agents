@@ -203,7 +203,7 @@ _ROUTES: dict[str, list] = {
         (re.compile(r"^/v1/sessions/([^/]+)/file-journals$"), "_handle_get_file_journals", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/terminals$"), "_handle_list_terminals", ()),
         # Parent-side browser bridge: env_id in path, rest forwarded to child.
-        (re.compile(r"^/v1/tunnel-proxy/([^/]+)(?:/.*)?$"), "_handle_tunnel_proxy", (urllib.parse.unquote,)),
+        (re.compile(r"^/v1/env-proxy/([^/]+)(?:/.*)?$"), "_handle_env_proxy", (urllib.parse.unquote,)),
     ],
     "POST": [
         (re.compile(r"^/v1/auth/login$"), "_handle_auth_login", ()),
@@ -243,7 +243,7 @@ _ROUTES: dict[str, list] = {
         (re.compile(r"^/v1/workspace/copy$"), "_handle_workspace_copy", ()),
         (re.compile(r"^/v1/workspace/upload/init$"), "_handle_workspace_upload_init", ()),
         (re.compile(r"^/v1/workspace/upload/([^/]+)/complete$"), "_handle_workspace_upload_complete", (urllib.parse.unquote,)),
-        (re.compile(r"^/v1/tunnel-proxy/([^/]+)(?:/.*)?$"), "_handle_tunnel_proxy", (urllib.parse.unquote,)),
+        (re.compile(r"^/v1/env-proxy/([^/]+)(?:/.*)?$"), "_handle_env_proxy", (urllib.parse.unquote,)),
     ],
     "PUT": [
         (re.compile(r"^/v1/models/([^/]+)$"), "_handle_update_model", ()),
@@ -253,7 +253,7 @@ _ROUTES: dict[str, list] = {
         (re.compile(r"^/v1/agents/([^/]+)$"), "_handle_update_agent", ()),
         (re.compile(r"^/v1/remote-envs/(.+)$"), "_handle_remote_envs_update", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/workspace/upload/([^/]+)/chunk/(\d+)$"), "_handle_workspace_upload_chunk", (urllib.parse.unquote, int)),
-        (re.compile(r"^/v1/tunnel-proxy/([^/]+)(?:/.*)?$"), "_handle_tunnel_proxy", (urllib.parse.unquote,)),
+        (re.compile(r"^/v1/env-proxy/([^/]+)(?:/.*)?$"), "_handle_env_proxy", (urllib.parse.unquote,)),
     ],
     "DELETE": [
         (re.compile(r"^/v1/models/([^/]+)$"), "_handle_delete_model", ()),
@@ -269,7 +269,7 @@ _ROUTES: dict[str, list] = {
         (re.compile(r"^/v1/workspace/delete$"), "_handle_workspace_delete", ()),
         (re.compile(r"^/v1/workspace/upload/([^/]+)$"), "_handle_workspace_upload_cancel", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/terminals/([^/]+)$"), "_handle_delete_terminal", ()),
-        (re.compile(r"^/v1/tunnel-proxy/([^/]+)(?:/.*)?$"), "_handle_tunnel_proxy", (urllib.parse.unquote,)),
+        (re.compile(r"^/v1/env-proxy/([^/]+)(?:/.*)?$"), "_handle_env_proxy", (urllib.parse.unquote,)),
     ],
 }
 
@@ -639,20 +639,20 @@ class HandlerBaseMixin:
             # must be handled before the JSON route table; credentials are
             # enforced by the /v1/ gate above (GET ?token= or session cookie).
             # Trust boundary: with parent auth DISABLED there are no
-            # credentials to check, so /v1/tunnel/* and /v1/tunnel-proxy/*
+            # credentials to check, so /v1/tunnel/* and /v1/env-proxy/*
             # are open to anyone who can reach this port (a connected
             # tunnel can execute the child's local tools). Keep the port
             # off untrusted networks when the parent has no password set.
             if path == "/v1/tunnel/ws" and self.headers.get("Upgrade", "").lower() == "websocket":
                 self._handle_tunnel_ws()
                 return
-            # Tunnel browser bridge terminal WS: /v1/tunnel-proxy/{env}/v1/terminals/ws
-            if path.startswith("/v1/tunnel-proxy/") and path.endswith("/v1/terminals/ws") \
+            # Tunnel browser bridge terminal WS: /v1/env-proxy/{env}/v1/terminals/ws
+            if path.startswith("/v1/env-proxy/") and path.endswith("/v1/terminals/ws") \
                     and self.headers.get("Upgrade", "").lower() == "websocket":
                 # 浏览器用 encodeURIComponent 构造桥接 URL（tunnel%3A...），
                 # 原始路径里 env id 仍是百分号编码 —— 先 unquote 再交给处理器。
-                env_id = urllib.parse.unquote(path[len("/v1/tunnel-proxy/"):].split("/", 1)[0])
-                self._handle_tunnel_proxy_ws(env_id)
+                env_id = urllib.parse.unquote(path[len("/v1/env-proxy/"):].split("/", 1)[0])
+                self._handle_env_proxy_ws(env_id)
                 return
             if not self._dispatch_route("GET", path):
                 self._send_json_error(404, f"Not found: {self.path}")

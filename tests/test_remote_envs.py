@@ -1124,10 +1124,15 @@ def _seed_env(server, env_id, url, snapshot=None, online=None):
 
 
 @contextlib.contextmanager
-def _real_child_server(tmp_path, name="child_data"):
+def _real_child_server(tmp_path, name="child_data", workspace=None):
     """Start a second real RuntimeHTTPServer (isolated data dir) as the child."""
     child_data = tmp_path / name
     child_data.mkdir()
+    if workspace:
+        os.makedirs(workspace, exist_ok=True)
+        (child_data / "env.json").write_text(
+            json.dumps({"AGENTS_WORKSPACE": workspace}), encoding="utf-8"
+        )
     with patch("runtime.server._MODELS_PATH", str(child_data / "models.json")), \
          patch("runtime.server._TOOLS_PATH", str(child_data / "tools.json")), \
          patch("runtime.server._PROMPT_TEMPLATES_PATH", str(child_data / "prompt_templates.json")), \
@@ -1450,3 +1455,142 @@ class TestSharedProxyCache:
         manager.get_proxy("http://10.0.0.7:7988")
         manager.remove("http://10.0.0.7:7988")
         assert manager._proxies == {}
+
+
+# ---------------------------------------------------------------------------
+# Browser bridge for DIRECT children: /v1/env-proxy/{env_id}/{child path}
+# ---------------------------------------------------------------------------
+
+
+def _bridge(parent, env_id, child_path, method="GET", payload=None, headers=None):
+    """Call the parent's same-origin bridge; returns (status, raw bytes)."""
+    url = (f"http://127.0.0.1:{parent.port}/v1/env-proxy/"
+           f"{urllib.parse.quote(env_id, safe='')}{child_path}")
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    req_headers = dict(headers or {})
+    if data is not None:
+        req_headers.setdefault("Content-Type", "application/json")
+    req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read()
+
+
+class TestEnvProxyDirectBridge:
+    """直连子环境的文件管理请求也经母端同源桥，浏览器不再直连子端。
+
+    隧道环境的桥早已存在；这里验证同一个 handler 的**直连传输**：路径重建、
+    请求/响应头白名单、错误体透传都是共用的，只有最后一跳（urllib vs 隧道）
+    不同。要点是浏览器永远不需要子端地址与 token —— 母端从登记记录里注入。
+    """
+
+    def test_reads_and_writes_are_forwarded(self, server, tmp_path):
+        ws = str(tmp_path / "child_ws")
+        with _real_child_server(tmp_path, workspace=ws) as (child, _data):
+            _wait_child_hello(child)
+            env_id = _add_env(server, f"http://127.0.0.1:{child.port}/v1/setup")
+            (tmp_path / "child_ws" / "bridged.txt").write_text("bridge ok", encoding="utf-8")
+
+            status, raw = _bridge(
+                server, env_id, "/v1/workspace/list?path=.&page=1&page_size=50&restrict=0")
+            assert status == 200, raw
+            names = [e.get("name") for e in json.loads(raw).get("files", [])]
+            assert "bridged.txt" in names, names
+
+            status, raw = _bridge(
+                server, env_id, "/v1/workspace/content?path=bridged.txt&restrict=0")
+            assert status == 200, raw
+            assert raw == b"bridge ok"
+
+            status, raw = _bridge(server, env_id, "/v1/workspace/mkdir",
+                                  method="POST", payload={"parent_path": ".", "name": "bridged_dir"})
+            assert status == 200, raw
+            assert (tmp_path / "child_ws" / "bridged_dir").is_dir()
+
+    def test_query_and_percent_encoded_paths_survive_the_hop(self, server, tmp_path):
+        """预览/下载是 URL 消费的接口：路径与查询参数必须原样到达子端。"""
+        ws = str(tmp_path / "child_ws")
+        with _real_child_server(tmp_path, workspace=ws) as (child, _data):
+            _wait_child_hello(child)
+            env_id = _add_env(server, f"http://127.0.0.1:{child.port}/v1/setup")
+            (tmp_path / "child_ws" / "a b 图.png").write_bytes(b"\x89PNG\r\n\x1a\n fake")
+
+            quoted = urllib.parse.quote("a b 图.png", safe="")
+            status, raw = _bridge(
+                server, env_id, f"/v1/workspace/content?path={quoted}&restrict=0")
+            assert status == 200, raw
+            assert raw.startswith(b"\x89PNG")
+
+    def test_child_token_is_injected_by_the_parent(self, server, tmp_path):
+        """子端开了密码：浏览器不带任何凭据，母端用登记的 token 代它授权。"""
+        ws = str(tmp_path / "child_ws")
+        with _real_child_server(tmp_path, workspace=ws) as (child, _data):
+            _wait_child_hello(child)
+            status, config = _request(child, "POST", "/v1/auth/config", {"password": "child-pass"})
+            assert status == 200, config
+            token = config.get("setup_token", "")
+            assert token
+            env_id = _add_env(
+                server, f"http://127.0.0.1:{child.port}/v1/setup?token={token}")
+
+            # 不带凭据直连子端会被拒；走母端桥则母端注入 token
+            with pytest.raises(urllib.error.HTTPError) as exc:
+                urllib.request.urlopen(
+                    f"http://127.0.0.1:{child.port}/v1/workspace/list?path=.&restrict=0",
+                    timeout=10)
+            assert exc.value.code == 401
+
+            status, raw = _bridge(
+                server, env_id, "/v1/workspace/list?path=.&page=1&page_size=50&restrict=0")
+            assert status == 200, raw
+            assert "files" in json.loads(raw)
+
+    def test_writes_are_authorized_too(self, server, tmp_path):
+        """子端 ?token= 的豁免只对 GET 生效；PUT/POST/DELETE 要靠 Authorization 头。
+
+        桥替浏览器补的就是这个头 —— 否则上传分片、改名、删除会在子端 401。
+        """
+        ws = str(tmp_path / "child_ws")
+        with _real_child_server(tmp_path, workspace=ws) as (child, _data):
+            _wait_child_hello(child)
+            status, config = _request(child, "POST", "/v1/auth/config", {"password": "child-pass"})
+            assert status == 200, config
+            token = config.get("setup_token", "")
+            assert token
+            env_id = _add_env(
+                server, f"http://127.0.0.1:{child.port}/v1/setup?token={token}")
+
+            status, raw = _bridge(server, env_id, "/v1/workspace/mkdir", method="POST",
+                                  payload={"parent_path": ".", "name": "authed_dir"})
+            assert status == 200, raw
+            assert (tmp_path / "child_ws" / "authed_dir").is_dir()
+
+            status, raw = _bridge(server, env_id, "/v1/workspace/nope.txt", method="DELETE")
+            assert status != 401, raw
+
+    def test_unknown_env_id_is_404(self, server):
+        """桥只按 remote_envs.json 里的 id 寻址，不会被用来拨任意主机。"""
+        for bad in ("http://nope.example:1", "tunnel:0000000000000000"):
+            status, _raw = _bridge(server, bad, "/v1/env")
+            assert status == 404, (bad, status)
+
+    def test_unreachable_child_is_502(self, server):
+        env_id = _seed_env(server, "http://127.0.0.1:1", "http://127.0.0.1:1/v1/setup")
+        status, raw = _bridge(server, env_id, "/v1/workspace/list?path=.&restrict=0")
+        assert status == 502, raw
+        body = json.loads(raw)
+        assert body.get("error") == "child_unreachable", body
+        assert body.get("message"), body
+
+    def test_child_verdict_reaches_the_browser(self, server, tmp_path):
+        """子端自己的 4xx（文件不存在 / 上传缺片）必须原样回到浏览器。"""
+        ws = str(tmp_path / "child_ws")
+        with _real_child_server(tmp_path, workspace=ws) as (child, _data):
+            _wait_child_hello(child)
+            env_id = _add_env(server, f"http://127.0.0.1:{child.port}/v1/setup")
+            status, raw = _bridge(
+                server, env_id, "/v1/workspace/content?path=nope.txt&restrict=0")
+            assert status == 400, (status, raw)
+            assert "nope.txt" in raw.decode("utf-8", "replace")

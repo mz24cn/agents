@@ -423,7 +423,7 @@ def test_register_with_parent_address_persists_setup_source(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Browser bridge: /v1/tunnel-proxy/{env_id}/... (HTTP + terminal WS)
+# Browser bridge: /v1/env-proxy/{env_id}/... (HTTP + terminal WS)
 # ---------------------------------------------------------------------------
 
 class _WsBrowserSock:
@@ -483,7 +483,7 @@ def _ws_browser_connect(port: int, path: str) -> _WsBrowserSock:
     return _WsBrowserSock(raw, rest)
 
 
-def test_tunnel_proxy_browser_bridge(tmp_path):
+def test_env_proxy_browser_bridge(tmp_path):
     """The parent's browser bridge: same-origin HTTP proxy + terminal WS into
     a registered child (what the UI uses in tunnel mode)."""
     with _real_server(tmp_path, "parent_data") as parent, \
@@ -495,7 +495,7 @@ def test_tunnel_proxy_browser_bridge(tmp_path):
         status, body = _request(child_srv, "POST", "/v1/tunnel/parent/register")
         assert status == 200, body
         env_id = body["env_id"]
-        base = f"http://127.0.0.1:{parent_srv.port}/v1/tunnel-proxy/{env_id}"
+        base = f"http://127.0.0.1:{parent_srv.port}/v1/env-proxy/{env_id}"
 
         def _online():
             e = next((e for e in _parent_tunnel_envs(parent_srv) if e["id"] == env_id), None)
@@ -522,15 +522,17 @@ def test_tunnel_proxy_browser_bridge(tmp_path):
             assert resp.status == 200
         assert (tmp_path / "child_ws" / "bridge_dir").is_dir()
 
-        # 2. error paths: unknown tunnel env -> 404, non-tunnel id -> 400
-        for bad, expected in (("tunnel:0000000000000000", 404), ("env-x", 400)):
+        # 2. error paths: an id with no remote-env record -> 404 (the bridge
+        # resolves ids against the registry, so it can never dial an
+        # arbitrary host; direct envs are bridged too, see test_remote_envs)
+        for bad in ("tunnel:0000000000000000", "env-x"):
             try:
                 urllib.request.urlopen(
-                    f"http://127.0.0.1:{parent_srv.port}/v1/tunnel-proxy/{bad}/v1/env",
+                    f"http://127.0.0.1:{parent_srv.port}/v1/env-proxy/{bad}/v1/env",
                     timeout=10)
                 raise AssertionError("expected HTTP error")
             except urllib.error.HTTPError as exc:
-                assert exc.code == expected, (bad, exc.code)
+                assert exc.code == 404, (bad, exc.code)
 
         # 3. offline child -> 502, then back online
         tc = child_srv._server.tunnel_client
@@ -574,10 +576,10 @@ def test_tunnel_proxy_browser_bridge(tmp_path):
             ws.close()
 
 
-def test_tunnel_proxy_forwards_bodyless_delete(tmp_path):
+def test_env_proxy_forwards_bodyless_delete(tmp_path):
     """Regression: a bridged DELETE with no body must reach the child.
 
-    ``_handle_tunnel_proxy`` used to demand ``Content-Length > 0`` for every
+    ``_handle_env_proxy`` used to demand ``Content-Length > 0`` for every
     non-GET/HEAD method, so a bodyless ``DELETE /v1/terminals/{id}`` was
     answered with 400 by the *parent* and never forwarded. Destroying a
     terminal in tunnel mode therefore left the child's PTY session alive
@@ -591,7 +593,7 @@ def test_tunnel_proxy_forwards_bodyless_delete(tmp_path):
         status, body = _request(child_srv, "POST", "/v1/tunnel/parent/register")
         assert status == 200, body
         env_id = body["env_id"]
-        base = f"http://127.0.0.1:{parent_srv.port}/v1/tunnel-proxy/{env_id}"
+        base = f"http://127.0.0.1:{parent_srv.port}/v1/env-proxy/{env_id}"
 
         def _online():
             e = next((e for e in _parent_tunnel_envs(parent_srv) if e["id"] == env_id), None)
@@ -641,7 +643,7 @@ def test_tunnel_proxy_forwards_bodyless_delete(tmp_path):
             assert exc.code == 404, exc.code
 
 
-def test_tunnel_proxy_bridge_with_child_auth(tmp_path):
+def test_env_proxy_bridge_with_child_auth(tmp_path):
     """Browser bridge into a child with authorization enabled: no child-side
     token is configured on the parent — the child self-authorizes requests
     arriving over the tunnel (its own session cookie for HTTP, a fresh setup
@@ -666,7 +668,7 @@ def test_tunnel_proxy_bridge_with_child_auth(tmp_path):
             headers={"Authorization": f"Bearer {api_key}"})
         assert status == 200, body
         env_id = body["env_id"]
-        base = f"http://127.0.0.1:{parent_srv.port}/v1/tunnel-proxy/{env_id}"
+        base = f"http://127.0.0.1:{parent_srv.port}/v1/env-proxy/{env_id}"
         def _online():
             e = next((e for e in _parent_tunnel_envs(parent_srv) if e["id"] == env_id), None)
             return e if e and e.get("online") is True else None
@@ -729,7 +731,7 @@ def test_tunnel_proxy_bridge_with_child_auth(tmp_path):
             ws.close()
 
 
-def test_tunnel_proxy_bridge_percent_encoded_env_id(tmp_path):
+def test_env_proxy_bridge_percent_encoded_env_id(tmp_path):
     """Regression: the browser builds bridge URLs with encodeURIComponent
     (``tunnel%3A...``), so the raw request path carries a percent-encoded env
     id.  The parent must strip the *encoded* prefix when rebuilding the child
@@ -752,7 +754,7 @@ def test_tunnel_proxy_bridge_percent_encoded_env_id(tmp_path):
         env_id = body["env_id"]
         enc_id = urllib.parse.quote(env_id, safe="")
         assert enc_id != env_id  # the "tunnel:" colon is what the browser encodes
-        base = f"http://127.0.0.1:{parent_srv.port}/v1/tunnel-proxy/{enc_id}"
+        base = f"http://127.0.0.1:{parent_srv.port}/v1/env-proxy/{enc_id}"
 
         def _online():
             e = next((e for e in _parent_tunnel_envs(parent_srv) if e["id"] == env_id), None)
@@ -842,7 +844,7 @@ def _bridge_upload(parent_srv, env_id, name, payload, tag=""):
     """Browser-style workspace upload through the parent tunnel bridge:
     init -> chunk PUTs (Content-Length framing) -> complete.  Returns the
     (status, body) of the final complete call."""
-    base = f"http://127.0.0.1:{parent_srv.port}/v1/tunnel-proxy/{env_id}"
+    base = f"http://127.0.0.1:{parent_srv.port}/v1/env-proxy/{env_id}"
 
     def _raw(method, path, data=None, headers=None):
         req = urllib.request.Request(
@@ -936,14 +938,14 @@ def test_tunnel_proxy_browser_chunked_body(tmp_path):
             return e if e and e.get("online") is True else None
         _wait_until(_online, message="tunnel env online")
 
-        base = f"http://127.0.0.1:{parent_srv.port}/v1/tunnel-proxy/{env_id}"
+        base = f"http://127.0.0.1:{parent_srv.port}/v1/env-proxy/{env_id}"
         req = urllib.request.Request(
             base + "/v1/env")
         with urllib.request.urlopen(req, timeout=30) as resp:
             ws_root = json.loads(resp.read()).get("env", {}).get("AGENTS_WORKSPACE", "")
         payload = os.urandom(123457)  # odd size: 15 x 8192 + 2017
         st, init = _request(
-            parent_srv, "POST", f"/v1/tunnel-proxy/{env_id}/v1/workspace/upload/init",
+            parent_srv, "POST", f"/v1/env-proxy/{env_id}/v1/workspace/upload/init",
             {"workspace_id": "default", "file_name": "chunked.bin",
              "file_size": len(payload), "target_dir_path": ws_root,
              "target_path": "chunked.bin"})
@@ -981,7 +983,7 @@ def test_tunnel_proxy_browser_chunked_body(tmp_path):
 
         st, comp = _request(
             parent_srv, "POST",
-            f"/v1/tunnel-proxy/{env_id}/v1/workspace/upload/{init['upload_id']}/complete", {})
+            f"/v1/env-proxy/{env_id}/v1/workspace/upload/{init['upload_id']}/complete", {})
         assert st == 200, (st, comp)
         on_disk = (tmp_path / "child_ws" / "chunked.bin").read_bytes()
         assert on_disk == payload
@@ -1593,7 +1595,7 @@ def test_large_upload_does_not_stall_other_bridge_requests(tmp_path):
     try:
         conn = parent_srv._tunnel_manager.conn_for_env(env_id)
         conn.sock = _ThrottledSock(conn.sock, 0.03)
-        base = f"http://127.0.0.1:{parent_srv.port}/v1/tunnel-proxy/{env_id}"
+        base = f"http://127.0.0.1:{parent_srv.port}/v1/env-proxy/{env_id}"
 
         def _call(method, path, data=None, headers=None):
             req = urllib.request.Request(
@@ -1789,7 +1791,7 @@ def test_tunnel_proxy_streams_large_body_intact(tmp_path):
         assert CAP_REQ_CHUNK_ID in conn.caps, conn.caps
         calls = _spy_send_frames(conn)
         payload = os.urandom(CHUNK_SIZE * 3 + 1234)
-        base = f"http://127.0.0.1:{parent_srv.port}/v1/tunnel-proxy/{env_id}"
+        base = f"http://127.0.0.1:{parent_srv.port}/v1/env-proxy/{env_id}"
         status, data = _echo_body(base, payload)
         assert status == 200
         assert data == {"size": len(payload),
@@ -1808,7 +1810,7 @@ def test_tunnel_proxy_small_body_and_get(tmp_path):
     parent, child, parent_srv, child_srv, env_id = _pair_online(tmp_path)
     try:
         _install_echo(child_srv)
-        base = f"http://127.0.0.1:{parent_srv.port}/v1/tunnel-proxy/{env_id}"
+        base = f"http://127.0.0.1:{parent_srv.port}/v1/env-proxy/{env_id}"
         payload = b'{"hello":"world"}'
         status, data = _echo_body(base, payload)
         assert status == 200
@@ -1835,7 +1837,7 @@ def test_tunnel_proxy_streams_chunked_body(tmp_path):
         calls = _spy_send_frames(conn)
         payload = os.urandom(CHUNK_SIZE + 5000)
         status_line, body = _raw_chunked_post(
-            parent_srv.port, f"/v1/tunnel-proxy/{env_id}/v1/tunnel-test/echo", payload)
+            parent_srv.port, f"/v1/env-proxy/{env_id}/v1/tunnel-test/echo", payload)
         assert " 200 " in status_line, (status_line, body[:200])
         assert json.loads(body) == {"size": len(payload),
                                     "sha256": hashlib.sha256(payload).hexdigest()}
@@ -1857,7 +1859,7 @@ def test_tunnel_proxy_buffers_without_req_chunk_cap(tmp_path):
         assert not parent_srv._tunnel_manager.env_supports_req_chunks(env_id)
         calls = _spy_send_frames(conn)
         payload = os.urandom(CHUNK_SIZE * 2 + 7)
-        base = f"http://127.0.0.1:{parent_srv.port}/v1/tunnel-proxy/{env_id}"
+        base = f"http://127.0.0.1:{parent_srv.port}/v1/env-proxy/{env_id}"
         status, data = _echo_body(base, payload)
         assert status == 200
         assert data == {"size": len(payload),
@@ -1878,7 +1880,7 @@ def test_tunnel_proxy_browser_disconnect_mid_body_aborts(tmp_path):
         _install_echo(child_srv)
         client = child_srv._server.tunnel_client
         raw = socket.create_connection(("127.0.0.1", parent_srv.port), timeout=30)
-        path = f"/v1/tunnel-proxy/{env_id}/v1/tunnel-test/echo"
+        path = f"/v1/env-proxy/{env_id}/v1/tunnel-test/echo"
         raw.sendall((
             f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
             "Content-Type: application/octet-stream\r\n"
@@ -1891,7 +1893,7 @@ def test_tunnel_proxy_browser_disconnect_mid_body_aborts(tmp_path):
         assert " 400 " in status_line, status_line
         _wait_until(lambda: not client._bodies,
                     message="child released the aborted request body")
-        status, _env = _request(parent_srv, "GET", f"/v1/tunnel-proxy/{env_id}/v1/env")
+        status, _env = _request(parent_srv, "GET", f"/v1/env-proxy/{env_id}/v1/env")
         assert status == 200
     finally:
         child.__exit__(None, None, None)
@@ -1907,7 +1909,7 @@ def test_tunnel_proxy_chunked_body_truncated_aborts(tmp_path):
         _install_echo(child_srv)
         client = child_srv._server.tunnel_client
         raw = socket.create_connection(("127.0.0.1", parent_srv.port), timeout=30)
-        path = f"/v1/tunnel-proxy/{env_id}/v1/tunnel-test/echo"
+        path = f"/v1/env-proxy/{env_id}/v1/tunnel-test/echo"
         raw.sendall((
             f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
             "Content-Type: application/octet-stream\r\n"
@@ -1920,7 +1922,7 @@ def test_tunnel_proxy_chunked_body_truncated_aborts(tmp_path):
         assert " 400 " in status_line, status_line
         _wait_until(lambda: not client._bodies,
                     message="child released the truncated chunked body")
-        status, _env = _request(parent_srv, "GET", f"/v1/tunnel-proxy/{env_id}/v1/env")
+        status, _env = _request(parent_srv, "GET", f"/v1/env-proxy/{env_id}/v1/env")
         assert status == 200
     finally:
         child.__exit__(None, None, None)
@@ -1949,7 +1951,7 @@ def test_tunnel_proxy_forwards_body_before_fully_read(tmp_path):
 
         total = CHUNK_SIZE * 4
         raw = socket.create_connection(("127.0.0.1", parent_srv.port), timeout=30)
-        path = f"/v1/tunnel-proxy/{env_id}/v1/tunnel-test/echo"
+        path = f"/v1/env-proxy/{env_id}/v1/tunnel-test/echo"
         raw.sendall((
             f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
             "Content-Type: application/octet-stream\r\n"
