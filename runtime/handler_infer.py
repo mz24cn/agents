@@ -7,12 +7,15 @@ Zero third-party dependencies — only Python standard library.
 
 from __future__ import annotations
 
+import base64
 import copy
 import json
 import logging
+import mimetypes
 import os
 import re
 import threading
+import urllib.parse
 from dataclasses import asdict
 from typing import Optional
 
@@ -44,6 +47,70 @@ from runtime.server_state import (
 )
 
 logger = logging.getLogger("runtime.server")
+
+# 单个引用的可载入上限：超过就不载（推理本来也塞不进上下文）。
+_MAX_REMOTE_REF_BYTES = 64 * 1024 * 1024
+# 回拉的网络超时（秒）。
+_REMOTE_REF_TIMEOUT = 120.0
+
+
+def _make_remote_ref_hooks(remote_proxy):
+    """给远程会话用的两个按需回拉钩子：``(remote_reader, image_resolver)``。
+
+    远程会话里用户引用的实体（粘贴的图片、文件管理器插入的路径、子端工具生成的
+    文件）都在**子端**文件系统上，母端本地没有这些字节。两个钩子共用一次请求内
+    的字节缓存，同一引用最多回拉一次：
+
+    * ``remote_reader(ref) -> bytes``：展开 ``<file>`` 时读文本，当场内联成代码块。
+    * ``image_resolver(ref) -> str``：请求构造时把 ``message.images`` 里的子端引用
+      换成 ``data:`` URI（协议层直接吃，见 ``Runtime._drop_history_images``）。
+
+    不在母端落盘、不设 TTL/配额：图片只在真正要发出去的那一次被取一次，历史消息
+    的图片本来就被剥掉，需要时再走子端 ``GET /v1/workspace/content`` 拉。持久化里
+    保留的是用户写的子端引用，现场不被缓存路径污染。
+
+    Raises:
+        ValueError: 引用为空 / 子端读不到 / 超过单引用上限。展开阶段由
+            ``handler_infer`` 映射成 400；请求构造阶段作为推理错误上报。
+    """
+    cache: dict[str, bytes] = {}
+
+    def read(ref: str) -> bytes:
+        raw = str(ref or "").strip()
+        if not raw:
+            raise ValueError("Empty file reference")
+        if raw in cache:
+            return cache[raw]
+        # restrict=0：粘贴目录（/tmp）与任意子端路径都要能读 —— 引用本身就是
+        # 用户已经写进消息、授权过的，母端只是替它去取字节。
+        query = "path=" + urllib.parse.quote(raw, safe="") + "&restrict=0"
+        status, data = remote_proxy.http_bytes(
+            f"/v1/workspace/content?{query}", timeout=_REMOTE_REF_TIMEOUT)
+        if status != 200:
+            detail = data[:200].decode("utf-8", "replace").strip() if data else ""
+            raise ValueError(
+                f"Referenced file is not readable on the remote environment: {raw}"
+                f" (HTTP {status}{'; ' + detail if detail else ''})"
+            )
+        if len(data) > _MAX_REMOTE_REF_BYTES:
+            raise ValueError(
+                f"Referenced file is too large to load from the remote environment: {raw}"
+                f" ({len(data)} bytes)"
+            )
+        cache[raw] = data
+        return data
+
+    def resolve_image(ref: str) -> str:
+        item = str(ref or "")
+        # 已经是可直接编码的形式（data URI / http(s)）就原样交给协议层。
+        if item.startswith(("data:", "http://", "https://")):
+            return item
+        raw = item.strip()
+        data = read(raw)
+        mime = mimetypes.guess_type(raw.replace("\\", "/"))[0] or "image/png"
+        return f"data:{mime};base64," + base64.b64encode(data).decode("ascii")
+
+    return read, resolve_image
 
 
 def _add_exec_cli_for_open_terminal(
@@ -361,6 +428,16 @@ class HandlerInferMixin:
                 body.get("model_id"), body.get("tool_ids"),
             )
 
+        # 载入的文件实体（<file>）一律展开：本地会话按本地工作区解析；远程会话的
+        # 文件在子端（粘贴上传写的是子端 /tmp 或子端工作区），母端本地没有这些
+        # 字节，于是**按需回拉**：文本当场读成代码块，图片则把子端引用原样留在
+        # message.images 里，字节等到请求构造时再取（见 InferenceRequest.image_resolver）。
+        # 占位符里始终保留用户写的原始引用，conversation.json 记录的是真实现场。
+        remote_reader = None
+        remote_image_resolver = None
+        if remote_proxy is not None:
+            remote_reader, remote_image_resolver = _make_remote_ref_hooks(remote_proxy)
+
         original_messages = None
         user_message_timestamp = None
         timestamp_fallback_used = False
@@ -380,14 +457,12 @@ class HandlerInferMixin:
                 if msg.role == "user" and mentioned_agent_ids:
                     msg.mentions = mentioned_agent_ids
                 original_messages.append(msg)
-            # 远程会话的工具执行在子环境，本地工作区的 <file> 引用于子端
-            # 无意义；保留原文不展开。
-            if remote_proxy is None:
-                try:
-                    original_messages = expand_workspace_file_refs(original_messages, _get_ws())
-                except ValueError as exc:
-                    self._send_json_error(400, str(exc))
-                    return None
+            try:
+                original_messages = expand_workspace_file_refs(
+                    original_messages, _get_ws(), remote_reader=remote_reader)
+            except ValueError as exc:
+                self._send_json_error(400, str(exc))
+                return None
         elif is_continue:
             # 继续推理：不携带新用户消息，基于会话既有上下文推理。
             # File journals still belong to the existing initiating user turn.
@@ -545,6 +620,7 @@ class HandlerInferMixin:
             text=body.get("text"),
             stream=True,
             max_tool_rounds=body.get("max_tool_rounds") or env_int("MAX_TOOL_ROUNDS", 200),
+            image_resolver=remote_image_resolver,
         )
 
         session_dir = None

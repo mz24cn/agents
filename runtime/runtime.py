@@ -613,10 +613,7 @@ class Runtime:
             for msg in messages:
                 if msg.timestamp is None:
                     msg.timestamp = _now_iso()
-                if (
-                    msg.prompt_template is not None
-                    and self._prompt_template_manager is not None
-                ):
+                if msg.prompt_template is not None and self._prompt_template_manager is not None:
                     template = self._prompt_template_manager.get(msg.prompt_template)
                     if template is not None:
                         # Re-render template-backed messages on every inference.
@@ -629,11 +626,55 @@ class Runtime:
                             for key, value in msg.arguments.items():
                                 content = content.replace(f"{{{{{key}}}}}", str(value))
                         msg.content = content
-            return self._apply_vlm_image_fallback(model_config, messages)
+            return self._apply_vlm_image_fallback(
+                model_config,
+                self._drop_history_images(messages, getattr(request, "image_resolver", None)))
         if request.text is not None:
             messages = [Message(role="user", content=request.text, timestamp=_now_iso())]
             return self._apply_vlm_image_fallback(model_config, messages)
         return []
+
+    @staticmethod
+    def _drop_history_images(messages: list, image_resolver=None) -> list:
+        """Keep image payloads only on the newest image-carrying user message.
+
+        ``<file>`` expansion stores image *paths* on the message and
+        ``Message.to_dict`` persists them, so without this every later turn
+        re-reads and re-encodes **every old image** into the request -- a
+        large per-turn token cost, and a hard failure once the file is gone
+        (the protocol encoders raise, they do not tolerate a missing path).
+        History keeps its ``[Image file attached: ...]`` placeholders; only
+        the current turn's payload travels.
+
+        *image_resolver* is a request-scoped hook: it maps the kept message's
+        image references to something the protocol encoders can read.  A remote
+        session passes one that pulls the child's bytes as a ``data:`` URI, so
+        the persisted record keeps the child reference while the wire request
+        carries the payload -- exactly once per request, no parent-side cache to
+        expire.  It also makes ``continue`` work: the turn being continued has
+        no new user message, so its persisted child reference is re-read here.
+
+        conversation.json is left untouched: list entries are replaced with
+        copies, the persisted Message objects are not mutated.  (The one
+        exception is intentional: the VLM fallback runs after this and still
+        mutates the kept message in place, so its transcription is persisted.)
+        """
+        keep = -1
+        for index, msg in enumerate(messages):
+            if msg.role == "user" and getattr(msg, "images", None):
+                keep = index
+        if keep < 0:
+            return messages
+        out = list(messages)
+        for index, msg in enumerate(out):
+            if index == keep:
+                if image_resolver is not None and getattr(msg, "images", None):
+                    out[index] = replace(
+                        msg, images=[image_resolver(item) for item in msg.images])
+                continue
+            if msg.role == "user" and getattr(msg, "images", None):
+                out[index] = replace(msg, images=None)
+        return out
 
     def _apply_vlm_image_fallback(self, model_config, messages: list) -> list:
         """Transcribe attached images into text when the model cannot see them.

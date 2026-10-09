@@ -293,6 +293,9 @@ const translations = {
     imageFullAlt: '全尺寸图片',
     imagePreview: '图片预览',
     closeImage: '关闭',
+    imageUnavailable: '图片不可用（文件已移动或删除）',
+    fileRefContent: '文件内容',
+    imageTranscription: '图片识别内容',
 
     // MessageBubble
     roleUser: '👤 用户',
@@ -993,6 +996,9 @@ const translations = {
     imageFullAlt: 'Full-size image',
     imagePreview: 'Image preview',
     closeImage: 'Close',
+    imageUnavailable: 'Image unavailable (moved or deleted)',
+    fileRefContent: 'File content',
+    imageTranscription: 'Image transcription',
 
     // MessageBubble
     roleUser: '👤 User',
@@ -1192,9 +1198,9 @@ const translations = {
     generateParamsPlaceholder: '{"temperature": 0.7}',
     modelEnvPlaceholderHint: 'Supports {{key}} placeholders, resolved from matching backend environment variables only during inference.',
     generateParamsExtraBodyHint: 'Do not keep an extra_body key; flatten its fields into the top level or they may be ignored.',
-    maxContext: 'Max Context Length',
+    maxContext: 'Allowed Max Context Length',
     maxContextPlaceholder: 'e.g. 128K, 1M; leave empty if unknown',
-    maxContextHint: 'K/M units are supported (1K = 1024, 1M = 1024K). Context compression is triggered mid-loop when a round reaches 90% of this value; empty means 0 and skips that check.',
+    maxContextHint: 'The ceiling this agent may use at runtime, not the real context window of the model - use "Check Models" to see the real one, and a value slightly below it is recommended. K/M units are supported (1K = 1024, 1M = 1024K). Context compression is triggered mid-loop when a round reaches 90% of this value; empty means 0 and skips that check.',
     maxContextInvalid: 'Enter a number, optionally with a K or M unit',
     probeModels: 'Check Models',
     probeLoading: 'Checking...',

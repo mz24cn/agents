@@ -15,6 +15,7 @@
   import ConfirmDialog from '../ConfirmDialog.svelte'
   import { extractPlaceholders } from '../../lib/placeholder.js'
   import { buildFileJournalTurnKeyMap } from '../../lib/file-journals.js'
+  import { restoreFileRefTags } from '../../lib/file-ref.js'
   import { mergeToolCallDeltas, startsNewToolCallRound } from '../../lib/stream-messages.js'
   import { t } from '../../lib/i18n.svelte.js'
   import { navigate } from '../../lib/router.svelte.js'
@@ -1585,7 +1586,10 @@
       store.messages = store.messages.slice(0, revokeIndex)
     }
     if (revokedMessage?.content) {
-      inputText = revokedMessage.content
+      // The stored turn is the *expanded* one: <file> tags were replaced by
+      // [Image/Text file attached: …] plus the inlined payload. Refill the
+      // editor with the tag form so the chips come back, not raw placeholders.
+      inputText = restoreFileRefTags(revokedMessage.content)
     }
   }
 

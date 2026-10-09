@@ -238,6 +238,17 @@ class RemoteToolProxy:
             data = {"data": data}
         return status, data
 
+    def http_bytes(self, path: str,
+                   timeout: Optional[float] = None) -> tuple[int, bytes]:
+        """通用子端字节 GET（``<file>`` / 图片引用按需回拉，见
+        ``handler_infer._make_remote_ref_hooks``）。
+
+        与 :meth:`http_json` 同一传输（直连走 urllib、隧道走 TunnelManager），
+        但不解析响应体：``/v1/workspace/content`` 返回的就是文件原始字节。
+        """
+        return self._http_request(self._build_url(path), method="GET",
+                                  timeout=timeout)
+
     # ------------------------------------------------------------------
     # 工具清单
     # ------------------------------------------------------------------

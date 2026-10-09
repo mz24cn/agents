@@ -113,6 +113,97 @@ def test_prepare_reasoning_for_tool_rounds_requires_label_and_trailing_tool():
     assert assistant.thinking is None
 
 
+def test_normalize_messages_sends_only_the_newest_image_payload():
+    """历史消息里的图片不随请求重放：只保留最近一条带图 user 消息的 images。
+
+    ``<file>`` 展开把图片**路径**写进 ``Message.images``，而 ``Message.to_dict``
+    会把它持久化，协议层每次请求都按路径重新读盘 + base64。不清历史的话，
+    每一轮都把之前所有图重传一遍（token 随轮数线性爆炸），文件被删掉后甚至
+    直接 ``ValueError: Failed to read image`` 打断推理。
+    """
+    runtime = Runtime(model_registry=ModelRegistry(), tool_registry=ToolRegistry())
+    history = [
+        Message(role="user", content="第一张图", images=["/tmp/a.png"]),
+        Message(role="assistant", content="看到了"),
+        Message(role="user", content="第二张图", images=["/tmp/b.png"]),
+    ]
+    request = InferenceRequest(model_id="test-model", messages=list(history))
+
+    prepared = runtime._normalize_messages(request)
+
+    assert [m.images for m in prepared if m.role == "user"] == [None, ["/tmp/b.png"]]
+    # 占位符仍在正文里：模型知道"之前发过图"，只是不再重传字节
+    assert "[Image file attached" in prepared[0].content or prepared[0].content == "第一张图"
+
+
+def test_normalize_messages_image_strip_does_not_touch_the_persisted_record():
+    """清图只发生在请求构造：conversation.json 要尽可能还原现场。"""
+    runtime = Runtime(model_registry=ModelRegistry(), tool_registry=ToolRegistry())
+    persisted = [
+        Message(role="user", content="第一张图", images=["/tmp/a.png"]),
+        Message(role="assistant", content="看到了"),
+        Message(role="user", content="第二张图", images=["/tmp/b.png"]),
+    ]
+    request = InferenceRequest(model_id="test-model", messages=list(persisted))
+
+    prepared = runtime._normalize_messages(request)
+
+    assert [m.images for m in persisted] == [["/tmp/a.png"], None, ["/tmp/b.png"]]
+    assert prepared[2] is persisted[2]  # 保留的那条不复制，VLM 兜底仍可原地改写
+    # 被清的那条是副本：原对象（会写进 conversation.json）完好
+    assert prepared[0] is not persisted[0]
+    assert prepared[0].content == persisted[0].content
+
+
+def test_normalize_messages_keeps_images_when_only_history_has_them():
+    """只有历史带图（本轮没图）：仍然只留最后一条，不整批清空。"""
+    runtime = Runtime(model_registry=ModelRegistry(), tool_registry=ToolRegistry())
+    messages = [
+        Message(role="user", content="图一", images=["/tmp/a.png"]),
+        Message(role="assistant", content="好"),
+        Message(role="user", content="再看一眼那张图"),
+    ]
+    request = InferenceRequest(model_id="test-model", messages=list(messages))
+
+    prepared = runtime._normalize_messages(request)
+
+    assert [m.images for m in prepared if m.role == "user"] == [["/tmp/a.png"], None]
+
+
+def test_normalize_messages_resolves_only_the_kept_image_payload():
+    """远程会话：留下的那条把子端引用换成可编码载荷，历史连字节都不去取。
+
+    远程会话的图片实体在**子端**，持久化里存的是子端引用；只有请求构造时才经
+    ``InferenceRequest.image_resolver`` 向子端取字节（编成 data URI）。母端因此
+    不需要任何缓存目录，也就没有过期/配额/清理；"继续推理"重发同一轮时同样在
+    这里重新取一次。
+    """
+    runtime = Runtime(model_registry=ModelRegistry(), tool_registry=ToolRegistry())
+    persisted = [
+        Message(role="user", content="第一张图", images=["/tmp/a.png"]),
+        Message(role="assistant", content="看到了"),
+        Message(role="user", content="第二张图", images=["/tmp/b.png"]),
+    ]
+    seen = []
+
+    def resolver(ref):
+        seen.append(ref)
+        return f"data:image/png;base64,{ref}"
+
+    request = InferenceRequest(model_id="test-model", messages=list(persisted),
+                               image_resolver=resolver)
+
+    prepared = runtime._normalize_messages(request)
+
+    # 只为真正发出去的那条取字节，历史消息连回拉都不发生
+    assert seen == ["/tmp/b.png"]
+    assert [m.images for m in prepared if m.role == "user"] == [
+        None, ["data:image/png;base64,/tmp/b.png"]]
+    # 持久化侧原样：conversation.json 里仍是用户写的子端引用
+    assert [m.images for m in persisted] == [["/tmp/a.png"], None, ["/tmp/b.png"]]
+    assert prepared[2] is not persisted[2]
+
+
 # --- Hypothesis strategies ---
 
 # Strategy for non-empty text strings (plain text input)

@@ -6,6 +6,7 @@
   import { workspace as workspaceApi } from '../../lib/api.js'
   import { remoteWorkspace } from '../../lib/remote-execution.svelte.js'
   import { serializeEditor } from '../../lib/chat-input-serialize.js'
+  import { parseFileRefParts, restoreFileRefTags, hasFileRefs } from '../../lib/file-ref.js'
 
   let { disabled = false, onSend, onStop, onStopForce, onToggleTemplatePanel, onToggleWorkspacePanel, workspacePanelOpen = false, templatePanelOpen = false, text = $bindable(''), isStreaming = false, selectedAgentIds = [], agentList = [], remote = null, onError = () => {} } = $props()
 
@@ -49,23 +50,19 @@
     return chip
   }
 
+  // The editor holds the <file> form; a revoked / re-edited / re-pasted message
+  // may arrive in the backend's expanded form ([Image/Text file attached: …]
+  // plus inlined content). Both become chips, so what is shown is what gets sent.
   function renderEditorFromText(value) {
     if (!editorEl) return
     const source = String(value ?? '')
-    const re = /<file>\s*([^<]+?)\s*<\/file>/g
     const fragment = document.createDocumentFragment()
-    let index = 0
-    let match
-
-    while ((match = re.exec(source)) !== null) {
-      if (match.index > index) {
-        fragment.appendChild(document.createTextNode(source.slice(index, match.index)))
+    for (const part of parseFileRefParts(source)) {
+      if (part.type === 'file') {
+        if (part.ref) fragment.appendChild(createFileChip(part.ref))
+      } else {
+        fragment.appendChild(document.createTextNode(part.value))
       }
-      fragment.appendChild(createFileChip(match[1]))
-      index = re.lastIndex
-    }
-    if (index < source.length) {
-      fragment.appendChild(document.createTextNode(source.slice(index)))
     }
 
     editorEl.replaceChildren(fragment)
@@ -214,6 +211,40 @@
   }
 
   /**
+   * Insert restored text (chips + text) at the caret. Used when the clipboard
+   * carries a previously sent message: its file references must come back as
+   * chips, which execCommand('insertText') cannot produce.
+   */
+  function insertRestoredTextAtCaret(value) {
+    const selection = window.getSelection()
+    const range = selection && selection.rangeCount ? selection.getRangeAt(0) : null
+    if (!editorEl || !range || !editorEl.contains(range.startContainer)) {
+      // No caret inside the editor: go through the text pipeline, the $effect
+      // below re-renders the editor from the new value.
+      text = text ? `${text}${value}` : value
+      return
+    }
+    const fragment = document.createDocumentFragment()
+    let last = null
+    for (const part of parseFileRefParts(value)) {
+      const node = part.type === 'file' && part.ref
+        ? createFileChip(part.ref)
+        : (part.value ? document.createTextNode(part.value) : null)
+      if (!node) continue
+      fragment.appendChild(node)
+      last = node
+    }
+    range.deleteContents()
+    range.insertNode(fragment)
+    if (last) {
+      range.setStartAfter(last)
+      range.collapse(true)
+      selection.removeAllRanges()
+      selection.addRange(range)
+    }
+  }
+
+  /**
    * Paste handling:
    * - If the clipboard carries files (image / PDF / DOCX ...), upload them into
    *   the backend paste directory (/tmp on Linux, OS temp dir on Windows) and
@@ -229,6 +260,13 @@
       return
     }
     const pasted = (e.clipboardData?.getData('text/plain') ?? '').replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+    // Copying a chat message yields the backend's expanded form; fold it back
+    // into chips instead of pasting "[Image file attached: …]" as prose.
+    if (hasFileRefs(pasted)) {
+      insertRestoredTextAtCaret(restoreFileRefTags(pasted))
+      syncTextFromEditor()
+      return
+    }
     document.execCommand('insertText', false, pasted)
     syncTextFromEditor()
   }

@@ -949,16 +949,34 @@ def _resolve_workspace_file(ref_path: str, workspace: str) -> str:
     return file_path
 
 
-def _read_text_file(path: str) -> str:
-    raw = open(path, "rb").read()
+def _decode_text(raw: bytes) -> str:
     try:
         return raw.decode("utf-8")
     except UnicodeDecodeError:
         return raw.decode("utf-8", errors="replace")
 
 
-def expand_workspace_file_refs_in_message(message: Message, workspace: str) -> Message:
+def _read_text_file(path: str) -> str:
+    return _decode_text(open(path, "rb").read())
+
+
+def expand_workspace_file_refs_in_message(message: Message, workspace: str,
+                                          remote_reader=None) -> Message:
     """Expand <file> tags inside one user message in-place and return it.
+
+    Args:
+        message: user message to expand (returned unchanged with no <file> tag).
+        workspace: local workspace root, the base for relative references.
+        remote_reader: optional ``ref -> bytes`` callable, used by remote
+            sessions: the entity lives on the **child** environment, so the
+            parent cannot open it locally and *workspace* plays no role
+            (references are child-side paths).  Text is read here, because its
+            content is inlined into the message.  Images are **not** fetched
+            here: the child reference is stored on ``message.images`` verbatim
+            and the request builder pulls the bytes once per request (see
+            ``InferenceRequest.image_resolver``).  That keeps conversation.json
+            recording what the user actually referenced instead of a
+            parent-side cache path that would go stale.
 
     Deduplication logic:
     - Path descriptions (e.g. [Text file attached: ...]) appear at every occurrence
@@ -975,31 +993,39 @@ def expand_workspace_file_refs_in_message(message: Message, workspace: str) -> M
     attachments: list[str] = []
 
     def replace(match: re.Match) -> str:
-        file_path = match.group(1).strip()
+        ref_path = match.group(1).strip()
 
-        if os.path.isabs(file_path):
-            file_path = os.path.realpath(file_path)
+        if remote_reader is not None:
+            # 子端引用原样保留：占位符与 images 都写它，字节留给请求构造去取
+            file_path = ref_path
+            display_path = ref_path
         else:
-            file_path = os.path.realpath(os.path.join(workspace, file_path.lstrip("/\\")))
-
-        if not os.path.isfile(file_path):
-            raise ValueError(f"Referenced file does not exist: {file_path}")
+            if os.path.isabs(ref_path):
+                file_path = os.path.realpath(ref_path)
+            else:
+                file_path = os.path.realpath(os.path.join(workspace, ref_path.lstrip("/\\")))
+            display_path = file_path
+            if not os.path.isfile(file_path):
+                raise ValueError(f"Referenced file does not exist: {file_path}")
 
         if is_image_file(file_path):
             # Image content (base64) only added once
             if file_path not in processed_files:
                 images.append(file_path)
                 processed_files.add(file_path)
-            return f"[Image file attached: {file_path}]"
+            return f"[Image file attached: {display_path}]"
         if is_text_file(file_path):
             # Text content (code block) only added once
             if file_path not in processed_files:
-                content = _read_text_file(file_path)
-                attachments.append(f"[Text file attached: {file_path}]\n```\n{content}\n```")
+                if remote_reader is not None:
+                    content = _decode_text(remote_reader(file_path))
+                else:
+                    content = _read_text_file(file_path)
+                attachments.append(f"[Text file attached: {display_path}]\n```\n{content}\n```")
                 processed_files.add(file_path)
-            return f"[Text file attached: {file_path}]"
+            return f"[Text file attached: {display_path}]"
         # Unsupported file type: return path reference instead of raising error
-        return f"[file attached: {file_path}]"
+        return f"[file attached: {display_path}]"
 
     message.content = _FILE_REF_RE.sub(replace, message.content)
     
@@ -1012,12 +1038,13 @@ def expand_workspace_file_refs_in_message(message: Message, workspace: str) -> M
     return message
 
 
-def expand_workspace_file_refs(messages: Iterable[Message] | None, workspace: str) -> list[Message] | None:
+def expand_workspace_file_refs(messages: Iterable[Message] | None, workspace: str,
+                               remote_reader=None) -> list[Message] | None:
     """Expand workspace file references in user messages."""
     if messages is None:
         return None
     expanded = list(messages)
     for msg in expanded:
-        expand_workspace_file_refs_in_message(msg, workspace)
+        expand_workspace_file_refs_in_message(msg, workspace, remote_reader)
     return expanded
 

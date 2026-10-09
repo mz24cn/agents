@@ -1272,11 +1272,23 @@ class TestRemoteInferEndToEnd:
             with _terminal_sessions_lock:
                 _terminal_sessions.pop(terminal_id, None)
 
-    def test_remote_infer_skips_local_file_ref_expansion(self, parent, child):
-        """Remote sessions must not expand <file> refs against the parent workspace."""
+    def test_remote_infer_pulls_child_text_file_refs_on_demand(self, parent, child, tmp_path, monkeypatch):
+        """远程会话的 ``<file>`` 文本实体**按需回拉**再展开。
+
+        旧行为是"远程会话跳过本地展开"，于是写到子端的粘贴图片 / 子端工具
+        生成的文件在母端推理时永远只是占位符 —— VLM 收不到图。现在远程与
+        本地走同一条展开路径，只是寻址换成经 RemoteToolProxy 向子端
+        ``GET /v1/workspace/content`` 取字节（母端不落盘）。
+        """
         from runtime.models import ModelConfig
+        import runtime.common
+
+        # 镜像根目录跟着 DATA_DIR 走：patch 到父端 data dir 才能断言落盘位置
+        monkeypatch.setattr(runtime.common, "DATA_DIR", str(parent[1]))
 
         env_id = _add_env(parent, f"http://127.0.0.1:{child[0].port}/v1/setup")
+        _child_write_file(child, "sess-mirror-1", "notes.txt", "child-side content")
+
         parent_runtime = parent[0]._server.runtime  # type: ignore[attr-defined]
         parent_runtime._model_registry.register(  # type: ignore[attr-defined]
             ModelConfig(
@@ -1289,11 +1301,13 @@ class TestRemoteInferEndToEnd:
         final_chunk = json.dumps({"choices": [{"delta": {"content": "ok"}}]})
         stream = io.BytesIO((f"data: {final_chunk}\n\ndata: [DONE]\n\n").encode("utf-8"))
         real_urlopen = urllib.request.urlopen
-        child_base = f"http://127.0.0.1:{child[0].port}"
+        sent = {}
 
         def selective_urlopen(req, **kwargs):
             url = req.full_url if isinstance(req, urllib.request.Request) else str(req)
             if url.startswith("http://model.invalid"):
+                # 模型请求体是展开后的现场：文本实体应已作为代码块并在其中
+                sent["body"] = (req.data or b"").decode("utf-8", "replace")
                 mock_resp = MagicMock()
                 mock_resp.__iter__ = lambda self: iter(stream.readlines())
                 mock_resp.read = stream.read
@@ -1304,17 +1318,103 @@ class TestRemoteInferEndToEnd:
             return real_urlopen(req, **kwargs)
 
         with patch("urllib.request.urlopen", side_effect=selective_urlopen):
-            # <file> pointing at a non-existent parent file: local mode would
-            # 400; remote mode must keep the raw text and succeed.
             status, body = _request(parent[0], "POST", "/v1/infer", {
                 "model_id": "e2e-model-2",
                 "tool_ids": [],
-                "messages": [{"role": "user", "content": "read <file>no/such/file.txt</file>"}],
+                # 子端工作区：母端不存在这个目录，本地展开会直接 400
+                "workspace": str(tmp_path / "child_ws"),
+                "messages": [{"role": "user", "content": "读一下 <file>notes.txt</file>"}],
                 "session_id": "new",
                 "remote_env": env_id,
             })
         assert status == 200, body
         assert body.get("success") is True
+        assert "child-side content" in sent.get("body", ""), sent
+        # 占位符保留用户写的原始引用，不暴露任何母端路径
+        assert "[Text file attached: notes.txt]" in sent.get("body", ""), sent
+        # 母端不落盘：字节只在请求里走一趟，没有缓存需要过期或清理
+        assert not (parent[1] / "remote_file_cache").exists()
+
+    def test_remote_infer_pulls_child_image_ref_as_a_data_uri(self, parent, child, tmp_path):
+        """图片实体：请求里带字节，持久化里只留子端引用。
+
+        粘贴到子端的图片母端本地没有。展开时把**子端引用原样**记进
+        ``message.images``，直到请求构造才经子端 ``GET /v1/workspace/content``
+        取字节编成 data URI —— 每个请求一趟，母端不落盘也不留缓存；
+        conversation.json 里仍是用户写下的子端路径（现场不被污染，也不塞 base64）。
+        """
+        import base64
+        from runtime.models import ModelConfig
+
+        env_id = _add_env(parent, f"http://127.0.0.1:{child[0].port}/v1/setup")
+        payload = b"\x89PNG\r\n\x1a\n remote-png-bytes"
+        (tmp_path / "child_ws" / "shot.png").write_bytes(payload)
+
+        parent_runtime = parent[0]._server.runtime  # type: ignore[attr-defined]
+        parent_runtime._model_registry.register(  # type: ignore[attr-defined]
+            ModelConfig(
+                model_id="e2e-model-img",
+                api_base="http://model.invalid",
+                model_name="e2e",
+                api_protocol="openai",
+                labels=["vlm"],  # 模型能看图：不走 read_image 转写
+            )
+        )
+        final_chunk = json.dumps({"choices": [{"delta": {"content": "ok"}}]})
+        stream = io.BytesIO((f"data: {final_chunk}\n\ndata: [DONE]\n\n").encode("utf-8"))
+        real_urlopen = urllib.request.urlopen
+        sent = {}
+
+        def selective_urlopen(req, **kwargs):
+            url = req.full_url if isinstance(req, urllib.request.Request) else str(req)
+            if url.startswith("http://model.invalid"):
+                sent["body"] = (req.data or b"").decode("utf-8", "replace")
+                mock_resp = MagicMock()
+                mock_resp.__iter__ = lambda self: iter(stream.readlines())
+                mock_resp.read = stream.read
+                mock_resp.close = MagicMock()
+                mock_resp.__enter__ = lambda s: s
+                mock_resp.__exit__ = MagicMock(return_value=False)
+                return mock_resp
+            return real_urlopen(req, **kwargs)
+
+        with patch("urllib.request.urlopen", side_effect=selective_urlopen):
+            status, body = _request(parent[0], "POST", "/v1/infer", {
+                "model_id": "e2e-model-img",
+                "tool_ids": [],
+                "workspace": str(tmp_path / "child_ws"),
+                "messages": [{"role": "user", "content": "看下 <file>shot.png</file>"}],
+                "session_id": "new",
+                "remote_env": env_id,
+            })
+        assert status == 200, body
+        # 模型请求里是真正的图片字节，不再只是占位符
+        assert base64.b64encode(payload).decode("ascii") in sent.get("body", ""), sent
+
+        sid = body.get("session_id")
+        conv = json.loads(
+            (parent[1] / "chat_data" / sid / "conversation.json").read_text(encoding="utf-8"))
+        user_msgs = [m for m in conv.get("messages", []) if m.get("role") == "user"]
+        assert user_msgs, conv
+        # 持久化保留子端引用：既不内联 base64，也不写母端临时路径
+        assert user_msgs[-1].get("images") == ["shot.png"], user_msgs[-1]
+        assert "data:image" not in json.dumps(conv)
+
+    def test_remote_infer_missing_child_file_ref_is_400(self, parent, child, tmp_path, monkeypatch):
+        """子端也读不到的引用：与本地一致报 400，不再静默留下占位符。"""
+        import runtime.common
+
+        monkeypatch.setattr(runtime.common, "DATA_DIR", str(parent[1]))
+        env_id = _add_env(parent, f"http://127.0.0.1:{child[0].port}/v1/setup")
+        status, body = _request(parent[0], "POST", "/v1/infer", {
+            "model_id": "e2e-model-none",
+            "tool_ids": [],
+            "messages": [{"role": "user", "content": "读 <file>no/such/file.txt</file>"}],
+            "session_id": "new",
+            "remote_env": env_id,
+        })
+        assert status == 400, body
+        assert "no/such/file.txt" in body.get("error", "")
 
     def test_remote_infer_stream_round_trip(self, parent, child, tmp_path):
         """/v1/infer/stream: SSE carries the remote tool round-trip end to end."""

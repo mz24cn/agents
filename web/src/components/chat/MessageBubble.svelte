@@ -10,6 +10,7 @@
   import { t } from '../../lib/i18n.svelte.js'
   import { highlight } from '../../lib/highlight.js'
   import { isToolErrorContent } from '../../lib/tool-result.js'
+  import { parseFileRefParts, restoreFileRefTags } from '../../lib/file-ref.js'
 
   let { msg, agentList = [], onRevoke, collapseButton = null, onCollapse, hasFileChanges = false, onToggleFileDiff, fileDiffData = null, fileDiffVisible = false, compact = false, replyDetailed = null, onToggleReplyMode, toolResultsById = {}, scrollTargetIndex = null, showRetry = false, onRetry, retryDisabled = false } = $props()
 
@@ -66,20 +67,11 @@
     return { html: null, lang: null, displayContent }
   }
 
-  function renderContentParts(content) {
-    const source = String(content ?? '')
-    const re = /<file>\s*([^<]+?)\s*<\/file>/g
-    const parts = []
-    let index = 0
-    let match
-    while ((match = re.exec(source)) !== null) {
-      if (match.index > index) parts.push({ type: 'text', value: source.slice(index, match.index) })
-      parts.push({ type: 'file', value: match[1].trim() })
-      index = re.lastIndex
-    }
-    if (index < source.length) parts.push({ type: 'text', value: source.slice(index) })
-    return parts
-  }
+  // User messages arrive in two spellings of the same reference: the live one
+  // the browser still holds (`<file>path</file>`) and the expanded one the
+  // backend persisted (`[Image/Text file attached: path]`, with text content or
+  // an image transcription inlined as a fenced block). Both render as chips.
+  const userContentParts = $derived(parseFileRefParts(msg.content))
 
   // 获取AI代理信息
   const matchedAgent = $derived((msg.agent_id || msg.assistant_id) ? agentList.find(a => a.agent_id === (msg.agent_id || msg.assistant_id)) : null)
@@ -305,7 +297,10 @@
             {t('expandExecution')}
           </button>
         {/if}
-        <CopyButton getText={() => msg.content ?? ''} />
+        <!-- Copying a user message yields the editor form (<file>…</file>, no
+             inlined payload), so pasting it back into the input box restores the
+             chips instead of dropping expanded placeholder text in as prose. -->
+        <CopyButton getText={() => restoreFileRefTags(msg.content ?? '')} />
       </div>
     {:else if msg.role === 'assistant'}
      {#if matchedAgent}
@@ -433,9 +428,18 @@
       {/if}
     {:else}
       <div class="content">
-        {#each renderContentParts(msg.content) as part}
+        {#each userContentParts as part}
           {#if part.type === 'file'}
-            <span class="file-ref-chip">{part.value}</span>
+            <!-- The reference itself is the chip; whatever the backend inlined
+                 (file content, image transcription) is folded away by default so
+                 a restored session reads like the message that was typed. -->
+            <span class="file-ref-chip" title={part.ref}>{part.ref}</span>
+            {#if part.content}
+              <details class="file-ref-detail">
+                <summary>{part.kind === 'image' ? t('imageTranscription') : t('fileRefContent')}</summary>
+                <pre class="file-ref-body">{part.content}</pre>
+              </details>
+            {/if}
           {:else}
             {part.value}
           {/if}
@@ -652,6 +656,39 @@
     background: color-mix(in srgb, var(--primary) 14%, var(--bg-secondary));
     border-color: color-mix(in srgb, var(--primary) 35%, var(--border));
     color: var(--primary);
+  }
+  /* Inlined file content / image transcription: present but folded, so a
+     restored session reads as easily as the message that was typed. */
+  .file-ref-detail {
+    display: block;
+    margin: 4px 0;
+  }
+  .file-ref-detail summary {
+    display: inline-block;
+    cursor: pointer;
+    font-size: 0.75rem;
+    opacity: 0.75;
+    user-select: none;
+  }
+  .file-ref-detail summary::before {
+    content: '\25b8';
+    margin-right: 4px;
+  }
+  .file-ref-detail[open] summary::before {
+    content: '\25be';
+  }
+  .file-ref-body {
+    margin: 4px 0 0;
+    padding: 6px 8px;
+    max-height: 320px;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 0.78rem;
+    background: rgba(0, 0, 0, 0.18);
+    border: 1px solid var(--border);
+    border-radius: 6px;
   }
   .template-ref { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 6px; white-space: normal; }
   .template-ref-id { font-family: monospace; font-weight: 600; font-size: 0.9rem; }

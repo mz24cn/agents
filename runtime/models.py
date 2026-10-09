@@ -350,6 +350,11 @@ class InferenceRequest:
     text: Optional[str] = None
     stream: bool = False
     max_tool_rounds: int = 100
+    # Request-scoped ``image reference -> payload`` hook, never persisted.  A
+    # remote session sets it so the images of the turn actually being sent are
+    # pulled from the child environment at request-construction time (the
+    # persisted message keeps the child path, see Runtime._drop_history_images).
+    image_resolver: Optional[object] = None
 
 
 @dataclass
