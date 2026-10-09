@@ -272,6 +272,7 @@ def _make_delegate_fn(runtime, thread_local):
                     context_manager=sub_context_manager,
                     session_id=short_sub_id,
                     ready=lambda: conversation_persister.is_current(collected_msgs),
+                    inference_model_id=model_id or getattr(thread_local, "model_id", None) or "",
                 )
                 pre_exc = conversation_persister.pre_persist()
                 if pre_exc is not None:
@@ -603,6 +604,7 @@ def _make_talk_to_fn(runtime, thread_local):
                     context_manager=sub_context_manager,
                     session_id=short_sub_id,
                     ready=lambda: conversation_persister.is_current(collected_msgs),
+                    inference_model_id=model_id or "",
                 )
                 pre_exc = conversation_persister.pre_persist()
                 if pre_exc is not None:

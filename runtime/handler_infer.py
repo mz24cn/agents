@@ -1038,6 +1038,7 @@ class HandlerInferMixin:
                     self._is_active_stream(session_id, cancel_event)
                     and conversation_persister.is_current(collected_messages)
                 ),
+                inference_model_id=model_id or "",
             )
             if use_session and session_id is not None
             else None

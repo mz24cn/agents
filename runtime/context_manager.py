@@ -402,29 +402,27 @@ def _extract_tagged_block(text: str, tag: str) -> str:
 #   - a single pathological turn (e.g. a multi-MB tool output) is still capped
 #     at ``_SUMMARY_TURN_MAX_CHARS`` chars (head 3/4 + tail 1/4); this is a
 #     per-turn content-quality limit, not a total budget;
-#   - if the summary model rejects the request with a context-overflow error
-#     (the window is not known client-side, and the delta can grow unbounded
-#     while compression keeps failing), the prompt is rebuilt with a token
-#     budget halved from the natural prompt size (down to
-#     ``_SUMMARY_PROMPT_MIN_TOKENS``), dropping the OLDEST delta turns first
-#     (a marker documents the loss);
-#   - an ACCEPTED request that returns an EMPTY answer is also retried:
-#     when completion tokens were used (``stat.completion_tokens > 0``) a
-#     thinking model spent the remaining completion budget on reasoning and
-#     never reached the answer (the prompt nearly filled the provider's
-#     TOTAL token window) - the prompt is shrunk like an overflow retry so
-#     the model has room to both think and answer; when no completion tokens
-#     were used at all the same prompt is resent a few times;
+#   - the prompt is bounded UP FRONT by the compression model's context window
+#     (``ModelConfig.max_context``) so the request succeeds in ONE call: the
+#     budget leaves room for the summary/memory output and, once a known window
+#     is available, the OLDEST delta turns are dropped (a marker documents the
+#     loss) to stay inside it;
+#   - when no window is known for either the summary model or the inference
+#     model, the delta is sent in full (best effort, as before);
+#   - an ACCEPTED request that returns an EMPTY answer using NO completion
+#     tokens is a transient provider blip and the SAME (already window-bounded)
+#     prompt is resent a few times;
 #   - repeated failures enter a backoff window so over-budget sessions do not
 #     hammer the summary model with the same doomed request on every turn.
 
-_SUMMARY_PROMPT_MIN_TOKENS: int = 8192
 _SUMMARY_TURN_MAX_CHARS: int = 20000
-#: Cap for the "previous summary" section when no retry budget is active; a
+#: Cap for the "previous summary" section when a prompt budget is active; a
 #: rolling summary should be compact (quality limit, not a window constraint).
 _PREV_SUMMARY_MAX_TOKENS: int = 16384
-#: Maximum number of overflow retries (each one halves the prompt budget).
-_MAX_OVERFLOW_RETRIES: int = 12
+#: Output tokens reserved inside the compression model's context window for the
+#: summary + memory answer, so the (bounded) prompt plus the reply always fit in
+#: one request.  The prompt budget is ``window - _COMPRESSION_OUTPUT_RESERVE``.
+_COMPRESSION_OUTPUT_RESERVE: int = 16384
 #: Maximum number of same-prompt retries after an empty answer that used no
 #: completion tokens at all (transient provider behavior).
 _MAX_EMPTY_OUTPUT_RETRIES: int = 2
@@ -449,17 +447,6 @@ _PLACEHOLDER_MEMORY_CONTENTS: frozenset[str] = frozenset(
 )
 _VALID_ENTRY_TYPES: frozenset[str] = frozenset(
     {"fact", "preference", "decision", "entity"}
-)
-_OVERFLOW_ERROR_KEYWORDS: tuple[str, ...] = (
-    "exceed",
-    "context size",
-    "context length",
-    "context_length",
-    "too many tokens",
-    "maximum context",
-    "prompt is too long",
-    "range of input",
-    "max_tokens",
 )
 
 # Fast CJK-aware token estimate.  ``estimate_llm_tokens`` in runtime.common has
@@ -496,10 +483,19 @@ def _is_placeholder_memory_entry(content: str) -> bool:
     return not stripped or stripped in _PLACEHOLDER_MEMORY_CONTENTS
 
 
-def _is_overflow_error(error: str) -> bool:
-    """Return True when *error* looks like a context-window overflow rejection."""
-    lowered = (error or "").lower()
-    return any(keyword in lowered for keyword in _OVERFLOW_ERROR_KEYWORDS)
+def _compression_prompt_budget(max_context: int) -> Optional[int]:
+    """Return the prompt token budget for a compression request, or ``None``.
+
+    Compression is designed to succeed in a SINGLE call, so the prompt is
+    bounded by the compression model's context window (``max_context``),
+    reserving room for the summary + memory answer.  ``max_context <= 0``
+    means the window is unknown, in which case the delta is sent in full
+    (best effort) and the budget is ``None``.
+    """
+    if not max_context or max_context <= 0:
+        return None
+    budget = max_context - _COMPRESSION_OUTPUT_RESERVE
+    return budget if budget > 0 else 0
 
 
 def _truncate_turn_content(content: str, max_chars: int = _SUMMARY_TURN_MAX_CHARS) -> str:
@@ -2032,6 +2028,77 @@ class ContextManager:
         prompt = _COMPRESSION_PROMPT_HEAD + history_section + _COMPRESSION_PROMPT_TAIL
         return prompt.replace("{current_ts}", current_ts)
 
+    def _select_compression_model(
+        self,
+        inference_model_id: str = "",
+        inference_max_context: int = 0,
+    ) -> tuple[str, int]:
+        """Choose the model + effective window for a compression call.
+
+        Returns ``(model_id, window)`` where ``window`` is the context window to
+        bound the compression prompt to (``0`` = unknown, so the delta is sent in
+        full).  Selection rules:
+
+        - The configured summary model (``SUMMARY_MODEL_ID``; default
+          ``"summary"``) is used when it is available and its window is at
+          least the inference model's.
+        - The compression switches to the INFERENCE model when the summary
+          model is unset/unregistered, OR when both windows are known and the
+          summary model's is smaller than the inference model's.  The inference
+          model's window is provably sufficient (the mid-loop trigger only fires
+          at 90 % of it), so a prompt bounded by it always fits — the
+          one-shot-success guarantee.
+        - When neither a summary model nor an inference model is available,
+          compression stays disabled: ``("", 0)`` is returned.
+
+        The ``window`` is the smallest known window among the two candidates, so
+        the prompt never exceeds a window the endpoint is known to honour.
+        """
+        summary_raw = self._summary_model_id  # resolved (or "" when disabled)
+        summary_cfg = None
+        if summary_raw and self._model_registry is not None:
+            summary_cfg = self._model_registry.get(summary_raw)
+        summary_win = int((summary_cfg.max_context or 0) if summary_cfg else 0)
+
+        inference_cfg = None
+        if inference_model_id and self._model_registry is not None:
+            inference_cfg = self._model_registry.get(inference_model_id)
+        inference_win = int(inference_max_context or 0)
+
+        has_summary = summary_cfg is not None or (
+            summary_raw is not None and summary_raw and self._model_registry is None
+        )
+        has_inference = inference_cfg is not None
+
+        # Pick the compression model:
+        #  - summary model, when it is available and NOT provably smaller than
+        #    the inference model;
+        #  - otherwise the inference model (unset summary, or summary smaller).
+        switch_to_inference = (
+            has_inference
+            and (
+                not has_summary
+                or (summary_win > 0 and inference_win > 0 and summary_win < inference_win)
+            )
+        )
+        if switch_to_inference:
+            model_id = inference_cfg.model_id
+            model_win = inference_win
+        elif has_summary:
+            model_id = summary_cfg.model_id if summary_cfg is not None else summary_raw
+            model_win = summary_win
+        elif has_inference:
+            model_id = inference_cfg.model_id
+            model_win = inference_win
+        else:
+            return ("", 0)
+
+        # Bound the prompt by the smallest known window among the two
+        # candidates (a 0 window means "unknown" and does not constrain).
+        known = [w for w in (model_win, inference_win) if w > 0]
+        window = min(known) if known else 0
+        return (model_id, window)
+
     def compress_context(
         self,
         session_id: str,
@@ -2039,6 +2106,8 @@ class ContextManager:
         last_total_tokens: Optional[int] = None,
         forced: bool = False,
         trigger_threshold: Optional[int] = None,
+        inference_model_id: str = "",
+        inference_max_context: int = 0,
     ) -> None:
         """Compress conversation history in a single LLM call.
 
@@ -2061,25 +2130,26 @@ class ContextManager:
         All configuration values are re-read from the environment on every
         call so changes take effect without a restart.
 
-        The delta is sent IN FULL — in normal operation it is inherently
-        bounded by the ``MAX_TOKENS_IN_CONTEXT`` trigger threshold, so an
-        extra prompt budget would only discard context the summary model
-        could handle.  The only pre-emptive limits are per pathological
-        single turns (``_SUMMARY_TURN_MAX_CHARS`` chars).  If the summary
-        model nevertheless rejects the request with a context-overflow error
-        (e.g. a very small summary-model window, or a delta that grew while
-        compression kept failing), the prompt is rebuilt with a token budget
-        halved from the natural prompt size — dropping the oldest delta turns
-        first — down to 8192 tokens.
+        The compression is designed to succeed in a SINGLE call.  The prompt is
+        therefore bounded UP FRONT by the compression model's context window
+        (``ModelConfig.max_context``): the budget is the model's window minus a
+        reserve for the summary + memory answer, and the OLDEST delta turns are
+        dropped (a marker documents the loss) to stay inside it.  Pathological
+        single turns are still capped at ``_SUMMARY_TURN_MAX_CHARS`` chars.
+        When no window is known for any candidate model, the delta is sent in
+        full (best effort, as before).
 
-        An ACCEPTED request that still comes back with an EMPTY answer is
-        handled the same way: when the response used completion tokens (a
-        thinking model spent the remaining output budget on reasoning —
-        typical when the prompt nearly fills the provider's TOTAL token
-        window, e.g. context + output capped at 1M), the prompt is shrunk
-        like an overflow retry so the model has room to both think and
-        answer; when no completion tokens were used at all the same prompt
-        is resent up to ``_MAX_EMPTY_OUTPUT_RETRIES`` times.
+        Model selection (see :meth:`_select_compression_model`): the configured
+        summary model is used when it is available and its window is at least
+        the inference model's; otherwise the compression runs on the inference
+        model itself, whose window is provably sufficient because the mid-loop
+        trigger only fires at 90 % of it.  If neither a summary model nor an
+        inference model is known, compression is disabled.
+
+        An ACCEPTED request that still comes back with an EMPTY answer having
+        used NO completion tokens is a transient provider blip and the SAME
+        (already window-bounded) prompt is resent up to
+        ``_MAX_EMPTY_OUTPUT_RETRIES`` times.
 
         Failure semantics (important):
 
@@ -2111,8 +2181,24 @@ class ContextManager:
                 (:meth:`compress_context_in_loop`) passes 90 % of the model's
                 ``ModelConfig.max_context`` so a running inference is compressed
                 even when ``MAX_TOKENS_IN_CONTEXT`` is configured larger.
+            inference_model_id: ``model_id`` of the model running the current
+                inference.  Used as the compression model when the summary model
+                is unset or has a smaller context window (see
+                :meth:`_select_compression_model`).
+            inference_max_context: Context window (``ModelConfig.max_context``)
+                of the inference model in tokens; ``0`` means unknown.  When the
+                inference model is chosen for compression it bounds the prompt,
+                and it also caps the prompt of a (smaller) summary model so the
+                request never exceeds a window the endpoint is known to honour.
         """
-        if not self._summary_model_id:
+        # Choose which model performs the compression and the window to bound
+        # the prompt to, so the request succeeds in ONE call (see the docstring
+        # and :meth:`_select_compression_model`).  Compression is disabled only
+        # when neither a summary model nor an inference model is available.
+        model_id, window = self._select_compression_model(
+            inference_model_id, inference_max_context
+        )
+        if not model_id:
             return
 
         # Resolve last_total_tokens
@@ -2189,28 +2275,31 @@ class ContextManager:
             return
 
         current_ts = now_iso()
-        # None = no budget: the first attempt sends the full delta.  Only a
-        # rejection installs a budget (halved from the natural size): either
-        # an overflow 400, or an accepted request that came back empty after
-        # burning its completion budget on thinking.
-        budget: Optional[int] = None
+        # Bound the prompt by the compression model's context window so the
+        # request succeeds in ONE call.  ``window == 0`` means no window is
+        # known for any candidate, in which case the budget is ``None`` and the
+        # delta is sent in full (best effort, as before).
+        budget = _compression_prompt_budget(window)
+        prompt = self._build_compression_prompt(
+            delta, delta_start, previous_summary, budget, current_ts
+        )
+        if budget is not None:
+            logging.info(
+                "compress_context: session %s compressing with model=%s window=%d "
+                "prompt budget=%d delta turns=%d",
+                session_id, model_id, window, budget, len(delta),
+            )
+
         error = ""
         raw_output = ""
         success = False
-        attempt = 0
         empty_retries = 0
         while True:
-            attempt += 1
-            shrink = False
-            prompt = self._build_compression_prompt(
-                delta, delta_start, previous_summary, budget, current_ts
-            )
-
             result = None
             try:
                 from runtime.models import InferenceRequest, Message as _Message  # local import to avoid circular deps
                 infer_request = InferenceRequest(
-                    model_id=self._summary_model_id,
+                    model_id=model_id,
                     messages=[_Message(role="user", content=prompt)],
                 )
                 result = self._infer_fn(infer_request)
@@ -2251,25 +2340,15 @@ class ContextManager:
 
             if success and not raw_output.strip():
                 success = False
-                # The provider ACCEPTED the request but no answer came back.
-                # (a) completion tokens were used: a thinking model spent the
-                #     remaining completion budget on reasoning and never got
-                #     to the answer.  This happens when the prompt nearly
-                #     fills the provider's TOTAL token window (context +
-                #     output), leaving only a few hundred output tokens.
-                #     Shrinking the prompt gives the model room to both think
-                #     and answer, so retry with a halved budget like overflow.
-                # (b) no completion tokens at all: a transient empty
-                #     response - resend the same prompt a couple of times.
+                # The provider ACCEPTED the request but returned an empty answer.
+                # An empty answer that used NO completion tokens is a transient
+                # provider blip — resend the SAME (already window-bounded)
+                # prompt a couple of times.  (Because the prompt is bounded to
+                # leave room for the answer, the "thinking model exhausted the
+                # completion budget" case no longer needs a shrink-retry.)
                 stat = getattr(result, "stat", None) if result is not None else None
                 used_completion = int(getattr(stat, "completion_tokens", 0) or 0)
-                if used_completion > 0:
-                    error = (
-                        "empty model output (completion budget exhausted "
-                        "by thinking)"
-                    )
-                    shrink = attempt < _MAX_OVERFLOW_RETRIES
-                elif empty_retries < _MAX_EMPTY_OUTPUT_RETRIES:
+                if used_completion == 0 and empty_retries < _MAX_EMPTY_OUTPUT_RETRIES:
                     empty_retries += 1
                     logging.warning(
                         "compress_context: empty model output for session %s "
@@ -2278,47 +2357,15 @@ class ContextManager:
                         session_id, empty_retries, _MAX_EMPTY_OUTPUT_RETRIES,
                     )
                     continue
-                else:
-                    error = "empty model output"
+                error = "empty model output"
 
-            if success:
-                break
-
-            # Context-overflow rejection (HTTP 400), or a thinking model that
-            # consumed the completion budget on reasoning without answering
-            # (accepted request, empty content): retry with a prompt budget
-            # halved from the natural prompt size, dropping the oldest delta
-            # turns first, down to _SUMMARY_PROMPT_MIN_TOKENS.
-            if (
-                not shrink
-                and error
-                and _is_overflow_error(error)
-                and attempt < _MAX_OVERFLOW_RETRIES
-            ):
-                shrink = True
-            if shrink:
-                if budget is None:
-                    budget = max(
-                        2 * _SUMMARY_PROMPT_MIN_TOKENS,
-                        _estimate_tokens_fast(prompt),
-                    )
-                next_budget = max(_SUMMARY_PROMPT_MIN_TOKENS, budget // 2)
-                if next_budget < budget:
-                    budget = next_budget
-                    logging.warning(
-                        "compress_context: prompt did not fit the summary "
-                        "model for session %s (%s); retrying with a %d-token "
-                        "prompt budget (oldest delta turns dropped)",
-                        session_id, error, budget,
-                    )
-                    continue
             break
 
         if not success:
             logging.warning(
-                "compress_context: LLM call failed for session %s (%s); "
+                "compress_context: LLM call failed for session %s (model=%s; %s); "
                 "summary.md and memory.md left unchanged",
-                session_id, error or "unknown error",
+                session_id, model_id, error or "unknown error",
             )
             self._record_compress_failure(session_id, effective_tokens or 0)
             return
@@ -2426,6 +2473,7 @@ class ContextManager:
         turns: list[ConversationTurn],
         round_total_tokens: Optional[int],
         max_context: int = 0,
+        inference_model_id: str = "",
     ) -> bool:
         """Mid-loop compression trigger driven by the model's context window.
 
@@ -2484,6 +2532,8 @@ class ContextManager:
             turns,
             last_total_tokens=round_total_tokens,
             trigger_threshold=threshold,
+            inference_model_id=inference_model_id,
+            inference_max_context=max_context,
         )
         return True
 

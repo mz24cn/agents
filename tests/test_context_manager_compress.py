@@ -43,6 +43,8 @@ from runtime.context_manager import (
     serialize_memory,
     serialize_summary,
 )
+from runtime.models import ModelConfig
+from runtime.registry import ModelRegistry
 
 
 # ---------------------------------------------------------------------------
@@ -317,47 +319,33 @@ def test_single_giant_turn_is_capped_per_turn() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_overflow_error_retries_with_smaller_budget() -> None:
-    """A context-overflow rejection must trigger a retry whose budget is
-    halved from the NATURAL (uncapped) prompt size; the (smaller) second
-    prompt succeeds and is persisted."""
+def test_overflow_error_is_single_call_and_not_persisted() -> None:
+    """A context-overflow rejection is a single failed call: the prompt is
+    already bounded by the compression model's window up front, so there is no
+    halving retry — the failure is logged and summary/memory stay untouched."""
     calls: dict = {"n": 0, "prompts": []}
 
-    def overflow_then_ok(req: Any) -> SimpleNamespace:
+    def overflow(req: Any) -> SimpleNamespace:
         calls["n"] += 1
         calls["prompts"].append(req.messages[0].content)
-        if calls["n"] == 1:
-            return _failed_result(
-                req,
-                "HTTP 400: Bad Request. {\"error\":{\"message\":\"request "
-                "(300000 tokens) exceeds the available context size "
-                "(131072 tokens)\"}}",
-            )
-        return SimpleNamespace(
-            content="<summary>\nrecovered summary\n</summary>\n<memory>\n[]\n</memory>"
+        return _failed_result(
+            req,
+            "HTTP 400: Bad Request. {\"error\":{\"message\":\"request "
+            "(300000 tokens) exceeds the available context size "
+            "(131072 tokens)\"}}",
         )
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        cm = _make_cm(tmp_dir, infer_fn=overflow_then_ok)
+        cm = _make_cm(tmp_dir, infer_fn=overflow)
         sid = cm.create_session()
 
-        # ~20k tokens of delta: large enough that the first (uncapped) prompt
-        # is well above the 8192-token halving floor.
         turns = [_make_turn(content=f"turn {i}: " + "word " * 80) for i in range(200)]
         cm.compress_context(sid, turns, last_total_tokens=2000)
 
-        assert calls["n"] == 2, "overflow must be retried exactly once here"
-        first, second = calls["prompts"][0], calls["prompts"][1]
-        # The FIRST attempt sends the full delta (no artificial budget).
-        assert "turn 0:" in first and "turn 197:" in first
-        assert "older turn(s) omitted" not in first
-        # The retry budget is the natural size halved: oldest turns are
-        # dropped with a marker, making the prompt clearly smaller.
-        assert "older turn(s) omitted" in second
-        est1, est2 = _estimate_tokens_fast(first), _estimate_tokens_fast(second)
-        assert est2 < est1 * 0.75, f"retry prompt must be ~half: {est2} vs {est1}"
-        text, _fm = cm.get_summary(sid)
-        assert text.strip() == "recovered summary"
+        assert calls["n"] == 1, "an overflow 400 must not trigger a shrinking retry"
+        assert not os.path.isfile(cm._summary_path(sid))
+        assert not os.path.isfile(cm._memory_path(sid))
+        assert cm.get_summary(sid)[0] == ""
 
 
 # ---------------------------------------------------------------------------
@@ -378,42 +366,27 @@ def _empty_output_result(completion_tokens: int) -> SimpleNamespace:
     )
 
 
-def test_empty_output_with_thinking_retries_smaller_prompt() -> None:
-    """A thinking model that spent the remaining completion budget on
-    reasoning (prompt nearly filled the provider's TOTAL window) must be
-    retried with a SHRUNK prompt — the same halving mechanism as overflow —
-    so the model has room to both think and answer."""
+def test_empty_output_with_thinking_is_single_call_and_not_persisted() -> None:
+    """An empty answer that DID use completion tokens (a thinking model spent
+    the budget on reasoning) is a single failed call — the prompt is already
+    window-bounded so there is no shrinking retry, and nothing is persisted."""
     calls: dict = {"n": 0, "prompts": []}
 
-    def starved_then_ok(req: Any) -> SimpleNamespace:
+    def starved(req: Any) -> SimpleNamespace:
         calls["n"] += 1
         calls["prompts"].append(req.messages[0].content)
-        if calls["n"] == 1:
-            return _empty_output_result(completion_tokens=1616)
-        return SimpleNamespace(
-            content="<summary>\nrecovered summary\n</summary>\n<memory>\n[]\n</memory>"
-        )
+        return _empty_output_result(completion_tokens=1616)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        cm = _make_cm(tmp_dir, infer_fn=starved_then_ok)
+        cm = _make_cm(tmp_dir, infer_fn=starved)
         sid = cm.create_session()
 
-        # ~20k tokens of delta: large enough that the first (uncapped) prompt
-        # is well above the 8192-token halving floor.
         turns = [_make_turn(content=f"turn {i}: " + "word " * 80) for i in range(200)]
         cm.compress_context(sid, turns, last_total_tokens=2000)
 
-        assert calls["n"] == 2, "thinking-starved empty output must be retried"
-        first, second = calls["prompts"][0], calls["prompts"][1]
-        # First attempt sends the full delta.
-        assert "turn 0:" in first and "turn 197:" in first
-        assert "older turn(s) omitted" not in first
-        # Retry is shrunk: oldest turns dropped with a marker, ~half size.
-        assert "older turn(s) omitted" in second
-        est1, est2 = _estimate_tokens_fast(first), _estimate_tokens_fast(second)
-        assert est2 < est1 * 0.75, f"retry prompt must be ~half: {est2} vs {est1}"
-        text, _fm = cm.get_summary(sid)
-        assert text.strip() == "recovered summary"
+        assert calls["n"] == 1, "a thinking-starved empty output must not be retried"
+        assert not os.path.isfile(cm._summary_path(sid))
+        assert cm.get_summary(sid)[0] == ""
 
 
 def test_empty_output_without_tokens_retries_same_prompt() -> None:
@@ -446,8 +419,8 @@ def test_empty_output_without_tokens_retries_same_prompt() -> None:
 
 
 def test_persistent_empty_output_with_thinking_is_not_persisted() -> None:
-    """If the answer stays empty on every (shrinking) attempt, the failure
-    exhausts the budget halvings and nothing is persisted."""
+    """If the answer stays empty (and used completion tokens), it is a single
+    failed call — no shrinking retry — and nothing is persisted."""
     calls: dict = {"n": 0}
 
     def always_starved(req: Any) -> SimpleNamespace:
@@ -460,7 +433,7 @@ def test_persistent_empty_output_with_thinking_is_not_persisted() -> None:
         turns = [_make_turn(content=f"turn {i}") for i in range(4)]
         cm.compress_context(sid, turns, last_total_tokens=2000)  # must not raise
 
-        assert calls["n"] >= 2, "the shrunk retry must have been attempted"
+        assert calls["n"] == 1, "a thinking-starved empty output is a single call"
         assert not os.path.isfile(cm._summary_path(sid))
         assert not os.path.isfile(cm._memory_path(sid))
         assert cm.get_summary(sid)[0] == ""
@@ -708,3 +681,171 @@ def test_placeholder_summary_treated_as_no_summary() -> None:
         assert "(concise summary prose" not in text
         assert text.strip() == "summary text"
         assert fm.get("summary_version") == 4  # continues the version counter
+
+
+# ---------------------------------------------------------------------------
+# One-shot success: prompt bounded by the compression model's window
+# ---------------------------------------------------------------------------
+
+
+def _make_cm_with_registry(
+    tmp_dir: str, *, summary_model_id: str = "", models: list[ModelConfig]
+) -> ContextManager:
+    registry = ModelRegistry()
+    for m in models:
+        registry.register(m)
+    infer_fn = lambda req: SimpleNamespace(  # noqa: E731
+        content="<summary>\nsummary text\n</summary>\n<memory>\n[]\n</memory>"
+    )
+    return ContextManager(
+        infer_fn=infer_fn,
+        chats_dir=tmp_dir,
+        recent_turns_k=2,
+        summary_model_id=summary_model_id,
+        max_tokens_in_context=1000,
+        model_registry=registry,
+    )
+
+
+def _cfg(model_id: str, max_context: int) -> ModelConfig:
+    return ModelConfig(model_id=model_id, api_base="http://localhost", model_name=model_id, max_context=max_context)
+
+
+def test_prompt_is_bounded_by_the_compression_window() -> None:
+    """When the compression model's window is known, a very large delta must be
+    dropped to the window budget so the request fits in ONE call (oldest delta
+    turns dropped with a marker) — instead of blowing past the window."""
+    store: dict = {}
+
+    def capturing(req: Any) -> SimpleNamespace:
+        store.setdefault("prompts", []).append(req.messages[0].content)
+        return SimpleNamespace(
+            content="<summary>\nsummary text\n</summary>\n<memory>\n[]\n</memory>"
+        )
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        registry = ModelRegistry()
+        registry.register(_cfg("summary-model", 20000))
+        cm = ContextManager(
+            infer_fn=capturing,
+            chats_dir=tmp_dir,
+            recent_turns_k=2,
+            summary_model_id="summary-model",
+            max_tokens_in_context=1000,
+            model_registry=registry,
+        )
+        sid = cm.create_session()
+        # ~30k tokens of delta: far above the 20000-window budget, so the
+        # oldest turns must be dropped to fit in one request.
+        turns = [_make_turn(content=f"turn {i}: " + "word " * 80) for i in range(300)]
+        cm.compress_context(sid, turns, last_total_tokens=2000)
+
+        prompt = store["prompts"][0]
+        assert "older turn(s) omitted" in prompt, (
+            "the over-window delta must be dropped to the window budget"
+        )
+        # The compression still SUCCEEDED in a single call.
+        text, fm = cm.get_summary(sid)
+        assert text.strip() == "summary text"
+        assert fm.get("summary_version", 0) >= 1
+
+
+def test_prompt_unbounded_when_no_window_known() -> None:
+    """When no window is known for any candidate, the delta is sent in full
+    (best effort) — no oldest turns are dropped."""
+    store: dict = {}
+
+    def capturing(req: Any) -> SimpleNamespace:
+        store.setdefault("prompts", []).append(req.messages[0].content)
+        return SimpleNamespace(
+            content="<summary>\ns\n</summary>\n<memory>\n[]\n</memory>"
+        )
+
+    registry = ModelRegistry()
+    registry.register(_cfg("summary-model", 0))
+    cm = ContextManager(
+        infer_fn=capturing,
+        chats_dir=tempfile.mkdtemp(),
+        recent_turns_k=2,
+        summary_model_id="summary-model",
+        max_tokens_in_context=1000,
+        model_registry=registry,
+    )
+    sid = cm.create_session()
+    turns = [_make_turn(content=f"turn {i}") for i in range(10)]
+    cm.compress_context(sid, turns, last_total_tokens=2000)
+
+    first = store["prompts"][0]
+    # recent_turns_k=2 keeps the last 2 turns verbatim, so the delta is 0..7.
+    assert "Turn 0 " in first and "Turn 7 " in first
+    assert "older turn(s) omitted" not in first
+
+
+def test_selects_summary_model_when_window_large_enough() -> None:
+    """Summary model window (>= inference window) -> use the summary model,
+    bounded by the (smaller) inference window so the request never exceeds a
+    window the endpoint is known to honour."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cm = _make_cm_with_registry(
+            tmp_dir,
+            summary_model_id="summary-model",
+            models=[
+                _cfg("summary-model", 393216),
+                _cfg("infer-model", 131072),
+            ],
+        )
+        model_id, window = cm._select_compression_model(
+            inference_model_id="infer-model", inference_max_context=131072
+        )
+        assert model_id == "summary-model"
+        # Bounded by the smaller (inference) window — guarantees one-shot fit.
+        assert window == 131072
+
+
+def test_switches_to_inference_model_when_summary_smaller() -> None:
+    """Summary model's window smaller than the inference model's -> run on the
+    inference model instead (its window is provably sufficient)."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cm = _make_cm_with_registry(
+            tmp_dir,
+            summary_model_id="summary-model",
+            models=[
+                _cfg("summary-model", 32768),
+                _cfg("infer-model", 131072),
+            ],
+        )
+        model_id, window = cm._select_compression_model(
+            inference_model_id="infer-model", inference_max_context=131072
+        )
+        assert model_id == "infer-model"
+        assert window == 131072  # bounded by the inference model's window
+
+
+def test_switches_to_inference_model_when_summary_unset() -> None:
+    """No summary model -> run on the inference model."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cm = _make_cm_with_registry(
+            tmp_dir,
+            models=[_cfg("infer-model", 131072)],
+        )
+        # _summary_model_id default is "summary"; with a registry lacking it,
+        # it resolves to "" (compression model unavailable) -> inference used.
+        model_id, window = cm._select_compression_model(
+            inference_model_id="infer-model", inference_max_context=131072
+        )
+        assert model_id == "infer-model"
+        assert window == 131072
+
+
+def test_disabled_when_no_compression_model_available() -> None:
+    """Neither a summary model nor an inference model -> compression disabled."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cm = ContextManager(
+            infer_fn=lambda req: SimpleNamespace(content="x"),
+            chats_dir=tmp_dir,
+            recent_turns_k=2,
+            summary_model_id="",
+            max_tokens_in_context=1000,
+            model_registry=ModelRegistry(),  # empty registry
+        )
+        assert cm._select_compression_model("", 0) == ("", 0)

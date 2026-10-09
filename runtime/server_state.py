@@ -772,7 +772,10 @@ def persist_conversation(
             "summary_version", 0
         ) if compress else 0
         if compress:
-            context_manager.compress_context(session_id, new_turns, last_total_tokens=last_total_tokens)
+            context_manager.compress_context(
+                session_id, new_turns, last_total_tokens=last_total_tokens,
+                inference_model_id=model_id,
+            )
         summary_version_after = context_manager.get_summary(session_id)[1].get(
             "summary_version", 0
         ) if compress else summary_version_before
@@ -972,10 +975,16 @@ class InLoopContextCompressor:
         context_manager,
         session_id: Optional[str],
         ready: Optional[Callable[[], bool]] = None,
+        inference_model_id: str = "",
     ) -> None:
         self.context_manager = context_manager
         self.session_id = session_id
         self.ready = ready
+        # model_id of the model running this loop.  Compression bounds its
+        # prompt by the compression model's window and, when the summary model is
+        # unavailable or smaller, runs on this inference model (whose window is
+        # provably sufficient since the trigger fires at 90 % of it).
+        self.inference_model_id = inference_model_id or ""
 
     def __call__(
         self,
