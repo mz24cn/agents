@@ -405,12 +405,23 @@
     const doNavigate = () => {
       fileManagerNavigateTarget = { path: req.path, token: req.token }
     }
-    // 会话绑定远程环境时 workspacePath 是子端工作区路径：先切回本地工作区再导航
+    // 会话绑定远程环境时 workspacePath 是子端工作区路径：会话日志目录在母端，
+    // 需临时把 workspacePath 切到本地工作区再导航（文件管理器按它重置环境/根），
+    // 导航完成后**立即恢复子端路径**——绝不能让它停留在母端 AGENTS_WORKSPACE，
+    // 否则用户下一条消息会把母端路径写进 meta.workspace（工作区落盘丢失）。
     const sessionBoundRemote = !!(sessionId && remoteExecution.sessionId === sessionId && remoteExecution.env)
+    const childWorkspace = sessionBoundRemote ? (workspacePath || '') : ''
     if (!workspacePath || sessionBoundRemote) {
       fetchWorkspacePath().then(() => {
         if (openSessionLogDir.token !== req.token) return // 已被更新的请求取代
-        doNavigate()
+        if (sessionBoundRemote) {
+          const prev = workspacePath
+          workspacePath = defaultWorkspacePath
+          doNavigate()
+          workspacePath = childWorkspace || prev
+        } else {
+          doNavigate()
+        }
       })
     } else {
       doNavigate()
@@ -770,7 +781,12 @@
       
       if (envMap.AGENTS_WORKSPACE) {
         defaultWorkspacePath = envMap.AGENTS_WORKSPACE
-        workspacePath = envMap.AGENTS_WORKSPACE
+        // 守卫：当前会话已绑定远程环境时，workspacePath 是子端工作区路径，
+        // 不能被母端 AGENTS_WORKSPACE 覆盖——否则下一轮消息会把母端路径
+        // 写进 meta.workspace（曾导致远程会话工作区落盘/显示丢失）。
+        if (!resolvePanelRemoteEnv(sessionId)) {
+          workspacePath = envMap.AGENTS_WORKSPACE
+        }
       }
     } catch (err) {
       console.error('Failed to fetch workspace path:', err)
@@ -953,6 +969,14 @@
       reqBody.agent_ids = selectedAgentIds
     }
     if (workspacePath) {
+      // 防御：会话已绑定远程环境时 workspacePath 应是子端路径；若恰好等于
+      // 母端默认工作区，多半是前端状态被母端 AGENTS_WORKSPACE 污染了
+      // （曾导致 meta.workspace 落盘丢失）。不阻断发送，只留痕便于取证。
+      if (selectedRemoteEnvId && defaultWorkspacePath && workspacePath === defaultWorkspacePath) {
+        console.warn('[chat] sending with workspacePath equal to parent AGENTS_WORKSPACE ' +
+          `(${workspacePath}) while session is bound to ${selectedRemoteEnvId}; ` +
+          'meta.workspace may be recorded against the parent, not the child')
+      }
       reqBody.workspace = workspacePath
     }
     reqBody.session_id = sessionId ?? 'new'
