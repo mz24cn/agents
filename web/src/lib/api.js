@@ -917,15 +917,19 @@ export function isRemoteLogoImage(logo) {
 /**
  * 解析远程环境 logo 的展示地址：
  * data: / http(s):// / // 开头的原样使用；/ 开头或相对路径
- * 以环境地址（id，即 scheme://netloc）为基解析。
+ * 的子端路径走同源 env-proxy 桥（与文件管理器同一通道：子端 token 由
+ * 母端注入，浏览器无需可达子端）：/v1/env-proxy/{env_id}{logo}。
+ *
+ * @param {string} [origin] 同源前缀（默认 ``location.origin``，测试可注入）
  */
-export function resolveRemoteEnvLogo(envId, logo) {
+export function resolveRemoteEnvLogo(envId, logo, origin = typeof location !== 'undefined' ? location.origin : '') {
   const value = String(logo ?? '').trim()
   if (!value) return ''
   if (value.startsWith('data:') || value.startsWith('http') || value.startsWith('//')) return value
-  const base = String(envId ?? '').trim()
-  if (!base) return value
-  return value.startsWith('/') ? base + value : base + '/' + value
+  const id = String(envId ?? '').trim()
+  if (!id) return value
+  const path = value.startsWith('/') ? value : '/' + value
+  return `${origin}/v1/env-proxy/${encodeURIComponent(id)}${path}`
 }
 
 /** AI代理 API */

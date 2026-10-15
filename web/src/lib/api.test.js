@@ -734,16 +734,18 @@ describe('resolveRemoteEnvLogo', () => {
       .toBe('data:image/png;base64,AAA')
   })
 
-  it('resolves /-prefixed logos against the environment address', () => {
-    expect(resolveRemoteEnvLogo('http://child:7988', '/logo.png'))
-      .toBe('http://child:7988/logo.png')
-    expect(resolveRemoteEnvLogo('https://a.b.com:8443', '/sub/logo.png'))
-      .toBe('https://a.b.com:8443/sub/logo.png')
+  it('routes /-prefixed logos through the same-origin env-proxy bridge', () => {
+    expect(resolveRemoteEnvLogo('http://child:7988', '/logo.png', 'http://parent:7988'))
+      .toBe('http://parent:7988/v1/env-proxy/http%3A%2F%2Fchild%3A7988/logo.png')
+    expect(resolveRemoteEnvLogo('https://a.b.com:8443', '/sub/logo.png', 'http://parent:7988'))
+      .toBe('http://parent:7988/v1/env-proxy/https%3A%2F%2Fa.b.com%3A8443/sub/logo.png')
   })
 
-  it('resolves relative logos against the environment address', () => {
-    expect(resolveRemoteEnvLogo('http://child:7988', 'logo.png'))
-      .toBe('http://child:7988/logo.png')
+  it('routes relative logos through the bridge and encodes tunnel ids', () => {
+    expect(resolveRemoteEnvLogo('http://child:7988', 'logo.png', 'http://parent:7988'))
+      .toBe('http://parent:7988/v1/env-proxy/http%3A%2F%2Fchild%3A7988/logo.png')
+    expect(resolveRemoteEnvLogo('tunnel:0123456789abcdef', '/l.png', 'http://parent:7988'))
+      .toBe('http://parent:7988/v1/env-proxy/tunnel%3A0123456789abcdef/l.png')
   })
 
   it('returns an empty string for a missing logo', () => {
