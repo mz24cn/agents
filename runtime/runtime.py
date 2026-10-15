@@ -2434,6 +2434,25 @@ class Runtime:
                 round_index, round_total_tokens,
             )
             return messages
+        # Mid-loop compression rebuilds the in-flight context.  Every image in
+        # the rebuilt list has already been interpreted in an earlier round of
+        # THIS loop (the entry-time resolver resolved the newest image-carrying
+        # user message to a data: URI before compression fired), so drop all
+        # image payloads here and keep only the "[Image file attached: ...]"
+        # placeholder that lives in the message content.  Reusing
+        # _drop_history_images is deliberately avoided: it keeps the payload of
+        # the *newest* image-carrying user message, which after a rebuild is
+        # exactly the one the user-anchor guarantee prepended back — that would
+        # re-inject the raw child-side path and crash convert_image_to_base64
+        # on the POSIX host.  Dropping also saves tokens on every following round.
+        try:
+            from dataclasses import replace as _dc_replace
+        except ImportError:  # pragma: no cover
+            _dc_replace = None
+        if _dc_replace is not None:
+            for _i, _m in enumerate(replacement):
+                if getattr(_m, "images", None):
+                    replacement[_i] = _dc_replace(_m, images=None)
         _logger.info(
             "infer_stream: context rebuilt mid-loop | round=%d tokens=%d "
             "messages=%d->%d prompt_tokens=%d->%d",
