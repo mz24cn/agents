@@ -159,10 +159,15 @@
   }
 
   /** Mark *row* selected and copy its context window into the input.
+   *  模型名称为空时，顺手把该行的名称也填上。
    *  @param {boolean} onlyIfEmpty - keep a value the user already typed. */
   function applyProbeRow(row, { onlyIfEmpty = false } = {}) {
     if (!row) return
     probeRows = probeRows.map(item => ({ ...item, selected: item === row }))
+    if (!model_name.trim() && row.model_name) {
+      model_name = row.model_name
+      if (errors.model_name) errors.model_name = ''
+    }
     const value = Number(row.max_context) || 0
     if (value <= 0) {
       probeNote = t('probeNoContext', { name: row.model_name })
@@ -325,6 +330,7 @@
       {/if}
       {@const visible = filterProbeRows(probeRows, probeFilter)}
       {@const cols = probeColumns(probeRows)}
+      {@const colspan = 4 + cols.output + cols.features + cols.status}
       <div class="probe-table-wrap">
         <table class="probe-table">
           <thead>
@@ -363,7 +369,7 @@
                 {#if cols.status}<td>{row.status || '—'}</td>{/if}
               </tr>
             {:else}
-              <tr class="probe-no-match"><td colspan="7">{t('probeNoMatchRows')}</td></tr>
+              <tr class="probe-no-match"><td colspan={colspan}>{t('probeNoMatchRows')}</td></tr>
             {/each}
           </tbody>
         </table>

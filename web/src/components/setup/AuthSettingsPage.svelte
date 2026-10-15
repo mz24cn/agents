@@ -123,6 +123,14 @@
     return t('inferenceBusyGeneric')
   }
 
+  // ↓ 按钮禁用时的提示：说明为什么现在点不了（推理进行中 / 更新或重启正在进行）
+  function downgradeTitle() {
+    if (inferenceActive) return t('downgradeBlockedInference')
+    if (checkingUpdate || applyingUpdate) return t('updateApplying')
+    if (restartingBackend) return t('restartBackendStarting')
+    return t('updateDowngradeMark')
+  }
+
   function refreshUpdateMessage() {
     const busy = inferenceActive ? inferenceBusyReason() : ''
     if (updateAvailable) {
@@ -550,13 +558,16 @@
   }
 
 
-  // 可升级：三个版本任一比本地（母环境）更新时，显示与构建版本一致的蓝色升级图标
-  function envHasUpgrade(entry) {
-    return [
-      [frontend, entry.frontend_build],
-      [backend, entry.backend_build],
-      [lastConfig, entry.last_config],
-    ].some(([local, there]) => !!local && (!there || local > there))
+  // 可升级（按版本项）：母环境（本地）的该版本比环境更新时，
+  // 在表格对应的版本格内显示与「构建版本」一致的 ↑ 标记
+  function envSlotUpgrade(local, there) {
+    return !!local && (!there || local > there)
+  }
+
+  // 可降级（按版本项）：环境的（子的）该版本项比母环境（本地）更新时，
+  // 在表格对应的版本格内显示 ↓ 标记（仅提示：该环境比母环境更新）
+  function envSlotDowngrade(local, there) {
+    return !!local && !!there && there > local
   }
 
   // 在线：直连与隧道环境统一看 online 字段（见 normalizeEnvEntries）
@@ -775,35 +786,29 @@
               <div class="build-row">
                 <span class="build-label">
                   {t('buildFrontend')}
-                  {#if frontendSync === 'upgrade'}
-                    <span class="sync-up" title={t('updateUpgradeMark')}>⏫</span>
-                  {:else if frontendSync === 'downgrade'}
-                    <button class="sync-down" type="button" title={t('updateDowngradeMark')} aria-label={t('downgradeFrontend')} onclick={() => applyDowngrade('frontend')} disabled={!canApplyDowngrade}>⏬</button>
+                  {#if frontendSync === 'downgrade'}
+                    <button class="sync-down" type="button" title={downgradeTitle()} aria-label={t('downgradeFrontend')} onclick={() => applyDowngrade('frontend')} disabled={!canApplyDowngrade}>↓</button>
                   {/if}
                 </span>
-                <code class="build-value">{frontend || '-'}</code>
+                <code class="build-value">{frontend || '-'}{#if frontendSync === 'upgrade'}<span class="sync-up" title={t('updateUpgradeMark')}>↑</span>{/if}</code>
               </div>
               <div class="build-row">
                 <span class="build-label">
                   {t('buildBackend')}
-                  {#if backendSync === 'upgrade'}
-                    <span class="sync-up" title={t('updateUpgradeMark')}>⏫</span>
-                  {:else if backendSync === 'downgrade'}
-                    <button class="sync-down" type="button" title={t('updateDowngradeMark')} aria-label={t('downgradeBackend')} onclick={() => applyDowngrade('backend')} disabled={!canApplyDowngrade}>⏬</button>
+                  {#if backendSync === 'downgrade'}
+                    <button class="sync-down" type="button" title={downgradeTitle()} aria-label={t('downgradeBackend')} onclick={() => applyDowngrade('backend')} disabled={!canApplyDowngrade}>↓</button>
                   {/if}
                 </span>
-                <code class="build-value">{backend || '-'}</code>
+                <code class="build-value">{backend || '-'}{#if backendSync === 'upgrade'}<span class="sync-up" title={t('updateUpgradeMark')}>↑</span>{/if}</code>
               </div>
               <div class="build-row">
                 <span class="build-label">
                   {t('buildConfig')}
-                  {#if configSync === 'upgrade'}
-                    <span class="sync-up" title={t('updateUpgradeMark')}>⏫</span>
-                  {:else if configSync === 'downgrade'}
-                    <button class="sync-down" type="button" title={t('updateDowngradeMark')} aria-label={t('downgradeConfig')} onclick={() => applyDowngrade('config')} disabled={!canApplyDowngrade}>⏬</button>
+                  {#if configSync === 'downgrade'}
+                    <button class="sync-down" type="button" title={downgradeTitle()} aria-label={t('downgradeConfig')} onclick={() => applyDowngrade('config')} disabled={!canApplyDowngrade}>↓</button>
                   {/if}
                 </span>
-                <code class="build-value">{lastConfig || '-'}</code>
+                <code class="build-value">{lastConfig || '-'}{#if configSync === 'upgrade'}<span class="sync-up" title={t('updateUpgradeMark')}>↑</span>{/if}</code>
               </div>
             </div>
             <div class="update-panel">
@@ -965,7 +970,6 @@
                   <span>{t('buildBackend')}</span>
                   <span>{t('buildConfig')}</span>
                   <span>{t('remoteEnvInference')}</span>
-                  <span>{t('remoteEnvUpgradeCol')}</span>
                   <span>{t('remoteEnvOnlineCol')}</span>
                   <span></span>
                 </div>
@@ -986,15 +990,12 @@
                         <span class="remote-env-app-title" title={entry.app_title}>{entry.app_title || '-'}</span>
                       </span>
                       <span class="remote-env-platform" title={[entry.arch, entry.os].filter(Boolean).join(' / ')}>{[entry.arch, entry.os].filter(Boolean).join(' / ') || '-'}</span>
-                      <code class="build-value">{entry.frontend_build || '-'}</code>
-                      <code class="build-value">{entry.backend_build || '-'}</code>
-                      <code class="build-value">{entry.last_config || '-'}</code>
+                      <code class="build-value">{entry.frontend_build || '-'}{#if envSlotUpgrade(frontend, entry.frontend_build)}<span class="sync-up" title={t('remoteEnvUpgradeHint')}>↑</span>{:else if envSlotDowngrade(frontend, entry.frontend_build)}<span class="sync-down" title={t('remoteEnvDowngradeHint')}>↓</span>{/if}</code>
+                      <code class="build-value">{entry.backend_build || '-'}{#if envSlotUpgrade(backend, entry.backend_build)}<span class="sync-up" title={t('remoteEnvUpgradeHint')}>↑</span>{:else if envSlotDowngrade(backend, entry.backend_build)}<span class="sync-down" title={t('remoteEnvDowngradeHint')}>↓</span>{/if}</code>
+                      <code class="build-value">{entry.last_config || '-'}{#if envSlotUpgrade(lastConfig, entry.last_config)}<span class="sync-up" title={t('remoteEnvUpgradeHint')}>↑</span>{:else if envSlotDowngrade(lastConfig, entry.last_config)}<span class="sync-down" title={t('remoteEnvDowngradeHint')}>↓</span>{/if}</code>
                       <span class="inference-pill" class:busy={entry.inference_active}>
                         <span class="dot"></span>
                         {entry.inference_active ? t('remoteEnvInferenceActive') : t('remoteEnvIdle')}
-                      </span>
-                      <span class="remote-env-upgrade" title={envHasUpgrade(entry) ? t('remoteEnvUpgradeHint') : ''}>
-                        {#if envHasUpgrade(entry)}<span class="sync-up">⏫</span>{/if}
                       </span>
                       <span class="remote-env-online" title={envOnline(entry) ? t('remoteEnvOnline') : t('remoteEnvOffline')}>
                         {#if envOnline(entry)}<span class="env-check">✓</span>{/if}
@@ -1355,7 +1356,7 @@
   }
   .build-content {
     display: grid;
-    grid-template-columns: 190px minmax(0, 1fr);
+    grid-template-columns: 220px minmax(0, 1fr);
     gap: 18px;
     align-items: start;
   }
@@ -1381,17 +1382,21 @@
     line-height: 1;
     vertical-align: middle;
   }
-  .sync-down {
+  /* ↑ 可升级（蓝色，与远程环境表格一致）；↓ 对端更新：仅提示"只能升不会降"，与 ↑ 不对称，故用灰不用蓝 */
+  .sync-up { color: var(--primary); }
+  .sync-down { color: var(--text-secondary); }
+  button.sync-down {
     appearance: none;
     border: 0;
     padding: 1px 2px;
     background: transparent;
     cursor: pointer;
     border-radius: 4px;
+    font-weight: 400;
   }
-  .sync-down:hover:not(:disabled) { background: var(--bg-secondary); }
-  .sync-down:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
-  .sync-down:disabled { cursor: not-allowed; opacity: 0.45; }
+  button.sync-down:hover:not(:disabled) { background: var(--bg-secondary); }
+  button.sync-down:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
+  button.sync-down:disabled { cursor: not-allowed; opacity: 0.45; }
   .build-value {
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
     font-size: 0.88rem;
@@ -1399,6 +1404,7 @@
     background: var(--bg-secondary);
     padding: 3px 8px;
     border-radius: 4px;
+    white-space: nowrap;
   }
   .update-panel {
     min-width: 0;
@@ -1526,10 +1532,22 @@
   }
   .remote-envs-scroll {
     display: grid;
-    grid-template-columns: minmax(150px, max-content) minmax(120px, max-content) max-content repeat(3, 130px) max-content max-content max-content 1fr;
+    /* 列宽按比例分配：8 个信息列用 minmax(下限, 权重fr) 均分可用宽度，
+       操作列按按钮组内容宽度撑开并贴住右缘（行尾不再留空）；
+       min-width 兜底：窗口过窄时整表横向滚动而不是挤压内容 */
+    grid-template-columns:
+      minmax(180px, 1.2fr)
+      minmax(120px, 1.1fr)
+      minmax(100px, 0.8fr)
+      minmax(108px, 1fr)
+      minmax(108px, 1fr)
+      minmax(108px, 0.9fr)
+      minmax(84px, 0.8fr)
+      minmax(40px, 0.5fr)
+      max-content;
     column-gap: 12px;
-    width: max-content;
-    min-width: 100%;
+    width: 100%;
+    min-width: 1120px;
     padding: 0 12px;
   }
   .remote-env-head,
@@ -1541,10 +1559,8 @@
     padding: 8px 0;
   }
   /* Chromium 会忽略 subgrid 容器上的 justify-items，逐列对齐改在单元格上做：
-     表头单元格拉伸占满轨道宽，用 text-align 对齐文字（前两列默认即左对齐）；
-     数据行单元格用 justify-self 收缩为内容宽——地址(id)与标题列左对齐，
-     架构/系统、前端、后端、配置、状态、升级、在线列右对齐（状态列宽度由
-     最长的三字"推理中"胶囊撑开；升级/在线列由表头文字撑开），操作列保持右对齐 */
+     地址(id)与标题列左对齐；架构/系统、三个版本列、推理、在线列右对齐；
+     表头文字用 text-align 右对齐（前两列单独改回左对齐），数据单元格用 justify-self */
   .remote-env-head {
     text-align: right;
     /* 负 margin 抵消容器左右 padding，使灰色表头条横贯整个列表且不影响轨道对齐 */
@@ -1555,6 +1571,9 @@
     font-size: 0.8rem;
     font-weight: 600;
   }
+  .remote-env-head > :nth-child(-n + 2) {
+    text-align: left;
+  }
   .remote-env-address,
   .remote-env-app {
     justify-self: start;
@@ -1563,7 +1582,6 @@
   .remote-env-actions,
   .remote-env-row .build-value,
   .remote-env-row .inference-pill,
-  .remote-env-row .remote-env-upgrade,
   .remote-env-row .remote-env-online {
     justify-self: end;
   }
@@ -1593,13 +1611,6 @@
   .tunnel-address {
     cursor: default;
     color: var(--text);
-  }
-  .remote-env-upgrade {
-    min-width: 14px;
-    line-height: 1;
-  }
-  .remote-env-upgrade .sync-up {
-    margin-left: 0;
   }
   .remote-env-online {
     line-height: 1;
@@ -1667,8 +1678,8 @@
   .remote-env-actions {
     display: flex;
     gap: 6px;
-    /* 右对齐：1fr 末列 + auto margin，每行按钮组都贴住右边缘（移动端
-       flex-wrap 布局下同样生效），保证各行按钮上下对齐。 */
+    /* 操作列按按钮组内容撑开（max-content 轨道）；auto margin 把按钮组推到
+       表格右缘（移动端 flex-wrap 布局下同样生效），保证各行按钮上下对齐。 */
     margin-left: auto;
   }
   .btn-sm {
