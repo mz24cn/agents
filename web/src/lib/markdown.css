@@ -2,9 +2,15 @@
  * Markdown 嵌入内容共享样式（唯一出处）
  *
  * 聊天消息容器（.markdown-content）与文件 MD 预览容器（.text-preview）
- * 都挂 .md-view 类，本文件负责「共享渲染管道（lib/markdown.js）产出的
- * 嵌入内容」样式：代码块/复制按钮/语法高亮/Mermaid 容器与工具栏/数学。
+ * 都挂 .md-view 类，本文件负责「共享渲染管道（lib/markdown.js）产出」的
+ * 嵌入内容样式：代码块/复制按钮/语法高亮/Mermaid 容器与工具栏/数学。
  * 基础排版（h1-p-ul-a 等）因两种语境字号行高不同，仍留在各组件。
+ *
+ * 注意：嵌入"表面"（代码块/按钮等）一律用 --bg-tertiary。
+ * 它在本 app 是事实上的第三级表面令牌（CopyButton / FileDiffViewer /
+ * ToolCallCard / MessageBubble 按钮等 ~20 处都引用它）。切勿改成
+ * --bg-secondary —— 那正是 assistant/tool 消息气泡的底色，二者会
+ * 撞色导致代码块底色在浅色主题下"消失"（只剩悬浮的复制按钮与语言角标）。
  */
 
 /* ===== 代码块（markdown 内的围栏代码，非文件预览的整文件行号视图） ===== */
@@ -19,7 +25,7 @@
   padding: 2px 8px;
   font-size: 0.7em;
   color: var(--text-secondary, #888);
-  background: var(--bg-secondary, rgba(0, 0, 0, 0.15));
+  background: var(--bg-tertiary, rgba(0, 0, 0, 0.15));
   border-radius: 4px 0 4px 0;
   text-transform: uppercase;
   letter-spacing: 0.05em;
@@ -32,7 +38,7 @@
   z-index: 1;
 }
 .md-view .code-block pre {
-  background: var(--bg-secondary, rgba(0, 0, 0, 0.08));
+  background: var(--bg-tertiary, rgba(0, 0, 0, 0.08));
   padding: 0.8em 1em;
   border-radius: 4px;
   overflow-x: auto;
@@ -48,7 +54,7 @@
   padding: 2px 8px;
   font-size: 0.7em;
   color: var(--text-secondary, #888);
-  background: var(--bg-secondary, rgba(0, 0, 0, 0.15));
+  background: var(--bg-tertiary, rgba(0, 0, 0, 0.15));
   border: none;
   border-radius: 0 4px 0 4px;
   cursor: pointer;
@@ -130,7 +136,7 @@
   font-size: 0.72em;
   line-height: 1.5;
   color: var(--text-secondary, #888);
-  background: var(--bg-secondary, rgba(0, 0, 0, 0.06));
+  background: var(--bg-tertiary, rgba(0, 0, 0, 0.06));
   border: 1px solid var(--border, rgba(0, 0, 0, 0.1));
   border-radius: 4px;
   cursor: pointer;
@@ -139,7 +145,7 @@
 }
 .md-view .mermaid-tbtn:hover {
   color: var(--text, #333);
-  background: var(--border, rgba(0, 0, 0, 0.12));
+  background: var(--bg-tertiary, rgba(0, 0, 0, 0.12));
 }
 .md-view .mermaid-tbtn:active {
   color: #fff;

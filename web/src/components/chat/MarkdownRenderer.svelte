@@ -61,7 +61,8 @@
   }
 
   .markdown-content :global(code) {
-    background: var(--bg-secondary, rgba(0,0,0,0.1));
+    /* --bg-tertiary 是 app 的第三级表面令牌；勿用 --bg-secondary（= 消息气泡底色，会撞色致底色消失） */
+    background: var(--bg-tertiary, rgba(0,0,0,0.1));
     padding: 0.15em 0.35em;
     border-radius: 3px;
     font-size: 0.88em;
@@ -69,7 +70,7 @@
   }
 
   .markdown-content :global(pre) {
-    background: var(--bg-secondary, rgba(0,0,0,0.08));
+    background: var(--bg-tertiary, rgba(0,0,0,0.08));
     padding: 0.8em 1em;
     border-radius: 4px;
     overflow-x: auto;
@@ -104,7 +105,7 @@
     text-align: left;
   }
   .markdown-content :global(th) {
-    background: var(--bg-secondary, rgba(0,0,0,0.06));
+    background: var(--bg-tertiary, rgba(0,0,0,0.06));
     font-weight: 600;
   }
 
