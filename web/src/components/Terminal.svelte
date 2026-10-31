@@ -1,21 +1,26 @@
 <script>
   import { onMount, onDestroy } from 'svelte';
   import { copyToClipboard } from '$lib/clipboard.js';
-  import { buildRemoteWsUrl } from '$lib/remote-execution.svelte.js';
+  import { LOCAL_ENV_ID, openTerminalChannel } from '$lib/terminals-mux.js';
   import '@xterm/xterm/css/xterm.css';
 
-  // remote: { base, token, host } — when set, the terminal connects directly
-  // to the child environment's /v1/terminals/ws (remote exec mode).
-  let { sessionId, workspace = '', visible = true, onStatusChange = null, remote = null } = $props();
+  // remoteEnvId: the child environment this channel belongs to ('' = local).
+  // It is only an id: the tab's ONE shared terminal socket carries it as
+  // `env_id` on the open frame and the parent dials that environment (over its
+  // tunnel or directly).  The browser therefore needs nothing else about the
+  // child — no URL, no credential, no extra connection.
+  let { sessionId, workspace = '', visible = true, onStatusChange = null, remoteEnvId = '' } = $props();
 
   let termEl;
   let term;
   let fitAddon;
-  let ws;
+  // Channel handle on this origin's shared terminal socket (see
+  // $lib/terminals-mux.js).  Not reactive: the $effect below must not
+  // re-trigger when it is (re)assigned.
+  let chan;
   let connected = false;
   let loading = false;
   let resizeObserver;
-  let retryTimeout;
   let destroyed = false;
 
   // ── mouse-tracking: persistently disable ──────────────────
@@ -28,90 +33,63 @@
     } catch {}
   }
 
-  function getWsUrl(sid) {
-    // 远程执行：直接连接子环境 WebSocket（携带 token 查询参数鉴权）。
-    if (remote) {
-      return buildRemoteWsUrl('/v1/terminals/ws', {
-        terminal_id: sid,
-        ...(workspace ? { workspace: workspace } : {}),
-        ...(term && fitAddon ? { cols: term.cols, rows: term.rows } : {}),
-      });
-    }
+  // 本地终端和子环境终端挂的是**同一个端点**：本 tab 只有一条终端 WS，通道属于
+  // 哪个环境由 open 帧里的 env_id 决定（$lib/terminals-mux.js 与母端的
+  // runtime/terminal_env_bridge.py）。所以多开几个子环境不会再多占浏览器每原点
+  // ~6 条连接的额度，子端凭据也始终留在母端。
+  function muxUrl() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    let url = `${proto}//${location.host}/v1/terminals/ws?terminal_id=${sid}`;
-    if (workspace) {
-      url += `&workspace=${encodeURIComponent(workspace)}`;
-    }
-    if (term && fitAddon) {
-      try {
-        url += `&cols=${term.cols}&rows=${term.rows}`;
-      } catch {}
-    }
-    return url;
+    return `${proto}//${location.host}/v1/terminals/ws`;
+  }
+
+  function closeChannel() {
+    try { chan?.close(); } catch {}
+    chan = null;
   }
 
   function connect() {
     if (destroyed) return;
-    if (ws) { try { ws.close(); } catch {} }
+    closeChannel();
     loading = true;
     connected = false;
     notifyStatus();
 
-    ws = new WebSocket(getWsUrl(sessionId));
-    const thisWs = ws;
-    let terminalIdReceived = false;
-
-    ws.onopen = () => {
-      loading = false;
-      connected = true;
-      notifyStatus();
-      try { fitAddon?.fit(); } catch {}
-      if (term) handleResize({ cols: term.cols, rows: term.rows });
-      disableMouseTracking();
-    };
-
-    ws.onmessage = (evt) => {
-      if (!terminalIdReceived) {
+    // Every terminal of this tab shares one WebSocket; the hub dials it,
+    // re-dials on loss (re-opening each channel) and drops the socket once the
+    // last channel closes.
+    chan = openTerminalChannel({
+      url: muxUrl(),
+      terminalId: sessionId,
+      // 会话绑定到子环境时，这条通道路由到那个环境；否则归 local。
+      envId: remoteEnvId || LOCAL_ENV_ID,
+      ...(workspace ? { workspace } : {}),
+      cols: term?.cols ?? 80,
+      rows: term?.rows ?? 24,
+      onData: (chunk) => {
         try {
-          const data = JSON.parse(evt.data);
-          if (data.__terminal_id) { terminalIdReceived = true; return; }
-        } catch {}
-      }
-      try {
-        term?.write(evt.data);
-      } catch (e) {
-        console.warn('[term] write error caught:', e.message || e);
-      }
-    };
-
-    ws.onclose = () => {
-      loading = false;
-      connected = false;
-      notifyStatus();
-      // Only auto-retry if this is still the *active* websocket.  connect()
-      // deliberately closes the previous socket when opening a new one; that
-      // old socket must not schedule another retry, otherwise the 3s retry
-      // would fight with the fresh connection and create an endless
-      // connect/disconnect loop (visible as a flickering "Connecting...").
-      if (!destroyed && thisWs === ws) scheduleRetry();
-    };
-
-    ws.onerror = () => {};
+          term?.write(chunk);
+        } catch (e) {
+          console.warn('[term] write error caught:', e.message || e);
+        }
+      },
+      onStatus: ({ connected: up, loading: busy, error = null }) => {
+        connected = up;
+        if (busy !== undefined) loading = busy;
+        if (up) {
+          try { fitAddon?.fit(); } catch {}
+          disableMouseTracking();
+        }
+        notifyStatus(error);
+      },
+    });
   }
 
-  function notifyStatus() {
-    onStatusChange?.({ connected, loading, error: null, terminalId: sessionId });
-  }
-
-  function scheduleRetry() {
-    clearTimeout(retryTimeout);
-    retryTimeout = setTimeout(connect, 3000);
+  function notifyStatus(error = null) {
+    onStatusChange?.({ connected, loading, error, terminalId: sessionId });
   }
 
   function handleResize(size) {
-    if (ws?.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ __resize: true, cols: size.cols, rows: size.rows }));
-    }
+    chan?.resize(size.cols, size.rows);
   }
 
   function doFit() {
@@ -120,8 +98,7 @@
 
   export function destroy() {
     destroyed = true;
-    clearTimeout(retryTimeout);
-    try { ws?.close(); } catch {}
+    closeChannel();
   }
 
   onMount(async () => {
@@ -140,7 +117,7 @@
     term.onResize(handleResize);
 
     term.onData((data) => {
-      if (ws?.readyState === WebSocket.OPEN) ws.send(data);
+      chan?.send(data);
     });
 
     term.open(termEl);
@@ -177,9 +154,7 @@
           }
           for (const mode of modes) {
             const pm = (mode === 1) ? 2 : 0;
-            if (ws?.readyState === WebSocket.OPEN) {
-              ws.send(`\x1b[?${mode};${pm}$y`);
-            }
+            chan?.send(`\x1b[?${mode};${pm}$y`);
           }
           return true;
         }
@@ -229,9 +204,8 @@
 
   onDestroy(() => {
     destroyed = true;
-    clearTimeout(retryTimeout);
     resizeObserver?.disconnect();
-    try { ws?.close(); } catch {}
+    closeChannel();
     try { term?.dispose(); } catch {}
   });
 
@@ -243,24 +217,20 @@
   });
 
   // 连接目标 = 执行环境（本地/子端）+ 会话。目标变化（切换执行环境、
-  // 绑定异步解析完成）时关闭旧连接并重新连接到新目标；首次挂载时也走这里。
+  // 绑定异步解析完成）时关掉旧通道并在新的共享 socket 上重新打开；首次挂载
+  // 时也走这里。visible 只决定何时首次挂载通道：隐藏期间仍然保持附着 ——
+  // 后端 PTY 一直在跑，但脱离期间打印的内容不会补发，浏览器里那份 xterm
+  // 回滚缓冲就是唯一的历史；共享 socket 让这份"随时可恢复"不再多占连接。
   let wsTarget = ''
   $effect(() => {
-    const target = `${remote?.host ?? ''}\u0000${sessionId ?? ''}`
-    if (visible && sessionId && !destroyed) {
-      if (target !== wsTarget) {
-        wsTarget = target
-        if (ws && ws.readyState !== WebSocket.CLOSED) {
-          try { ws.close(); } catch {}
-        }
-        const timer = setTimeout(() => connect(), 0);
-        return () => clearTimeout(timer);
-      }
-      if (!ws || ws.readyState === WebSocket.CLOSED) {
-        const timer = setTimeout(() => connect(), 0);
-        return () => clearTimeout(timer);
-      }
-    }
+    // 目标 = 执行环境（local 或某个子环境的 id）+ 会话。用 env id 而不是 host：
+    // 两个子环境可能同 host 不同部署路径，host 相同但环境不同。
+    const target = `${remoteEnvId || LOCAL_ENV_ID}\u0000${sessionId ?? ''}`
+    if (!visible || !sessionId || destroyed) return
+    if (target === wsTarget && chan) return
+    wsTarget = target
+    const timer = setTimeout(() => connect(), 0);
+    return () => clearTimeout(timer);
   });
 </script>
 

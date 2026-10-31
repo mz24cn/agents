@@ -13,11 +13,12 @@ import {
   clearRemoteBinding,
   resolvePanelRemoteEnv,
   buildRemoteUrl,
-  buildRemoteWsUrl,
   remoteRequest,
   remoteWorkspace,
   remoteSessions,
   fetchRemoteWorkspacePath,
+  destroyTerminalInEnv,
+  envProxyPrefix,
 } from './remote-execution.svelte.js'
 
 function mockFetch(data, status = 200) {
@@ -83,12 +84,13 @@ describe('bindSessionToRemoteEnv', () => {
       // HTTP 不再直连子端：一律走母端同源桥，子端 token 由母端注入。
       base: 'http://parent.local:7988/v1/env-proxy/http%3A%2F%2F10.0.0.5%3A7988',
       prefix: '/v1/env-proxy/http%3A%2F%2F10.0.0.5%3A7988',
-      // 只有终端 WS 仍直连子端，凭据单独放在 wsToken 里。
-      wsPrefix: '',
-      wsToken: 'as_abc',
       transport: 'http',
       title: 'Child A',
     })
+    // 终端不再有 "ws 前缀 / 子端 token" 这套字段：终端走本页那一条共享
+    // /v1/terminals/ws，通道路由只看 env id（见 terminals-mux.test.js）。
+    expect(env).not.toHaveProperty('wsPrefix')
+    expect(env).not.toHaveProperty('wsToken')
     expect(remoteExecution.sessionId).toBe('sess-1')
     expect(remoteExecution.env).toBe(env)
   })
@@ -119,7 +121,7 @@ describe('bindSessionToRemoteEnv', () => {
 // URL builders
 // ---------------------------------------------------------------------------
 
-describe('buildRemoteUrl / buildRemoteWsUrl', () => {
+describe('buildRemoteUrl (HTTP bridge)', () => {
   it('routes child paths through the bridge without a child token', async () => {
     vi.stubGlobal('fetch', mockFetch(ENV_RECORDS))
     await bindSessionToRemoteEnv('sess-1', 'http://10.0.0.5:7988')
@@ -132,20 +134,14 @@ describe('buildRemoteUrl / buildRemoteWsUrl', () => {
     expect(withQuery).not.toContain('token=')
   })
 
-  it('keeps sub-path base for direct-child ws urls', async () => {
+  it('carries no terminal ws url: the env id alone routes the terminal', async () => {
+    // 子端是 https、页面是 http 也一样：终端不拨子端，也不拨"每环境一条"的桥接
+    // WS —— 它挂在页面自己那条共享 /v1/terminals/ws 上，open 帧带 env_id。
     vi.stubGlobal('fetch', mockFetch(ENV_RECORDS))
-    await bindSessionToRemoteEnv('sess-2', 'https://sub.example.com:8443')
-    const wsUrl = buildRemoteWsUrl('/v1/terminals/ws', { terminal_id: 't1' })
-    expect(wsUrl).toBe('wss://sub.example.com:8443/v1/terminals/ws?terminal_id=t1')
-  })
-
-  it('direct-child ws keeps the child token, http does not', async () => {
-    // 终端 WS 直连子端（浏览器可达时才可用），握手仍需要子端 token；
-    // 同一环境的 HTTP 走桥，token 由母端注入，不出现在浏览器 URL 里。
-    vi.stubGlobal('fetch', mockFetch(ENV_RECORDS))
-    await bindSessionToRemoteEnv('sess-1', 'http://10.0.0.5:7988')
-    expect(buildRemoteWsUrl('/v1/terminals/ws', { terminal_id: 't1' })).toBe(
-      'ws://10.0.0.5:7988/v1/terminals/ws?terminal_id=t1&token=as_abc')
+    const env = await bindSessionToRemoteEnv('sess-2', 'https://sub.example.com:8443')
+    expect(env.id).toBe('https://sub.example.com:8443')
+    expect(env).not.toHaveProperty('wsPrefix')
+    expect(env).not.toHaveProperty('wsToken')
     expect(buildRemoteUrl('/v1/workspace/list')).not.toContain('token=')
   })
 
@@ -155,20 +151,14 @@ describe('buildRemoteUrl / buildRemoteWsUrl', () => {
     expect(env).toMatchObject({
       id: 'tunnel:0123456789abcdef',
       base: 'http://parent.local:7988/v1/env-proxy/tunnel%3A0123456789abcdef',
-      wsToken: '',
       host: 'parent.local:7988',
       prefix: '/v1/env-proxy/tunnel%3A0123456789abcdef',
-      wsPrefix: '/v1/env-proxy/tunnel%3A0123456789abcdef',
       transport: 'ws-tunnel',
     })
     // HTTP through the bridge: same origin, no child token in the URL
     const url = buildRemoteUrl('/v1/workspace/list', { query: { path: '.' } })
     expect(url).toBe('http://parent.local:7988/v1/env-proxy/tunnel%3A0123456789abcdef/v1/workspace/list?path=.')
     expect(url).not.toContain('token=')
-    // terminal WS through the bridge (protocol follows the page)
-    const wsUrl = buildRemoteWsUrl('/v1/terminals/ws', { terminal_id: 't9' })
-    expect(wsUrl).toBe(
-      'ws://parent.local:7988/v1/env-proxy/tunnel%3A0123456789abcdef/v1/terminals/ws?terminal_id=t9')
     // workspace media URLs point at the bridge too
     expect(remoteWorkspace.content('a.png')).toBe(
       'http://parent.local:7988/v1/env-proxy/tunnel%3A0123456789abcdef/v1/workspace/content?path=a.png&restrict=1')
@@ -178,14 +168,13 @@ describe('buildRemoteUrl / buildRemoteWsUrl', () => {
     vi.stubGlobal('fetch', mockFetch({ envs: [{ id: 'tunnel:ffffffffffffffff', url: 'http://direct:1/v1/setup', status: 'online' }] }))
     const env = await bindSessionToRemoteEnv('sess-1', 'tunnel:ffffffffffffffff')
     expect(env.base).toContain('/v1/env-proxy/')
-    // 隧道环境的终端 WS 也只能经母端桥接，浏览器不需要子端凭据
-    expect(env.wsPrefix).toContain('/v1/env-proxy/')
-    expect(env.wsToken).toBe('')
+    expect(env.transport).toBe('ws-tunnel')
+    // 隧道环境没有"母端↔子端"的 url 可谈（终端只靠 id 路由）
+    expect(env.url).toBe('')
   })
 
   it('throws when nothing is bound', () => {
     expect(() => buildRemoteUrl('/v1/tools')).toThrow()
-    expect(() => buildRemoteWsUrl('/v1/terminals/ws')).toThrow()
   })
 })
 
@@ -448,5 +437,49 @@ describe('remoteWorkspace.uploadChunk', () => {
     handle.abort()
     expect(xhr.aborted).toBe(true)
     await expect(handle.promise).rejects.toMatchObject({ name: 'AbortError' })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Env-addressed bridge calls (background sessions)
+//
+// `remoteExecution` describes the CURRENT session's binding.  A terminal of a
+// background session has to be destroyed in *its* environment, so the bridge is
+// addressed by env id instead of following the active binding.
+// ---------------------------------------------------------------------------
+
+describe('envProxyPrefix / destroyTerminalInEnv', () => {
+  function captureFetch(status = 200) {
+    const calls = []
+    vi.stubGlobal('fetch', vi.fn(async (url, opts) => {
+      calls.push({ url, method: opts?.method, headers: opts?.headers })
+      return { ok: status < 300, status, json: () => Promise.resolve({}) }
+    }))
+    return calls
+  }
+
+  it('addresses the bridge by env id, percent-encoded', () => {
+    expect(envProxyPrefix('http://10.0.0.5:7988')).toBe('/v1/env-proxy/http%3A%2F%2F10.0.0.5%3A7988')
+    expect(envProxyPrefix('tunnel:0123456789abcdef')).toBe('/v1/env-proxy/tunnel%3A0123456789abcdef')
+  })
+
+  it('deletes the terminal of a session that is not the bound one', async () => {
+    clearRemoteBinding()          // no active binding at all — still works
+    const calls = captureFetch(204)
+    await destroyTerminalInEnv('http://10.0.0.5:7988', '2026-01-02_12-30-00')
+    expect(calls[0].method).toBe('DELETE')
+    expect(calls[0].url).toBe(
+      '/v1/env-proxy/http%3A%2F%2F10.0.0.5%3A7988/v1/terminals/2026-01-02_12-30-00')
+    // Same-origin: the parent authenticates the browser (cookie) and injects the
+    // child credential itself, so no token may appear anywhere in the request.
+    expect(calls[0].url).not.toContain('token')
+    expect(calls[0].url.startsWith('/v1/env-proxy/')).toBe(true)
+    vi.unstubAllGlobals()
+  })
+
+  it('swallows failures (terminal teardown must not block the UI)', async () => {
+    captureFetch(502)
+    await expect(destroyTerminalInEnv('env-x', 's1')).resolves.toBeUndefined()
+    vi.unstubAllGlobals()
   })
 })

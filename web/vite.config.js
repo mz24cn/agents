@@ -38,6 +38,9 @@ export default defineConfig({
   plugins: [svelte(), buildVersionPlugin()],
   server: {
     proxy: {
+      // One multiplexed terminal socket per tab (every terminal of the tab
+      // shares it), so it needs its own ws-enabled entry like the other
+      // upgrade endpoints.
       '/v1/terminals/ws': {
         target: 'ws://localhost:7988',
         ws: true

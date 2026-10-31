@@ -7,12 +7,15 @@
  *
  *  - the active binding (which session + which child env), set by ChatPage
  *    on session restore / env switch,
- *  - child request helpers (workspace files, file journals, tools, terminal
- *    WebSocket).  HTTP always goes through the parent's same-origin bridge
+ *  - child request helpers (workspace files, file journals, tools).  HTTP
+ *    always goes through the parent's same-origin bridge
  *    (/v1/env-proxy/{env_id}/...): the browser never needs a route to the
  *    child, carries no child credential, and the parent picks the transport
- *    (reverse WS tunnel or direct HTTP).  Only the interactive terminal
- *    WebSocket still dials a direct child itself,
+ *    (reverse WS tunnel or direct HTTP).  The interactive terminal does not
+ *    use the bridge path at all: it rides the tab's ONE
+ *    ``WS /v1/terminals/ws`` socket like any other terminal, and the frame's
+ *    ``env_id`` routes it to this environment (runtime/terminal_env_bridge.py)
+ *    — one connection per tab however many environments are open.
  *  - URL helpers derived from the registered setup URL.
  *
  * Revoke stays on the PARENT (it coordinates child journal restore first);
@@ -23,11 +26,10 @@ import { remoteEnv } from './api.js'
 
 /** Active binding for the current chat session.
  *  sessionId: string | null — the session this binding applies to
- *  env: { id, url, base, host, title, prefix, wsPrefix, wsToken, transport } | null
- *    base     — same-origin bridge prefix (…/v1/env-proxy/{env_id})
- *    prefix   — bridge path prefix for HTTP (both transports)
- *    wsPrefix — bridge path prefix for the terminal WS ('' = dial the child)
- *    wsToken  — child token for a direct child's WS handshake only
+ *  env: { id, url, base, host, title, prefix, transport } | null
+ *    base     — same-origin bridge prefix (…/v1/env-proxy/{env_id}) for HTTP
+ *    prefix   — the same prefix as a path (kept for display/debug)
+ *    id       — environment id, carried into the terminal mux as env_id
  */
 export const remoteExecution = $state({ sessionId: null, env: null })
 
@@ -126,36 +128,17 @@ export async function bindSessionToRemoteEnv(sessionId, envId) {
   const prefix = `/v1/env-proxy/${encodeURIComponent(record.id)}`
   const bridgeBase = `${location.protocol}//${location.host}${prefix}`
   const isTunnel = record.id.startsWith('tunnel:') || record.transport === 'ws-tunnel'
-  if (isTunnel) {
-    remoteExecution.env = {
-      id: record.id,
-      url: '',
-      base: bridgeBase,
-      host: location.host,
-      title: record.app_title || record.title || '',
-      prefix,
-      // Terminal WS is bridged too: the child is not reachable from here.
-      wsPrefix: prefix,
-      wsToken: '',
-      transport: 'ws-tunnel',
-    }
-  } else {
-    const { token, host } = parseSetupUrl(record.url)
-    remoteExecution.env = {
-      id: record.id,
-      // 终端 WS 仍直连子端（浏览器可达时才可用）：url 决定 ws/wss，host 是
-      // 拨号地址，wsToken 是子端 WS 握手的凭据。桥接一条长连接交互式 socket
-      // 只是多一跳，并不增加可达性。HTTP 一律走桥，子端 token 由母端注入，
-      // 不再出现在浏览器 URL / 请求头里。
-      url: record.url,
-      base: bridgeBase,
-      host,
-      title: record.app_title || record.title || '',
-      prefix,
-      wsPrefix: '',
-      wsToken: token,
-      transport: record.transport || 'http',
-    }
+  // url/host describe the parent↔child hop only (a tunnel env has no such URL
+  // to speak of); the browser itself always talks to the parent.
+  const childHost = isTunnel ? location.host : parseSetupUrl(record.url).host
+  remoteExecution.env = {
+    id: record.id,
+    url: isTunnel ? '' : record.url,
+    base: bridgeBase,
+    host: childHost,
+    title: record.app_title || record.title || '',
+    prefix,
+    transport: isTunnel ? 'ws-tunnel' : (record.transport || 'http'),
   }
   return remoteExecution.env
 }
@@ -209,27 +192,6 @@ export function buildRemoteUrl(path, { query = {} } = {}) {
   for (const [k, v] of Object.entries(query)) {
     if (v !== undefined && v !== null) u.searchParams.set(k, String(v))
   }
-  return u.toString()
-}
-
-/** Build a child WebSocket URL (ws/wss) with token. */
-export function buildRemoteWsUrl(path, params = {}) {
-  const env = remoteExecution.env
-  if (!env) throw new Error('No remote environment bound')
-  // 协议跟随子环境自身的 scheme（父子环境可能 http/https 不一致）；
-  // 登记 URL 缺失时回退到页面协议。
-  const proto = env.url && env.url.startsWith('https')
-    ? 'wss:'
-    : (env.url ? 'ws:' : (location.protocol === 'https:' ? 'wss:' : 'ws:'))
-  const u = new URL(`${proto}//${env.host}`)
-  // Tunnel envs: the WS is bridged under /v1/env-proxy/{env_id}/... (same
-  // origin as the page); direct envs keep the bare child path and dial the
-  // child with its setup token.
-  u.pathname = (env.wsPrefix || '') + path
-  for (const [k, v] of Object.entries(params)) {
-    if (v !== undefined && v !== null) u.searchParams.set(k, String(v))
-  }
-  if (env.wsToken) u.searchParams.set('token', env.wsToken)
   return u.toString()
 }
 
@@ -388,10 +350,33 @@ export async function fetchRemoteWorkspacePath(envOverride = null) {
 }
 
 /**
+ * Same-origin bridge prefix for one environment, addressed by id.
+ *
+ * `remoteExecution` describes the **current** session's binding only; panels
+ * that act on a *background* session (its terminal, its workspace) need the
+ * bridge addressed explicitly instead of following the active binding.
+ */
+export function envProxyPrefix(envId) {
+  return `/v1/env-proxy/${encodeURIComponent(envId)}`
+}
+
+/**
  * Destroy the child terminal for a session (the terminal runs on the child).
  */
 export function destroyRemoteTerminal(sessionId) {
   return remoteRequest('DELETE', `/v1/terminals/${encodeURIComponent(sessionId)}`).catch(err => {
     console.warn('Failed to delete remote terminal:', err)
   })
+}
+
+/**
+ * Destroy a terminal in a specific environment, by env id (background
+ * sessions: the active binding belongs to another session).
+ */
+export function destroyTerminalInEnv(envId, sessionId) {
+  return fetch(envProxyPrefix(envId) + `/v1/terminals/${encodeURIComponent(sessionId)}`, {
+    method: 'DELETE',
+  })
+    .then(res => (res.ok ? null : Promise.reject(new Error(`DELETE terminal: ${res.status}`))))
+    .catch(err => { console.warn('Failed to delete remote terminal:', err) })
 }

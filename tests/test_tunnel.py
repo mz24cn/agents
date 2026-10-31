@@ -272,12 +272,17 @@ def test_register_online_call_and_stream(tmp_path):
         assert status_code == 200
         assert json.loads(raw)["env"].get("TUNNEL_TEST") == "1"
 
-        # 5. terminal stream bridge
+        # 5. terminal stream bridge (multiplexed: one socket, one channel)
         tag = f"tun-{int(time.time() * 1000)}"
-        stream = manager.open_stream_env(env_id, f"/v1/terminals/ws?terminal_id={tag}")
+        stream = manager.open_stream_env(env_id, "/v1/terminals/ws")
         marker = f"TUNNEL_ECHO_{tag}".encode("ascii")
         try:
-            stream.send(b"echo " + marker + b"\r")
+            stream.send(json.dumps(
+                {"op": "open", "c": tag, "cols": 80, "rows": 24},
+            ).encode("utf-8"))
+            stream.send(json.dumps({
+                "op": "input", "c": tag, "d": "echo " + marker.decode("ascii") + "\r",
+            }).encode("utf-8"))
             buf = b""
             deadline = time.monotonic() + 20
             while time.monotonic() < deadline:
@@ -483,6 +488,44 @@ def _ws_browser_connect(port: int, path: str) -> _WsBrowserSock:
     return _WsBrowserSock(raw, rest)
 
 
+def _ws_channel_echo(ws, channel: str, command: bytes, marker: bytes,
+                     timeout: float = 30.0, env_id: str | None = None) -> bytes:
+    """Open a terminal channel on a multiplexed socket, type ``command`` into
+    it, and collect output frames until ``marker`` shows up (or time runs
+    out). Returns everything that came back, marker included.
+
+    ``env_id`` routes the channel to a child environment (the terminal socket
+    is the same one the tab's local terminals use)."""
+    open_frame = {"op": "open", "c": channel, "cols": 100, "rows": 30}
+    if env_id:
+        open_frame["env_id"] = env_id
+    wsutil.ws_send_frame(ws, json.dumps(open_frame).encode("utf-8"),
+                         wsutil.OP_TEXT, mask=True)
+    buf = b""
+    opened = False
+    deadline = time.monotonic() + timeout
+    while marker not in buf and time.monotonic() < deadline:
+        try:
+            frame = wsutil.ws_recv_frame(ws, expect_masked=False)
+        except socket.timeout:
+            break
+        if frame is None:
+            break
+        if not opened:
+            try:
+                control = json.loads(frame[1].decode("utf-8", "ignore"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                control = {}
+            if control.get("op") == "opened" and control.get("c") == channel:
+                opened = True
+                wsutil.ws_send_frame(ws, json.dumps(
+                    {"op": "input", "c": channel, "d": command.decode("ascii")},
+                ).encode("utf-8"), wsutil.OP_TEXT, mask=True)
+                continue
+        buf += frame[1]
+    return buf
+
+
 def test_env_proxy_browser_bridge(tmp_path):
     """The parent's browser bridge: same-origin HTTP proxy + terminal WS into
     a registered child (what the UI uses in tunnel mode)."""
@@ -549,24 +592,14 @@ def test_env_proxy_browser_bridge(tmp_path):
         tc.start()
         _wait_until(_online, message="tunnel env online again")
 
-        # 4. terminal WebSocket bridge: browser WS -> parent -> tunnel -> child PTY
+        # 4. terminal channel routed by env_id: browser WS -> parent -> tunnel
+        # -> child PTY.  Same socket the tab's local terminals use, so adding an
+        # environment costs the browser no connection at all.
         tag = f"pb-{int(time.time() * 1000)}"
         marker = f"BRIDGE_ECHO_{tag}".encode("ascii")
-        ws = _ws_browser_connect(
-            parent_srv.port, f"{base}/v1/terminals/ws?terminal_id={tag}&cols=100&rows=30")
+        ws = _ws_browser_connect(parent_srv.port, "/v1/terminals/ws")
         try:
-            buf = b""
-            deadline = time.monotonic() + 30
-            while marker not in buf and time.monotonic() < deadline:
-                try:
-                    frame = wsutil.ws_recv_frame(ws, expect_masked=False)
-                except socket.timeout:
-                    break
-                if frame is None:
-                    break
-                buf += frame[1]
-                if b"__terminal_id" in buf:
-                    wsutil.ws_send_frame(ws, b"echo " + marker + b"\r", wsutil.OP_TEXT, mask=True)
+            buf = _ws_channel_echo(ws, tag, b"echo " + marker + b"\r", marker, env_id=env_id)
             assert marker in buf, f"echo marker not seen; got {buf[-400:]!r}"
         finally:
             try:
@@ -600,11 +633,15 @@ def test_env_proxy_forwards_bodyless_delete(tmp_path):
             return e if e and e.get("online") is True else None
         _wait_until(_online, message="tunnel env online")
 
-        # Create a real PTY session on the child through the terminal WS bridge.
+        # Create a real PTY session on the child: the tab's one terminal socket,
+        # channel routed by env_id.
         tag = f"del-{int(time.time() * 1000)}"
-        ws = _ws_browser_connect(
-            parent_srv.port, f"{base}/v1/terminals/ws?terminal_id={tag}&cols=80&rows=24")
+        ws = _ws_browser_connect(parent_srv.port, "/v1/terminals/ws")
         try:
+            wsutil.ws_send_frame(ws, json.dumps(
+                {"op": "open", "c": tag, "cols": 80, "rows": 24, "env_id": env_id},
+            ).encode("utf-8"), wsutil.OP_TEXT, mask=True)
+
             def _child_has_terminal():
                 with urllib.request.urlopen(
                     f"http://127.0.0.1:{child_srv.port}/v1/terminals", timeout=10) as resp:
@@ -704,24 +741,13 @@ def test_env_proxy_bridge_with_child_auth(tmp_path):
             assert resp.status == 200
         assert (tmp_path / "child_ws" / "auth_dir").is_dir()
 
-        # Terminal WS bridge: the child self-authenticates the local handshake
+        # Terminal channel over the tunnel: the child self-authenticates the
+        # handshake the parent dials on our behalf.
         tag = f"pa-{int(time.time() * 1000)}"
         marker = f"AUTH_ECHO_{tag}".encode("ascii")
-        ws = _ws_browser_connect(
-            parent_srv.port, f"{base}/v1/terminals/ws?terminal_id={tag}&cols=100&rows=30")
+        ws = _ws_browser_connect(parent_srv.port, "/v1/terminals/ws")
         try:
-            buf = b""
-            deadline = time.monotonic() + 30
-            while marker not in buf and time.monotonic() < deadline:
-                try:
-                    frame = wsutil.ws_recv_frame(ws, expect_masked=False)
-                except socket.timeout:
-                    break
-                if frame is None:
-                    break
-                buf += frame[1]
-                if b"__terminal_id" in buf:
-                    wsutil.ws_send_frame(ws, b"echo " + marker + b"\r", wsutil.OP_TEXT, mask=True)
+            buf = _ws_channel_echo(ws, tag, b"echo " + marker + b"\r", marker, env_id=env_id)
             assert marker in buf, f"echo marker not seen; got {buf[-400:]!r}"
         finally:
             try:
@@ -739,9 +765,9 @@ def test_env_proxy_bridge_percent_encoded_env_id(tmp_path):
     index.html (text/html), and the frontend's ``res.json()`` yields null
     ("Cannot read properties of null (reading 'tools')").
 
-    Covers both the HTTP bridge and the terminal WS bridge (the WS shortcut
-    used to hand the still-encoded id to the handler and 400 with
-    "Not a tunnel environment").
+    Only the HTTP bridge carries an env id in the path now; the terminal moved
+    to the shared ``WS /v1/terminals/ws`` with ``env_id`` in the frame, where
+    encoding cannot go wrong.
     """
     with _real_server(tmp_path, "parent_data") as parent, \
          _real_server(tmp_path, "child_data", workspace=tmp_path / "child_ws") as child:
@@ -774,24 +800,13 @@ def test_env_proxy_bridge_percent_encoded_env_id(tmp_path):
         names = [e.get("name") for e in data.get("entries", data.get("files", []))]
         assert "enc.txt" in names, names
 
-        # Terminal WS bridge with the encoded env id must upgrade (previously 400).
+        # The terminal has no URL to get wrong any more: env_id travels inside
+        # the open frame of the shared socket, colon included.
         tag = f"enc-{int(time.time() * 1000)}"
         marker = f"ENC_ECHO_{tag}".encode("ascii")
-        ws = _ws_browser_connect(
-            parent_srv.port, f"{base}/v1/terminals/ws?terminal_id={tag}&cols=100&rows=30")
+        ws = _ws_browser_connect(parent_srv.port, "/v1/terminals/ws")
         try:
-            buf = b""
-            deadline = time.monotonic() + 30
-            while marker not in buf and time.monotonic() < deadline:
-                try:
-                    frame = wsutil.ws_recv_frame(ws, expect_masked=False)
-                except socket.timeout:
-                    break
-                if frame is None:
-                    break
-                buf += frame[1]
-                if b"__terminal_id" in buf:
-                    wsutil.ws_send_frame(ws, b"echo " + marker + b"\r", wsutil.OP_TEXT, mask=True)
+            buf = _ws_channel_echo(ws, tag, b"echo " + marker + b"\r", marker, env_id=env_id)
             assert marker in buf, f"echo marker not seen; got {buf[-400:]!r}"
         finally:
             try:

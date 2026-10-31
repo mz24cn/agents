@@ -593,99 +593,74 @@ class HandlerTunnelMixin:
             return _fail(400, "Failed to read request body")
         return status, resp_headers, chunks, progress["n"]
 
-    def _handle_env_proxy_ws(self, env_id: str) -> None:
-        """GET /v1/env-proxy/{env_id}/v1/terminals/ws — terminal bridge.
+    # Parent → child terminal sockets (runtime/terminal_env_bridge.py): the
+    # timeout of the parent→child WS handshake.  Once connected the link is
+    # idle-safe — a PTY goes quiet for minutes — so only the handshake is
+    # time-bounded.
+    _MUX_ENV_DIAL_TIMEOUT = 15.0
 
-        Browser WebSocket ↔ parent tunnel stream ↔ child terminal WebSocket.
-        Frame types are preserved (the terminal protocol speaks text).
+    def _mux_env_transport(self, env_id: str):
+        """Dial a child's mux socket on behalf of one tab's remote channels.
 
-        Tunnel environments only.  A direct environment keeps the
-        browser-direct terminal WS: the browser can already reach it, and
-        bridging a long-lived interactive socket through the parent would add
-        a hop without adding reachability.
+        Called from the bridge's worker thread, so blocking here is expected.
+        The contract is small: return a transport (WSCTransport /
+        TunnelTransport) or raise ``EnvBridgeError`` with a browser-safe reason.
+        The child credential is attached here and never crosses to the browser.
         """
-        record, tunnel_manager = self._env_proxy_env(env_id)
-        if record is None:
-            return
-        if not self._env_proxy_is_tunnel(record, env_id):
-            self._send_json_error(400, "Not a tunnel environment")
-            return
-        if tunnel_manager is None or not tunnel_manager.is_online(env_id):
-            self._send_json_response(502, {
-                "error": "child_unreachable",
-                "message": "Child tunnel is offline.",
-            })
-            return
+        from runtime.remote_tool_proxy import child_endpoint
+        from runtime.terminal_env_bridge import (
+            EnvBridgeError,
+            TunnelTransport,
+            WSCTransport,
+        )
+        from runtime.wsclient import WSClient, WSClientError
 
-        key = self.headers.get("Sec-WebSocket-Key")
-        if not key:
-            self._send_json_error(400, "Missing Sec-WebSocket-Key")
-            return
-        self.close_connection = True
-        sock = self.connection
+        manager = getattr(self.server, "remote_env_manager", None)
+        if manager is None:
+            raise EnvBridgeError("this service has no child environments")
         try:
-            sock.settimeout(None)
-        except OSError:
-            pass
-        try:
-            sock.sendall(wsutil.ws_handshake_response(key).encode("utf-8"))
-        except OSError:
-            return
+            record = manager.get(env_id)
+        except KeyError:
+            raise EnvBridgeError(f"unknown environment: {env_id}") from None
 
-        # Child terminal path (the child self-authorizes the local handshake
-        # when its authorization is enabled).
-        child_path = self._env_proxy_child_path(env_id)
-        try:
-            stream = tunnel_manager.open_stream_env(
-                env_id, child_path, timeout=15,
-            )
-        except Exception as exc:
-            self._tunnel_ws_close(sock)
-            return
-
-        def _pump_to_browser() -> None:
+        if self._env_proxy_is_tunnel(record, env_id):
+            # NAT-ed or firewalled child: the stream rides the tunnel this child
+            # already holds open, so no inbound route to the child is needed
+            # (the child authorizes the handshake on its side).
+            tunnel_manager = getattr(self.server, "tunnel_manager", None)
+            if tunnel_manager is None or not tunnel_manager.is_online(env_id):
+                raise EnvBridgeError("child tunnel is offline")
             try:
-                while True:
-                    item = stream.recv(timeout=5.0)
-                    if item is None:
-                        break
-                    frame_type, data = item
-                    if frame_type == "text":
-                        wsutil.ws_send_text(sock, data.decode("utf-8", errors="replace"))
-                    else:
-                        wsutil.ws_send_binary(sock, data)
-            except OSError:
-                pass
-            finally:
-                try:
-                    stream.close()
-                except Exception:
-                    pass
+                stream = tunnel_manager.open_stream_env(
+                    env_id, "/v1/terminals/ws", timeout=self._MUX_ENV_DIAL_TIMEOUT,
+                )
+            except Exception as exc:
+                raise EnvBridgeError(f"child tunnel handshake failed: {exc}") from exc
+            return TunnelTransport(stream)
 
-        pump = threading.Thread(target=_pump_to_browser, name="env-proxy-ws", daemon=True)
-        pump.start()
+        base, token = child_endpoint(record)
+        if base.startswith("https://"):
+            ws_base = "wss://" + base[len("https://"):]
+        elif base.startswith("http://"):
+            ws_base = "ws://" + base[len("http://"):]
+        else:
+            raise EnvBridgeError(f"environment has no direct URL: {env_id}")
+        headers = {"User-Agent": "agent-service-terminal/1.0"}
+        if token:
+            # Bearer rather than ?token=: the child accepts it on the upgrade
+            # and, unlike a query parameter, it never lands in an access log.
+            headers["Authorization"] = f"Bearer {token}"
         try:
-            while True:
-                frame = wsutil.ws_recv_frame(sock, expect_masked=True)
-                if frame is None:
-                    break
-                opcode, payload = frame
-                if opcode == wsutil.OP_PING:
-                    wsutil.ws_send_pong(sock, payload)
-                    continue
-                if opcode not in (wsutil.OP_TEXT, wsutil.OP_BINARY):
-                    continue
-                try:
-                    stream.send(payload)
-                except Exception:
-                    break
-        finally:
-            try:
-                stream.close()
-            except Exception:
-                pass
-            self._tunnel_ws_close(sock)
-            pump.join(timeout=5)
+            child = WSClient.connect(ws_base + "/v1/terminals/ws",
+                                     timeout=self._MUX_ENV_DIAL_TIMEOUT,
+                                     extra_headers=headers)
+        except (WSClientError, OSError) as exc:
+            raise EnvBridgeError(f"cannot reach child environment: {exc}") from exc
+        # An interactive terminal is idle by nature, so never let a socket
+        # timeout tear the link down: teardown comes from close() or a real EOF.
+        child.set_timeout(None)
+        return WSCTransport(child)
+
 
     # ------------------------------------------------------------------
     # Child side: browser UI endpoints

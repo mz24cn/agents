@@ -329,7 +329,7 @@ python app.py 0.0.0.0:9000 # 自定义主机和端口（重载 AGENTS_URL）
 | POST | `/v1/workspace/upload/{upload_id}/complete` | 完成分块上传 |
 | DELETE | `/v1/workspace/upload/{upload_id}` | 取消上传 |
 
-> **补充：** 另有 WebSocket 终端端点 `WS /v1/terminals/ws`，用于浏览器实时终端会话。与所有 `/v1/` 端点一样需要鉴权（会话 cookie 或 `Authorization: Bearer` API key）。
+> **补充：** 另有 WebSocket 终端端点 `WS /v1/terminals/ws`，用于浏览器实时终端会话。它是多路复用的：每个 tab 只有一条连接，承载该 tab 打开的全部终端，每帧带自己的通道 id（浏览器→服务端 `{"op": "open"|"input"|"resize"|"close", "c": id, ...}`，服务端→浏览器控制帧 `{"op": "opened"|"closed"|"error", "c": id}` 与输出帧 `{"c": id, "d": chunk}`）。与所有 `/v1/` 端点一样需要鉴权（会话 cookie 或 `Authorization: Bearer` API key）。
 
 > **安全说明（远程环境隧道）：** 子→母反向隧道端点（`/v1/tunnel/*`、`/v1/env-proxy/*`）与上述端点同样位于 `/v1/` 鉴权门之后：母服务设置密码时，子端使用其 `SETUP_SOURCE` 安装链接中的 token 拨号鉴权；母服务未设置密码（鉴权关闭）时，这些端点完全开放——任何能到达母端口的客户端都可注册隧道并把请求转发到子端本地端点（含执行子端工具）。使用远程环境时，请勿在未设置密码的情况下将母端端口暴露到不受信任的网络。
 

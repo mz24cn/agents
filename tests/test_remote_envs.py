@@ -43,6 +43,11 @@ from runtime.remote_env_manager import (
 from runtime.registry import ModelRegistry, ToolRegistry
 from runtime.runtime import Runtime
 from runtime.server import RuntimeHTTPServer
+from runtime import wsutil
+# Browser-side WebSocket handshake + multiplexed-channel helpers (the same
+# ones the tunnel tests use): the direct-child bridge must behave exactly like
+# the tunnel one, so it is driven by the same client code.
+from tests.test_tunnel import _ws_browser_connect, _ws_channel_echo
 
 
 # ---------------------------------------------------------------------------
@@ -1478,12 +1483,77 @@ def _bridge(parent, env_id, child_path, method="GET", payload=None, headers=None
         return exc.code, exc.read()
 
 
+# -- raw terminal socket helpers -------------------------------------------
+#
+# The terminal endpoint is one multiplexed WebSocket for the whole tab; a
+# child-environment terminal is a channel of it, named by env_id on the open
+# frame (runtime/terminal_env_bridge.py).
+
+def _ws_open_channel(sock, channel: str, env_id: str | None = None,
+                     cols: int = 80, rows: int = 24) -> None:
+    frame = {"op": "open", "c": channel, "cols": cols, "rows": rows}
+    if env_id:
+        frame["env_id"] = env_id
+    wsutil.ws_send_frame(sock, json.dumps(frame).encode("utf-8"),
+                         wsutil.OP_TEXT, mask=True)
+
+
+def _ws_wait_for(sock, pred, timeout: float = 15.0):
+    """Next control frame on a browser terminal socket satisfying ``pred``."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            frame = wsutil.ws_recv_frame(sock, expect_masked=False)
+        except OSError:
+            return None
+        if frame is None:
+            return None
+        if frame[0] != wsutil.OP_TEXT:
+            continue
+        try:
+            msg = json.loads(frame[1].decode("utf-8", "replace"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(msg, dict) and pred(msg):
+            return msg
+    return None
+
+
+def _ws_channel_echo_input(sock, channel: str, command: bytes, marker: bytes,
+                           timeout: float = 30.0) -> bytes:
+    """Type ``command`` into an already-open channel and collect its output."""
+    wsutil.ws_send_frame(sock, json.dumps(
+        {"op": "input", "c": channel, "d": command.decode("ascii")},
+    ).encode("utf-8"), wsutil.OP_TEXT, mask=True)
+    buf = b""
+    deadline = time.monotonic() + timeout
+    while marker not in buf and time.monotonic() < deadline:
+        try:
+            frame = wsutil.ws_recv_frame(sock, expect_masked=False)
+        except OSError:
+            break
+        if frame is None:
+            break
+        buf += frame[1]
+    return buf
+
+
+def _ws_close(sock) -> None:
+    try:
+        wsutil.ws_send_close(sock, 1000, mask=True)
+    except OSError:
+        pass
+    sock.close()
+
+
 class TestEnvProxyDirectBridge:
-    """直连子环境的文件管理请求也经母端同源桥，浏览器不再直连子端。
+    """直连子环境：文件管理走母端同源 HTTP 桥，终端走共享 mux 的 env_id 通道。
 
     隧道环境的桥早已存在；这里验证同一个 handler 的**直连传输**：路径重建、
     请求/响应头白名单、错误体透传都是共用的，只有最后一跳（urllib vs 隧道）
     不同。要点是浏览器永远不需要子端地址与 token —— 母端从登记记录里注入。
+    终端不是请求，因此不在 HTTP 桥里：它挂在本 tab 唯一那条
+    ``WS /v1/terminals/ws`` 上，open 帧带 env_id 决定 PTY 在哪个环境跑。
     """
 
     def test_reads_and_writes_are_forwarded(self, server, tmp_path):
@@ -1594,3 +1664,143 @@ class TestEnvProxyDirectBridge:
                 server, env_id, "/v1/workspace/content?path=nope.txt&restrict=0")
             assert status == 400, (status, raw)
             assert "nope.txt" in raw.decode("utf-8", "replace")
+
+    # -- terminal channels routed by env_id ---------------------------------
+    #
+    # The terminal used to be the one remote-execution surface the browser
+    # dialed itself -- and briefly, one bridge socket per environment.  Both
+    # shapes cost the page a connection per environment, and the browser's
+    # per-origin pool is only ~6 wide, so the channel now rides the tab's
+    # single ``WS /v1/terminals/ws`` and ``env_id`` says whose PTY runs it.
+
+    def test_terminal_channel_routes_to_the_direct_child(self, server, tmp_path):
+        """env_id 通道：浏览器拨母端，母端拨子端，PTY 在子端跑。"""
+        ws = str(tmp_path / "child_ws")
+        with _real_child_server(tmp_path, workspace=ws) as (child, _data):
+            _wait_child_hello(child)
+            env_id = _add_env(server, f"http://127.0.0.1:{child.port}/v1/setup")
+
+            tag = f"dws-{int(time.time() * 1000)}"
+            marker = f"DIRECT_ENV_ECHO_{tag}".encode("ascii")
+            sock = _ws_browser_connect(server.port, "/v1/terminals/ws")
+            try:
+                buf = _ws_channel_echo(sock, tag, b"echo " + marker + b"\r", marker,
+                                       env_id=env_id)
+                assert marker in buf, f"echo marker not seen; got {buf[-300:]!r}"
+
+                # The PTY really lives on the child (both servers here share
+                # this process' terminal table, so "absent on the parent" is not
+                # something the test can tell apart -- what matters is that the
+                # child registered the session the channel asked for).
+                status, child_terms = _request(child, "GET", "/v1/terminals")
+                assert status == 200, child_terms
+                assert [t for t in child_terms.get("terminals", [])
+                        if t.get("session_id") == tag], child_terms
+            finally:
+                _ws_close(sock)
+
+    def test_two_channels_of_one_environment_share_the_child_hop(self, server, tmp_path):
+        """同一环境的两个终端共用母端→子端那一条连接（连接数关键所在）。
+
+        Proof from the child side: both channels get their own PTY, and closing
+        one leaves the other -- and the connection it rides -- working.
+        """
+        ws = str(tmp_path / "child_ws")
+        with _real_child_server(tmp_path, workspace=ws) as (child, _data):
+            _wait_child_hello(child)
+            env_id = _add_env(server, f"http://127.0.0.1:{child.port}/v1/setup")
+
+            stamp = int(time.time() * 1000)
+            a, b = f"a-{stamp}", f"b-{stamp}"
+            marker_a = f"ENV_CH_A_{stamp}".encode("ascii")
+            marker_b = f"ENV_CH_B_{stamp}".encode("ascii")
+            sock = _ws_browser_connect(server.port, "/v1/terminals/ws")
+            try:
+                buf = _ws_channel_echo(sock, a, b"echo " + marker_a + b"\r", marker_a,
+                                       env_id=env_id)
+                assert marker_a in buf, f"channel a: {buf[-300:]!r}"
+                buf = _ws_channel_echo(sock, b, b"echo " + marker_b + b"\r", marker_b,
+                                       env_id=env_id)
+                assert marker_b in buf, f"channel b: {buf[-300:]!r}"
+
+                # Close one channel; the other keeps talking on the same child
+                # connection (it is refcounted per environment, not per channel).
+                wsutil.ws_send_frame(sock, json.dumps({"op": "close", "c": a}).encode(),
+                                     wsutil.OP_TEXT, mask=True)
+                marker_c = f"ENV_CH_C_{stamp}".encode("ascii")
+                buf = _ws_channel_echo_input(sock, b, b"echo " + marker_c + b"\r", marker_c)
+                assert marker_c in buf, f"channel b after closing a: {buf[-300:]!r}"
+            finally:
+                _ws_close(sock)
+
+    def test_child_token_is_injected_into_the_terminal_handshake(self, server, tmp_path):
+        """子端开了密码：母端用登记 token 完成 WS 握手，浏览器不带子端凭据。"""
+        ws = str(tmp_path / "child_ws")
+        with _real_child_server(tmp_path, workspace=ws) as (child, _data):
+            _wait_child_hello(child)
+            status, config = _request(child, "POST", "/v1/auth/config", {"password": "child-pass"})
+            assert status == 200, config
+            token = config.get("setup_token", "")
+            assert token
+            env_id = _add_env(
+                server, f"http://127.0.0.1:{child.port}/v1/setup?token={token}")
+
+            tag = f"tok-{int(time.time() * 1000)}"
+            marker = f"TOKEN_ECHO_{tag}".encode("ascii")
+            sock = _ws_browser_connect(server.port, "/v1/terminals/ws")
+            try:
+                buf = _ws_channel_echo(sock, tag, b"echo " + marker + b"\r", marker,
+                                       env_id=env_id)
+                assert marker in buf, f"echo marker not seen; got {buf[-300:]!r}"
+            finally:
+                _ws_close(sock)
+
+    def test_unauthorized_child_fails_the_channel_not_the_socket(self, server, tmp_path):
+        """记录里没有 token 就拨不开子端：只在该通道上报错，共享 socket 继续服务。"""
+        ws = str(tmp_path / "child_ws")
+        with _real_child_server(tmp_path, workspace=ws) as (child, _data):
+            _wait_child_hello(child)
+            status, config = _request(child, "POST", "/v1/auth/config", {"password": "child-pass"})
+            assert status == 200, config
+            token = config.get("setup_token", "")
+            assert token
+            # Register with the token, then rewrite the record without it: the
+            # parent can no longer authorize the child handshake, so the channel
+            # answers an error frame -- the browser never learns a credential it
+            # should not have, and the tab's other terminals (here: a local one)
+            # keep running on the same socket.
+            env_id = _add_env(
+                server, f"http://127.0.0.1:{child.port}/v1/setup?token={token}")
+            server._remote_env_manager.upsert(f"http://127.0.0.1:{child.port}/v1/setup")
+
+            dead = f"nope-{int(time.time() * 1000)}"
+            local = f"local-{int(time.time() * 1000)}"
+            sock = _ws_browser_connect(server.port, "/v1/terminals/ws")
+            try:
+                _ws_open_channel(sock, dead, env_id=env_id)
+                _ws_open_channel(sock, local)
+                msg = _ws_wait_for(sock, lambda m: m.get("c") == dead and m.get("op") == "error")
+                assert msg is not None, "no error frame for the unreachable environment"
+                assert "unreachable" in msg.get("error", ""), msg
+                opened = _ws_wait_for(sock, lambda m: m.get("c") == local and m.get("op") == "opened")
+                assert opened is not None, opened
+                marker = f"LOCAL_AFTER_FAILURE_{local}".encode("ascii")
+                buf = _ws_channel_echo_input(sock, local, b"echo " + marker + b"\r", marker)
+                assert marker in buf, buf[-300:]
+            finally:
+                _ws_close(sock)
+
+    def test_unreachable_environment_reports_on_its_own_channel(self, server):
+        """拨不通（连接被拒）也只影响该通道：不再有那一次失败的 HTTP 握手。"""
+        env_id = _seed_env(server, "http://127.0.0.1:1", "http://127.0.0.1:1/v1/setup")
+        dead = f"dead-{int(time.time() * 1000)}"
+        sock = _ws_browser_connect(server.port, "/v1/terminals/ws")
+        try:
+            _ws_open_channel(sock, dead, env_id=env_id)
+            msg = _ws_wait_for(sock, lambda m: m.get("c") == dead and m.get("op") == "error")
+            assert msg is not None, "no error frame for the unreachable environment"
+            assert "unreachable" in msg.get("error", ""), msg
+        finally:
+            _ws_close(sock)
+
+

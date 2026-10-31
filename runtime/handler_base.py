@@ -48,6 +48,7 @@ from runtime.server_state import (
     _terminal_sessions,
     _terminal_sessions_lock,
 )
+from runtime.terminal_env_bridge import LOCAL_ENV_ID, EnvMuxBridge
 
 logger = logging.getLogger("runtime.server")
 
@@ -61,6 +62,21 @@ _MAX_JSON_BODY_BYTES = 64 * 1024 * 1024
 # web/dist, so this limit is far above any realistic update while still
 # bounding memory.
 _MAX_PUSH_BODY_BYTES = 512 * 1024 * 1024
+
+# Terminals a single multiplexed terminal socket (/v1/terminals/ws) may
+# carry.  Far above what a browser tab realistically opens (one per session
+# with a terminal ever shown) while still bounding the fds one connection can
+# hold open.
+_MAX_MUX_CHANNELS = 32
+
+
+def _mux_dim(value, default: int) -> int:
+    """Coerce a terminal dimension from a mux frame, clamped to something sane."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(0, min(n, 10000))
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +205,9 @@ _ROUTES: dict[str, list] = {
         (re.compile(r"^/v1/sessions/([^/]+)/stream$"), "_handle_session_stream", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/sessions/([^/]+)/log-dir$"), "_handle_session_log_dir", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/sessions/([^/]+)/execution-analysis$"), "_handle_session_execution_analysis", (urllib.parse.unquote,)),
+        # meta only (no conversation): cheap enough for the browser to resolve a
+        # *background* session's bindings before it opens that session's terminal.
+        (re.compile(r"^/v1/sessions/([^/]+)/meta$"), "_handle_session_meta", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/sessions/([^/]+)$"), "_handle_get_session", ()),
         (re.compile(r"^/v1/agents$"), "_handle_list_agents", ()),
         (re.compile(r"^/v1/agents/([^/]+)$"), "_handle_get_agent", ()),
@@ -627,12 +646,15 @@ class HandlerBaseMixin:
         if path.startswith("/v1/"):
             if not self._require_authorized("GET", path):
                 return
-            # The terminal endpoint spawns a real shell; its WebSocket
-            # handshake is a plain GET with an Upgrade header, so it must be
-            # handled here, before the JSON route table (which would 404 it).
-            # Credentials are already enforced by the /v1/ gate above.
+            # One multiplexed terminal socket per browser tab: every terminal
+            # the tab has opened shares it -- terminals of *child environments*
+            # included, which the frame's ``env_id`` routes to the right child
+            # (see _handle_terminal_mux_ws).  So N terminals cost one of the
+            # browser's ~6 per-origin connections instead of N.  It spawns real
+            # shells, so it stays behind the /v1/ auth gate above; the upgrade
+            # must be handled before the JSON route table (which would 404 it).
             if path == "/v1/terminals/ws" and self.headers.get("Upgrade", "").lower() == "websocket":
-                self._handle_websocket()
+                self._handle_terminal_mux_ws()
                 return
             # Tunnel data channel (child → parent reverse tunnel). Like the
             # terminal endpoint it is a plain GET with an Upgrade header and
@@ -646,13 +668,12 @@ class HandlerBaseMixin:
             if path == "/v1/tunnel/ws" and self.headers.get("Upgrade", "").lower() == "websocket":
                 self._handle_tunnel_ws()
                 return
-            # Tunnel browser bridge terminal WS: /v1/env-proxy/{env}/v1/terminals/ws
-            if path.startswith("/v1/env-proxy/") and path.endswith("/v1/terminals/ws") \
-                    and self.headers.get("Upgrade", "").lower() == "websocket":
-                # 浏览器用 encodeURIComponent 构造桥接 URL（tunnel%3A...），
-                # 原始路径里 env id 仍是百分号编码 —— 先 unquote 再交给处理器。
-                env_id = urllib.parse.unquote(path[len("/v1/env-proxy/"):].split("/", 1)[0])
-                self._handle_env_proxy_ws(env_id)
+            # Voice input: browser WebSocket bridged to the local ASR
+            # accessory service.  Same "Upgrade before the JSON route table"
+            # rule as the terminal and tunnel sockets; the /v1/ gate above
+            # already checked the session cookie / token.
+            if path == "/v1/asr/ws" and self.headers.get("Upgrade", "").lower() == "websocket":
+                self._handle_asr_ws()
                 return
             if not self._dispatch_route("GET", path):
                 self._send_json_error(404, f"Not found: {self.path}")
@@ -1164,46 +1185,6 @@ class HandlerBaseMixin:
     # WebSocket support
     # ------------------------------------------------------------------
 
-    def _handle_websocket(self) -> None:
-        """Handle WebSocket upgrade request and start PTY session."""
-        key = self.headers.get("Sec-WebSocket-Key")
-        if not key:
-            self._send_json_error(400, "Missing Sec-WebSocket-Key")
-            return
-
-        # The socket is hijacked below — do not let the HTTP/1.1 keep-alive
-        # loop try to parse further requests on this connection afterwards.
-        self.close_connection = True
-
-        # Parse terminal_id and optional params from query string
-        parsed = urllib.parse.urlparse(self.path)
-        params = urllib.parse.parse_qs(parsed.query)
-        terminal_id = params.get("terminal_id", [None])[0]
-        initial_cols = int(params["cols"][0]) if params.get("cols") else None
-        initial_rows = int(params["rows"][0]) if params.get("rows") else None
-        workspace = params.get("workspace", [None])[0]
-        if workspace:
-            from runtime.common import set_request_context as _set_ctx
-            _set_ctx(workspace=workspace)
-
-        # Perform WebSocket handshake
-        response = wsutil.ws_handshake_response(key)
-        sock = self.connection
-        # The socket inherits the HTTP handler's idle timeout (self.timeout=30,
-        # applied in BaseHTTPRequestHandler.setup for keep-alive connections).
-        # A WebSocket/PTY terminal must stay alive while idle (e.g. the user is
-        # just reading the shell prompt), so clear the timeout on the hijacked
-        # socket.  Otherwise an idle terminal is force-closed after 30s and the
-        # frontend falls into a reconnect loop.
-        try:
-            sock.settimeout(None)
-        except OSError:
-            pass
-        sock.sendall(response.encode("utf-8"))
-
-        logger.info("WebSocket connection established: terminal_id=%s, cols=%s, rows=%s", terminal_id, initial_cols, initial_rows)
-        self._start_pty_session(sock, terminal_id, initial_cols, initial_rows)
-
     @staticmethod
     def _ws_send_frame(sock, text: str) -> None:
         """Encode and send a WebSocket text frame."""
@@ -1233,184 +1214,248 @@ class HandlerBaseMixin:
                 continue
             return payload.decode("utf-8", errors="ignore")
 
-    def _start_pty_session(self, sock, terminal_id: Optional[str] = None,
-                            initial_cols: Optional[int] = None,
-                            initial_rows: Optional[int] = None) -> None:
-        """Start a PTY session over WebSocket connection.
-        
-        Args:
-            sock: WebSocket connection socket
-            terminal_id: Optional terminal session ID (format: session_id or session_id:assistant_id)
-            initial_cols: Terminal columns from the client
-            initial_rows: Terminal rows from the client
-        """
-        if sys.platform == "win32":
-            self._start_pty_session_win32(sock, terminal_id, initial_cols, initial_rows)
-        else:
-            self._start_pty_session_unix(sock, terminal_id, initial_cols, initial_rows)
+    # ------------------------------------------------------------------
+    # Multiplexed terminal WebSocket (one socket per browser tab)
+    # ------------------------------------------------------------------
 
-    def _start_pty_session_win32(self, sock, terminal_id: Optional[str] = None,
-                                  initial_cols: Optional[int] = None,
-                                  initial_rows: Optional[int] = None) -> None:
-        """Windows PTY session using winpty.
-        
-        Supports session persistence: if a terminal session with the same ID already exists,
-        reconnect to it instead of creating a new one.
+    def _handle_terminal_mux_ws(self) -> None:
+        """Handle ``WS /v1/terminals/ws``: every terminal of one tab on one socket.
+
+        The browser's per-origin HTTP/1.1 pool is only ~6 connections wide and a
+        WebSocket counts against it, so one socket per terminal lets a handful of
+        open terminals starve ordinary requests.  Here the tab keeps a single
+        socket and every frame carries its channel id:
+
+        - client → server ``{"op": "open"|"input"|"resize"|"close", "c": id, ...}``
+        - server → client ``{"op": "opened"|"closed"|"error", "c": id}`` for
+          control, ``{"c": id, "d": chunk}`` for PTY output.
+
+        ``open`` also carries ``env_id``, which is what makes the single socket
+        cover **child environments** too (runtime/terminal_env_bridge.py):
+
+        - ``"local"`` (default) -- the PTY is spawned here, as before;
+        - any other id          -- a registered environment; the parent dials
+          that child's own ``/v1/terminals/ws`` once per tab and every channel
+          of that env rides that one connection.
+
+        One browser socket per tab therefore holds no matter how many
+        environments the user opens terminals in -- an extra environment costs
+        the browser nothing, and the child credential never leaves this process.
+        A child that cannot be reached fails *its* channels with an ``error``
+        frame; it must never take the tab's other terminals down.
+
+        Each channel drives a persistent PTY session: closing a channel (or
+        losing the whole socket) detaches but never kills it, and output produced
+        while detached is not replayed — there is no browser-facing scrollback on
+        the server.  That is exactly why the frontend keeps the channels of
+        temporarily hidden terminals attached: the browser-side xterm scrollback
+        is the only history there is.
         """
-        if PtyProcess is None:
-            self._ws_send_frame(sock, '{"error": "winpty not available"}')
+        key = self.headers.get("Sec-WebSocket-Key")
+        if not key:
+            self._send_json_error(400, "Missing Sec-WebSocket-Key")
             return
 
-        # Get or create terminal
-        session_id = terminal_id.split(":")[0] if terminal_id else None
-        if session_id:
-            terminal_info = get_or_create_terminal(
-                session_id,
-                cols=initial_cols or 80,
-                rows=initial_rows or 24,
-                send_output=lambda data: self._ws_send_frame(sock, data),
-            )
-        else:
-            terminal_info = None
-        
-        if not terminal_info:
-            self._ws_send_frame(sock, '{"error": "Failed to create terminal"}')
-            return
-        
-        # Attach the browser to the terminal's persistent WinPTY reader.
-        # Do not start/stop readers here: concurrent proc.read() calls split
-        # PowerShell VT redraw sequences and produce duplicated/wrapped input.
-        with _terminal_sessions_lock:
-            terminal_info["sock"] = sock
-            terminal_info["disconnected_at"] = None
-            terminal_info["send_output"] = lambda data: self._ws_send_frame(sock, data)
-        
-        proc = terminal_info.get("proc")
-        
-        # Resize PTY to match the client's terminal dimensions on reconnect
-        if proc and initial_cols and initial_rows:
+        # The socket is hijacked below — do not let the HTTP/1.1 keep-alive loop
+        # try to parse further requests on this connection afterwards.
+        self.close_connection = True
+        sock = self.connection
+        try:
+            sock.settimeout(None)
+        except OSError:
+            pass
+        sock.sendall(wsutil.ws_handshake_response(key).encode("utf-8"))
+
+        # PTY output arrives from each terminal's own reader thread while this
+        # thread writes input echoes and control frames, so frame writes are
+        # serialized (a half-written header/payload pair would corrupt the
+        # stream).  The env bridge pumps child frames through the same lock.
+        send_lock = threading.Lock()
+        channels: dict[str, dict] = {}
+
+        def send_raw(text: str) -> None:
+            with send_lock:
+                self._ws_send_frame(sock, text)
+
+        def send_msg(payload: dict) -> None:
+            send_raw(json.dumps(payload, ensure_ascii=False))
+
+        def env_channel_closed(term_id: str, error: Optional[str]) -> None:
+            """A child environment's link died: retire just its channels."""
+            info = channels.get(term_id)
+            if info is None or not info.get("env_id"):
+                return  # already detached (or a local channel, which never fires)
+            channels.pop(term_id, None)
+            if error:
+                send_msg({"op": "error", "c": term_id,
+                          "error": f"environment unreachable: {error}"})
+            else:
+                send_msg({"op": "closed", "c": term_id})
+
+        # Remote channels (``env_id`` != local) are dialed on worker threads, so
+        # a firewalled child cannot stall this socket's read loop.
+        bridge = EnvMuxBridge(dial=self._mux_env_transport,
+                              send_text=send_raw,
+                              on_channel_closed=env_channel_closed)
+
+        def attach(term_id: str, cols: int, rows: int, workspace,
+                   env_id: str = LOCAL_ENV_ID) -> None:
+            if env_id != LOCAL_ENV_ID:
+                # Nothing is spawned locally: the PTY lives on the child and
+                # ``workspace`` is a path over there.  The first channel of an
+                # env opens the parent -> child connection; later ones share it.
+                channels[term_id] = {"env_id": env_id}
+                bridge.open(env_id, term_id, cols=cols, rows=rows,
+                            workspace=workspace if isinstance(workspace, str) else "")
+                return
+            if workspace:
+                from runtime.common import set_request_context as _set_ctx
+                _set_ctx(workspace=workspace)
+            if sys.platform == "win32" and PtyProcess is None:
+                send_msg({"op": "error", "c": term_id, "error": "winpty not available"})
+                return
+
+            def emit(data: str, _term_id: str = term_id) -> None:
+                send_msg({"c": _term_id, "d": data})
+
+            # Marks which socket owns the callback, so detaching this socket
+            # never clears a channel another tab (or a reconnect) took over.
+            emit._mux_sock = sock
+            session_id = term_id.split(":")[0] or term_id
+            info = get_or_create_terminal(session_id, cols=cols, rows=rows, send_output=emit)
+            if not info:
+                send_msg({"op": "error", "c": term_id, "error": "Failed to create terminal"})
+                return
+            with _terminal_sessions_lock:
+                info["sock"] = sock
+                info["disconnected_at"] = None
+                info["send_output"] = emit
+            channels[term_id] = info
+            self._terminal_set_winsize(info, cols, rows)
+            send_msg({"op": "opened", "c": term_id})
+
+        def detach(term_id: str, *, notify: bool) -> None:
+            info = channels.pop(term_id, None)
+            if info is None:
+                return
+            env_id = info.get("env_id")
+            if env_id:
+                # Remote channel: release it on the child, and let the
+                # parent -> child connection go with the last channel this tab
+                # had in that environment (the child keeps each PTY detached).
+                bridge.close(term_id)
+            else:
+                with _terminal_sessions_lock:
+                    if info.get("sock") is sock:
+                        info["sock"] = None
+                        info["disconnected_at"] = time.monotonic()
+                    if getattr(info.get("send_output"), "_mux_sock", None) is sock:
+                        info["send_output"] = None
+            if notify:
+                send_msg({"op": "closed", "c": term_id})
+
+        def write_input(term_id: str, data: str) -> None:
+            info = channels.get(term_id)
+            if info is None:
+                return
+            env_id = info.get("env_id")
+            if env_id:
+                if not bridge.forward(term_id, {"op": "input", "c": term_id, "d": data}):
+                    # The child link died; the bridge reports those channels,
+                    # so stop routing to it here rather than repeating the drop.
+                    channels.pop(term_id, None)
+                return
             try:
-                proc.setwinsize(initial_rows, initial_cols)
-            except Exception:
+                if sys.platform == "win32":
+                    proc = info.get("proc")
+                    if proc:
+                        proc.write(data)
+                else:
+                    master_fd = info.get("master_fd")
+                    if master_fd is not None:
+                        os.write(master_fd, data.encode("utf-8"))
+            except OSError:
                 pass
-        
-        # Send terminal_id to client
-        if terminal_id:
-            self._ws_send_frame(sock, json.dumps({"__terminal_id": terminal_id}))
-        
+
+        logger.info("Multiplexed terminal channel established")
         try:
             while True:
-                user_input = self._ws_recv_frame(sock)
-                if user_input is None:
+                raw = self._ws_recv_frame(sock)
+                if raw is None:
                     break
-
-                # Handle resize command
-                if user_input.startswith('{"__resize":'):
-                    try:
-                        msg = json.loads(user_input)
-                        proc.setwinsize(msg["rows"], msg["cols"])
+                try:
+                    msg = json.loads(raw)
+                except (ValueError, TypeError):
+                    send_msg({"op": "error", "error": "malformed frame"})
+                    continue
+                if not isinstance(msg, dict):
+                    continue
+                term_id = msg.get("c")
+                if not isinstance(term_id, str) or not term_id or len(term_id) > 256:
+                    send_msg({"op": "error", "error": "missing channel id"})
+                    continue
+                op = msg.get("op")
+                if op == "open":
+                    # ``env_id`` is the whole routing story: "local" (default,
+                    # and what every pre-existing client sends) runs the PTY
+                    # here, anything else is a registered child environment.
+                    env_id = msg.get("env_id") or LOCAL_ENV_ID
+                    if not isinstance(env_id, str) or len(env_id) > 256:
+                        send_msg({"op": "error", "c": term_id, "error": "invalid env_id"})
                         continue
-                    except Exception:
-                        pass
-
-                proc.write(user_input)
+                    if term_id not in channels and len(channels) >= _MAX_MUX_CHANNELS:
+                        send_msg({"op": "error", "c": term_id,
+                                  "error": f"too many terminals on one channel (max {_MAX_MUX_CHANNELS})"})
+                        continue
+                    attach(term_id, _mux_dim(msg.get("cols"), 80), _mux_dim(msg.get("rows"), 24),
+                           msg.get("workspace"), env_id)
+                elif op == "input":
+                    data = msg.get("d")
+                    if isinstance(data, str):
+                        write_input(term_id, data)
+                elif op == "resize":
+                    info = channels.get(term_id)
+                    if info is None:
+                        continue
+                    cols, rows = _mux_dim(msg.get("cols"), 0), _mux_dim(msg.get("rows"), 0)
+                    env_id = info.get("env_id")
+                    if env_id:
+                        bridge.forward(term_id, {"op": "resize", "c": term_id,
+                                                 "cols": cols, "rows": rows})
+                    else:
+                        self._terminal_set_winsize(info, cols, rows)
+                elif op == "close":
+                    detach(term_id, notify=True)
+                else:
+                    send_msg({"op": "error", "c": term_id, "error": f"unknown op: {op}"})
         finally:
-            # Mark session as disconnected but don't terminate
-            if terminal_info:
-                with _terminal_sessions_lock:
-                    if terminal_info.get("sock") is sock:
-                        terminal_info["disconnected_at"] = time.monotonic()
-                        terminal_info["sock"] = None
-                        terminal_info["send_output"] = None
+            # Losing the socket detaches every channel of this tab but keeps the
+            # PTYs alive for reconnection (and for the agent's terminal tools).
+            for term_id in list(channels):
+                detach(term_id, notify=False)
+            # ...and the same for the children: drop their connections, their
+            # PTYs stay detached on the child until the next tab asks for them.
+            bridge.shutdown()
             sock.close()
+            logger.info("Multiplexed terminal channel closed")
 
-    def _start_pty_session_unix(self, sock, terminal_id: Optional[str] = None,
-                                initial_cols: Optional[int] = None,
-                                initial_rows: Optional[int] = None) -> None:
-        """Unix PTY session using pty.fork().
-        
-        Supports session persistence: if a terminal session with the same ID already exists,
-        reconnect to it instead of creating a new one.
-        """
-        # Get or create terminal.  The PTY is drained by exactly one reader
-        # thread, owned by get_or_create_terminal; it fans output out to the
-        # currently attached browser (send_output) and to exec_cli's
-        # output_buffer.  Starting a second reader here would race os.read()
-        # on the same master_fd and silently drop whichever chunks the other
-        # thread wins, so attaching only (re)binds the socket.
-        session_id = terminal_id.split(":")[0] if terminal_id else None
-        if session_id:
-            terminal_info = get_or_create_terminal(
-                session_id,
-                cols=initial_cols or 80,
-                rows=initial_rows or 24,
-                send_output=lambda data: self._ws_send_frame(sock, data),
-            )
-        else:
-            terminal_info = None
-
-        if not terminal_info:
-            self._ws_send_frame(sock, '{"error": "Failed to create terminal"}')
+    @staticmethod
+    def _terminal_set_winsize(info: dict, cols: int, rows: int) -> None:
+        """Apply the client's geometry to an attached terminal (PTY or winpty)."""
+        if not cols or not rows:
             return
-
-        master_fd = terminal_info.get("master_fd")
-
-        # Attach this socket as the current output target.  Do not flip the
-        # shared "active" flag: it gates the persistent reader and is cleared
-        # only when the session is torn down, so toggling it per attach would
-        # (racily) terminate the reader.
-        with _terminal_sessions_lock:
-            terminal_info["sock"] = sock
-            terminal_info["disconnected_at"] = None
-            terminal_info["send_output"] = lambda data: self._ws_send_frame(sock, data)
-
-        # Resize PTY to match the client's terminal dimensions on reconnect
-        if master_fd and initial_cols and initial_rows:
-            try:
-                winsize = struct.pack("HHHH", initial_rows, initial_cols, 0, 0)
+        try:
+            if sys.platform == "win32":
+                proc = info.get("proc")
+                if proc:
+                    proc.setwinsize(rows, cols)
+                return
+            master_fd = info.get("master_fd")
+            if master_fd is not None:
+                winsize = struct.pack("HHHH", rows, cols, 0, 0)
                 fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsize)
-            except Exception:
-                pass
-        
-        # Send terminal_id to client
-        if terminal_id:
-            self._ws_send_frame(sock, json.dumps({"__terminal_id": terminal_id}))
-
-        def set_winsize(fd, rows, cols):
-            winsize = struct.pack("HHHH", rows, cols, 0, 0)
-            fcntl.ioctl(fd, termios.TIOCSWINSZ, winsize)
-
-        try:
-            while True:
-                user_input = self._ws_recv_frame(sock)
-                if user_input is None:
-                    break
-
-                # Handle resize command
-                if user_input.startswith('{"__resize":'):
-                    try:
-                        msg = json.loads(user_input)
-                        set_winsize(master_fd, msg["rows"], msg["cols"])
-                        continue
-                    except Exception:
-                        pass
-
-                # Regular keyboard input
-                os.write(master_fd, user_input.encode("utf-8"))
-        finally:
-            # On disconnect: don't kill the PTY process, just detach this
-            # socket so the session stays alive for reconnection.  Only clear
-            # the output target if no newer socket has taken over meanwhile
-            # (a reconnect may already have rebound it).
-            if terminal_info:
-                with _terminal_sessions_lock:
-                    if terminal_info.get("sock") is sock:
-                        terminal_info["disconnected_at"] = time.monotonic()
-                        terminal_info["sock"] = None
-                        terminal_info["send_output"] = None
-
-            sock.close()
-            logger.info("Terminal session disconnected: %s (session stays alive for reconnection)", terminal_id)
+        except Exception:
+            pass
 
     def do_POST(self) -> None:
         """Handle POST requests."""

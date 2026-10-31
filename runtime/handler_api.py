@@ -2543,6 +2543,30 @@ class HandlerApiMixin:
             return {"env_id": env_id, "path": str(data["path"])}
         return None
 
+    def _handle_session_meta(self, session_id: str) -> None:
+        """GET /v1/sessions/{session_id}/meta — 会话 meta，不含消息。
+
+        ``GET /v1/sessions/{id}`` 会把整段对话带回来；前端有时只需要 meta 里的
+        绑定（``remote_env`` / ``workspace``），最有说服力的例子是给**非当前
+        会话**打开终端：那条通道的 ``env_id`` 必须在该会话的 meta 没被加载过之
+        前也知道，否则终端会在母端起一个本地 PTY，而它的会话其实属于某个子环境
+        （见 web/src/components/chat/ChatPage.svelte 的 sessionRemoteEnvIds）。
+        """
+        try:
+            self.server.session_manager.session_dir(session_id)  # type: ignore[attr-defined]
+        except FileNotFoundError:
+            self._send_json_error(404, f"Session not found: {session_id}")
+            return
+        except ValueError as exc:
+            self._send_json_error(400, str(exc))
+            return
+        meta = self.server.context_manager.get_session_meta(session_id)  # type: ignore[attr-defined]
+        self._send_json_response(200, {
+            "status": "success",
+            "session_id": session_id,
+            "meta": meta,
+        })
+
     def _handle_session_execution_analysis(self, session_id: str) -> None:
         """GET /v1/sessions/{session_id}/execution-analysis — 分析主/子会话执行耗时。"""
         from runtime.execution_analysis import analyze_session_execution

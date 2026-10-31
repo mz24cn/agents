@@ -102,6 +102,16 @@ class _TunnelStream:
 
     # -- child → parent direction (filled by the reader loop) ------------
 
+    @property
+    def closed(self) -> bool:
+        """True once EOF/close/fail was seen.
+
+        ``recv()`` answers None for "nothing yet" as well as for EOF, so a
+        caller that must tell an idle stream from a dead one (a terminal WS
+        bridge stays quiet for minutes) has to ask this instead.
+        """
+        return self._closed
+
     def mark_ready(self, status: int) -> None:
         self._ready_status = status
         self._ready_event.set()

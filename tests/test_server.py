@@ -1577,6 +1577,39 @@ class TestSessionAPI:
         assert status == 404
         assert "error" in body
 
+    def test_get_session_meta_returns_bindings_without_messages(self, server_with_env):
+        """GET /v1/sessions/{id}/meta 只回 meta（不含 messages）。
+
+        浏览器给**非当前会话**打开终端时要先知道它绑在哪个子环境（否则那条
+        通道会在母端起一个本地 PTY），但为此下载整段对话太贵。
+        """
+        import json as _json
+        chats_dir = server_with_env._context_manager._chats_dir
+        session_id = "2026-01-02_12-31-00"
+        session_dir = os.path.join(chats_dir, session_id)
+        os.makedirs(session_dir, exist_ok=True)
+        conv_data = {
+            "meta": {"remote_env": "http://child.example:7988", "workspace": "/root/remote-dir"},
+            "messages": [{"role": "user", "content": "x" * 5000}],
+        }
+        with open(os.path.join(session_dir, "conversation.json"), "w", encoding="utf-8") as f:
+            _json.dump(conv_data, f)
+
+        status, body = _get(server_with_env, f"/v1/sessions/{session_id}/meta")
+        assert status == 200
+        assert body["session_id"] == session_id
+        assert body["meta"]["remote_env"] == "http://child.example:7988"
+        assert body["meta"]["workspace"] == "/root/remote-dir"
+        # 关键：不带消息，也不带 index 条目
+        assert "messages" not in body
+        assert "title" not in body
+
+    def test_get_session_meta_not_found(self, server_with_env):
+        """GET /v1/sessions/{id}/meta 会话不存在时返回 404（不是空 meta）。"""
+        status, body = _get(server_with_env, "/v1/sessions/nonexistent-session/meta")
+        assert status == 404
+        assert "error" in body
+
     def test_get_sessions_lists_created_sessions(self, server_with_env):
         """创建会话目录后，GET /v1/sessions 应返回该会话。"""
         import json as _json

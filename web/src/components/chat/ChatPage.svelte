@@ -30,9 +30,17 @@
     fetchRemoteEnvList,
     fetchRemoteWorkspacePath,
     remoteSessions,
-    destroyRemoteTerminal,
+    destroyTerminalInEnv,
     resolvePanelRemoteEnv,
   } from '../../lib/remote-execution.svelte.js'
+  import {
+    sessionEnvRegistry,
+    rememberSessionEnv,
+    rememberSessionWorkspace,
+    forgetSession,
+    resolveTerminalEnvId,
+    sessionWorkspace,
+  } from '../../lib/session-env-registry.svelte.js'
 
   const STORAGE_MODEL_KEY = 'chat_selected_model'
   const STORAGE_TOOLS_KEY = 'chat_selected_tools'
@@ -361,6 +369,38 @@
   let terminals = $state(new Map())
   let terminalVisible = $state(false)  // Whether current session's terminal is shown
 
+  // Which environment / workspace a session's terminal belongs to — per
+  // session, because terminals render for **every** opened session while
+  // `remoteExecution` describes the current one only (see
+  // lib/session-env-registry.svelte.js for why a background session must not
+  // follow it).  Only the env **id** is needed: the tab's single terminal
+  // socket routes by `env_id` (lib/terminals-mux.js).
+  function terminalRemoteEnvId(termId) {
+    return resolveTerminalEnvId(termId, sessionId, selectedRemoteEnvId)
+  }
+
+  function terminalWorkspace(termId) {
+    return termId === sessionId ? workspacePath : sessionWorkspace(termId)
+  }
+
+  // A terminal can be opened for a session this page load never visited, and
+  // its binding lives in that session's meta.  Fetch just the meta (cheap: no
+  // conversation) instead of guessing "local".
+  async function resolveSessionRemoteEnv(sid) {
+    try {
+      const data = await sessionsApi.meta(sid)
+      const meta = data?.meta || {}
+      // Switching sessions in the meantime makes the restore path authoritative.
+      if (sid !== sessionId) {
+        rememberSessionEnv(sid, typeof meta.remote_env === 'string' ? meta.remote_env : '')
+        rememberSessionWorkspace(sid, typeof meta.workspace === 'string' ? meta.workspace : '')
+      }
+    } catch {
+      // Unknown binding: stay local.  A later visit (or the retarget below)
+      // fixes it; a wrongly-local terminal is recoverable, a silent kill is not.
+    }
+  }
+
   // Derived: current session's terminal data
   let currentTerminalData = $derived(terminals.get(sessionId))
   let currentTerminalStatus = $derived(currentTerminalData?.status || null)
@@ -465,6 +505,10 @@
 
   function openTerminal(sid) {
     if (!sid) return
+    // Background session whose binding this page never loaded: ask, don't guess.
+    // The channel is re-targeted once the answer arrives (Terminal.svelte keys
+    // its connection target on the env id).
+    if (sid !== sessionId && !sessionEnvRegistry.envs[sid]) void resolveSessionRemoteEnv(sid)
     // Create terminal entry if not exists
     if (!terminals.has(sid)) {
       terminals = new Map(terminals).set(sid, {
@@ -497,16 +541,18 @@
     }
   }
 
-  function destroyTerminal(sid) {
+  function destroyTerminal(sid, envIdOverride = null) {
     if (!sid) return
     // Call Terminal component's destroy to prevent auto-reconnect
     const termData = terminals.get(sid)
     if (termData?.ref?.destroy) {
       termData.ref.destroy()
     }
-    // 销毁执行环境侧的终端会话（本地=母端；远程=子端，终端运行在子端）
-    if (remoteExecution.sessionId === sid && remoteExecution.env) {
-      destroyRemoteTerminal(sid)
+    // 销毁执行环境侧的终端会话（本地=母端；远程=该会话绑定的子端，终端运行在子端）。
+    // 按会话查环境而不是看当前激活绑定：后台会话的终端同样属于它自己的环境。
+    const envId = envIdOverride ?? terminalRemoteEnvId(sid)
+    if (envId) {
+      destroyTerminalInEnv(envId, sid)
     } else {
       fetch(`/v1/terminals/${encodeURIComponent(sid)}`, { method: 'DELETE' })
         .catch(err => console.warn('Failed to delete terminal:', err))
@@ -671,17 +717,12 @@
   function envDisplayName(e) {
     return e.app_title ? `${e.app_title} [${e.id}]` : e.id
   }
-  // 当前会话绑定的远程环境（供 Terminal 直连子端）。
-  // 终端总是会话级（无会话时没有终端），故这里严格要求存在会话；文件管理器可
-  // 在无会话时使用，走 workspacePanelRemoteEnv。
-  let currentRemoteEnv = $derived(
-    sessionId && remoteExecution.sessionId === sessionId && remoteExecution.env
-      ? remoteExecution.env
-      : null
-  )
+  // 终端属于哪一端由 terminalRemoteEnvId(termId) 逐会话解析
+  // （lib/session-env-registry.svelte.js）：终端总是会话级，后台会话的终端同样
+  // 属于它自己的环境，不能跟随「当前会话的激活绑定」。
   // "打开会话日志目录"本地锁定：会话日志目录始终在本地（父端），绑定远程环境
   // 的会话也要显示本地会话目录，故临时断开文件管理器的远程环境（终端仍按
-  // currentRemoteEnv 匹配，互不干扰）。切换会话或关闭面板时清除。
+  // terminalRemoteEnvId 解析，互不干扰）。切换会话或关闭面板时清除。
   let logDirLocalMode = $state(false)
   // 子端 file journal "软链接"：父端 log-dir 探测到子端已有 journal 时非空
   // （{ envId, path, envName }），文件管理器在本地会话目录里渲染跳转条目。
@@ -722,19 +763,24 @@
     // 环境切换使日志目录面板里的子端 journal 软链接失效（它指向旧环境）
     logDirRemoteJournal = null
     remoteEnvDropdownOpen = false
+    // 终端连接目标随执行环境变化：销毁当前会话终端（重新打开会连新目标）。
+    // 必须在改 selectedRemoteEnvId 之前取旧环境 —— 终端是在**旧**环境里跑的。
+    const prevEnvId = selectedRemoteEnvId || ''
+    if (sessionId && terminals.has(sessionId)) destroyTerminal(sessionId, prevEnvId)
     selectedRemoteEnvId = envId
-    // 终端连接目标随执行环境变化：销毁当前会话终端（重新打开会连新目标）
-    if (sessionId && terminals.has(sessionId)) destroyTerminal(sessionId)
+    rememberSessionEnv(sessionId, envId)
 
     if (!envId) {
       await bindSessionToRemoteEnv(sessionId, '')
       if (defaultWorkspacePath) workspacePath = defaultWorkspacePath
+      rememberSessionWorkspace(sessionId, workspacePath)
       return
     }
     const env = await bindSessionToRemoteEnv(sessionId, envId)
     if (!env) {
       // 环境记录不存在（可能已被删除）：回退本地
       selectedRemoteEnvId = ''
+      rememberSessionEnv(sessionId, '')
       errorMsg = t('remoteEnvNotFound')
       return
     }
@@ -742,7 +788,10 @@
     if (selectedRemoteEnvId === envId) {
       try {
         const ws = await fetchRemoteWorkspacePath()
-        if (selectedRemoteEnvId === envId && ws) workspacePath = ws
+        if (selectedRemoteEnvId === envId && ws) {
+          workspacePath = ws
+          rememberSessionWorkspace(sessionId, ws)
+        }
       } catch { /* 工作区路径仅用于展示，失败不影响执行 */ }
     }
   }
@@ -1822,6 +1871,7 @@
         }
         // 恢复执行环境绑定（meta.remote_env = 子环境 id）
         const restoredRemoteEnvId = typeof meta.remote_env === 'string' ? meta.remote_env : ''
+        rememberSessionEnv(sid, restoredRemoteEnvId)
         if (restoredRemoteEnvId) {
           selectedRemoteEnvId = restoredRemoteEnvId
           bindSessionToRemoteEnv(sid, restoredRemoteEnvId).then(env => {
@@ -1851,9 +1901,12 @@
         if (newWorkspace && newWorkspace !== workspacePath) {
           workspacePath = newWorkspace
         }
+        // 记住本会话的工作区：切走之后它的终端仍要落在这个目录里
+        rememberSessionWorkspace(sid, newWorkspace || '')
       } else {
         // 无 meta 的旧会话：本地执行
         selectedRemoteEnvId = ''
+        rememberSessionEnv(sid, '')
         bindSessionToRemoteEnv(sid, '')
         // 无 meta 的旧会话，工作区回退到默认值
         if (defaultWorkspacePath && defaultWorkspacePath !== workspacePath) {
@@ -1926,6 +1979,7 @@
         selectedRemoteEnvId = ''
         clearRemoteBinding()
       }
+      forgetSession(deletedSid)
     }
   })
 
@@ -2248,11 +2302,11 @@
     <!-- Terminals: render all instances, show only current session's if visible -->
     {#each Array.from(terminals.entries()) as [termId, termData] (termId)}
       <div class="terminal-view" class:visible={terminalVisible && termId === sessionId}>
-        <Terminal 
+        <Terminal
           bind:this={termData.ref}
           sessionId={termId}
-          workspace={workspacePath}
-          remote={termId === sessionId ? currentRemoteEnv : null}
+          workspace={terminalWorkspace(termId)}
+          remoteEnvId={terminalRemoteEnvId(termId)}
           visible={terminalVisible && termId === sessionId}
           onStatusChange={(status) => handleTerminalStatusChange(termId, status)}
         />

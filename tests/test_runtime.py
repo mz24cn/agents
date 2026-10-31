@@ -1923,11 +1923,13 @@ def test_unix_pty_single_reader_fans_out_to_browser_and_buffer(monkeypatch):
         ss.unregister_terminal_session("single-reader:auto")
 
 
-def test_unix_terminal_attach_does_not_start_second_reader(monkeypatch):
-    """回归：终端 WebSocket attach 只重绑 socket，不再新建 PTY 读取线程。
+def test_terminal_attach_does_not_start_second_reader(monkeypatch):
+    """回归：终端 attach 只重绑输出回调，不再新建 PTY 读取线程。
 
-    两个 reader 竞争 `master_fd` 是上面输出被吞的根因；attach 阶段不得再启动
-    任何读取线程（输出扇出由 `get_or_create_terminal` 的常驻 reader 负责）。
+    两个 reader 竞争 `master_fd` 是上面输出被吞的根因。多路复用后 attach 就是
+    对同一个 terminal 再调一次 `get_or_create_terminal`：常驻 reader 只在创建
+    时起一次，attach 只换 `send_output`（`handler_base._handle_terminal_mux_ws`
+    的 attach 分支不再自己起线程）。
     """
     import sys
 
@@ -1935,7 +1937,6 @@ def test_unix_terminal_attach_does_not_start_second_reader(monkeypatch):
         pytest.skip("unix PTY path")
 
     from runtime import server_state as ss
-    from runtime import handler_base as hb
 
     fake_fd = 987655
     chunks = [b""]  # 常驻 reader 立即 EOF，避免遗留线程
@@ -1943,9 +1944,7 @@ def test_unix_terminal_attach_does_not_start_second_reader(monkeypatch):
     monkeypatch.setattr(ss.pty, "fork", lambda: (4243, fake_fd))
     monkeypatch.setattr(ss.os, "read", lambda fd, n: chunks.pop(0) if chunks else b"")
     monkeypatch.setattr(ss.select, "select", lambda r, w, x, t: (list(r), [], []))
-
-    info = ss.get_or_create_terminal("attach-once", cols=80, rows=24)
-    assert info is not None
+    monkeypatch.setattr(ss.os, "kill", lambda *a, **k: None)
 
     started: list = []
 
@@ -1955,19 +1954,24 @@ def test_unix_terminal_attach_does_not_start_second_reader(monkeypatch):
         def start(self):
             started.append(self._target)
 
-    class _FakeSock:
-        def sendall(self, data):
-            pass
-        def recv(self, n):
-            return b""
-        def close(self):
-            pass
-
-    monkeypatch.setattr(ss.os, "kill", lambda *a, **k: None)
-    monkeypatch.setattr(hb.threading, "Thread", _RecordingThread)
+    monkeypatch.setattr(ss.threading, "Thread", _RecordingThread)
     try:
-        handler = hb.HandlerBaseMixin.__new__(hb.HandlerBaseMixin)
-        handler._start_pty_session_unix(_FakeSock(), "attach-once", 80, 24)
+        first = ss.get_or_create_terminal(
+            "attach-once", cols=80, rows=24,
+            send_output=lambda data, _t="attach-once:auto": None,
+        )
+        assert first is not None
+        assert len(started) == 1, f"创建 PTY 时应只起一个常驻 reader: {started!r}"
+
+        # attach：同一个 terminal 再来一次（第二个 tab / 重连），只重绑回调
+        started.clear()
+        second = ss.get_or_create_terminal(
+            "attach-once", cols=100, rows=30,
+            send_output=lambda data, _t="attach-once:auto": None,
+        )
+        assert second is not None
+        assert second is first
+        assert second["pid"] == first["pid"]
     finally:
         ss.unregister_terminal_session("attach-once:auto")
 

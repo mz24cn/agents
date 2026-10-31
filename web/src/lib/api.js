@@ -377,6 +377,9 @@ export const sessions = {
     ? requestWithDownloadProgress(`/v1/sessions/${encodeURIComponent(sessionId)}`, onProgress)
     : request('GET', `/v1/sessions/${encodeURIComponent(sessionId)}`),
   logDir:        (sessionId)     => request('GET',    `/v1/sessions/${encodeURIComponent(sessionId)}/log-dir`),
+  // meta only — no conversation. Lets the browser resolve a *background*
+  // session's bindings (remote_env / workspace) without downloading its chat.
+  meta:          (sessionId)     => request('GET',    `/v1/sessions/${encodeURIComponent(sessionId)}/meta`),
   executionAnalysis: (sessionId) => request('GET',    `/v1/sessions/${encodeURIComponent(sessionId)}/execution-analysis`),
   delete:        (sessionId)     => request('DELETE', `/v1/sessions/${encodeURIComponent(sessionId)}`),
   // title 非空 = 人工设定标题；空 = 模型生成标题
