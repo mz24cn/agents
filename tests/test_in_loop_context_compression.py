@@ -57,6 +57,7 @@ def _make_cm(
     infer_fn: Callable | None = None,
     recent_turns_k: int = 2,
     max_tokens_in_context: int = 1000,
+    summary_model_id: str | None = "test-model",
 ) -> ContextManager:
     if infer_fn is None:
         infer_fn = lambda req: SimpleNamespace(  # noqa: E731
@@ -66,7 +67,7 @@ def _make_cm(
         infer_fn=infer_fn,
         chats_dir=tmp_dir,
         recent_turns_k=recent_turns_k,
-        summary_model_id="test-model",
+        summary_model_id=summary_model_id,
         max_tokens_in_context=max_tokens_in_context,
     )
 
@@ -460,7 +461,9 @@ def test_disabled_persister_is_never_current() -> None:
 
 
 def _make_model_registry(
-    protocol: str = "openai", max_context: int = 0
+    protocol: str = "openai",
+    max_context: int = 0,
+    generate_params: dict | None = None,
 ) -> ModelRegistry:
     registry = ModelRegistry()
     registry.register(
@@ -470,6 +473,7 @@ def _make_model_registry(
             model_name="test",
             api_protocol=protocol,
             max_context=max_context,
+            generate_params=dict(generate_params or {}),
         )
     )
     return registry
@@ -532,11 +536,22 @@ def _content_sse(text: str) -> io.BytesIO:
     return io.BytesIO(f"data: {chunk}\n\ndata: [DONE]\n\n".encode("utf-8"))
 
 
-def _run_tool_loop(hook, *, first_round_sse=None, max_context: int = 0):
+def _run_tool_loop(
+    hook,
+    *,
+    first_round_sse=None,
+    max_context: int = 0,
+    tool_result: str = "PENDING-TOOL-RESULT",
+    overflow_hook=None,
+    generate_params: dict | None = None,
+    pause_gate=None,
+):
     """Run a two-round tool loop, returning (collected, bodies, round_count)."""
     runtime = Runtime(
-        model_registry=_make_model_registry(max_context=max_context),
-        tool_registry=_tool_registry(),
+        model_registry=_make_model_registry(
+            max_context=max_context, generate_params=generate_params
+        ),
+        tool_registry=_tool_registry(tool_result=tool_result),
     )
     bodies: list[dict] = []
     rounds = [0]
@@ -559,7 +574,12 @@ def _run_tool_loop(hook, *, first_round_sse=None, max_context: int = 0):
         max_tool_rounds=5,
     )
     with patch("urllib.request.urlopen", side_effect=mock_urlopen):
-        collected = list(runtime.infer_stream(request, on_round_complete=hook))
+        collected = list(runtime.infer_stream(
+            request,
+            on_round_complete=hook,
+            on_context_overflow=overflow_hook,
+            pause_gate=pause_gate,
+        ))
     return collected, bodies, rounds[0]
 
 
@@ -804,3 +824,341 @@ def test_production_wiring_compresses_and_rebuilds_mid_loop(tmp_path) -> None:
     assert round2_messages[1]["content"] == "ORIGINAL-USER-TURN"
     assert round2_messages[3]["content"] == "PENDING-TOOL-RESULT"
     assert any(m.role == "assistant" and m.content == "final answer" for m in collected)
+
+
+
+# ---------------------------------------------------------------------------
+# Pre-send context guard: the check that runs BEFORE the request is sent
+# ---------------------------------------------------------------------------
+#
+# ``on_round_complete`` measures the round that just ENDED (exact token counts,
+# and no user waiting time spent on the compression it triggers).  The context
+# guard measures the request that is about to be SENT, which is the only
+# measurement that can still prevent a provider rejection: this round's tool
+# results and a user message injected at a pause boundary both join AFTER the
+# post-round compression.
+
+
+def _budget_estimate(budget: int):
+    """The estimate callable the loop hands to the overflow hook."""
+    from runtime.common import estimate_chat_prompt_tokens_capped
+
+    return lambda msgs: estimate_chat_prompt_tokens_capped(msgs, None, budget)
+
+
+def test_send_budget_tokens_reserves_room_for_the_reply(monkeypatch: pytest.MonkeyPatch) -> None:
+    """budget = max_context minus the output reserve, derived then kept sane."""
+    monkeypatch.delenv("CONTEXT_OUTPUT_RESERVE_TOKENS", raising=False)
+    budget_of = Runtime._context_send_budget_tokens
+
+    def cfg(max_context: int, **params: int) -> ModelConfig:
+        return ModelConfig(
+            model_id="m",
+            api_base="http://x",
+            model_name="m",
+            max_context=max_context,
+            generate_params=dict(params),
+        )
+
+    assert budget_of(cfg(0)) == 0, "unknown window: the guard stays off"
+    assert budget_of(cfg(10_000, max_completion_tokens=4_000)) == 6_000
+    assert budget_of(cfg(10_000, max_tokens=50_000)) == 5_000, "reserve clamped to half"
+    assert budget_of(cfg(200_000)) == 200_000 - 8192, "default reserve"
+    assert budget_of(cfg(1_500)) == 750, "a tiny window keeps half for the reply"
+
+    monkeypatch.setenv("CONTEXT_OUTPUT_RESERVE_TOKENS", "1000")
+    assert budget_of(cfg(10_000, max_tokens=4_000)) == 9_000, "env wins over the model cap"
+    monkeypatch.setenv("CONTEXT_OUTPUT_RESERVE_TOKENS", "not-a-number")
+    assert budget_of(cfg(10_000, max_tokens=4_000)) == 6_000, "invalid env falls back"
+
+
+def test_guard_measures_the_request_that_is_about_to_be_sent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fat tool result is caught before round 2 although round 1 was small."""
+    monkeypatch.setenv("CONTEXT_OUTPUT_RESERVE_TOKENS", "1024")
+    window = 4000
+    seen: list[tuple] = []
+
+    def overflow(messages, budget, estimate, max_context):
+        seen.append((budget, max_context, estimate(messages)))
+        compact = [Message(role="user", content="REBUILT-COMPACT")]
+        return compact, estimate(compact)
+
+    collected, bodies, rounds = _run_tool_loop(
+        None,
+        first_round_sse=lambda: _tool_call_sse("dummy_tool", "call_1"),
+        max_context=window,
+        tool_result="fat " * 20_000,
+        overflow_hook=overflow,
+    )
+
+    assert rounds == 2
+    assert len(seen) == 1, "only the oversized round is acted on"
+    budget, seen_window, measured = seen[0]
+    assert (seen_window, budget) == (window, window - 1024)
+    assert measured > budget, "the tool result alone exceeds the ceiling"
+
+    round2_contents = [m.get("content") or "" for m in bodies[1]["messages"]]
+    assert "REBUILT-COMPACT" in round2_contents, "the loop continued on the rebuilt list"
+    assert all("fat fat" not in text for text in round2_contents)
+    assert any(m.role == "assistant" and m.content == "final answer" for m in collected)
+
+
+def test_guard_refuses_a_request_that_cannot_be_made_to_fit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A remedy that does not help ends in an Error: instead of a rejected call."""
+    monkeypatch.setenv("CONTEXT_OUTPUT_RESERVE_TOKENS", "1024")
+
+    def overflow(messages, budget, estimate, max_context):
+        return None, estimate(messages)  # nothing helped
+
+    collected, bodies, rounds = _run_tool_loop(
+        None,
+        first_round_sse=lambda: _tool_call_sse("dummy_tool", "call_1"),
+        max_context=4000,
+        tool_result="fat " * 20_000,
+        overflow_hook=overflow,
+    )
+
+    assert rounds == 1, "the doomed second request must not be sent"
+    errors = [
+        m.content for m in collected
+        if isinstance(m.content, str) and m.content.startswith("Error:")
+    ]
+    assert len(errors) == 1 and "context too large" in errors[0], errors
+
+
+def test_guard_is_inert_while_the_model_window_is_unknown() -> None:
+    """No window configured: nothing is measured and nothing is refused."""
+    calls: list[object] = []
+    collected, bodies, rounds = _run_tool_loop(
+        None,
+        first_round_sse=lambda: _tool_call_sse("dummy_tool", "call_1"),
+        max_context=0,
+        tool_result="fat " * 20_000,
+        overflow_hook=lambda *args: calls.append(args),
+    )
+    assert calls == []
+    assert rounds == 2, "behaviour is unchanged when the window is unknown"
+
+
+def test_guard_without_a_session_to_compress_only_warns(caplog) -> None:
+    """A stateless request has no remedy: report it, but still send (as before)."""
+    with caplog.at_level(logging.WARNING, logger="runtime.runtime"):
+        collected, bodies, rounds = _run_tool_loop(
+            None,
+            first_round_sse=lambda: _tool_call_sse("dummy_tool", "call_1"),
+            max_context=4000,
+            tool_result="fat " * 20_000,
+        )
+    assert rounds == 2
+    assert any("no session context" in record.getMessage() for record in caplog.records)
+
+
+def test_guard_sees_a_user_message_injected_at_a_pause_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The hole the post-round check cannot see: an interjection joins after it."""
+    monkeypatch.setenv("CONTEXT_OUTPUT_RESERVE_TOKENS", "1024")
+    gate_calls = [0]
+
+    def pause_gate():
+        gate_calls[0] += 1
+        if gate_calls[0] == 2:  # reached once the tool round has completed
+            return {
+                "append": [{"role": "user", "content": "INTERJECTED " * 6_000}],
+                "stop": False,
+            }
+        return None
+
+    seen: list[bool] = []
+
+    def overflow(messages, budget, estimate, max_context):
+        seen.append(
+            any("INTERJECTED" in (getattr(m, "content", "") or "") for m in messages)
+        )
+        compact = [Message(role="user", content="REBUILT-COMPACT")]
+        return compact, estimate(compact)
+
+    collected, bodies, rounds = _run_tool_loop(
+        None,
+        first_round_sse=lambda: _tool_call_sse("dummy_tool", "call_1"),
+        max_context=4000,
+        pause_gate=pause_gate,
+        overflow_hook=overflow,
+    )
+
+    assert rounds == 2
+    assert seen == [True], "the interjection was part of the measured request"
+
+
+def _fat_pending_round(fat: str) -> list:
+    """The in-flight message list of a tool round whose result is oversized."""
+    return [
+        Message(role="user", content="OLDER-USER-TURN"),
+        Message(role="assistant", content="OLDER-ASSISTANT-TURN"),
+        Message(
+            role="assistant",
+            content="",
+            tool_calls=[{"id": "call_1", "name": "dummy_tool", "arguments": "{}"}],
+        ),
+        Message(role="tool", content=fat, name="dummy_tool", tool_use_id="call_1"),
+    ]
+
+
+def _pending_round_turns_with_fat(fat: str) -> list:
+    """A persisted session whose pending round produced an oversized result."""
+    from runtime.context_manager import ConversationTurn
+
+    turns = _pending_tool_round_turns()
+    turns[-1] = ConversationTurn(
+        role="tool", content=fat, timestamp="2026-01-01T00:00:03",
+        name="dummy_tool", tool_use_id="call_1",
+    )
+    return turns
+
+
+def test_ensure_within_budget_compresses_then_offloads(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Least lossy first: summary, then deeper summary, then file offload.
+
+    The pending round is never dropped; only its oversized result leaves the
+    context, and it leaves as a file reference the agent can read back.
+    """
+    spill_dir = str(tmp_path / "spill")
+    monkeypatch.setenv("CONTEXT_SPILL_DIR", spill_dir)
+    store: dict = {}
+    cm = _make_cm(str(tmp_path), infer_fn=_capturing_infer(store), recent_turns_k=2)
+    sid = cm.create_session()
+
+    fat = "TOOLDUMP " * 30_000
+    cm.save_conversation(sid, _pending_round_turns_with_fat(fat))
+
+    in_flight = _fat_pending_round(fat)
+    compressor = InLoopContextCompressor(
+        context_manager=cm, session_id=sid, inference_model_id="test-model",
+    )
+    budget = 2_000
+    replacement, after = compressor.ensure_within_budget(
+        in_flight, budget, _budget_estimate(budget)
+    )
+
+    assert replacement is not None, "the guard must change something"
+    assert after <= budget, f"still {after} tokens over a {budget} budget"
+
+    # The shallow pass could not free enough (the pending round alone is
+    # oversized), so a second, deeper pass ran before the offload step.
+    assert store["calls"] == 2, f"expected a shallow and a deep pass, got {store['calls']}"
+    assert cm.get_summary(sid)[0].strip(), "the compression produced a summary"
+
+    # The pending round survived, with its oversized result offloaded.
+    tool_messages = [m for m in replacement if m.role == "tool"]
+    assert tool_messages, "the tool result the model waits for must stay"
+    assert "output offloaded to file:" in tool_messages[-1].content
+    assert len(tool_messages[-1].content) < 5_000, "only an excerpt stays inline"
+
+    # The full text is on disk: nothing was lost, only moved out of the context.
+    offloaded = os.listdir(os.path.join(spill_dir, sid))
+    assert offloaded
+    with open(os.path.join(spill_dir, sid, offloaded[0]), encoding="utf-8") as fh:
+        assert fh.read() == fat
+
+    # The caller's own Message objects are untouched: persistence and the UI
+    # transcript keep the verbatim tool output.
+    assert in_flight[-1].content == fat
+
+
+def test_ensure_within_budget_offloads_when_compression_is_unavailable(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No summary model and no inference model id: offload is what remains."""
+    spill_dir = str(tmp_path / "spill")
+    monkeypatch.setenv("CONTEXT_SPILL_DIR", spill_dir)
+    # No compression model at all: neither a summary model nor an inference
+    # model id, which is what makes the deeper-summary step a no-op.
+    monkeypatch.setenv("SUMMARY_MODEL_ID", "")
+    cm = _make_cm(str(tmp_path), recent_turns_k=2, summary_model_id="")
+    sid = cm.create_session()
+
+    fat = "TOOLDUMP " * 30_000
+    cm.save_conversation(sid, _pending_round_turns_with_fat(fat))
+
+    in_flight = _fat_pending_round(fat)
+    compressor = InLoopContextCompressor(context_manager=cm, session_id=sid)
+    budget = 2_000
+    replacement, after = compressor.ensure_within_budget(
+        in_flight, budget, _budget_estimate(budget)
+    )
+
+    assert cm.get_summary(sid)[0] == "", "no compression model: nothing to summarize"
+    assert replacement is not None and after <= budget
+    assert "output offloaded to file:" in replacement[-1].content
+    assert in_flight[-1].content == fat
+
+
+def test_ensure_within_budget_is_inert_when_the_request_already_fits() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cm = _make_cm(tmp_dir)
+        sid = cm.create_session()
+        cm.save_conversation(sid, _pending_tool_round_turns())
+        compressor = InLoopContextCompressor(context_manager=cm, session_id=sid)
+        messages = _fat_pending_round("small result")
+        estimate = _budget_estimate(2_000)
+        replacement, after = compressor.ensure_within_budget(messages, 20_000, estimate)
+        assert replacement is None and after <= 20_000
+        assert cm.get_summary(sid)[0] == "", "nothing was compressed"
+
+
+def test_ensure_within_budget_skips_rebuild_but_still_offloads_when_not_persisted(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unpersisted round: rebuilding would lose it, so only offload is available."""
+    spill_dir = str(tmp_path / "spill")
+    monkeypatch.setenv("CONTEXT_SPILL_DIR", spill_dir)
+    cm = _make_cm(str(tmp_path), recent_turns_k=2)
+    sid = cm.create_session()
+    cm.save_conversation(sid, _pending_tool_round_turns())
+
+    fat = "TOOLDUMP " * 30_000
+    compressor = InLoopContextCompressor(
+        context_manager=cm, session_id=sid, ready=lambda: False,
+    )
+    budget = 2_000
+    replacement, after = compressor.ensure_within_budget(
+        _fat_pending_round(fat), budget, _budget_estimate(budget)
+    )
+    assert replacement is not None and after <= budget
+    assert "output offloaded to file:" in replacement[-1].content
+
+
+# ---------------------------------------------------------------------------
+# Offload helpers
+# ---------------------------------------------------------------------------
+
+
+def test_offload_is_content_addressed_excerpted_and_pruned(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from runtime.context_manager import (
+        _CONTEXT_SPILL_KEEP_FILES,
+        is_spilled_content,
+        spill_reference,
+    )
+
+    spill_dir = tmp_path / "spill"
+    monkeypatch.setenv("CONTEXT_SPILL_DIR", str(spill_dir))
+
+    fat = "z" * 40_000
+    first = spill_reference("s1", fat, label="tool")
+    assert first and "output offloaded to file:" in first
+    assert len(first) < 5_000, "the replacement is bounded whatever the input size"
+    assert first == spill_reference("s1", fat, label="tool"), "same content, same file"
+    assert len(os.listdir(str(spill_dir / "s1"))) == 1
+
+    assert spill_reference("s1", "short one", label="tool") is None, "short stays short"
+    assert is_spilled_content(first)
+    assert spill_reference("s1", first, label="tool") == first, "never re-offloaded"
+
+    for index in range(_CONTEXT_SPILL_KEEP_FILES + 10):
+        spill_reference("s2", f"{index} " + "y" * 40_000, label="tool")
+    assert len(os.listdir(str(spill_dir / "s2"))) == _CONTEXT_SPILL_KEEP_FILES
+
+    # A session id must stay one path segment.
+    assert spill_reference("../escape", fat, label="tool") is None

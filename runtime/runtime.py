@@ -30,6 +30,7 @@ from runtime.common import (
     snapshot_request_context,
     restore_request_context,
     estimate_chat_prompt_tokens,
+    estimate_chat_prompt_tokens_capped,
     estimate_message_payload_tokens,
     env_int,
 )
@@ -69,6 +70,17 @@ def _get_model_api_timeout() -> int:
         return int(os.environ.get("MODEL_API_TIMEOUT", "180"))
     except (TypeError, ValueError):
         return 300
+
+
+# CONTEXT_OUTPUT_RESERVE_TOKENS (tokens): completion space the pre-send context
+# guard keeps free when it measures a request against ModelConfig.max_context.
+# Providers that charge ONE window for input AND output reject a request whose
+# prompt alone fills it, so the guard's ceiling is ``max_context - reserve``.
+# 0 / unset means "derive it": the model's own configured output cap
+# (generate_params max_tokens / max_completion_tokens / max_output_tokens) when
+# it has one, otherwise a fraction of the window clamped to [1024, 8192].
+def _get_context_output_reserve_override() -> int:
+    return env_int("CONTEXT_OUTPUT_RESERVE_TOKENS", 0)
 
 
 # MODEL_INFER_TIMEOUT (seconds) caps one continuous streaming inference output:
@@ -2382,6 +2394,125 @@ class Runtime:
     # Streaming inference
     # ------------------------------------------------------------------
 
+    #: Generation parameters that cap the reply, in the order they are looked
+    #: up when deriving the output reserve of the pre-send context guard.
+    _OUTPUT_CAP_PARAMS: tuple[str, ...] = (
+        "max_tokens", "max_completion_tokens", "max_output_tokens",
+    )
+
+    @classmethod
+    def _context_send_budget_tokens(cls, model_config: object) -> int:
+        """Return the prompt-token ceiling for one request; ``0`` = unknown.
+
+        A provider that charges a single window for input AND output rejects a
+        request whose prompt alone fills ``ModelConfig.max_context``, so the
+        ceiling is the window minus the space the reply needs:
+        ``CONTEXT_OUTPUT_RESERVE_TOKENS`` when set, otherwise the model's own
+        configured output cap, otherwise ``min(8192, max(1024, window // 16))``.
+
+        A reserve larger than half the window is clamped, and a ceiling that
+        would not be positive disables the guard instead of rejecting every
+        request: an unknown/absurd configuration must not break inference.
+        """
+        window = int(getattr(model_config, "max_context", 0) or 0)
+        if window <= 0:
+            return 0
+        reserve = _get_context_output_reserve_override()
+        if reserve <= 0:
+            params = getattr(model_config, "generate_params", None) or {}
+            configured = 0
+            for key in cls._OUTPUT_CAP_PARAMS:
+                value = params.get(key)
+                if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                    configured = max(configured, value)
+            reserve = configured or min(8192, max(1024, window // 16))
+        reserve = min(reserve, window // 2)
+        budget = window - reserve
+        return budget if budget > 0 else 0
+
+    def _guard_context_before_send(
+        self,
+        messages: list,
+        tools: Optional[list],
+        model_config: object,
+        on_context_overflow: Optional[Callable],
+    ) -> tuple[list, str]:
+        """Measure the request that is about to be sent; make it fit, or refuse.
+
+        The mid-loop compression hook (:meth:`_maybe_refresh_context`) measures
+        the round that just ENDED, at 90 % of the window.  That is the right
+        place to spend a compression round — the user is not waiting yet, and
+        the provider-reported token count of that round is exact — but it cannot
+        see what joins the request afterwards: the tool results of that round,
+        and a user message injected at a pause boundary.  This guard closes that
+        gap: it runs after every source of new content and immediately before
+        the request is serialised.
+
+        Cost when the request fits (the normal case) is one CJK-aware estimate
+        walk over the message list — single-digit milliseconds for a typical
+        context — and no LLM call.  ``max_context == 0`` (window unknown) keeps
+        the previous behaviour: nothing is measured and nothing is refused.
+
+        Returns ``(messages, error)``: ``error`` is empty when the request may
+        be sent (``messages`` possibly replaced by a rebuilt/trimmed list), and
+        non-empty when the caller must emit it instead of burning a round-trip
+        the provider would reject.
+        """
+        budget = self._context_send_budget_tokens(model_config)
+        if budget <= 0:
+            return messages, ""
+
+        window = int(getattr(model_config, "max_context", 0) or 0)
+        tool_schemas = tools if tools else None
+        estimated = estimate_chat_prompt_tokens_capped(messages, tool_schemas, budget)
+        if estimated <= budget:
+            return messages, ""
+
+        if on_context_overflow is None:
+            # Nothing can be done (no session context to compress, e.g. a
+            # stateless request): report it and let the request go, as before.
+            _logger.warning(
+                "context guard: request of ~%d prompt tokens exceeds the %d-token "
+                "ceiling (window %d) but no session context is available to "
+                "compress it",
+                estimated, budget, window,
+            )
+            return messages, ""
+
+        try:
+            replacement, after = on_context_overflow(
+                messages,
+                budget,
+                lambda msgs: estimate_chat_prompt_tokens_capped(msgs, tool_schemas, budget),
+                window,
+            )
+        except Exception:  # never let the guard itself break the loop
+            _logger.exception(
+                "context guard: overflow handling failed; sending as-is | "
+                "estimated=%d budget=%d",
+                estimated, budget,
+            )
+            return messages, ""
+
+        if replacement:
+            messages = list(replacement)
+        if after <= budget:
+            return messages, ""
+
+        model_id = getattr(model_config, "model_id", "") or "?"
+        _logger.warning(
+            "context guard: refusing to send | model=%s estimated=%d budget=%d "
+            "window=%d messages=%d",
+            model_id, after, budget, window, len(messages),
+        )
+        return messages, (
+            f"Error: context too large to send: about {after} prompt tokens do not "
+            f"fit the {budget} available to model {model_id} (window {window} tokens, "
+            f"{window - budget} kept for the reply). It was compressed and its "
+            f"oversized output offloaded to files, which was not enough. Start a "
+            f"new session, or split this step into smaller pieces."
+        )
+
     def _maybe_refresh_context(
         self,
         on_round_complete: Optional[Callable[[list, int, int], Optional[list]]],
@@ -2468,6 +2599,7 @@ class Runtime:
         cancel_event: Optional[object] = None,
         on_round_complete: Optional[Callable[[list, int, int], Optional[list]]] = None,
         pause_gate: Optional[Callable[[], Optional[dict]]] = None,
+        on_context_overflow: Optional[Callable] = None,
     ) -> Iterator[Message]:
         """Streaming inference with full tool call loop and Skill progressive disclosure.
 
@@ -2500,6 +2632,17 @@ class Runtime:
                 context window.  Returning ``None`` keeps the accumulated
                 messages.  Terminal rounds (no tool call) are not passed to the
                 hook — the session-completed trigger handles them.
+            on_context_overflow: Optional pre-send hook, called by the context
+                guard (:meth:`_guard_context_before_send`) with
+                ``(messages, input_budget, estimate, max_context)`` when the
+                request that is about to be sent is measured larger than the
+                model's window minus its output reserve.  Unlike
+                *on_round_complete* this one must act: the provider would reject
+                the request.  It returns ``(replacement, tokens_after)``; the
+                loop sends *replacement* when it fits and emits an
+                ``Error:`` message instead of a doomed request when it does not.
+                Passing ``None`` keeps the measurement (it logs what would not
+                fit) but never refuses the send.
 
         Yields:
             Message objects incrementally.
@@ -2591,6 +2734,19 @@ class Runtime:
                 return
 
             messages = _ensure_tool_call_results(messages)
+            # Last line of defence on context size.  Everything that can join
+            # the request after the post-round compression has joined by now:
+            # this round's tool results, a user message injected at a pause
+            # boundary, a skill disclosure, the entry-time context of a new
+            # turn.  Measuring here — rather than at the end of the previous
+            # round, which is where compression is cheap and unhurried — is what
+            # makes the number true of the request about to be sent.
+            messages, context_error = self._guard_context_before_send(
+                messages, tools, model_config, on_context_overflow,
+            )
+            if context_error:
+                yield Message(role="assistant", timestamp=_now_iso(), content=context_error)
+                return
             request_messages = _prepare_reasoning_for_tool_rounds(messages, model_config)
             url, headers, body_bytes = protocol.build_request(
                 config=inference_model_config, messages=request_messages,

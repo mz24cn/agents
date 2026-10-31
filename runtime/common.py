@@ -130,6 +130,36 @@ def estimate_tokens(text: str) -> int:
     return len(text) // 4
 
 
+#: Codepoint ranges treated as ~1 token per character.  Single source of truth
+#: for both :func:`_is_cjk_token_char` and the regex used by
+#: :func:`estimate_llm_tokens`.
+_CJK_TOKEN_CHAR_RANGES: tuple[tuple[int, int], ...] = (
+    (0x2E80, 0x30FF),
+    (0x31F0, 0x31FF),
+    (0x3400, 0x4DBF),
+    (0x4E00, 0x9FFF),
+    (0xAC00, 0xD7AF),
+    (0xF900, 0xFAFF),
+    (0xFF00, 0xFFEF),
+    (0x20000, 0x323AF),
+)
+
+#: Single character class over :data:`_CJK_TOKEN_CHAR_RANGES`, and its "run"
+#: form: matching maximal runs and summing their lengths keeps the number of
+#: match objects (and therefore the temporary list ``findall`` builds) far below
+#: the character count, which is what makes the estimate fast on CJK-dense text.
+_CJK_TOKEN_CHAR_RE = re.compile(
+    "["
+    + "".join(
+        f"\\u{low:04X}-\\u{high:04X}" if high <= 0xFFFF else
+        f"\\U{low:08X}-\\U{high:08X}"
+        for low, high in _CJK_TOKEN_CHAR_RANGES
+    )
+    + "]"
+)
+_CJK_TOKEN_RUN_RE = re.compile(_CJK_TOKEN_CHAR_RE.pattern + "+")
+
+
 def _is_cjk_token_char(char: str) -> bool:
     """Return whether *char* is normally close to one tokenizer token.
 
@@ -138,16 +168,7 @@ def _is_cjk_token_char(char: str) -> bool:
     estimate, but it avoids under-counting Chinese text by roughly 4x.
     """
     codepoint = ord(char)
-    return (
-        0x2E80 <= codepoint <= 0x30FF
-        or 0x31F0 <= codepoint <= 0x31FF
-        or 0x3400 <= codepoint <= 0x4DBF
-        or 0x4E00 <= codepoint <= 0x9FFF
-        or 0xAC00 <= codepoint <= 0xD7AF
-        or 0xF900 <= codepoint <= 0xFAFF
-        or 0xFF00 <= codepoint <= 0xFFEF
-        or 0x20000 <= codepoint <= 0x323AF
-    )
+    return any(low <= codepoint <= high for low, high in _CJK_TOKEN_CHAR_RANGES)
 
 
 def estimate_llm_tokens(text: object) -> int:
@@ -157,13 +178,19 @@ def estimate_llm_tokens(text: object) -> int:
     Japanese and Korean characters are commonly one token each (occasionally
     fewer or more depending on the model).  The estimate deliberately rounds a
     non-empty Latin fragment up so short messages never become zero tokens.
+
+    The classification is one C-level regex pass over the whole string instead
+    of a per-character Python loop (same semantics, roughly an order of
+    magnitude faster), which is what lets the pre-send context guard in
+    :meth:`Runtime.infer_stream` measure an in-flight context of hundreds of
+    thousands of tokens on every tool round.
     """
     if text is None:
         return 0
     value = text if isinstance(text, str) else str(text)
     if not value:
         return 0
-    cjk_chars = sum(1 for char in value if _is_cjk_token_char(char))
+    cjk_chars = sum(len(run) for run in _CJK_TOKEN_RUN_RE.findall(value))
     other_chars = len(value) - cjk_chars
     return cjk_chars + ((other_chars + 3) // 4 if other_chars else 0)
 
@@ -224,18 +251,9 @@ def estimate_chat_message_tokens(message: object) -> int:
     return total
 
 
-def estimate_chat_prompt_tokens(messages: object, tools: object = None) -> int:
-    """Estimate the complete prompt for one model request.
-
-    The estimate includes every context message, chat-template role overhead,
-    the assistant-generation primer, and tool schemas.  Consequently multi-turn
-    fallback usage grows with the actual context instead of only measuring the
-    newest user/tool message.
-    """
-    total = 3  # assistant-generation primer used by common chat templates
-    for message in messages or []:
-        total += estimate_chat_message_tokens(message)
-
+def _tool_schema_tokens(tools: object) -> int:
+    """Estimate the prompt tokens charged by the exposed tool schemas."""
+    total = 0
     for tool in tools or []:
         if isinstance(tool, dict):
             function = tool.get("function") if isinstance(tool.get("function"), dict) else tool
@@ -251,6 +269,42 @@ def estimate_chat_prompt_tokens(messages: object, tools: object = None) -> int:
                 "parameters": getattr(tool, "parameters", {}),
             }
         total += 8 + estimate_llm_tokens(_compact_json(payload))
+    return total
+
+
+def estimate_chat_prompt_tokens(messages: object, tools: object = None) -> int:
+    """Estimate the complete prompt for one model request.
+
+    The estimate includes every context message, chat-template role overhead,
+    the assistant-generation primer, and tool schemas.  Consequently multi-turn
+    fallback usage grows with the actual context instead of only measuring the
+    newest user/tool message.
+    """
+    total = 3 + _tool_schema_tokens(tools)  # 3: assistant primer in chat templates
+    for message in messages or []:
+        total += estimate_chat_message_tokens(message)
+    return total
+
+
+def estimate_chat_prompt_tokens_capped(
+    messages: object, tools: object = None, cap: int = 0
+) -> int:
+    """Estimate the prompt for one request, stopping as soon as *cap* is passed.
+
+    The return value is the running estimate: ``<= cap`` when the prompt fits
+    the cap, ``> cap`` as soon as it is known not to.  Callers that only need
+    the verdict (the pre-send context guard) therefore never walk more of the
+    context than the budget itself, however long the accumulated history is.
+
+    ``cap <= 0`` means "no cap" and the full estimate is returned.
+    """
+    total = 3 + _tool_schema_tokens(tools)  # 3: assistant primer in chat templates
+    if cap > 0 and total > cap:
+        return total
+    for message in messages or []:
+        total += estimate_chat_message_tokens(message)
+        if cap > 0 and total > cap:
+            return total
     return total
 
 

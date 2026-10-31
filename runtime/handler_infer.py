@@ -1242,6 +1242,10 @@ class HandlerInferMixin:
                     cancel_event=cancel_event,
                     on_round_complete=context_compressor,
                     pause_gate=_pause_gate,
+                    on_context_overflow=(
+                        context_compressor.ensure_within_budget
+                        if context_compressor is not None else None
+                    ),
                 )
 
             for msg in msg_gen:

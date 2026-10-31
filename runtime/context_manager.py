@@ -399,9 +399,12 @@ def _extract_tagged_block(text: str, tag: str) -> str:
 #
 # Guards:
 #
-#   - a single pathological turn (e.g. a multi-MB tool output) is still capped
-#     at ``_SUMMARY_TURN_MAX_CHARS`` chars (head 3/4 + tail 1/4); this is a
-#     per-turn content-quality limit, not a total budget;
+#   - a single pathological turn (e.g. a multi-MB tool output) is offloaded to
+#     a file and replaced by an excerpt plus its path (``spill_reference``), so
+#     the detail stays reachable instead of being silently cut; only if that
+#     write fails is the turn cut to ``_SUMMARY_TURN_MAX_CHARS`` chars (head
+#     3/4 + tail 1/4).  Offloading only happens inside a compression round,
+#     never because content is merely long;
 #   - the prompt is bounded UP FRONT by the compression model's context window
 #     (``ModelConfig.max_context``) so the request succeeds in ONE call: the
 #     budget leaves room for the summary/memory output and, once a known window
@@ -449,23 +452,13 @@ _VALID_ENTRY_TYPES: frozenset[str] = frozenset(
     {"fact", "preference", "decision", "entity"}
 )
 
-# Fast CJK-aware token estimate.  ``estimate_llm_tokens`` in runtime.common has
-# the same semantics but walks the text character by character in Python, which
-# is far too slow for multi-megabyte histories; the regex-based count below
-# runs in C and matches it.
-_CJK_TOKEN_CHAR_RE = re.compile(
-    "[\u2E80-\u30FF\u31F0-\u31FF\u3400-\u4DBF\u4E00-\u9FFF"
-    "\uAC00-\uD7AF\uF900-\uFAFF\U00020000-\U000323AF]"
+# Fast CJK-aware token estimate.  The implementation lives in runtime.common
+# (a single C-level regex pass); the name is kept here because the compression
+# code and its tests refer to it.
+from runtime.common import (  # noqa: E402
+    estimate_llm_tokens as _estimate_tokens_fast,
+    sha256_bytes,
 )
-
-
-def _estimate_tokens_fast(text: str) -> int:
-    """Fast CJK-aware token estimate (same semantics as ``estimate_llm_tokens``)."""
-    if not text:
-        return 0
-    cjk = len(_CJK_TOKEN_CHAR_RE.findall(text))
-    other = len(text) - cjk
-    return cjk + ((other + 3) // 4 if other else 0)
 
 
 def _is_placeholder_summary(text: str) -> bool:
@@ -498,13 +491,179 @@ def _compression_prompt_budget(max_context: int) -> Optional[int]:
     return budget if budget > 0 else 0
 
 
-def _truncate_turn_content(content: str, max_chars: int = _SUMMARY_TURN_MAX_CHARS) -> str:
+# ---------------------------------------------------------------------------
+# Oversized-content offload (spill to file)
+# ---------------------------------------------------------------------------
+#
+# A single pathological turn (a multi-megabyte tool output, a huge pasted file
+# in a user message) used to be silently cut to ``_SUMMARY_TURN_MAX_CHARS``.
+# Instead such content is now written to a file and replaced by an excerpt plus
+# the file path: the compression model can record that path in the summary, and
+# the agent can read the full content back with its file tools.  Nothing is
+# lost, only moved out of the context.
+#
+# Scope guard (deliberate): offloading happens ONLY inside a compression round
+# — the trigger is "the context does not fit, so we are compressing".  Content
+# is never spilled merely because it is long.
+
+#: Estimated tokens above which a turn is offloaded instead of truncated.
+_CONTEXT_SPILL_MIN_TOKENS: int = 4000
+#: Characters kept inline (head / tail) next to the file reference.  The
+#: replacement therefore stays bounded (~3 KB) whatever the input size.
+_CONTEXT_SPILL_HEAD_CHARS: int = 2000
+_CONTEXT_SPILL_TAIL_CHARS: int = 1200
+#: Newest N offload files are kept per session; older ones are pruned.
+_CONTEXT_SPILL_KEEP_FILES: int = 32
+#: Marks an already-offloaded message, so a repeated compression round neither
+#: re-writes the file nor treats the offloaded original as new content.
+SPILL_MARKER: str = "[output offloaded to file:"
+
+
+def _spill_root() -> str:
+    """Directory oversized content is offloaded to (env overridable).
+
+    ``/tmp/agents-context-spill`` by default: ``/tmp`` is accepted by the file
+    tools' path validator regardless of the active workspace
+    (``builtin_tools_coding._validate_path``), so a path written into the
+    context is guaranteed to be readable back by the agent.
+    """
+    return os.environ.get("CONTEXT_SPILL_DIR") or "/tmp/agents-context-spill"
+
+
+def is_spilled_content(content: object) -> bool:
+    """Return whether *content* is already an offload reference."""
+    return SPILL_MARKER in (content if isinstance(content, str) else "")
+
+
+def _spill_session_dir(session_id: str) -> str:
+    """Per-session offload directory, rejecting anything but a plain ID."""
+    if (
+        not session_id
+        or os.sep in session_id
+        or (os.altsep and os.altsep in session_id)
+        or ".." in session_id
+    ):
+        raise ValueError(f"Invalid session_id for offload: {session_id!r}")
+    return os.path.join(_spill_root(), session_id)
+
+
+def _prune_spill_dir(directory: str) -> None:
+    """Keep only the newest ``_CONTEXT_SPILL_KEEP_FILES`` offload files."""
+    if _CONTEXT_SPILL_KEEP_FILES <= 0:
+        return
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return
+    dated: list[tuple[float, str]] = []
+    for name in names:
+        path = os.path.join(directory, name)
+        try:
+            dated.append((os.path.getmtime(path), path))
+        except OSError:
+            continue
+    for _, path in sorted(dated)[:-_CONTEXT_SPILL_KEEP_FILES]:
+        try:
+            os.unlink(path)
+        except OSError:  # pragma: no cover - best effort housekeeping
+            logger.warning("context offload: could not prune %s", path)
+
+
+def spill_content_to_file(
+    session_id: str, content: str, label: str = "content"
+) -> Optional[str]:
+    """Write *content* into the session's offload directory; return its path.
+
+    The file name embeds a digest of the content, so the same content always
+    maps to the same file (idempotent across compression rounds).  ``None`` is
+    returned when the write fails; the caller then falls back to truncation.
+    """
+    if not session_id or not content:
+        return None
+    try:
+        directory = _spill_session_dir(session_id)
+        digest = sha256_bytes(content.encode("utf-8", errors="replace"))[:16]
+        safe_label = "".join(
+            ch if ch.isalnum() or ch in "-_" else "_" for ch in (label or "content")
+        )[:32]
+        path = os.path.join(directory, f"{safe_label}-{digest}.txt")
+        if os.path.isfile(path) and os.path.getsize(path) > 0:
+            return path
+        os.makedirs(directory, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as fh:
+                fh.write(content)
+            os.replace(tmp_path, path)
+            tmp_path = None
+        finally:
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+        _prune_spill_dir(directory)
+        return path
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            "context offload: cannot write %s content for session %s: %s",
+            label, session_id, exc,
+        )
+        return None
+
+
+def spill_reference(session_id: str, content: str, label: str = "content") -> Optional[str]:
+    """Bounded replacement for an oversized *content*: excerpt + file path.
+
+    Returns ``None`` when the content is too small to be worth offloading or
+    the file could not be written, so the caller keeps its own fallback (head +
+    tail truncation).  The returned text is itself bounded, which is what makes
+    it useful inside a budget-constrained compression prompt.
+    """
+    if not content or is_spilled_content(content):
+        return content or None
+    tokens = _estimate_tokens_fast(content)
+    if tokens < _CONTEXT_SPILL_MIN_TOKENS:
+        return None
+    path = spill_content_to_file(session_id, content, label)
+    if not path:
+        return None
+    head = content[:_CONTEXT_SPILL_HEAD_CHARS]
+    tail = content[-_CONTEXT_SPILL_TAIL_CHARS:] if _CONTEXT_SPILL_TAIL_CHARS > 0 else ""
+    omitted = len(content) - len(head) - len(tail)
+    reference = (
+        f"{SPILL_MARKER} {path} ({len(content):,} chars, ~{tokens:,} tokens; "
+        f"the full text is still on disk, read it with a file tool)]\n{head}"
+    )
+    if omitted > 0:
+        reference += f"\n[... {omitted:,} characters omitted from the middle ...]\n{tail}"
+    logger.info(
+        "context offload: session %s %s content of %d chars moved to %s",
+        session_id, label, len(content), path,
+    )
+    return reference
+
+
+def _truncate_turn_content(
+    content: str,
+    max_chars: int = _SUMMARY_TURN_MAX_CHARS,
+    session_id: str = "",
+    label: str = "turn",
+) -> str:
     """Cap a single turn's content for the compression prompt.
 
-    Keeps the head (3/4) and the tail (1/4); a marker documents the omission.
+    An over-long turn is offloaded to a file and replaced by an excerpt plus
+    its path (lossless, and the agent can read it back).  Only when that is
+    impossible (no session to file under, unwritable directory) is the content
+    cut in place, keeping the head (3/4) and the tail (1/4) with a marker that
+    documents the omission.
     """
     if max_chars <= 0 or len(content) <= max_chars:
         return content
+    if session_id:
+        spilled = spill_reference(session_id, content, label)
+        if spilled:
+            return spilled
     head = max_chars * 3 // 4
     tail = max_chars // 4
     omitted = len(content) - head - tail
@@ -1939,11 +2098,18 @@ class ContextManager:
         previous_summary: str,
         budget_tokens: Optional[int],
         current_ts: str,
+        session_id: str = "",
     ) -> str:
         """Build the compression prompt for the delta.
 
         ``delta`` holds the turns NOT yet covered by ``previous_summary``;
         ``delta[i]`` is global turn index ``delta_start + i``.
+
+        ``session_id`` enables offloading: a turn too large for the prompt is
+        written to a file and replaced by an excerpt plus its path, so the
+        summary can point at the full text instead of summarising a silent
+        truncation.  Without it (or when the write fails) an over-long turn is
+        truncated head/tail as before.
 
         ``budget_tokens=None`` (the normal case): the FULL delta is sent —
         only pathological single turns are capped at
@@ -1952,7 +2118,8 @@ class ContextManager:
         (overflow-retry case): the whole prompt is additionally bounded to
         that many tokens — the previous summary is capped at 1/4 of the
         budget, then the OLDEST turns are dropped (a marker documents the
-        loss), and as a last resort the newest turn is hard-truncated.
+        loss), and as a last resort the newest turn is offloaded or, failing
+        that, hard-truncated.
         """
         overhead = (
             _estimate_tokens_fast(_COMPRESSION_PROMPT_HEAD)
@@ -1977,7 +2144,9 @@ class ContextManager:
         rendered: list[str] = []
         estimates: list[int] = []
         for i, t in enumerate(delta):
-            content = _truncate_turn_content(t.content)
+            content = _truncate_turn_content(
+                t.content, session_id=session_id, label=(t.name or t.role or "turn"),
+            )
             line = f"Turn {delta_start + i} {_turn_compression_label(t)}: {content}"
             rendered.append(line)
             estimates.append(_estimate_tokens_fast(line) + 1)
@@ -1991,12 +2160,23 @@ class ContextManager:
 
             if dropped == len(rendered):
                 # Not a single turn fits — keep only the most recent one,
-                # hard-truncated.
+                # offloaded to a file when it is oversized and only then
+                # hard-truncated to what is left of the budget.
                 if turns_budget > 0:
+                    newest_index = delta_start + len(delta) - 1
+                    newest = delta[-1].content
+                    if session_id:
+                        newest = (
+                            spill_reference(
+                                session_id, newest,
+                                label=(delta[-1].name or delta[-1].role or "turn"),
+                            )
+                            or newest
+                        )
                     rendered = [
-                        f"Turn {delta_start + len(delta) - 1} "
+                        f"Turn {newest_index} "
                         f"{_turn_compression_label(delta[-1])}: "
-                        + _truncate_to_token_budget(delta[-1].content, turns_budget)
+                        + _truncate_to_token_budget(newest, turns_budget)
                     ]
                     dropped = len(delta) - 1
                 else:
@@ -2108,6 +2288,7 @@ class ContextManager:
         trigger_threshold: Optional[int] = None,
         inference_model_id: str = "",
         inference_max_context: int = 0,
+        deep: bool = False,
     ) -> None:
         """Compress conversation history in a single LLM call.
 
@@ -2190,6 +2371,14 @@ class ContextManager:
                 inference model is chosen for compression it bounds the prompt,
                 and it also caps the prompt of a (smaller) summary model so the
                 request never exceeds a window the endpoint is known to honour.
+            deep: Summarize everything except the last turn instead of keeping
+                the most recent K turns verbatim.  Used by the pre-send guard
+                when the unsummarized recent-K window itself no longer fits the
+                model's window: the alternative is to drop those turns without
+                any summary, so summarising them is the lossless-first option
+                (oversized turns among them are offloaded to a file, and the
+                in-flight round is pulled back verbatim by
+                :meth:`assemble_context`).
         """
         # Choose which model performs the compression and the window to bound
         # the prompt to, so the request succeeds in ONE call (see the docstring
@@ -2224,7 +2413,15 @@ class ContextManager:
         # is large — compress all turns except the very last user message so
         # the model still has the immediate request in context.
         k = self._recent_turns_k
-        if len(turns) > k:
+        if deep:
+            # The pre-send guard reports that even the unsummarized recent-K
+            # window does not fit the model's window.  Compress deeper: every
+            # turn except the last one goes into the summary.  The in-flight
+            # round is not orphaned by this: assemble_context's tool-chain
+            # backtracking pulls the pending assistant(tool_calls) turn back in
+            # verbatim (see its tool-chain integrity checks).
+            summarized_up_to = len(turns) - 2
+        elif len(turns) > k:
             summarized_up_to = len(turns) - k - 1
         else:
             # All turns fit within the K window but are too large together.
@@ -2281,7 +2478,8 @@ class ContextManager:
         # delta is sent in full (best effort, as before).
         budget = _compression_prompt_budget(window)
         prompt = self._build_compression_prompt(
-            delta, delta_start, previous_summary, budget, current_ts
+            delta, delta_start, previous_summary, budget, current_ts,
+            session_id=session_id,
         )
         if budget is not None:
             logging.info(

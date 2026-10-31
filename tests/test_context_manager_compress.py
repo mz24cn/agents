@@ -11,8 +11,9 @@ Covers:
     sent to the LLM; a call without new turns does not call the LLM)
   - failed LLM results (success=False) are never persisted
   - placeholder echoes of the prompt format are never persisted
-  - the FULL delta is sent without any artificial prompt budget (only
-    pathological single turns are capped per-turn)
+  - the FULL delta is sent without any artificial prompt budget (a pathological
+    single turn is offloaded to a file and referenced by path; only when that
+    write is impossible is the turn cut per-turn)
   - context-overflow retry: the first attempt is the full delta, the retry
     installs a budget halved from the natural prompt size (oldest turns
     dropped)
@@ -293,12 +294,17 @@ def test_compression_sends_full_delta_without_budget() -> None:
         assert fm.get("summarized_up_to_turn") == 197  # 200 - k(2) - 1
 
 
-def test_single_giant_turn_is_capped_per_turn() -> None:
-    """A pathological single turn (100 KB of text) is capped per-turn
-    (head 3/4 + tail 1/4, with a marker), but is still represented — the
-    per-turn cap is a content-quality limit, not a total budget."""
+def test_single_giant_turn_is_offloaded_to_a_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A pathological single turn is offloaded to a file, not silently cut.
+
+    The compression prompt then carries an excerpt plus the file path, so the
+    full content stays reachable (by the summary model and, later, by the
+    agent's file tools) instead of being lost to a truncation marker.
+    """
     store: dict = {}
     with tempfile.TemporaryDirectory() as tmp_dir:
+        spill_dir = os.path.join(tmp_dir, "spill")
+        monkeypatch.setenv("CONTEXT_SPILL_DIR", spill_dir)
         cm = _make_cm(tmp_dir, recent_turns_k=1, infer_fn=_capturing_infer(store))
         sid = cm.create_session()
 
@@ -307,11 +313,47 @@ def test_single_giant_turn_is_capped_per_turn() -> None:
         cm.compress_context(sid, turns, last_total_tokens=2000)
 
         prompt = store["prompts"][0]
-        assert "characters omitted" in prompt, "giant turn must be truncated"
+        assert "output offloaded to file:" in prompt, "giant turn must be offloaded"
+        assert "characters omitted" in prompt, "the excerpt marks its own gap"
         assert "Turn 0 " in prompt, "the giant turn must still be represented"
         # The very last turn stays out of the compression prompt by design
         # (it is preserved verbatim in the inference context).
         assert "last user msg" not in prompt
+
+        # The offloaded text is complete on disk, and its size is what the
+        # reference advertises.
+        session_spill = os.path.join(spill_dir, sid)
+        files = os.listdir(session_spill)
+        assert len(files) == 1
+        with open(os.path.join(session_spill, files[0]), encoding="utf-8") as fh:
+            assert fh.read() == giant
+        assert f"{len(giant):,} chars" in prompt
+
+
+def test_giant_turn_falls_back_to_truncation_when_offload_is_impossible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the offload target cannot be written, the turn is capped as before."""
+    store: dict = {}
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        # A regular file where a directory would be needed: every mkdir fails.
+        blocker = os.path.join(tmp_dir, "blocker")
+        with open(blocker, "w", encoding="utf-8") as fh:
+            fh.write("not a directory")
+        monkeypatch.setenv(
+            "CONTEXT_SPILL_DIR", os.path.join(blocker, "spill"),
+        )
+        cm = _make_cm(tmp_dir, recent_turns_k=1, infer_fn=_capturing_infer(store))
+        sid = cm.create_session()
+
+        giant = "y" * 100_000
+        turns = [_make_turn(content=giant), _make_turn(content="last user msg")]
+        cm.compress_context(sid, turns, last_total_tokens=2000)
+
+        prompt = store["prompts"][0]
+        assert "output offloaded to file:" not in prompt
+        assert "characters omitted" in prompt, "giant turn must be truncated"
+        assert "Turn 0 " in prompt
 
 
 # ---------------------------------------------------------------------------

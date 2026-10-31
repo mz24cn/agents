@@ -286,6 +286,10 @@ def _make_delegate_fn(runtime, thread_local):
                     request,
                     cancel_event=cancel_event,
                     on_round_complete=context_compressor,
+                    on_context_overflow=(
+                        context_compressor.ensure_within_budget
+                        if context_compressor is not None else None
+                    ),
                 ):
                     msg.agent_id = getattr(msg, "agent_id", None) or getattr(thread_local, "agent_id", None)
                     if msg.role == "usage":
@@ -619,6 +623,10 @@ def _make_talk_to_fn(runtime, thread_local):
                     request,
                     cancel_event=cancel_event,
                     on_round_complete=context_compressor,
+                    on_context_overflow=(
+                        context_compressor.ensure_within_budget
+                        if context_compressor is not None else None
+                    ),
                 ):
                     msg.agent_id = getattr(msg, "agent_id", None) or agent_id
                     if msg.role == "usage":

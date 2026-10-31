@@ -989,6 +989,16 @@ class InLoopContextCompressor:
     predicate (normally :meth:`IncrementalConversationPersister.is_current`)
     that must hold at call time; otherwise the hook is a no-op and the loop
     keeps its accumulated messages.
+
+    A second entry point, :meth:`ensure_within_budget`, serves the pre-send
+    guard of :meth:`Runtime.infer_stream`.  When the request that is about to be
+    sent is measured larger than the model's window minus its output reserve,
+    this hook may not decline: it compresses (incrementally, then deeply) and
+    offloads oversized messages to files until the request fits, and otherwise
+    reports that it did not fit so the caller refuses the send instead of
+    burning a round-trip the provider would reject.  Both entry points share the
+    same rebuild path and the same never-drop-the-pending-round invariants; see
+    ``docs/plan-context-send-guard.md``.
     """
 
     def __init__(
@@ -1043,21 +1053,9 @@ class InLoopContextCompressor:
             session_id, turns, round_total_tokens, max_context
         ):
             return None
-        try:
-            assembled = context_manager.assemble_context(session_id, [])
-        except OSError as exc:
-            logger.warning(
-                "in-loop context compression: failed to rebuild the context for "
-                "session %s: %s",
-                session_id,
-                exc,
-            )
+        rebuilt = self._rebuild_from_disk()
+        if rebuilt is None:
             return None
-        if not assembled:
-            return None
-        from runtime.models import Message
-
-        rebuilt = [Message.from_dict(m) for m in assembled]
         _, front_matter = context_manager.get_summary(session_id)
         logger.info(
             "in-loop context compression: session %s rebuilt %d messages after a "
@@ -1069,6 +1067,211 @@ class InLoopContextCompressor:
             front_matter.get("summarized_up_to_turn"),
         )
         return rebuilt
+
+    # ------------------------------------------------------------------
+    # Pre-send guard: the request about to be sent does not fit the window
+    # ------------------------------------------------------------------
+
+    def ensure_within_budget(
+        self,
+        messages: list,
+        input_budget: int,
+        estimate: Callable[[list], int],
+        max_context: int = 0,
+    ) -> tuple[Optional[list], int]:
+        """Compress / offload until the pending request fits *input_budget*.
+
+        Called by the pre-send guard of :meth:`Runtime.infer_stream` when the
+        measured prompt of the request that is ABOUT to be sent exceeds the
+        model's window minus its output reserve.  Unlike :meth:`__call__` —
+        which fires at 90 % of the window at the END of a completed round, on
+        purpose, because compression then costs the user no waiting time — this
+        one must act: the provider is about to reject the request.
+
+        Steps, least lossy first (each re-measured, stopping as soon as the
+        request fits):
+
+        1. one incremental compression round.  Because the post-round
+           compression already ran, its delta is just what came since: the last
+           tool round and any user message injected mid-flight;
+        2. if that is not enough, a DEEP compression round: everything except
+           the pending round is summarised (oversized turns among them are
+           offloaded to a file by the compression prompt builder, so their full
+           text stays reachable);
+        3. if the pending round ALONE does not fit, its oversized messages are
+           offloaded to files in place, leaving an excerpt plus the path.
+
+        ``estimate`` is the caller's prompt estimator (same estimator and tool
+        schemas as the guard used, so the numbers stay comparable).
+
+        Returns ``(replacement, tokens_after)``: ``replacement`` is ``None``
+        when nothing could be changed, and ``tokens_after`` is the estimate of
+        the list the caller should send, so the caller re-measures for free and
+        can refuse the request instead of burning a rejected round-trip.
+        """
+        from runtime.common import estimate_llm_tokens  # local: hot-path module
+
+        budget = int(input_budget or 0)
+        current = list(messages)
+        current_tokens = estimate(current)
+        if (
+            self.context_manager is None
+            or not self.session_id
+            or budget <= 0
+            or current_tokens <= budget
+        ):
+            return None, current_tokens
+
+        session_id = self.session_id
+        context_manager = self.context_manager
+        replaced = False
+
+        # Rebuilding reads the session from disk, so it is only safe while this
+        # stream owns the session and its frames are persisted (same rule as
+        # __call__).  When it is not safe, skip straight to step 3, which works
+        # on the in-flight list itself.
+        if self.ready is None or self.ready():
+            try:
+                turns = context_manager.load_conversation(session_id)
+            except (FileNotFoundError, ValueError):
+                turns = []
+            if turns:
+                before = context_manager.get_summary(session_id)[1].get(
+                    "summarized_up_to_turn"
+                )
+                for deep in (False, True):
+                    previous_tokens = current_tokens
+                    context_manager.compress_context(
+                        session_id,
+                        turns,
+                        last_total_tokens=current_tokens,
+                        trigger_threshold=budget,
+                        inference_model_id=self.inference_model_id,
+                        inference_max_context=max_context,
+                        deep=deep,
+                    )
+                    after = context_manager.get_summary(session_id)[1].get(
+                        "summarized_up_to_turn"
+                    )
+                    if after == before:
+                        # Nothing new to summarise (or compression is disabled /
+                        # in failure backoff): a deeper pass cannot help either.
+                        break
+                    before = after
+                    rebuilt = self._rebuild_from_disk()
+                    if rebuilt is None:
+                        break
+                    current, current_tokens, replaced = rebuilt, estimate(rebuilt), True
+                    logger.info(
+                        "pre-send context guard: session %s compressed (deep=%s) "
+                        "before sending: %d -> %d estimated prompt tokens "
+                        "(budget %d, %d messages)",
+                        session_id, deep, previous_tokens, current_tokens,
+                        budget, len(current),
+                    )
+                    if current_tokens <= budget:
+                        break
+
+        if current_tokens > budget:
+            offloaded, current_tokens = self._offload_oversized(
+                current, budget, estimate, estimate_llm_tokens,
+            )
+            if offloaded is not None:
+                current, replaced = offloaded, True
+
+        return (current if replaced else None), current_tokens
+
+    def _offload_oversized(
+        self,
+        messages: list,
+        budget: int,
+        estimate: Callable[[list], int],
+        estimate_content: Callable[[object], int],
+    ) -> tuple[Optional[list], int]:
+        """Replace the largest messages with file references until it fits.
+
+        Only ever reached from the pre-send guard, i.e. only once compression
+        has been decided — content is never offloaded because it is merely long.
+        The biggest content is offloaded first and the loop stops as soon as the
+        request fits, so the number of offloaded messages stays minimal.  The
+        Message objects of the loop are never mutated: they are also held by the
+        caller's persistence list, and the transcript must keep the verbatim
+        tool output.
+        """
+        from dataclasses import replace as dc_replace
+
+        from runtime.context_manager import (
+            is_spilled_content,
+            spill_reference,
+            _CONTEXT_SPILL_MIN_TOKENS,
+        )
+
+        candidates: list[tuple[int, int]] = []
+        for index, message in enumerate(messages):
+            if getattr(message, "images", None):
+                continue
+            content = self._message_content(message)
+            if not isinstance(content, str) or is_spilled_content(content):
+                continue
+            size = estimate_content(content)
+            if size >= _CONTEXT_SPILL_MIN_TOKENS:
+                candidates.append((size, index))
+        if not candidates:
+            return None, estimate(messages)
+
+        candidates.sort(reverse=True)
+        current = list(messages)
+        current_tokens = estimate(current)
+        offloaded = 0
+        for size, index in candidates:
+            if current_tokens <= budget:
+                break
+            content = self._message_content(current[index])
+            label = (
+                getattr(current[index], "name", None)
+                or (current[index].get("name") if isinstance(current[index], dict) else None)
+                or getattr(current[index], "role", None)
+                or "content"
+            )
+            reference = spill_reference(self.session_id or "", content, label=str(label))
+            if not reference or reference == content:
+                continue
+            if dc_replace is not None and not isinstance(current[index], dict):
+                current[index] = dc_replace(current[index], content=reference)
+            else:
+                current[index] = {**current[index], "content": reference}
+            offloaded += 1
+            current_tokens = estimate(current)
+            logger.info(
+                "pre-send context guard: session %s offloaded a %d-token %s "
+                "message to a file (excerpt of %d chars kept inline)",
+                self.session_id, size, label, len(reference),
+            )
+        return (current if offloaded else None), current_tokens
+
+    @staticmethod
+    def _message_content(message: object) -> object:
+        if isinstance(message, dict):
+            return message.get("content")
+        return getattr(message, "content", None)
+
+    def _rebuild_from_disk(self) -> Optional[list]:
+        """Re-assemble the in-flight context the way a new turn is assembled."""
+        try:
+            assembled = self.context_manager.assemble_context(self.session_id, [])
+        except OSError as exc:
+            logger.warning(
+                "in-loop context compression: failed to rebuild the context for "
+                "session %s: %s",
+                self.session_id,
+                exc,
+            )
+            return None
+        if not assembled:
+            return None
+        from runtime.models import Message
+
+        return [Message.from_dict(m) for m in assembled]
 
 
 
