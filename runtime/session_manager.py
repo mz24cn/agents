@@ -462,6 +462,90 @@ class SessionManager:
         except Exception as exc:
             logger.warning("on_session_created: 写入 index.json 失败 (session=%s): %s", session_id, exc)
 
+    def on_session_forked(
+        self,
+        session_id: str,
+        parent_session_id: str,
+        title: Optional[str] = None,
+        first_user_message: Optional[str] = None,
+    ) -> str:
+        """衍生会话建档：沿用父会话标题，并记录 ``forked_from`` 溯源字段。
+
+        标题优先取显式传入值，其次父会话标题，最后退回首条用户消息
+        （``on_session_created`` 的默认行为）。``forked_from`` 让侧边栏可以
+        标出衍生会话，也保留了「这条会话从哪里来」的信息；飞行模式设定
+        一并继承，因为衍生分支上的使用习惯与父会话一致。
+
+        Args:
+            session_id: 新建的衍生会话 ID。
+            parent_session_id: 被衍生的父会话 ID。
+            title: 可选的显式标题（通常由调用方从父会话 index 条目取得）。
+            first_user_message: 衍生历史里的首条用户消息，用于兜底标题。
+
+        Returns:
+            实际写入 index.json 的标题（失败时返回传入标题或空串）。
+        """
+        self.on_session_created(session_id, first_user_message)
+        try:
+            index = self._read_index()
+            entry = index.get(session_id)
+            if not isinstance(entry, dict):
+                return str(title or "")
+            parent_entry = index.get(parent_session_id)
+            parent_entry = parent_entry if isinstance(parent_entry, dict) else {}
+
+            inherited = str(title or "").strip() or str(parent_entry.get("title") or "").strip()
+            if inherited:
+                entry["title"] = inherited[:100]
+            entry["forked_from"] = parent_session_id
+            if parent_entry.get("flight_mode"):
+                entry["flight_mode"] = True
+
+            index[session_id] = entry
+            self._write_index(index)
+            return str(entry.get("title") or "")
+        except Exception as exc:
+            logger.warning(
+                "on_session_forked: 写入 index.json 失败 (session=%s): %s", session_id, exc
+            )
+            return str(title or "")
+
+    def session_categories(self, session_id: str) -> list[str]:
+        """列出会话在 tree.json 中挂载的全部末级分类路径（无则空列表）。"""
+        tree = self.get_category_tree().get("tree") or []
+        found: list[str] = []
+
+        def walk(children, path_ids: list[str]) -> None:
+            for item in children:
+                if not isinstance(item, dict):
+                    continue
+                node_id = str(item.get("id", ""))
+                kids = item.get("children", [])
+                if any(isinstance(k, dict) for k in kids):
+                    walk(kids, path_ids + [node_id])
+                elif session_id in kids:
+                    found.append("/".join(path_ids + [node_id]))
+
+        walk(tree, [])
+        return found
+
+    def inherit_categories(self, session_id: str, parent_session_id: str) -> int:
+        """把衍生会话挂到父会话所在的全部末级分类，返回成功挂载数。
+
+        分类树是人工/模型共同维护的结构，衍生会话落在同一分类里才与
+        目录视图一致；tree.json 缺失或分类被剪枝时自然什么都不做。
+        """
+        attached = 0
+        try:
+            for category_path in self.session_categories(parent_session_id):
+                if self.attach_session_to_category(session_id, category_path):
+                    attached += 1
+        except Exception as exc:
+            logger.warning(
+                "inherit_categories: 继承分类失败 (session=%s): %s", session_id, exc
+            )
+        return attached
+
     def update_index(
         self,
         session_id: str,

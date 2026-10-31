@@ -532,6 +532,9 @@ export const sessions = {
   generateTitle: (sessionId, title = '') => request('POST', `/v1/sessions/${encodeURIComponent(sessionId)}/generate-title`, { title }),
   regenerateSummary: (sessionId) => request('POST',   `/v1/sessions/${encodeURIComponent(sessionId)}/regenerate-summary`),
   revoke:        (sessionId, timestamp, { forced = false, keepFiles = false } = {}) => request('POST', `/v1/sessions/${encodeURIComponent(sessionId)}/revoke`, { session_id: sessionId, timestamp, forced, keep_files: keepFiles }),
+  // 衍生新会话：把该消息及之前的轮次复制成一条新会话（新会话 ID 由后端生成）。
+  // timestamp 是 message_index 的交叉校验，也是下标错位时的兜底定位依据。
+  fork:          (sessionId, { messageIndex = null, timestamp = '' } = {}) => request('POST', `/v1/sessions/${encodeURIComponent(sessionId)}/fork`, { message_index: messageIndex, timestamp }),
   markRead:      (sessionId)     => request('POST',   `/v1/sessions/${encodeURIComponent(sessionId)}/read`),
   fileJournals:  (sessionId)     => request('GET',    `/v1/sessions/${encodeURIComponent(sessionId)}/file-journals`),
   fileJournalDiff: (sessionId, turnKey) => request('GET', `/v1/sessions/${encodeURIComponent(sessionId)}/file-journals/${encodeURIComponent(turnKey)}`),

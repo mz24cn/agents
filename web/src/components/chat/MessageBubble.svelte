@@ -12,7 +12,7 @@
   import { isToolErrorContent } from '../../lib/tool-result.js'
   import { parseFileRefParts, restoreFileRefTags } from '../../lib/file-ref.js'
 
-  let { msg, agentList = [], onRevoke, collapseButton = null, onCollapse, hasFileChanges = false, onToggleFileDiff, fileDiffData = null, fileDiffVisible = false, compact = false, replyDetailed = null, onToggleReplyMode, toolResultsById = {}, scrollTargetIndex = null, showRetry = false, onRetry, retryDisabled = false } = $props()
+  let { msg, agentList = [], onRevoke, collapseButton = null, onCollapse, hasFileChanges = false, onToggleFileDiff, fileDiffData = null, fileDiffVisible = false, compact = false, replyDetailed = null, onToggleReplyMode, toolResultsById = {}, scrollTargetIndex = null, showRetry = false, onRetry, retryDisabled = false, onFork, forkDisabled = false, forkBusy = false } = $props()
 
   // ── Compact mode helpers ──
   /** Determine icon for tool result in compact mode */
@@ -332,6 +332,16 @@
             {thinkingExpanded ? t('collapseThinking') : t('expandThinking')}
           </button>
         {/if}
+        {#if onFork}
+          <!-- 只在 assistant 的收尾回复上出现（MessageList 已判定）：点击后后端把
+               这条消息及之前的所有轮次复制成一条新会话，前端切到新会话继续对话。 -->
+          <button
+            class="fork-btn"
+            onclick={() => onFork()}
+            disabled={forkDisabled || forkBusy}
+            title={forkBusy ? t('forkSessionBusy') : t('forkSessionTitle')}
+          >{forkBusy ? t('forkSessionBusy') : t('forkSession')}</button>
+        {/if}
         <CopyButton getText={() => {
           const parts = []
           if (msg.content) parts.push(msg.content)
@@ -622,6 +632,31 @@
     color: #fff;
   }
   .retry-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  /* 衍生新会话：与同行其它小按钮保持同一形状 */
+  .fork-btn {
+    padding: 2px 8px;
+    font-family: inherit;
+    font-size: 0.75rem;
+    color: var(--text-secondary, #888);
+    background: var(--bg-tertiary, rgba(0,0,0,0.15));
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    letter-spacing: 0.05em;
+    line-height: 1.4;
+    white-space: nowrap;
+    transition: background 0.1s;
+  }
+  .fork-btn:hover:not(:disabled) {
+    background: var(--bg-secondary, rgba(0,0,0,0.2));
+    color: var(--text, #333);
+  }
+  .fork-btn:active:not(:disabled) {
+    background: var(--primary, #4a9eff);
+    color: #fff;
+  }
+  .fork-btn:disabled { opacity: 0.5; cursor: not-allowed; }
   .content {
     white-space: pre-wrap;
     line-height: 1.5;

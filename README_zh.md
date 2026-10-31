@@ -27,6 +27,7 @@
 - **多浏览器共享会话实时推理** — 同一会话可在多个浏览器或标签页中同步观看和操作；服务端保留并广播当前用户消息、assistant/token、thinking、工具调用及结果等推理帧，新加入的浏览器可重放尚未落盘的实时进度；切换会话或浏览器后可继续接收推理，重新发送末次推理（Continue）时对旧 assistant 消息的移除也会同步到其他浏览器
 - **飞行模式（Flight Mode）** — 可按会话开启后台持续推理；开启后即使所有浏览器都断开连接、关闭页面或切走，推理任务仍会在服务端继续执行并持久化，稍后重新打开即可恢复观看；未开启飞行模式时，最后一个浏览器离开后会取消无人观察的推理，避免无意消耗模型资源
 - **轮间插话与软暂停（Interject / Pause）** — 模型连续工作时无需中止重来：新的用户消息可排入队列（每次生成最多缓冲 10 条），在**轮边界**注入共享上下文并继续，群聊则在**波次边界**消费以免改变已排定的波次成员；停止按钮区分「暂停 / 停止 / 强制停止」，暂停在上一轮工具调用已完整落盘时干净收尾（状态 `paused`），随后可原地续推（`POST /v1/infer/stream` 请求体加 `"resume": true`，不删除任何历史轮，仍在推理中则返回 409），插话走 `POST /v1/infer/interject`；无人观察的推理不再被瞬时断连误杀（默认宽限 10s，可用 `SESSION_UNOBSERVED_GRACE_S` 调整），插话轮随对话持久化并标记 `meta.kind="interjection"`
+- **衍生会话（fork）** — 每条没有工具调用的 assistant 收尾回复（一轮推理循环的结束消息）都有「衍生新会话」按钮：后端把这条消息及其之前的所有轮次复制进一条新会话（新会话 ID 按 `YYMMDD_HHMMSS` 生成），并带上与新历史对齐的 `summary.md` / `memory.md`（覆盖到被截掉轮次的滚动摘要会被丢弃，memory 只保留新历史内的条目）；摘要被丢弃时复制进来的历史自己就可能超出上下文预算，此时后端立即为新会话生成一份 `summary.md`，响应里的 `context_guard` 报告实测 token 数、预算与是否压缩过；侧边栏随即插入并选中新会话，此后输入都发往新会话，原会话原封不动，撤销 / 重试 / 文件 journal 互不影响；标题与分类目录继承父会话，`conversation.json` 的 `meta.parent_session_id` 与 `index.json` 的 `forked_from` 记下来源；推理进行中（`streaming` / `paused`）不允许衍生，因为当前轮还没落盘。API：`POST /v1/sessions/{session_id}/fork`，body `{"message_index": int, "timestamp": str}`（时间戳校验下标，列表错位时按时间戳重新定位）
 - **工作区文件管理** — 完整的工作区文件管理器，支持目录树导航、文件列表（列表/网格视图）、搜索（AND/OR模式，基于ripgrep/grep）、重命名、复制、删除、下载及分块/并行上传（支持暂停/恢复/重试）；对话中的工作区文件引用（`<file>路径</file>`）在推理时自动展开为内联内容或附加图片
 - **自安装脚本** — 通过 `/v1/setup` 将当前 Agent Service 源码、已编译 Web UI（`web/dist`）和运行时配置导出为自解压安装脚本；可在另一台机器上安装：Linux/macOS shell 使用 `curl -s http://{host}:7988/v1/setup | sh`，Windows PowerShell 使用 `irm http://{host}:7988/v1/setup | iex`。
 - **在线增量更新** — Web UI 可连接远端 Agent Service 检查并应用更新，分别比较前端、后端与运行时配置版本，只下载发生变化的最小增量包；配置更新可热加载模型、工具、MCP、提示词模板和 AI 代理，前端或配置更新无需重启，Python 后端代码更新则自动安全重启；存在活动推理时会阻止更新，避免破坏进行中的会话
@@ -288,6 +289,7 @@ python app.py 0.0.0.0:9000 # 自定义主机和端口（重载 AGENTS_URL）
 | DELETE | `/v1/mcp-servers/{server_name}` | 删除一个 MCP server |
 | POST | `/v1/sessions/{session_id}/generate-title` | 设定或生成会话标题（body 带非空 title 为人工设定，空则模型生成） |
 | POST | `/v1/sessions/{session_id}/revoke` | 撤销/取消一个会话 |
+| POST | `/v1/sessions/{session_id}/fork` | 从一条无工具调用的 assistant 回复衍生新会话（body：`message_index` + `timestamp`；截取该消息及之前所有轮次，附带对齐后的 summary/memory） |
 | DELETE | `/v1/tools/batch` | 批量删除工具 |
 | GET | `/v1/prompt-templates` | 获取提示词模板列表 |
 | POST | `/v1/prompt-templates` | 创建提示词模板 |

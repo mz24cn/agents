@@ -3,7 +3,7 @@
   import { router, navigate } from '../lib/router.svelte.js'
   import { t } from '../lib/i18n.svelte.js'
   import { sessions, subscribeSessionEvents } from '../lib/api.js'
-  import { sessionRestore, sessionDownload, newSessionCreated, sessionDeleted, currentSession, newSessionRequest, terminalOpen, openSessionLogDir, messageScrollRequest } from '../lib/session-state.svelte.js'
+  import { sessionRestore, sessionDownload, newSessionCreated, sessionDeleted, sessionForked, currentSession, newSessionRequest, terminalOpen, openSessionLogDir, messageScrollRequest } from '../lib/session-state.svelte.js'
   import { sidebarWidth, setSidebarWidth, toggleSidebarCollapsed, collapseSidebar, SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH } from '../lib/sidebar-width.svelte.js'
   import SessionCategoryNode from './SessionCategoryNode.svelte'
 
@@ -78,6 +78,9 @@
   // Maps session_id -> status string from SSE events
   let sessionStatuses = $state({})
   let flightSessions = $state(new Set())
+  // 本次页面会话内「衍生会话 -> 原会话 ID」的记录，仅用于在条目前显示来源标记。
+  // 普通 Map 即可：写入时机总在 sessionList 重新赋值之前，渲染时读取即可见。
+  const forkParents = new Map()
 
   function _applyStatusToSessionList(sid, status) {
     sessionStatuses[sid] = status
@@ -519,9 +522,18 @@
     }
     lastClickTime = now
     restoreError = ''
+    await loadSessionIntoChat(sessionId, { collapseMobile: true })
+  }
+
+  /**
+   * 下载并选中一个会话：走的是会话列表点击的同一条路径
+   * （sessions.get + sessionRestore.pending），所以 ChatPage 的会话恢复
+   * 逻辑只有一份。衍生新会话后要复用它，因此从 handleSessionClick 里拆出来。
+   */
+  async function loadSessionIntoChat(sessionId, { collapseMobile = true } = {}) {
     // 移动端：立即收起侧边栏，不能等网络请求返回后再收起，
     // 否则 fixed 遮罩持续挡住对话内容，用户体验为"点两下"
-    if (window.innerWidth < 1024) {
+    if (collapseMobile && window.innerWidth < 1024) {
       collapseSidebar()
     }
     // 先进入 ChatPage，再开始下载。这样从 Setup 等页面切换会话时，
@@ -1116,6 +1128,40 @@
       newSessionCreated.title = null
     }
   })
+
+  // 衍生新会话：ChatPage 请求成功后在这里插入列表并选中。
+  // 选中走的是 handleSessionClick 同一条加载路径，因此 ChatPage 的会话恢复
+  // 逻辑只有一份；此后 ChatPage 的当前会话 ID 变成新会话，用户输入发往新 ID。
+  $effect(() => {
+    const sid = sessionForked.sessionId
+    if (!sid) return
+    const parentSid = sessionForked.parentSessionId
+    const title = sessionForked.title || sid
+    // 记下「衍生自哪条会话」，条目前显示一个来源标记（本次页面会话内有效）。
+    if (parentSid) forkParents.set(sid, parentSid)
+    if (!sessionList.some(s => s.session_id === sid)) {
+      // 与新建会话同样的插入规则：只在「目录视图未启用」且（无搜索词或标题命中）
+      // 时插入，避免破坏当前过滤结果。
+      const searchable = `${title} ${sid}`.toLowerCase()
+      if (!(directoryOpen && selectedCategory) && (!activeSearchQuery || searchable.includes(activeSearchQuery.toLowerCase()))) {
+        sessionList = [{ session_id: sid, title }, ...sessionList]
+      }
+    }
+    // 消费掉信号：失败也消费，避免反复重试同一个 fork 结果。
+    sessionForked.sessionId = null
+    sessionForked.parentSessionId = null
+    sessionForked.title = null
+
+    // 会话目录视图下新会话未必在当前过滤结果里，刷新列表兜底。
+    if (directoryOpen && selectedCategory) {
+      void loadCategoryTree(true)
+    }
+    // 选中新会话。加载失败（后端已建好目录但下载失败）时刷新列表，
+    // 用户仍能从侧边栏点进去，不会丢会话。
+    loadSessionIntoChat(sid).catch(() => {
+      void loadSessions()
+    })
+  })
 </script>
 
 <!-- 点击空白处关闭菜单 -->
@@ -1478,6 +1524,10 @@
                 ontouchend={(e) => { e.preventDefault(); handleSessionClick(entry.session_id) }}
                 title={getSessionDisplay(entry).tooltip}
               >
+                {#if forkParents.has(entry.session_id)}
+                  <!-- 衍生出来的会话：悬停可以看到它是从哪条会话复制出来的 -->
+                  <span class="session-fork" title={t('forkSource').replace('{id}', forkParents.get(entry.session_id))}>⑂</span>
+                {/if}
                 {getSessionDisplay(entry).display}
                 {#if flightSessions.has(entry.session_id)}<span class="session-flight">✈️</span>{/if}
               </button>
@@ -1995,6 +2045,8 @@
   }
  .menu-check { margin-left: auto; font-weight: 700; color: #22c55e; }
   .session-flight { margin-left: .35rem; font-size: .9em; vertical-align: -0.1em; }
+  /* 衍生会话的来源标记：放在标题前，悬停显示「衍生自 …」 */
+  .session-fork { margin-right: .3rem; font-size: .9em; opacity: .65; vertical-align: -0.1em; }
 
   .menu-emoji {
     display: inline-flex;

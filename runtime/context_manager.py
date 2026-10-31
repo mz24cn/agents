@@ -162,7 +162,10 @@ class IntrospectionSnapshot:
 # Token estimation & shared utilities (re-exported from common)
 # ---------------------------------------------------------------------------
 
-from runtime.common import estimate_tokens  # noqa: F401 — re-export
+from runtime.common import (  # noqa: F401 — re-export
+    estimate_tokens,
+    estimate_chat_prompt_tokens,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1478,6 +1481,12 @@ class ContextManager:
     _DEFAULT_MAX_TOKENS: int = 65536
     _DEFAULT_SUMMARY_MODEL_ID: str = "summary"
 
+    #: Fraction of ``MAX_TOKENS_IN_CONTEXT`` at which a fork's copied history is
+    #: already considered too large.  Same 90 % point the mid-loop compression
+    #: hook leaves for the reply (:meth:`compress_context`), because the guard
+    #: measures a history that still has a whole inference in front of it.
+    _FORK_GUARD_RATIO: float = 0.9
+
     def __init__(
         self,
         infer_fn: Callable,
@@ -1901,6 +1910,410 @@ class ContextManager:
             "removed_count": removed_count,
             "git": git_result,
             "journal": journal_result,
+        }
+
+    # ------------------------------------------------------------------
+    # Session fork (derive a new session from one assistant message)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _validate_session_id(session_id: str) -> None:
+        """Reject empty or path-traversal session IDs (mirrors ``SessionManager``)."""
+        if (
+            not session_id
+            or os.sep in session_id
+            or (os.altsep and os.altsep in session_id)
+            or ".." in session_id
+        ):
+            raise ValueError(f"Invalid session_id: {session_id}")
+
+    @staticmethod
+    def _resolve_fork_cut(messages: list, message_index: object, timestamp: str) -> int:
+        """Return the inclusive index of the message a fork is taken from.
+
+        A fork ends on an assistant turn that carries no tool calls — the
+        closing message of a reasoning loop — so the new session inherits a
+        conversation that can be continued without dangling tool calls.
+
+        The client sends the index it displays the message at (authoritative
+        when the client loaded this very ``conversation.json``) together with
+        the message timestamp.  Timestamps are only second-precise and repeat
+        freely inside one turn, so the timestamp acts as a cross-check first
+        and as a fallback only when the index no longer lines up with the file
+        (a client list that drifted away from what was persisted).
+        """
+        def is_loop_end(msg: object) -> bool:
+            return (
+                isinstance(msg, dict)
+                and msg.get("role") == "assistant"
+                and not msg.get("tool_calls")
+            )
+
+        # ``bool`` is an ``int`` subclass; a JSON ``true`` must not read as 1.
+        if isinstance(message_index, int) and not isinstance(message_index, bool):
+            if 0 <= message_index < len(messages) and is_loop_end(messages[message_index]):
+                candidate = messages[message_index]
+                if not timestamp or candidate.get("timestamp") == timestamp:
+                    return message_index
+
+        if timestamp:
+            # Last match wins: the loop-closing message is the newest one that
+            # shares the timestamp, which is what the user clicked.
+            for index in range(len(messages) - 1, -1, -1):
+                msg = messages[index]
+                if is_loop_end(msg) and msg.get("timestamp") == timestamp:
+                    return index
+
+        raise ValueError(
+            "No forkable assistant message found "
+            f"(message_index={message_index!r}, timestamp={timestamp!r})"
+        )
+
+    def _allocate_session_id(self) -> str:
+        """Return a session ID whose directory does not exist yet.
+
+        ``session_timestamp()`` has one-second resolution, so two forks created
+        in the same second would collide; a numeric suffix keeps both.
+        """
+        base = session_timestamp()
+        candidate = base
+        attempt = 1
+        while os.path.exists(os.path.join(self._chats_dir, candidate)):
+            attempt += 1
+            if attempt > 100:
+                raise OSError(f"Cannot allocate a session id for a fork of {base}")
+            candidate = f"{base}_{attempt}"
+        return candidate
+
+    def _fork_compression_files(
+        self, parent_session_id: str, new_session_id: str, new_turn_count: int
+    ) -> None:
+        """Copy ``summary.md`` / ``memory.md`` into a fork, dropping the excess.
+
+        Same reconciliation as :meth:`_reconcile_compression_after_revoke`, but
+        written to the fork instead of rewriting the parent: a rolling summary
+        that covers turns the fork left out would inject context the fork never
+        had, so it is dropped altogether rather than trusted.
+        """
+        summary_text, summary_fm = self.get_summary(parent_session_id)
+        summarized_up_to = summary_fm.get("summarized_up_to_turn", -1)
+        if not isinstance(summarized_up_to, int):
+            summarized_up_to = -1
+
+        if summary_text.strip() and 0 <= summarized_up_to < new_turn_count:
+            front_matter = dict(summary_fm)
+            front_matter["session_id"] = new_session_id
+            front_matter["summarized_up_to_turn"] = min(
+                summarized_up_to, new_turn_count - 1
+            )
+            front_matter["updated_at"] = now_iso()
+            self._atomic_write(
+                self._summary_path(new_session_id),
+                serialize_summary(front_matter, summary_text),
+            )
+        # Otherwise the fork starts without ``summary.md``: there is none to
+        # copy, or the parent's summary describes turns the fork left out.  A
+        # rolling summary of history the fork never had would inject context the
+        # model cannot ground, so the next compression round rebuilds it from the
+        # fork's own turns.
+
+        # Memory is a per-turn record, not a rolling text: entries recorded
+        # inside the copied prefix stay valid, entries recorded after the cut
+        # are dropped.  Independent of the summary decision above.
+        entries = [
+            entry
+            for entry in self.load_memory(parent_session_id)
+            if entry.source_turn_index < new_turn_count
+        ]
+        if entries:
+            self.save_memory(new_session_id, entries)
+
+    def _last_reported_prompt_tokens(self, session_id: str) -> int:
+        """Return the provider-reported prompt size of the last stored message.
+
+        ``0`` when no message carries usage stats.  Deliberately reads the last
+        *copied* message rather than ``meta.last_total_tokens``: the meta value
+        belongs to the parent's newest turn, which a fork may not have copied.
+
+        Args:
+            session_id: Session to inspect (a fork, right after it was written).
+
+        Returns:
+            The prompt-token count of the newest message that has a ``stat``,
+            or ``0`` when none does.
+        """
+        try:
+            turns = self.load_conversation(session_id)
+        except (FileNotFoundError, ValueError):
+            return 0
+        for turn in reversed(turns):
+            stat = getattr(turn, "stat", None)
+            if not isinstance(stat, dict):
+                continue
+            for key in ("prompt_tokens", "total_tokens"):
+                value = stat.get(key)
+                if isinstance(value, int) and value > 0:
+                    return value
+        return 0
+
+    def _fork_context_guard(self, new_session_id: str) -> dict:
+        """Rebuild a fork's ``summary.md`` when its copied history cannot fit.
+
+        :meth:`_fork_compression_files` drops a rolling summary that describes
+        turns the cut removed.  With no summary, :meth:`assemble_context` sends
+        the WHOLE copied history — and when the cut point sits behind the
+        parent's compression point that history is larger than anything the
+        parent ever sent, because the parent sent ``summary + recent turns``
+        instead.  The fork's very first request then fails with a
+        context-length error, and the mid-loop hook (:meth:`compress_context`)
+        cannot save it: that only measures a round which already completed.
+
+        So measure what the first request would carry and, if it does not fit,
+        generate the summary here — the same call
+        ``POST /v1/sessions/{id}/regenerate-summary`` uses.
+
+        Args:
+            new_session_id: The fork, already written to disk.
+
+        Returns:
+            A JSON-serialisable report: ``estimated_tokens`` / ``budget`` /
+            ``compressed`` / ``warning`` (empty when nothing is wrong).  Never
+            raises: a fork that could not be compressed is still a valid fork,
+            it just carries a warning for the caller to surface.
+        """
+        budget = int(self._max_tokens_in_context * self._FORK_GUARD_RATIO)
+        if budget <= 0:
+            return {
+                "estimated_tokens": 0,
+                "budget": 0,
+                "compressed": False,
+                "warning": "",
+            }
+
+        def _history_tokens(with_reported_floor: bool) -> int:
+            # What the first request of the fork would carry, summary included.
+            # The local estimate cannot see the runtime system prompt or the
+            # tool schemas; the provider-reported size of the last copied
+            # message does, so it raises the floor while deciding whether the
+            # history is worth compressing.  After compressing, that figure
+            # describes the PARENT's request at the cut point, not the fork's
+            # new one, so only the local estimate is compared any more.
+            estimated = estimate_chat_prompt_tokens(
+                self.assemble_context(new_session_id, [])
+            )
+            if not with_reported_floor:
+                return estimated
+            return max(estimated, self._last_reported_prompt_tokens(new_session_id))
+
+        measured = _history_tokens(with_reported_floor=True)
+        if measured <= budget:
+            return {
+                "estimated_tokens": measured,
+                "budget": budget,
+                "compressed": False,
+                "warning": "",
+            }
+
+        if not self._summary_model_id:
+            warning = (
+                f"forked history is about {measured} prompt tokens, over the "
+                f"{budget}-token budget, and no summary model is configured "
+                "(SUMMARY_MODEL_ID): the first inference may be rejected"
+            )
+            logger.warning("fork_session guard: %s (session=%s)", warning, new_session_id)
+            return {
+                "estimated_tokens": measured,
+                "budget": budget,
+                "compressed": False,
+                "warning": warning,
+            }
+
+        try:
+            self.compress_context_forced(new_session_id)
+        except Exception as exc:  # the fork stays usable; the warning explains
+            logger.exception(
+                "fork_session guard: compression of the forked history failed "
+                "(session=%s, ~%d tokens)",
+                new_session_id, measured,
+            )
+            warning = (
+                f"forked history is about {measured} prompt tokens, over the "
+                f"{budget}-token budget, and compressing it failed: {exc}"
+            )
+            return {
+                "estimated_tokens": measured,
+                "budget": budget,
+                "compressed": False,
+                "warning": warning,
+            }
+
+        after = _history_tokens(with_reported_floor=False)
+        summary_text = self.get_summary(new_session_id)[0]
+        # A placeholder summary is the house definition of "the model produced
+        # nothing": it is the compression prompt's own format example leaking
+        # back into summary.md.
+        if not summary_text.strip() or _is_placeholder_summary(summary_text):
+            warning = (
+                f"forked history is about {measured} prompt tokens, over the "
+                f"{budget}-token budget, but the summary model returned nothing"
+            )
+            logger.warning(
+                "fork_session guard: %s (session=%s)", warning, new_session_id
+            )
+            return {
+                "estimated_tokens": after,
+                "budget": budget,
+                "compressed": False,
+                "warning": warning,
+            }
+
+        warning = ""
+        if after > budget:
+            # Compression ran, but the fork is still heavy: the summary covers
+            # fewer turns than the history holds (recent turns stay verbatim).
+            # The real ceiling is the model's window, which ContextManager does
+            # not know, so this is reported rather than treated as a failure.
+            warning = (
+                f"the fork was compressed but still carries about {after} "
+                f"prompt tokens, over the {budget}-token budget; its first "
+                "inference may still be rejected"
+            )
+            logger.warning("fork_session guard: %s", warning)
+
+        logger.info(
+            "fork_session guard: %s history ~%d tokens > %d budget; rebuilt "
+            "summary.md, now ~%d tokens",
+            new_session_id, measured, budget, after,
+        )
+        return {
+            "estimated_tokens": after,
+            "budget": budget,
+            "compressed": True,
+            "warning": warning,
+        }
+
+    def fork_session(
+        self,
+        session_id: str,
+        message_index: Optional[int] = None,
+        timestamp: str = "",
+    ) -> dict:
+        """Create a new session from this conversation's first *message_index* turns.
+
+        Copies ``conversation.json`` truncated to include the anchored message,
+        plus the reconciled ``summary.md`` / ``memory.md`` (the files that make
+        the copied history usable on its own).  Request dumps, file journals and
+        sub-session directories stay with the parent: a fork is a new branch of
+        the conversation, not a duplicate of everything the parent produced.
+
+        When the copied history does not fit the context the fork will run in —
+        possible because a summary covering turns the cut removed is dropped —
+        :meth:`_fork_context_guard` rebuilds ``summary.md`` before the fork is
+        handed back, so its first inference is not the one that discovers the
+        ceiling.
+
+        Args:
+            session_id: Parent session to fork.
+            message_index: Index of the anchoring assistant message in
+                ``conversation.json``'s ``messages`` array (inclusive).
+            timestamp: Timestamp of that message; used to cross-check the index
+                and as a fallback when the index cannot be verified.
+
+        Returns:
+            ``{"session_id", "parent_session_id", "cut_index",
+            "message_count", "first_user_message", "context_guard"}``.
+            ``context_guard`` reports what :meth:`_fork_context_guard` measured
+            and whether it had to rebuild ``summary.md`` for the fork.
+
+        Raises:
+            FileNotFoundError: The parent conversation file does not exist.
+            ValueError: Malformed input, malformed conversation, or no
+                forkable assistant message at the given anchor.
+            OSError: The fork directory could not be created or written.
+        """
+        import shutil
+
+        self._validate_session_id(session_id)
+        conv_path = self._conversation_path(session_id)
+        if not os.path.isfile(conv_path):
+            raise FileNotFoundError(f"Conversation file not found: {conv_path}")
+
+        try:
+            with open(conv_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"conversation.json is malformed: {exc}") from exc
+        except OSError as exc:
+            raise ValueError(f"Cannot read conversation.json: {exc}") from exc
+
+        if not isinstance(data, dict):
+            raise ValueError(
+                "conversation.json must contain a JSON object, got "
+                f"{type(data).__name__}"
+            )
+        messages = data.get("messages")
+        if not isinstance(messages, list) or not messages:
+            raise ValueError(f"Session has no messages to fork: {session_id}")
+
+        cut_index = self._resolve_fork_cut(messages, message_index, timestamp)
+        new_messages = messages[: cut_index + 1]
+
+        new_session_id = self._allocate_session_id()
+        new_dir = os.path.join(self._chats_dir, new_session_id)
+        os.makedirs(new_dir)
+
+        try:
+            now = now_iso()
+            meta = data.get("meta")
+            meta = dict(meta) if isinstance(meta, dict) else {}
+            # ``last_total_tokens`` and the session bindings (``model_id``,
+            # ``tool_ids``, ``agent_ids``, ``remote_env``, ``workspace``) are
+            # inherited on purpose: the fork continues under the same setup.
+            meta.update({
+                "session_id": new_session_id,
+                "created_at": now,
+                "updated_at": now,
+                "turn_count": len(new_messages),
+                "parent_session_id": session_id,
+                "forked_from_message_index": cut_index,
+            })
+            self._atomic_write(
+                os.path.join(new_dir, "conversation.json"),
+                json.dumps(
+                    {"meta": meta, "messages": new_messages},
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            )
+            self._fork_compression_files(session_id, new_session_id, len(new_messages))
+        except Exception:
+            # Never leave a half-written session behind: the caller reports the
+            # failure and the client keeps using the parent session.
+            shutil.rmtree(new_dir, ignore_errors=True)
+            raise
+
+        first_user_message = ""
+        for msg in new_messages:
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                content = msg.get("content")
+                if isinstance(content, str) and content.strip():
+                    first_user_message = content.strip()
+                break
+
+        logger.info(
+            "fork_session: %s -> %s (kept %d/%d messages, cut at %d)",
+            session_id, new_session_id, len(new_messages), len(messages), cut_index,
+        )
+        # Outside the rollback block on purpose: a fork whose history needs
+        # compressing is still a fork, even if that compression fails.
+        context_guard = self._fork_context_guard(new_session_id)
+        return {
+            "session_id": new_session_id,
+            "parent_session_id": session_id,
+            "cut_index": cut_index,
+            "message_count": len(new_messages),
+            "first_user_message": first_user_message,
+            "context_guard": context_guard,
         }
 
     # ------------------------------------------------------------------

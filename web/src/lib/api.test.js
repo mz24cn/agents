@@ -849,6 +849,52 @@ describe('sessions.revoke', () => {
 })
 
 
+describe('sessions.fork', () => {
+  it('posts the anchor index and timestamp to the fork endpoint', async () => {
+    vi.stubGlobal('fetch', mockFetch({
+      status: 'success',
+      session_id: 'session-2',
+      parent_session_id: 'session-1',
+      title: 'parent title',
+      message_count: 4,
+      cut_index: 3,
+    }))
+
+    const result = await sessions.fork('session-1', { messageIndex: 3, timestamp: '2026-05-13T10:00:00' })
+
+    expect(fetch).toHaveBeenCalledOnce()
+    const [url, opts] = fetch.mock.calls[0]
+    expect(url).toBe('/v1/sessions/session-1/fork')
+    expect(opts.method).toBe('POST')
+    expect(JSON.parse(opts.body)).toEqual({ message_index: 3, timestamp: '2026-05-13T10:00:00' })
+    expect(result.session_id).toBe('session-2')
+    expect(result.parent_session_id).toBe('session-1')
+  })
+
+  it('encodes the session id and tolerates a missing anchor timestamp', async () => {
+    vi.stubGlobal('fetch', mockFetch({ session_id: 'session-2' }))
+
+    await sessions.fork('session/1')
+
+    const [url, opts] = fetch.mock.calls[0]
+    expect(url).toBe('/v1/sessions/session%2F1/fork')
+    expect(JSON.parse(opts.body)).toEqual({ message_index: null, timestamp: '' })
+  })
+
+  it('surfaces the backend error message (e.g. session inferring)', async () => {
+    vi.stubGlobal('fetch', mockFetch({ error: 'Session is inferring, fork is not allowed now: session-1' }, 409))
+
+    try {
+      await sessions.fork('session-1', { messageIndex: 1 })
+      throw new Error('Expected fork to fail')
+    } catch (err) {
+      expect(err.message).toBe('Session is inferring, fork is not allowed now: session-1')
+      expect(err.status).toBe(409)
+    }
+  })
+})
+
+
 // ---------------------------------------------------------------------------
 // remoteEnv — remote environment management (远程环境管理)
 // ---------------------------------------------------------------------------

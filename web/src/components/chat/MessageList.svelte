@@ -10,9 +10,10 @@
   import { resolveFileJournalTurnKey } from '../../lib/file-journals.js'
   import { isToolErrorContent } from '../../lib/tool-result.js'
   import { buildTurnAgentGrouping } from '../../lib/message-groups.js'
+  import { canForkMessage, lastForkableIndex } from '../../lib/session-fork.js'
   import { currentSession, messageScrollRequest } from '../../lib/session-state.svelte.js'
 
-  let { messages = [], agentList = [], displayMessageDetails = false, onRevoke, onScrollAtBottom, shouldScrollToBottom = false, collapsedGroups = new Set(), onToggleCollapse, fileJournalTurnKeyMap = {}, fileDiffVisible = new Set(), fileDiffCache = {}, onToggleFileDiff, retryAssistantIndex = -1, onRetryLastInference, retryDisabled = false } = $props()
+  let { messages = [], agentList = [], displayMessageDetails = false, onRevoke, onScrollAtBottom, shouldScrollToBottom = false, collapsedGroups = new Set(), onToggleCollapse, fileJournalTurnKeyMap = {}, fileDiffVisible = new Set(), fileDiffCache = {}, onToggleFileDiff, retryAssistantIndex = -1, onRetryLastInference, retryDisabled = false, onFork, forkDisabled = false, forkBusyIndex = -1 } = $props()
   let listEl = $state(null)
   let isAtBottom = $state(true)
   // Ephemeral per-turn overrides. This state lives only in this keyed
@@ -42,6 +43,20 @@
   function scrollToBottom() {
     if (listEl) {
       listEl.scrollTop = listEl.scrollHeight
+    }
+  }
+
+  /**
+   * 「衍生新会话」按钮的三条 prop，详细模式（逐条消息）与折叠模式（末条回复）共用。
+   * 判定规则见 lib/session-fork.js：只有没有 tool_calls 的 assistant 收尾回复可 fork。
+   * onFork(index, msg) 交给 ChatPage 去调后端；forkBusyIndex 让被点的那条按钮变忙态。
+   */
+  function forkProps(msgIndex) {
+    if (!onFork || !canForkMessage(messages[msgIndex])) return {}
+    return {
+      onFork: () => onFork(msgIndex, messages[msgIndex]),
+      forkDisabled,
+      forkBusy: forkBusyIndex === msgIndex,
     }
   }
 
@@ -441,11 +456,12 @@
                         showRetry={msgIndex === retryAssistantIndex}
                         onRetry={msgIndex === retryAssistantIndex ? onRetryLastInference : undefined}
                         {retryDisabled}
+                        {...forkProps(msgIndex)}
                       />
                     </div>
                   {:else}
                     <div transition:slide={{ duration: SLIDE_DURATION }} data-intermediate={group.startIndex}>
-                      <MessageBubble {msg} {agentList} {onRevoke} />
+                      <MessageBubble {msg} {agentList} {onRevoke} {...forkProps(msgIndex)} />
                     </div>
                   {/if}
                 {/each}
@@ -454,6 +470,7 @@
           {:else if !groupDetailed}
             <!-- Compact mode: one assistant-style card per continuous agent block. -->
             {#each group.compactAgentBlocks as block (block.start)}
+              {@const blockForkIndex = onFork ? lastForkableIndex(messages, getBlockMessageIndices(block)) : -1}
               {@const blockAgent = getBlockAgent(block)}
               {@const blockStat = getBlockStat(block)}
               {@const blockToolResults = getCompactToolResults(block)}
@@ -471,6 +488,15 @@
                     {/if}
                     {#if getBlockMessageIndices(block).includes(retryAssistantIndex) && onRetryLastInference}
                       <button class="agent-block-retry-btn" onclick={onRetryLastInference} disabled={retryDisabled}>{t('retryLastInference')}</button>
+                    {/if}
+                    {#if blockForkIndex >= 0}
+                      <!-- 紧凑模式整轮被折成一张卡片：fork 取该块最后一条收尾回复 -->
+                      <button
+                        class="agent-block-fork-btn"
+                        onclick={() => onFork(blockForkIndex, messages[blockForkIndex])}
+                        disabled={forkDisabled}
+                        title={forkBusyIndex === blockForkIndex ? t('forkSessionBusy') : t('forkSessionTitle')}
+                      >{forkBusyIndex === blockForkIndex ? t('forkSessionBusy') : t('forkSession')}</button>
                     {/if}
                     {#if block === group.compactAgentBlocks.at(-1)}
                       <button class="agent-block-mode-btn" onclick={() => toggleReplyMode(group.startIndex)}>{t('detailedReply')}</button>
@@ -504,6 +530,7 @@
                   showRetry={group.lastAssistantIndex === retryAssistantIndex}
                   onRetry={group.lastAssistantIndex === retryAssistantIndex ? onRetryLastInference : undefined}
                   {retryDisabled}
+                  {...forkProps(group.lastAssistantIndex)}
                 />
               </div>
             {/if}
@@ -610,7 +637,8 @@
     background: var(--bg-secondary, rgba(0,0,0,0.2));
     color: var(--text, #333);
   }
-  .agent-block-retry-btn {
+  .agent-block-retry-btn,
+  .agent-block-fork-btn {
     padding: 2px 8px;
     font-family: inherit;
     font-size: 0.75rem;
@@ -625,15 +653,18 @@
     white-space: nowrap;
     transition: background 0.1s;
   }
-  .agent-block-retry-btn:hover:not(:disabled) {
+  .agent-block-retry-btn:hover:not(:disabled),
+  .agent-block-fork-btn:hover:not(:disabled) {
     background: var(--bg-secondary, rgba(0,0,0,0.2));
     color: var(--text, #333);
   }
-  .agent-block-retry-btn:active:not(:disabled) {
+  .agent-block-retry-btn:active:not(:disabled),
+  .agent-block-fork-btn:active:not(:disabled) {
     background: var(--primary, #4a9eff);
     color: #fff;
   }
-  .agent-block-retry-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .agent-block-retry-btn:disabled,
+  .agent-block-fork-btn:disabled { opacity: 0.5; cursor: not-allowed; }
   .agent-block-mode-btn:active {
     background: var(--primary, #4a9eff);
     color: #fff;

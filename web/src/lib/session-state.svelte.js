@@ -27,6 +27,14 @@ export const newSessionRequest = $state({ token: 0 })
 export const sessionDeleted = $state({ sessionId: null })
 // sessionId: string | null — 被删除的会话 ID
 
+// 衍生会话通知：ChatPage 请求后端 fork 成功后，通知 Sidebar 把新会话插入
+// 会话列表并选中（选中即走正常的会话加载路径，不另建加载逻辑）。
+export const sessionForked = $state({ sessionId: null, parentSessionId: null, title: null, token: 0 })
+// sessionId: string | null — 后端生成的新会话 ID
+// parentSessionId: string | null — 被衍生的原会话 ID（侧边栏溯源标记）
+// title: string | null — 后端沿用的标题（一般为父会话标题）
+// token: number — 每次衍生递增，重复衍生也能被响应
+
 // 终端打开请求：Sidebar 菜单触发，ChatPage 监听并显示终端
 export const terminalOpen = $state({ sessionId: null, token: 0 })
 // sessionId: string | null — 要打开终端的会话 ID

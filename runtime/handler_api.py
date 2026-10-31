@@ -2820,6 +2820,73 @@ class HandlerApiMixin:
             target=_run, name="remote-session-cleanup", daemon=True,
         ).start()
 
+    def _handle_fork_session(self, session_id: str) -> None:
+        """POST /v1/sessions/{session_id}/fork — 从一条 assistant 消息衍生新会话。
+
+        请求体 ``{"message_index": int, "timestamp": "..."}`` 指向被点击的消息：
+        一条没有工具调用的 assistant 消息（一轮推理循环的结束消息）。后端把
+        该消息及其之前的全部轮次写入新会话目录，并带上对齐后的 summary.md /
+        memory.md，随后在 index.json 建档，标题沿用父会话并记录
+        ``forked_from``。新会话 ID 由后端按 ``YYMMDD_HHMMSS`` 生成。
+
+        推理进行中禁止衍生：此刻 conversation.json 还没有当前轮，前端展示的
+        下标也会与磁盘上的下标错位，截取点会选错。
+        """
+        body = self._read_json_body()
+        if body is None:
+            return
+
+        with _session_state_lock:
+            status = _session_statuses.get(session_id, "")
+        if status in ("streaming", "paused"):
+            self._send_json_error(
+                409, f"Session is inferring, fork is not allowed now: {session_id}"
+            )
+            return
+
+        session_manager = self.server.session_manager  # type: ignore[attr-defined]
+        context_manager = self.server.context_manager  # type: ignore[attr-defined]
+        try:
+            result = context_manager.fork_session(
+                session_id,
+                body.get("message_index"),
+                str(body.get("timestamp") or ""),
+            )
+        except FileNotFoundError:
+            self._send_json_error(404, f"Session not found: {session_id}")
+            return
+        except ValueError as exc:
+            self._send_json_error(400, str(exc))
+            return
+        except OSError as exc:
+            logger.warning("fork session failed (session=%s): %s", session_id, exc)
+            self._send_json_error(500, f"Failed to fork session: {exc}")
+            return
+
+        parent_title = (session_manager.get_title_info(session_id) or {}).get("title") or ""
+        title = session_manager.on_session_forked(
+            result["session_id"],
+            session_id,
+            title=parent_title,
+            first_user_message=result["first_user_message"],
+        )
+        # 分类目录视图里，衍生会话与父会话同级同分类
+        session_manager.inherit_categories(result["session_id"], session_id)
+
+        self._send_json_response(200, {
+            "status": "success",
+            "session_id": result["session_id"],
+            "parent_session_id": session_id,
+            "title": title,
+            "message_count": result["message_count"],
+            "cut_index": result["cut_index"],
+            "first_user_message": result["first_user_message"],
+            # 复制历史自带的 token 守卫：{estimated_tokens, budget, compressed,
+            # warning}。warning 非空表示这份历史超出可运行的上下文（压缩没做成，
+            # 或压缩后仍超），会话仍可用，只是首次推理可能被模型拒绝。
+            "context_guard": result.get("context_guard") or {},
+        })
+
     def _handle_generate_session_title(self, session_id: str) -> None:
         """POST /v1/sessions/{session_id}/generate-title — 设定或生成会话标题。
 

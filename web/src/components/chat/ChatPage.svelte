@@ -18,8 +18,9 @@
   import { restoreFileRefTags } from '../../lib/file-ref.js'
   import { mergeToolCallDeltas, startsNewToolCallRound } from '../../lib/stream-messages.js'
   import { t } from '../../lib/i18n.svelte.js'
+  import { forkContextWarning } from '../../lib/session-fork.js'
   import { navigate } from '../../lib/router.svelte.js'
-  import { sessionRestore, sessionDownload, newSessionCreated, sessionDeleted, currentSession, newSessionRequest, terminalOpen, openSessionLogDir } from '../../lib/session-state.svelte.js'
+  import { sessionRestore, sessionDownload, newSessionCreated, sessionDeleted, sessionForked, currentSession, newSessionRequest, terminalOpen, openSessionLogDir } from '../../lib/session-state.svelte.js'
   import DownloadProgress from './DownloadProgress.svelte'
   import { collapseSidebar } from '../../lib/sidebar-width.svelte.js'
   import Terminal from '../Terminal.svelte'
@@ -60,6 +61,10 @@
   // 输入草稿：从本地存储初始化，新打开页面 / 切换到会话页时还原未发送的输入（含 <file> 引用文本）
   let inputText = $state('')
   let sessionId = $state(null)   // currently displayed session ID
+  // 衍生新会话（fork）请求态：forkBusyIndex 让被点的那条消息按钮显示忙态，
+  // forkBusy 期间禁用全部 fork 按钮，避免连点创建出多条会话。
+  let forkBusy = $state(false)
+  let forkBusyIndex = $state(-1)
 
   // ── 输入草稿保护 ─────────────────────────────────────────────────────────────
   // inputText 的任何变更（键入 / 粘贴 / 工作区选文件 / 撤销回填 / 发送后清空）
@@ -1824,6 +1829,49 @@
     return `${t('revokeConflictMessage')}${fileList}`
   }
 
+  // ── 衍生新会话（fork）────────────────────────────────────────────
+  // 把这条 assistant 收尾回复及之前的所有轮次复制成一条新会话：后端生成新会话
+  // ID，并复制 conversation.json 前缀 / memory / summary；前端只通知 Sidebar 把
+  // 新会话插入会话列表并选中（走正常的会话加载路径），此后消息都发往新会话 ID。
+  async function handleForkSession(messageIndex, msg = null) {
+    const sourceSessionId = sessionId
+    if (!sourceSessionId || forkBusy) return
+    // 推理中不能 fork：本轮尚未落盘（截点会少掉一轮），且 conversation.json
+    // 正在被写入。MessageList 的按钮此时也是禁用态，这里兜底。
+    if (isStreaming || backendStreamingSessions.has(sourceSessionId)) {
+      errorMsg = t('forkSessionBlocked')
+      return
+    }
+    forkBusy = true
+    forkBusyIndex = messageIndex
+    errorMsg = ''
+    try {
+      // timestamp 一并上交：它是 message_index 的交叉校验，也是列表错位时的兜底定位依据。
+      const result = await sessionsApi.fork(sourceSessionId, {
+        messageIndex,
+        timestamp: msg?.timestamp || '',
+      })
+      const forkedSessionId = result?.session_id
+      if (!forkedSessionId) throw new Error(t('forkSessionFailed'))
+      sessionForked.sessionId = forkedSessionId
+      sessionForked.parentSessionId = sourceSessionId
+      // 父会话没标题时后端返回空串，退回首条用户消息做占位标题
+      sessionForked.title = result.title || result.first_user_message || null
+      sessionForked.token++
+      const guardWarning = forkContextWarning(result.context_guard, t)
+      if (guardWarning) {
+        // 会话已建好，只是复制进来的历史超出可运行的上下文、而摘要没能重建
+        // （或重建后仍超）。不阻断切换（fork 仍可用），只说明首次推理可能被拒。
+        errorMsg = guardWarning
+      }
+    } catch (err) {
+      errorMsg = err?.message || t('forkSessionFailed')
+    } finally {
+      forkBusy = false
+      forkBusyIndex = -1
+    }
+  }
+
   async function handleRevoke(timestamp, hasFileChanges = false) {
     if (!sessionId) return
     revokeConfirm = { timestamp, hasFileChanges }
@@ -2492,7 +2540,7 @@
     <!-- Message list: hidden when terminal is visible -->
     <div class="message-list-container" class:hidden={terminalVisible}>
       {#key sessionId}
-        <MessageList {messages} {agentList} {displayMessageDetails} onRevoke={handleRevoke} onScrollAtBottom={handleScrollAtBottom} {shouldScrollToBottom} {collapsedGroups} onToggleCollapse={toggleCollapse} {fileJournalTurnKeyMap} {fileDiffCache} {fileDiffVisible} onToggleFileDiff={handleToggleFileDiff} {retryAssistantIndex} onRetryLastInference={handleRetryLastInference} retryDisabled={isStreaming} />
+        <MessageList {messages} {agentList} {displayMessageDetails} onRevoke={handleRevoke} onScrollAtBottom={handleScrollAtBottom} {shouldScrollToBottom} {collapsedGroups} onToggleCollapse={toggleCollapse} {fileJournalTurnKeyMap} {fileDiffCache} {fileDiffVisible} onToggleFileDiff={handleToggleFileDiff} {retryAssistantIndex} onRetryLastInference={handleRetryLastInference} retryDisabled={isStreaming} onFork={handleForkSession} forkDisabled={isStreaming || forkBusy} {forkBusyIndex} />
       {/key}
 
       <WorkspaceFileManager

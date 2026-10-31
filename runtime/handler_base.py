@@ -264,6 +264,8 @@ _ROUTES: dict[str, list] = {
         (re.compile(r"^/v1/sessions/([^/]+)/read$"), "_handle_mark_session_read", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/sessions/([^/]+)/flight$"), "_handle_session_flight", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/sessions/([^/]+)/revoke$"), "_handle_revoke_session", (urllib.parse.unquote,)),
+        # Derive a new session from one assistant message (conversation copy).
+        (re.compile(r"^/v1/sessions/([^/]+)/fork$"), "_handle_fork_session", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/agents$"), "_handle_create_agent", ()),
         (re.compile(r"^/v1/workspace/rename$"), "_handle_workspace_rename", ()),
         (re.compile(r"^/v1/workspace/mkdir$"), "_handle_workspace_mkdir", ()),
