@@ -1496,6 +1496,10 @@ def begin_session_stream(session_id: str, cancel_event=None) -> None:
             "starter_connected": True,
             "cancel_event": cancel_event,
             "done": False,
+            # Set by the tool loop at the moment it decides to finish with an
+            # empty interjection buffer; the interject endpoint refuses
+            # anything after that point instead of buffering it forever.
+            "loop_closing": False,
             "unobserved_timer": None,
         }
     if stale_event is not None and stale_event is not cancel_event:
@@ -1731,11 +1735,16 @@ def queue_infer_interjection(
 ) -> Optional[str]:
     """Buffer one user message for the current generation's next boundary.
 
-    Returns "queued", "full", or None when there is no live generation owned
-    by ``owner_event``. The message is *not* published to the broker here;
-    ``take_infer_boundary_action`` consumes it and the inference loop yields
-    it, so publishing, persistence ordering and multi-agent stream merging
-    all keep their existing invariants.
+    Returns "queued", "full", "closing", or None when there is no live
+    generation owned by ``owner_event``. The message is *not* published to the
+    broker here; ``take_infer_boundary_action`` consumes it and the inference
+    loop yields it, so publishing, persistence ordering and multi-agent stream
+    merging all keep their existing invariants.
+
+    ``"closing"`` means the generation's tool loop already reached its end
+    decision with an empty buffer (see ``try_close_infer_loop``): no boundary
+    will ever come, so the caller must refuse the message and let the client
+    re-send it as a normal turn rather than accept a turn that never runs.
     """
     with _session_stream_lock:
         stream = _session_streams.get(session_id)
@@ -1745,6 +1754,12 @@ def queue_infer_interjection(
             or stream["done"]
         ):
             return None
+        if owner_event is not None and owner_event.is_set():
+            # Abort wins over interjection: a cancelling generation has no
+            # next boundary either.
+            return None
+        if stream.get("loop_closing"):
+            return "closing"
         pending = stream.setdefault("pending_interjections", [])
         if len(pending) >= _MAX_PENDING_INTERJECTIONS:
             return "full"
@@ -1808,6 +1823,63 @@ def take_infer_interjections(session_id: str, owner_event) -> list:
         if buffered and stream.get("pending_interjections") is not None:
             stream["pending_interjections"].clear()
         return buffered
+
+
+def try_close_infer_loop(session_id: str, owner_event) -> bool:
+    """Ask whether the tool loop may finish; atomic against an interjection.
+
+    Called by the inference loop at the exact point where it would end — the
+    last model round produced no tool call.  Exactly one of two outcomes is
+    decided under ``_session_stream_lock``, so a message that arrives in the
+    same instant as the loop's final round is never lost:
+
+    * ``False`` — a user message is already buffered.  The turn is not over:
+      the loop must run one more round, and the message is left in place for
+      that round's boundary gate (``take_infer_boundary_action``) to consume
+      like any other interjection.  Nothing is marked, so later messages stay
+      acceptable.
+    * ``True`` — the buffer is empty.  The generation is marked closing, which
+      makes every later interjection return ``"closing"`` and get refused by
+      the endpoint (the client then sends it as a normal turn).  A soft-pause
+      still pending here is moot — the answer completed — and is dropped with
+      the resting state.
+
+    Unknown / superseded / finished generations report ``True``: the loop may
+    end, and the endpoint already refuses those cases.
+    """
+    with _session_stream_lock:
+        stream = _session_streams.get(session_id)
+        if (
+            stream is None
+            or stream.get("cancel_event") is not owner_event
+            or stream["done"]
+        ):
+            return True
+        if stream.get("pending_interjections"):
+            return False
+        stream["loop_closing"] = True
+        stream["pause_requested"] = False
+        return True
+
+
+def close_infer_loop(session_id: str, owner_event) -> None:
+    """Mark a generation closed to interjections, unconditionally.
+
+    For loop shapes that cannot continue on buffered input — group chat
+    schedules agents from @-mentions alone, so a lone user message has no wave
+    to join.  Closing makes a late interjection refused (re-sent as a normal
+    turn) instead of silently buffered past the last boundary.
+    """
+    with _session_stream_lock:
+        stream = _session_streams.get(session_id)
+        if (
+            stream is None
+            or stream.get("cancel_event") is not owner_event
+            or stream["done"]
+        ):
+            return
+        stream["loop_closing"] = True
+        stream["pause_requested"] = False
 
 
 def get_infer_exit_reason(session_id: str, owner_event) -> Optional[str]:

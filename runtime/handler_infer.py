@@ -35,6 +35,7 @@ from runtime.server_state import (
     _session_streams,
     begin_session_stream,
     clear_infer_control,
+    close_infer_loop,
     disconnect_session_stream_starter,
     end_paused_session_status,
     finish_session_stream,
@@ -53,6 +54,7 @@ from runtime.server_state import (
     stream_batch_is_protocol_complete,
     StreamUsageEstimator,
     take_infer_boundary_action,
+    try_close_infer_loop,
     transition_session_stream_status,
 )
 
@@ -1207,6 +1209,20 @@ class HandlerInferMixin:
                     return None
                 return take_infer_boundary_action(session_id, cancel_event)
 
+            # Loop-exit gate. Asked when the tool loop would end (the last
+            # model round produced no tool call). A user message that landed
+            # while that round was streaming means the turn is not over, so the
+            # answer must not be the last word: the gate returns False and the
+            # same generation runs another round, which picks the message up at
+            # its round boundary. With nothing buffered it returns True and the
+            # generation is closed to further interjections — a later one is
+            # refused so the client re-sends it as a normal turn instead of
+            # having it accepted into a queue nothing will ever drain.
+            def _loop_close_gate() -> bool:
+                if session_id is None:
+                    return True
+                return try_close_infer_loop(session_id, cancel_event)
+
             # Group-chat interjection gate: consumed at every wave boundary
             # (previous wave fully settled, next wave not yet dispatched).
             # Interjections only join the shared transcript; group pause is
@@ -1216,6 +1232,18 @@ class HandlerInferMixin:
                 if session_id is None:
                     return []
                 return take_infer_interjections(session_id, cancel_event)
+
+            # Group-chat loop-exit gate. A wave loop cannot continue on a lone
+            # interjection (waves are scheduled by @-mentions alone), so the
+            # only correct answer at its end is to close the generation: what
+            # was accepted in time still joins the shared transcript, anything
+            # later is refused and re-sent as a normal turn that does schedule
+            # agents.
+            def _group_close_gate() -> bool:
+                if session_id is None:
+                    return True
+                close_infer_loop(session_id, cancel_event)
+                return True
 
             # === 统一消息源 ===
             if is_group_chat:
@@ -1235,6 +1263,7 @@ class HandlerInferMixin:
                     model_id=model_id,
                     tool_ids=tool_ids,
                     interject_gate=_group_interject_gate,
+                    close_gate=_group_close_gate,
                 )
             else:
                 msg_gen = runtime.infer_stream(
@@ -1242,6 +1271,7 @@ class HandlerInferMixin:
                     cancel_event=cancel_event,
                     on_round_complete=context_compressor,
                     pause_gate=_pause_gate,
+                    close_gate=_loop_close_gate,
                     on_context_overflow=(
                         context_compressor.ensure_within_budget
                         if context_compressor is not None else None
@@ -1290,6 +1320,14 @@ class HandlerInferMixin:
                 if msg.role == "assistant" and msg.content and msg.content.startswith("Error:"):
                     model_id_for_log = request.model_id if not is_group_chat else (getattr(msg, "agent_id", "group_chat") or "group_chat")
                     logger.error("infer_stream error event | model=%s %s", model_id_for_log, msg.content)
+
+            # The message source is exhausted: this generation's loop is over.
+            # Close it to interjections *before* the finalization below (a
+            # context compression there can take seconds), so a message that
+            # arrives in that window is refused and re-sent as a normal turn
+            # rather than accepted into a buffer that no boundary will drain.
+            if session_id is not None:
+                close_infer_loop(session_id, cancel_event)
 
             # 【已移除】尾部发送 session_id 的逻辑，已在第一条消息中发送
 
@@ -1502,6 +1540,12 @@ class HandlerInferMixin:
         - 推理活跃 → 202 {"status": "queued"}（队列上限 10，超出 429）
         - 推理已结束/不存在 → 200 {"status": "not_active"}，由前端降级为
           普通发送（基于完整历史的新请求）。
+        - 「已结束」判定与循环收尾是同一个原子决定（``try_close_infer_loop``）：
+          模型最后一轮没有工具调用、正要退出循环的那一刻，若队列里已有消息，
+          循环不允许结束，会带着它再跑一轮；只有队列为空时循环才真正收尾，并把
+          generation 关闭，此后的插话一律 not_active 退回，不会被永久缓存。
+          群聊的波次循环无法靠一条孤立的插话续跑，因此收尾时先关闭队列，再把
+          已经接受的插话写入共享历史。
         - 群聊会话同样支持（粗粒度语义）：插话只在 wave 边界进入共享历史，已在执行的 agent 看不到它，
           之后的每一轮发言都能看到；插话只改上下文，不改变 agent 调度（调度仍由 @mention 决定）。
         - stop/force abort 会清空未消费的缓冲（abort 永远赢）；pause 与

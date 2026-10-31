@@ -160,6 +160,12 @@ def _get_model_api_retry_delay() -> float:
 
 _RETRYABLE_MODEL_HTTP_CODES = frozenset({408, 425, 429, 500, 502, 503, 504, 524})
 
+# Rounds an otherwise-finished generation may run purely because a user
+# interjection arrived in time (see infer_stream's close_gate).  Matches the
+# interjection queue cap in server_state: every such round consumes buffered
+# input, so this bounds the extension instead of letting it self-sustain.
+_MAX_INTERJECTED_ROUNDS = 10
+
 
 def _is_timeout_error(exc: BaseException) -> bool:
     """Recognize direct and urllib-wrapped socket timeout failures."""
@@ -2599,6 +2605,7 @@ class Runtime:
         cancel_event: Optional[object] = None,
         on_round_complete: Optional[Callable[[list, int, int], Optional[list]]] = None,
         pause_gate: Optional[Callable[[], Optional[dict]]] = None,
+        close_gate: Optional[Callable[[], bool]] = None,
         on_context_overflow: Optional[Callable] = None,
     ) -> Iterator[Message]:
         """Streaming inference with full tool call loop and Skill progressive disclosure.
@@ -2643,6 +2650,16 @@ class Runtime:
                 ``Error:`` message instead of a doomed request when it does not.
                 Passing ``None`` keeps the measurement (it logs what would not
                 fit) but never refuses the send.
+            close_gate: Optional end-of-turn hook, asked at the single point
+                where this loop would finish (a model round returned no tool
+                call).  Returning ``False`` means a user interjection is already
+                buffered for this generation: the turn is not over, so the loop
+                runs another round and its boundary injects the message like any
+                other interjection.  Returning ``True`` lets the loop return and
+                means the generation has been closed to further interjections —
+                a later one is refused by the endpoint (and re-sent as a normal
+                turn) instead of being buffered past the last boundary.  ``None``
+                (no session-scoped control) ends the loop as before.
 
         Yields:
             Message objects incrementally.
@@ -2682,6 +2699,9 @@ class Runtime:
 
         # 2. Streaming tool call loop
         tool_round = 0
+        # Rounds run only because a user interjection arrived at a point where
+        # the loop would otherwise have finished (see close_gate below).
+        interjected_rounds = 0
         total_prompt = 0
         total_completion = 0
         # overall_ms is measured from entry into the inference/tool loop until
@@ -3182,6 +3202,25 @@ class Runtime:
                 if ttft_ms is not None:
                     stat_dict["ttft_ms"] = round(ttft_ms, 1)
                 yield Message(role="usage", timestamp=_now_iso(), name="round", content=json.dumps(stat_dict))
+                # The model is done with this turn, but a user message that
+                # landed while this last round was streaming means the turn is
+                # NOT over.  ``close_gate`` makes that call atomically with the
+                # interject endpoint: it returns False when a message is
+                # already buffered — this generation then runs one more round,
+                # whose boundary injects the message exactly like any other
+                # interjection — and True once the buffer is empty, which also
+                # closes the generation to further interjections so a late one
+                # is refused and re-sent as a normal turn instead of being
+                # buffered past the last boundary.  A keep-going round always
+                # consumes buffered input, and the bound below matches the
+                # interjection queue cap, so this cannot loop on its own.
+                if (
+                    close_gate is not None
+                    and interjected_rounds < _MAX_INTERJECTED_ROUNDS
+                    and close_gate() is False
+                ):
+                    interjected_rounds += 1
+                    continue
                 return
 
             # Max rounds check

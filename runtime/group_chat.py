@@ -762,6 +762,7 @@ def run_group_chat_stream_gen(
     tool_ids: list[str],
     max_rounds: int = 5,
     interject_gate=None,
+    close_gate=None,
 ) -> Generator[Message, None, None]:
     """Generator version of group chat inference.
 
@@ -797,6 +798,7 @@ def run_group_chat_stream_gen(
         tool_ids=tool_ids,
         max_rounds=max_rounds,
         interject_gate=interject_gate,
+        close_gate=close_gate,
     )
 
 
@@ -823,6 +825,7 @@ def _run_group_chat_stream_gen(
     max_rounds: int = 5,
     stream_chunks: bool = True,
     interject_gate=None,
+    close_gate=None,
 ) -> Generator[Message, None, None]:
     """Execute group chat inference as a generator of Messages.
 
@@ -903,27 +906,33 @@ def _run_group_chat_stream_gen(
     # completed round builds a fresh dict for the following round.
     trigger_msgs: dict[str, list[Message]] = {}
 
+    def _drain_interjections():
+        """Buffered user interjections, as Messages, at a wave boundary.
+
+        Coarse-grained by design: an interjection queued while this generation
+        runs joins the shared transcript exactly here — after the previous wave
+        fully settled (all tool results in, next triggers computed) and before
+        the next wave is dispatched. Agents already running inside a wave never
+        observe it; every later turn sees it via assemble_agent_context.
+        Interjections only change context, they never schedule agents: wave
+        membership stays driven by @-mentions alone.
+        """
+        if interject_gate is None:
+            return
+        for item in interject_gate():
+            if not isinstance(item, dict):
+                continue
+            interjection = Message.from_dict(dict(item))
+            if interjection.role != "user" or not (interjection.content or "").strip():
+                continue
+            # Audit marker for in-memory consumers; to_dict() drops it.
+            interjection.kind = "interjection"  # type: ignore[attr-defined]
+            existing_turns.append(interjection)
+            yield interjection
+
     while pending_mentioned and round_num < max_rounds:
         # --- User interjections (wave boundary) ---
-        # Coarse-grained by design: an interjection queued while this
-        # generation runs joins the shared transcript exactly here — after
-        # the previous wave fully settled (all tool results in, next
-        # triggers computed) and before the next wave is dispatched. Agents
-        # already running inside a wave never observe it; every later turn
-        # sees it via assemble_agent_context. Interjections only change
-        # context, they never schedule agents: wave membership stays driven
-        # by @-mentions alone.
-        if interject_gate is not None:
-            for item in interject_gate():
-                if not isinstance(item, dict):
-                    continue
-                interjection = Message.from_dict(dict(item))
-                if interjection.role != "user" or not (interjection.content or "").strip():
-                    continue
-                # Audit marker for in-memory consumers; to_dict() drops it.
-                interjection.kind = "interjection"  # type: ignore[attr-defined]
-                existing_turns.append(interjection)
-                yield interjection
+        yield from _drain_interjections()
         round_num += 1
         current_trigger_msgs = trigger_msgs
         next_trigger_msgs: dict[str, list[Message]] = {}
@@ -1311,5 +1320,16 @@ def _run_group_chat_stream_gen(
         # are fragmented chunks that can miss cross-chunk @-mentions.
         trigger_msgs = next_trigger_msgs
         pending_mentioned = list(trigger_msgs.keys())
+
+    # The wave loop is over. Close the generation to interjections first, so a
+    # message arriving from here on is refused (the client re-sends it as a
+    # normal turn, which does schedule agents) instead of accepted into a queue
+    # whose last boundary has already passed. Then hand everything that was
+    # accepted in time to the shared transcript: group waves are scheduled by
+    # @-mentions alone, so a lone message has no wave to re-enter, but it
+    # becomes a real user turn that every later turn sees — never dropped.
+    if close_gate is not None:
+        close_gate()
+    yield from _drain_interjections()
 
     # No additional yield needed; the queue already yielded everything.
