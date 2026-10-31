@@ -320,6 +320,17 @@
   let stopMenuEl = $state(null)
   let stopBtnEl = $state(null)
 
+  // Idempotency lock for stop-menu actions: once an option is picked the
+  // button goes disabled and stays that way until the session state actually
+  // changes (streaming / paused / pause-requested flips) — the resulting
+  // status event re-enables it. A page reload clears the lock by design
+  // (e.g. stop didn't land and the user wants to escalate to force-stop).
+  let actionPending = $state(false)
+  $effect(() => {
+    void [isStreaming, isPaused, pauseRequested]
+    actionPending = false
+  })
+
   function toggleStopMenu() {
     stopMenuOpen = !stopMenuOpen
   }
@@ -329,7 +340,9 @@
   }
 
   function pickStopAction(fn) {
+    if (actionPending) return
     closeStopMenu()
+    actionPending = true
     fn?.()
   }
 
@@ -348,7 +361,9 @@
   // draft in the box the draft wins (a normal send continues the intact
   // history — the backend treats the paused conversation as ordinary context).
   function handleResumeOrSend() {
+    if (actionPending) return
     syncTextFromEditor()
+    actionPending = true
     if (text.trim()) {
       handleSend()
       return
@@ -439,8 +454,9 @@
       if (isStreaming) {
         // 推理中回车 = “附加新的消息”（与下拉菜单项同一动作）：不打断当前
         // 模型轮，草稿排队到下一个轮边界。输入框为空则不动作。
-        if (onInterject) {
+        if (onInterject && !actionPending) {
           closeStopMenu()
+          actionPending = true
           handleInterjectText()
         }
         return
@@ -547,12 +563,12 @@
         {#if stopMenuOpen}
           <div class="stop-menu" bind:this={stopMenuEl}>
             {#if canPause}
-              <button class="stop-menu-item" onclick={() => pickStopAction(onPause)}>{t('pauseInference')}</button>
+              <button class="stop-menu-item" onclick={() => pickStopAction(onPause)}><span class="stop-menu-icon">⏸️</span>{t('pauseInference')}</button>
             {/if}
-            <button class="stop-menu-item" onclick={() => pickStopAction(onStop)}>{t('stopInference')}</button>
-            <button class="stop-menu-item danger" onclick={() => pickStopAction(onStopForce)}>{t('forceStopInference')}</button>
+            <button class="stop-menu-item" onclick={() => pickStopAction(onStop)}><span class="stop-menu-icon">⏹️</span>{t('stopInference')}</button>
+            <button class="stop-menu-item danger" onclick={() => pickStopAction(onStopForce)}><span class="stop-menu-icon">⛔</span>{t('forceStopInference')}</button>
             {#if onInterject && text.trim()}
-              <button class="stop-menu-item" onclick={() => pickStopAction(handleInterjectText)}>{t('attachNewMessage')}</button>
+              <button class="stop-menu-item" onclick={() => pickStopAction(handleInterjectText)}><span class="stop-menu-icon">💬</span>{t('attachNewMessage')}</button>
             {/if}
           </div>
         {/if}
@@ -560,33 +576,37 @@
           bind:this={stopBtnEl}
           class="send-btn stop"
           class:pause-pending={pauseRequested}
+          disabled={actionPending}
           onclick={toggleStopMenu}
           title={pauseRequested ? t('pausingTooltip') : t('stopBtnTooltip')}
-        >⏹<span class="caret">▼</span></button>
+        ><span class="stop-glyph">⏹</span><span class="caret">▼</span></button>
       </div>
     {:else if isPaused}
-      <!-- 暂停态：▶ 恢复推理（输入框有内容时等效普通发送=带消息恢复）；
-           ⏹▼ 结束暂停任务（不恢复，会话按暂停点的完整历史正式收尾）。 -->
+      <!-- 暂停态：与推理中同款控件——只有 ⏹▼。菜单：恢复执行 / 结束暂停任务 /
+           附加新的消息（输入框有内容时；等价普通发送，后端自动从暂停点接管会话）。
+           Enter：有内容=发送，空=恢复执行。 -->
       <div class="stop-cell">
         {#if stopMenuOpen}
           <div class="stop-menu" bind:this={stopMenuEl}>
-            <button class="stop-menu-item danger" onclick={() => pickStopAction(onEndPause)}>{t('endPausedTask')}</button>
+            {#if onResume}
+              <button class="stop-menu-item" onclick={() => pickStopAction(onResume)}><span class="stop-menu-icon">▶</span>{t('resumeInference')}</button>
+            {/if}
+            {#if onEndPause}
+              <button class="stop-menu-item danger" onclick={() => pickStopAction(onEndPause)}><span class="stop-menu-icon">⏹️</span>{t('endPausedTask')}</button>
+            {/if}
+            {#if text.trim()}
+              <button class="stop-menu-item" onclick={() => pickStopAction(handleSend)}><span class="stop-menu-icon">💬</span>{t('attachNewMessage')}</button>
+            {/if}
           </div>
         {/if}
-        {#if onEndPause}
-          <button
-            bind:this={stopBtnEl}
-            class="send-btn stop"
-            onclick={toggleStopMenu}
-            title={t('pausedMenuTooltip')}
-          >⏹<span class="caret">▼</span></button>
-        {/if}
         <button
-          class="send-btn"
-          onclick={handleResumeOrSend}
-          disabled={disabled}
-          title={text.trim() ? t('sendAndResumeTooltip') : t('resumeTooltip')}
-        >▶</button>
+          bind:this={stopBtnEl}
+          class="send-btn stop"
+          class:paused-control={isPaused}
+          disabled={actionPending}
+          onclick={toggleStopMenu}
+          title={t('pausedMenuTooltip')}
+        ><span class="stop-glyph">⏸</span><span class="caret">▼</span></button>
       </div>
     {:else}
       <!-- 有内容时显示发送按钮 -->
@@ -736,7 +756,10 @@
     background: var(--danger, #e53e3e);
   }
   .send-btn.stop:hover { background: #c53030; }
-  .send-btn.stop .caret { font-size: 0.55rem; }
+  .send-btn.stop { gap: 1px; }
+  .send-btn.stop .stop-glyph { display: flex; align-items: center; line-height: 1; }
+  .send-btn.stop:disabled { opacity: 0.55; cursor: not-allowed; }
+  .send-btn.stop .caret { font-size: 0.55rem; line-height: 1; display: flex; align-items: center; transform: translateY(-0.5px); }
   /* pause 已受理、正等待轮边界生效 */
   .send-btn.stop.pause-pending { animation: stop-pending-pulse 1.2s ease-in-out infinite; }
   @keyframes stop-pending-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
@@ -769,6 +792,12 @@
   }
   .stop-menu-item:hover { background: var(--bg-secondary); }
   .stop-menu-item.danger { color: var(--danger, #e53e3e); }
+  /* 菜单项前的示意图标：固定列宽，保证不同 emoji 宽度下文字左对齐 */
+  .stop-menu-icon {
+    display: inline-block;
+    width: 1.5em;
+    text-align: center;
+  }
   /* "+"工作区按钮样式：使用次要色调 */
   .send-btn.workspace-btn {
     background: var(--bg-secondary);
