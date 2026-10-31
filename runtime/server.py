@@ -449,6 +449,18 @@ class _ThreadingHTTPServer(ThreadingHTTPServer):
 
     daemon_threads = True
 
+    # socketserver.TCPServer.request_queue_size defaults to 5, i.e. the listening
+    # socket is created with listen(5).  The UI holds long-lived SSE/WebSocket
+    # connections open (inference streams, session streams, terminals, the
+    # session-events hub), and browsers cap a page at 6 concurrent HTTP/1.1
+    # sockets per origin -- so when the browser frees a slot it tends to open a
+    # burst of new connections at once.  Anything past the accept backlog is not
+    # queued by the kernel but dropped, and the client only retries after its
+    # ~1s SYN retransmission: requests then stall in integer seconds.  Measured
+    # with 40 simultaneous connections: backlog 5 -> p90 1033ms / max 1040ms;
+    # backlog 128 -> p90 43ms / max 45ms.
+    request_queue_size = 128
+
     def __init__(self, server_address, RequestHandlerClass, bind_and_activate=True,
                  ssl_context: Optional[ssl.SSLContext] = None) -> None:
         super().__init__(server_address, RequestHandlerClass, bind_and_activate)
