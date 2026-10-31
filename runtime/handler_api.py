@@ -62,6 +62,7 @@ from runtime.server_state import (
     _session_state_lock,
     _session_statuses,
     _unread_sessions,
+    clear_session_stream_state,
     flight_sessions_snapshot,
     register_session_stream_with_snapshot,
     set_session_flight_mode,
@@ -2630,6 +2631,10 @@ class HandlerApiMixin:
             return
         # index.json 中对应条目已移除：一并清理内存中的飞行模式状态
         set_session_flight_mode(session_id, False)
+        # 会话流 broker（含未消费的 pause/interject 缓冲）与状态标记也随目录
+        # 一起消失；若仍有活动 generation，cancel_event 令其 unwind，而不是
+        # 向已删除的目录继续落盘。
+        clear_session_stream_state(session_id)
         # 远程会话：子端存在同 id 的孤儿会话目录（文件 journal / delegate 子会话）。
         # fire-and-forget 清理，不阻塞删除响应，也不因清理失败而报错。
         if remote_env_id:

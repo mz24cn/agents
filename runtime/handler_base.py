@@ -234,6 +234,7 @@ _ROUTES: dict[str, list] = {
         (re.compile(r"^/v1/infer$"), "_handle_infer", ()),
         (re.compile(r"^/v1/infer/stream$"), "_handle_infer_stream", ()),
         (re.compile(r"^/v1/infer/abort$"), "_handle_infer_abort", ()),
+        (re.compile(r"^/v1/infer/interject$"), "_handle_infer_interject", ()),
         (re.compile(r"^/v1/tools/call$"), "_handle_tool_call", ()),
         (re.compile(r"^/v1/tools/mcp$"), "_handle_register_mcp_servers", ()),
         (re.compile(r"^/v1/tools/test$"), "_handle_test_tool", ()),

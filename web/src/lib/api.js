@@ -330,25 +330,73 @@ export function inferStream(body, onMessage, onDone, onError, onInit = null, onS
 }
 
 /**
- * Abort an active stream inference by session_id.
- * Sends POST /v1/infer/abort so the backend can set the cancel_event
+ * Control an active stream inference by session_id.
+ * Sends POST /v1/infer/abort with an explicit action so the backend can react
  * even while a delegate sub-agent is running (no SSE writes happening).
  *
  * @param {string} sessionId
- * @param {boolean} [forced=false]  When true, kills running tool processes
- *        (exec_shell, MCP) and forces session status to done.  Use when the
- *        session is stuck in a tool call that won't respond to a normal abort.
+ * @param {boolean|string} [action='stop']  'stop': cancel at the next check
+ *        point (writes an interrupted assistant turn). 'force': additionally
+ *        kills running tool processes (exec_shell, MCP) and forces the session
+ *        status to done. 'pause': soft-pause — the inference keeps the current
+ *        round intact and stops at the next round boundary (after all tool
+ *        calls of the current round completed), leaving the conversation
+ *        resumable. Legacy booleans are still accepted (true => 'force').
  * @returns {Promise<void>}
  */
-export async function abortInferStream(sessionId, forced = false) {
+export async function abortInferStream(sessionId, action = 'stop') {
+  const act = action === true ? 'force' : action === false || !action ? 'stop' : action
   try {
-    await apiFetch('/v1/infer/abort', {
+    const res = await apiFetch('/v1/infer/abort', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_id: sessionId, forced }),
+      // `forced` is kept for backward compatibility with older servers.
+      body: JSON.stringify({ session_id: sessionId, action: act, forced: act === 'force' }),
     })
+    // Return the parsed control response ({ ok, action, effective }) so the
+    // caller can reflect "effective: false" (no active generation to pause).
+    try { return await res.json() } catch { return null }
   } catch {
     // best-effort — ignore network errors
+    return null
+  }
+}
+
+/**
+ * Soft-pause a running inference (see abortInferStream action 'pause').
+ * The generation stops at its next round boundary and the session status
+ * becomes "paused"; resume later with a normal continuation request
+ * (resumeInferStream) or a plain new message.
+ */
+export async function pauseInferStream(sessionId) {
+  await abortInferStream(sessionId, 'pause')
+}
+
+/**
+ * Queue a user message into the currently running inference generation
+ * (POST /v1/infer/interject). The backend appends it at the next round
+ * boundary (after all tool calls of the current round completed) and the
+ * SAME generation continues — a live interjection, not a new request.
+ *
+ * @returns {Promise<{ok:boolean,status:'queued'|'not_active'}|null>}
+ *          null on network error; callers should fall back to a normal send.
+ */
+export async function interjectInfer(sessionId, content, timestamp) {
+  // The client timestamp doubles as the bubble's identity: ChatPage renders
+  // the local bubble immediately, and both the enqueue publish and the
+  // boundary drain re-publish the same timestamp, which the session-stream
+  // user-frame dedup (by timestamp) collapses into one message.
+  const message = { role: 'user', content }
+  if (timestamp) message.timestamp = timestamp
+  try {
+    const res = await apiFetch('/v1/infer/interject', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId, message }),
+    })
+    try { return await res.json() } catch { return null }
+  } catch {
+    return null
   }
 }
 

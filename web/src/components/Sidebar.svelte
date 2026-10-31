@@ -175,6 +175,7 @@
   function getSessionStatusClass(entry) {
     const status = entry._status || sessionStatuses[entry.session_id] || ''
     if (status === 'streaming') return 'status-streaming'
+    if (status === 'paused') return 'status-paused'
     if (status === 'done_success_unread') return 'status-done-success-unread'
     if (status === 'done_error_unread') return 'status-done-error-unread'
     return ''

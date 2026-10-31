@@ -761,6 +761,7 @@ def run_group_chat_stream_gen(
     model_id: str,
     tool_ids: list[str],
     max_rounds: int = 5,
+    interject_gate=None,
 ) -> Generator[Message, None, None]:
     """Generator version of group chat inference.
 
@@ -795,6 +796,7 @@ def run_group_chat_stream_gen(
         model_id=model_id,
         tool_ids=tool_ids,
         max_rounds=max_rounds,
+        interject_gate=interject_gate,
     )
 
 
@@ -820,6 +822,7 @@ def _run_group_chat_stream_gen(
     tool_ids: list[str],
     max_rounds: int = 5,
     stream_chunks: bool = True,
+    interject_gate=None,
 ) -> Generator[Message, None, None]:
     """Execute group chat inference as a generator of Messages.
 
@@ -901,6 +904,26 @@ def _run_group_chat_stream_gen(
     trigger_msgs: dict[str, list[Message]] = {}
 
     while pending_mentioned and round_num < max_rounds:
+        # --- User interjections (wave boundary) ---
+        # Coarse-grained by design: an interjection queued while this
+        # generation runs joins the shared transcript exactly here — after
+        # the previous wave fully settled (all tool results in, next
+        # triggers computed) and before the next wave is dispatched. Agents
+        # already running inside a wave never observe it; every later turn
+        # sees it via assemble_agent_context. Interjections only change
+        # context, they never schedule agents: wave membership stays driven
+        # by @-mentions alone.
+        if interject_gate is not None:
+            for item in interject_gate():
+                if not isinstance(item, dict):
+                    continue
+                interjection = Message.from_dict(dict(item))
+                if interjection.role != "user" or not (interjection.content or "").strip():
+                    continue
+                # Audit marker for in-memory consumers; to_dict() drops it.
+                interjection.kind = "interjection"  # type: ignore[attr-defined]
+                existing_turns.append(interjection)
+                yield interjection
         round_num += 1
         current_trigger_msgs = trigger_msgs
         next_trigger_msgs: dict[str, list[Message]] = {}

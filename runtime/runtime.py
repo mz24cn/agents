@@ -2467,6 +2467,7 @@ class Runtime:
         request: InferenceRequest,
         cancel_event: Optional[object] = None,
         on_round_complete: Optional[Callable[[list, int, int], Optional[list]]] = None,
+        pause_gate: Optional[Callable[[], Optional[dict]]] = None,
     ) -> Iterator[Message]:
         """Streaming inference with full tool call loop and Skill progressive disclosure.
 
@@ -2554,6 +2555,34 @@ class Runtime:
             if cancel_event is not None and cancel_event.is_set():
                 yield Message(role="assistant", timestamp=_now_iso(), content="Error: user interrupted.")
                 return
+
+            # Soft-pause / interjection checkpoint. Reached only after the
+            # previous round fully completed (assistant turn appended, every
+            # tool result appended, both incrementally persisted by the
+            # handler), so stopping here leaves a complete, resumable
+            # conversation on disk. Buffered user messages (phase-2
+            # interjections) win over the pause request: they join the loop
+            # context before the next model request and the same generation
+            # continues; a plain pause stops here with no new API call.
+            if pause_gate is not None:
+                boundary = pause_gate()
+                if boundary is not None:
+                    for raw in boundary.get("append") or []:
+                        injected = (
+                            Message.from_dict(raw)
+                            if isinstance(raw, dict) else raw
+                        )
+                        # Mark the frame so downstream consumers (persistence,
+                        # UI) can distinguish a mid-flight interjection from a
+                        # turn that initiated this generation.
+                        try:
+                            injected.kind = "interjection"
+                        except Exception:
+                            pass
+                        messages.append(injected)
+                        yield injected
+                    if boundary.get("stop"):
+                        return
 
             # Dynamically throttle very long/fast tool-call loops before the
             # next model API request, if MAX_INFER_PER_MINUTE is configured.

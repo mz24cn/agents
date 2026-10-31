@@ -1,7 +1,7 @@
 <script>
   import { onMount, onDestroy, setContext, untrack } from 'svelte'
   import { writable } from 'svelte/store'
-  import { inferStream, abortInferStream, subscribeSessionEvents, subscribeSessionStream, agents as agentsApi, sessions as sessionsApi, remoteEnv as remoteEnvApi } from '../../lib/api.js'
+  import { inferStream, abortInferStream, interjectInfer, subscribeSessionEvents, subscribeSessionStream, agents as agentsApi, sessions as sessionsApi, remoteEnv as remoteEnvApi } from '../../lib/api.js'
   import { catalog, loadAgents, loadTools, loadEnvVars, refreshAgents } from '../../lib/catalog-state.svelte.js'
   import ModelSelector from './ModelSelector.svelte'
   import ToolSelector from './ToolSelector.svelte'
@@ -138,6 +138,25 @@
   let directlyConsumedSessions = new Set()
   let directStreamLastSeq = new Map()
   let backendStreamingSessions = new Set()
+  // One frame channel per tab made watching a *running* inference almost free,
+  // so a streaming session must never end up with no observer: the backend
+  // cancels a non-flight generation once nobody watches it, and a flight-mode
+  // one would keep running while this tab silently receives nothing. If the
+  // channel entry of a still-streaming session disappears (torn-down channel, an
+  // unexpected per-session done), re-attach it here.
+  let streamWatchSweep = null
+  function rearmMissingStreamWatches() {
+    for (const sid of backendStreamingSessions) {
+      if (!sessionStore[storeKey(sid)] || isSessionStreamWatched(sid)) continue
+      subscribeToExistingSession(sid)
+    }
+  }
+  // Sessions currently in the soft-paused resting state (fed by the
+  // session-events init snapshot and live status frames). Reactive sets so
+  // the input bar can swap to the ▶ resume affordance and remember a pending
+  // pause request while the backend drains at the round boundary.
+  const backendPausedSessions = $state(new Set())
+  const pauseRequestedSessions = $state(new Set())
   function storeKey(sid) { return sid || '__new__' }
 
   function streamUiDebug(event, details = {}) {
@@ -345,6 +364,8 @@
 
   let messages = $derived(sessionStore[storeKey(sessionId)]?.messages ?? [])
   let isStreaming = $derived(sessionStore[storeKey(sessionId)]?.isStreaming ?? false)
+  let isPaused = $derived(!!sessionId && backendPausedSessions.has(sessionId))
+  let pauseRequested = $derived(!!sessionId && pauseRequestedSessions.has(sessionId))
   let collapsedGroups = $derived(sessionStore[storeKey(sessionId)]?.collapsedGroups ?? new Set())
 
   let isGroupChat = $derived(selectedAgentIds.length > 1)
@@ -994,7 +1015,7 @@
     _doSend(apiMessages, pendingUserMsg)
   }
 
-  function _doSend(apiMessages, pendingUserMsg, isContinue = false, retryAgentId = null) {
+  function _doSend(apiMessages, pendingUserMsg, isContinue = false, retryAgentId = null, isResume = false) {
     // Each stream writes to its own sessionStore entry via keyRef.
     // keyRef.key may change from '__new__' to the real session ID once the
     // backend assigns one (onInit / first onStreamMsg with session_id).
@@ -1009,10 +1030,18 @@
     let aIdxRef = { value: -1, groupMode: false, groupMap: {} }
     // 继续推理时不携带新用户消息（messages: [] + continue: true），
     // 后端基于会话既有上下文再跑一轮推理。
-    const reqBody = { model_id: selectedModelId, tool_ids: selectedToolIds, messages: isContinue ? [] : apiMessages, stream: true }
+    const reqBody = { model_id: selectedModelId, tool_ids: selectedToolIds, messages: (isContinue || isResume) ? [] : apiMessages, stream: true }
     if (isContinue) {
       reqBody.continue = true
       if (retryAgentId) reqBody.retry_agent_id = retryAgentId
+    }
+    if (isResume) {
+      // 恢复软暂停的会话：后端从完整历史继续，不删除任何轮、不写中断尾轮。
+      reqBody.resume = true
+      if (sessionId) {
+        backendPausedSessions.delete(sessionId)
+        pauseRequestedSessions.delete(sessionId)
+      }
     }
     if (selectedAgentIds.length > 0) {
       reqBody.agent_ids = selectedAgentIds
@@ -1165,18 +1194,83 @@
 
     // 通知后端 set cancel_event，后端会发送终止消息并关闭连接。
     // 不再主动终止前端连接，等待后端发送终止消息后自然关闭。
-    abortInferStream(sessionId)
+    abortInferStream(sessionId, 'stop')
   }
 
-  // Double-click stop = forced abort: kills running tool processes (exec_shell, MCP)
-  // and forces session status to done.  Use when the session is stuck in a
-  // tool call that won't respond to a normal abort.
+  // 停止动作菜单：强制停止 = 杀掉卡死的工具进程并强制收尾。
   function handleStopForce() {
     const key = storeKey(sessionId)
-    if (sessionId) abortInferStream(sessionId, true)
+    if (sessionId) abortInferStream(sessionId, 'force')
     // Immediately mark local state as not streaming so the UI unblocks.
     const store = sessionStore[key]
     if (store) store.isStreaming = false
+  }
+
+  // 软暂停：不打断当前模型轮，推理循环在轮边界（上一轮 assistant+tool 已
+  // 完整增量落盘之后、下一次 build_request 之前）干净收尾，状态广播 paused。
+  // 后端回 effective=false 表示没有活动推理（可能刚好自然收尾），按普通完成处理。
+  function handlePauseInference() {
+    if (!sessionId) return
+    const store = sessionStore[storeKey(sessionId)]
+    if (!store?.isStreaming) return
+    pauseRequestedSessions.add(sessionId)
+    abortInferStream(sessionId, 'pause').then((res) => {
+      if (res && res.effective === false) pauseRequestedSessions.delete(sessionId)
+    }).catch(() => {
+      pauseRequestedSessions.delete(sessionId)
+    })
+  }
+
+  // 恢复暂停的推理：不带新消息的空续推（resume: true，不删除任何历史轮）。
+  // 输入框里有草稿时走普通发送路径 —— 暂停会话的历史完整，新消息请求天然
+  // 就是"带消息的恢复"。
+  function handleResumeInference() {
+    if (!sessionId) return
+    const store = sessionStore[storeKey(sessionId)]
+    if (!store || store.isStreaming || !backendPausedSessions.has(sessionId)) return
+    _doSend([], null, false, null, true)
+  }
+
+  // 推理途中插话：把输入框草稿排队到当前 generation 的下一个轮边界
+  // （本轮所有工具调用完成后）并由同一 generation 继续 —— 不打断当前
+  // 模型轮，也不新起请求。generation 恰好已结束时降级为普通发送。
+  async function handleInterject(textVal) {
+    const val = String(textVal ?? '').trim()
+    if (!sessionId || !val) return
+    // Same timestamp is used by the local bubble, the enqueue publish and
+    // the boundary drain re-publish — the user-frame dedup (by timestamp)
+    // collapses all three into a single message, so the bubble shows up
+    // immediately even while a long model/tool round is in flight.
+    const ts = new Date().toISOString().slice(0, 19).replace('T', ' ')
+    const res = await interjectInfer(sessionId, val, ts)
+    if (res && res.status === 'queued') {
+      inputText = ''
+      const store = sessionStore[storeKey(sessionId)]
+      if (store) {
+        const dup = store.messages.some(m => m.role === 'user' && m.timestamp === ts)
+        if (!dup) store.messages = [...store.messages, { role: 'user', content: val, timestamp: ts }]
+      }
+    } else if (!res || res.status === 'not_active') {
+      handleSend(val)
+    } else {
+      errorMsg = res.error || t('streamError')
+    }
+  }
+
+  // 结束被暂停的会话：不恢复，把 paused 状态正式收敛为普通完成（历史保持
+  // 完整）。后端广播 done_success_unread，所有浏览器同步；当前正在查看的
+  // 会话顺手标记已读，避免给自己留未读徽标。
+  async function handleEndPausedSession() {
+    if (!sessionId) return
+    const sid = sessionId
+    const res = await abortInferStream(sid, 'end')
+    if (res && res.ended) {
+      backendPausedSessions.delete(sid)
+      pauseRequestedSessions.delete(sid)
+      sessionsApi.markRead(sid).catch(() => {})
+    }
+    // ended=false：后端不在 paused（可能其他端已恢复/结束，事件会自行
+    // 同步），或收尾竞态 — 保持 UI 现状，用户可重试。
   }
 
   function getToolUseId(msg) {
@@ -2076,27 +2170,44 @@
     _unsubscribeSessionEvents = subscribeSessionEvents(
       (data) => {
         if (data.event === 'init') {
+          backendPausedSessions.clear()
           for (const [sid, status] of Object.entries(data.sessions || {})) {
             if (status === 'streaming') backendStreamingSessions.add(sid)
+            else if (status === 'paused') backendPausedSessions.add(sid)
             const s = sessionStore[storeKey(sid)]
             if (s && status === 'streaming') {
               s.isStreaming = true
               subscribeToExistingSession(sid)
+            } else if (s && status === 'paused') {
+              s.isStreaming = false
             }
           }
         } else if (data.event === 'message' && data.session_id && data.status) {
           const sid = data.session_id
           const s = sessionStore[storeKey(sid)]
-          if (data.status === 'streaming') backendStreamingSessions.add(sid)
-          else if (data.status.startsWith('done_')) {
+          if (data.status === 'streaming') {
+            backendStreamingSessions.add(sid)
+            backendPausedSessions.delete(sid)
+            pauseRequestedSessions.delete(sid)
+          } else if (data.status === 'paused') {
+            // Soft-pause settled: the generation is over (its SSE closed with
+            // [DONE]); the session rests in a resumable state.
             backendStreamingSessions.delete(sid)
+            backendPausedSessions.add(sid)
+            pauseRequestedSessions.delete(sid)
+            directlyConsumedSessions.delete(sid)
+            directStreamLastSeq.delete(sid)
+          } else if (data.status.startsWith('done_')) {
+            backendStreamingSessions.delete(sid)
+            backendPausedSessions.delete(sid)
+            pauseRequestedSessions.delete(sid)
             directlyConsumedSessions.delete(sid)
             directStreamLastSeq.delete(sid)
           }
           if (s && data.status === 'streaming') {
             s.isStreaming = true
             subscribeToExistingSession(sid)
-          } else if (s && data.status.startsWith('done_')) {
+          } else if (s && (data.status.startsWith('done_') || data.status === 'paused')) {
             s.isStreaming = false
           }
         }
@@ -2390,6 +2501,13 @@
     onSend={handleSend}
     onStop={handleStop}
     onStopForce={handleStopForce}
+    onPause={handlePauseInference}
+    onResume={handleResumeInference}
+    onEndPause={handleEndPausedSession}
+    onInterject={handleInterject}
+    {isPaused}
+    {pauseRequested}
+    canPause={selectedAgentIds.length <= 1}
     onToggleTemplatePanel={toggleTemplatePanel}
     onToggleWorkspacePanel={toggleWorkspacePanel}
     bind:workspacePanelOpen

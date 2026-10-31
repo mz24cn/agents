@@ -222,7 +222,14 @@ const translations = {
 
     // ChatInput
     inputPlaceholder: '输入消息...',
-    stopBtnTooltip: '单击=中止 | 双击=强制终止（杀掉卡住的工具进程）',
+    stopBtnTooltip: '点击选择停止方式（暂停 / 停止 / 强制停止）',
+    pauseInference: '暂停推理',
+    stopInference: '停止推理',
+    forceStopInference: '强制停止推理',
+    attachNewMessage: '附加新的消息',
+    pausingTooltip: '暂停已受理，等待当前轮（含工具调用）收尾',
+    resumeTooltip: '恢复推理',
+    sendAndResumeTooltip: '发送并继续推理',
     retryInferenceRequest: '重新发送推理请求',
     retryLastInference: '重新发送末次推理',
     confirmRetryLastInference: '此操作将移除当前最后一条助手消息，然后重新发起推理请求。一般适用于推理异常失败的情况。是否继续？',
@@ -926,7 +933,16 @@ const translations = {
 
     // ChatInput
     inputPlaceholder: 'Type a message...',
-    stopBtnTooltip: 'Click = abort | Double-click = force kill (terminate stuck tool processes)',
+    stopBtnTooltip: 'Click to choose how to stop (pause / stop / force)',
+    pauseInference: 'Pause inference',
+    stopInference: 'Stop inference',
+    forceStopInference: 'Force stop inference',
+    attachNewMessage: 'Attach new message',
+    pausingTooltip: 'Pause accepted; waiting for the current round (incl. tool calls) to settle',
+    resumeTooltip: 'Resume inference',
+    endPausedTask: 'End paused task',
+    pausedMenuTooltip: 'Paused: resume inference or end this task for good',
+    sendAndResumeTooltip: 'Send and resume inference',
     retryInferenceRequest: 'Retry inference request',
     retryLastInference: 'Retry last inference',
     confirmRetryLastInference: 'This will remove the current final assistant message and then start a new inference request. This is useful for retrying abnormal failed inferences. Continue?',

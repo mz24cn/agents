@@ -356,6 +356,28 @@ def _merge_single_agent_stream_messages(
             _flush_assistant(stat=current_stat)
             current_stat = None
             continue
+        if m.role == "user":
+            # Interjected user turn (mid-run insertion): the inference loop
+            # yields it at a round boundary, so the stream may contain a bare
+            # user message between rounds. Flush any open assistant buffer
+            # first, then persist the user turn itself — otherwise the saved
+            # conversation would silently drop what the model actually saw.
+            if assistant_text_buf or assistant_thinking_buf or pending_tool_calls:
+                _flush_assistant(stat=current_stat or last_stat)
+            turns.append(ConversationTurn(
+                role="user",
+                content=m.content or "",
+                timestamp=m.timestamp or now_iso(),
+                name=getattr(m, "name", None) or "",
+                images=getattr(m, "images", None),
+                agent_id=getattr(m, "agent_id", None),
+                mentions=getattr(m, "mentions", None),
+                meta=(
+                    {"kind": "interjection"}
+                    if getattr(m, "kind", None) == "interjection" else None
+                ),
+            ))
+            continue
         if m.role == "assistant":
             # Track agent identity from the first assistant chunk that carries it
             if getattr(m, "agent_id", None) and not current_agent_id:
@@ -1078,7 +1100,10 @@ def _load_function_from_file(file_path: str, func_name: str) -> Callable:
 # Session Status Stream – in-memory state
 # ---------------------------------------------------------------------------
 # Set of session_ids that are currently streaming (registered/cancelled per request).
-# Maps session_id -> status string: "streaming" | "done_success_unread" | "done_error_unread"
+# Maps session_id -> status string: "streaming" | "paused" | "done_success_unread" | "done_error_unread"
+# "paused" is a resting soft-stop state reached at an inference round boundary (see
+# take_infer_boundary_action); the conversation on disk is complete and a later
+# inference continues from it like any other next round.
 # "idle" state means session is neither active nor unread (i.e. viewed or just completed-and-read).
 _session_statuses: dict[str, str] = {}
 # Set of session_ids that have completed but whose result has not been "viewed" yet.
@@ -1332,6 +1357,213 @@ def transition_session_stream_status(
         # happens here.
         _enqueue_session_event_frame(frame)
         return True
+
+
+def end_paused_session_status(session_id: str) -> bool:
+    """Formally finish a paused session without resuming it.
+
+    A soft pause is a resting state, not a completed answer; the user must
+    also be able to abandon it. Ending keeps the persisted conversation
+    exactly as it is and moves the session status ``paused`` ->
+    ``done_success_unread`` (history complete == natural completion), then
+    broadcasts the event like any terminal transition. Returns False when the
+    session is not paused (already resumed/ended) or when a live generation
+    currently owns the session.
+    """
+    frame = _build_session_status_frame(session_id, "done_success_unread")
+    with _session_stream_lock:
+        stream = _session_streams.get(session_id)
+        if stream is not None and not stream.get("done"):
+            # A generation is (re)running: its own terminal transition wins.
+            return False
+        with _session_state_lock:
+            if _session_statuses.get(session_id) != "paused":
+                return False
+            _session_statuses[session_id] = "done_success_unread"
+            _unread_sessions[session_id] = "done_success_unread"
+        if stream is not None:
+            # Drop any stale pause/interjection control with the resting state.
+            stream["pause_requested"] = False
+            if stream.get("pending_interjections"):
+                stream["pending_interjections"].clear()
+    _enqueue_session_event_frame(frame)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Inference pause / interjection control (soft-stop at round boundaries)
+# ---------------------------------------------------------------------------
+
+
+def request_pause_infer(session_id: str, owner_event) -> bool:
+    """Ask the current inference generation to stop at its next round boundary.
+
+    The generator exits cleanly after the previous round fully completed and
+    was incrementally persisted, so conversation.json remains a valid context
+    for a later continuation. Returns False when no generation owned by
+    ``owner_event`` is running (unknown/superseded/finished stream) — callers
+    treat that as a no-op (the inference already ended on its own).
+    """
+    with _session_stream_lock:
+        stream = _session_streams.get(session_id)
+        if (
+            stream is None
+            or stream.get("cancel_event") is not owner_event
+            or stream["done"]
+        ):
+            return False
+        stream["pause_requested"] = True
+        return True
+
+
+# Hard cap on buffered interjections per generation. Messages are memory-only
+# until consumed at a round boundary; the cap only guards against unbounded
+# buffering. Individual message length is intentionally unrestricted.
+_MAX_PENDING_INTERJECTIONS = 10
+
+
+def set_session_stream_agents(session_id: str, owner_event, agent_ids) -> None:
+    """Record the participating agents of the current generation.
+
+    Pause and interjection are single-agent features in phase 1; the abort
+    and interject endpoints run in different requests and need the roster
+    that belongs to the running generation, not to some later request.
+    """
+    with _session_stream_lock:
+        stream = _session_streams.get(session_id)
+        if stream is None or (owner_event is not None and stream.get("cancel_event") is not owner_event):
+            return
+        stream["agent_ids"] = list(agent_ids or [])
+
+
+def queue_infer_interjection(
+    session_id: str, owner_event, message: dict
+) -> Optional[str]:
+    """Buffer one user message for the current generation's next boundary.
+
+    Returns "queued", "full", or None when there is no live generation owned
+    by ``owner_event``. The message is *not* published to the broker here;
+    ``take_infer_boundary_action`` consumes it and the inference loop yields
+    it, so publishing, persistence ordering and multi-agent stream merging
+    all keep their existing invariants.
+    """
+    with _session_stream_lock:
+        stream = _session_streams.get(session_id)
+        if (
+            stream is None
+            or stream.get("cancel_event") is not owner_event
+            or stream["done"]
+        ):
+            return None
+        pending = stream.setdefault("pending_interjections", [])
+        if len(pending) >= _MAX_PENDING_INTERJECTIONS:
+            return "full"
+        pending.append(message)
+        return "queued"
+
+
+def take_infer_boundary_action(session_id: str, owner_event) -> Optional[dict]:
+    """Atomically consume pause/buffer state at an inference round boundary.
+
+    Returns ``None`` when this generation has nothing to apply, otherwise
+    ``{"append": [message dicts], "stop": bool}``. A cancel-pending generation
+    always returns ``None``: abort wins over pause. Buffered user messages
+    (interjections, M2) are consumed in arrival order and continue the loop;
+    the soft ``stop`` is only handed out when the pause request is not
+    immediately satisfied by such buffered input. When ``stop`` is True the
+    exit reason ``"paused"`` is recorded for the handler's finalization.
+    """
+    with _session_stream_lock:
+        stream = _session_streams.get(session_id)
+        if (
+            stream is None
+            or stream.get("cancel_event") is not owner_event
+            or stream["done"]
+        ):
+            return None
+        if owner_event is not None and owner_event.is_set():
+            return None
+        had_pause = bool(stream.get("pause_requested"))
+        buffered = list(stream.get("pending_interjections") or [])
+        if not had_pause and not buffered:
+            return None
+        stream["pause_requested"] = False
+        if stream.get("pending_interjections"):
+            stream["pending_interjections"].clear()
+        stop = had_pause and not buffered
+        if stop:
+            stream["exit_reason"] = "paused"
+        return {"append": buffered, "stop": stop}
+
+
+def take_infer_interjections(session_id: str, owner_event) -> list:
+    """Consume buffered interjections only (never the soft-pause flag).
+
+    Used by the group-chat wave boundary: interjections join the shared
+    transcript between waves, but group pause is not implemented, so a stray
+    ``pause_requested`` flag must not be consumed or honoured here. Returns
+    an empty list when there is nothing buffered for this generation.
+    """
+    with _session_stream_lock:
+        stream = _session_streams.get(session_id)
+        if (
+            stream is None
+            or stream.get("cancel_event") is not owner_event
+            or stream["done"]
+        ):
+            return []
+        if owner_event is not None and owner_event.is_set():
+            return []
+        buffered = list(stream.get("pending_interjections") or [])
+        if buffered and stream.get("pending_interjections") is not None:
+            stream["pending_interjections"].clear()
+        return buffered
+
+
+def get_infer_exit_reason(session_id: str, owner_event) -> Optional[str]:
+    """Return the recorded terminal reason ("paused") for this generation."""
+    with _session_stream_lock:
+        stream = _session_streams.get(session_id)
+        if stream is None or stream.get("cancel_event") is not owner_event:
+            return None
+        return stream.get("exit_reason")
+
+
+def clear_infer_control(session_id: str, owner_event) -> None:
+    """Drop a pending pause/buffer for this generation (abort supersedes it)."""
+    with _session_stream_lock:
+        stream = _session_streams.get(session_id)
+        if stream is None or stream.get("cancel_event") is not owner_event:
+            return
+        stream["pause_requested"] = False
+        buffered = stream.get("pending_interjections")
+        if buffered:
+            buffered.clear()
+
+
+def clear_session_stream_state(session_id: str) -> None:
+    """Remove all in-memory stream bookkeeping for a deleted session.
+
+    Drops the broker (including any pending pause / interjection buffers),
+    the status and unread markers, and wakes retained SSE handlers. A running
+    generation owned by this session is cancelled so its generator unwinds
+    instead of persisting into a directory that no longer exists.
+    """
+    with _session_stream_lock:
+        stream = _session_streams.pop(session_id, None)
+    with _session_state_lock:
+        _session_statuses.pop(session_id, None)
+        _unread_sessions.pop(session_id, None)
+    if stream is None:
+        return
+    cancel_event = stream.get("cancel_event")
+    if cancel_event is not None:
+        cancel_event.set()
+    for send_fn in list(stream.get("subscribers") or []):
+        try:
+            send_fn(None)
+        except Exception:
+            pass
 
 
 def get_session_stream_snapshot(session_id: str, after_seq: int = -1) -> dict:

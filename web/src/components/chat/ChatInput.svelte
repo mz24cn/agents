@@ -8,7 +8,7 @@
   import { serializeEditor } from '../../lib/chat-input-serialize.js'
   import { parseFileRefParts, restoreFileRefTags, hasFileRefs } from '../../lib/file-ref.js'
 
-  let { disabled = false, onSend, onStop, onStopForce, onToggleTemplatePanel, onToggleWorkspacePanel, workspacePanelOpen = false, templatePanelOpen = false, text = $bindable(''), isStreaming = false, selectedAgentIds = [], agentList = [], remote = null, onError = () => {} } = $props()
+  let { disabled = false, onSend, onStop, onStopForce, onPause, onResume, onEndPause, onInterject, isPaused = false, pauseRequested = false, canPause = true, onToggleTemplatePanel, onToggleWorkspacePanel, workspacePanelOpen = false, templatePanelOpen = false, text = $bindable(''), isStreaming = false, selectedAgentIds = [], agentList = [], remote = null, onError = () => {} } = $props()
 
   let editorEl = $state(null)
   let lastRenderedText = ''
@@ -39,7 +39,7 @@
   )
 
   // 输入框为空且不在流式状态时，显示"?"按钮（提示词模板入口）
-  let showTemplateBtn = $derived(!isStreaming && !text.trim())
+  let showTemplateBtn = $derived(!isStreaming && !isPaused && !text.trim())
 
   function createFileChip(ref) {
     const chip = document.createElement('span')
@@ -299,31 +299,50 @@
     }
   })
 
-  // Double-click detection for forced abort.
-  // Wait 300ms to decide whether this is a single click or a double click, then
-  // send exactly one abort request: single → normal abort, double → forced abort.
-  let _stopClickTimer = null
-  let _stopClickCount = 0
+  // The stop button becomes a small action menu while inference is streaming:
+  // pause / stop / force stop. A click toggles the upward-opening menu; clicks
+  // outside or Escape close it. (The former double-click force-kill gesture is
+  // replaced by an explicit menu item — it was undiscoverable and conflicted
+  // with the menu.)
+  let stopMenuOpen = $state(false)
+  let stopMenuEl = $state(null)
+  let stopBtnEl = $state(null)
 
-  function handleStopClick() {
-    _stopClickCount += 1
-    if (_stopClickTimer) return
+  function toggleStopMenu() {
+    stopMenuOpen = !stopMenuOpen
+  }
 
-    _stopClickTimer = setTimeout(() => {
-      const clickCount = _stopClickCount
-      _stopClickTimer = null
-      _stopClickCount = 0
-      if (clickCount >= 2) {
-        onStopForce?.()
-      } else {
-        onStop?.()
-      }
-    }, 300)
+  function closeStopMenu() {
+    stopMenuOpen = false
+  }
+
+  function pickStopAction(fn) {
+    closeStopMenu()
+    fn?.()
+  }
+
+  function handleDocumentClick(e) {
+    if (!stopMenuOpen) return
+    const target = e.target
+    if (stopMenuEl?.contains(target) || stopBtnEl?.contains(target)) return
+    closeStopMenu()
   }
 
   onDestroy(() => {
-    if (_stopClickTimer) clearTimeout(_stopClickTimer)
+    stopMenuOpen = false
   })
+
+  // Paused state: the send button resumes the interrupted inference. With a
+  // draft in the box the draft wins (a normal send continues the intact
+  // history — the backend treats the paused conversation as ordinary context).
+  function handleResumeOrSend() {
+    syncTextFromEditor()
+    if (text.trim()) {
+      handleSend()
+      return
+    }
+    onResume?.()
+  }
 
   function handleSend() {
     syncTextFromEditor()
@@ -331,6 +350,38 @@
     if (!trimmed || disabled) return
     onSend?.(trimmed)
     text = ''
+  }
+
+  // 推理途中的“附加新的消息”：草稿排队到当前推理的下一个轮边界。
+  // 不清空输入框 —— 由 ChatPage 在收到 queued 确认后清空（请求失败时
+  // 草稿保留，可直接重试）。
+  function handleInterjectText() {
+    syncTextFromEditor()
+    const trimmed = text.trim()
+    if (!trimmed || disabled) return
+    onInterject?.(trimmed)
+  }
+
+  /**
+   * Voice input: write recognized words into the editor at the caret.
+   *
+   * `partial` events rewrite the in-flight run in place (the service sends the
+   * whole segment again as it refines it); `commit` settles it. Both keep the
+   * caret right after what was just spoken, so the next words continue there
+   * and anything typed around them stays put.
+   */
+  function handleVoicePartial(value) {
+    if (!voiceWriter && editorEl) voiceWriter = new VoiceRunWriter(editorEl)
+    if (!voiceWriter) return
+    voiceWriter.update(value)
+    syncTextFromEditor()
+  }
+
+  function handleVoiceCommit(value) {
+    if (!voiceWriter && editorEl) voiceWriter = new VoiceRunWriter(editorEl)
+    if (!voiceWriter) return
+    voiceWriter.commit(value)
+    syncTextFromEditor()
   }
 
   function handleKeydown(e) {
@@ -361,9 +412,27 @@
       }
     }
 
+    if (e.key === 'Escape' && stopMenuOpen) {
+      e.preventDefault()
+      closeStopMenu()
+      return
+    }
+
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
-      if (isStreaming) return
+      if (isStreaming) {
+        // 推理中回车 = “附加新的消息”（与下拉菜单项同一动作）：不打断当前
+        // 模型轮，草稿排队到下一个轮边界。输入框为空则不动作。
+        if (onInterject) {
+          closeStopMenu()
+          handleInterjectText()
+        }
+        return
+      }
+      if (isPaused) {
+        handleResumeOrSend()
+        return
+      }
       handleSend()
     } else if (e.key === 'Enter' && e.shiftKey) {
       e.preventDefault()
@@ -373,6 +442,7 @@
   }
 </script>
 
+<svelte:window onclick={handleDocumentClick} />
 <div class="chat-input">
   <div class="input-shell">
     <div
@@ -443,17 +513,61 @@
       >
         ?
       </button>
+    {:else if isStreaming}
+      <!-- 推理中：⏹+▼ 动作菜单（暂停 / 停止 / 强制停止） -->
+      <div class="stop-cell">
+        {#if stopMenuOpen}
+          <div class="stop-menu" bind:this={stopMenuEl}>
+            {#if canPause}
+              <button class="stop-menu-item" onclick={() => pickStopAction(onPause)}>{t('pauseInference')}</button>
+            {/if}
+            <button class="stop-menu-item" onclick={() => pickStopAction(onStop)}>{t('stopInference')}</button>
+            <button class="stop-menu-item danger" onclick={() => pickStopAction(onStopForce)}>{t('forceStopInference')}</button>
+            {#if onInterject && text.trim()}
+              <button class="stop-menu-item" onclick={() => pickStopAction(handleInterjectText)}>{t('attachNewMessage')}</button>
+            {/if}
+          </div>
+        {/if}
+        <button
+          bind:this={stopBtnEl}
+          class="send-btn stop"
+          class:pause-pending={pauseRequested}
+          onclick={toggleStopMenu}
+          title={pauseRequested ? t('pausingTooltip') : t('stopBtnTooltip')}
+        >⏹<span class="caret">▼</span></button>
+      </div>
+    {:else if isPaused}
+      <!-- 暂停态：▶ 恢复推理（输入框有内容时等效普通发送=带消息恢复）；
+           ⏹▼ 结束暂停任务（不恢复，会话按暂停点的完整历史正式收尾）。 -->
+      <div class="stop-cell">
+        {#if stopMenuOpen}
+          <div class="stop-menu" bind:this={stopMenuEl}>
+            <button class="stop-menu-item danger" onclick={() => pickStopAction(onEndPause)}>{t('endPausedTask')}</button>
+          </div>
+        {/if}
+        {#if onEndPause}
+          <button
+            bind:this={stopBtnEl}
+            class="send-btn stop"
+            onclick={toggleStopMenu}
+            title={t('pausedMenuTooltip')}
+          >⏹<span class="caret">▼</span></button>
+        {/if}
+        <button
+          class="send-btn"
+          onclick={handleResumeOrSend}
+          disabled={disabled}
+          title={text.trim() ? t('sendAndResumeTooltip') : t('resumeTooltip')}
+        >▶</button>
+      </div>
     {:else}
-      <!-- 有内容或流式时显示发送/停止按钮 -->
+      <!-- 有内容时显示发送按钮 -->
       <button
         class="send-btn"
-        class:stop={isStreaming}
-        onclick={isStreaming ? handleStopClick : handleSend}
-        disabled={isStreaming ? false : (disabled || !text.trim())}
-        title={isStreaming ? t('stopBtnTooltip') : ''}
-      >
-        {#if isStreaming}⏹{:else}↑{/if}
-      </button>
+        onclick={handleSend}
+        disabled={disabled || !text.trim()}
+        title=""
+      >↑</button>
     {/if}
   </div>
 </div>
@@ -584,8 +698,47 @@
   }
   .send-btn:hover:not(:disabled) { background: var(--primary-hover); }
   .send-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-  .send-btn.stop { background: var(--danger, #e53e3e); }
+  /* 推理中的 ⏹▼ 停止动作按钮：比纯图标略宽以容纳下拉箭头 */
+  .send-btn.stop {
+    width: auto;
+    padding: 0 6px;
+    gap: 2px;
+    background: var(--danger, #e53e3e);
+  }
   .send-btn.stop:hover { background: #c53030; }
+  .send-btn.stop .caret { font-size: 0.55rem; }
+  /* pause 已受理、正等待轮边界生效 */
+  .send-btn.stop.pause-pending { animation: stop-pending-pulse 1.2s ease-in-out infinite; }
+  @keyframes stop-pending-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
+
+  .stop-cell { position: relative; display: flex; justify-content: flex-end; gap: 6px; }
+  .stop-menu {
+    position: absolute;
+    bottom: calc(100% + 6px);
+    right: 0;
+    z-index: 20;
+    display: flex;
+    flex-direction: column;
+    min-width: 130px;
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+    padding: 3px;
+  }
+  .stop-menu-item {
+    border: none;
+    background: transparent;
+    color: var(--text-primary);
+    font-size: 0.8rem;
+    text-align: left;
+    padding: 6px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .stop-menu-item:hover { background: var(--bg-secondary); }
+  .stop-menu-item.danger { color: var(--danger, #e53e3e); }
   /* "+"工作区按钮样式：使用次要色调 */
   .send-btn.workspace-btn {
     background: var(--bg-secondary);

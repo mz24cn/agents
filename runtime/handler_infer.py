@@ -31,9 +31,15 @@ from runtime.common import (
 from runtime.builtin_tools_coding import _FileJournalManagerHolder
 from runtime.models import InferenceRequest, Message, ModelConfig
 from runtime.server_state import (
+    _session_stream_lock,
+    _session_streams,
     begin_session_stream,
+    clear_infer_control,
     disconnect_session_stream_starter,
+    end_paused_session_status,
     finish_session_stream,
+    get_infer_exit_reason,
+    take_infer_interjections,
     get_terminal_for_session,
     IncrementalConversationPersister,
     InLoopContextCompressor,
@@ -41,8 +47,12 @@ from runtime.server_state import (
     merge_stream_messages,
     publish_session_stream_frame,
     persist_conversation,
+    queue_infer_interjection,
+    request_pause_infer,
+    set_session_stream_agents,
     stream_batch_is_protocol_complete,
     StreamUsageEstimator,
+    take_infer_boundary_action,
     transition_session_stream_status,
 )
 
@@ -184,6 +194,11 @@ class HandlerInferMixin:
         # retry_agent_id chooses who performs this retry; agent_ids is the
         # participant roster to retain (and may replace the old roster).
         is_continue = body.get("continue") is True
+        # Resume continues a soft-paused session from its persisted history:
+        # same context-restore path as continue, but WITHOUT removing the
+        # trailing turn (a paused conversation ends on a complete round —
+        # assistant turn + all tool results — waiting to be interpreted).
+        is_resume = body.get("resume") is True
         retry_agent_id = body.get("retry_agent_id") or None
 
         # Resolve agent_ids: support multi-select and retry takeover.
@@ -367,15 +382,35 @@ class HandlerInferMixin:
                         raw_session_id,
                     )
 
-        # === Retry validation ===
+        # === Retry / resume validation ===
         continued_user_message_timestamp = None
-        if is_continue:
+        if is_continue or is_resume:
             if raw_session_id in (None, "new"):
-                self._send_json_error(400, "continue requires an existing session_id")
+                self._send_json_error(400, "continue/resume requires an existing session_id")
                 return None
             if not use_session or session_id is None:
                 self._send_json_error(404, f"Session not found: {raw_session_id}")
                 return None
+            if is_resume:
+                # A resume may only target a resting (paused) session. If a
+                # generation is still running — e.g. a pause was requested but
+                # has not reached its round boundary yet, or another client
+                # already resumed — starting a parallel request would trigger
+                # the supersede-and-cancel path and destroy the running turn.
+                with _session_stream_lock:
+                    active = _session_streams.get(session_id)
+                    still_streaming = (
+                        active is not None
+                        and not active.get("done")
+                        and not (active.get("cancel_event") is not None and active["cancel_event"].is_set())
+                    )
+                if still_streaming:
+                    self._send_json_error(
+                        409,
+                        "session is still inference; pause has not taken effect yet "
+                        "or the session was already resumed",
+                    )
+                    return None
             if len(agent_ids) > 1 and not retry_agent_id:
                 self._send_json_error(400, "group-chat retry requires retry_agent_id")
                 return None
@@ -384,10 +419,8 @@ class HandlerInferMixin:
                     400, "retry requires retry_agent_id or model_id + tool_ids"
                 )
                 return None
-            # Continue is an explicit destructive user action. Do not infer
-            # whether the final response is failed or incomplete; remove exactly
-            # one final assistant message because the request asked us to.
             removed_message = None
+            removed = False
             try:
                 # Capture the identity before the atomic rewrite. The removal is
                 # later published as a retained control frame so other browsers
@@ -395,9 +428,9 @@ class HandlerInferMixin:
                 turns = context_manager.load_conversation(session_id)
                 if turns and turns[-1].role == "assistant":
                     removed_message = turns[-1]
-                # Continue retries the same user turn, so all file operations
-                # must retain that turn's journal key rather than falling back
-                # to the current retry/tool execution time.
+                # Continue/retry resumes the same user turn, so all file
+                # operations must retain that turn's journal key rather than
+                # falling back to the current retry/tool execution time.
                 continued_user_message_timestamp = next(
                     (
                         turn.timestamp
@@ -406,27 +439,41 @@ class HandlerInferMixin:
                     ),
                     None,
                 )
-                removed = context_manager.remove_trailing_assistant_message(session_id)
+                if is_continue:
+                    # Continue is an explicit destructive user action. Do not
+                    # infer whether the final response is failed or incomplete;
+                    # remove exactly one final assistant message because the
+                    # request asked us to. A resume never mutates history: the
+                    # paused conversation already ends on a complete round.
+                    removed = context_manager.remove_trailing_assistant_message(session_id)
             except (OSError, ValueError) as exc:
                 self._send_json_error(
                     500, f"Failed to remove trailing assistant message: {exc}"
                 )
                 return None
-            if not removed:
-                self._send_json_error(
-                    400, "continue requires the final conversation turn to be an assistant message"
+            if is_continue:
+                if not removed:
+                    self._send_json_error(
+                        400, "continue requires the final conversation turn to be an assistant message"
+                    )
+                    return None
+                body["_removed_trailing_assistant"] = True
+                if removed_message is not None:
+                    body["_removed_trailing_assistant_timestamp"] = removed_message.timestamp
+                    body["_removed_trailing_assistant_agent_id"] = removed_message.agent_id
+                logger.info(
+                    "continue: explicitly removed trailing assistant turn from session %s; "
+                    "retry_agent_id=%s agent_ids=%s model_id=%s tool_ids=%s",
+                    session_id, retry_agent_id, agent_ids,
+                    body.get("model_id"), body.get("tool_ids"),
                 )
-                return None
-            body["_removed_trailing_assistant"] = True
-            if removed_message is not None:
-                body["_removed_trailing_assistant_timestamp"] = removed_message.timestamp
-                body["_removed_trailing_assistant_agent_id"] = removed_message.agent_id
-            logger.info(
-                "continue: explicitly removed trailing assistant turn from session %s; "
-                "retry_agent_id=%s agent_ids=%s model_id=%s tool_ids=%s",
-                session_id, retry_agent_id, agent_ids,
-                body.get("model_id"), body.get("tool_ids"),
-            )
+            else:
+                logger.info(
+                    "resume: continuing paused session %s from intact history; "
+                    "agent_ids=%s model_id=%s tool_ids=%s",
+                    session_id, agent_ids,
+                    body.get("model_id"), body.get("tool_ids"),
+                )
 
         # 载入的文件实体（<file>）一律展开：本地会话按本地工作区解析；远程会话的
         # 文件在子端（粘贴上传写的是子端 /tmp 或子端工作区），母端本地没有这些
@@ -441,7 +488,7 @@ class HandlerInferMixin:
         original_messages = None
         user_message_timestamp = None
         timestamp_fallback_used = False
-        if "messages" in body and not is_continue:
+        if "messages" in body and not (is_continue or is_resume):
             from runtime.workspace_manager import expand_workspace_file_refs
             from runtime.common import get_workspace as _get_ws
             now_ts = now_iso()
@@ -463,8 +510,8 @@ class HandlerInferMixin:
             except ValueError as exc:
                 self._send_json_error(400, str(exc))
                 return None
-        elif is_continue:
-            # 继续推理：不携带新用户消息，基于会话既有上下文推理。
+        elif is_continue or is_resume:
+            # 继续推理（continue）/恢复暂停（resume）：不携带新用户消息，基于会话既有上下文推理。
             # File journals still belong to the existing initiating user turn.
             original_messages = []
             user_message_timestamp = continued_user_message_timestamp
@@ -944,6 +991,7 @@ class HandlerInferMixin:
         }
         if session_id is not None:
             begin_session_stream(session_id, cancel_event)
+            set_session_stream_agents(session_id, cancel_event, agent_ids)
             # Continue has already removed the persisted final assistant turn.
             # Retain a control frame before status broadcast so every other
             # browser applies the same mutation before replacement output starts.
@@ -1147,6 +1195,28 @@ class HandlerInferMixin:
                         session_id, exc,
                     )
 
+            # === Soft-pause gate (single-agent only in phase 1) ===
+            # Checked by the tool loop at round boundaries: after a pause is
+            # requested (POST /v1/infer/abort {action: "pause"}), the generator
+            # stops before the next model API call. The conversation persisted
+            # so far is complete, so a later resume continues from it exactly
+            # like a normal next round. Group chat has its own thread model and
+            # is intentionally not pauseable yet.
+            def _pause_gate() -> Optional[dict]:
+                if session_id is None:
+                    return None
+                return take_infer_boundary_action(session_id, cancel_event)
+
+            # Group-chat interjection gate: consumed at every wave boundary
+            # (previous wave fully settled, next wave not yet dispatched).
+            # Interjections only join the shared transcript; group pause is
+            # intentionally not implemented, so this gate never touches the
+            # pause flag (take_infer_interjections is interjection-only).
+            def _group_interject_gate() -> list:
+                if session_id is None:
+                    return []
+                return take_infer_interjections(session_id, cancel_event)
+
             # === 统一消息源 ===
             if is_group_chat:
                 from runtime.group_chat import run_group_chat_stream_gen
@@ -1164,12 +1234,14 @@ class HandlerInferMixin:
                     agent_manager=self.server.agent_manager,  # type: ignore[attr-defined]
                     model_id=model_id,
                     tool_ids=tool_ids,
+                    interject_gate=_group_interject_gate,
                 )
             else:
                 msg_gen = runtime.infer_stream(
                     request,
                     cancel_event=cancel_event,
                     on_round_complete=context_compressor,
+                    pause_gate=_pause_gate,
                 )
 
             for msg in msg_gen:
@@ -1254,17 +1326,30 @@ class HandlerInferMixin:
                 m.role == "assistant" and m.content and m.content.startswith("Error:")
                 for m in collected_messages
             )
+            # A soft pause stopped the generator at a completed round boundary:
+            # the conversation is intact and persisted, but the outcome is a
+            # resting "paused" state, not a finished answer. No title
+            # generation on this path (the aligned decision: 暂停收尾不更新标题).
+            paused_exit = (
+                session_id is not None
+                and get_infer_exit_reason(session_id, cancel_event) == "paused"
+            )
             if use_session and self._is_active_stream(session_id, cancel_event):
                 persist_exc = conversation_persister.finalize(
                     collected_messages,
-                    update_title=not has_error,
+                    update_title=not has_error and not paused_exit,
                 )
                 if persist_exc is not None:
                     logger.error("infer_stream: failed to save conversation for session %s: %s", session_id, persist_exc)
 
             # --- Session Status Stream: broadcast the terminal outcome ---
             if session_id is not None:
-                status = "done_error_unread" if has_error else "done_success_unread"
+                if paused_exit:
+                    status = "paused"
+                elif has_error:
+                    status = "done_error_unread"
+                else:
+                    status = "done_success_unread"
                 transition_session_stream_status(session_id, cancel_event, status)
         except (BrokenPipeError, ConnectionResetError):
             cancel_event.set()
@@ -1337,13 +1422,23 @@ class HandlerInferMixin:
         return active_streams.get(session_id) is cancel_event
 
     def _handle_infer_abort(self) -> None:
-        """POST /v1/infer/abort — 主动中止指定会话的流式推理。
+        """POST /v1/infer/abort — 主动中止/暂停指定会话的流式推理。
 
-        请求体: {"session_id": "<session_id>", "forced": true|false}
-        找到对应的 cancel_event 并 set()，使推理线程在下一个检查点退出。
+        请求体: {"session_id": "<session_id>", "action": "stop"|"force"|"pause"|"end"}
+        （兼容旧版: {"session_id": ..., "forced": true|false}，无 action 字段时
+        forced=true 等价 "force"，否则等价 "stop"。）
 
-        当 forced=true 时，还会主动杀死正在执行的工具进程（exec_cli、MCP），
-        并强制将会话状态标记为 done_error_unread，适用于工具调用卡死的场景。
+        - stop:  找到对应的 cancel_event 并 set()，推理线程在下一个检查点退出。
+        - force: 还会主动杀死正在执行的工具进程（exec_cli、MCP），并强制把会话
+                 状态标记为 done_error_unread，适用于工具调用卡死的场景。
+        - pause: 软暂停。不打断当前模型轮，也不杀任何工具进程；推理循环在下一个
+                 轮边界（上一轮 assistant+tool 结果已完整增量落盘之后、下一次
+                 build_request 之前）干净结束本次 generation，会话状态广播
+                 "paused"。历史保留在 conversation.json，后续恢复 = 一次普通的
+                 续推请求（POST /v1/infer/stream 携带 resume: true）。
+        - end:   结束被暂停的会话（不恢复）。仅当会话处于 paused 且没有活跃
+                 generation 时生效：状态收敛为 done_success_unread 并广播；
+                 其余情况幂等 no-op（ended=false）。
         """
         body = self._read_json_body()
         if body is None:
@@ -1352,14 +1447,35 @@ class HandlerInferMixin:
         if not session_id:
             self._send_json_error(400, "Missing required field: session_id")
             return
-        forced = body.get("forced", False) is True
+        action = body.get("action")
+        if action not in ("stop", "force", "pause", "end"):
+            action = "force" if body.get("forced", False) is True else "stop"
 
         active_streams = getattr(self.server, "active_streams", None)
         target_event = active_streams.get(session_id) if active_streams is not None else None
+
+        if action == "end":
+            # 结束被暂停的会话：不恢复、不新增任何轮次，把 resting 的 paused 状态
+            # 正式收敛为 done_success_unread（历史在暂停点已完整落盘）。会话正在
+            # 推理或状态并非 paused 时是 no-op（幂等）。
+            ended = end_paused_session_status(session_id)
+            self._send_json_response(200, {"ok": True, "action": "end", "ended": ended})
+            return
+
+        if action == "pause":
+            effective = False
+            if target_event is not None:
+                effective = request_pause_infer(session_id, target_event)
+            # 幂等：无活动流/已被替换时 effective=False，前端按普通空闲会话处理。
+            self._send_json_response(200, {"ok": True, "action": "pause", "effective": effective})
+            return
+
         if target_event is not None:
+            # abort 永远赢：先撤掉尚未消费的暂停标志，再触发 cancel。
+            clear_infer_control(session_id, target_event)
             target_event.set()
 
-        if forced:
+        if action == "force":
             self._force_abort(session_id, owner_event=target_event)
             self._send_json_response(200, {"ok": True, "forced": True})
         elif active_streams is not None and session_id in active_streams:
@@ -1367,6 +1483,67 @@ class HandlerInferMixin:
         else:
             # 会话不存在或已结束，视为成功（幂等）
             self._send_json_response(200, {"ok": True, "note": "session not found or already done"})
+
+    def _handle_infer_interject(self) -> None:
+        """POST /v1/infer/interject — 流式推理途中追加一条用户消息。
+
+        请求体: {"session_id": ..., "message": {"role":"user","content":...},
+                 "client_message_id": 可选去重id}
+
+        消息只进入当前 generation 的内存缓冲（不落盘、不新起推理），并在
+        下一个轮边界（本轮所有工具调用完成之后、下一次模型请求之前）被消费：
+        追加进推理循环的消息列表、作为 user 帧发布到会话流、随后由同一
+        generation 继续推理 —— 即"同代续跑"，符合"实时插入"的原有语义。
+
+        - 推理活跃 → 202 {"status": "queued"}（队列上限 10，超出 429）
+        - 推理已结束/不存在 → 200 {"status": "not_active"}，由前端降级为
+          普通发送（基于完整历史的新请求）。
+        - 群聊会话同样支持（粗粒度语义）：插话只在 wave 边界进入共享历史，已在执行的 agent 看不到它，
+          之后的每一轮发言都能看到；插话只改上下文，不改变 agent 调度（调度仍由 @mention 决定）。
+        - stop/force abort 会清空未消费的缓冲（abort 永远赢）；pause 与
+          interject 同到达时插入优先（缓冲非空则不 stop）。
+        """
+        body = self._read_json_body()
+        if body is None:
+            return
+        session_id = body.get("session_id")
+        if not session_id:
+            self._send_json_error(400, "Missing required field: session_id")
+            return
+        message = body.get("message")
+        if not isinstance(message, dict) or message.get("role") != "user":
+            self._send_json_error(400, "Field 'message' must be a user message object")
+            return
+        content = message.get("content")
+        if isinstance(content, str):
+            content = content.strip()
+        if not content:
+            self._send_json_error(400, "Field 'message.content' must be non-empty")
+            return
+        message = dict(message)
+        message["content"] = content
+        message.setdefault("timestamp", now_iso())
+        client_message_id = body.get("client_message_id")
+        if client_message_id:
+            message["client_message_id"] = str(client_message_id)
+
+        active_streams = getattr(self.server, "active_streams", None)
+        target_event = active_streams.get(session_id) if active_streams is not None else None
+        if target_event is None or target_event.is_set():
+            self._send_json_response(200, {"ok": True, "status": "not_active", "session_id": session_id})
+            return
+
+        outcome = queue_infer_interjection(session_id, target_event, message)
+        if outcome == "queued":
+            # Show the turn immediately in every browser attached to the
+            # session stream. The boundary drain re-publishes the same
+            # timestamp, and ChatPage suppresses the duplicate on it.
+            publish_session_stream_frame(session_id, dict(message), owner_event=target_event)
+            self._send_json_response(202, {"ok": True, "status": "queued", "session_id": session_id})
+        elif outcome == "full":
+            self._send_json_error(429, "interjection queue is full (max 10)")
+        else:
+            self._send_json_response(200, {"ok": True, "status": "not_active", "session_id": session_id})
 
     def _force_abort(self, session_id: str, owner_event=None) -> None:
         """Kill running tool processes and force the targeted generation done."""
