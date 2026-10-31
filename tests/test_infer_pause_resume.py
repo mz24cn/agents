@@ -830,22 +830,44 @@ def test_group_chat_interjection_injected_at_wave_boundary():
 def test_interject_end_to_end_continues_same_generation(continue_server):
     """A mid-run interjection surfaces as a user frame and steers the SAME
     generation: the next model call already contains it, and no paused state
-    or new request is involved."""
+    or new request is involved.
+
+    Deterministic by construction — the interjection is queued from inside the
+    scripted handler of the FIRST model round. At that point the generation is
+    streaming, so the request is accepted, and the first round boundary cannot
+    have been reached yet, so the drain is guaranteed to find it. No sleeps, no
+    watching the SSE for a tool frame to decide when to POST, no wall-clock
+    assumption.
+
+    The previous version blocked the *second* model call until the POST had
+    returned, which guards the wrong point: the boundary drains the buffer
+    *before* that call is issued, so under load the drain could run on an empty
+    buffer and the "round 2 already carries the insertion" assertion failed
+    intermittently. That was a test race, not a product race.
+    """
     srv = continue_server
     cm = srv._context_manager
     session_id = cm.create_session()
 
     r1 = _openai_sse_text("", tool_calls=[("echo", "{}")])
     r2 = _openai_sse_text("Considered the insertion.")
-    gate = threading.Event()
     model_bodies = []
+    queue_status = {}
 
     def side_effect(request, **kwargs):
         body = json.loads(request.data.decode("utf-8"))
         model_bodies.append(body)
         if len(model_bodies) > 1:
-            gate.wait(timeout=10)
-        return _make_resp(r1 if len(model_bodies) == 1 else r2)
+            return _make_resp(r2)
+        # Round 1 is in flight: queue the insertion strictly before the
+        # boundary that consumes it.
+        status, res = _post_json(
+            srv, "/v1/infer/interject",
+            {"session_id": session_id,
+             "message": {"role": "user", "content": "also mind X"}},
+        )
+        queue_status.update(status=status, body=res)
+        return _make_resp(r1)
 
     payload = json.dumps({
         "session_id": session_id,
@@ -860,31 +882,32 @@ def test_interject_end_to_end_continues_same_generation(continue_server):
     )
 
     lines = []
-    queue_status = {}
     with _patch_model_urlopen(srv, side_effect):
         resp = urllib.request.urlopen(req, timeout=15)
-        queued = False
         for raw in resp:
-            text = raw.decode("utf-8", "replace")
-            lines.append(text)
-            if '"role": "tool"' in text and not queued:
-                status, res = _post_json(
-                    srv, "/v1/infer/interject",
-                    {"session_id": session_id,
-                     "message": {"role": "user", "content": "also mind X"}},
-                )
-                queue_status.update(status=status, body=res)
-                gate.set()
-                queued = True
-    gate.set()
+            lines.append(raw.decode("utf-8", "replace"))
     body = "".join(lines)
 
     assert queue_status["status"] == 202
     assert queue_status["body"]["status"] == "queued"
-    # The interjection is brokered to the session stream as a user frame.
+    # The interjection is brokered to the session stream as a user frame. On
+    # this (starter) connection it surfaces at the round boundary — after the
+    # completed tool round, before the answer that considered it; the browsers
+    # attached as subscribers also get it the moment it is queued, which is the
+    # arrival order the UI has to repair when the late tool result lands.
     assert '"role": "user"' in body and "also mind X" in body
-    # Same generation: the second model request already carries the insertion.
+    assert (
+        body.index('"role": "tool"')
+        < body.index("also mind X")
+        < body.index("Considered the insertion.")
+    )
+
+    # Same generation: the insertion reached round 2, and it was not part of
+    # round 1 (which started before it could be queued).
     assert len(model_bodies) == 2
+    assert not any(
+        m.get("content") == "also mind X" for m in model_bodies[0]["messages"]
+    )
     assert any(
         m.get("role") == "user" and m.get("content") == "also mind X"
         for m in model_bodies[1]["messages"]
