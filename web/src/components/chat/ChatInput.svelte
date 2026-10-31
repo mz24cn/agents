@@ -7,11 +7,20 @@
   import { remoteWorkspace } from '../../lib/remote-execution.svelte.js'
   import { serializeEditor } from '../../lib/chat-input-serialize.js'
   import { parseFileRefParts, restoreFileRefTags, hasFileRefs } from '../../lib/file-ref.js'
+  import { VoiceRunWriter } from '../../lib/voice-insert.js'
+  import VoiceInput from './VoiceInput.svelte'
 
   let { disabled = false, onSend, onStop, onStopForce, onPause, onResume, onEndPause, onInterject, isPaused = false, pauseRequested = false, canPause = true, onToggleTemplatePanel, onToggleWorkspacePanel, workspacePanelOpen = false, templatePanelOpen = false, text = $bindable(''), isStreaming = false, selectedAgentIds = [], agentList = [], remote = null, onError = () => {} } = $props()
 
   let editorEl = $state(null)
   let lastRenderedText = ''
+
+  // Voice input: recognized words are written straight into the editor at the
+  // caret (a selection is replaced), so they can be edited or discarded before
+  // sending. The writer owns the in-flight run and keeps it from being
+  // duplicated as the service refines the same segment.
+  let voiceWriter = null
+  let voiceInput = $state(null)   // VoiceInput instance (stop() on send/destroy)
 
   // @mention 相关状态
   let mentionMenuOpen = $state(false)
@@ -67,6 +76,9 @@
 
     editorEl.replaceChildren(fragment)
     lastRenderedText = source
+    // The live ASR run was part of the old DOM; a later partial starts a new
+    // one at the caret instead of writing into a detached node.
+    voiceWriter?.reset()
   }
 
   function placeCaretAtEnd() {
@@ -348,6 +360,10 @@
     syncTextFromEditor()
     const trimmed = text.trim()
     if (!trimmed || disabled) return
+    // Stop capturing before handing the text over: a trailing ASR segment
+    // would otherwise land in the box that has just been cleared.
+    voiceInput?.stop?.({ discard: true })
+    voiceWriter?.reset()
     onSend?.(trimmed)
     text = ''
   }
@@ -481,7 +497,11 @@
       </div>
     {/if}
   </div>
-  <div class="btn-stack">
+  <!-- Two rows of two buttons. Top row: workspace file manager + voice input.
+       Bottom row: send/stop (or the prompt-template entry) + the slot reserved
+       for "pause inference", which will let a user message be injected while
+       the agent is reasoning. -->
+  <div class="btn-grid">
     <!-- 工作区文件管理器按钮：打开时显示减号，关闭时显示加号 -->
     <button
       class="send-btn workspace-btn"
@@ -492,7 +512,15 @@
     >
       {workspacePanelOpen ? '−' : '+'}
     </button>
-    
+
+    <VoiceInput
+      bind:this={voiceInput}
+      {disabled}
+      onCommit={handleVoiceCommit}
+      onPartial={handleVoicePartial}
+      {onError}
+    />
+
     {#if templatePanelOpen}
       <!-- 提示词面板打开时显示叉号关闭按钮 -->
       <button
@@ -675,11 +703,13 @@
     margin-right: 4px;
     font-family: system-ui, sans-serif;
   }
-  .btn-stack {
-    display: flex;
-    flex-direction: column;
+  /* 2x2 button grid: workspace + voice on top, send/stop (+ pause/resume) below. */
+  .btn-grid {
+    display: grid;
+    grid-template-columns: repeat(2, auto);
     gap: 4px;
     flex-shrink: 0;
+    justify-content: end;
   }
   .send-btn {
     width: 28px;

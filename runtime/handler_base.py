@@ -224,6 +224,8 @@ _ROUTES: dict[str, list] = {
         (re.compile(r"^/v1/sessions/([^/]+)/file-journals/([^/]+)$"), "_handle_get_file_journal_diff", (urllib.parse.unquote, urllib.parse.unquote)),
         (re.compile(r"^/v1/sessions/([^/]+)/file-journals$"), "_handle_get_file_journals", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/terminals$"), "_handle_list_terminals", ()),
+        # Voice input: is the ASR accessory service (accessories/ASR) up?
+        (re.compile(r"^/v1/asr/health$"), "_handle_asr_health", ()),
         # Parent-side browser bridge: env_id in path, rest forwarded to child.
         (re.compile(r"^/v1/env-proxy/([^/]+)(?:/.*)?$"), "_handle_env_proxy", (urllib.parse.unquote,)),
     ],

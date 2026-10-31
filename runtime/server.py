@@ -95,6 +95,7 @@ from runtime.server_state import (
 # Handler mixins (moved to runtime/handler_*.py)
 # ---------------------------------------------------------------------------
 from runtime.handler_api import HandlerApiMixin
+from runtime.handler_asr import HandlerAsrMixin
 from runtime.handler_base import HandlerBaseMixin
 from runtime.handler_infer import HandlerInferMixin
 from runtime.handler_tunnel import HandlerTunnelMixin
@@ -109,6 +110,7 @@ class _RuntimeRequestHandler(
     HandlerWorkspaceMixin,
     HandlerApiMixin,
     HandlerTunnelMixin,
+    HandlerAsrMixin,
     BaseHTTPRequestHandler,
 ):
     """HTTP request handler that routes requests to the Runtime instance.
@@ -121,6 +123,7 @@ class _RuntimeRequestHandler(
     - HandlerInferMixin: inference endpoints
     - HandlerWorkspaceMixin: workspace + upload endpoints
     - HandlerApiMixin: registries, env, sessions, agents
+    - HandlerAsrMixin: voice input, bridged to the accessories/ASR service
     """
 
     # HTTP/1.1 keep-alive: reuse TCP connections across requests instead of

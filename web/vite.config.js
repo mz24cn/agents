@@ -51,6 +51,14 @@ export default defineConfig({
         target: 'ws://localhost:7988',
         ws: true
       },
+      // Voice input: /v1/asr/ws is a WebSocket upgrade (the runtime bridges
+      // it to the accessories/ASR service), so it needs its own ws-enabled
+      // entry -- the plain /v1 entry below only proxies HTTP.  /v1/asr/health
+      // travels through /v1.
+      '/v1/asr/ws': {
+        target: 'ws://localhost:7988',
+        ws: true
+      },
       '/v1': {
         target: 'http://localhost:7988',
         changeOrigin: true

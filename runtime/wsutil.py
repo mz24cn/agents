@@ -130,7 +130,8 @@ def _recv_exact(sock, n: int) -> bytes:
     return b"".join(chunks)
 
 
-def ws_recv_frame(sock, expect_masked: bool = False) -> Optional[Tuple[int, bytes]]:
+def ws_recv_frame(sock, expect_masked: bool = False,
+                  reply_close: bool = True) -> Optional[Tuple[int, bytes]]:
     """Receive one (unfragmented) frame.
 
     Returns ``(opcode, payload)`` or ``None`` when the connection is closed
@@ -144,6 +145,10 @@ def ws_recv_frame(sock, expect_masked: bool = False) -> Optional[Tuple[int, byte
     (client→server frames are always masked per RFC 6455) and False when
     reading from a server.  A mismatch is tolerated: the actual mask bit in
     the frame header is authoritative.
+
+    ``reply_close`` is False for bridges that send their own teardown close:
+    answering the close handshake twice makes Chrome log "Close received after
+    close", which looks exactly like a failed recording.
     """
     try:
         header = _recv_exact(sock, 2)
@@ -158,10 +163,11 @@ def ws_recv_frame(sock, expect_masked: bool = False) -> Optional[Tuple[int, byte
         return None
     if opcode == OP_CLOSE:
         # Consume the close frame: reply best-effort, then report closed.
-        try:
-            ws_send_frame(sock, b"", OP_CLOSE)
-        except OSError:
-            pass
+        if reply_close:
+            try:
+                ws_send_frame(sock, b"", OP_CLOSE)
+            except OSError:
+                pass
         return None
 
     payload_len = b2 & 0x7F

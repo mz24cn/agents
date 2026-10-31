@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<!--
+  ASR 服务 Web UI —— 麦克风实时字幕 / 本地音频文件转写 / 引擎切换 / 实时指标
+  打开方式：推荐由 ASR 服务直接提供 http://<host>:7996/webui（WS/HTTP 同端口，
+  地址会自动填成本页来源）；也可直接双击打开，或 python -m http.server
+  （浏览器只给安全上下文麦克风权限：http://localhost 与 https 可用，
+  从别的机器访问需要 https 或 chrome://flags 放行）
+-->
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>ASR 流式识别</title>
+<style>
+  :root { --bg:#111418; --fg:#e6edf3; --dim:#8b949e; --line:#2b3138; --acc:#3fb950; --warn:#d29922; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif; }
+  header { padding:14px 20px; border-bottom:1px solid var(--line); display:flex; gap:14px; align-items:center; flex-wrap:wrap; }
+  h1 { font-size:16px; margin:0; }
+  .pill { font-size:12px; color:var(--dim); border:1px solid var(--line); border-radius:999px; padding:2px 10px; }
+  main { display:grid; grid-template-columns: 1.4fr 1fr; gap:16px; padding:16px 20px; }
+  @media (max-width:900px){ main{grid-template-columns:1fr;} }
+  .card { background:#161b22; border:1px solid var(--line); border-radius:10px; padding:14px; }
+  .card h2 { font-size:13px; margin:0 0 10px; color:var(--dim); font-weight:600; letter-spacing:.05em; }
+  button { background:#21262d; color:var(--fg); border:1px solid var(--line); border-radius:8px;
+           padding:8px 14px; cursor:pointer; font-size:14px; }
+  button:hover { border-color:#545d68; }
+  button.primary { background:#1f6feb; border-color:#1f6feb; }
+  button.danger { background:#a40e26; border-color:#a40e26; }
+  input, select { background:#0d1117; color:var(--fg); border:1px solid var(--line);
+                  border-radius:6px; padding:6px 8px; font-size:13px; }
+  label { color:var(--dim); font-size:12px; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:10px; }
+  #out { min-height:220px; max-height:52vh; overflow:auto; white-space:pre-wrap; }
+  .final { color:var(--fg); }
+  .spk { display:inline-block; min-width:24px; text-align:center; padding:0 5px; margin-right:4px;
+         border-radius:3px; font-size:11px; color:#fff; background:#666; }
+  .spkS1 { background:#2f6fb7; } .spkS2 { background:#b7652f; } .spkS3 { background:#2f9e6b; }
+  .spkS4 { background:#8a4fa0; } .spkS5 { background:#a04f4f; }
+  .partial { color:var(--warn); }
+  .meta { color:var(--dim); font-size:12px; }
+  .bar { height:8px; background:#0d1117; border-radius:6px; overflow:hidden; }
+  .bar > i { display:block; height:100%; width:0%; background:var(--acc); transition:width .1s; }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  td { padding:4px 6px; border-bottom:1px solid var(--line); color:var(--dim); }
+  td:last-child { color:var(--fg); text-align:right; }
+  canvas { width:100%; height:48px; background:#0d1117; border-radius:6px; }
+  .log { font-family:ui-monospace,Menlo,monospace; font-size:11px; color:var(--dim);
+         max-height:160px; overflow:auto; white-space:pre-wrap; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ASR 流式识别</h1>
+  <span class="pill" id="state">未连接</span>
+  <span class="pill" id="enginePill">engine: -</span>
+  <span class="pill" id="rtf">rtf: -</span>
+  <span class="pill" id="latency">首字延迟: -</span>
+</header>
+
+<main>
+  <section class="card">
+    <h2>实时字幕</h2>
+    <div class="row">
+      <button class="primary" id="btnMic">开始录音</button>
+      <button id="btnStop">停止</button>
+      <button id="btnClear">清空</button>
+      <label>采样率
+        <select id="sr">
+          <option value="16000">16000（推荐）</option>
+          <option value="8000">8000（电话）</option>
+          <option value="44100">44100</option>
+        </select>
+      </label>
+      <label>判停(ms) <input id="silence" type="number" value="800" style="width:70px"></label>
+      <label>最大段长(ms) <input id="maxseg" type="number" value="15000" style="width:80px"></label>
+      <label><input type="checkbox" id="dump"> 存本次录音(WAV)</label>
+    </div>
+    <canvas id="wave"></canvas>
+    <div class="bar" style="margin:8px 0"><i id="level"></i></div>
+    <div id="out"></div>
+  </section>
+
+  <section>
+    <div class="card">
+      <h2>连接</h2>
+      <div class="row">
+        <label>WS <input id="url" size="26" value="ws://127.0.0.1:7996/asr/ws"></label>
+        <label>HTTP <input id="http" size="26" value="http://127.0.0.1:7996"></label>
+        <label>token <input id="token" size="10" placeholder="可选"></label>
+      </div>
+      <div class="row">
+        <button id="btnHealth">读取状态</button>
+        <button id="btnEngines">引擎列表</button>
+        <select id="engineSel"></select>
+        <button id="btnSwitch">切换引擎</button>
+      </div>
+      <div class="log" id="log"></div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <h2>本地文件转写（wav / mp3 / m4a）</h2>
+      <div class="row">
+        <input type="file" id="file">
+        <button id="btnFile">转写</button>
+        <label><input type="checkbox" id="seg" checked> 分段</label>
+      </div>
+      <div id="fileOut" class="final"></div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <h2>指标</h2>
+      <table id="stats"><tr><td>等待数据</td><td>-</td></tr></table>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const out = $('out'), logEl = $('log');
+let ws = null, audioCtx = null, mediaStream = null, node = null, srcNode = null;
+let partialEl = null, segStart = 0, t0 = 0, firstPartial = null, segCount = 0;
+let resampler = null, pending = new Float32Array(0);
+let dumpChunks = [], dumpOn = false;
+
+// 本页由 ASR 服务自己提供时（GET /webui），默认指向本页来源：WS 与 HTTP 同端口
+if (location.protocol === 'http:' || location.protocol === 'https:') {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  $('url').value = proto + '//' + location.host + '/asr/ws';
+  $('http').value = location.origin;
+}
+
+function log(msg) {
+  const t = new Date().toLocaleTimeString();
+  logEl.textContent = `[${t}] ${msg}\n` + logEl.textContent;
+}
+function setState(s, color) { $('state').textContent = s; $('state').style.color = color || ''; }
+
+// 说话人标签（服务端 --spk 开着时 final 才带 spk）
+function spkBadge(d) {
+  if (!d.spk) return '';
+  return `<span class="spk spk${d.spk}" title="说话人 ${d.spk}">${d.spk}</span>`;
+}
+function spkMeta(d) {
+  if (!d.spk) return '';
+  let s = ' · ' + d.spk;
+  if (d.sim !== null && d.sim !== undefined) s += ' 相似度 ' + d.sim;
+  if (d.spk_short) s += '（段太短，沿用上一位）';
+  if (d.spk_ms !== null && d.spk_ms !== undefined) s += ' · 声纹 ' + d.spk_ms + 'ms';
+  return s;
+}
+
+function httpUrl(path) {
+  const base = $('http').value.replace(/\/$/, '');
+  const tk = $('token').value;
+  return base + path + (tk ? `?token=${encodeURIComponent(tk)}` : '');
+}
+
+// ---------------- WebSocket ----------------
+function connect() {
+  let url = $('url').value;
+  const tk = $('token').value;
+  if (tk) url += (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(tk);
+  url += (url.includes('?') ? '&' : '?') + 'sample_rate=' + $('sr').value;
+  ws = new WebSocket(url);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => {
+    setState('已连接', 'var(--acc)');
+    ws.send(JSON.stringify({type: 'config', sample_rate: +$('sr').value, language: 'zh',
+      vad: {max_end_silence_ms: +$('silence').value, max_segment_ms: +$('maxseg').value}}));
+    log('WS 已连接: ' + url);
+  };
+  ws.onmessage = (e) => {
+    const d = JSON.parse(e.data);
+    if (d.type === 'ready') {
+      $('enginePill').textContent = 'engine: ' + d.engine + ' / ' + d.device;
+      log('ready: ' + JSON.stringify(d));
+    } else if (d.type === 'segment_start') {
+      segStart = d.start_ms;
+    } else if (d.type === 'partial') {
+      if (firstPartial === null) { firstPartial = ((performance.now() - t0) / 1000).toFixed(2);
+                                   $('latency').textContent = '首字延迟: ' + firstPartial + 's'; }
+      if (!partialEl) { partialEl = document.createElement('div'); partialEl.className = 'partial'; out.appendChild(partialEl); }
+      partialEl.textContent = `[${d.seg_id}] ${d.text}`;
+      out.scrollTop = out.scrollHeight;
+    } else if (d.type === 'final') {
+      segCount++;
+      if (partialEl) partialEl.remove();
+      partialEl = null;
+      const div = document.createElement('div');
+      div.className = 'final';
+      div.innerHTML = `${spkBadge(d)}<b>${d.text}</b><div class="meta">seg ${d.seg_id} · ${d.start_ms}~${d.end_ms}ms · ` +
+                      `took ${d.took_ms}ms · rtf ${d.rtf} · ${d.reason}${spkMeta(d)}</div>`;
+      out.appendChild(div);
+      out.scrollTop = out.scrollHeight;
+      $('rtf').textContent = 'rtf: ' + d.rtf;
+    } else if (d.type === 'segment_cancel') {
+      if (partialEl) partialEl.remove();
+      partialEl = null;
+      log('杂音段已撤销: seg ' + d.seg_id + ' (' + (d.reason || '') + ')');
+    } else if (d.type === 'replay') {
+      if (partialEl) partialEl.remove();
+      partialEl = null;
+      const div = document.createElement('div');
+      div.className = 'final';
+      div.innerHTML = `${spkBadge(d)}<b>${d.text}</b><div class="meta">补发 seg ${d.seg_id} · ` +
+                      `${d.start_ms}~${d.end_ms}ms${spkMeta(d)}</div>`;
+      out.appendChild(div);
+      out.scrollTop = out.scrollHeight;
+    } else if (d.type === 'stats') {
+      renderStats(d);
+    } else if (d.type === 'error') {
+      log('错误: ' + (d.message || JSON.stringify(d)));
+    } else {
+      log(d.type + ': ' + JSON.stringify(d));
+    }
+  };
+  ws.onclose = (e) => { setState('已断开', 'var(--warn)'); log('WS 关闭 code=' + e.code + ' ' + (e.reason||'')); };
+  ws.onerror = () => log('WS 出错');
+}
+
+// ---------------- 麦克风 ----------------
+const wave = $('wave'), wctx = wave.getContext('2d');
+function drawWave(data) {
+  const w = wave.width = wave.clientWidth * devicePixelRatio;
+  const h = wave.height = 48 * devicePixelRatio;
+  wctx.clearRect(0, 0, w, h); wctx.strokeStyle = '#3fb950'; wctx.beginPath();
+  for (let i = 0; i < data.length; i++) {
+    const x = i / data.length * w, y = h / 2 - data[i] * h / 2;
+    i ? wctx.lineTo(x, y) : wctx.moveTo(x, y);
+  }
+  wctx.stroke();
+}
+
+async function startMic() {
+  if (ws && ws.readyState === 1) ws.close();
+  connect();
+  const targetRate = +$('sr').value;
+  mediaStream = await navigator.mediaDevices.getUserMedia({
+    audio: {echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1}});
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  srcNode = audioCtx.createMediaStreamSource(mediaStream);
+  node = audioCtx.createScriptProcessor(1024, 1, 1);
+  resampler = new AntiAliasResampler(audioCtx.sampleRate, targetRate);
+  pending = new Float32Array(0);
+  dumpChunks = []; dumpOn = !!$('dump').checked;
+
+  node.onaudioprocess = (e) => {
+    const ch = e.inputBuffer.getChannelData(0);
+    drawWave(ch);
+    let peak = 0; for (let i = 0; i < ch.length; i++) peak = Math.max(peak, Math.abs(ch[i]));
+    $('level').style.width = Math.min(100, peak * 220) + '%';
+    // 重采样到目标采样率，再切 20ms 帧发出去
+    sendFrames(resampler ? resampler.process(ch) : ch);
+  };
+  srcNode.connect(node); node.connect(audioCtx.destination);
+  t0 = performance.now(); firstPartial = null;
+  setState('录音中', 'var(--acc)');
+  log(`麦克风已开启 ctx=${audioCtx.sampleRate}Hz -> ${targetRate}Hz` + (dumpOn ? ' (存WAV)' : ''));
+}
+
+/** 重采样后的 float32 -> 20ms PCM16 帧：发出去，勾选时同时留一份用于离线 A/B。 */
+function sendFrames(chunk) {
+  const merged = new Float32Array(pending.length + chunk.length);
+  merged.set(pending); merged.set(chunk, pending.length);
+  const frame = 320;                       // 20ms @16k
+  let i = 0;
+  for (; i + frame <= merged.length; i += frame) {
+    const slice = merged.subarray(i, i + frame);
+    const pcm = new Int16Array(slice.length);
+    for (let j = 0; j < slice.length; j++) pcm[j] = Math.max(-32768, Math.min(32767, slice[j] * 32767));
+    if (dumpOn) dumpChunks.push(pcm);
+    if (ws && ws.readyState === 1) ws.send(pcm.buffer);
+  }
+  pending = merged.slice(i);
+}
+
+/**
+ * 抗混叠重采样（加窗 sinc 抽取）。
+ *
+ * 线性插值在降采样时不安全：48k 的 block 直接拉到 16k，会把 8kHz 以上的分量
+ * **原幅度**折回语音带（实测 12kHz 正弦变成 4kHz、峰值 1.000），模型分不清它和
+ * 语音，擦音/声调首当其冲。所以每个输出点做一次加窗 sinc 内插，降采样时 sinc 按
+ * to/from 收窄，等效截止在 to/2。跨 block 保留历史，边界不咔哒。
+ * 与聊天客户端 web/src/lib/asr-client.js 的 AntiAliasResampler 同一套。
+ */
+class AntiAliasResampler {
+  constructor(fromRate, toRate, taps = 24) {
+    this.from = Number(fromRate) || toRate;
+    this.to = Number(toRate) || fromRate;
+    this.half = Math.max(2, Math.round(taps));
+    this.step = this.from / this.to;           // 每个输出点占多少输入点
+    this.beta = Math.min(1, this.to / this.from);
+    this._kernels = [];
+    // 先垫 half 个静音，头几个输出点也有完整窗口（尾部由 flush() 补零）
+    this._buf = new Float32Array(this.half);
+    this._base = -this.half;
+    this._out = 0;
+  }
+
+  _kernel(phase) {
+    const slot = Math.round(phase * 256) % 257;
+    const cached = this._kernels[slot];
+    if (cached) return cached;
+    const b = this.beta, half = this.half;
+    // 奇数抽头、关于 x=0 对称：不对称会把线性相位毁掉，阻带从 ~45dB 塌到 ~15dB
+    const k = new Float32Array(2 * half + 1);
+    for (let j = 0; j <= 2 * half; j++) {
+      const x = j - half + phase, ax = Math.abs(x);
+      if (ax > half) { k[j] = 0; continue; }
+      const y = b * x;
+      const sinc = y === 0 ? 1 : Math.sin(Math.PI * y) / (Math.PI * y);
+      k[j] = b * sinc * (0.54 + 0.46 * Math.cos(Math.PI * ax / half));
+    }
+    // 加窗 sinc 和约等于 1 但不精确；除以抽头和把通带（和直流）钉在 unity
+    let total = 0;
+    for (const v of k) total += v;
+    if (total) for (let j = 0; j < k.length; j++) k[j] /= total;
+    this._kernels[slot] = k;
+    return k;
+  }
+
+  /** 处理一个 block；只返回完整的输出点，其余留在缓冲里。 */
+  process(input) {
+    if (this.from === this.to) return input;
+    const merged = new Float32Array(this._buf.length + input.length);
+    merged.set(this._buf); merged.set(input, this._buf.length);
+    this._buf = merged;
+    const base = this._base, half = this.half, step = this.step;
+    const last = base + merged.length - 1;
+    const out = [];
+    while (true) {
+      const pos = this._out * step, centre = Math.floor(pos);
+      if (centre - half < base || centre + half > last) break;
+      const k = this._kernel(pos - centre);
+      let acc = 0;
+      for (let j = 0; j <= 2 * half; j++) acc += k[j] * merged[centre - half + j - base];
+      out.push(acc);
+      this._out++;
+    }
+    // 留下够下个 block 首个窗口用的历史
+    const keep = 2 * half;
+    if (merged.length > keep) { this._base = base + merged.length - keep; this._buf = merged.slice(-keep); }
+    else this._base = base;
+    return Float32Array.from(out);
+  }
+
+  /** 收尾：输入侧补零把剩下的输出点挤出来（停止时调一次）。 */
+  flush() {
+    if (this.from === this.to) return new Float32Array(0);
+    const half = this.half, step = this.step;
+    const merged = new Float32Array(this._buf.length + half);
+    merged.set(this._buf);
+    const base = this._base, last = base + merged.length - 1;
+    const out = [];
+    while (true) {
+      const pos = this._out * step, centre = Math.floor(pos);
+      if (centre - half < base || centre + half > last) break;
+      const k = this._kernel(pos - centre);
+      let acc = 0;
+      for (let j = 0; j <= 2 * half; j++) acc += k[j] * merged[centre - half + j - base];
+      out.push(acc);
+      this._out++;
+    }
+    this._buf = new Float32Array(0); this._base = base + merged.length;
+    return Float32Array.from(out);
+  }
+}
+
+/** 把这次实际发出去的 PCM16 帧拼成 WAV 下载，用于离线复现/换参数对比。 */
+function dumpWav() {
+  let n = 0; for (const c of dumpChunks) n += c.length;
+  if (!n) { log('本次没有可保存的音频'); return; }
+  const rate = +$('sr').value || 16000;
+  const buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+  const put = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  put(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); put(8, 'WAVE');
+  put(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  put(36, 'data'); v.setUint32(40, n * 2, true);
+  let o = 44;
+  for (const c of dumpChunks) { for (let i = 0; i < c.length; i++, o += 2) v.setInt16(o, c[i], true); }
+  const d = new Date(), p = (x) => String(x).padStart(2, '0');
+  const name = `asr_${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}` +
+               `_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}_${rate}hz.wav`;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([buf], {type: 'audio/wav'}));
+  a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  log(`已保存 ${name}：${(n / rate).toFixed(1)}s / ${n} 采样 -> python asr_client.py --file ${name} --no-realtime`);
+  dumpChunks = [];
+}
+
+function stopMic() {
+  if (resampler) { sendFrames(resampler.flush()); resampler = null; }
+  if (node) { try { srcNode.disconnect(); node.disconnect(); } catch (e) {} node = null; }
+  if (audioCtx) { audioCtx.close(); audioCtx = null; }
+  if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({type: 'flush'}));
+  setState('已停止', 'var(--warn)');
+  log('已停止录音（已发送 flush）');
+  if (dumpOn) dumpWav();
+  setTimeout(() => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({type: 'stats'})); }, 800);
+}
+
+// ---------------- 控制面 ----------------
+async function health() {
+  const r = await fetch(httpUrl('/health'));
+  const d = await r.json();
+  $('enginePill').textContent = 'engine: ' + (d.engine || '-') + ' / ' + (d.mem.device || '');
+  log('health: ' + d.status + ' warmup=' + d.warmup + ' sessions=' + d.sessions);
+  renderStats({mem: d.mem, counters: d.counters, vad: d.vad, audio_ms: d.counters.audio_ms,
+               finals: d.counters.finals, uptime_s: d.uptime_s});
+}
+async function engines() {
+  const r = await fetch(httpUrl('/engines'));
+  const d = await r.json();
+  const sel = $('engineSel'); sel.innerHTML = '';
+  d.engines.forEach(e => {
+    const o = document.createElement('option');
+    o.value = e.name; o.textContent = e.name + (e.available ? '' : ' (不可用)');
+    if (e.name === d.current) o.selected = true;
+    sel.appendChild(o);
+  });
+  log('引擎: ' + d.engines.map(e => e.name + (e.available ? '' : '*')).join(', '));
+}
+async function switchEngine() {
+  const r = await fetch(httpUrl('/engine'), {method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({name: $('engineSel').value})});
+  const d = await r.json();
+  log('切换引擎: ' + JSON.stringify(d).slice(0, 200));
+}
+async function transcribeFile() {
+  const f = $('file').files[0];
+  if (!f) { log('先选文件'); return; }
+  $('fileOut').textContent = '转写中…';
+  const buf = await f.arrayBuffer();
+  let b64 = '', u8 = new Uint8Array(buf);
+  for (let i = 0; i < u8.length; i += 0x8000)
+    b64 += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+  const body = {audio_b64: btoa(b64), format: (f.name.split('.').pop() || 'wav'),
+                with_segments: $('seg').checked};
+  const r = await fetch(httpUrl('/transcribe'), {method: 'POST',
+    headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  const d = await r.json();
+  if (!d.ok) { $('fileOut').textContent = '失败: ' + d.error; log('转写失败: ' + d.error); return; }
+  let html = `<b>${d.text}</b><div class="meta">${d.engine} · ${d.audio_ms}ms 音频 · ${d.elapsed_ms}ms 耗时</div>`;
+  (d.segments || []).forEach(s => html += `<div class="meta">[${s.start_ms}-${s.end_ms}] ${s.text}</div>`);
+  $('fileOut').innerHTML = html;
+  log(`文件转写完成: ${d.elapsed_ms}ms / ${d.audio_ms}ms 音频`);
+}
+
+function renderStats(d) {
+  const rows = [];
+  if (d.mem) rows.push(['显存 空闲/总', (d.mem.free_mb ?? '-') + ' / ' + (d.mem.total_mb ?? '-') + ' MB',
+                        ], ['torch 占用', (d.mem.torch_alloc_mb ?? '-') + ' MB'],
+                       ['GPU', d.mem.gpu || d.mem.device]);
+  if (d.counters) { rows.push(['final 段数', d.counters.finals]); rows.push(['音频累计', (d.counters.audio_ms/1000).toFixed(1)+'s']); }
+  if (d.audio_ms !== undefined) rows.push(['本次会话音频', (d.audio_ms/1000).toFixed(1) + 's']);
+  if (d.partials !== undefined) rows.push(['partial 次数', d.partials]);
+  if (d.uptime_s !== undefined) rows.push(['运行时长', d.uptime_s + 's']);
+  if (d.vad) rows.push(['VAD 段/丢弃', (d.vad.segments ?? '-') + ' / ' + (d.vad.rejected_short ?? '-')]);
+  $('stats').innerHTML = rows.map(r => `<tr><td>${r[0]}</td><td>${r[1]}</td></tr>`).join('');
+}
+
+$('btnMic').onclick = () => startMic().catch(e => log('麦克风失败: ' + e));
+$('btnStop').onclick = stopMic;
+$('btnClear').onclick = () => { out.innerHTML = ''; partialEl = null; };
+$('btnHealth').onclick = () => health().catch(e => log('health 失败: ' + e));
+$('btnEngines').onclick = () => engines().catch(e => log('engines 失败: ' + e));
+$('btnSwitch').onclick = () => switchEngine().catch(e => log('切换失败: ' + e));
+$('btnFile').onclick = () => transcribeFile().catch(e => log('转写失败: ' + e));
+health(); engines();
+</script>
+</body>
+</html>

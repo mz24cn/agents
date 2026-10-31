@@ -21,6 +21,7 @@
 - **服务级授权系统** — 面向单租户场景的可选授权机制，保护所有 `/v1/*` API；脚本/SDK 使用 Bearer API Key，Web UI 使用 HttpOnly Session Cookie；凭据以哈希形式保存在本地 `~/.agents_runtime/auth_token.json`，`/v1/setup` 导出链接使用短有效期 setup token（`token` 参数也接受长效 API Key，便于持久化链接）
 - **HTTP API 服务** — 基于 `http.server` 的轻量 REST API，无需 FastAPI/uvicorn
 - **多模态** — 支持图片（base64）和音频输入，适配 VLM 模型；非 VLM 模型收到图片时，自动通过 `read_image` 工具调用 VLM 模型将图片转述为文本（需注册 `model_id` 或 `labels` 含 `read-image` 的 VLM 模型）
+- **语音输入（ASR）** — 对着麦克风说话，边上说边上出字（`partial` 累积文本、停顿出 `final`）：能量 VAD 自动断句、引擎自带或 ct-punc 补标点、可选说话人标签（`S1/S2…`），浏览器任意采样率（常见 48kHz）抗混叠重采样到 16kHz，断线重连补发漏掉的 final；识别服务为独立进程 `accessories/ASR/`（默认 `127.0.0.1:7996`，模型常驻显存、多路并发、引擎热切换、`POST /transcribe` 整文件转写），runtime 以 `/v1/asr/health` 与 `/v1/asr/ws` 同源桥转发并由服务端注入 ASR token，识别文字按光标位置写入输入框；`AGENTS_ASR_URL` 留空即整个功能关闭（UI 不出现麦克风）
 - **对话持久化加固与继续推理** — 推理过程中每完成一轮工具调用即增量落盘（`conversation.json`），服务器异常重启时最多丢失最后一轮；中断的会话（最后一轮为用户消息/工具调用/工具结果）可在 Web UI 中一键"继续推理"，基于既有上下文恢复，无需重发消息；`POST /v1/infer/stream` 请求体加 `"continue": true` 即可通过 API 触发
 - **多任务并发对话及实时状态跟踪** — 支持多个聊天会话同时进行，每个会话独立管理流式状态；通过 SSE 实时更新会话状态（流式中、成功、错误、未读）；基于用户滚动位置自动管理已读状态；会话标题实时广播更新
 - **多浏览器共享会话实时推理** — 同一会话可在多个浏览器或标签页中同步观看和操作；服务端保留并广播当前用户消息、assistant/token、thinking、工具调用及结果等推理帧，新加入的浏览器可重放尚未落盘的实时进度；切换会话或浏览器后可继续接收推理，重新发送末次推理（Continue）时对旧 assistant 消息的移除也会同步到其他浏览器

@@ -12,6 +12,10 @@
 
 ## 📰 更新动态（News）
 
+### 2026-10-31
+
+- **语音实时输入（ASR）** — 聊天输入框多了一个麦克风：对着说话，边上说边上出字（`partial` 实时累积、停顿落 `final`），能量 VAD 自动断句补标点、可选说话人标签，识别文字按光标位置写入输入框，断线重连自动补发漏掉的句子。识别服务是一个独立进程（`accessories/ASR/`，默认 `127.0.0.1:7996`：模型常驻显存、多路并发、引擎热切换，另有 `POST /transcribe` 整文件转写），agent 侧配好 `AGENTS_ASR_URL` 即启用、留空则界面上不出现麦克风。**需要 4GB 或以上显存**，推荐 `qwen3-asr-0.6b`（`Qwen/Qwen3-ASR-0.6B`）：同一批真实旁白实测准确率在各引擎里最高，延迟也宽裕（RTF 0.1~0.2，1080 Ti / 5060 实测）。[安装与用法](accessories/ASR/README.md)
+
 ### 2026-09-17
 
 - **TUI 对话客户端（`tui.py`）** — 纯 Python 标准库实现的本地终端对话客户端：终端内流式对话、斜杠命令管理、会话管理，零第三方依赖，SSH 登录服务器后 `python tui.py` 即开即聊，用法见 [docs/introduce-tui.md](docs/introduce-tui.md)；其主要用途之一是子端隧道注册，`/tunnel register <url>` 将本机 agent 注册到母端，供远程访问。

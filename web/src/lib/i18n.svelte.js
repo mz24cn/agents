@@ -215,10 +215,28 @@ const translations = {
     // AudioPlayer
     audioNotSupported: '浏览器不支持音频播放',
 
-    // AudioRecorder
-    audioUnavailable: '🎙️ 录音功能不可用',
-    stopRecording: '停止录音',
-    startRecording: '开始录音',
+    // VoiceInput（语音输入 → accessories/ASR 流式识别）
+    audioUnavailable: '🎤️ 语音输入不可用',
+    voiceInput: '语音输入（识别结果插入输入框）',
+    voiceListening: '正在聆听… 再点一次结束',
+    voiceConnecting: '连接识别服务…',
+    voiceFinalizing: '识别收尾中…',
+    voiceEngineReady: '语音输入（识别引擎：{engine}）',
+    voiceServiceDown: '语音识别服务未启动：python accessories/ASR/ASR_server.py',
+    voiceNotConfigured: '未启用语音输入：设置 AGENTS_ASR_URL 指向 ASR 服务',
+    voiceInsecureContext: '麦克风需要安全上下文：请用 https 或 localhost 访问（当前 {origin}）',
+    voiceUnsupported: '当前浏览器不支持麦克风采集',
+    voiceMicDenied: '麦克风权限被拒绝（可在浏览器地址栏重新允许）',
+    voiceMicMissing: '没有找到可用的麦克风设备',
+    asrDisconnected: '语音识别连接中断',
+    asrUnauthorized: '识别服务拒绝连接（token 不匹配）',
+    voiceNoAudio: '浏览器没有采到任何音频：麦克风可能被系统静音，或采集通道被拦截',
+    voiceNoResult: '已送出音频，但服务端没识别出语音：多半是麦克风静音、音量太小或选错了输入设备',
+    voiceAudioBlocked: '浏览器暂停了音频采集（AudioContext 未运行），让页面保持在前台后重试',
+    voiceMicStalled: '浏览器中途停止了送音频（音频采集被挂起）：把标签页切回前台，或重新点一次麦克风',
+    voiceNoSpeechDetected: '麦克风在收声，但服务端没切出语音段：多半是底噪被自动增益抬高或声音太轻，离麦克风近一点再试',
+    stopRecording: '停止语音输入',
+    startRecording: '开始语音输入',
 
     // ChatInput
     inputPlaceholder: '输入消息...',
@@ -926,10 +944,28 @@ const translations = {
     // AudioPlayer
     audioNotSupported: 'Audio playback not supported',
 
-    // AudioRecorder
-    audioUnavailable: '🎙️ Recording unavailable',
-    stopRecording: 'Stop recording',
-    startRecording: 'Start recording',
+    // VoiceInput (voice input -> accessories/ASR streaming recognition)
+    audioUnavailable: '🎤️ Voice input unavailable',
+    voiceInput: 'Voice input (transcription is inserted into the box)',
+    voiceListening: 'Listening… click again to finish',
+    voiceConnecting: 'Connecting to the ASR service…',
+    voiceFinalizing: 'Finalizing…',
+    voiceEngineReady: 'Voice input (engine: {engine})',
+    voiceServiceDown: 'ASR service is not running: python accessories/ASR/ASR_server.py',
+    voiceNotConfigured: 'Voice input is not enabled: set AGENTS_ASR_URL to the ASR service',
+    voiceInsecureContext: 'Microphone needs a secure context: use https or localhost (current: {origin})',
+    voiceUnsupported: 'This browser cannot capture microphone audio',
+    voiceMicDenied: 'Microphone permission denied (re-allow it in the address bar)',
+    voiceMicMissing: 'No microphone device found',
+    asrDisconnected: 'Transcription connection lost',
+    asrUnauthorized: 'ASR service rejected the connection (token mismatch)',
+    voiceNoAudio: 'The browser captured no audio: the microphone may be muted at OS level or blocked',
+    voiceNoResult: 'Audio was sent but no speech was recognized: the mic is probably muted, too quiet, or the wrong input device',
+    voiceAudioBlocked: 'The browser suspended audio capture (AudioContext not running); keep the tab in the foreground and retry',
+    voiceMicStalled: 'The browser stopped delivering audio mid-recording (capture suspended); bring the tab back to the foreground or tap the mic again',
+    voiceNoSpeechDetected: 'The mic is capturing but the service never opened a speech segment: the noise floor is probably raised by auto-gain or the voice is too quiet - get closer to the mic',
+    stopRecording: 'Stop voice input',
+    startRecording: 'Start voice input',
 
     // ChatInput
     inputPlaceholder: 'Type a message...',
