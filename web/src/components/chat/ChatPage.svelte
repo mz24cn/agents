@@ -17,6 +17,7 @@
   import { buildFileJournalTurnKeyMap } from '../../lib/file-journals.js'
   import { restoreFileRefTags } from '../../lib/file-ref.js'
   import { mergeToolCallDeltas, startsNewToolCallRound } from '../../lib/stream-messages.js'
+  import { assistantIndexForToolCall, insertToolMessage } from '../../lib/stream-tool-placement.js'
   import { t } from '../../lib/i18n.svelte.js'
   import { forkContextWarning } from '../../lib/session-fork.js'
   import { navigate } from '../../lib/router.svelte.js'
@@ -1346,13 +1347,7 @@
   }
 
   function findAssistantIndexForToolCall(messages, toolUseId) {
-    if (!toolUseId) return -1
-    return messages.findLastIndex(message =>
-      message.role === 'assistant'
-      && (message.tool_calls || []).some(call =>
-        (call?.id || call?.tool_use_id) === toolUseId
-      )
-    )
+    return assistantIndexForToolCall(messages, toolUseId)
   }
 
   function resolveToolOwnerAgentId(msg, messages) {
@@ -1569,13 +1564,13 @@
             })
             store.messages = arr
           } else {
-            store.messages = [...msgs, normalizeToolMessage(msg, {
+            store.messages = insertToolMessage(msgs, normalizeToolMessage(msg, {
               role: 'tool',
               name: msg.name || '',
               content: delta,
               streaming: true,
               sub_messages: { [agentKey]: subMessage },
-            })]
+            }), tcId)
           }
         } else if (existingIdx >= 0) {
           // delegate / legacy tool streaming: concatenate to content
@@ -1585,12 +1580,12 @@
           arr[existingIdx] = newMsg
           store.messages = arr
         } else {
-          store.messages = [...msgs, normalizeToolMessage(msg, {
+          store.messages = insertToolMessage(msgs, normalizeToolMessage(msg, {
             role: 'tool',
             name: msg.name || '',
             content: delta,
             streaming: true,
-          })]
+          }), tcId)
         }
         // 流式帧不重置 aIdxRef，让 assistant 消息继续累积
       } else if (msg.streaming === false) {
@@ -1650,7 +1645,7 @@
           })
           store.messages = arr
         } else {
-          store.messages = [...msgs, normalizeToolMessage(msg, { role: 'tool' })]
+          store.messages = insertToolMessage(msgs, normalizeToolMessage(msg, { role: 'tool' }), tcId)
         }
         aIdxRef.value = -1
         // Group-chat: reset per-agent index
