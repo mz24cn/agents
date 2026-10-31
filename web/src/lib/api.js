@@ -240,10 +240,26 @@ export const promptTemplates = {
  * @param {function} onMessage  Called with each parsed SSE JSON message
  * @param {function} onDone     Called when the stream ends ([DONE])
  * @param {function} onError    Called on fetch or parse errors
+ * @param {object}   [options]  `{ onHandoff }`: `onHandoff(session_id, afterSeq)`
+ *        takes over this session's frames on the tab's shared frame channel and
+ *        returns the (optional) teardown. The POST connection is only released
+ *        once the backend actually watches the session, so the page keeps one
+ *        observable subscription instead of api.js creating an untracked one.
  * @returns {function}          Call to abort the stream
  */
-export function inferStream(body, onMessage, onDone, onError, onInit = null, onSequence = null) {
+export function inferStream(body, onMessage, onDone, onError, onInit = null, onSequence = null, options = {}) {
+  const onHandoff = options.onHandoff ?? null
+  // Called when the tab's frame channel could not take the session over, so this
+  // POST keeps streaming it itself: the page must treat the session as directly
+  // consumed again, otherwise a later re-subscription would apply the same
+  // frames twice.
+  const onHandoffFallback = options.onHandoffFallback ?? null
   const controller = new AbortController()
+  // Set once the session has been handed over to the tab's shared frame
+  // channel: the POST connection is then released on purpose, so its
+  // AbortError must not be reported as a finished/failed inference.
+  let handedOff = false
+  let stopChannel = null
 
   apiFetch('/v1/infer/stream', {
     method: 'POST',
@@ -262,54 +278,133 @@ export function inferStream(body, onMessage, onDone, onError, onInit = null, onS
       let buffer = ''
       let currentEvent = 'message'
       let currentId = null
+      // Lines of the chunk that carried the `init` event and came after it. They
+      // are normally replayed by the frame channel (its cursor starts at the
+      // sequence the init reported), but if the take-over fails they must be fed
+      // through this stream instead of being dropped.
+      let deferredLines = []
+
+      /** Consumes one SSE line. Returns 'done', 'handed-off' or null. */
+      function consumeLine(line) {
+        const trimmed = line.trim()
+        if (trimmed.startsWith('event: ')) {
+          currentEvent = trimmed.slice(7).trim()
+          return null
+        }
+        if (trimmed.startsWith('id:')) {
+          const parsed = Number.parseInt(trimmed.slice(3).trim(), 10)
+          currentId = Number.isFinite(parsed) ? parsed : null
+          return null
+        }
+        if (trimmed === '') {
+          currentEvent = 'message'  // Reset to default event type after blank line
+          currentId = null
+          return null
+        }
+        if (!trimmed.startsWith('data: ')) return null
+
+        const payload = trimmed.slice(6).trim()
+        if (payload === '[DONE]') {
+          onDone()
+          return 'done'
+        }
+        try {
+          const data = JSON.parse(payload)
+          if (currentEvent === 'init' && onInit) {
+            onInit(data)
+          } else if (currentEvent !== 'init') {
+            onMessage(data, currentEvent)
+            if (currentId !== null) onSequence?.(currentId)
+            if (shouldLogStreamFrame(currentId, data)) {
+              streamDebug('direct_frame', { seq: currentId, role: data?.role, name: data?.name, streaming: data?.streaming })
+            }
+          }
+          if (currentEvent === 'init' && data?.session_id) {
+            // Connection budget: the POST stream is only the initiator
+            // handshake. Move this session's frames onto the tab's shared frame
+            // channel and give the POST connection back, so N concurrent
+            // inferences no longer cost N connections. `stream_seq` is the
+            // broker sequence of the last frame the POST already published,
+            // i.e. the replay baseline.
+            handedOff = true
+            const afterSeq = Number.isFinite(data.stream_seq) ? data.stream_seq : -1
+            if (onHandoff) {
+              // The page subscribes (and tracks) the session itself.
+              onHandoff(data.session_id, afterSeq)
+            } else {
+              stopChannel = framesHandoff(data.session_id, afterSeq, {
+                onMessage,
+                onDone,
+                onApplied: (acknowledge) => acknowledge(),
+              })
+            }
+            if (Number.isFinite(data.stream_seq)) onSequence?.(data.stream_seq)
+            // Release the POST connection only once the channel confirms it
+            // watches this session: outside flight mode the backend cancels a
+            // generation as soon as its starter is gone while nobody observes
+            // it, so aborting before the subscription landed showed up as
+            // "Error: user interrupted." for inferences the user never aborted.
+            framesWatchingReady(data.session_id)
+              .catch(() => false)
+              .then((watched) => {
+                if (watched) {
+                  if (!controller.signal.aborted) controller.abort()
+                  return
+                }
+                // No take-over (hub unavailable, command refused or too slow):
+                // keep this POST as the session's data plane rather than
+                // dropping the only observer mid-generation.
+                streamDebug('frames_handoff_fallback', { sessionId: data.session_id })
+                if (stopChannel) {
+                  stopChannel()
+                  stopChannel = null
+                } else {
+                  unwatchSessionStream(data.session_id)
+                  onHandoffFallback?.(data.session_id, afterSeq)
+                }
+                handedOff = false
+                const pending = deferredLines
+                deferredLines = []
+                for (const pendingLine of pending) {
+                  if (consumeLine(pendingLine) === 'done') return
+                }
+                pump()
+              })
+            return 'handed-off'
+          }
+        } catch {
+          // skip malformed JSON chunks
+        }
+        return null
+      }
 
       function pump() {
         reader.read().then(({ done, value }) => {
           if (done) {
-            onError(new Error('Inference stream ended before [DONE]'))
+            if (!handedOff) onError(new Error('Inference stream ended before [DONE]'))
             return
           }
           buffer += decoder.decode(value, { stream: true })
           const lines = buffer.split('\n')
           // Keep the last (possibly incomplete) line in the buffer
           buffer = lines.pop() || ''
-          for (const line of lines) {
-            const trimmed = line.trim()
-            if (trimmed.startsWith('event: ')) {
-              currentEvent = trimmed.slice(7).trim()
-            } else if (trimmed.startsWith('id:')) {
-              const parsed = Number.parseInt(trimmed.slice(3).trim(), 10)
-              currentId = Number.isFinite(parsed) ? parsed : null
-            } else if (trimmed.startsWith('data: ')) {
-              const payload = trimmed.slice(6).trim()
-              if (payload === '[DONE]') {
-                onDone()
-                return
-              }
-              try {
-                const data = JSON.parse(payload)
-                if (currentEvent === 'init' && onInit) {
-                  onInit(data)
-                } else if (currentEvent !== 'init') {
-                  onMessage(data, currentEvent)
-                  if (currentId !== null) onSequence?.(currentId)
-                  if (shouldLogStreamFrame(currentId, data)) {
-                    streamDebug('direct_frame', { seq: currentId, role: data?.role, name: data?.name, streaming: data?.streaming })
-                  }
-                }
-              } catch {
-                // skip malformed JSON chunks
-              }
-            } else if (trimmed === '') {
-              currentEvent = 'message'  // Reset to default event type after blank line
-              currentId = null
+          for (let index = 0; index < lines.length; index++) {
+            const outcome = consumeLine(lines[index])
+            if (outcome === 'done') return
+            if (outcome === 'handed-off') {
+              // Reading stops here on purpose: the channel owns the session from
+              // now on. The rest of this chunk is remembered so a failed
+              // take-over can still deliver them itself.
+              deferredLines = lines.slice(index + 1)
+              return
             }
           }
           pump()
         }).catch((err) => {
-          // AbortError is expected when user cancels — treat as clean done
+          // AbortError is expected when user cancels — treat as clean done.
+          // It is also how the deliberate post-init handoff ends this stream.
           if (err.name === 'AbortError') {
-            onDone()
+            if (!handedOff) onDone()
           } else {
             onError(err)
           }
@@ -320,13 +415,16 @@ export function inferStream(body, onMessage, onDone, onError, onInit = null, onS
     })
     .catch((err) => {
       if (err.name === 'AbortError') {
-        onDone()
+        if (!handedOff) onDone()
       } else {
         onError(err)
       }
     })
 
-  return () => controller.abort()
+  return () => {
+    controller.abort()
+    stopChannel?.()
+  }
 }
 
 /**
@@ -441,161 +539,443 @@ export const sessions = {
 }
 
 /**
- * Subscribe to the retained/live inference stream for an existing session.
+ * 会话帧共享通道（GET /v1/sessions/frames 的 SSE 单例）。
  *
- * Unexpected EOF and network/read errors are retried automatically.  Every
- * inference frame has a monotonically increasing SSE `id`; reconnects pass the
- * last successfully applied id back as `after`, so the backend replays only the
- * missing frames and then resumes the live stream. `onApplied`, when supplied,
- * receives acknowledgement callbacks so a batching UI can advance that cursor
- * only after applying the corresponding frame.
+ * 旧实现里每个正在流式的会话都各占一条 HTTP 长连接：发起方一条
+ * POST /v1/infer/stream，旁观方一条 GET /v1/sessions/{id}/stream。浏览器对同一
+ * origin 的 HTTP/1.1 并发上限通常是 6 条（WebSocket 也计入这个池），所以
+ * 3-4 个并发推理 + 事件 hub + 终端 WS 就能把 6 条占满，其后的普通请求在
+ * 浏览器侧排队等空闲连接，表现为"后端卡住"。
+ *
+ * 现在每个 tab 只维护一条帧通道，承载该 tab 正在观看的**所有**会话的帧；
+ * 增减订阅通过短命令完成（POST /v1/sessions/frames/subscribe|unsubscribe）。
+ * 后端按 conn id 建通道：没有则创建，有则复用；断线重连后按各会话自己的
+ * lastSeq 重放缺失帧，语义与旧的每会话独立流一致。
+ *
+ * 连接数因此与并发会话数无关：1 条事件 hub + 1 条帧通道。
  */
-export function subscribeSessionStream(sessionId, onMessage, onDone, onError, onInit = null, after = -1, onApplied = null) {
-  let stopped = false
-  let completed = false
-  let controller = null
-  let reconnectTimer = null
-  let pendingApplications = 0
-  let reconnectAfterApplications = false
-  let lastSeq = Number.isFinite(Number(after)) ? Number(after) : -1
-  let baselineInitialized = lastSeq >= 0
+const FRAMES_WATCHDOG_MS = 45_000
+const FRAMES_RECONNECT_MS = 1_000
+const FRAMES_CONN_KEY = 'agents_frames_conn'
+// Upper bound for waiting until the channel really watches a session before the
+// POST that started the inference releases itself. The backend tolerates a
+// momentary loss of every observer (SESSION_UNOBSERVED_GRACE_S), so a slow
+// subscribe command is survivable; this bound only stops a broken channel from
+// pinning the POST connection forever.
+const FRAMES_HANDOFF_WAIT_MS = 2_000
+const FRAMES_SUBSCRIBE_RETRY_MS = 400
 
-  const finish = () => {
-    if (completed || stopped) return
-    completed = true
-    if (reconnectTimer) {
-      clearTimeout(reconnectTimer)
-      reconnectTimer = null
-    }
-    onDone?.()
+/** Per-tab channel id: stable across reloads of the same tab. */
+function framesConnId() {
+  let id = ''
+  try { id = sessionStorage.getItem(FRAMES_CONN_KEY) || '' } catch { /* private mode */ }
+  if (!id) {
+    id = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`
+    try { sessionStorage.setItem(FRAMES_CONN_KEY, id) } catch { /* private mode */ }
   }
+  return id
+}
 
-  const scheduleReconnect = () => {
-    if (stopped || completed || reconnectTimer) return
-    if (pendingApplications > 0) {
-      reconnectAfterApplications = true
-      return
-    }
-    reconnectAfterApplications = false
-    reconnectTimer = setTimeout(() => {
-      reconnectTimer = null
-      connect()
-    }, 1000)
+const sessionFramesHub = {
+  conn: '',
+  entries: new Map(),   // sessionId -> subscription entry
+  controller: null,
+  reconnectTimer: null,
+  watchdogTimer: null,
+  generation: 0,
+  connecting: false,
+  connected: false,
+  lastError: null,
+}
+
+function framesClearWatchdog() {
+  if (sessionFramesHub.watchdogTimer) clearTimeout(sessionFramesHub.watchdogTimer)
+  sessionFramesHub.watchdogTimer = null
+}
+
+function framesArmWatchdog(generation) {
+  framesClearWatchdog()
+  sessionFramesHub.watchdogTimer = setTimeout(() => {
+    if (generation !== sessionFramesHub.generation) return
+    streamDebug('frames_watchdog', { generation })
+    sessionFramesHub.controller?.abort()
+  }, FRAMES_WATCHDOG_MS)
+}
+
+function framesCommand(path, payload) {
+  return apiFetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+    .then(async (res) => {
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        streamDebug('frames_cmd_error', { path, status: res.status })
+        return { ok: false, status: res.status }
+      }
+      return { ok: true, ...data }
+    })
+    .catch((err) => {
+      if (err?.name !== 'AbortError') streamDebug('frames_cmd_error', { path, error: String(err) })
+      return { ok: false, error: String(err) }
+    })
+}
+
+/** Ask the backend to (re-)register this session on the tab's channel. */
+function framesSubscribeCommand(entry) {
+  const hub = sessionFramesHub
+  if (!hub.conn) return (entry.subscribePending = Promise.resolve(false))
+  // Idempotent per channel generation: the initial subscribe of a session and a
+  // connect/reconnect sweep both want the same registration, and a duplicate
+  // command would make the backend replay the same gap twice.
+  if (entry.registeredGeneration === hub.generation && entry.subscribePending) {
+    return entry.subscribePending
   }
+  entry.registeredGeneration = hub.generation
+  const send = () => framesCommand('/v1/sessions/frames/subscribe', {
+    conn: hub.conn,
+    session_id: entry.sessionId,
+    after: entry.lastSeq,
+  }).then((result) => result.ok === true && result.registered !== false)
+  return (entry.subscribePending = send().then((registered) => {
+    if (registered) return true
+    // The command did not land (proxy hiccup, 5xx, dropped connection): the
+    // backend still has no observer for this session, so retry once on the same
+    // channel before the caller decides whether it may release its own stream.
+    if (entry.registeredGeneration !== hub.generation || !hub.conn) return false
+    return new Promise((resolve) => setTimeout(resolve, FRAMES_SUBSCRIBE_RETRY_MS))
+      .then(() => {
+        if (entry.registeredGeneration !== hub.generation || !hub.conn) return false
+        entry.registeredGeneration = -1
+        return (entry.subscribePending = send())
+      })
+  }))
+}
 
-  const connect = () => {
-    if (stopped || completed) return
-    controller = new AbortController()
-    streamDebug('retained_connect', { sessionId, after: lastSeq })
-    const url = `/v1/sessions/${encodeURIComponent(sessionId)}/stream?after=${encodeURIComponent(lastSeq)}`
-    apiFetch(url, { signal: controller.signal }).then((res) => {
-      if (!res.ok) throw new Error(`Session stream request failed: ${res.status}`)
-      if (!res.body?.getReader) throw new Error('Session stream response body is unavailable')
+// Callers that must not release their own connection before the channel is
+// watching wait on these; resolved by whichever connect attempt finishes first.
+const framesReadyWaiters = []
+
+function framesResolveReady(value) {
+  for (const resolve of framesReadyWaiters.splice(0, framesReadyWaiters.length)) resolve(value)
+}
+
+function framesAwaitConnection() {
+  if (sessionFramesHub.connected) return Promise.resolve(true)
+  return new Promise((resolve) => framesReadyWaiters.push(resolve))
+}
+
+/**
+ * Does this tab's shared channel currently watch this session? Pages use it to
+ * tell an intentional unsubscribe from a lost subscription (a torn-down channel,
+ * an unexpected per-session "done") and re-arm the latter.
+ */
+export function isSessionStreamWatched(sessionId) {
+  return sessionFramesHub.entries.has(String(sessionId))
+}
+
+/**
+ * Promise that settles true once the backend confirmed it watches this session on
+ * this tab's channel, false if that did not happen within FRAMES_HANDOFF_WAIT_MS.
+ * `subscribeSessionStream` records the pending command per entry, so this never
+ * triggers a second subscribe.
+ */
+function framesWatchingReady(sessionId) {
+  const entry = sessionFramesHub.entries.get(String(sessionId))
+  if (!entry) return Promise.resolve(false)
+  const pending = entry.subscribePending
+  if (!pending) return Promise.resolve(false)
+  return Promise.race([
+    Promise.resolve(pending).then((registered) => registered === true),
+    new Promise((resolve) => setTimeout(() => resolve(false), FRAMES_HANDOFF_WAIT_MS)),
+  ])
+}
+
+/**
+ * Advance the resume cursor. Frames are applied in batches by the UI, so the
+ * cursor only moves once the batcher has acknowledged them; a reconnect that
+ * happens earlier is deferred until then.
+ */
+function framesAcknowledge(entry, seq) {
+  entry.lastSeq = Math.max(entry.lastSeq, seq)
+  entry.pendingApplications = Math.max(0, entry.pendingApplications - 1)
+  if (entry.pendingApplications === 0 && entry.reconnectAfterApplications) {
+    entry.reconnectAfterApplications = false
+    if (sessionFramesHub.connected) framesSubscribeCommand(entry)
+  }
+}
+
+function framesApply(entry, seq, eventName, frame) {
+  entry.onMessage?.(frame, seq, eventName)
+  if (seq == null) return
+  if (entry.onApplied) {
+    entry.pendingApplications += 1
+    let acknowledged = false
+    entry.onApplied(() => {
+      if (acknowledged) return
+      acknowledged = true
+      framesAcknowledge(entry, seq)
+    })
+  } else {
+    entry.lastSeq = Math.max(entry.lastSeq, seq)
+  }
+}
+
+/** The per-session stream ended ([DONE] equivalent for this session only). */
+function framesFinish(entry) {
+  const hub = sessionFramesHub
+  if (hub.entries.get(entry.sessionId) === entry) {
+    hub.entries.delete(entry.sessionId)
+  }
+  try {
+    entry.onDone?.()
+  } catch (err) {
+    console.warn('[sessionFramesHub] onDone error', err)
+  }
+  if (hub.entries.size === 0) framesTeardown()
+}
+
+function framesDispatch(currentEvent, payload) {
+  const hub = sessionFramesHub
+  if (currentEvent === 'chan_init') {
+    streamDebug('frames_chan_init', { conn: hub.conn, generation: payload?.generation })
+    return
+  }
+  const entry = hub.entries.get(payload?.session_id)
+  if (!entry) return   // unsubscribed while the frame was in flight
+  if (currentEvent === 'sub_init') {
+    if (!entry.baselineInitialized) {
+      // First registration: conversation.json is the local baseline, so the
+      // resume cursor starts at the last persisted sequence.
+      const persistedSeq = Number(payload?.persisted_seq)
+      if (Number.isFinite(persistedSeq)) entry.lastSeq = Math.max(entry.lastSeq, persistedSeq)
+      entry.baselineInitialized = true
+    }
+    streamDebug('frames_sub_init', { sessionId: entry.sessionId, lastSeq: entry.lastSeq, ...payload })
+    entry.onInit?.(payload)
+    return
+  }
+  if (currentEvent === 'done') {
+    streamDebug('frames_done', { sessionId: entry.sessionId, lastSeq: entry.lastSeq })
+    framesFinish(entry)
+    return
+  }
+  if (currentEvent === 'frame') {
+    const seq = Number.isFinite(payload?.seq) ? payload.seq : null
+    framesApply(entry, seq, payload?.event || 'message', payload?.frame)
+    if (shouldLogStreamFrame(seq, payload?.frame)) {
+      streamDebug('frames_frame', {
+        sessionId: entry.sessionId, seq, lastSeq: entry.lastSeq,
+        role: payload?.frame?.role, name: payload?.frame?.name, streaming: payload?.frame?.streaming,
+      })
+    }
+  }
+}
+
+function framesDispatchError(err) {
+  if (err?.name === 'AbortError') return
+  streamDebug('frames_error', { error: String(err) })
+  for (const entry of sessionFramesHub.entries.values()) {
+    try {
+      entry.onError?.(err)
+    } catch {
+      // a listener throwing must not break hub delivery
+    }
+  }
+}
+
+function framesScheduleReconnect() {
+  const hub = sessionFramesHub
+  if (hub.reconnectTimer) return
+  hub.reconnectTimer = setTimeout(() => {
+    hub.reconnectTimer = null
+    hub.connected = false
+    if (hub.entries.size > 0) framesConnect()
+  }, FRAMES_RECONNECT_MS)
+}
+
+function framesTeardown() {
+  const hub = sessionFramesHub
+  hub.generation += 1
+  framesClearWatchdog()
+  framesResolveReady(false)
+  if (hub.reconnectTimer) {
+    clearTimeout(hub.reconnectTimer)
+    hub.reconnectTimer = null
+  }
+  if (hub.conn) framesCommand('/v1/sessions/frames/close', { conn: hub.conn })
+  hub.controller?.abort()
+  hub.controller = null
+  hub.connected = false
+  hub.connecting = false
+  hub.conn = ''
+  hub.lastError = null
+}
+
+function framesConnect() {
+  const hub = sessionFramesHub
+  if (hub.connecting || hub.connected) return
+  if (hub.entries.size === 0) return
+  hub.connecting = true
+  const generation = ++hub.generation
+  hub.conn = framesConnId()
+  hub.controller = new AbortController()
+  framesArmWatchdog(generation)
+  streamDebug('frames_connect', { conn: hub.conn, generation, sessions: hub.entries.size })
+  apiFetch(`/v1/sessions/frames?conn=${encodeURIComponent(hub.conn)}`, { signal: hub.controller.signal })
+    .then((res) => {
+      if (generation !== hub.generation) return
+      if (!res.ok) throw new Error(`Session frames request failed: ${res.status}`)
+      hub.connected = true
+      hub.connecting = false
+      hub.lastError = null
+      // The channel now exists (created or re-attached). Re-register every
+      // watched session: the backend replays each session's gap frames from its
+      // own cursor, so a reconnect loses nothing.
+      for (const entry of hub.entries.values()) framesSubscribeCommand(entry)
+      framesResolveReady(true)
 
       const reader = res.body.getReader()
       const decoder = new TextDecoder()
       let buffer = ''
       let currentEvent = 'message'
-      let currentId = null
-
-      const processLine = (line) => {
-        const trimmed = line.trim()
-        if (trimmed.startsWith('event:')) {
-          currentEvent = trimmed.slice(6).trim()
-        } else if (trimmed.startsWith('id:')) {
-          const parsed = Number.parseInt(trimmed.slice(3).trim(), 10)
-          currentId = Number.isFinite(parsed) ? parsed : null
-        } else if (trimmed.startsWith('data:')) {
-          const payload = trimmed.slice(5).trim()
-          if (payload === '[DONE]') {
-            finish()
-            return
-          }
-          try {
-            const data = JSON.parse(payload)
-            if (currentEvent === 'init') {
-              // On the first connection, conversation.json is the local
-              // baseline. Remember the matching persisted sequence before any
-              // replay frames arrive, so even an immediate disconnect can
-              // resume without losing frames persisted in the meantime.
-              if (!baselineInitialized) {
-                const persistedSeq = Number(data?.persisted_seq)
-                if (Number.isFinite(persistedSeq)) lastSeq = Math.max(lastSeq, persistedSeq)
-                baselineInitialized = true
-              }
-              streamDebug('retained_init', { sessionId, lastSeq, ...data })
-              onInit?.(data)
-            } else {
-              // Delivery and application are separate when the UI batches
-              // frames. The optional acknowledgement callback advances the
-              // reconnect cursor only after the batcher has applied this frame.
-              onMessage?.(data, currentId, currentEvent)
-              if (currentId !== null) {
-                if (onApplied) {
-                  const appliedSeq = currentId
-                  pendingApplications += 1
-                  let acknowledged = false
-                  onApplied(() => {
-                    if (acknowledged) return
-                    acknowledged = true
-                    lastSeq = Math.max(lastSeq, appliedSeq)
-                    pendingApplications = Math.max(0, pendingApplications - 1)
-                    if (pendingApplications === 0 && reconnectAfterApplications) scheduleReconnect()
-                  })
-                } else {
-                  lastSeq = Math.max(lastSeq, currentId)
-                }
-              }
-              if (shouldLogStreamFrame(currentId, data)) {
-                streamDebug('retained_frame', { sessionId, seq: currentId, lastSeq, role: data?.role, name: data?.name, streaming: data?.streaming })
-              }
-            }
-          } catch {
-            // Do not advance lastSeq for malformed/unapplied frames; a later
-            // reconnect can replay them instead of silently creating a gap.
-          }
-        } else if (!trimmed) {
-          currentEvent = 'message'
-          currentId = null
-        }
-      }
 
       const pump = () => reader.read().then(({ done, value }) => {
+        if (generation !== hub.generation) return
         if (done) {
-          // A valid terminal stream sends [DONE]. Plain EOF is treated as a
-          // dropped connection and resumed from lastSeq.
-          streamDebug('retained_eof', { sessionId, lastSeq })
-          scheduleReconnect()
+          framesClearWatchdog()
+          streamDebug('frames_eof', { generation })
+          hub.connected = false
+          hub.connecting = false
+          hub.lastError = new Error('Session frames stream closed')
+          framesDispatchError(hub.lastError)
+          if (hub.entries.size > 0) framesScheduleReconnect()
           return
         }
+        // Any bytes (including SSE comment heartbeats) prove the connection is
+        // still delivering data.
+        framesArmWatchdog(generation)
         buffer += decoder.decode(value, { stream: true })
         const lines = buffer.split('\n')
         buffer = lines.pop() || ''
         for (const line of lines) {
-          processLine(line)
-          if (completed || stopped) return
+          const trimmed = line.trim()
+          if (trimmed.startsWith('event:')) {
+            currentEvent = trimmed.slice(6).trim()
+          } else if (trimmed.startsWith('data:')) {
+            try {
+              framesDispatch(currentEvent, JSON.parse(trimmed.slice(5).trim()))
+            } catch {
+              // skip malformed JSON
+            }
+          } else if (!trimmed) {
+            currentEvent = 'message'
+          }
         }
         return pump()
       })
 
       return pump()
-    }).catch((err) => {
-      if (err.name === 'AbortError' || stopped || completed) return
-      streamDebug('retained_error', { sessionId, lastSeq, error: String(err) })
-      onError?.(err)
-      scheduleReconnect()
     })
+    .catch((err) => {
+      if (generation !== hub.generation) return
+      framesClearWatchdog()
+      hub.connected = false
+      hub.connecting = false
+      // Nobody may wait on a connection that is never going to happen: release
+      // the hand-off waiters so the POST initiator can decide to keep carrying
+      // the session itself instead of sitting on its own timeout.
+      framesResolveReady(false)
+      if (err?.name !== 'AbortError') {
+        hub.lastError = err
+        framesDispatchError(err)
+      }
+      if (hub.entries.size > 0) framesScheduleReconnect()
+    })
+}
+
+/**
+ * Subscribe to the retained/live inference frames of one session.
+ *
+ * Every watched session in this tab shares the single frame channel above;
+ * this function only registers (or replaces) that session's entry, so opening
+ * a fifth concurrent inference no longer costs a fifth connection.
+ *
+ * Unexpected EOF and network/read errors are retried automatically by the hub.
+ * Every frame has a monotonically increasing per-session sequence; reconnects
+ * pass the last applied sequence back as `after`, so the backend replays only
+ * the missing frames and then resumes live delivery. `onApplied`, when
+ * supplied, receives acknowledgement callbacks so a batching UI can advance
+ * that cursor only after applying the corresponding frame.
+ *
+ * @returns {function} Call to stop watching this session (and to close the
+ *                     shared channel when it was the last one).
+ */
+export function subscribeSessionStream(sessionId, onMessage, onDone, onError, onInit = null, after = -1, onApplied = null) {
+  const hub = sessionFramesHub
+  const entry = {
+    sessionId,
+    onMessage, onDone, onError, onInit, onApplied,
+    lastSeq: Number.isFinite(Number(after)) ? Number(after) : -1,
+    baselineInitialized: Number.isFinite(Number(after)) && Number(after) >= 0,
+    pendingApplications: 0,
+    reconnectAfterApplications: false,
+  }
+  // Replaces any previous subscription for the same session (e.g. the POST
+  // stream handing the session over to the channel, or a re-subscribe after a
+  // retired inference generation).
+  hub.entries.set(sessionId, entry)
+  if (hub.connected) {
+    entry.subscribePending = framesSubscribeCommand(entry)
+  } else {
+    // The channel does not exist yet: connect first, then register. Waiting on
+    // this promise is how the POST initiator knows the hand-off completed.
+    entry.subscribePending = framesAwaitConnection()
+      .then((connected) => (connected ? framesSubscribeCommand(entry) : false))
+    framesConnect()
   }
 
-  connect()
-  return () => {
-    stopped = true
-    if (reconnectTimer) {
-      clearTimeout(reconnectTimer)
-      reconnectTimer = null
-    }
-    controller?.abort()
-  }
+  return () => framesUnwatch(sessionId, entry)
+}
+
+/**
+ * Stop watching one session on this tab's channel. `onlyIfEntry` makes the call a
+ * no-op when the subscription was already replaced by a newer one (e.g. the POST
+ * stream fell back to carrying the session itself and a page-level subscription
+ * took its place meanwhile).
+ */
+function framesUnwatch(sessionId, onlyIfEntry = null) {
+  const hub = sessionFramesHub
+  const key = String(sessionId)
+  const entry = hub.entries.get(key)
+  if (!entry || (onlyIfEntry && entry !== onlyIfEntry)) return false
+  hub.entries.delete(key)
+  if (hub.conn) framesCommand('/v1/sessions/frames/unsubscribe', { conn: hub.conn, session_id: key })
+  if (hub.entries.size === 0) framesTeardown()
+  return true
+}
+
+/** Drop a page-owned watch (used when the POST keeps carrying the session). */
+export function unwatchSessionStream(sessionId) {
+  return framesUnwatch(sessionId)
+}
+
+/**
+ * Route one inference's frames through the shared channel and stop holding a
+ * dedicated POST connection for it. Called by inferStream() right after the
+ * POST's `init` event, which carries the session id and the sequence baseline.
+ */
+function framesHandoff(sessionId, afterSeq, { onMessage, onDone, onError, onApplied }) {
+  return subscribeSessionStream(
+    sessionId,
+    (frame, seq, eventName) => onMessage?.(frame, eventName, seq),
+    () => onDone?.(),
+    onError ?? null,
+    null,
+    afterSeq,
+    onApplied ?? null,
+  )
 }
 
 /**
@@ -874,6 +1254,25 @@ export function __resetSessionEventsHubForTests() {
   hub.bufferInitSeq = -1
   hub.lastError = null
   hub.pending.clear()
+}
+
+/** Drop the shared frame channel without issuing a close command (tests only). */
+export function __resetSessionFramesHubForTests() {
+  const hub = sessionFramesHub
+  hub.generation += 1
+  framesClearWatchdog()
+  if (hub.reconnectTimer) {
+    clearTimeout(hub.reconnectTimer)
+    hub.reconnectTimer = null
+  }
+  hub.controller?.abort()
+  hub.controller = null
+  hub.entries.clear()
+  hub.connected = false
+  hub.connecting = false
+  hub.conn = ''
+  hub.lastError = null
+  try { sessionStorage.removeItem(FRAMES_CONN_KEY) } catch { /* private mode */ }
 }
 
 

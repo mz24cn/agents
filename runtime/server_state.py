@@ -1178,12 +1178,71 @@ def _session_stream_frame_summary(frame: dict) -> str:
     )
 
 
-def _cancel_unobserved_stream_locked(session_id: str, stream: dict) -> bool:
+# How long a non-flight generation may go without an observer before it is
+# cancelled. Every browser connection that counts as an observer can blip: the
+# POST -> frame-channel hand-off, a channel reconnect, a subscribe command that
+# has to be retried. Cancelling on the *first* of those made users see
+# "Error: user interrupted." for inferences they never aborted, while a tab that
+# is genuinely gone only has to stay gone. Overridable for tests.
+UNOBSERVED_GRACE_S = 10.0
+
+
+def _unobserved_grace_s() -> float:
+    raw = os.environ.get("SESSION_UNOBSERVED_GRACE_S", "")
+    if not raw.strip():
+        return UNOBSERVED_GRACE_S
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return UNOBSERVED_GRACE_S
+
+
+def _disarm_unobserved_cancel_locked(stream: dict) -> None:
+    """Forget a pending "nobody is watching" cancellation (an observer returned)."""
+    timer = stream.get("unobserved_timer")
+    if timer is not None:
+        stream["unobserved_timer"] = None
+        try:
+            timer.cancel()
+        except Exception:
+            pass
+
+
+def _resolve_unobserved_cancel(session_id: str, cancel_event, reason: str) -> None:
+    """Cancel after the grace window, unless an observer came back meanwhile."""
+    with _session_stream_lock:
+        stream = _session_streams.get(session_id)
+        if stream is None or stream.get("cancel_event") is not cancel_event:
+            return                      # superseded generation; not ours to cancel
+        stream["unobserved_timer"] = None
+        if stream["done"] or session_id in _flight_sessions:
+            return
+        if stream["starter_connected"] or stream["subscribers"]:
+            logging.getLogger("runtime.server").info(
+                "session_stream unobserved_grace_rescued sid=%s reason=%s "
+                "subscribers=%s starter_connected=%s",
+                session_id, reason, len(stream["subscribers"]),
+                stream["starter_connected"],
+            )
+            return
+        cancel_event.set()
+        logging.getLogger("runtime.server").warning(
+            "session_stream CANCELLED sid=%s reason=%s (unobserved for %ss)",
+            session_id, reason, _unobserved_grace_s(),
+        )
+
+
+def _cancel_unobserved_stream_locked(session_id: str, stream: dict,
+                                     reason: str = "unobserved") -> bool:
     """Cancel an active non-flight stream after its last browser disconnects.
 
     Must be called with ``_session_stream_lock`` held. The starter inference SSE
     counts as one session-specific connection, as does every retained/live
-    subscriber created after a browser opens the session.
+    subscriber created after a browser opens the session (a per-tab frame channel
+    registers one subscriber per session it watches).
+
+    Returns True only when the cancellation happened here. A deferred one returns
+    False, so callers never claim a cancellation that has not happened yet.
     """
     if stream["done"] or session_id in _flight_sessions:
         return False
@@ -1192,8 +1251,25 @@ def _cancel_unobserved_stream_locked(session_id: str, stream: dict) -> bool:
     cancel_event = stream.get("cancel_event")
     if cancel_event is None:
         return False
-    cancel_event.set()
-    return True
+    grace = _unobserved_grace_s()
+    if grace <= 0:
+        cancel_event.set()
+        logging.getLogger("runtime.server").warning(
+            "session_stream CANCELLED sid=%s reason=%s (no grace)", session_id, reason,
+        )
+        return True
+    if stream.get("unobserved_timer") is not None:
+        return False                    # a cancellation is already scheduled
+    timer = threading.Timer(
+        grace, _resolve_unobserved_cancel, args=(session_id, cancel_event, reason),
+    )
+    timer.daemon = True
+    stream["unobserved_timer"] = timer
+    timer.start()
+    logging.getLogger("runtime.server").info(
+        "session_stream unobserved sid=%s reason=%s grace=%ss", session_id, reason, grace,
+    )
+    return False
 
 
 def begin_session_stream(session_id: str, cancel_event=None) -> None:
@@ -1201,6 +1277,14 @@ def begin_session_stream(session_id: str, cancel_event=None) -> None:
     with _session_stream_lock:
         previous = _session_streams.get(session_id)
         previous_subscribers = list(previous["subscribers"]) if previous else []
+        stale_event = None
+        if previous is not None:
+            # A pending "nobody is watching" cancellation must not be dropped just
+            # because a replacement generation took over the registry entry: the
+            # retired generation is still running and still unobserved.
+            if previous.get("unobserved_timer") is not None:
+                stale_event = previous.get("cancel_event")
+            _disarm_unobserved_cancel_locked(previous)
         _session_streams[session_id] = {
             "next_seq": 1,
             "persisted_seq": 0,
@@ -1209,7 +1293,10 @@ def begin_session_stream(session_id: str, cancel_event=None) -> None:
             "starter_connected": True,
             "cancel_event": cancel_event,
             "done": False,
+            "unobserved_timer": None,
         }
+    if stale_event is not None and stale_event is not cancel_event:
+        stale_event.set()
     # Wake retained GET handlers attached to the retired generation. Their UI
     # observes the authoritative streaming status and reconnects to this broker.
     for send_fn in previous_subscribers:
@@ -1597,6 +1684,7 @@ def subscribe_session_stream(session_id: str, send_fn) -> bool:
         if stream is None or stream["done"]:
             return False
         stream["subscribers"].append(send_fn)
+        _disarm_unobserved_cancel_locked(stream)
         return True
 
 
@@ -1608,7 +1696,8 @@ def unsubscribe_session_stream(session_id: str, send_fn) -> None:
                 stream["subscribers"].remove(send_fn)
             except ValueError:
                 return
-            _cancel_unobserved_stream_locked(session_id, stream)
+            _cancel_unobserved_stream_locked(session_id, stream,
+                                             reason="last_subscriber_left")
 
 
 def disconnect_session_stream_starter(session_id: str, owner_event=None) -> bool:
@@ -1676,6 +1765,7 @@ def register_session_stream_with_snapshot(session_id: str, send_fn, after_seq: i
         registered = not stream["done"]
         if registered:
             stream["subscribers"].append(send_fn)
+            _disarm_unobserved_cancel_locked(stream)
         effective_after = stream["persisted_seq"] if after_seq < 0 else after_seq
         done = stream["done"]
         persisted_seq = stream["persisted_seq"]
@@ -1700,6 +1790,324 @@ def register_session_stream_with_snapshot(session_id: str, send_fn, after_seq: i
         "latest_seq": latest_seq,
         "frames": replay,
     }
+
+
+# ---------------------------------------------------------------------------
+# Per-tab multiplexed frame channels (connection budget)
+# ---------------------------------------------------------------------------
+# A browser tab used to hold one HTTP connection per streaming session. Together
+# with the status hub and the terminal WebSockets that easily exhausted the
+# browser's 6-connections-per-origin budget, after which every ordinary request
+# queued *in the browser* and the backend merely looked hung.
+#
+# A channel carries the retained + live frames of *every* session one tab
+# watches, over a single SSE connection. It registers one subscriber per watched
+# session with the existing per-session broker, so the "cancel the inference when
+# nobody is watching" rule (``_cancel_unobserved_stream_locked``) keeps working
+# exactly as before: the channel is simply one more subscriber of each session.
+#
+# ``conn`` ids are minted by the browser tab. ``get_or_create_frame_channel`` /
+# ``attach_frame_channel`` reuse the existing channel when the id is already
+# known, so a reconnect re-attaches to the same channel instead of creating a
+# second one, and the per-session subscriptions survive the blip.
+#
+# Lock ordering: ``_frame_channels_lock`` may be taken while then taking
+# ``_session_stream_lock`` (subscribe/unsubscribe), never the other way round.
+# Channel ``send_fn``s are only ever invoked by the broker *outside*
+# ``_session_stream_lock``, so they can safely take this lock.
+
+FRAME_CHANNEL_GRACE_S = 15.0
+FRAME_CHANNEL_QUEUE_MAXSIZE = 8192
+FRAME_CHANNEL_MAX = 64
+
+_frame_channels: dict[str, dict] = {}
+_frame_channels_lock = threading.RLock()
+
+
+def _frame_channel_push(channel: dict, item: dict) -> bool:
+    """Enqueue one channel item. Returns False when the queue is overfull."""
+    import queue as _queue
+    try:
+        channel["queue"].put_nowait(item)
+        return True
+    except _queue.Full:
+        # The broker retains every frame, so a dropped live frame is not lost
+        # data: the tab reconnects and replays from its own cursor. Returning
+        # False would mark this subscriber dead and could cancel an inference
+        # that is merely being read slowly, so report success instead.
+        logging.getLogger("runtime.server").warning(
+            "frame_channel queue_full conn=%s sid=%s qsize=%s",
+            channel.get("id"), item.get("session_id"), channel["queue"].qsize(),
+        )
+        return True
+
+
+def _make_frame_channel_send_fn(channel: dict, session_id: str):
+    """Bridge one broker subscriber to this channel's outgoing queue."""
+    def _send(envelope) -> bool:
+        if envelope is None:
+            # The broker uses None to retire a generation / finish the stream.
+            with _frame_channels_lock:
+                channel["sessions"].pop(session_id, None)
+            return _frame_channel_push(channel, {"type": "done", "session_id": session_id})
+        return _frame_channel_push(channel, {
+            "type": "frame",
+            "session_id": session_id,
+            "seq": envelope["seq"],
+            "event": envelope.get("event"),
+            "frame": envelope["frame"],
+        })
+    return _send
+
+
+def _new_frame_channel_locked(conn_id: str) -> dict:
+    import queue as _queue
+    channel = {
+        "id": conn_id,
+        "queue": _queue.Queue(maxsize=FRAME_CHANNEL_QUEUE_MAXSIZE),
+        "sessions": {},
+        "generation": 0,
+        "connected": False,
+        "grace_timer": None,
+        "created": time.monotonic(),
+        "last_seen": time.monotonic(),
+    }
+    _frame_channels[conn_id] = channel
+    # Bound the registry: evict the least recently seen disconnected channels.
+    if len(_frame_channels) > FRAME_CHANNEL_MAX:
+        stale = sorted(
+            (c for c in _frame_channels.values() if not c["connected"]),
+            key=lambda c: c["last_seen"],
+        )
+        for victim in stale[: len(_frame_channels) - FRAME_CHANNEL_MAX]:
+            _drop_frame_channel_locked(victim["id"], victim)
+    # A channel created by a subscribe command that never attaches must not
+    # leak its subscriptions.
+    _arm_frame_channel_grace(conn_id, 0)
+    return channel
+
+
+def _arm_frame_channel_grace(conn_id: str, generation: int) -> None:
+    """Schedule teardown of a detached channel unless it re-attaches."""
+    channel = _frame_channels.get(conn_id)
+    if channel is None:
+        return
+    timer = channel.get("grace_timer")
+    if timer is not None:
+        timer.cancel()
+        channel["grace_timer"] = None
+
+    def _expire() -> None:
+        with _frame_channels_lock:
+            current = _frame_channels.get(conn_id)
+            if current is None or current["connected"]:
+                return
+            if current["generation"] != generation:
+                return
+            _drop_frame_channel_locked(conn_id, current)
+
+    timer = threading.Timer(FRAME_CHANNEL_GRACE_S, _expire)
+    timer.daemon = True
+    channel["grace_timer"] = timer
+    timer.start()
+
+
+def _drop_frame_channel_locked(conn_id: str, channel: dict) -> None:
+    """Remove the channel and every per-session subscription it holds."""
+    timer = channel.get("grace_timer")
+    if timer is not None:
+        timer.cancel()
+        channel["grace_timer"] = None
+    released = sorted(channel["sessions"])
+    for session_id, send_fn in list(channel["sessions"].items()):
+        channel["sessions"].pop(session_id, None)
+        try:
+            unsubscribe_session_stream(session_id, send_fn)
+        except Exception:
+            pass
+    if _frame_channels.get(conn_id) is channel:
+        _frame_channels.pop(conn_id, None)
+    if released:
+        # Without this line a dropped channel is invisible in the log, and its
+        # released subscriptions look like a spontaneous inference cancellation.
+        logging.getLogger("runtime.server").info(
+            "frame_channel dropped conn=%s generation=%s released=%s",
+            conn_id, channel.get("generation"), released,
+        )
+
+
+def get_or_create_frame_channel(conn_id: str) -> dict:
+    """Return the channel for ``conn_id``; create it when it does not exist."""
+    with _frame_channels_lock:
+        channel = _frame_channels.get(conn_id)
+        if channel is None:
+            channel = _new_frame_channel_locked(conn_id)
+        else:
+            channel["last_seen"] = time.monotonic()
+        return channel
+
+
+def attach_frame_channel(conn_id: str) -> tuple[dict, int]:
+    """Attach an SSE connection to a channel, creating it when absent.
+
+    Re-attaching with the same ``conn`` id reuses the channel and its
+    subscriptions. Frames queued while detached are discarded: the client
+    re-subscribes every session with its own cursor and the broker replays the
+    gap, which is both simpler and authoritative.
+    """
+    with _frame_channels_lock:
+        channel = _frame_channels.get(conn_id)
+        if channel is None:
+            channel = _new_frame_channel_locked(conn_id)
+        reattach = channel["generation"] > 0 or channel["sessions"]
+        channel["generation"] += 1
+        generation = channel["generation"]
+        channel["connected"] = True
+        channel["last_seen"] = time.monotonic()
+        timer = channel.get("grace_timer")
+        if timer is not None:
+            timer.cancel()
+            channel["grace_timer"] = None
+    if reattach:
+        import queue as _queue
+        drained = 0
+        while True:
+            try:
+                channel["queue"].get_nowait()
+                drained += 1
+            except _queue.Empty:
+                break
+        # Wake the previous connection so it stops writing without waiting for
+        # its next frame; it recognises its own generation and exits.
+        try:
+            channel["queue"].put_nowait({"type": "attach_flush", "generation": generation})
+        except _queue.Full:
+            pass
+        if drained:
+            logging.getLogger("runtime.server").info(
+                "frame_channel reattached conn=%s generation=%s discarded=%s",
+                conn_id, generation, drained,
+            )
+    return channel, generation
+
+
+def detach_frame_channel(conn_id: str, generation: int) -> bool:
+    """Mark the channel's SSE connection as gone; keep it for the grace window.
+
+    Subscriptions deliberately stay registered for ``FRAME_CHANNEL_GRACE_S`` so a
+    reconnect (same tab, same ``conn`` id) does not cancel inferences that are
+    still being watched. After the window they are released, which restores the
+    "nobody is watching" cancellation rule for a tab that is really gone.
+    """
+    with _frame_channels_lock:
+        channel = _frame_channels.get(conn_id)
+        if channel is None or channel["generation"] != generation:
+            # A newer connection already owns this channel; this handler is stale.
+            return False
+        channel["connected"] = False
+        channel["last_seen"] = time.monotonic()
+        _arm_frame_channel_grace(conn_id, generation)
+        return True
+
+
+def frame_channel_subscribe(conn_id: str, session_id: str, after_seq: int = -1) -> tuple[bool, dict]:
+    """Watch ``session_id`` on this channel and replay its gap frames in order.
+
+    Registration with the per-session broker and the ``sub_init`` + replay push
+    are atomic against live delivery (the channel ``send_fn`` takes the same
+    lock), so no frame can land before its ``sub_init`` or be duplicated by the
+    replay.
+    """
+    with _frame_channels_lock:
+        channel = _frame_channels.get(conn_id)
+        if channel is None:
+            channel = _new_frame_channel_locked(conn_id)
+        channel["last_seen"] = time.monotonic()
+        previous = channel["sessions"].pop(session_id, None)
+    if previous is not None:
+        # A fresh cursor replaces the old subscription (re-subscribe after a
+        # retired generation, or a duplicate subscribe from the same tab).
+        unsubscribe_session_stream(session_id, previous)
+
+    send_fn = _make_frame_channel_send_fn(channel, session_id)
+    registered, snapshot = register_session_stream_with_snapshot(session_id, send_fn, after_seq)
+    with _frame_channels_lock:
+        current = _frame_channels.get(conn_id)
+        if current is not channel:
+            # Torn down concurrently: undo and report as not watched.
+            try:
+                unsubscribe_session_stream(session_id, send_fn)
+            except Exception:
+                pass
+            return False, snapshot
+        current["sessions"][session_id] = send_fn
+        current["last_seen"] = time.monotonic()
+        _frame_channel_push(current, {
+            "type": "sub_init",
+            "session_id": session_id,
+            "active": snapshot["active"],
+            "persisted_seq": snapshot["persisted_seq"],
+            "latest_seq": snapshot["latest_seq"],
+        })
+        for item in snapshot["frames"]:
+            _frame_channel_push(current, {
+                "type": "frame",
+                "session_id": session_id,
+                "seq": item["seq"],
+                "event": item.get("event"),
+                "frame": item["frame"],
+            })
+        if not registered:
+            # Mirrors the immediate ``[DONE]`` of GET /v1/sessions/{id}/stream:
+            # this session is not streaming, so the client may finalize now
+            # instead of waiting for a frame that will never come.
+            _frame_channel_push(current, {"type": "done", "session_id": session_id})
+    return registered, snapshot
+
+
+def frame_channel_unsubscribe(conn_id: str, session_id: str) -> bool:
+    """Stop watching one session on this channel (releases its subscription)."""
+    with _frame_channels_lock:
+        channel = _frame_channels.get(conn_id)
+        if channel is None:
+            return False
+        send_fn = channel["sessions"].pop(session_id, None)
+        channel["last_seen"] = time.monotonic()
+    if send_fn is None:
+        return False
+    unsubscribe_session_stream(session_id, send_fn)
+    return True
+
+
+def close_frame_channel(conn_id: str) -> bool:
+    """Tear the channel down now (the tab closed or navigated away)."""
+    with _frame_channels_lock:
+        channel = _frame_channels.get(conn_id)
+        if channel is None:
+            return False
+        _drop_frame_channel_locked(conn_id, channel)
+        return True
+
+
+def frame_channel_snapshot() -> dict:
+    """Diagnostics / test helper: channel count, sessions and connection state."""
+    with _frame_channels_lock:
+        return {
+            conn_id: {
+                "sessions": sorted(channel["sessions"]),
+                "connected": channel["connected"],
+                "generation": channel["generation"],
+                "queued": channel["queue"].qsize(),
+            }
+            for conn_id, channel in _frame_channels.items()
+        }
+
+
+def frame_channel_reset() -> None:
+    """Drop every channel (test isolation)."""
+    with _frame_channels_lock:
+        for conn_id, channel in list(_frame_channels.items()):
+            _drop_frame_channel_locked(conn_id, channel)
 
 
 # ---------------------------------------------------------------------------

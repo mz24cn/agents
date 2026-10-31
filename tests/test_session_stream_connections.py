@@ -1,6 +1,7 @@
 """Connection-lifetime policy tests for retained session inference streams."""
 
 import threading
+import time
 
 import pytest
 
@@ -8,7 +9,11 @@ from runtime import server_state
 
 
 @pytest.fixture(autouse=True)
-def clean_session_stream_state():
+def clean_session_stream_state(monkeypatch):
+    # These tests assert the connection policy itself. The deferred window that
+    # protects a hand-off/reconnect from cancelling the generation is covered by
+    # the *_grace_* tests below, which set their own window.
+    monkeypatch.setenv("SESSION_UNOBSERVED_GRACE_S", "0")
     with server_state._session_stream_lock:
         server_state._session_streams.clear()
         server_state._flight_sessions.clear()
@@ -94,6 +99,67 @@ def test_global_agent_service_connection_does_not_count_as_session_subscription(
         assert cancel_event.is_set()
     finally:
         server_state._session_event_subscribers.clear()
+
+
+# --- deferred cancellation window (the POST -> frame-channel hand-off) ---------
+
+def test_unobserved_cancellation_waits_so_a_handoff_can_take_over(monkeypatch):
+    """A momentarily unobserved generation must not be cancelled on the spot.
+
+    Releasing the initiating POST stream and registering the shared frame-channel
+    subscriber are two separate requests, so the broker can be briefly observed
+    by nobody. Cancelling at that instant is what users saw as
+    "Error: user interrupted." for inferences they never aborted.
+    """
+    monkeypatch.setenv("SESSION_UNOBSERVED_GRACE_S", "0.3")
+    cancel_event = threading.Event()
+    server_state.begin_session_stream("session-1", cancel_event)
+
+    assert server_state.disconnect_session_stream_starter("session-1") is False
+    assert not cancel_event.is_set()
+
+    # The hand-off subscription lands inside the window -> nothing is cancelled.
+    subscriber = lambda envelope: True
+    registered, _snapshot = server_state.register_session_stream_with_snapshot(
+        "session-1", subscriber
+    )
+    assert registered is True
+    time.sleep(0.45)
+    assert not cancel_event.is_set()
+
+    # And when the observer really does go away, the window still cancels it.
+    server_state.unsubscribe_session_stream("session-1", subscriber)
+    assert not cancel_event.is_set()
+    time.sleep(0.45)
+    assert cancel_event.is_set()
+
+
+def test_flight_mode_toggled_on_inside_the_window_disarms_the_cancellation(monkeypatch):
+    monkeypatch.setenv("SESSION_UNOBSERVED_GRACE_S", "0.2")
+    cancel_event = threading.Event()
+    server_state.begin_session_stream("session-1", cancel_event)
+
+    server_state.disconnect_session_stream_starter("session-1")
+    assert not cancel_event.is_set()
+
+    assert server_state.set_session_flight_mode("session-1", True) is True
+    time.sleep(0.35)
+    assert not cancel_event.is_set()
+
+
+def test_pending_cancellation_of_a_retired_generation_still_runs(monkeypatch):
+    """A new generation must not swallow the old generation's pending cancel."""
+    monkeypatch.setenv("SESSION_UNOBSERVED_GRACE_S", "0.2")
+    old_event = threading.Event()
+    server_state.begin_session_stream("session-1", old_event)
+    server_state.disconnect_session_stream_starter("session-1")
+    assert not old_event.is_set()
+
+    new_event = threading.Event()
+    server_state.begin_session_stream("session-1", new_event)
+    time.sleep(0.35)
+    assert old_event.is_set()
+    assert not new_event.is_set()
 
 
 def test_stale_generation_cannot_finish_or_publish_into_replacement_stream():

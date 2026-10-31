@@ -3,7 +3,7 @@
  * Validates: Requirements 6.1–6.6, 4.1, 5.5, 5.6
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { env, sessions, subscribeSessionStream, subscribeSessionEvents, __resetSessionEventsHubForTests, remoteEnv, remoteEnvHomeUrl, isRemoteLogoImage, resolveRemoteEnvLogo, tools, build } from './api.js'
+import { env, sessions, inferStream, subscribeSessionStream, isSessionStreamWatched, subscribeSessionEvents, __resetSessionEventsHubForTests, __resetSessionFramesHubForTests, remoteEnv, remoteEnvHomeUrl, isRemoteLogoImage, resolveRemoteEnvLogo, tools, build } from './api.js'
 
 // ---------------------------------------------------------------------------
 // Helper: create a mock fetch that returns the given data with the given status
@@ -75,102 +75,354 @@ async function flushPromises() {
   await Promise.resolve()
 }
 
-describe('subscribeSessionStream', () => {
-  it('reconnects after unexpected EOF and resumes after the last applied frame id', async () => {
+// ---------------------------------------------------------------------------
+// subscribeSessionStream — 每 tab 单条共享帧通道（connection budget）
+// ---------------------------------------------------------------------------
+// 背景：浏览器对同一 origin 的 HTTP/1.1 并发连接上限通常是 6 条（WS 也计入）。
+// 旧实现每个流式会话各占一条长连接，3-4 个并发推理 + 事件 hub + 终端 WS 就把
+// 6 条占满，之后的普通请求在浏览器侧排队，表现为"后端卡住"。现在每 tab 只有
+// 一条 GET /v1/sessions/frames，会话通过短命令增减，连接数与并发会话数无关。
+
+function makeChannel() {
+  const encoder = new TextEncoder()
+  let controller = null
+  const response = new Response(new ReadableStream({
+    start(c) { controller = c },
+  }), { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+  return {
+    response,
+    push: (chunk) => controller.enqueue(encoder.encode(chunk)),
+    end: () => controller.close(),
+  }
+}
+
+/** fetch mock that separates the channel connection from the short commands. */
+function framesTransport(channels = []) {
+  const calls = { channel: [], commands: [] }
+  let index = 0
+  const fetchMock = vi.fn((url, opts = {}) => {
+    if (url.startsWith('/v1/sessions/frames?conn=')) {
+      calls.channel.push({ url, opts })
+      const channel = index < channels.length ? channels[index] : channels[channels.length - 1]
+      index += 1
+      return Promise.resolve(channel.response)
+    }
+    if (url.startsWith('/v1/sessions/frames/')) {
+      calls.commands.push({ url, body: JSON.parse(opts.body) })
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({ ok: true, registered: true, active: true, persisted_seq: 0, latest_seq: 0, replayed: 0 }),
+      })
+    }
+    return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({}) })
+  })
+  return { calls, fetch: fetchMock }
+}
+
+const chanInit = (conn) => `event: chan_init\ndata: {"conn":"${conn}","generation":1}\n\n`
+const subInit = (sid, persisted = 0) => `event: sub_init\ndata: {"session_id":"${sid}","active":true,"persisted_seq":${persisted},"latest_seq":0}\n\n`
+const chanFrame = (sid, seq, content) => `event: frame\nid: ${seq}\ndata: {"session_id":"${sid}","seq":${seq},"event":null,"frame":{"role":"assistant","content":"${content}"}}\n\n`
+const chanDone = (sid) => `event: done\ndata: {"session_id":"${sid}"}\n\n`
+
+/** Drain the reader pump: every enqueued chunk costs several microtask ticks. */
+async function settle() {
+  for (let i = 0; i < 30; i++) await Promise.resolve()
+}
+
+describe('subscribeSessionStream (shared frame channel)', () => {
+  beforeEach(() => {
+    __resetSessionFramesHubForTests()
+  })
+  afterEach(() => {
+    __resetSessionFramesHubForTests()
+    vi.useRealTimers()
+  })
+
+  it('watches several sessions over one channel connection', async () => {
     vi.useFakeTimers()
-    const first = sseResponse([
-      'event: init\ndata: {"active":true,"persisted_seq":4,"latest_seq":5}\n\n',
-      'id: 5\ndata: {"role":"assistant","content":"first"}\n\n',
-    ])
-    const second = sseResponse([
-      'event: init\ndata: {"active":true,"persisted_seq":5,"latest_seq":6}\n\n',
-      'id: 6\ndata: {"role":"assistant","content":"second"}\n\n',
-      'data: [DONE]\n\n',
-    ])
-    vi.stubGlobal('fetch', vi.fn()
-      .mockResolvedValueOnce(first)
-      .mockResolvedValueOnce(second))
+    const channel = makeChannel()
+    const transport = framesTransport([channel])
+    vi.stubGlobal('fetch', transport.fetch)
+
+    subscribeSessionStream('session-a', vi.fn(), vi.fn(), vi.fn())
+    subscribeSessionStream('session-b', vi.fn(), vi.fn(), vi.fn())
+    await settle()
+
+    expect(transport.calls.channel).toHaveLength(1)
+    expect(transport.calls.channel[0].url).toMatch(/^\/v1\/sessions\/frames\?conn=/)
+    const subscribed = transport.calls.commands
+      .filter((c) => c.url === '/v1/sessions/frames/subscribe')
+      .map((c) => c.body.session_id)
+    expect(subscribed).toEqual(['session-a', 'session-b'])
+    // Both commands ride the same tab channel id.
+    const conns = new Set(transport.calls.commands.map((c) => c.body.conn))
+    expect(conns.size).toBe(1)
+  })
+
+  it('reports whether the channel watches a session, so the page can re-arm', async () => {
+    vi.useFakeTimers()
+    const channel = makeChannel()
+    const transport = framesTransport([channel])
+    vi.stubGlobal('fetch', transport.fetch)
+
+    expect(isSessionStreamWatched('session-a')).toBe(false)
+    const stop = subscribeSessionStream('session-a', vi.fn(), vi.fn(), vi.fn())
+    await settle()
+    expect(isSessionStreamWatched('session-a')).toBe(true)
+
+    // An unexpected per-session "done" drops the entry: the page must observe
+    // that, otherwise nothing would ever resume a still-running inference.
+    channel.push(chanDone('session-a'))
+    await settle()
+    expect(isSessionStreamWatched('session-a')).toBe(false)
+    stop()
+  })
+
+  it('re-registers watched sessions exactly once after a reconnect', async () => {
+    vi.useFakeTimers()
+    const first = makeChannel()
+    const second = makeChannel()
+    const transport = framesTransport([first, second])
+    vi.stubGlobal('fetch', transport.fetch)
+
+    subscribeSessionStream('session-a', vi.fn(), vi.fn(), vi.fn())
+    await settle()
+    expect(transport.calls.commands.filter((c) => c.url === '/v1/sessions/frames/subscribe')).toHaveLength(1)
+
+    first.end()
+    await settle()
+    vi.advanceTimersByTime(1000)   // FRAMES_RECONNECT_MS
+    await settle()
+
+    expect(transport.calls.channel).toHaveLength(2)
+    const subscribed = transport.calls.commands
+      .filter((c) => c.url === '/v1/sessions/frames/subscribe')
+      .map((c) => c.body.session_id)
+    expect(subscribed).toEqual(['session-a', 'session-a'])
+  })
+
+  it('delivers frames of every session and finalizes only the finished one', async () => {
+    vi.useFakeTimers()
+    const channel = makeChannel()
+    const transport = framesTransport([channel])
+    vi.stubGlobal('fetch', transport.fetch)
+
+    const aMessages = []
+    const bMessages = []
+    const aDone = vi.fn()
+    const bDone = vi.fn()
+    subscribeSessionStream('session-a', (m) => aMessages.push(m.content), aDone, vi.fn())
+    subscribeSessionStream('session-b', (m) => bMessages.push(m.content), bDone, vi.fn())
+    await settle()
+
+    channel.push(chanInit('t'))
+    channel.push(subInit('session-a'))
+    channel.push(chanFrame('session-a', 1, 'a1'))
+    channel.push(chanFrame('session-b', 1, 'b1'))
+    channel.push(chanDone('session-a'))
+    await settle()
+
+    expect(aMessages).toEqual(['a1'])
+    expect(bMessages).toEqual(['b1'])
+    expect(aDone).toHaveBeenCalledOnce()
+    expect(bDone).not.toHaveBeenCalled()
+  })
+
+  it('reconnects the channel once and replays each session from its own cursor', async () => {
+    vi.useFakeTimers()
+    const first = makeChannel()
+    const second = makeChannel()
+    const transport = framesTransport([first, second])
+    vi.stubGlobal('fetch', transport.fetch)
+
+    const messages = []
+    subscribeSessionStream('session-a', (m) => messages.push(m.content), vi.fn(), vi.fn())
+    subscribeSessionStream('session-b', (m) => messages.push(m.content), vi.fn(), vi.fn())
+    await settle()
+
+    first.push(chanInit('t'))
+    first.push(chanFrame('session-a', 4, 'a4'))
+    first.push(chanFrame('session-b', 7, 'b7'))
+    await settle()
+    first.end()
+
+    await vi.advanceTimersByTimeAsync(1000)
+    await settle()
+
+    // One reconnect for the whole tab, not one per session.
+    expect(transport.calls.channel).toHaveLength(2)
+    const resumed = transport.calls.commands
+      .filter((c) => c.url === '/v1/sessions/frames/subscribe')
+      .map((c) => [c.body.session_id, c.body.after])
+    // The first two commands are the initial subscriptions; the last two are
+    // the post-reconnect resumes, each carrying its own cursor.
+    expect(resumed.slice(-2)).toEqual([['session-a', 4], ['session-b', 7]])
+
+    second.push(chanInit('t'))
+    second.push(chanFrame('session-a', 5, 'a5'))
+    await settle()
+    expect(messages).toEqual(['a4', 'b7', 'a5'])
+  })
+
+  it('uses persisted_seq as the resume baseline when the first delivery drops', async () => {
+    vi.useFakeTimers()
+    const first = makeChannel()
+    const second = makeChannel()
+    const transport = framesTransport([first, second])
+    vi.stubGlobal('fetch', transport.fetch)
+
+    subscribeSessionStream('session-a', vi.fn(), vi.fn(), vi.fn())
+    await settle()
+    first.push(chanInit('t'))
+    first.push(subInit('session-a', 9))
+    await settle()
+    first.end()
+
+    await vi.advanceTimersByTimeAsync(1000)
+    await settle()
+
+    const resumed = transport.calls.commands.filter((c) => c.url === '/v1/sessions/frames/subscribe')
+    expect(resumed.at(-1).body.after).toBe(9)
+  })
+
+  it('closes the channel when the last watched session goes away', async () => {
+    vi.useFakeTimers()
+    const channel = makeChannel()
+    const transport = framesTransport([channel])
+    vi.stubGlobal('fetch', transport.fetch)
+
+    const unsubscribeA = subscribeSessionStream('session-a', vi.fn(), vi.fn(), vi.fn())
+    subscribeSessionStream('session-b', vi.fn(), vi.fn(), vi.fn())
+    await settle()
+
+    unsubscribeA()
+    await settle()
+    expect(transport.calls.commands.some((c) => c.url === '/v1/sessions/frames/unsubscribe')).toBe(true)
+    expect(transport.calls.channel).toHaveLength(1)
+
+    // The remaining session keeps the channel alive; no extra connection.
+    channel.push(chanInit('t'))
+    channel.push(chanFrame('session-b', 1, 'still-here'))
+    await settle()
+    expect(transport.calls.channel).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// inferStream — init 后把会话帧交接给共享通道，POST 连接立即归还
+// ---------------------------------------------------------------------------
+
+describe('inferStream (post-init handoff)', () => {
+  beforeEach(() => {
+    __resetSessionFramesHubForTests()
+  })
+  afterEach(() => {
+    __resetSessionFramesHubForTests()
+    vi.useRealTimers()
+  })
+
+  it('keeps the POST stream when the channel cannot take the session over', async () => {
+    vi.useFakeTimers()
+    const encoder = new TextEncoder()
+    const postResponse = new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode('event: init\ndata: {"session_id":"session-f","stream_seq":1}\n\n'))
+        controller.enqueue(encoder.encode('id: 2\ndata: {"role":"assistant","content":"carried-by-post"}\n\n'))
+      },
+    }), { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+
+    // The shared channel is unusable: its connection fails outright.
+    const fetchMock = vi.fn((url, opts = {}) => {
+      if (url === '/v1/infer/stream') return Promise.resolve(postResponse)
+      if (url.startsWith('/v1/sessions/frames')) {
+        return Promise.resolve({ ok: false, status: 503, json: () => Promise.resolve({}) })
+      }
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({}) })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
     const messages = []
     const done = vi.fn()
-
-    const unsubscribe = subscribeSessionStream('session 1', (msg) => messages.push(msg.content), done, vi.fn())
-    await flushPromises()
-    expect(fetch.mock.calls[0][0]).toBe('/v1/sessions/session%201/stream?after=-1')
-
-    await vi.advanceTimersByTimeAsync(1000)
-    await flushPromises()
-
-    expect(fetch.mock.calls[1][0]).toBe('/v1/sessions/session%201/stream?after=5')
-    expect(messages).toEqual(['first', 'second'])
-    expect(done).toHaveBeenCalledOnce()
-    unsubscribe()
-    vi.useRealTimers()
-  })
-
-  it('waits for batched UI acknowledgement before advancing the resume cursor', async () => {
-    vi.useFakeTimers()
-    vi.stubGlobal('fetch', vi.fn()
-      .mockResolvedValueOnce(sseResponse([
-        'event: init\ndata: {"active":true,"persisted_seq":4,"latest_seq":5}\n\n',
-        'id: 5\ndata: {"role":"assistant","content":"first"}\n\n',
-      ]))
-      .mockResolvedValueOnce(sseResponse(['data: [DONE]\n\n'])))
-    const acknowledgements = []
-
-    const unsubscribe = subscribeSessionStream(
-      'session-ack',
-      vi.fn(),
-      vi.fn(),
-      vi.fn(),
-      null,
-      -1,
-      (acknowledge) => acknowledgements.push(acknowledge),
+    const error = vi.fn()
+    inferStream(
+      { messages: [] },
+      (msg) => messages.push(msg.content),
+      done,
+      error,
     )
-    await flushPromises()
-    await vi.advanceTimersByTimeAsync(1000)
-    await flushPromises()
+    await settle()
+    vi.advanceTimersByTime(3000)
+    await settle()
 
-    // EOF must not reconnect ahead of the queued animation-frame application.
-    expect(fetch).toHaveBeenCalledOnce()
-    expect(acknowledgements).toHaveLength(1)
-    acknowledgements[0]()
-    await vi.advanceTimersByTimeAsync(1000)
-    await flushPromises()
-
-    expect(fetch.mock.calls[1][0]).toBe('/v1/sessions/session-ack/stream?after=5')
-    unsubscribe()
-    vi.useRealTimers()
+    // Releasing the POST while nobody watches the session would cancel the
+    // inference (that is how "Error: user interrupted." appeared without the
+    // user aborting), so the POST must keep carrying the frames itself.
+    expect(messages).toEqual(['carried-by-post'])
+    expect(isSessionStreamWatched('session-f')).toBe(false)
+    expect(done).not.toHaveBeenCalled()
+    // A channel failure is reported to the subscription, but it must not end the
+    // inference the POST is still carrying.
+    expect(error).not.toHaveBeenCalledWith(expect.anything())
   })
 
-  it('uses persisted_seq as the resume baseline if the first connection drops after init', async () => {
+  it('releases the POST connection and keeps receiving frames on the channel', async () => {
     vi.useFakeTimers()
-    vi.stubGlobal('fetch', vi.fn()
-      .mockResolvedValueOnce(sseResponse([
-        'event: init\ndata: {"active":true,"persisted_seq":9,"latest_seq":9}\n\n',
-      ]))
-      .mockResolvedValueOnce(sseResponse(['data: [DONE]\n\n'])))
+    const channel = makeChannel()
+    const transport = framesTransport([channel])
+    const encoder = new TextEncoder()
+    const postResponse = new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode('event: init\ndata: {"session_id":"session-h","stream_seq":2}\n\n'))
+        // The client is expected to abort right after init; keep the stream
+        // open so a plain EOF cannot be mistaken for the handoff.
+      },
+    }), { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
 
-    const unsubscribe = subscribeSessionStream('session-2', vi.fn(), vi.fn(), vi.fn())
-    await flushPromises()
-    await vi.advanceTimersByTimeAsync(1000)
-    await flushPromises()
+    const fetchMock = vi.fn((url, opts = {}) => {
+      if (url === '/v1/infer/stream') {
+        expect(opts.signal).toBeTruthy()
+        return Promise.resolve(postResponse)
+      }
+      return transport.fetch(url, opts)
+    })
+    vi.stubGlobal('fetch', fetchMock)
 
-    expect(fetch.mock.calls[1][0]).toBe('/v1/sessions/session-2/stream?after=9')
-    unsubscribe()
-    vi.useRealTimers()
-  })
+    const messages = []
+    const done = vi.fn()
+    const error = vi.fn()
+    const init = vi.fn()
+    const sequences = []
+    inferStream(
+      { messages: [] },
+      (msg, eventName) => messages.push([msg.content, eventName]),
+      done,
+      error,
+      init,
+      (seq) => sequences.push(seq),
+    )
+    await settle()
 
-  it('cancels a pending reconnect when unsubscribed', async () => {
-    vi.useFakeTimers()
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(sseResponse([])))
+    expect(init).toHaveBeenCalledWith({ session_id: 'session-h', stream_seq: 2 })
+    // The session is now watched on the tab's single channel…
+    const subscribed = transport.calls.commands.filter((c) => c.url === '/v1/sessions/frames/subscribe')
+    expect(subscribed.map((c) => [c.body.session_id, c.body.after])).toEqual([['session-h', 2]])
+    // …and the POST connection is gone: no frames are delivered from it.
+    expect(transport.calls.channel).toHaveLength(1)
 
-    const unsubscribe = subscribeSessionStream('session-3', vi.fn(), vi.fn(), vi.fn())
-    await flushPromises()
-    unsubscribe()
-    await vi.advanceTimersByTimeAsync(1000)
+    channel.push(chanInit('t'))
+    channel.push(chanFrame('session-h', 3, 'via-channel'))
+    await settle()
+    expect(messages).toEqual([['via-channel', 'message']])
+    // onSequence only reports what the POST itself published; from here on the
+    // channel owns the per-session resume cursor (see the reconnect test).
+    expect(sequences).toEqual([2])
+    expect(error).not.toHaveBeenCalled()
+    expect(done).not.toHaveBeenCalled()
 
-    expect(fetch).toHaveBeenCalledOnce()
-    vi.useRealTimers()
+    channel.push(chanDone('session-h'))
+    await settle()
+    expect(done).toHaveBeenCalledOnce()
   })
 })
 

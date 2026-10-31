@@ -1,7 +1,7 @@
 <script>
   import { onMount, onDestroy, setContext, untrack } from 'svelte'
   import { writable } from 'svelte/store'
-  import { inferStream, abortInferStream, interjectInfer, subscribeSessionEvents, subscribeSessionStream, agents as agentsApi, sessions as sessionsApi, remoteEnv as remoteEnvApi } from '../../lib/api.js'
+  import { inferStream, abortInferStream, interjectInfer, subscribeSessionEvents, subscribeSessionStream, isSessionStreamWatched, agents as agentsApi, sessions as sessionsApi, remoteEnv as remoteEnvApi } from '../../lib/api.js'
   import { catalog, loadAgents, loadTools, loadEnvVars, refreshAgents } from '../../lib/catalog-state.svelte.js'
   import ModelSelector from './ModelSelector.svelte'
   import ToolSelector from './ToolSelector.svelte'
@@ -261,12 +261,23 @@
   }
 
   function subscribeToExistingSession(sid, { handoff = false } = {}) {
-    if (!sid || (!handoff && directlyConsumedSessions.has(sid)) || sessionStreamSubscriptions[sid]) return
+    if (!sid) return
+    // The POST stream owns this session until its init hands the session over.
+    if (!handoff && directlyConsumedSessions.has(sid)) return
+    // Already watched by this tab and the shared frame channel still carries it.
+    // `isSessionStreamWatched` is the authoritative half: an entry can be gone
+    // (a torn-down channel, an unexpected per-session "done") while this page
+    // still holds the old unsubscribe closure, and then nothing would ever
+    // resume the frames of a still-running inference.
+    if (sessionStreamSubscriptions[sid] && isSessionStreamWatched(sid)) return
     if (handoff) directlyConsumedSessions.delete(sid)
     const keyRef = { key: sid }
     const aIdxRef = { value: -1, groupMode: false, groupMap: {} }
     const frameBatcher = createStreamFrameBatcher((msg) => {
-      const { __streamSeq: _streamSeq, ...frame } = msg
+      const { __streamSeq: streamSeq, ...frame } = msg
+      // Remember the last *applied* frame so a re-subscription (lost channel
+      // entry, reconnect) resumes exactly where this page stopped.
+      if (Number.isFinite(streamSeq)) directStreamLastSeq.set(sid, streamSeq)
       // 保留流订阅的总是已有会话，wasNewSession 恒为 false。
       onStreamMsg(frame, aIdxRef, null, false, keyRef)
     })
@@ -1183,6 +1194,32 @@
       (seq) => {
         const sid = keyRef.key === '__new__' ? null : keyRef.key
         if (sid) directStreamLastSeq.set(sid, seq)
+      },
+      {
+        // The POST stream is only the initiator handshake. Hand this session's
+        // frames to the tab's shared frame channel through a *tracked*
+        // subscription, so the page can tell whether the channel still watches
+        // it (and re-subscribe if it does not). inferStream releases the POST
+        // connection only after the backend confirms the subscription: cancelling
+        // a non-flight inference happens the moment its starter is gone with
+        // nobody watching, which otherwise looked like a spurious
+        // "Error: user interrupted.".
+        onHandoff: (sid, afterSeq) => {
+          if (Number.isFinite(afterSeq)) directStreamLastSeq.set(sid, afterSeq)
+          subscribeToExistingSession(sid, { handoff: true })
+        },
+        // The shared channel could not take the session over (no channel, failed
+        // subscribe command). The POST keeps carrying the frames itself, so undo
+        // the hand-off bookkeeping: without this the sweep or a status event
+        // would attach a second consumer and every frame would be applied twice.
+        onHandoffFallback: (sid) => {
+          directlyConsumedSessions.add(sid)
+          const unsubscribe = sessionStreamSubscriptions[sid]
+          if (unsubscribe) {
+            unsubscribe()
+            delete sessionStreamSubscriptions[sid]
+          }
+        },
       },
     )
   }
@@ -2167,6 +2204,7 @@
     loadRemoteEnvs()
     // 页面隐藏（关闭/刷新/切后台）时，同步落盘 3 秒延迟窗口内尚未写入的草稿
     window.addEventListener('pagehide', flushDraftNow)
+    streamWatchSweep = setInterval(rearmMissingStreamWatches, 5_000)
     _unsubscribeSessionEvents = subscribeSessionEvents(
       (data) => {
         if (data.event === 'init') {
@@ -2217,6 +2255,10 @@
   })
   onDestroy(() => {
     window.removeEventListener('pagehide', flushDraftNow)
+    if (streamWatchSweep) {
+      clearInterval(streamWatchSweep)
+      streamWatchSweep = null
+    }
     // SPA 路由离开聊天页时也落盘草稿，再次进入聊天页可还原
     flushDraftNow()
     if (_unsubscribeSessionEvents) {

@@ -202,6 +202,9 @@ _ROUTES: dict[str, list] = {
         (re.compile(r"^/v1/sessions$"), "_handle_list_sessions", ()),
         (re.compile(r"^/v1/sessions/search$"), "_handle_search_sessions", ()),
         (re.compile(r"^/v1/sessions/events$"), "_handle_sessions_events", ()),
+        # Multiplexed frame channel: one SSE per browser tab. Must precede the
+        # generic /v1/sessions/{id} route, which would otherwise match "frames".
+        (re.compile(r"^/v1/sessions/frames$"), "_handle_session_frames", ()),
         (re.compile(r"^/v1/sessions/([^/]+)/stream$"), "_handle_session_stream", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/sessions/([^/]+)/log-dir$"), "_handle_session_log_dir", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/sessions/([^/]+)/execution-analysis$"), "_handle_session_execution_analysis", (urllib.parse.unquote,)),
@@ -250,6 +253,10 @@ _ROUTES: dict[str, list] = {
         (re.compile(r"^/v1/tunnel/parent/register$"), "_handle_tunnel_parent_register", ()),
         (re.compile(r"^/v1/tunnel/parent/unregister$"), "_handle_tunnel_parent_unregister", ()),
         (re.compile(r"^/v1/env/detect$"), "_handle_detect_env", ()),
+        # Multiplexed frame channel commands (see GET /v1/sessions/frames).
+        (re.compile(r"^/v1/sessions/frames/subscribe$"), "_handle_session_frames_subscribe", ()),
+        (re.compile(r"^/v1/sessions/frames/unsubscribe$"), "_handle_session_frames_unsubscribe", ()),
+        (re.compile(r"^/v1/sessions/frames/close$"), "_handle_session_frames_close", ()),
         (re.compile(r"^/v1/sessions/([^/]+)/generate-title$"), "_handle_generate_session_title", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/sessions/([^/]+)/regenerate-summary$"), "_handle_regenerate_session_summary", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/sessions/([^/]+)/read$"), "_handle_mark_session_read", (urllib.parse.unquote,)),

@@ -62,8 +62,13 @@ from runtime.server_state import (
     _session_state_lock,
     _session_statuses,
     _unread_sessions,
+    attach_frame_channel,
     clear_session_stream_state,
+    close_frame_channel,
+    detach_frame_channel,
     flight_sessions_snapshot,
+    frame_channel_subscribe,
+    frame_channel_unsubscribe,
     register_session_stream_with_snapshot,
     set_session_flight_mode,
     snapshot_session_titles,
@@ -2320,6 +2325,155 @@ class HandlerApiMixin:
             pass
         finally:
             unsubscribe_session_stream(session_id, _send)
+
+    # ------------------------------------------------------------------
+    # Multiplexed session frame channel (one SSE connection per browser tab)
+    # ------------------------------------------------------------------
+
+    def _frame_channel_wire(self, item: dict) -> bytes:
+        """Encode one channel item as an SSE block.
+
+        ``event:`` is reserved for channel control (``chan_init`` /
+        ``sub_init`` / ``done``); inference frames always travel as
+        ``event: frame`` with their original SSE event name inside the payload,
+        so one connection can carry any number of sessions unambiguously.
+        """
+        kind = item.get("type")
+        if kind == "frame":
+            payload = {
+                "session_id": item.get("session_id"),
+                "seq": item.get("seq"),
+                "event": item.get("event"),
+                "frame": item.get("frame"),
+            }
+            return (
+                f"event: frame\nid: {item.get('seq')}\n"
+                f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            ).encode("utf-8")
+        control = {k: v for k, v in item.items() if k != "type"}
+        return f"event: {kind}\ndata: {json.dumps(control, ensure_ascii=False)}\n\n".encode("utf-8")
+
+    def _handle_session_frames(self) -> None:
+        """GET /v1/sessions/frames?conn=<tab id> — one SSE connection that
+        carries the frames of every session this browser tab watches.
+
+        The channel is looked up by ``conn``: created when the tab connects for
+        the first time, re-attached when the same tab reconnects. Sessions are
+        added/removed with the ``/v1/sessions/frames/subscribe`` and
+        ``/unsubscribe`` commands.
+        """
+        conn = (self._get_query_param("conn", "") or "").strip()
+        if not conn or len(conn) > 64:
+            self._send_json_error(400, "conn query parameter is required")
+            return
+        channel, generation = attach_frame_channel(conn)
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache, no-transform")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+        import queue as _queue
+        channel_debug = os.environ.get("SESSION_STREAM_DEBUG", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        if channel_debug:
+            logger.warning(
+                "frame_channel open conn=%s generation=%s sessions=%s",
+                conn, generation, sorted(channel["sessions"]),
+            )
+        try:
+            self.wfile.write(self._frame_channel_wire({
+                "type": "chan_init", "conn": conn, "generation": generation,
+            }))
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            detach_frame_channel(conn, generation)
+            return
+
+        try:
+            while True:
+                try:
+                    item = channel["queue"].get(timeout=15)
+                except _queue.Empty:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    continue
+                if item.get("type") == "attach_flush":
+                    # Either this connection's own wake-up marker (ignore) or a
+                    # newer connection took the channel over (stop writing).
+                    if item.get("generation") != generation:
+                        break
+                    continue
+                self.wfile.write(self._frame_channel_wire(item))
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            detached = detach_frame_channel(conn, generation)
+            if channel_debug:
+                logger.warning(
+                    "frame_channel close conn=%s generation=%s detached=%s",
+                    conn, generation, detached,
+                )
+
+    def _handle_session_frames_subscribe(self) -> None:
+        """POST /v1/sessions/frames/subscribe {conn, session_id, after}.
+
+        Registers the channel as an observer of that session and pushes the
+        ``sub_init`` snapshot plus the retained frames after ``after`` onto the
+        channel. Returns the same snapshot synchronously so the caller can
+        render immediately.
+        """
+        data = self._read_json_body()
+        if data is None:
+            return
+        conn = str(data.get("conn") or "").strip()
+        session_id = str(data.get("session_id") or "").strip()
+        if not conn or not session_id:
+            self._send_json_error(400, "conn and session_id are required")
+            return
+        try:
+            after_seq = int(data.get("after", -1))
+        except (TypeError, ValueError):
+            after_seq = -1
+        registered, snapshot = frame_channel_subscribe(conn, session_id, after_seq)
+        self._send_json_response(200, {
+            "ok": True,
+            "registered": registered,
+            "active": snapshot["active"],
+            "persisted_seq": snapshot["persisted_seq"],
+            "latest_seq": snapshot["latest_seq"],
+            "replayed": len(snapshot["frames"]),
+        })
+
+    def _handle_session_frames_unsubscribe(self) -> None:
+        """POST /v1/sessions/frames/unsubscribe {conn, session_id}."""
+        data = self._read_json_body()
+        if data is None:
+            return
+        conn = str(data.get("conn") or "").strip()
+        session_id = str(data.get("session_id") or "").strip()
+        if not conn or not session_id:
+            self._send_json_error(400, "conn and session_id are required")
+            return
+        removed = frame_channel_unsubscribe(conn, session_id)
+        self._send_json_response(200, {"ok": True, "removed": removed})
+
+    def _handle_session_frames_close(self) -> None:
+        """POST /v1/sessions/frames/close {conn} — release the whole tab channel."""
+        data = self._read_json_body()
+        if data is None:
+            return
+        conn = str(data.get("conn") or "").strip()
+        if not conn:
+            self._send_json_error(400, "conn is required")
+            return
+        closed = close_frame_channel(conn)
+        self._send_json_response(200, {"ok": True, "closed": closed})
 
     def _session_search_max_results(self) -> int:
         """Read SEARCH_MAX_RESULTS at request time as the max session page size.
