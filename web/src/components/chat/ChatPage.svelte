@@ -155,8 +155,30 @@
   // session-events init snapshot and live status frames). Reactive sets so
   // the input bar can swap to the ▶ resume affordance and remember a pending
   // pause request while the backend drains at the round boundary.
-  const backendPausedSessions = $state(new Set())
-  const pauseRequestedSessions = $state(new Set())
+  let backendPausedSessions = $state(new Set())
+  let pauseRequestedSessions = $state(new Set())
+  // $state's proxy does not track in-place Set mutations in this Svelte
+  // version (only property assignments and array methods are reactive) —
+  // every mutation must copy-then-reassign, like the rest of this file does
+  // for fileDiffVisible / terminals / collapsedGroups. Mutating in place
+  // kept the sets correct but invisible to the UI: a live "paused" event
+  // changed the Set without ever re-rendering the ⏸ control (a page reload
+  // worked only because the init snapshot fills the sets before first
+  // render). These helpers keep the invariant in one place.
+  function markPaused(sid, paused = true) {
+    if (backendPausedSessions.has(sid) === paused) return
+    const next = new Set(backendPausedSessions)
+    if (paused) next.add(sid)
+    else next.delete(sid)
+    backendPausedSessions = next
+  }
+  function markPauseRequested(sid, requested = true) {
+    if (pauseRequestedSessions.has(sid) === requested) return
+    const next = new Set(pauseRequestedSessions)
+    if (requested) next.add(sid)
+    else next.delete(sid)
+    pauseRequestedSessions = next
+  }
   function storeKey(sid) { return sid || '__new__' }
 
   function streamUiDebug(event, details = {}) {
@@ -1050,8 +1072,8 @@
       // 恢复软暂停的会话：后端从完整历史继续，不删除任何轮、不写中断尾轮。
       reqBody.resume = true
       if (sessionId) {
-        backendPausedSessions.delete(sessionId)
-        pauseRequestedSessions.delete(sessionId)
+        markPaused(sessionId, false)
+        markPauseRequested(sessionId, false)
       }
     }
     if (selectedAgentIds.length > 0) {
@@ -1250,11 +1272,11 @@
     if (!sessionId) return
     const store = sessionStore[storeKey(sessionId)]
     if (!store?.isStreaming) return
-    pauseRequestedSessions.add(sessionId)
+    markPauseRequested(sessionId, true)
     abortInferStream(sessionId, 'pause').then((res) => {
-      if (res && res.effective === false) pauseRequestedSessions.delete(sessionId)
+      if (res && res.effective === false) markPauseRequested(sessionId, false)
     }).catch(() => {
-      pauseRequestedSessions.delete(sessionId)
+      markPauseRequested(sessionId, false)
     })
   }
 
@@ -1302,8 +1324,8 @@
     const sid = sessionId
     const res = await abortInferStream(sid, 'end')
     if (res && res.ended) {
-      backendPausedSessions.delete(sid)
-      pauseRequestedSessions.delete(sid)
+      markPaused(sid, false)
+      markPauseRequested(sid, false)
       sessionsApi.markRead(sid).catch(() => {})
     }
     // ended=false：后端不在 paused（可能其他端已恢复/结束，事件会自行
@@ -2208,10 +2230,10 @@
     _unsubscribeSessionEvents = subscribeSessionEvents(
       (data) => {
         if (data.event === 'init') {
-          backendPausedSessions.clear()
+          const pausedSnapshot = new Set()
           for (const [sid, status] of Object.entries(data.sessions || {})) {
             if (status === 'streaming') backendStreamingSessions.add(sid)
-            else if (status === 'paused') backendPausedSessions.add(sid)
+            else if (status === 'paused') pausedSnapshot.add(sid)
             const s = sessionStore[storeKey(sid)]
             if (s && status === 'streaming') {
               s.isStreaming = true
@@ -2220,25 +2242,26 @@
               s.isStreaming = false
             }
           }
+          backendPausedSessions = pausedSnapshot
         } else if (data.event === 'message' && data.session_id && data.status) {
           const sid = data.session_id
           const s = sessionStore[storeKey(sid)]
           if (data.status === 'streaming') {
             backendStreamingSessions.add(sid)
-            backendPausedSessions.delete(sid)
-            pauseRequestedSessions.delete(sid)
+            markPaused(sid, false)
+            markPauseRequested(sid, false)
           } else if (data.status === 'paused') {
             // Soft-pause settled: the generation is over (its SSE closed with
             // [DONE]); the session rests in a resumable state.
             backendStreamingSessions.delete(sid)
-            backendPausedSessions.add(sid)
-            pauseRequestedSessions.delete(sid)
+            markPaused(sid, true)
+            markPauseRequested(sid, false)
             directlyConsumedSessions.delete(sid)
             directStreamLastSeq.delete(sid)
           } else if (data.status.startsWith('done_')) {
             backendStreamingSessions.delete(sid)
-            backendPausedSessions.delete(sid)
-            pauseRequestedSessions.delete(sid)
+            markPaused(sid, false)
+            markPauseRequested(sid, false)
             directlyConsumedSessions.delete(sid)
             directStreamLastSeq.delete(sid)
           }
