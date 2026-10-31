@@ -10,7 +10,7 @@
     fileLanded,
     chunkRequestPromise,
   } from '../../lib/workspace-upload.js'
-  import { highlight, escapeHtml, getFileLang, isMarkdownFile } from '../../lib/highlight.js'
+  import { highlightByLines, escapeHtml, getFileLang, isMarkdownFile } from '../../lib/highlight.js'
   import { copyToClipboard } from '../../lib/clipboard.js'
   import { renderMarkdown, bindMarkdownExtras } from '../../lib/markdown.js'
   import { computeShortEdgeZoomSize } from '../../lib/imageZoom.js'
@@ -1405,7 +1405,8 @@
     const lang = getFileLang(filename)
     const lines = content.split('\n')
     if (lang) {
-      return renderCodeWithLines(lines.map(line => highlight(line, lang)))
+      // 先对完整内容高亮再拆行，保证跨行 token（如 Python docstring）按整体着色
+      return renderCodeWithLines(highlightByLines(content, lang))
     }
     return renderCodeWithLines(lines.map(l => escapeHtml(l)))
   }

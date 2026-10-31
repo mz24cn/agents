@@ -73,6 +73,7 @@
 /* ===== 语法高亮 token 色（与 lib/highlight.js 产出的类一一对应） ===== */
 .md-view .hl-keyword   { color: #c792ea; }
 .md-view .hl-string    { color: #c3e88d; }
+.md-view .hl-docstring { color: #b8c77b; font-style: italic; }
 .md-view .hl-comment   { color: #546e7a; font-style: italic; }
 .md-view .hl-number    { color: #f78c6c; }
 .md-view .hl-boolean   { color: #ff5874; }
@@ -86,6 +87,7 @@
 
 :root[data-theme='light'] .md-view .hl-keyword   { color: #7c3aed; }
 :root[data-theme='light'] .md-view .hl-string    { color: #16a34a; }
+:root[data-theme='light'] .md-view .hl-docstring { color: #3f7d1e; font-style: italic; }
 :root[data-theme='light'] .md-view .hl-comment   { color: #6b7280; font-style: italic; }
 :root[data-theme='light'] .md-view .hl-number    { color: #c2410c; }
 :root[data-theme='light'] .md-view .hl-boolean   { color: #dc2626; }

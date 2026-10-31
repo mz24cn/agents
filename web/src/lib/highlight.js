@@ -4,8 +4,8 @@
  */
 
 const PYTHON_RULES = [
-  // Triple-quoted strings (highest priority)
-  { pattern: /"""[\s\S]*?"""|'''[\s\S]*?'''/g, className: 'hl-string' },
+  // Triple-quoted strings / docstrings (highest priority)
+  { pattern: /"""[\s\S]*?"""|'''[\s\S]*?'''/g, className: 'hl-docstring' },
   // Single-line strings
   { pattern: /"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, className: 'hl-string' },
   // Decorators
@@ -494,6 +494,52 @@ function highlightJson(code, options = {}) {
   }
 }
 
+const PYTHON_DOCSTRING_PATTERN = /("""|''')[\s\S]*?\1/
+
+/**
+ * Computes non-overlapping highlight matches for Python code.
+ * Triple-quoted strings (docstrings) are identified first and treated as a
+ * single token, so other rules (comments, keywords, numbers, single-line
+ * strings) never match inside them.
+ * @param {string} code  Raw code text (unescaped)
+ * @returns {{className: string, end: number, start: number, text: string}[]}
+ */
+export function highlightPythonMatches(code) {
+  // First pass: mark triple-quoted strings as docstring regions
+  const matches = []
+  const docPattern = new RegExp(PYTHON_DOCSTRING_PATTERN.source, 'g')
+  let m
+  while ((m = docPattern.exec(code)) !== null) {
+    matches.push({ start: m.index, end: m.index + m[0].length, text: m[0], className: 'hl-docstring' })
+  }
+
+  // Second pass: apply remaining rules only outside docstring regions
+  const reserved = new Set()
+  for (const d of matches) {
+    for (let i = d.start; i < d.end; i++) reserved.add(i)
+  }
+
+  for (const rule of PYTHON_RULES) {
+    rule.pattern.lastIndex = 0
+    let cursor = 0
+    while ((m = rule.pattern.exec(code)) !== null) {
+      if (reserved.has(m.index) || m.index < cursor) continue
+      if (m.index + m[0].length > cursor) {
+        matches.push({ start: m.index, end: m.index + m[0].length, text: m[0], className: rule.className })
+        cursor = m.index + m[0].length
+      }
+    }
+  }
+
+  return matches
+}
+
+function highlightPython(code) {
+  const matches = highlightPythonMatches(code)
+  if (matches.length === 0) return escapeHtml(code)
+  return renderHighlighted(code, matches)
+}
+
 /**
  * Applies syntax highlighting to code after HTML-escaping it.
  * Falls back to plain escapeHtml for unsupported languages.
@@ -505,6 +551,7 @@ function highlightJson(code, options = {}) {
 export function highlight(code, lang, options = {}) {
   const normalizedLang = String(lang || '').toLowerCase()
   if (normalizedLang === 'json') return highlightJson(code, options)
+  if (normalizedLang === 'python' || normalizedLang === 'py') return highlightPython(code)
 
   const rules = RULES[normalizedLang]
   const escaped = escapeHtml(code)
@@ -527,6 +574,77 @@ export function highlight(code, lang, options = {}) {
   } catch {
     return escaped
   }
+}
+
+/**
+ * Highlights code as a whole (so tokens that span multiple lines, like Python
+ * docstrings, render as a single token) and returns one HTML string per
+ * source line. Line-spanning tokens are reopened and closed on every line
+ * they cover, so each line remains valid standalone HTML.
+ * @param {string} code   Raw code text (unescaped)
+ * @param {string} lang   Language identifier
+ * @returns {string[]}    One highlighted HTML string per source line
+ */
+export function highlightByLines(code, lang) {
+  if (typeof code !== 'string') return []
+  const normalizedLang = String(lang || '').toLowerCase()
+
+  let matches
+  if (normalizedLang === 'python' || normalizedLang === 'py') {
+    matches = highlightPythonMatches(code)
+  } else if (RULES[normalizedLang]) {
+    // Generic languages: collect matches the same way highlight() does
+    matches = []
+    for (const rule of RULES[normalizedLang]) {
+      rule.pattern.lastIndex = 0
+      let m
+      while ((m = rule.pattern.exec(code)) !== null) {
+        matches.push({ start: m.index, end: m.index + m[0].length, className: rule.className })
+      }
+    }
+  } else {
+    matches = []
+  }
+
+  // De-duplicate / keep only non-overlapping matches (first wins)
+  matches.sort((a, b) => a.start - b.start || a.end - b.end)
+  const filtered = []
+  let cursor = 0
+  for (const match of matches) {
+    if (match.start >= cursor) {
+      filtered.push(match)
+      cursor = match.end
+    }
+  }
+
+  // Line start offsets: index i marks the first char of line i
+  const lineStarts = [0]
+  for (let i = 0; i < code.length; i++) {
+    if (code[i] === '\n') lineStarts.push(i + 1)
+  }
+  const lineEnds = lineStarts.slice(1).map(s => s - 1)
+  lineEnds.push(code.length)
+
+  const lines = []
+  for (let i = 0; i < lineStarts.length; i++) {
+    const lineStart = lineStarts[i]
+    const lineEnd = lineEnds[i]
+    let html = ''
+    let pos = lineStart
+    for (const match of filtered) {
+      // Skip matches that don't overlap this line
+      if (match.end <= lineStart || match.start >= lineEnd) continue
+      const mStart = Math.max(match.start, lineStart)
+      const mEnd = Math.min(match.end, lineEnd)
+      if (mStart > pos) html += escapeHtml(code.slice(pos, mStart))
+      html += `<span class="${match.className}">${escapeHtml(code.slice(mStart, mEnd))}</span>`
+      pos = mEnd
+    }
+    if (pos < lineEnd) html += escapeHtml(code.slice(pos, lineEnd))
+    lines.push(html)
+  }
+
+  return lines
 }
 
 /**
