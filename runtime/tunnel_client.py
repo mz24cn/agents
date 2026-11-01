@@ -381,13 +381,13 @@ class TunnelClient:
         server_sock = getattr(self._server, "_server", None)
         return {
             **compute_setup_versions(self._env_manager, self._data_dir),
-            "inference_active": bool(getattr(server_sock, "active_streams", {})) or bool(
+            "inference_active": bool(getattr(server_sock, "active_infers", {})) or bool(
                 int(getattr(server_sock, "active_inference_count", 0) or 0)
             ),
             "api_inference_active": bool(
                 int(getattr(server_sock, "active_api_inference_count", 0) or 0)
             ),
-            "session_inference_active": bool(getattr(server_sock, "active_streams", {})),
+            "session_inference_active": bool(getattr(server_sock, "active_infers", {})),
             "server_instance_id": _SERVER_INSTANCE_ID,
             "app_title": str(env_map.get("APP_TITLE", "") or ""),
             "app_logo": str(env_map.get("APP_LOGO", "") or ""),

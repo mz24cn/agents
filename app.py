@@ -103,11 +103,11 @@ if __name__ == "__main__":
     finally:
         # 优雅收尾：先通知进行中的推理线程终止并落盘，再关闭服务器。
         # 推理线程是 daemon 线程，直接 stop() 会在进程退出时被强制终止，
-        # 可能丢失最后一轮对话输出。这里 set 所有 active_streams 的
+        # 可能丢失最后一轮对话输出。这里 set 所有 active_infers 的
         # cancel_event 并短暂等待，让推理线程走正常的最终持久化分支。
         # （配合推理过程中的增量持久化，最多丢失正在执行的最后一轮。）
         try:
-            active = getattr(server, "_active_streams", None) or {}
+            active = getattr(server, "_active_infers", None) or {}
             for ev in list(active.values()):
                 try:
                     ev.set()

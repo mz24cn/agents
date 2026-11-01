@@ -238,7 +238,7 @@ class _StubAbortHandler(HandlerInferMixin):
         self.responses = []
         self.errors = []
         self.forced_calls = []
-        self.server = SimpleNamespace(active_streams={})
+        self.server = SimpleNamespace(active_infers={})
 
     def _read_json_body(self):
         return dict(self._body)
@@ -257,7 +257,7 @@ def test_abort_pause_action_sets_flag_only():
     cancel_event = threading.Event()
     begin_session_stream("s1", cancel_event)
     handler = _StubAbortHandler({"session_id": "s1", "action": "pause"})
-    handler.server.active_streams = {"s1": cancel_event}
+    handler.server.active_infers = {"s1": cancel_event}
 
     handler._handle_infer_abort()
 
@@ -271,7 +271,7 @@ def test_abort_pause_action_sets_flag_only():
 def test_abort_legacy_forced_bool_still_forces():
     cancel_event = threading.Event()
     handler = _StubAbortHandler({"session_id": "s1", "forced": True})
-    handler.server.active_streams = {"s1": cancel_event}
+    handler.server.active_infers = {"s1": cancel_event}
 
     handler._handle_infer_abort()
 
@@ -284,7 +284,7 @@ def test_abort_stop_supersedes_pending_pause():
     begin_session_stream("s1", cancel_event)
     request_pause_infer("s1", cancel_event)
     handler = _StubAbortHandler({"session_id": "s1"})
-    handler.server.active_streams = {"s1": cancel_event}
+    handler.server.active_infers = {"s1": cancel_event}
 
     handler._handle_infer_abort()
 
@@ -549,7 +549,7 @@ class _StubInterjectHandler(HandlerInferMixin):
         self._body = body
         self.responses = []
         self.errors = []
-        self.server = SimpleNamespace(active_streams={})
+        self.server = SimpleNamespace(active_infers={})
 
     def _read_json_body(self):
         return dict(self._body)
@@ -583,7 +583,7 @@ def test_interject_endpoint_queues_and_validates():
         "session_id": "s1",
         "message": {"role": "user", "content": "  look here  "},
     })
-    handler.server.active_streams = {"s1": cancel_event}
+    handler.server.active_infers = {"s1": cancel_event}
 
     handler._handle_infer_interject()
     assert handler.responses[0][0] == 202
@@ -595,12 +595,12 @@ def test_interject_endpoint_queues_and_validates():
 
     # Malformed payloads are rejected, never buffered.
     bad = _StubInterjectHandler({"session_id": "s1", "message": {"role": "assistant"}})
-    bad.server.active_streams = {"s1": cancel_event}
+    bad.server.active_infers = {"s1": cancel_event}
     bad._handle_infer_interject()
     assert bad.errors and bad.errors[0][0] == 400
 
     empty = _StubInterjectHandler({"session_id": "s1", "message": {"role": "user", "content": "  "}})
-    empty.server.active_streams = {"s1": cancel_event}
+    empty.server.active_infers = {"s1": cancel_event}
     empty._handle_infer_interject()
     assert empty.errors and empty.errors[0][0] == 400
 
@@ -615,7 +615,7 @@ def test_interject_allowed_for_group_chat_generation_and_published_live():
         "session_id": "s1",
         "message": {"role": "user", "content": "mine", "timestamp": "2026-01-01 00:00:00"},
     })
-    handler.server.active_streams = {"s1": cancel_event}
+    handler.server.active_infers = {"s1": cancel_event}
 
     handler._handle_infer_interject()
     assert not handler.errors
@@ -667,7 +667,7 @@ def test_abort_end_action_converges_paused_session():
             self._body = body
             self.responses = []
             self.errors = []
-            self.server = SimpleNamespace(active_streams={})
+            self.server = SimpleNamespace(active_infers={})
 
         def _read_json_body(self):
             return dict(self._body)

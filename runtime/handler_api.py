@@ -1527,7 +1527,7 @@ class HandlerApiMixin:
         op = self._get_query_param("op", "")
         if op == "hello":
             versions = self._local_setup_versions()
-            inference_active = bool(getattr(self.server, "active_streams", {})) or bool(
+            inference_active = bool(getattr(self.server, "active_infers", {})) or bool(
                 int(getattr(self.server, "active_inference_count", 0) or 0)
             )
             # App metadata for the parent's remote-environment list. hello is
@@ -1542,11 +1542,11 @@ class HandlerApiMixin:
                 "last_config": versions["last_config"],
                 "inference_active": inference_active,
                 # Per-source busy breakdown: web sessions carry a session_id
-                # and are tracked in active_streams; stateless API calls (no
+                # and are tracked in active_infers; stateless API calls (no
                 # session_id) are invisible to the web UI and counted
                 # separately so the setup page can tell the two apart.
                 "api_inference_active": bool(int(getattr(self.server, "active_api_inference_count", 0) or 0)),
-                "session_inference_active": bool(getattr(self.server, "active_streams", {})),
+                "session_inference_active": bool(getattr(self.server, "active_infers", {})),
                 "server_started_at": _SERVER_STARTED_AT,
                 "server_instance_id": _SERVER_INSTANCE_ID,
                 # App identity + platform: displayed in the parent's remote
@@ -1735,11 +1735,11 @@ class HandlerApiMixin:
         local = dict(self._local_setup_versions())
         # 与 op=hello 相同的推理状态字段，让检查更新的 UI 一次请求拿全
         # 版本基线与推理占用。
-        local["inference_active"] = bool(getattr(self.server, "active_streams", {})) or bool(
+        local["inference_active"] = bool(getattr(self.server, "active_infers", {})) or bool(
             int(getattr(self.server, "active_inference_count", 0) or 0)
         )
         local["api_inference_active"] = bool(int(getattr(self.server, "active_api_inference_count", 0) or 0))
-        local["session_inference_active"] = bool(getattr(self.server, "active_streams", {}))
+        local["session_inference_active"] = bool(getattr(self.server, "active_infers", {}))
         self._send_json_response(200, {
             "remote": snapshot_from_hello(hello),
             "local": local,
@@ -1840,9 +1840,9 @@ class HandlerApiMixin:
             self._send_json_error(500, "Update lock is unavailable")
             return None
         with update_lock:
-            active_streams = getattr(self.server, "active_streams", {})
+            active_infers = getattr(self.server, "active_infers", {})
             active_count = int(getattr(self.server, "active_inference_count", 0) or 0)
-            if active_streams or active_count > 0:
+            if active_infers or active_count > 0:
                 self._send_json_response(409, {
                     "error": "inference_active",
                     "message": "Cannot update while inference sessions are active",

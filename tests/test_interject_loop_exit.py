@@ -179,7 +179,7 @@ def test_refused_interjection_is_answered_not_active_and_never_echoed():
             "timestamp": "2026-01-01 00:00:00",
         },
     })
-    handler.server.active_streams = {"s1": cancel_event}
+    handler.server.active_infers = {"s1": cancel_event}
 
     handler._handle_infer_interject()
 

@@ -753,7 +753,7 @@ class HandlerInferMixin:
         """Begin server-level tracking of a stateless (API) inference.
 
         Web requests always carry a session_id and are already tracked per
-        session via ``active_streams`` and the session status events.  A
+        session via ``active_infers`` and the session status events.  A
         stateless API call is invisible to the web UI, so the setup page
         needs a separate counter to report it.  Returns True when this
         request is stateless and the counter was incremented.
@@ -1108,10 +1108,10 @@ class HandlerInferMixin:
 
         set_request_context(sse_callback=_sse_write, cancel_event=cancel_event)
 
-        # 注册到 active_streams，使 /v1/infer/abort 可以主动触发中止
-        active_streams = getattr(self.server, "active_streams", None)
-        if active_streams is not None and session_id is not None:
-            active_streams[session_id] = cancel_event
+        # 注册到 active_infers，使 /v1/infer/abort 可以主动触发中止
+        active_infers = getattr(self.server, "active_infers", None)
+        if active_infers is not None and session_id is not None:
+            active_infers[session_id] = cancel_event
 
         # --- Session Status Stream: broadcast "streaming" ---
         if session_id is not None:
@@ -1437,11 +1437,11 @@ class HandlerInferMixin:
         finally:
             if session_id is not None:
                 finish_session_stream(session_id, owner_event=cancel_event)
-            # Only unregister from active_streams if we are still the active stream
+            # Only unregister from active_infers if we are still the active stream
             # for this session. A newer inference may have replaced our cancel_event.
-            if active_streams is not None and session_id is not None:
-                if active_streams.get(session_id) is cancel_event:
-                    active_streams.pop(session_id, None)
+            if active_infers is not None and session_id is not None:
+                if active_infers.get(session_id) is cancel_event:
+                    active_infers.pop(session_id, None)
             if api_inference:
                 self._leave_api_inference()
             self._cleanup_thread_local()
@@ -1451,17 +1451,17 @@ class HandlerInferMixin:
 
         When a user force-aborts and immediately starts a new inference on the
         same session, the old thread's ``cancel_event`` gets replaced in
-        ``active_streams`` by the new thread's event.  Calling this method
+        ``active_infers`` by the new thread's event.  Calling this method
         before persisting lets the stale thread detect that it has been
         superseded and skip the write — preventing a lost-update race on
         ``conversation.json``.
         """
         if session_id is None:
             return True
-        active_streams = getattr(self.server, "active_streams", None)
-        if active_streams is None:
+        active_infers = getattr(self.server, "active_infers", None)
+        if active_infers is None:
             return True
-        return active_streams.get(session_id) is cancel_event
+        return active_infers.get(session_id) is cancel_event
 
     def _handle_infer_abort(self) -> None:
         """POST /v1/infer/abort — 主动中止/暂停指定会话的流式推理。
@@ -1493,8 +1493,8 @@ class HandlerInferMixin:
         if action not in ("stop", "force", "pause", "end"):
             action = "force" if body.get("forced", False) is True else "stop"
 
-        active_streams = getattr(self.server, "active_streams", None)
-        target_event = active_streams.get(session_id) if active_streams is not None else None
+        active_infers = getattr(self.server, "active_infers", None)
+        target_event = active_infers.get(session_id) if active_infers is not None else None
 
         if action == "end":
             # 结束被暂停的会话：不恢复、不新增任何轮次，把 resting 的 paused 状态
@@ -1520,7 +1520,7 @@ class HandlerInferMixin:
         if action == "force":
             self._force_abort(session_id, owner_event=target_event)
             self._send_json_response(200, {"ok": True, "forced": True})
-        elif active_streams is not None and session_id in active_streams:
+        elif active_infers is not None and session_id in active_infers:
             self._send_json_response(200, {"ok": True})
         else:
             # 会话不存在或已结束，视为成功（幂等）
@@ -1575,8 +1575,8 @@ class HandlerInferMixin:
         if client_message_id:
             message["client_message_id"] = str(client_message_id)
 
-        active_streams = getattr(self.server, "active_streams", None)
-        target_event = active_streams.get(session_id) if active_streams is not None else None
+        active_infers = getattr(self.server, "active_infers", None)
+        target_event = active_infers.get(session_id) if active_infers is not None else None
         if target_event is None or target_event.is_set():
             self._send_json_response(200, {"ok": True, "status": "not_active", "session_id": session_id})
             return
