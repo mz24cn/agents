@@ -204,6 +204,127 @@ def _wait_model_retry(attempt: int, cancel_event: Optional[object] = None) -> bo
         time.sleep(min(remaining, 0.2))
 
 
+# ---------------------------------------------------------------------------
+# Degenerate model rounds: no tool call, no answer — protocol markup only
+# ---------------------------------------------------------------------------
+#
+# A chat template can put a tool call into the *text* stream
+# (``<tool_call><function=foo></function></tool_call>``).  When the protocol
+# layer cannot turn that into a structured tool call we receive it as plain
+# assistant content, and the round then looks like a finished answer: the
+# generation ends with markup as the reply and the session stops, even though
+# the model meant to keep working.  Detection is "no structured tool call AND
+# the content is empty once XML-style tags and whitespace are filtered out";
+# such a round is re-rolled like a transient transport failure, sharing the
+# MODEL_API_MAX_RETRIES budget.
+
+_XML_TAG_RE = re.compile(r"</?\|?[A-Za-z_][^<>]*>")
+# A tag cut short by max_tokens / a stop sequence: ``<function=foo`` with no
+# closing ``>``.  Filtering it keeps "markup only" detection total.
+_UNTERMINATED_TAG_RE = re.compile(r"<[A-Za-z_/|][^<>|]*\Z")
+# An opening tag whose name has not finished streaming yet (``<fun``).  Nothing
+# of it is a meaningful answer fragment, so a content buffer that is nothing but
+# this stays withheld until the next delta decides what it is.
+_OPEN_TAG_PREFIX_RE = re.compile(r"\s*<\s*/?\s*\|?\s*[A-Za-z0-9_.:-]*\Z")
+# Tags that are tool-call protocol and never an answer.  Matched only at the
+# very beginning of the content: text that *discusses* the markup quotes it
+# after prose, a leaked call starts with it.  Everything that follows such an
+# opener (JSON arguments, nested tags) is protocol noise as well.
+_TOOL_MARKUP_START_RE = re.compile(
+    r"""<\s*/?\s*\|?\s*(?:[A-Za-z0-9_.-]+:)?\s*
+        (?:tool_call|tool_calls|tool_use|tool_result|tool_response
+          |function_calls?|function_call|functions|parameters?
+          |invoke|arguments?
+          |im_start|im_end|antml:[a-z_-]+)
+        \s*[=>/|]""",
+    re.IGNORECASE | re.VERBOSE,
+)
+# Opening-tag prefixes that only ever belong to tool-call protocol.  A streamed
+# answer cannot begin with them, so the buffer may be withheld without ever
+# delaying real prose by more than one chunk.
+_XML_MARKUP_START_TOKENS = (
+    "<tool", "<function", "<parameter", "<invoke", "<antml",
+    "<|", "<im_start", "<im_end", "</",
+)
+# Upper bound on how much content is withheld while it still looks like
+# protocol noise: a long buffer has already proved it carries prose.
+_MAX_MARKUP_HOLD_CHARS = 2048
+
+
+def _visible_output_text(text: str) -> str:
+    """Return model content with XML-style tags and whitespace filtered out."""
+    if not text:
+        return ""
+    text = _XML_TAG_RE.sub(" ", text)
+    text = _UNTERMINATED_TAG_RE.sub(" ", text)
+    return re.sub(r"\s+", "", text)
+
+
+def _is_leaked_tool_markup(text: str) -> bool:
+    """Whether *text* opens with tool-call markup instead of carrying an answer."""
+    return bool(_TOOL_MARKUP_START_RE.match(text.lstrip()))
+
+
+def _is_degenerate_output(content: str) -> bool:
+    """Whether assistant text carries no answer at all.
+
+    True for empty/whitespace content, for content that collapses to nothing
+    once XML-style tags and whitespace are filtered out, and for content that
+    opens with leaked tool-call markup.  Callers pair this with "the round
+    produced no structured tool call" — a real tool call is fine even when the
+    text beside it is empty.
+    """
+    if not content or not content.strip():
+        return True
+    if _visible_output_text(content) == "":
+        return True
+    return _is_leaked_tool_markup(content)
+
+
+def _content_worth_streaming(buffer: str) -> bool:
+    """Whether a buffered content prefix may be released to the caller.
+
+    Content deltas are withheld while the round still reads as protocol noise
+    (markup tags, whitespace, an unfinished tag name, or a leaked tool call).
+    The buffer is released the moment real text shows up and the rest of the
+    round then streams normally, so the guard costs at most a few chunks of
+    latency and never hides an answer.
+    """
+    if not buffer:
+        return False
+    if len(buffer) > _MAX_MARKUP_HOLD_CHARS:
+        return True
+    if _is_leaked_tool_markup(buffer):
+        return False
+    if _OPEN_TAG_PREFIX_RE.match(buffer):
+        return False
+    if buffer.lstrip().startswith(_XML_MARKUP_START_TOKENS):
+        # A streamed answer never opens with a tool-call tag; keep holding so a
+        # markup-only round can be discarded without the user seeing its text.
+        return False
+    return bool(_visible_output_text(buffer))
+
+
+def _is_degenerate_response(response_messages: list) -> bool:
+    """Whether a parsed non-streaming reply has neither call nor answer.
+
+    Mirrors the streaming check: the assistant turn must not declare a tool
+    call, and its text must collapse to nothing once XML-style tags and
+    whitespace are filtered out.  Non-assistant messages (usage records) are
+    ignored, and a reply without any assistant message is left to the caller's
+    own empty-response handling.
+    """
+    assistant = next(
+        (m for m in response_messages if getattr(m, "role", "") == "assistant"),
+        None,
+    )
+    if assistant is None:
+        return False
+    if getattr(assistant, "tool_calls", None):
+        return False
+    return _is_degenerate_output(getattr(assistant, "content", "") or "")
+
+
 def _get_tool_exec_workers() -> int:
     """Return the maximum number of concurrent function-tool workers.
 
@@ -954,6 +1075,11 @@ class Runtime:
         total_completion = 0
         overall_start = time.monotonic()
         last_stat: Optional[TokenStat] = None
+        # Re-roll budget for model rounds that carry neither a tool call nor an
+        # answer (leaked chat-template markup).  Uses the MODEL_API_MAX_RETRIES
+        # budget but is counted per rollout, since every round below starts with
+        # a fresh transport-retry ``attempt`` counter.
+        degenerate_retry_count = 0
         while True:
             # Dynamically throttle very long/fast tool-call loops before the
             # next model API request, if MAX_INFER_PER_MINUTE is configured.
@@ -1068,6 +1194,31 @@ class Runtime:
                     error="Empty response from model",
                     error_code="EMPTY_RESPONSE",
                 )
+
+            # A chat template can put the tool call into the text channel
+            # (``<tool_call><function=foo></function></tool_call>``).  Such a
+            # round has no structured tool call and no answer once XML tags and
+            # whitespace are filtered out; finishing it here would end the
+            # rollout with markup as the reply.  Re-issue the request the same
+            # way a transient transport failure is retried (MODEL_API_MAX_RETRIES
+            # budget, before the tool loop, so nothing already executed runs
+            # again).
+            if _is_degenerate_response(response_messages):
+                if degenerate_retry_count < max_retries:
+                    degenerate_retry_count += 1
+                    _logger.warning(
+                        "infer round produced no tool call and no text beyond "
+                        "XML markup; retrying | url=%s attempt=%d/%d",
+                        url, degenerate_retry_count, max_retries,
+                    )
+                    _wait_model_retry(degenerate_retry_count)
+                    continue
+                _logger.error(
+                    "infer round still carried no answer after retries | "
+                    "url=%s attempts=%d",
+                    url, degenerate_retry_count + 1,
+                )
+            degenerate_retry_count = 0
 
             total_prompt += round_token_stat.prompt_tokens
             total_completion += round_token_stat.completion_tokens
@@ -2781,9 +2932,11 @@ class Runtime:
         # the final model round completes. It therefore includes every model
         # request, tool execution, and inter-round throttle delay.
         overall_start = time.monotonic()
-        # Shared retry budget for connection and read/parse failures before the
-        # protocol emits its first model output. It is reset after a model round
-        # completes successfully.
+        # Shared retry budget for model rounds that produced nothing usable:
+        # connection and read/parse failures before the protocol emits its first
+        # model output, empty streams, and rounds with no tool call whose text
+        # collapses to nothing once XML markup and whitespace are filtered out.
+        # It is reset after a model round completes successfully.
         pre_output_retry_count = 0
         while True:
             # Check cancel_event before each round (including before model API call)
@@ -2921,6 +3074,11 @@ class Runtime:
             # Stream this round and collect the full assistant message
             full_content = ""
             full_thinking = ""
+            # Content deltas are withheld while the round still reads as leaked
+            # tool-call markup only (see _content_worth_streaming), so a round
+            # that has to be re-rolled never showed its markup to the caller.
+            # full_content still accumulates every delta.
+            held_content = ""
             # Track tool calls by index for multi-tool support
             accumulated_tool_calls: dict[int, dict] = {}
             round_prompt = 0
@@ -3094,7 +3252,36 @@ class Runtime:
                             # For regular content/thinking, use current time
                             msg.timestamp = _now_iso()
 
-                    # Yield each chunk to the caller for real-time display
+                    # Yield each chunk to the caller for real-time display.
+                    # A content-only chunk is withheld while the round still
+                    # reads as protocol noise only (_content_worth_streaming), so
+                    # a round that has to be re-rolled never showed its markup.
+                    # Thinking/tool-call chunks still stream immediately; the
+                    # discard marker frame drops them from the caller's turn.
+                    if (
+                        msg.role == "assistant"
+                        and msg.content
+                        and not (msg.thinking or msg.tool_calls)
+                    ):
+                        held_content += msg.content
+                        if not _content_worth_streaming(held_content):
+                            continue
+                        msg.content, held_content = held_content, ""
+                        yield msg
+                        continue
+
+                    if msg.role == "assistant" and held_content:
+                        # Thinking / tool-call / empty chunks would otherwise be
+                        # delivered before the text they follow: release the
+                        # withheld prefix first to preserve the model's order.
+                        yield Message(
+                            role="assistant",
+                            timestamp=_now_iso(),
+                            content=held_content,
+                            started_at=request_started_at,
+                        )
+                        held_content = ""
+
                     yield msg
 
                     if msg.tool_calls:
@@ -3205,16 +3392,70 @@ class Runtime:
                 )
                 return
 
+            # Build tool calls list from accumulated data
+            all_tool_calls = None
+            if accumulated_tool_calls:
+                all_tool_calls = [accumulated_tool_calls[idx] for idx in sorted(accumulated_tool_calls.keys())]
+
+            # --- Degenerate round: no tool call, text carries no answer --------
+            # The model meant to keep working, but its tool call never reached
+            # us as a structured call (chat-template markup landed in content),
+            # or it produced no text at all.  Ending the turn here would persist
+            # that markup as the final reply and the session would stop, so
+            # re-roll the request exactly the way a transient transport failure
+            # is retried — same budget, MODEL_API_MAX_RETRIES.  Nothing of the
+            # discarded attempt may join the conversation: the markup content is
+            # never released below, and the marker frame drops the thinking
+            # deltas that were streamed.
+            if not all_tool_calls and _is_degenerate_output(full_content):
+                if pre_output_retry_count < max_retries:
+                    pre_output_retry_count += 1
+                    _logger.warning(
+                        "infer_stream round produced no tool call and no text "
+                        "beyond XML markup; re-rolling | url=%s attempt=%d/%d "
+                        "content=%r thinking_chars=%d",
+                        url, pre_output_retry_count, max_retries,
+                        full_content[:200], len(full_thinking),
+                    )
+                    yield Message(
+                        role="assistant",
+                        timestamp=_now_iso(),
+                        content="",
+                        discard_stream_output=True,
+                    )
+                    if not _wait_model_retry(pre_output_retry_count, cancel_event):
+                        yield Message(role="assistant", timestamp=_now_iso(),
+                                      content="Error: user interrupted.")
+                        return
+                    continue
+                _logger.error(
+                    "infer_stream round carried no answer after %d re-roll(s); "
+                    "keeping its output | url=%s content=%r",
+                    pre_output_retry_count, url, full_content[:200],
+                )
+
+            # The round is kept.  Release the content prefix that was withheld
+            # while it still looked like leaked tool-call markup: it was never
+            # streamed, and the merged/persisted assistant turn must carry the
+            # same text the conversation history keeps.
+            if held_content:
+                yield Message(
+                    role="assistant",
+                    timestamp=_now_iso(),
+                    content=held_content,
+                    started_at=request_started_at,
+                )
+                held_content = ""
+
+            # The round is accepted, so its retries no longer count against the
+            # next one: the pre-output budget is shared by connection failures,
+            # empty streams and degenerate (markup-only) rounds.
             pre_output_retry_count = 0
 
             # net_ms = time from request start to stream fully received
             # (empty streams return above and are never recorded as success).
             net_ms = (stream_end_time - round_start) * 1000
             ttft_ms = (first_token_time - round_start) * 1000 if first_token_time else None
-            # Build tool calls list from accumulated data
-            all_tool_calls = None
-            if accumulated_tool_calls:
-                all_tool_calls = [accumulated_tool_calls[idx] for idx in sorted(accumulated_tool_calls.keys())]
 
             # Protocols that cannot report stream usage still need logical
             # per-request statistics. Estimate from the exact messages/tool

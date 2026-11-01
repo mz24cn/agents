@@ -97,6 +97,13 @@ class Message:
     # merging a streamed round into conversation history.  Excluded from
     # to_dict() so it cannot leak into SSE frames or conversation.json.
     tool_calls_dropped: Optional[bool] = None
+    # Internal, in-memory marker (never persisted / never sent to clients):
+    # an assistant frame that instructs the stream-merge layer to drop
+    # everything streamed so far for the current assistant turn.  Emitted by the
+    # inference loops when a model round produced no tool call and no text
+    # besides XML-style markup, and is being re-rolled — without it the
+    # discarded attempt's output would be concatenated with the re-roll's.
+    discard_stream_output: Optional[bool] = None
 
     def to_dict(self) -> dict:
         """Serialize to a dictionary, omitting None fields."""

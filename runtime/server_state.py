@@ -396,6 +396,15 @@ def _merge_single_agent_stream_messages(
                 # deltas so the flushed assistant turn has no dangling tool_calls —
                 # otherwise OpenAI/Anthropic reject the next request.
                 pending_tool_calls = []
+            if getattr(m, "discard_stream_output", False):
+                # The model round is degenerate (no tool call, text only carried
+                # XML markup) and is being re-rolled.  Nothing this attempt
+                # streamed may become conversation history: drop the buffers so
+                # the re-roll becomes the assistant turn instead of being
+                # appended to the discarded attempt.
+                assistant_text_buf = ""
+                assistant_thinking_buf = ""
+                pending_tool_calls = []
             if m.tool_calls:
                 # tool_calls 到来时，合并到当前 assistant turn（不单独 flush）
                 for tc in m.tool_calls:

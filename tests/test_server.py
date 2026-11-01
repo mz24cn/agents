@@ -1257,6 +1257,38 @@ class TestMergeStreamMessages:
         assert "maximum tool-call rounds" in turns[0].content
         assert turns[0].tool_calls is None, "dangling tool_calls must be dropped"
 
+    def test_discard_stream_output_marker_drops_discarded_attempt(self):
+        """A re-rolled model round must leave nothing in the conversation.
+
+        infer_stream emits an assistant frame with discard_stream_output=True
+        when it re-rolls a round that carried neither a tool call nor an answer
+        (leaked chat-template markup).  Everything the discarded attempt streamed
+        must be dropped so the re-roll becomes the assistant turn instead of
+        being appended to the discarded output.
+        """
+        from runtime.server import merge_stream_messages
+
+        markup = (
+            "<tool_call>\n<function=exec_file_placeholder>\n"
+            "</function>\n</tool_call>"
+        )
+        stream = [
+            Message(role="assistant", content="",
+                    thinking="I will call the tool now."),
+            Message(role="assistant", content=markup),
+            Message(role="assistant", content="", discard_stream_output=True),
+            Message(role="assistant", content="The result is 42."),
+            Message(role="usage",
+                    content=json.dumps({"prompt_tokens": 1, "completion_tokens": 1})),
+        ]
+        turns, _ = merge_stream_messages(stream)
+
+        assert [t.role for t in turns] == ["assistant"]
+        assert turns[0].content == "The result is 42."
+        assert markup not in turns[0].content
+        assert turns[0].thinking is None, "discarded thinking must not be persisted"
+        assert turns[0].tool_calls is None
+
     def test_assistant_started_at_survives_stream_merge(self):
         from runtime.server import merge_stream_messages
 

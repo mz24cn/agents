@@ -717,3 +717,352 @@ def test_infer_stream_max_rounds_yields_assistant_note_not_fake_tool() -> None:
     assert len(note_msgs) == 1
     assert "maximum tool-call rounds" in note_msgs[0].content
     assert note_msgs[0].role == "assistant"
+
+
+# ---------------------------------------------------------------------------
+# Tests: degenerate model rounds (no tool call, text is XML markup only)
+# ---------------------------------------------------------------------------
+
+# Exactly what the production incident recorded: the chat template emitted the
+# tool call as text, the protocol layer had nothing to parse, and the session
+# ended with markup as the assistant reply.
+_LEAKED_TOOL_MARKUP = (
+    "<tool_call>\n<function=exec_file_placeholder>\n</function>\n</tool_call>"
+)
+
+
+def _make_openai_delta_sse(deltas: list[dict]) -> io.BytesIO:
+    """Build an OpenAI SSE body from raw ``delta`` dicts.
+
+    Lets a single response mix reasoning, content and tool-call chunks, which
+    is what a degenerate round looks like in the wild (thinking, then markup).
+    """
+    lines = [
+        f"data: {json.dumps({'choices': [{'delta': delta}]})}\n\n"
+        for delta in deltas
+    ]
+    lines.append("data: [DONE]\n\n")
+    return io.BytesIO("".join(lines).encode("utf-8"))
+
+
+def _runtime_for_stream() -> Runtime:
+    return Runtime(
+        model_registry=_make_model_registry("openai"),
+        tool_registry=ToolRegistry(),
+    )
+
+
+def test_infer_stream_rolls_back_markup_only_round() -> None:
+    """A round with no tool call whose text is markup only is re-rolled."""
+    runtime = _runtime_for_stream()
+    calls = 0
+
+    def mock_urlopen(request, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            body = _make_openai_delta_sse([
+                {"role": "assistant", "reasoning_content": "I should call the tool."},
+                {"content": _LEAKED_TOOL_MARKUP},
+            ])
+        else:
+            body = _make_openai_sse_response(["Now I have the answer."])
+        return _mock_urlopen_with_stream(body)(request, **kwargs)
+
+    request = InferenceRequest(model_id="test-model", text="hi", stream=True)
+    with patch.dict("os.environ", {
+        "MODEL_API_MAX_RETRIES": "2", "MODEL_API_RETRY_DELAY": "0",
+    }), patch("urllib.request.urlopen", side_effect=mock_urlopen):
+        messages = list(runtime.infer_stream(request))
+
+    assert calls == 2, "the degenerate round must be re-requested"
+    contents = [m.content for m in messages if m.role == "assistant" and m.content]
+    assert contents == ["Now I have the answer."], (
+        "the discarded attempt must contribute neither markup nor thinking"
+    )
+    assert all("<tool_call" not in (m.content or "") for m in messages)
+    markers = [m for m in messages if getattr(m, "discard_stream_output", False)]
+    assert len(markers) == 1
+    assert markers[0].role == "assistant"
+    # The discarded attempt is not reported as a model round.
+    assert len([m for m in messages if m.role == "usage"]) == 1
+
+
+def test_infer_stream_rolls_back_whitespace_and_thinking_only_rounds() -> None:
+    """Empty/whitespace bodies (even with thinking) carry no answer either."""
+    runtime = _runtime_for_stream()
+    calls = 0
+
+    def mock_urlopen(request, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            body = _make_openai_delta_sse([
+                {"role": "assistant", "reasoning_content": "hmm"},
+                {"content": "  \n\t \n"},
+            ])
+        elif calls == 2:
+            body = _make_openai_delta_sse(
+                [{"role": "assistant", "reasoning_content": "still thinking"}]
+            )
+        else:
+            body = _make_openai_sse_response(["finally"])
+        return _mock_urlopen_with_stream(body)(request, **kwargs)
+
+    request = InferenceRequest(model_id="test-model", text="hi", stream=True)
+    with patch.dict("os.environ", {
+        "MODEL_API_MAX_RETRIES": "2", "MODEL_API_RETRY_DELAY": "0",
+    }), patch("urllib.request.urlopen", side_effect=mock_urlopen):
+        messages = list(runtime.infer_stream(request))
+
+    assert calls == 3
+    assert [
+        m.content for m in messages if m.role == "assistant" and m.content
+    ] == ["finally"]
+
+
+def test_infer_stream_markup_only_round_honours_retry_budget() -> None:
+    """The re-roll shares MODEL_API_MAX_RETRIES and never loops forever.
+
+    When the budget is exhausted the attempt is kept as the reply (with a
+    logged error) instead of turning the failure into a silent infinite retry.
+    """
+    runtime = _runtime_for_stream()
+    calls = 0
+
+    def mock_urlopen(request, **kwargs):
+        nonlocal calls
+        calls += 1
+        body = _make_openai_delta_sse([
+            {"role": "assistant", "reasoning_content": "thinking"},
+            {"content": _LEAKED_TOOL_MARKUP},
+        ])
+        return _mock_urlopen_with_stream(body)(request, **kwargs)
+
+    request = InferenceRequest(model_id="test-model", text="hi", stream=True)
+    with patch.dict("os.environ", {
+        "MODEL_API_MAX_RETRIES": "2", "MODEL_API_RETRY_DELAY": "0",
+    }), patch("urllib.request.urlopen", side_effect=mock_urlopen):
+        messages = list(runtime.infer_stream(request))
+
+    assert calls == 3, "one request plus MODEL_API_MAX_RETRIES re-rolls"
+    contents = [m.content for m in messages if m.role == "assistant" and m.content]
+    assert contents == [_LEAKED_TOOL_MARKUP], (
+        "output must not be lost once the retry budget is exhausted"
+    )
+
+
+def test_infer_stream_keeps_rounds_that_carry_an_answer() -> None:
+    """Prose is streamed as usual, even when it quotes or trails markup."""
+    runtime = _runtime_for_stream()
+    prose = f"Let me run it: {_LEAKED_TOOL_MARKUP}"
+    calls = 0
+
+    def mock_urlopen(request, **kwargs):
+        nonlocal calls
+        calls += 1
+        body = _make_openai_delta_sse([
+            {"role": "assistant", "content": "Let me run it: "},
+            {"content": _LEAKED_TOOL_MARKUP},
+        ])
+        return _mock_urlopen_with_stream(body)(request, **kwargs)
+
+    request = InferenceRequest(model_id="test-model", text="hi", stream=True)
+    with patch.dict("os.environ", {
+        "MODEL_API_MAX_RETRIES": "2", "MODEL_API_RETRY_DELAY": "0",
+    }), patch("urllib.request.urlopen", side_effect=mock_urlopen):
+        messages = list(runtime.infer_stream(request))
+
+    assert calls == 1, "an answer is never re-rolled"
+    assert not [m for m in messages if getattr(m, "discard_stream_output", False)]
+    assert "".join(
+        m.content or "" for m in messages if m.role == "assistant"
+    ) == prose
+
+
+def test_infer_stream_released_prefix_is_not_duplicated() -> None:
+    """A withheld prefix is released exactly once, merged into one frame."""
+    runtime = _runtime_for_stream()
+    calls = 0
+
+    def mock_urlopen(request, **kwargs):
+        nonlocal calls
+        calls += 1
+        # The first chunk looks like protocol noise and is withheld; the next
+        # one proves it was prose, so the buffer is flushed as a single frame.
+        body = _make_openai_delta_sse([
+            {"role": "assistant", "content": "<"},
+            {"content": "b>ok</b>"},
+        ])
+        return _mock_urlopen_with_stream(body)(request, **kwargs)
+
+    request = InferenceRequest(model_id="test-model", text="hi", stream=True)
+    with patch.dict("os.environ", {
+        "MODEL_API_MAX_RETRIES": "2", "MODEL_API_RETRY_DELAY": "0",
+    }), patch("urllib.request.urlopen", side_effect=mock_urlopen):
+        messages = list(runtime.infer_stream(request))
+
+    assert calls == 1
+    streamed = [m.content for m in messages if m.role == "assistant" and m.content]
+    assert streamed == ["<b>ok</b>"]
+
+
+def test_degenerate_output_detection_rules() -> None:
+    """Detection is total over markup, whitespace and truncation."""
+    from runtime.runtime import _is_degenerate_output
+
+    assert _is_degenerate_output(_LEAKED_TOOL_MARKUP) is True
+    # Truncated by max_tokens / a stop sequence: no closing tag at all.
+    assert _is_degenerate_output("<tool_call>\n<function=exec_file_") is True
+    assert _is_degenerate_output("<tool_call>") is True
+    assert _is_degenerate_output("<|im_start|>assistant\n<function=x>") is True
+    assert _is_degenerate_output("") is True
+    assert _is_degenerate_output("  \n\t ") is True
+    # Real answers, including ones that merely quote protocol names.
+    assert _is_degenerate_output("Sure, here you are.") is False
+    assert _is_degenerate_output("The tag is: <tool_call>") is False
+    assert _is_degenerate_output("<system>reminder</system>") is False
+
+
+def test_degenerate_response_detection_for_non_streaming() -> None:
+    """The non-streaming path checks the assembled assistant message."""
+    from runtime.runtime import _is_degenerate_response
+
+    assert _is_degenerate_response(
+        [Message(role="assistant", content=_LEAKED_TOOL_MARKUP)]
+    ) is True
+    assert _is_degenerate_response(
+        [Message(role="assistant", content=_LEAKED_TOOL_MARKUP,
+                 tool_calls=[{"id": "c1", "name": "x", "arguments": {}}])]
+    ) is False, "a real tool call makes the round usable"
+    assert _is_degenerate_response(
+        [Message(role="assistant", content="ok")]
+    ) is False
+    assert _is_degenerate_response(
+        [Message(role="usage", content="{}")]
+    ) is False, "no assistant message is left to the empty-response path"
+
+
+def test_content_worth_streaming_rules() -> None:
+    """Withholding is bounded: protocol-looking prefixes only, never prose."""
+    from runtime.runtime import (
+        _MAX_MARKUP_HOLD_CHARS,
+        _content_worth_streaming,
+    )
+
+    assert _content_worth_streaming("") is False
+    assert _content_worth_streaming("<") is False
+    assert _content_worth_streaming("<too") is False
+    assert _content_worth_streaming("<tool_call>") is False
+    assert _content_worth_streaming(_LEAKED_TOOL_MARKUP) is False
+    assert _content_worth_streaming("<invoke name=\"exec\"") is False
+    assert _content_worth_streaming("H") is True
+    assert _content_worth_streaming("The tool tag is <tool_call>") is True
+    assert _content_worth_streaming(
+        "<x>" * (_MAX_MARKUP_HOLD_CHARS // 3 + 1)
+    ) is True, "content is never withheld without bound"
+
+
+# ---------------------------------------------------------------------------
+# Tests: degenerate model round (chat-template markup / no answer) is re-rolled,
+# and the discarded attempt must not leak into conversation history.
+# ---------------------------------------------------------------------------
+
+
+def test_is_degenerate_output_classifies_markup_and_prose() -> None:
+    from runtime.runtime import _is_degenerate_output
+
+    # empty / whitespace-only turns carry no answer
+    assert _is_degenerate_output("")
+    assert _is_degenerate_output("   \n\t")
+    # leaked chat-template protocol
+    assert _is_degenerate_output("<tool_call>do_it</tool_call>")
+    assert _is_degenerate_output("<|im_start|>assistant<|im_end|>")
+    assert _is_degenerate_output("<invoke name=\"read_file\">")
+    # Known limitation, pinned so it stays visible: a template frame whose tags
+    # are stripped leaves bare role words ("assistant"/"analysis"), which the
+    # tag-stripping classifier cannot distinguish from prose.  Only rounds whose
+    # *every* remaining character is markup are re-rolled -- deliberately
+    # conservative, because re-rolling a real answer is worse than keeping one.
+    assert not _is_degenerate_output("<|start|>assistant<|channel|>analysis<|message|>")
+    # prose is an answer even when it mentions markup
+    assert not _is_degenerate_output("The fix is in the loop guard.")
+    assert not _is_degenerate_output("The tag <tool_call> leaked into content.")
+
+
+def test_degenerate_round_is_rerolled_with_discard_marker(monkeypatch) -> None:
+    """A markup-only round is retried and marked so its stream is dropped."""
+    from runtime.runtime import Runtime
+    from runtime.models import InferenceRequest, ModelConfig
+    from runtime.registry import ModelRegistry, ToolRegistry
+    from unittest.mock import MagicMock, patch
+
+    monkeypatch.setenv("MODEL_API_MAX_RETRIES", "2")
+    monkeypatch.setenv("MODEL_API_RETRY_DELAY", "0")
+
+    registry = ModelRegistry()
+    registry.register(ModelConfig(
+        model_id="test-model", api_base="http://localhost:9999",
+        model_name="test", api_protocol="openai",
+    ))
+    runtime = Runtime(model_registry=registry, tool_registry=ToolRegistry())
+
+    streams = [
+        _make_openai_sse_response(["<tool_call>", "read_file</tool_call>"]),
+        _make_openai_sse_response(["修复已完成"]),
+    ]
+
+    def fake_urlopen(request, **kwargs):
+        stream = streams.pop(0)
+        resp = MagicMock()
+        resp.__iter__ = lambda self: iter(stream.readlines())
+        resp.read = stream.read
+        resp.close = MagicMock()
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = MagicMock(return_value=False)
+        return resp
+
+    request = InferenceRequest(model_id="test-model", text="hi", stream=True)
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        messages = list(runtime.infer_stream(request))
+
+    markers = [m for m in messages if getattr(m, "discard_stream_output", False)]
+    assert len(markers) == 1, messages
+    released = "".join(
+        m.content or "" for m in messages
+        if m.role == "assistant" and not getattr(m, "discard_stream_output", False)
+    )
+    assert "修复已完成" in released, released
+    assert "<|" not in released and "tool_call" not in released, released
+    assert not streams  # the re-roll actually re-issued the request
+
+
+def test_discard_marker_drops_streamed_text_thinking_and_tool_calls() -> None:
+    from runtime.models import Message
+    from runtime.server_state import _merge_single_agent_stream_messages
+
+    turns, _stat = _merge_single_agent_stream_messages([
+        Message(role="assistant", content="<tool_call>read_file</tool_call>",
+                thinking="被丢弃的思考"),
+        Message(role="assistant", content="",
+                tool_calls=[{"id": "t1", "name": "read_file", "arguments": {}}]),
+        Message(role="assistant", content="", discard_stream_output=True),
+        Message(role="assistant", content="真正的回答", thinking="保留的思考"),
+        Message(role="usage", content=json.dumps({"completed_at": "2026-11-01T00:00:00"})),
+    ])
+
+    assert len(turns) == 1, turns
+    assert turns[0].content == "真正的回答"
+    assert turns[0].thinking == "保留的思考"
+    assert turns[0].tool_calls is None
+
+
+def test_discard_marker_alone_produces_no_turn() -> None:
+    from runtime.models import Message
+    from runtime.server_state import _merge_single_agent_stream_messages
+
+    turns, _stat = _merge_single_agent_stream_messages([
+        Message(role="assistant", content="half-streamed", thinking="x"),
+        Message(role="assistant", content="", discard_stream_output=True),
+    ])
+    assert turns == [], turns

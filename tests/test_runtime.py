@@ -2621,3 +2621,89 @@ def test_mixed_batch_keeps_declaration_order_and_marshals_local_mcp(
     match = re.search(r'"filePath":\s*"([^"]+)"', messages[1].content)
     assert match, messages[1].content
     assert open(match.group(1), "rb").read() == b"\x89PNG" + b"z" * 2000
+
+
+def test_infer_retries_markup_only_round(monkeypatch) -> None:
+    """Non-streaming inference re-rolls a round with neither call nor answer.
+
+    The chat template of some models emits the tool call as text
+    (``<tool_call><function=…></function></tool_call>``).  The protocol layer
+    then has nothing to execute, and the rollout would end with markup as the
+    assistant reply.  Detection: no tool call plus content that is empty once
+    XML-style tags and whitespace are filtered out.
+    """
+    import json
+    from unittest.mock import MagicMock, patch
+
+    runtime = Runtime(
+        model_registry=_setup_model_registry(), tool_registry=ToolRegistry(),
+    )
+    markup = (
+        "<tool_call>\n<function=exec_file_placeholder>\n"
+        "</function>\n</tool_call>"
+    )
+    calls = 0
+
+    def _body(content: str) -> bytes:
+        return json.dumps({
+            "choices": [{"message": {"role": "assistant", "content": content}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }).encode()
+
+    def mock_urlopen(request, **kwargs):
+        nonlocal calls
+        calls += 1
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = _body(markup if calls == 1 else "ok")
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        return mock_resp
+
+    monkeypatch.setenv("MODEL_API_MAX_RETRIES", "2")
+    monkeypatch.setenv("MODEL_API_RETRY_DELAY", "0")
+    with patch("urllib.request.urlopen", side_effect=mock_urlopen):
+        result = runtime.infer(InferenceRequest(model_id="test-model", text="hello"))
+
+    assert calls == 2, "the degenerate round must be re-requested"
+    assert result.success is True
+    assert result.messages[-1].content == "ok", (
+        "the discarded attempt must not stay in the conversation"
+    )
+
+
+def test_infer_markup_only_round_honours_retry_budget(monkeypatch) -> None:
+    """The re-roll budget is MODEL_API_MAX_RETRIES; output is kept afterwards."""
+    import json
+    from unittest.mock import MagicMock, patch
+
+    runtime = Runtime(
+        model_registry=_setup_model_registry(), tool_registry=ToolRegistry(),
+    )
+    markup = (
+        "<tool_call>\n<function=exec_file_placeholder>\n"
+        "</function>\n</tool_call>"
+    )
+    calls = 0
+
+    def mock_urlopen(request, **kwargs):
+        nonlocal calls
+        calls += 1
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps({
+            "choices": [{"message": {"role": "assistant", "content": markup}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }).encode()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        return mock_resp
+
+    monkeypatch.setenv("MODEL_API_MAX_RETRIES", "2")
+    monkeypatch.setenv("MODEL_API_RETRY_DELAY", "0")
+    with patch("urllib.request.urlopen", side_effect=mock_urlopen):
+        result = runtime.infer(InferenceRequest(model_id="test-model", text="hello"))
+
+    assert calls == 3, "one request plus MODEL_API_MAX_RETRIES re-rolls"
+    assert result.success is True
+    assert result.messages[-1].content == markup, (
+        "once the budget is exhausted the reply is kept, not lost"
+    )

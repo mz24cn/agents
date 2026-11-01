@@ -1134,6 +1134,15 @@ def _run_group_chat_stream_gen(
                         except (TypeError, ValueError, AttributeError):
                             pass
                     if msg.role == "assistant":
+                        if getattr(msg, "discard_stream_output", False):
+                            # The model round carried neither a tool call nor an
+                            # answer (chat-template markup only) and is being
+                            # re-rolled: nothing it streamed may become this
+                            # agent's turn.
+                            asst_buf.clear()
+                            if stream_chunks:
+                                yield msg
+                            continue
                         msg.name = nickname
                         asst_buf.append(msg)
                     else:
