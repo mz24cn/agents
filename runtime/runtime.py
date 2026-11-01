@@ -248,25 +248,89 @@ def _get_tool_exec_timeout() -> Optional[float]:
     When a tool exceeds the cap the caller proceeds with an error result
     instead of blocking the inference worker indefinitely -- including
     group-chat workers, whose hang cannot be reached by the model HTTP
-    timeouts.  A timed-out function tool keeps running on a daemon worker
-    thread in the background.
+    timeouts.  A timed-out function tool runs on a daemon worker thread;
+    when a tool registered an abort hook (see register_tool_abort_hook) the
+    runtime asks it to stop the abandoned work instead of leaving it running.
 
     Returns None when the guard is disabled (env var empty / <= 0).
-    Default: 120 s.
+    Default: 200 s.
+
+    SWE-bench-Live: the guard must stay ABOVE the longest timeout a tool may
+    apply to itself, otherwise the runtime reports a timeout while the tool's
+    own process is still running: the model is told the command failed, the
+    command keeps
+    mutating the workspace, and its output is lost.  exec_shell derives its
+    default from this value minus a small margin (see EXEC_DEFAULT_TIMEOUT), so
+    the tool's internal timeout fires first and kills its process group.
     """
-    raw = os.environ.get("TOOL_EXEC_TIMEOUT", "120").strip()
+    raw = os.environ.get("TOOL_EXEC_TIMEOUT", "200").strip()
     if not raw:
         return None
     try:
         val = float(raw)
     except (TypeError, ValueError):
         _logger.warning(
-            "invalid TOOL_EXEC_TIMEOUT=%r; using default 120s", raw,
+            "invalid TOOL_EXEC_TIMEOUT=%r; using default 200s", raw,
         )
-        return 120.0
+        return 200.0
     if val <= 0:
         return None
     return val
+
+
+# SWE-bench-Live: margin (seconds) subtracted from TOOL_EXEC_TIMEOUT to
+# obtain the default per-command timeout for shell tools.  Keeping the tool's
+# own deadline inside
+# the runtime guard means the tool reaps its own process group instead of the
+# runtime merely giving up on it.
+TOOL_EXEC_TIMEOUT_HEADROOM = 20
+
+
+def _get_default_command_exec_timeout() -> int:
+    """Return the default timeout for a shell command, in seconds.
+
+    ``EXEC_DEFAULT_TIMEOUT`` overrides it; otherwise it is
+    ``TOOL_EXEC_TIMEOUT - TOOL_EXEC_TIMEOUT_HEADROOM`` so that the tool's own
+    deadline always fires before the runtime-level guard gives up on the call.
+    """
+    raw = os.environ.get("EXEC_DEFAULT_TIMEOUT", "").strip()
+    if raw:
+        try:
+            val = int(float(raw))
+            if val > 0:
+                return val
+        except (TypeError, ValueError):
+            _logger.warning("invalid EXEC_DEFAULT_TIMEOUT=%r; using derived value", raw)
+    base = _get_tool_exec_timeout()
+    if base is None:
+        # Guard disabled: keep a sane absolute default for the tool itself.
+        base = 200.0
+    return max(1, int(base) - TOOL_EXEC_TIMEOUT_HEADROOM)
+
+
+# SWE-bench-Live: tool-level abort hooks, consulted when the runtime guard gives
+# up on a tool call.  Without one, a timed-out function tool keeps running on its
+# daemon worker thread -- for exec_shell that meant the abandoned command kept
+# writing to the workspace after the model was told it timed out.
+_TOOL_ABORT_HOOKS: dict[str, "object"] = {}
+
+
+def register_tool_abort_hook(tool_name: str, hook) -> None:
+    """Register ``hook(session_id)`` to stop a tool call that exceeded its cap."""
+    _TOOL_ABORT_HOOKS[tool_name] = hook
+
+
+def _abort_timed_out_tool(tool_name: str, session_id: Optional[str]) -> bool:
+    """Ask a tool to terminate the work behind a call the guard has abandoned."""
+    hook = _TOOL_ABORT_HOOKS.get(tool_name)
+    if hook is None or not session_id:
+        return False
+    try:
+        hook(session_id)
+        return True
+    except Exception as exc:  # never let cleanup break the inference loop
+        _logger.warning("abort hook for %r failed: %s", tool_name, exc)
+        return False
 
 
 def _get_effective_tool_exec_timeout(
@@ -2220,8 +2284,17 @@ class Runtime:
         worker = threading.Thread(target=_worker, name="fn-tool", daemon=True)
         worker.start()
         if not done.wait(timeout):
+            # SWE-bench-Live: the daemon worker is abandoned, not cancelled.  Give
+            # the tool a chance to stop the work it started, otherwise an exec_shell
+            # command kept running (and writing files) long after the model was
+            # told it timed out.
+            aborted = _abort_timed_out_tool(
+                tool_config.name, caller_ctx.get("session_id"),
+            )
             return (f"Error: tool '{tool_config.name}' timed out "
-                    f"after {timeout:g}s")
+                    f"after {timeout:g}s"
+                    + ("" if aborted else "; the tool could not be interrupted "
+                                  "and may still be running"))
         if "error" in state:
             exc = state["error"]
             return f"Error: {type(exc).__name__}: {exc}"

@@ -55,6 +55,7 @@ from runtime.builtin_tools_coding import (  # noqa: F401
     _write_gzip_blob,
     EDIT_FILE_TOOL_CONFIG,
     EXEC_SHELL_TOOL_CONFIG,
+    kill_active_process_soft,
     READ_FILE_TOOL_CONFIG,
     SEARCH_CODE_TOOL_CONFIG,
     UNDO_TOOL_CONFIG,
@@ -113,6 +114,13 @@ def register_builtin_tools(tool_registry: ToolRegistry, runtime=None) -> list[st
     Returns:
         List of registered tool_ids.
     """
+    # SWE-bench-Live: let the runtime reap a shell command whose call exceeded
+    # TOOL_EXEC_TIMEOUT instead of abandoning a still-running writer.
+    # Imported here: runtime.runtime imports this module lazily, and a
+    # module-level import would create an initialisation cycle.
+    from runtime.runtime import register_tool_abort_hook
+    register_tool_abort_hook("exec_shell", kill_active_process_soft)
+
     ids = []
     for config, fn in BUILTIN_TOOLS:
         if fn is not None:

@@ -1278,18 +1278,18 @@ def test_function_tool_hang_returns_timeout_error(monkeypatch) -> None:
 
 
 def test_tool_exec_timeout_parsing(monkeypatch) -> None:
-    """TOOL_EXEC_TIMEOUT parsing: default 120 s, invalid -> 120 s,
+    """TOOL_EXEC_TIMEOUT parsing: default 200 s, invalid -> 200 s,
     empty / <= 0 -> guard disabled (None)."""
     from runtime.runtime import _get_tool_exec_timeout
 
     monkeypatch.delenv("TOOL_EXEC_TIMEOUT", raising=False)
-    assert _get_tool_exec_timeout() == 120.0
+    assert _get_tool_exec_timeout() == 200.0
 
     monkeypatch.setenv("TOOL_EXEC_TIMEOUT", "1.5")
     assert _get_tool_exec_timeout() == 1.5
 
     monkeypatch.setenv("TOOL_EXEC_TIMEOUT", "abc")
-    assert _get_tool_exec_timeout() == 120.0
+    assert _get_tool_exec_timeout() == 200.0
 
     monkeypatch.setenv("TOOL_EXEC_TIMEOUT", "")
     assert _get_tool_exec_timeout() is None

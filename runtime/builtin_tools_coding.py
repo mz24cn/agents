@@ -10,6 +10,12 @@ infrastructure:
 
 The tool configs and callables are aggregated and registered by
 ``runtime.builtin_tools`` (the facade module).
+
+Provenance marker: behaviour changed because of what this agent's
+SWE-bench-Live evaluation run showed is tagged ``SWE-bench-Live`` in
+code, in ``runtime/`` and in the tests that pin it; ``grep -rn
+'SWE-bench-Live' runtime tests`` lists every such place, and each tag
+states what the run observed.
 """
 
 from __future__ import annotations
@@ -38,6 +44,13 @@ if sys.platform != "win32":
     import fcntl
 
 from runtime.common import SYSTEM_ENCODING
+# SWE-bench-Live: a shell tool's own deadline has to sit inside the
+# runtime's tool-execution guard, and a call the guard abandons has to
+# be reaped rather than left running.
+from runtime.runtime import (
+    _get_default_command_exec_timeout,
+    register_tool_abort_hook,
+)
 from runtime.common import (
     set_request_context,
     get_request_context,
@@ -160,6 +173,25 @@ def kill_active_process(session_id: str) -> bool:
 
     try:
         # Kill the entire process group so child processes are also terminated.
+        kill_process_group(proc)
+        return True
+    except (ProcessLookupError, OSError):
+        return False
+
+
+def kill_active_process_soft(session_id: str) -> bool:
+    """Kill the shell process of *session_id* without marking a user abort.
+
+    SWE-bench-Live: used when the runtime's TOOL_EXEC_TIMEOUT guard gives
+    up on the call.  The command must be reaped, but it was not cancelled by
+    the user, so the abort-flag bookkeeping used for "user interrupted"
+    reporting must stay out of it.
+    """
+    with _active_processes_lock:
+        proc = _active_processes.pop(session_id, None)
+    if proc is None:
+        return False
+    try:
         kill_process_group(proc)
         return True
     except (ProcessLookupError, OSError):
@@ -2171,7 +2203,8 @@ def _exec_shell(command: str, timeout: Optional[int] = None, background: bool = 
 
     Args:
         command: The shell command to execute.
-      timeout: Optional timeout in seconds. If None, uses EXEC_DEFAULT_TIMEOUT.
+      timeout: Optional timeout in seconds. If None, uses EXEC_DEFAULT_TIMEOUT
+      (default: TOOL_EXEC_TIMEOUT minus a 20 s headroom).
         background: If True and platform is Windows, run command in background using
             Start-Process. Note: the process is spawned directly with no shell, so
             shell syntax (>, &&, |, %VAR%) is not interpreted. To use shell
@@ -2242,7 +2275,11 @@ def _exec_shell(command: str, timeout: Optional[int] = None, background: bool = 
     output_line_limit = env_int("EXEC_OUTPUT_LINE_LIMIT", 1000)
     max_line_length = env_int("EXEC_OUTPUT_COLUMN_LIMIT", 1000)
     if timeout is None:
-        timeout_val = env_int("EXEC_DEFAULT_TIMEOUT", 30)
+        # SWE-bench-Live: derived from TOOL_EXEC_TIMEOUT minus a headroom, so the
+        # internal deadline fires first and kills the whole process group.  A
+        # command that outlived the runtime guard used to keep mutating the
+        # workspace after the model had already been told it timed out.
+        timeout_val = _get_default_command_exec_timeout()
     else:
         timeout_val = int(timeout)
 
@@ -2395,7 +2432,10 @@ EXEC_SHELL_TOOL_CONFIG = ToolConfig(
             },
             "timeout": {
                 "type": "integer",
-                "description": "Optional timeout in seconds (default: EXEC_DEFAULT_TIMEOUT)",
+                "description": (
+                    "Optional timeout in seconds (default: EXEC_DEFAULT_TIMEOUT, "
+                    "which itself defaults to TOOL_EXEC_TIMEOUT minus 20)"
+                ),
             },
         },
         "required": ["command"],
