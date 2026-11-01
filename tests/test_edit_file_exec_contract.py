@@ -26,8 +26,11 @@ if str(ROOT) not in sys.path:
 
 from runtime.builtin_tools_coding import (  # noqa: E402
     _Linter,
+    _diff_preview,
     _edit_file,
     _exec_shell,
+    _shift_indent_str,
+    _uniform_indent_shift,
 )
 from runtime.runtime import (  # noqa: E402
     _get_default_command_exec_timeout,
@@ -46,6 +49,102 @@ def _write(ws: Path, name: str, text: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
     return path
+
+
+# ---------------------------------------------------------------- diff echo
+def test_edit_success_carries_unified_diff(workspace):
+    _write(workspace, "a.py", "def f():\n    return 1\n")
+    res = _json.loads(_edit_file(
+        "a.py", "search_replace", old_str="    return 1", new_str="    return 2",
+    ))
+    assert res.get("file_modified") is True, res
+    assert res["matched_at_line"] == 2
+    # the model must be able to see what it wrote without re-reading the file
+    assert "-    return 1" in res["diff"]
+    assert "+    return 2" in res["diff"]
+    assert res["diff_truncated"] is False
+
+
+def test_diff_is_truncated_for_large_edits(workspace):
+    old = "".join(f"line{i}\n" for i in range(200))
+    new = "".join(f"changed{i}\n" for i in range(200))
+    _write(workspace, "big.txt", old)
+    res = _json.loads(_edit_file("big.txt", "search_replace", old_str=old, new_str=new))
+    assert res["diff_truncated"] is True, res
+    assert len(res["diff"]) < 4000, len(res["diff"])
+
+
+# ------------------------------------------------------------- NoChange error
+def test_identical_strings_are_reported_as_no_change(workspace):
+    path = _write(workspace, "same.py", "x = 1\n")
+    before = path.read_bytes()
+    res = _json.loads(_edit_file(
+        "same.py", "search_replace", old_str="x = 1", new_str="x = 1",
+    ))
+    assert res.get("error") == "NoChange", res
+    assert path.read_bytes() == before
+
+
+def test_context_only_patch_is_reported_as_no_change(workspace):
+    """A diff whose +/- lines are identical used to be reported as a success."""
+    path = _write(workspace, "ctx.py", "a\nb\nc\n")
+    before = path.read_bytes()
+    patch = (
+        "--- a/ctx.py\n"
+        "+++ b/ctx.py\n"
+        "@@ -1,3 +1,3 @@\n"
+        " a\n"
+        "-b\n"
+        "+b\n"
+        " c\n"
+    )
+    res = _json.loads(_edit_file("ctx.py", "diff", patch=patch))
+    assert res.get("error") == "NoChange", res
+    assert path.read_bytes() == before
+
+
+# ------------------------------------------------------- whitespace handling
+def _read_lines(ws: Path, name: str):
+    return (ws / name).read_text(encoding="utf-8").splitlines()
+
+
+def test_non_uniform_indent_mismatch_is_still_refused(workspace):
+    _write(workspace, "p.py", "def f():\n    if x:\n        return 1\n")
+    res = _json.loads(_edit_file(
+        "p.py", "search_replace",
+        old_str="  if x:\n        return 1",       # deltas: -2 and 0
+        new_str="  if x:\n        return 2",
+    ))
+    assert res.get("error") == "LineNotFound", res
+    assert "缩进差量不一致" in res["message"] or "多个匹配" in res["message"], res
+    assert _read_lines(workspace, "p.py") == ["def f():", "    if x:", "        return 1"]
+
+
+def test_shift_that_would_dedent_below_zero_is_refused(workspace):
+    _write(workspace, "p.py", "def f():\n    return 1\n")
+    res = _json.loads(_edit_file(
+        "p.py", "search_replace",
+        old_str="        return 1",   # file has 4, old_str has 8 -> delta -4
+        new_str="return 2",          # has no indent to remove
+    ))
+    assert res.get("error") == "LineNotFound", res
+    assert _read_lines(workspace, "p.py") == ["def f():", "    return 1"]
+
+
+def test_uniform_shift_does_not_clobber_python_block_structure():
+    lines = ["    if x:", "        return 1", "", "    return 0"]
+    delta, reason = _uniform_indent_shift([f"{l}\n" for l in lines], "\n".join(lines), 0)
+    assert delta is None and reason, reason          # identical -> no shift needed
+    shifted = _shift_indent_str("if x:\n    return 1", 4)
+    assert shifted == "    if x:\n        return 1"
+    assert _shift_indent_str("if x:", -4) is None
+
+
+def test_diff_preview_shape():
+    out = _diff_preview("a\nb\n", "a\nc\n", "f.txt")
+    assert out["diff_truncated"] is False
+    assert "-b" in out["diff"] and "+c" in out["diff"]
+    assert _diff_preview("a\n", "a\n", "f.txt") == {"diff": "", "diff_truncated": False}
 
 
 # ------------------------------------------------------------- timeout guard

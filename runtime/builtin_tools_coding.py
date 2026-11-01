@@ -36,6 +36,7 @@ import sys
 import tempfile
 import threading
 import datetime
+import difflib
 from typing import Optional
 
 logger = logging.getLogger("runtime.builtin_tools")
@@ -1181,6 +1182,59 @@ WRITE_FILE_TOOL_CONFIG = ToolConfig(
 # Task 7.1 & 7.2 — _edit_file implementation (search_replace + diff modes)
 # ---------------------------------------------------------------------------
 
+def _edit_result(
+    resolved_path: str,
+    rel_path: str,
+    backup: dict,
+    *,
+    lines_added: int,
+    lines_removed: int,
+    extra: Optional[dict] = None,
+) -> str:
+    """Build the edit_file response, or a NoChange error if nothing changed.
+
+    SWE-bench-Live: the response echoes a bounded unified diff of the edit.
+    Without it the model only sees "6 added / 2 removed" and re-reads the file
+    to verify its own edit -- an extra read costs roughly twenty times more
+    context than the diff,
+    and 18% of edit rounds did exactly that.  The diff also exposes a
+    wrong-location edit at the moment it happens instead of at evaluation time.
+    """
+    old_bytes = backup.get("data", b"")
+    try:
+        with open(resolved_path, "rb") as f:
+            new_bytes = f.read()
+    except FileNotFoundError:
+        # File was deleted during edit (unlikely but handle gracefully)
+        new_bytes = b""
+
+    if old_bytes == new_bytes:
+        # An edit that lands nothing must not look like a success.
+        return json.dumps({
+            "error": "NoChange",
+            "message": (
+                "The edit was applied but the file content is byte-for-byte "
+                "identical to before, so nothing changed. Re-read the file and "
+                "issue the edit you intend."
+            ),
+        })
+
+    old_text = old_bytes.decode("utf-8", errors="replace")
+    new_text = new_bytes.decode("utf-8", errors="replace")
+    preview = _diff_preview(old_text, new_text, rel_path)
+
+    payload = {
+        "file": rel_path,
+        "lines_added": lines_added,
+        "lines_removed": lines_removed,
+        "file_modified": True,
+    }
+    if extra:
+        payload.update(extra)
+    payload.update(preview)
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def _edit_file(
     path: str,
     mode: str,
@@ -1265,6 +1319,119 @@ def _strip_lines(text: str) -> list[str]:
     return [line.strip() for line in text.splitlines()]
 
 
+#: SWE-bench-Live: bounds for the diff echoed back by edit_file.  A short diff
+#: is the cheapest way to let the model see what it actually wrote; without
+#: it the model re-reads the file to check, which costs an order of magnitude
+#: more context.
+_DIFF_MAX_LINES = 40
+_DIFF_MAX_CHARS = 2600
+
+
+def _diff_preview(
+    old_text: str, new_text: str, label: str,
+    max_lines: int = _DIFF_MAX_LINES, max_chars: int = _DIFF_MAX_CHARS,
+) -> dict:
+    """Build a small unified diff of the edit for the tool response."""
+    if old_text == new_text:
+        return {"diff": "", "diff_truncated": False}
+    body = list(difflib.unified_diff(
+        old_text.splitlines(keepends=True),
+        new_text.splitlines(keepends=True),
+        fromfile=label, tofile=label, n=2,
+    ))
+    truncated = False
+    if len(body) > max_lines:
+        body = body[:max_lines]
+        truncated = True
+    text = "".join(body)
+    if len(text) > max_chars:
+        text = text[:max_chars].rsplit("\n", 1)[0]
+        truncated = True
+    if truncated:
+        text += "\n[...diff truncated: re-read the file only if this is not enough...]"
+    return {"diff": text, "diff_truncated": truncated}
+
+
+def _leading_ws(line: str) -> str:
+    """Return the leading whitespace of *line* (without the line terminator)."""
+    stripped = line.rstrip("\r\n")
+    return stripped[: len(stripped) - len(stripped.lstrip())]
+
+
+def _uniform_indent_shift(
+    file_lines: list[str], old_str: str, start: int,
+) -> tuple[Optional[int], str]:
+    """Decide whether a whitespace-only mismatch can be repaired rigorously.
+
+    SWE-bench-Live: a mismatch is repairable only when *every* non-blank line
+    of ``old_str`` is off by the same amount in the same whitespace style,
+    i.e. the model quoted a block that is one uniform indent level away from
+    the file.  Shifting
+    ``new_str`` by that same amount then provably preserves the block's internal
+    structure, which is all indentation-sensitive languages depend on.
+
+    Returns ``(delta, reason)``.  ``delta`` is None when the mismatch is not a
+    pure uniform shift -- mixed deltas, tabs, or an ambiguous match -- and the
+    caller must refuse instead of guessing.
+    """
+    old_lines = old_str.splitlines()
+    if not old_lines:
+        return None, "empty old_str"
+    if _count_tolerant_occurrences(file_lines, old_str) != 1:
+        return None, (
+            "忽略空白后有多个匹配位置，无法确定应替换哪一处"
+        )
+    if start + len(old_lines) > len(file_lines):
+        return None, "匹配范围超出文件"
+
+    deltas: list[int] = []
+    for offset, old_line in enumerate(old_lines):
+        file_line = file_lines[start + offset].rstrip("\r\n")
+        if not old_line.strip() and not file_line.strip():
+            # Both lines are blank: blank lines carry no indentation evidence,
+            # and rewriting them would only invent trailing whitespace.
+            continue
+        old_ws = _leading_ws(old_line)
+        file_ws = _leading_ws(file_line)
+        if "\t" in old_ws or "\t" in file_ws:
+            return None, "缩进包含制表符，无法按空格平移"
+        # One indent must be a prefix of the other; otherwise the two blocks are
+        # laid out differently rather than merely shifted.
+        if not (file_ws.startswith(old_ws) or old_ws.startswith(file_ws)):
+            return None, "缩进结构不是简单平移"
+        deltas.append(len(file_ws) - len(old_ws))
+
+    if not deltas:
+        return None, "没有可用于判断缩进的行"
+    if len(set(deltas)) != 1:
+        return None, f"各行缩进差量不一致 ({sorted(set(deltas))})"
+    delta = deltas[0]
+    if delta == 0:
+        return None, "差异不在缩进上"
+    return delta, ""
+
+
+def _shift_indent_str(text: str, delta: int) -> Optional[str]:
+    """Shift every non-blank line of *text* by *delta* spaces, or refuse."""
+    if delta == 0:
+        return text
+    out: list[str] = []
+    for line in text.splitlines():
+        if not line.strip():
+            out.append(line)
+            continue
+        ws = _leading_ws(line)
+        if "\t" in ws:
+            return None
+        if delta > 0:
+            out.append(" " * delta + line)
+            continue
+        if len(ws) < -delta:
+            return None
+        out.append(line[-delta:])
+    return "\n".join(out)
+
+
 def _find_first_occurrence(file_lines: list[str], old_str: str) -> Optional[int]:
     """Find the start index (0-based) of the first occurrence of old_str in file_lines.
 
@@ -1341,28 +1508,61 @@ def _edit_file_search_replace(
     if new_str is None:
         new_str = ""
 
+    # SWE-bench-Live: a literal old_str == new_str call cannot change anything.
+    # It used to be
+    # reported as a success carrying lines_added/lines_removed, which kept the
+    # model convinced the change had landed (observed as three consecutive
+    # identical calls against the same file in one session).
+    if old_str == new_str:
+        return json.dumps({
+            "error": "NoChange",
+            "message": (
+                "old_str and new_str are identical, so this edit cannot change "
+                "the file. Re-read the file and issue the edit you intend."
+            ),
+        })
+
     # Read file content
     with open(resolved_path, "r", encoding="utf-8", errors="replace") as f:
         file_lines = f.readlines()
 
-    # Two-tier matching: an exact (whitespace-sensitive) match is required.
-    # A whitespace-tolerant-only match is refused instead of applied: silently
-    # re-indenting the replacement has repeatedly produced IndentationError
-    # output, so report where the block matches modulo whitespace and ask the
-    # model to fix old_str/new_str indentation and retry.
+    # SWE-bench-Live two-tier matching: an exact (whitespace-sensitive) match is
+    # preferred.
+    # A whitespace-only mismatch is repaired only when it is one provably
+    # uniform indent shift; anything looser is refused with the reason, because
+    # guessing at indentation has repeatedly produced IndentationError output.
+    indent_shift: Optional[int] = None
     match_start = _find_first_occurrence_strict(file_lines, old_str)
     if match_start is None:
         tolerant_start = _find_first_occurrence(file_lines, old_str)
         if tolerant_start is None:
             return json.dumps({"error": "LineNotFound", "message": "Could not find text block in the specified file"})
-        message = (
-            f"old_str 仅在忽略空白后匹配（第 {tolerant_start + 1} 行），"
-            "缩进不一致，请修正 old_str/new_str 后重试"
-        )
-        occurrences = _count_tolerant_occurrences(file_lines, old_str)
-        if occurrences > 1:
-            message += f"；文件中共有 {occurrences} 处忽略空白后的匹配，行号为首处"
-        return json.dumps({"error": "LineNotFound", "message": message}, ensure_ascii=False)
+        # Whitespace-only mismatch.  Repair it only when every non-blank line is
+        # off by the same amount in the same whitespace style: shifting new_str
+        # by that same amount provably preserves the block's relative structure,
+        # so the result is what the model asked for rather than a guess.  Any
+        # other mismatch stays an explicit refusal.
+        shift, reason = _uniform_indent_shift(file_lines, old_str, tolerant_start)
+        shifted_new = _shift_indent_str(new_str, shift) if shift is not None else None
+        if shift is not None and shifted_new is not None:
+            new_str = shifted_new
+            match_start = tolerant_start
+            indent_shift = shift
+        else:
+            why = reason or "new_str 平移后会产生负缩进"
+            message = (
+                f"old_str 仅在忽略空白后匹配（第 {tolerant_start + 1} 行），"
+                "缩进不一致，请修正 old_str/new_str 后重试"
+                f"；未自动修正的原因：{why}"
+            )
+            occurrences = _count_tolerant_occurrences(file_lines, old_str)
+            if occurrences > 1:
+                message += (
+                    f"；文件中共有 {occurrences} 处忽略空白后的匹配，行号为首处"
+                )
+            return json.dumps(
+                {"error": "LineNotFound", "message": message}, ensure_ascii=False,
+            )
 
     old_line_count = len(old_str.splitlines()) if old_str else 0
     # Ensure we handle old_str that doesn't end with newline
@@ -1430,22 +1630,14 @@ def _edit_file_search_replace(
     lines_removed = old_line_count
     lines_added = new_line_count
 
-    # Detect if file content actually changed
-    old_content = backup.get("data", b"")
-    try:
-        with open(resolved_path, "rb") as f:
-            new_content = f.read()
-    except FileNotFoundError:
-        # File was deleted during edit (unlikely but handle gracefully)
-        new_content = b""
-    file_modified = (old_content != new_content)
-
-    return json.dumps({
-        "file": rel_path,
-        "lines_added": lines_added,
-        "lines_removed": lines_removed,
-        "file_modified": file_modified,
-    })
+    return _edit_result(
+        resolved_path, rel_path, backup,
+        lines_added=lines_added, lines_removed=lines_removed,
+        extra={
+            "matched_at_line": match_start + 1,
+            **({"indent_shift_applied": indent_shift} if indent_shift else {}),
+        },
+    )
 
 
 def _strip_diff_fence(patch: str) -> str:
@@ -1780,22 +1972,10 @@ def _edit_file_diff(
         elif line.startswith("-") and not line.startswith("---"):
             lines_removed += 1
 
-    # Detect if file content actually changed
-    old_content = backup.get("data", b"")
-    try:
-        with open(resolved_path, "rb") as f:
-            new_content = f.read()
-    except FileNotFoundError:
-        # File was deleted during edit (unlikely but handle gracefully)
-        new_content = b""
-    file_modified = (old_content != new_content)
-
-    return json.dumps({
-        "file": rel_path,
-        "lines_added": lines_added,
-        "lines_removed": lines_removed,
-        "file_modified": file_modified,
-    })
+    return _edit_result(
+        resolved_path, rel_path, backup,
+        lines_added=lines_added, lines_removed=lines_removed,
+    )
 
 
 # Task 7.3 — Register edit_file tool

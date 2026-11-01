@@ -1069,6 +1069,9 @@ class TestEditFilePropertyP7:
         # Ensure target doesn't accidentally appear in prefix/suffix lines
         assume(target not in prefix_line)
         assume(target not in suffix_line)
+        # An edit whose replacement equals the target cannot change anything and
+        # is now reported as NoChange instead of a silent success.
+        assume(replacement != target)
 
         content = f"{prefix_line}\n{target}\n{suffix_line}\n"
         test_file = workspace / "prop7_test.txt"
@@ -1154,19 +1157,48 @@ class TestEditFilePropertyP8:
                                         old_str=search_line,
                                         new_str=replacement))
 
-        if search_indent == file_indent:
-            # Exact match: the replacement must be applied.
-            assert "error" not in result, (
-                f"Expected match to succeed with file_indent={file_indent}, "
-                f"search_indent={search_indent}, line={line_content!r}, "
-                f"but got error: {result}"
-            )
-            new_content = test_file.read_text(encoding="utf-8")
-            assert replacement in new_content, (
-                f"Replacement {replacement!r} not found in file after edit"
-            )
+        # Keep the tolerant match unique: the surrounding lines must not be
+        # interchangeable with the searched line.
+        assume(line_content not in ("before", "after"))
+
+        delta = file_indent - search_indent
+        replace_ws = len(replacement) - len(replacement.lstrip(" "))
+        blank_replacement = not replacement.strip()
+        if blank_replacement:
+            # Blank lines are never shifted: shifting them would invent trailing
+            # whitespace the model did not write.
+            expected_line = replacement
+            applicable = True
+        elif delta > 0:
+            expected_line = " " * delta + replacement
+            applicable = True
+        elif delta < 0:
+            # Dedenting is only possible when new_str has enough indentation.
+            applicable = replace_ws >= -delta
+            expected_line = replacement[-delta:]
         else:
-            # Whitespace-only match: refused, file left unmodified.
+            expected_line = replacement
+            applicable = True
+        expected_content = f"before\n{expected_line}\nafter\n"
+
+        if search_indent == file_indent:
+            # Exact match: the replacement must be applied verbatim.
+            if expected_content == content:
+                assert result.get("error") == "NoChange", result
+                assert test_file.read_text(encoding="utf-8") == content
+            else:
+                assert "error" not in result, (
+                    f"Expected match to succeed with file_indent={file_indent}, "
+                    f"search_indent={search_indent}, line={line_content!r}, "
+                    f"but got error: {result}"
+                )
+                new_content = test_file.read_text(encoding="utf-8")
+                assert new_content == expected_content, (
+                    f"Expected {expected_content!r}, got {new_content!r}"
+                )
+        elif not applicable:
+            # A shift that would push new_str below column 0 is refused rather
+            # than guessed at, and the file is left untouched.
             assert result.get("error") == "LineNotFound", (
                 f"Expected LineNotFound for file_indent={file_indent}, "
                 f"search_indent={search_indent}, line={line_content!r}, "
@@ -1176,7 +1208,23 @@ class TestEditFilePropertyP8:
                 f"Expected indentation-mismatch diagnostic, got: {result['message']}"
             )
             assert test_file.read_text(encoding="utf-8") == content, (
-                "File must be left unmodified when only a tolerant match exists"
+                "File must be left unmodified when the shift is not rigorous"
+            )
+        elif expected_content == content:
+            assert result.get("error") == "NoChange", result
+            assert test_file.read_text(encoding="utf-8") == content
+        else:
+            # Uniform shift: new_str is moved by the same amount, which keeps the
+            # block's relative indentation intact.
+            assert "error" not in result, (
+                f"Expected uniform-shift repair for file_indent={file_indent}, "
+                f"search_indent={search_indent}, line={line_content!r}, "
+                f"but got: {result}"
+            )
+            assert result.get("indent_shift_applied") == delta, result
+            new_content = test_file.read_text(encoding="utf-8")
+            assert new_content == expected_content, (
+                f"Expected {expected_content!r}, got {new_content!r}"
             )
 
 
