@@ -239,7 +239,7 @@ def test_assembled_context_never_leaks_the_snapshot() -> None:
 # ---------------------------------------------------------------------------
 
 def test_non_stream_infer_records_the_snapshot() -> None:
-    """``POST /v1/infer`` goes through ``_persist_conversation``, which builds
+    """``POST /v1/infer`` runs the shared pipeline, whose persist point builds
     the snapshot from the very values it hands to ``persist_conversation``."""
     import urllib.error
     import urllib.request
@@ -271,7 +271,9 @@ def test_non_stream_infer_records_the_snapshot() -> None:
         msgs.append(Message(role="assistant", content="ok"))
         return InferenceResult(success=True, messages=msgs)
 
-    def _infer_stream(request):
+    # POST /v1/infer now runs the streaming pipeline, which calls the generator
+    # with cancel/gate kwargs; a stub has to accept them.
+    def _infer_stream(request, **_pipeline_kwargs):
         for msg in (request.messages or []):
             yield msg
         yield Message(role="assistant", content="ok")

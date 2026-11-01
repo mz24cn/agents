@@ -47,7 +47,6 @@ from runtime.server_state import (
     mark_session_stream_persisted,
     merge_stream_messages,
     publish_session_stream_frame,
-    persist_conversation,
     queue_infer_interjection,
     request_pause_infer,
     set_session_stream_agents,
@@ -182,6 +181,158 @@ def _remote_session_has_terminal(
 
 
 _stream_batch_is_protocol_complete = stream_batch_is_protocol_complete
+
+
+class InferSink:
+    """Where the inference pipeline's *output bytes* go — nothing else.
+
+    ``_handle_infer_stream`` owns one pipeline: request preparation, session
+    registration, cancel events, incremental persistence, title/compression
+    finalization and the session status stream.  The only thing that differs
+    between ``POST /v1/infer/stream`` and ``POST /v1/infer`` is the transport
+    the frames are written to, so that is the single seam this class abstracts.
+
+    Deliberately *not* part of the interface: message selection, persistence
+    timing and error semantics.  A sink cannot change pipeline behaviour, which
+    is what keeps the two endpoints from drifting apart again.
+    """
+
+    #: True when the caller is not an SSE client waiting on this connection:
+    #: no bytes are emitted and the starter is never considered disconnected.
+    buffered = False
+
+    def begin(self, session_id: Optional[str]) -> None:
+        """Emit the response preamble (SSE: headers + close-on-finish)."""
+
+    def write(self, payload: bytes) -> None:
+        """Write one already-serialized SSE payload; may raise on disconnect."""
+
+    def heartbeat(self) -> None:
+        """Keep the connection from being reaped by idle timeouts."""
+
+    def error(self, message: str) -> None:
+        """Report a pipeline-level failure to the caller."""
+
+
+class SseStreamSink(InferSink):
+    """Default sink: stream SSE frames straight to the HTTP connection.
+
+    Reproduces, byte for byte, what ``_handle_infer_stream`` used to write
+    directly to ``self.wfile`` before the sink seam existed.
+    """
+
+    def __init__(self, handler):
+        self._handler = handler
+
+    def begin(self, session_id: Optional[str]) -> None:
+        handler = self._handler
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        handler.send_header("Cache-Control", "no-cache")
+        handler.send_header("Connection", "close")
+        if session_id is not None:
+            handler.send_header("X-Session-Id", session_id)
+        handler.end_headers()
+        # SSE streams are not keep-alive compatible: close the connection when
+        # the stream ends instead of letting the HTTP/1.1 loop read more.
+        handler.close_connection = True
+
+    def write(self, payload: bytes) -> None:
+        self._handler.wfile.write(payload)
+        self._handler.wfile.flush()
+
+    def heartbeat(self) -> None:
+        self.write(b": keepalive\n\n")
+
+    def error(self, message: str) -> None:
+        self.write(f"data: {json.dumps({'error': message}, ensure_ascii=False)}\n\n".encode("utf-8"))
+
+
+class BufferedInferSink(InferSink):
+    """Sink used by ``POST /v1/infer``: swallow frames, hand back one envelope.
+
+    Frames are dropped because the pipeline already appends every protocol
+    message to ``collected``, which is the authoritative list the JSON envelope
+    is built from (see :meth:`build_envelope`).  The HTTP response is written by
+    the caller after the run, so no SSE headers and no ``close_connection``.
+
+    A buffered caller stays "connected" for the whole run: a plain HTTP client
+    gives no way to observe an early disconnect, so the starter is never marked
+    disconnected and the inference is never cancelled because nobody was
+    watching — matching the historical behaviour of ``/v1/infer``.
+    """
+
+    buffered = True
+
+    def __init__(self):
+        self.started = False
+        self.session_id: Optional[str] = None
+        self.collected: list[Message] = []
+        self.error_text: Optional[str] = None
+
+    def begin(self, session_id: Optional[str]) -> None:
+        self.started = True
+        self.session_id = session_id
+
+    def attach(self, *, session_id: Optional[str], collected: list) -> None:
+        """Bind the pipeline's own state so the envelope can be rebuilt."""
+        self.session_id = session_id
+        self.collected = collected
+
+    def write(self, payload: bytes) -> None:
+        return None
+
+    def heartbeat(self) -> None:
+        return None
+
+    def error(self, message: str) -> None:
+        self.error_text = message
+
+    def build_envelope(self) -> tuple[int, dict]:
+        """Assemble the ``/v1/infer`` JSON body from the collected messages.
+
+        Returns ``(http_status, envelope)``.  Same contract as before the sink
+        seam: merged ConversationTurns plus ``success`` / ``session_id`` /
+        ``stat`` / ``error``, 200 on a clean run and 500 when a round failed.
+        ``merge_stream_messages`` is the very same merge the persister uses, so
+        the response matches what was written to ``conversation.json``.
+        """
+        collected = self.collected
+        merged_turns, merged_last_stat = merge_stream_messages(collected)
+        merged_messages = [
+            {k: v for k, v in asdict(turn).items() if v is not None}
+            for turn in merged_turns
+        ]
+        has_error = any(
+            m.role == "assistant" and m.content and m.content.startswith("Error:")
+            for m in collected
+        )
+        success = has_error is False and self.error_text is None
+
+        stat_dict = merged_last_stat
+        if stat_dict is None:
+            for m in reversed(collected):
+                if m.role == "usage":
+                    try:
+                        stat_dict = json.loads(m.content)
+                    except (json.JSONDecodeError, ValueError, AttributeError):
+                        pass
+                    break
+
+        envelope: dict = {"success": success, "messages": merged_messages}
+        if self.session_id is not None:
+            envelope["session_id"] = self.session_id
+        if not success:
+            if self.error_text is not None:
+                envelope["error"] = f"Inference failed: {self.error_text}"
+            else:
+                for m in collected:
+                    if m.role == "assistant" and m.content and m.content.startswith("Error:"):
+                        envelope["error"] = m.content
+                        break
+        if stat_dict is not None:
+            envelope["stat"] = stat_dict
+        return (200 if success else 500), envelope
 
 
 class HandlerInferMixin:
@@ -729,26 +880,6 @@ class HandlerInferMixin:
             "remote_env", "remote_tool_proxy",
         ])
 
-    def _persist_conversation(self, context_manager, session_id, original_messages, collected_messages, agent_ids=None, agent_nickname=None, model_id=None, tool_ids=None, workspace=None, remote_env=None, compress=True, update_title=True):
-        if session_id is None:
-            return None
-        exc = persist_conversation(
-            context_manager=context_manager,
-            session_id=session_id,
-            original_messages=original_messages,
-            collected_messages=collected_messages,
-            session_manager=self.server.session_manager,  # type: ignore[attr-defined]
-            agent_ids=agent_ids,
-            agent_nickname=agent_nickname,
-            model_id=model_id,
-            tool_ids=tool_ids,
-            workspace=workspace,
-            extra_meta={"remote_env": remote_env} if remote_env else None,
-            compress=compress,
-            update_title=update_title,
-        )
-        return exc
-
     def _enter_api_inference(self) -> bool:
         """Begin server-level tracking of a stateless (API) inference.
 
@@ -788,141 +919,94 @@ class HandlerInferMixin:
             )
 
     def _handle_infer(self) -> None:
-        """POST /v1/infer — execute model inference (non-streaming).
+        """POST /v1/infer — synchronous shell around the streaming pipeline.
 
-        This is a thin wrapper around infer_stream that collects all stream
-        messages and returns them as a single JSON response. This ensures
-        non-streaming inference automatically benefits from any improvements
-        to the streaming implementation.
+        There is deliberately no second inference implementation here: the
+        request is handed to :meth:`_handle_infer_stream` with a
+        :class:`BufferedInferSink`.  Authorization and validation, session
+        creation, the cancel event, ``active_infers`` registration, the session
+        status stream, the three-phase incremental persistence, in-loop context
+        compression, the file journal and the group-chat path therefore behave
+        exactly as they do over SSE.  That is what was missing before: the
+        non-streaming copy persisted only after the run finished, so during a
+        long non-streaming run — one blocking call spanning hundreds of tool
+        rounds — ``conversation.json`` did not exist, ``GET
+        /v1/sessions/{id}`` answered 404 "Session not found" and the sidebar
+        could not see the session at all.
+
+        The sink throws the frame bytes away; the JSON body is rebuilt from the
+        pipeline's own message list with the same ``merge_stream_messages`` the
+        persister uses, so the response matches ``conversation.json``.  The
+        contract is unchanged (``success`` / ``messages`` / ``session_id`` /
+        ``stat`` / ``error``, 200 or 500).
+
+        Consequences of sharing one pipeline, all intended:
+
+        * the session and its first turn are on disk before inference starts;
+        * the run registers in ``active_infers`` under its session id, so it
+          shows up as "streaming" for the UI, can be watched via
+          ``GET /v1/sessions/{id}/stream`` and stopped via ``POST /v1/infer/abort``
+          (stop or pause) exactly like a streamed run;
+        * ``session_inference_active`` is therefore true while it runs.  Hot
+          updates were already refused during a non-streaming call, because
+          ``do_POST`` counts every ``/v1/infer`` request in
+          ``active_inference_count``; what is new is that the *session* itself is
+          now a tracked, interruptable generation rather than an anonymous one;
+        * the file journal is flushed by the pipeline's cleanup before this
+          method regains control, i.e. before the response is observable.
+
+        A buffered caller is never treated as disconnected: a plain HTTP request
+        gives no way to notice the client going away, so the run plays out to the
+        end instead of being cancelled for lack of an observer — as ``/v1/infer``
+        always behaved.
         """
-        result = self._prepare_infer_request()
-        if result is None:
-            return
-        _body, request, session_id, use_session, original_messages, context_manager, agent_ids, agent_nickname, model_id, tool_ids, workspace, remote_proxy = result
-
-        api_inference = self._enter_api_inference()
+        sink = BufferedInferSink()
         try:
-            runtime = self._get_runtime()
-
-            collected_messages: list[Message] = []
-            # === Group chat routing (non-streaming) ===
-            mentioned_agent_ids = get_request_context("mentioned_agent_ids") or []
-            try:
-                if len(agent_ids) > 1:
-                    # Multi-agent group chat without SSE streaming
-                    from runtime.group_chat import run_group_chat_stream
-                    collected_messages = run_group_chat_stream(
-                        runtime=runtime,
-                        mentioned_agent_ids=mentioned_agent_ids,
-                        all_agent_ids=agent_ids,
-                        original_messages=original_messages,
-                        base_request=request,
-                        cancel_event=None,  # non-streaming: no cancel support
-                        sse_callback=None,   # non-streaming: no SSE output
-                        context_manager=context_manager,
-                        session_id=session_id,
-                        agent_manager=self.server.agent_manager,  # type: ignore[attr-defined]
-                        model_id=model_id,
-                        tool_ids=tool_ids,
-                    )
-                else:
-                    for msg in runtime.infer_stream(request):
-                        collected_messages.append(msg)
-                        if msg.role == "assistant" and msg.content and msg.content.startswith("Error:"):
-                            logger.error("infer error event | model=%s %s", request.model_id, msg.content)
-            except Exception as exc:
+            self._handle_infer_stream(sink=sink)
+        except Exception as exc:
+            # ``_handle_infer_stream`` handles failures of the inference itself;
+            # reaching here means something blew up while assembling request or
+            # session state.  Nothing has been written to the connection yet (a
+            # buffered sink emits no headers), so a clean 500 is still possible.
+            logger.exception("infer: non-streaming pipeline raised: %s", exc)
+            sink.error_text = str(exc)
+            if not sink.started:
                 self._send_json_error(500, f"Inference failed: {exc}")
                 return
 
-            if agent_ids and len(agent_ids) <= 1:
-                for msg in collected_messages:
-                    if msg.role == "assistant":
-                        msg.agent_id = agent_ids[0]
-                        if agent_nickname:
-                            msg.name = agent_nickname
+        if not sink.started:
+            # ``_prepare_infer_request`` rejected the call and already sent the
+            # response (400 / 401 / 404 / 409 / 413); writing again would corrupt
+            # the keep-alive framing.
+            return
 
-            if use_session:
-                persist_exc = self._persist_conversation(context_manager, session_id, original_messages, collected_messages, agent_ids, agent_nickname, model_id, tool_ids, workspace, remote_env=str(_body.get("remote_env") or ""))
-                if persist_exc is not None:
-                    self._send_json_error(500, f"Failed to save conversation: {persist_exc}")
-                    return
+        status, envelope = sink.build_envelope()
+        self._send_json_response(status, envelope)
 
-            merged_turns, merged_last_stat = merge_stream_messages(collected_messages)
-            if agent_ids:
-                for turn in merged_turns:
-                    if turn.role == "assistant":
-                        if agent_nickname and not turn.name:
-                            turn.name = agent_nickname
-                        if not turn.agent_id:
-                            turn.agent_id = agent_ids[0]
-
-            merged_messages = [
-                {k: v for k, v in asdict(turn).items() if v is not None}
-                for turn in merged_turns
-            ]
-
-            has_error = any(
-                m.role == "assistant" and m.content and m.content.startswith("Error:")
-                for m in collected_messages
-            )
-            success = not has_error
-
-            stat_dict = merged_last_stat
-            if stat_dict is None:
-                for m in reversed(collected_messages):
-                    if m.role == "usage":
-                        try:
-                            stat_dict = json.loads(m.content)
-                        except (json.JSONDecodeError, ValueError, AttributeError):
-                            pass
-                        break
-
-            response_data: dict = {
-                "success": success,
-                "messages": merged_messages,
-            }
-            if session_id is not None:
-                response_data["session_id"] = session_id
-            if not success:
-                for m in collected_messages:
-                    if m.role == "assistant" and m.content and m.content.startswith("Error:"):
-                        response_data["error"] = m.content
-                        break
-            if stat_dict is not None:
-                response_data["stat"] = stat_dict
-
-            status = 200 if success else 500
-            # Make the journal final before the response becomes observable.
-            self._finalize_file_journal()
-            self._send_json_response(status, response_data)
-        finally:
-            self._cleanup_thread_local()
-            if api_inference:
-                self._leave_api_inference()
-
-    def _handle_infer_stream(self) -> None:
+    def _handle_infer_stream(self, sink: Optional[InferSink] = None) -> None:
         """POST /v1/infer/stream — execute streaming model inference.
 
-        Returns Server-Sent Events (SSE) stream. 
+        Returns Server-Sent Events (SSE) stream.
         First event: 'init' containing session_id and user_message_timestamp.
         Subsequent events: Assistant messages.
+
+        ``sink`` abstracts only *where the frame bytes go*.  Called without one
+        (the route handler) it writes SSE to this connection exactly as before;
+        ``POST /v1/infer`` passes a :class:`BufferedInferSink` to run this same
+        pipeline and answer with a single JSON body.  Keep every other decision
+        here — persistence timing, cancel events, status stream — endpoint
+        agnostic: that is the whole point of the seam.
         """
         result = self._prepare_infer_request()
         if result is None:
             return
         _body, request, session_id, use_session, original_messages, context_manager, agent_ids, agent_nickname, model_id, tool_ids, workspace, remote_proxy = result
 
+        if sink is None:
+            sink = SseStreamSink(self)
+
         api_inference = self._enter_api_inference()
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
-        if session_id is not None:
-            self.send_header("X-Session-Id", session_id)
-        self.end_headers()
-        # SSE streams are not keep-alive compatible: close the connection when
-        # the stream ends instead of letting the HTTP/1.1 loop read more.
-        self.close_connection = True
+        sink.begin(session_id)
 
         # === 前置发送 Session Init 消息 ===
         # 从 original_messages 中提取用户消息时间戳（已在 _prepare_infer_request 中注入）
@@ -982,9 +1066,15 @@ class HandlerInferMixin:
         cancel_event = threading.Event()
         runtime = self._get_runtime()
         collected_messages: list[Message] = []
+        # A buffered (non-streaming) caller builds its JSON envelope from the
+        # pipeline's own message list, so hand it the live list object.  It is
+        # only ever appended to here, never rebound, so the reference stays
+        # valid for the whole run.  The SSE sink ignores this.
+        if sink.buffered:
+            sink.attach(session_id=session_id, collected=collected_messages)
         # A single SSE connection may receive frames from nested-tool worker
         # threads as well as the HTTP handler thread.  Serialize every write so
-        # JSON events and heartbeat comments can never interleave on wfile.
+        # JSON events and heartbeat comments can never interleave.
         sse_write_lock = threading.Lock()
         client_connected = True
         latest_stream_seq = 0
@@ -1036,14 +1126,12 @@ class HandlerInferMixin:
         # subscriber. Expose the baseline before the first mirrored frame so it
         # can hand off to GET /sessions/{id}/stream without duplicates.
         init_payload["stream_seq"] = latest_stream_seq
-        self.wfile.write(f"event: init\ndata: {json.dumps(init_payload, ensure_ascii=False)}\n\n".encode("utf-8"))
-        self.wfile.flush()
+        sink.write(f"event: init\ndata: {json.dumps(init_payload, ensure_ascii=False)}\n\n".encode("utf-8"))
         # ================================
 
         def _write_sse_payload(payload: bytes) -> None:
             with sse_write_lock:
-                self.wfile.write(payload)
-                self.wfile.flush()
+                sink.write(payload)
 
         def _mark_starter_disconnected(exc: Exception) -> None:
             nonlocal client_connected
@@ -1102,7 +1190,10 @@ class HandlerInferMixin:
             if not client_connected:
                 return
             try:
-                _write_sse_payload(b": keepalive\n\n")
+                # Same lock as frame writes: a heartbeat must never interleave
+                # with a half-written JSON event from a nested-tool thread.
+                with sse_write_lock:
+                    sink.heartbeat()
             except Exception as exc:
                 _mark_starter_disconnected(exc)
 
@@ -1424,9 +1515,7 @@ class HandlerInferMixin:
             elif use_session:
                 logger.info("infer_stream: skipped stale persist for session %s (Exception)", session_id)
             try:
-                error_data = json.dumps({"error": str(exc)}, ensure_ascii=False)
-                self.wfile.write(f"data: {error_data}\n\n".encode("utf-8"))
-                self.wfile.flush()
+                sink.error(str(exc))
             except Exception:
                 pass
             # --- Session Status Stream: broadcast "done_error_unread" ---

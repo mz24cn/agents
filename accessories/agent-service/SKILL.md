@@ -353,6 +353,12 @@ curl -fsS -X DELETE "$SERVER_URL/v1/env/SUMMARY_MODEL_ID" | python -m json.tool
 - `"new"`：创建新会话并持久化
 - 现有 session ID：恢复并追加会话；不存在则按无状态推理
 
+服务端只有一条推理管线：`/v1/infer` 是 `/v1/infer/stream` 的同步外壳，差别仅在
+响应形态（一次性 JSON 信封 vs SSE 帧）。因此带 `session_id` 的非流式推理在运行
+期间就是可读的会话——输入轮在推理开始前已落盘，每个完整轮次增量落盘，Web 侧栏
+能看到进度，`POST /v1/infer/abort` 也能停止或暂停它。区别只在于：非流式客户端
+无法观测断连，所以请求一旦受理就会跑到底，不会因为没人看而被取消。
+
 ```bash
 curl -fsS -X POST "$SERVER_URL/v1/infer" \
   -H 'Content-Type: application/json' \

@@ -267,9 +267,9 @@ python app.py 0.0.0.0:9000 # 自定义主机和端口（重载 AGENTS_URL）
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/v1/infer` | 非流式推理 |
+| POST | `/v1/infer` | 非流式推理（一次性 JSON，与流式走同一条服务端管线） |
 | POST | `/v1/infer/stream` | 流式推理（SSE） |
-| POST | `/v1/infer/abort` | 中止指定会话的流式推理 |
+| POST | `/v1/infer/abort` | 中止指定会话的推理（流式与非流式皆可） |
 | POST | `/v1/auth/login` | 登录，获取访问凭证 |
 | POST | `/v1/auth/logout` | 登出，使当前访问凭证失效 |
 | GET | `/v1/auth/config` | 查询授权配置 |

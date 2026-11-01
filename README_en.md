@@ -288,9 +288,9 @@ change takes effect after a restart.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/v1/infer` | Non-streaming inference |
+| POST | `/v1/infer` | Non-streaming inference (one-shot JSON, same server pipeline as `/v1/infer/stream`) |
 | POST | `/v1/infer/stream` | Streaming inference (SSE) |
-| POST | `/v1/infer/abort` | Abort an active streaming inference by session ID |
+| POST | `/v1/infer/abort` | Abort an active inference by session ID (streaming or not) |
 | POST | `/v1/auth/login` | Log in and obtain an access credential |
 | POST | `/v1/auth/logout` | Log out and invalidate the current access credential |
 | GET | `/v1/auth/config` | Query authorization configuration |

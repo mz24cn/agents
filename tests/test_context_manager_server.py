@@ -93,7 +93,9 @@ def mock_runtime(tmp_path):
         api_protocol="ollama",
     ))
     rt = Runtime(model_reg, tool_reg)
-    def _mock_infer_stream(request):
+    def _mock_infer_stream(request, **_pipeline_kwargs):
+        # 流水线（流式与非流式共用）会带上 cancel_event/pause_gate/close_gate 等
+        # 关键字参数，替身必须接受。
         for msg in (request.messages or []):
             yield msg
         yield Message(role="assistant", content="Hello from mock")
@@ -258,7 +260,7 @@ class TestContextAssemblyWithRealFiles:
         # Track what messages the mock infer receives
         received_messages: list = []
 
-        def capturing_infer_stream(request):
+        def capturing_infer_stream(request, **_pipeline_kwargs):
             for m in (request.messages or []):
                 received_messages.append(m)
                 yield m
