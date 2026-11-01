@@ -26,9 +26,11 @@ if str(ROOT) not in sys.path:
 
 from runtime.builtin_tools_coding import (  # noqa: E402
     _Linter,
+    _changed_files_report,
     _diff_preview,
     _edit_file,
     _exec_shell,
+    _git_workspace_state,
     _shift_indent_str,
     _uniform_indent_shift,
 )
@@ -219,6 +221,55 @@ def test_linter_can_be_disabled(tmp_path, monkeypatch):
     assert ok
 
 
+# ------------------------------------------------------- exec change reporting
+def test_changed_files_report_groups_by_status():
+    prev = {"a.py": " M", "gone.py": " M"}
+    now = {"a.py": " M", "new.py": "??"}
+    payload = _changed_files_report(prev, now)
+    assert payload is not None
+    groups = payload["changed_files"]
+    assert "new.py" in groups["??"]
+    assert "gone.py" in groups["D"]
+    assert "a.py" not in _json.dumps(groups)
+
+
+def test_changed_files_report_is_silent_when_nothing_changed():
+    state = {"a.py": " M"}
+    assert _changed_files_report(state, dict(state)) is None
+
+
+def test_exec_shell_reports_files_written_by_a_command(workspace, monkeypatch):
+    ws = str(workspace)
+    subprocess.run(["git", "init", "-q"], cwd=ws, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=ws, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=ws, check=True)
+    (workspace / "tracked.py").write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=ws, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=ws, check=True)
+
+    res = _json.loads(_exec_shell("printf 'y = 2\\n' > generated.py"))
+    assert res["exit_code"] == 0, res
+    assert "generated.py" in _json.dumps(res.get("changed_files")), res
+
+    # a command that touches nothing reports nothing
+    res2 = _json.loads(_exec_shell("true"))
+    assert "changed_files" not in res2, res2
+
+    # attribution: an edit_file change is not blamed on the next command
+    _edit_file("tracked.py", "search_replace", old_str="x = 1", new_str="x = 2")
+    res3 = _json.loads(_exec_shell("true"))
+    assert "changed_files" not in res3, res3
+
+
+def test_exec_shell_change_report_can_be_disabled(workspace, monkeypatch):
+    ws = str(workspace)
+    subprocess.run(["git", "init", "-q"], cwd=ws, check=True)
+    monkeypatch.setenv("EXEC_REPORT_CHANGES", "0")
+    assert _git_workspace_state(ws) is None
+    res = _json.loads(_exec_shell("printf 'z\\n' > f.txt"))
+    assert "changed_files" not in res, res
+
+
 # ------------------------------------------------------------- timeout guard
 def test_tool_exec_timeout_default_is_above_the_command_default(monkeypatch):
     monkeypatch.delenv("TOOL_EXEC_TIMEOUT", raising=False)
@@ -236,3 +287,5 @@ def test_command_default_follows_the_guard(monkeypatch):
     assert _get_default_command_exec_timeout() == 40
     monkeypatch.setenv("EXEC_DEFAULT_TIMEOUT", "15")
     assert _get_default_command_exec_timeout() == 15
+
+

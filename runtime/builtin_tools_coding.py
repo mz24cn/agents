@@ -2494,6 +2494,121 @@ SEARCH_CODE_TOOL_CONFIG = ToolConfig(
 # Task 10.1 — _exec_shell implementation
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Workspace change detection for exec_shell
+#
+# SWE-bench-Live: 42% of the files in the final patches of that evaluation
+# run never went through an edit tool: they were produced by shell
+# redirection, sed, cp/mv, or a
+# generator the model ran.  Those writes are invisible to the agent (it only sees
+# stdout) and invisible to the file journal, so the model cannot tell what a
+# command did to the repository and the collected patch silently accumulates
+# build artifacts.  A before/after ``git status`` around each command closes both
+# gaps using exactly the view the patch collection itself uses.
+# ---------------------------------------------------------------------------
+
+_EXEC_GIT_REPO_CACHE: dict[str, bool] = {}
+
+#: Max paths echoed per exec_shell result, keeping the addition bounded.
+_EXEC_CHANGES_MAX_PATHS = 40
+
+
+def _exec_changes_enabled() -> bool:
+    return os.environ.get("EXEC_REPORT_CHANGES", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def _is_git_workspace(workspace: str) -> bool:
+    cached = _EXEC_GIT_REPO_CACHE.get(workspace)
+    if cached is not None:
+        return cached
+    ok = False
+    try:
+        probe = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=workspace, capture_output=True, text=True, timeout=10,
+        )
+        ok = probe.returncode == 0
+    except Exception as exc:
+        logger.warning("git probe failed for %s: %s", workspace, exc)
+    _EXEC_GIT_REPO_CACHE[workspace] = ok
+    return ok
+
+
+def _git_workspace_state(workspace: str) -> Optional[dict]:
+    """Return ``{path: porcelain_status}`` for the repo containing *workspace*.
+
+    Returns None when change reporting is off, the workspace is not a git
+    repository, or git could not run -- the caller then skips the report rather
+    than guessing.
+    """
+    if sys.platform == "win32" or not _exec_changes_enabled():
+        return None
+    if not _is_git_workspace(workspace):
+        return None
+    try:
+        res = subprocess.run(
+            ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            cwd=workspace, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=15,
+        )
+    except Exception as exc:
+        logger.warning("git status failed for %s: %s", workspace, exc)
+        return None
+    if res.returncode != 0:
+        return None
+
+    state: dict[str, str] = {}
+    fields = (res.stdout or "").split("\0")
+    index = 0
+    while index < len(fields):
+        entry = fields[index]
+        index += 1
+        if not entry or len(entry) < 4:
+            continue
+        status, path = entry[:2], entry[3:]
+        state[path] = status
+        # Renames/copies emit the source path as an extra NUL-separated field.
+        if status[0] in ("R", "C") and index < len(fields):
+            index += 1
+    return state
+
+
+def _changed_files_report(prev: Optional[dict], now: Optional[dict]) -> Optional[dict]:
+    """Describe what a command changed, or None when nothing did."""
+    if prev is None or now is None:
+        return None
+    groups: dict[str, list[str]] = {}
+
+    def add(path: str, status: str) -> None:
+        groups.setdefault(status.strip() or "??", []).append(path)
+
+    for path in sorted(set(now) - set(prev)):
+        add(path, now[path])
+    for path in sorted(set(prev) - set(now)):
+        add(path, "D ")
+    for path in sorted(set(prev) & set(now)):
+        if prev[path] != now[path]:
+            add(path, now[path])
+
+    if not groups:
+        return None
+
+    total = sum(len(v) for v in groups.values())
+    payload: dict = {"changed_files": {k: v for k, v in groups.items()}}
+    if total > _EXEC_CHANGES_MAX_PATHS:
+        payload["changed_files"] = {
+            k: v[:_EXEC_CHANGES_MAX_PATHS] for k, v in groups.items()
+        }
+        payload["changed_files_truncated"] = total
+    payload["changed_files_note"] = (
+        "This command modified the workspace outside the edit tools "
+        "(status: ??=new untracked, M=modified, D=deleted)."
+    )
+    return payload
+
+
 def _exec_shell(command: str, timeout: Optional[int] = None, background: bool = False) -> str:
     """Execute a shell command in the workspace with output limits.
 
@@ -2586,6 +2701,11 @@ def _exec_shell(command: str, timeout: Optional[int] = None, background: bool = 
     env = os.environ.copy()
     env["TERM"] = "dumb"
 
+    # SWE-bench-Live: snapshot the repository state so the result can say what
+    # this command changed.  Taken here (not from a previous call's cache) so
+    # files written by edit_file in between are not misattributed to it.
+    git_state_before = _git_workspace_state(workspace)
+
     # Use Popen with start_new_session=True so the abort handler can kill
     # the entire process group via kill_active_process().
     session_id = get_request_context("session_id")
@@ -2631,11 +2751,17 @@ def _exec_shell(command: str, timeout: Optional[int] = None, background: bool = 
             # Timeout — kill the process group.
             kill_process_group(proc)
             stdout, stderr = proc.communicate()
-            return json.dumps({
+            timeout_payload = {
                 "error": "Timeout",
                 "message": f"Command exceeded timeout of {timeout_val} seconds",
                 "exit_code": None,
-            })
+            }
+            report = _changed_files_report(
+                git_state_before, _git_workspace_state(workspace),
+            )
+            if report:
+                timeout_payload.update(report)
+            return json.dumps(timeout_payload)
     finally:
         # Unregister.
         if session_id:
@@ -2705,6 +2831,10 @@ def _exec_shell(command: str, timeout: Optional[int] = None, background: bool = 
     }
     if truncated:
         response["omitted_lines"] = omitted_lines
+
+    report = _changed_files_report(git_state_before, _git_workspace_state(workspace))
+    if report:
+        response.update(report)
 
     return json.dumps(response)
 

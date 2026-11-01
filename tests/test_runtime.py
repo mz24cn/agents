@@ -2016,7 +2016,10 @@ def test_exec_shell_runs_in_session_workspace(monkeypatch, session_ctx, tmp_path
         EXEC_SHELL_TOOL_CONFIG, {"command": "pwd"})
     assert "error" not in json.loads(result), result
 
-    assert spawned_cwd == [workspace], (
+    # exec_shell also probes ``git status`` before/after the command to report
+    # what it changed, so more than one spawn is expected; every spawn must
+    # still be the session workspace.
+    assert spawned_cwd and set(spawned_cwd) == {workspace}, (
         f"exec_shell 未在会话 workspace 下执行: {spawned_cwd!r} (期望 {workspace!r})")
 
 
