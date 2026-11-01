@@ -36,6 +36,7 @@ from runtime.builtin_tools_coding import (  # noqa: E402
 )
 from runtime.runtime import (  # noqa: E402
     _get_default_command_exec_timeout,
+    _get_max_infer_output_chars,
     _get_tool_exec_timeout,
 )
 
@@ -289,3 +290,10 @@ def test_command_default_follows_the_guard(monkeypatch):
     assert _get_default_command_exec_timeout() == 15
 
 
+def test_infer_output_cap_default_and_disable(monkeypatch):
+    monkeypatch.delenv("MAX_INFER_OUTPUT_CHARS", raising=False)
+    assert _get_max_infer_output_chars() == 65536
+    monkeypatch.setenv("MAX_INFER_OUTPUT_CHARS", "1000")
+    assert _get_max_infer_output_chars() == 1000
+    monkeypatch.setenv("MAX_INFER_OUTPUT_CHARS", "0")
+    assert _get_max_infer_output_chars() is None

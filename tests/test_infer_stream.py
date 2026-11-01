@@ -963,6 +963,113 @@ def test_content_worth_streaming_rules() -> None:
     ) is True, "content is never withheld without bound"
 
 
+import io
+import json
+
+
+def test_infer_stream_output_cap_aborts_runaway_reasoning(monkeypatch) -> None:
+    """MAX_INFER_OUTPUT_CHARS cuts a round that emits too much reasoning.
+
+    A single round that streams megabytes of hidden thinking is replayed into
+    every later request, until the endpoint rejects the whole conversation.  The
+    cap bounds it at the source: generation is stopped, the unusable round is
+    discarded and retried, and the runaway text never reaches the history.
+    """
+    from runtime.runtime import Runtime
+    from runtime.models import InferenceRequest, ModelConfig
+    from runtime.registry import ModelRegistry, ToolRegistry
+
+    monkeypatch.setenv("MAX_INFER_OUTPUT_CHARS", "40")
+    monkeypatch.setenv("MODEL_RETRY_BACKOFF", "0")
+
+    registry = ModelRegistry()
+    registry.register(ModelConfig(
+        model_id="test-model", api_base="http://localhost:9999",
+        model_name="test", api_protocol="openai",
+    ))
+    runtime = Runtime(model_registry=registry, tool_registry=ToolRegistry())
+
+    runaway = ["思考" * 60] * 20          # far beyond the 40-character cap
+    calls = {"n": 0}
+
+    def fake_urlopen(request, **kwargs):
+        calls["n"] += 1
+        stream = _make_openai_sse_response(runaway, field="reasoning_content")
+        from unittest.mock import MagicMock
+        resp = MagicMock()
+        resp.__iter__ = lambda self: iter(stream.readlines())
+        resp.read = stream.read
+        resp.close = MagicMock()
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = MagicMock(return_value=False)
+        return resp
+
+    request = InferenceRequest(model_id="test-model", text="hi", stream=True)
+    from unittest.mock import patch
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        messages = list(runtime.infer_stream(request))
+
+    # the round was retried up to the cap-retry budget, then surfaced as an error
+    assert calls["n"] == 3, calls
+    final = messages[-1]
+    assert final.role == "assistant"
+    assert "MAX_INFER_OUTPUT_CHARS" in final.content, final.content
+
+    # nothing near the runaway volume was forwarded to the caller
+    streamed = sum(len(m.thinking or "") for m in messages if m.role == "assistant")
+    assert streamed <= 40 * 3, streamed
+    # and no usage/success stat was emitted for an aborted round
+    assert not [m for m in messages if m.role == "usage"], messages
+
+
+def test_infer_stream_output_cap_disabled_streams_everything(monkeypatch) -> None:
+    from runtime.runtime import Runtime
+    from runtime.models import InferenceRequest, ModelConfig
+    from runtime.registry import ModelRegistry, ToolRegistry
+
+    monkeypatch.setenv("MAX_INFER_OUTPUT_CHARS", "0")
+
+    registry = ModelRegistry()
+    registry.register(ModelConfig(
+        model_id="test-model", api_base="http://localhost:9999",
+        model_name="test", api_protocol="openai",
+    ))
+    runtime = Runtime(model_registry=registry, tool_registry=ToolRegistry())
+
+    chunks = ["思考" * 60] * 20
+    # The round must also carry an answer: reasoning-only output is a
+    # degenerate round (see test_degenerate_round_is_rerolled_with_discard_marker)
+    # and gets re-rolled, which is not what this test exercises.  Both parts
+    # must live in one SSE body -- parsing stops at the first ``[DONE]``.
+    def _delta(field: str, text: str) -> str:
+        payload = {"choices": [{"delta": {"role": "assistant", field: text}}]}
+        return f"data: {json.dumps(payload)}\n\n"
+
+    stream = io.BytesIO(
+        "".join([_delta("reasoning_content", c) for c in chunks]
+                + [_delta("content", "完成")]
+                + ["data: [DONE]\n\n"]).encode("utf-8")
+    )
+    from unittest.mock import MagicMock, patch
+
+    def fake_urlopen(request, **kwargs):
+        resp = MagicMock()
+        resp.__iter__ = lambda self: iter(stream.readlines())
+        resp.read = stream.read
+        resp.close = MagicMock()
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = MagicMock(return_value=False)
+        return resp
+
+    request = InferenceRequest(model_id="test-model", text="hi", stream=True)
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        messages = list(runtime.infer_stream(request))
+
+    streamed = sum(len(m.thinking or "") for m in messages if m.role == "assistant")
+    assert streamed == sum(len(c) for c in chunks)
+    assert messages[-1].role == "usage"
+
+
 # ---------------------------------------------------------------------------
 # Tests: degenerate model round (chat-template markup / no answer) is re-rolled,
 # and the discarded attempt must not leak into conversation history.

@@ -104,6 +104,37 @@ def _get_model_infer_timeout() -> Optional[float]:
     return val
 
 
+# MAX_INFER_OUTPUT_CHARS (characters): hard cap on what ONE model round may
+# emit, counted as hidden thinking plus visible content.  Reasoning models can
+# produce more than a million characters in a single round; that text is then
+# replayed on every following round until the endpoint rejects the request
+# ("request (393294 tokens) exceeds the available context size").  The cap stops
+# generation at the source instead.  Unset / empty -> the default below;
+# 0 or a negative value -> guard disabled (see _get_max_infer_output_chars).
+_DEFAULT_MAX_INFER_OUTPUT_CHARS = 65536
+
+# How many times one round may be retried after being cut by the output cap.
+_MAX_OUTPUT_CAP_RETRIES = 2
+
+
+def _get_max_infer_output_chars() -> Optional[int]:
+    """Return MAX_INFER_OUTPUT_CHARS, read dynamically on every model round."""
+    raw = os.environ.get("MAX_INFER_OUTPUT_CHARS", "").strip()
+    if not raw:
+        return _DEFAULT_MAX_INFER_OUTPUT_CHARS
+    try:
+        val = int(float(raw))
+    except (TypeError, ValueError):
+        _logger.warning(
+            "invalid MAX_INFER_OUTPUT_CHARS=%r; using default %d",
+            raw, _DEFAULT_MAX_INFER_OUTPUT_CHARS,
+        )
+        return _DEFAULT_MAX_INFER_OUTPUT_CHARS
+    if val <= 0:
+        return None
+    return val
+
+
 # Experimental repetitive-output detection. After MODEL_INFER_TIMEOUT fires,
 # the final 100 chars are used as a fingerprint and searched backwards for two
 # earlier complete matches. Visible content and hidden thinking are inspected
@@ -2938,6 +2969,8 @@ class Runtime:
         # collapses to nothing once XML markup and whitespace are filtered out.
         # It is reset after a model round completes successfully.
         pre_output_retry_count = 0
+        # Retry budget for rounds aborted by the per-round output cap.
+        output_cap_retry_count = 0
         while True:
             # Check cancel_event before each round (including before model API call)
             # so we don't block on a long urlopen timeout after a forced abort.
@@ -3001,6 +3034,7 @@ class Runtime:
 
             api_timeout = _get_model_api_timeout()
             infer_timeout = _get_model_infer_timeout()
+            max_output_chars = _get_max_infer_output_chars()
             # MODEL_INFER_TIMEOUT is a per-round wall-clock cap, while
             # MODEL_API_TIMEOUT remains the socket-level connect/read timeout.
             # For urlopen we use the smaller of the two so a stream that goes
@@ -3091,6 +3125,8 @@ class Runtime:
             tool_calls_first_ts: Optional[str] = None  # Reset for each round
             content_loop_detected = False
             thinking_loop_detected = False
+            # Set when this round emitted more than MAX_INFER_OUTPUT_CHARS.
+            output_cap_hit = False
 
             # Per-round stream activity diagnostics. These counters include
             # content, thinking, and tool-call chunks. Character rates count
@@ -3200,6 +3236,25 @@ class Runtime:
                             full_thinking += msg.thinking
                         if msg.content:
                             full_content += msg.content
+
+                        # Per-round output-size guard (MAX_INFER_OUTPUT_CHARS).
+                        # Counted over thinking + content: hidden reasoning is
+                        # exactly what grows without bound, and it is replayed
+                        # into every subsequent request.  Closing the response
+                        # here also stops the server from decoding further
+                        # tokens, so the wasted work is bounded by the cap.
+                        if max_output_chars is not None and (
+                            len(full_thinking) + len(full_content)
+                        ) >= max_output_chars:
+                            output_cap_hit = True
+                            http_resp.close()
+                            _logger.error(
+                                "infer_stream output cap reached | url=%s "
+                                "round=%d limit=%d %s",
+                                url, tool_round, max_output_chars,
+                                _timeout_diagnostics(guard_now),
+                            )
+                            break
 
                     # Per-round continuous-output guard (MODEL_INFER_TIMEOUT).
                     # The clock restarts on every model round and is separate
@@ -3362,6 +3417,47 @@ class Runtime:
             finally:
                 stream_end_time = time.monotonic()
                 http_resp.close()
+
+            # The round was cut short by MAX_INFER_OUTPUT_CHARS.  Nothing that
+            # partial round emitted is usable: a tool call truncated at the cap
+            # would execute with malformed arguments, and reasoning that hit the
+            # cap by definition never reached a conclusion.  Retry the round, so
+            # the work already in the conversation is kept and only this output
+            # is discarded.
+            if output_cap_hit:
+                produced = len(full_thinking) + len(full_content)
+                if output_cap_retry_count < _MAX_OUTPUT_CAP_RETRIES:
+                    output_cap_retry_count += 1
+                    _logger.warning(
+                        "infer_stream output cap exceeded; retrying round | "
+                        "url=%s attempt=%d/%d chars=%d limit=%d "
+                        "thinking_chars=%d content_chars=%d",
+                        url, output_cap_retry_count, _MAX_OUTPUT_CAP_RETRIES,
+                        produced, max_output_chars,
+                        len(full_thinking), len(full_content),
+                    )
+                    if not _wait_model_retry(output_cap_retry_count, cancel_event):
+                        yield Message(role="assistant", timestamp=_now_iso(),
+                                      content="Error: user interrupted.")
+                        return
+                    continue
+                _logger.error(
+                    "infer_stream output cap exceeded after retries | url=%s "
+                    "attempts=%d chars=%d limit=%d",
+                    url, output_cap_retry_count + 1, produced, max_output_chars,
+                )
+                yield Message(
+                    role="assistant",
+                    timestamp=_now_iso(),
+                    content=(
+                        f"Error: model output exceeded MAX_INFER_OUTPUT_CHARS "
+                        f"({produced} chars >= {max_output_chars}; "
+                        f"thinking={len(full_thinking)}, content={len(full_content)}). "
+                        f"The output was discarded and the conversation kept. "
+                        f"Answer again concisely."
+                    ),
+                )
+                return
 
             # A transport can return HTTP 200 and terminate the SSE/NDJSON body
             # without ever producing content, thinking, or a tool call.  Treat
