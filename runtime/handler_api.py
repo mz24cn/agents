@@ -2603,8 +2603,13 @@ class HandlerApiMixin:
         conv_path = os.path.join(session_manager.chats_dir, session_id, "conversation.json")
 
         if not os.path.isfile(conv_path):
-            # conversation.json 不存在（人为删除或磁盘故障），顺手清理 index
-            session_manager.remove_from_index(session_id)
+            # 只有会话目录也消失时才清理 index。目录还在但没有 conversation.json
+            # 意味着这条会话正在推理（已建档、尚未落盘）或上一次推理被强杀：
+            # 索引条目必须保留，否则侧边栏会在推理期间凭空消失、推理结束又回来。
+            if not os.path.isdir(os.path.dirname(conv_path)):
+                session_manager.remove_from_index(session_id)
+            # NOTE: 这里不能 update_index(generate_title=True) —— GET 是读操作，
+            # 不该给一条还没有轮次的会话生成标题或刷新 last_inference_at。
             self._send_json_error(404, f"Session not found: {session_id}")
             return
 
