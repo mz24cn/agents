@@ -653,12 +653,6 @@ class RuntimeHTTPServer:
         self._server.auth_manager = self._auth_manager  # type: ignore[attr-defined]
         self._server.session_manager = self._session_manager  # type: ignore[attr-defined]
         self._server.active_infers = self._active_infers  # type: ignore[attr-defined]
-        # Deprecated alias for the same dict (in-flight inference cancel_events).
-        # Kept so code that only knows the old ``active_streams`` name — external
-        # readers using ``getattr(server, "active_streams", {})``, which silently
-        # falls back to {} instead of erroring — keeps observing real state.
-        # New code must use ``active_infers``.
-        self._server.active_streams = self._active_infers  # type: ignore[attr-defined]
         self._server.active_inference_count = 0  # type: ignore[attr-defined]
         self._server.active_api_inference_count = 0  # type: ignore[attr-defined]
         self._server.inference_update_lock = threading.Lock()  # type: ignore[attr-defined]

@@ -1989,30 +1989,3 @@ class TestSessionTitleAndFlight:
                 srv2.stop()
         finally:
             server_state._flight_sessions.clear()
-
-
-class TestInferenceRegistryAlias:
-    """``active_streams`` became ``active_infers``; the old name must stay live.
-
-    That dict no longer tracks only SSE streams — a non-streaming
-    ``POST /v1/infer`` registers its cancel event there too — hence the rename.
-    Readers that still ask for ``active_streams`` use ``getattr(..., {})``, which
-    fails *silently* rather than loudly, so the alias has to be the very same
-    dict: a stale copy would hide running inferences from the setup page and let
-    a hot update race an active generation.
-    """
-
-    def test_both_names_address_the_same_registry(self, server):
-        infers = server._active_infers
-        assert infers is not None
-        assert server._server.active_infers is infers
-        assert server._server.active_streams is infers
-
-        ev = threading.Event()
-        infers["s1"] = ev
-        try:
-            assert server._server.active_streams.get("s1") is ev
-            infers.pop("s1")
-            assert "s1" not in server._server.active_streams
-        finally:
-            infers.pop("s1", None)
