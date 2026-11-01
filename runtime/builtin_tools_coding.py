@@ -814,29 +814,84 @@ class _PathValidator:
 
 
 
+# SWE-bench-Live: syntax-only YAML check.  Two things the previous
+# ``yaml.safe_load`` one-liner got wrong:
+#   * it rejected documents using application-specific short tags (CloudFormation
+#     ``!Ref``/``!Equals``, Ansible, Kubernetes shorthand) with ConstructorError,
+#     even though those documents parse fine;
+#   * it rejected multi-document streams (``---`` separated) with ComposerError.
+# Unknown tags are reduced to None here: the check keeps validating *syntax*
+# (which is all a post-edit guard should assert) without second-guessing the
+# application's tag vocabulary.
+_YAML_CHECK_SCRIPT = "\n".join((
+    "import sys",
+    "try:",
+    "    import yaml",
+    "except ImportError:",
+    "    raise SystemExit(0)  # parser absent: do not revert a valid edit",
+    "class _TagTolerantLoader(yaml.SafeLoader):",
+    "    pass",
+    "_TagTolerantLoader.add_multi_constructor('!', lambda loader, suffix, node: None)",
+    "try:",
+    "    with open(sys.argv[1], encoding='utf-8-sig') as _fh:",
+    "        list(yaml.load_all(_fh, Loader=_TagTolerantLoader))",
+    "except Exception as _exc:",
+        "    raise SystemExit('invalid YAML: %s' % getattr(_exc, 'problem', _exc))",
+))
+
+
+# SWE-bench-Live: use the interpreter that is actually running the agent
+# service.  Images
+# that ship only ``python3`` (no ``python`` on PATH) made every check below
+# raise FileNotFoundError, which the generic handler turned into a silent
+# pass -- the linter was a no-op in those images.
+_PY = sys.executable or "python"
+
 class _Linter:
     """Run a basic syntax check on a file after editing.
 
     The linter command is selected by file extension.  Unknown extensions
     always pass.  This class never raises an exception.
+
+    SWE-bench-Live: a check may only roll back an edit when it reports a
+    defect **in the edited file itself**.  A checker that is missing,
+    offline, or complaining about unrelated files is treated as a pass;
+    that used to revert correct edits.
     """
 
     # Map of file extension → command template (%s is replaced by the path)
     _COMMANDS: dict[str, list[str]] = {
-        ".py": ["python", "-m", "py_compile"],
+        ".py": [_PY, "-m", "py_compile"],
         ".js": ["node", "--check"],
         ".jsx": ["node", "--check"],
         ".ts": ["npx", "--yes", "tsc", "--noEmit", "--allowJs", "--checkJs"],
         ".tsx": ["npx", "--yes", "tsc", "--noEmit", "--allowJs", "--checkJs"],
-        ".json": ["python", "-c", "import sys,json; json.load(open(sys.argv[1]),'r')"],
-        ".yaml": ["python", "-c",
-                  "import sys; import importlib; yaml=importlib.import_module('yaml'); "
-                  "yaml.safe_load(open(sys.argv[1]))"],
-        ".yml": ["python", "-c",
-                 "import sys; import importlib; yaml=importlib.import_module('yaml'); "
-                 "yaml.safe_load(open(sys.argv[1]))"],
+        # SWE-bench-Live: json.load() takes a single positional fp argument.
+        # The previous form passed 'r' positionally, so EVERY .json edit
+        # failed with
+        # "TypeError: load() takes 1 positional argument but 2 were given"
+        # and was rolled back as LintFailed.  utf-8-sig keeps a leading BOM
+        # from turning an otherwise valid document into a parse error.
+        ".json": [_PY, "-c",
+                  "import sys, json\n"
+                  "try:\n"
+                  "    json.load(open(sys.argv[1], encoding='utf-8-sig'))\n"
+                  "except Exception as exc:\n"
+                  "    raise SystemExit('invalid JSON: %s' % exc)"],
+        ".yaml": [_PY, "-c", _YAML_CHECK_SCRIPT],
+        ".yml": [_PY, "-c", _YAML_CHECK_SCRIPT],
         ".sh": ["bash", "-n"],
     }
+
+    #: SWE-bench-Live: extensions whose checker reports project-wide state
+    #: rather than the edited file alone (``tsc --noEmit`` walks the whole
+    #: program).
+    _PROJECT_SCOPED = (".ts", ".tsx")
+
+    #: Shape of one tsc diagnostic: ``src/app.ts(12,5): error TS2304: ...``
+    _TS_DIAGNOSTIC_RE = re.compile(
+        r"^(?P<file>[^()\n]+)\((?P<line>\d+),(?P<col>\d+)\):\s+error\s+TS\d+:"
+    )
 
     def check(self, path: str) -> tuple[bool, str]:
         """Check *path* for syntax errors.
@@ -846,6 +901,12 @@ class _Linter:
         Never raises.
         """
         try:
+            # SWE-bench-Live: escape hatch, so a checker that an image does not
+            # ship can never be the reason a correct edit is reverted.
+            if os.environ.get("EDIT_LINT_ENABLED", "1").strip().lower() in (
+                "0", "false", "no", "off",
+            ):
+                return (True, "")
             ext = os.path.splitext(path)[1].lower()
             cmd_template = self._COMMANDS.get(ext)
             if cmd_template is None:
@@ -861,12 +922,67 @@ class _Linter:
             )
             if result.returncode == 0:
                 return (True, (result.stdout or "") + (result.stderr or ""))
-            return (False, ((result.stdout or "") + (result.stderr or "")).strip())
+            output = ((result.stdout or "") + (result.stderr or "")).strip()
+
+            # SWE-bench-Live: exit 127 means the checker binary itself is absent
+            # from the image.  That is a tooling gap, not a defect in the edit.
+            if result.returncode == 127:
+                logger.warning(
+                    "_Linter: checker unavailable for %s: %s", path, output[:300],
+                )
+                return (True, output)
+
+            if ext in self._PROJECT_SCOPED:
+                return self._judge_project_check(path, output)
+
+            return (False, output)
         except Exception as exc:
             # Never raise — treat unexpected errors as a pass so that the
             # linter doesn't block edits when the tool is unavailable.
             logger.warning("_Linter.check(%r) raised unexpectedly: %s", path, exc)
             return (True, "")
+
+    def _judge_project_check(self, path: str, output: str) -> tuple[bool, str]:
+        """Roll back only for diagnostics that name the edited file.
+
+        SWE-bench-Live: ``tsc --noEmit`` type-checks the whole program, so a
+        pre-existing error in ``node_modules`` or in a sibling module would
+        otherwise revert every edit made anywhere in the repository.
+        """
+        target = os.path.realpath(path)
+        target_name = os.path.basename(target)
+        relevant: list[str] = []
+        seen_diagnostic = False
+        for line in output.splitlines():
+            match = self._TS_DIAGNOSTIC_RE.match(line.strip())
+            if not match:
+                continue
+            seen_diagnostic = True
+            reported = match.group("file").strip()
+            candidate = (
+                reported if os.path.isabs(reported)
+                else os.path.join(os.path.dirname(target), reported)
+            )
+            if (
+                os.path.realpath(candidate) == target
+                or os.path.basename(os.path.normpath(reported)) == target_name
+            ):
+                relevant.append(line)
+
+        if not seen_diagnostic:
+            # Nothing parseable: the checker itself failed (offline npx, no
+            # tsc, unreadable tsconfig).  Never revert on that.
+            logger.warning(
+                "_Linter: project checker did not run for %s: %s", path, output[:400],
+            )
+            return (True, output)
+        if not relevant:
+            return (
+                True,
+                "project-wide diagnostics unrelated to this file were ignored: "
+                + output[:500],
+            )
+        return (False, "\n".join(relevant))
 
 
 # ---------------------------------------------------------------------------

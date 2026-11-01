@@ -108,6 +108,20 @@ def _read_lines(ws: Path, name: str):
     return (ws / name).read_text(encoding="utf-8").splitlines()
 
 
+def test_uniform_indent_shift_is_repaired(workspace):
+    # every line of old_str is one space deeper than the file
+    _write(workspace, "p.json", '{\n  "a": {\n    "b": 1\n  }\n}\n')
+    res = _json.loads(_edit_file(
+        "p.json", "search_replace",
+        old_str='   "a": {\n     "b": 1\n   }',
+        new_str='   "a": {\n     "b": 2\n   }',
+    ))
+    assert "error" not in res, res
+    assert res["indent_shift_applied"] == -1
+    # new_str was shifted by the same amount: relative structure preserved
+    assert _read_lines(workspace, "p.json") == ['{', '  "a": {', '    "b": 2', '  }', '}']
+
+
 def test_non_uniform_indent_mismatch_is_still_refused(workspace):
     _write(workspace, "p.py", "def f():\n    if x:\n        return 1\n")
     res = _json.loads(_edit_file(
@@ -145,6 +159,64 @@ def test_diff_preview_shape():
     assert out["diff_truncated"] is False
     assert "-b" in out["diff"] and "+c" in out["diff"]
     assert _diff_preview("a\n", "a\n", "f.txt") == {"diff": "", "diff_truncated": False}
+
+
+# ------------------------------------------------------------------- linter
+def _check(tmp_path, name, text):
+    path = tmp_path / name
+    path.write_text(text, encoding="utf-8")
+    return _Linter().check(str(path))
+
+
+def test_json_edits_are_not_reverted_by_a_broken_checker(tmp_path):
+    ok, out = _check(tmp_path, "a.json", '{"a": [1, 2], "b": null}')
+    assert ok, out
+    ok, out = _check(tmp_path, "bom.json", "\ufeff" + '{"a": 1}')
+    assert ok, out
+
+
+def test_invalid_json_still_fails(tmp_path):
+    ok, out = _check(tmp_path, "bad.json", '{"a": 1,}')
+    assert not ok and "invalid JSON" in out
+
+
+def test_cloudformation_yaml_tags_and_multi_document_pass(tmp_path):
+    ok, out = _check(tmp_path, "t.yaml",
+                     "Conditions:\n  IsProd: !Equals [!Ref Env, prod]\n"
+                     "Resources:\n  R: !Ref Foo\n")
+    assert ok, out
+    ok, out = _check(tmp_path, "m.yaml", "---\na: 1\n---\nb: !Custom x\n")
+    assert ok, out
+
+
+def test_yaml_syntax_error_still_fails(tmp_path):
+    ok, out = _check(tmp_path, "bad.yaml", "a: [1, 2\n")
+    assert not ok and "invalid YAML" in out
+
+
+def test_python_syntax_error_still_fails(tmp_path):
+    ok, out = _check(tmp_path, "bad.py", "def f():\nreturn 1\n")
+    assert not ok
+
+
+def test_project_wide_typecheck_does_not_revert_the_edit():
+    linter = _Linter()
+    out = ('node_modules/@rjsf/utils/lib/x.d.ts(1,8): error TS1259: unrelated\n'
+           'src/other.ts(3,1): error TS2304: pre-existing\n')
+    ok, msg = linter._judge_project_check("/repo/src/app.tsx", out)
+    assert ok and "ignored" in msg
+    ok, _ = linter._judge_project_check(
+        "/repo/src/app.tsx", "src/app.tsx(1,2): error TS2322: mine\n")
+    assert not ok
+    ok, _ = linter._judge_project_check(
+        "/repo/src/app.tsx", "npm ERR! code ENOTFOUND\n")
+    assert ok
+
+
+def test_linter_can_be_disabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("EDIT_LINT_ENABLED", "0")
+    ok, _ = _check(tmp_path, "bad.py", "def f():\nreturn 1\n")
+    assert ok
 
 
 # ------------------------------------------------------------- timeout guard
