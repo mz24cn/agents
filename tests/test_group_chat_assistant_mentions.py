@@ -32,12 +32,24 @@ from runtime.runtime import Runtime
 from runtime.group_chat import (
     _build_agent_system_messages,
     build_agents_markdown,
-    run_group_chat_stream,
     run_group_chat_stream_gen,
     parse_mentions,
     resolve_mentions,
     route_group_chat_user_message,
 )
+from runtime.server_state import merge_stream_messages
+
+
+def _merged_turns(**kwargs) -> list[Message]:
+    """Whole-turn view of one group-chat run.
+
+    Drives the production generator and then merges the streamed frames with the
+    same ``merge_stream_messages`` the HTTP handler runs before writing
+    conversation.json.  These assertions are about complete agent turns, and the
+    list-returning entry point that used to hand them over directly is gone.
+    """
+    turns, _stat = merge_stream_messages(list(run_group_chat_stream_gen(**kwargs)))
+    return turns
 
 
 class FakeTemplate:
@@ -697,7 +709,7 @@ def test_round2_with_persisted_conversation_turns_does_not_assume_dict(tmp_path)
         "我觉得有道理。",
     ])
 
-    collected = run_group_chat_stream(
+    collected = _merged_turns(
         runtime=runtime,
         mentioned_agent_ids=["SunWuKong"],
         all_agent_ids=["SunWuKong", "ShaWuJing", "ZhuBaJie"],
@@ -725,7 +737,7 @@ def test_assistant_mention_triggers_round2():
         "我觉得有道理。",          # ShaWuJing's round-2 reply
     ])
 
-    collected = run_group_chat_stream(
+    collected = _merged_turns(
         runtime=runtime,
         mentioned_agent_ids=["SunWuKong"],
         all_agent_ids=["SunWuKong", "ShaWuJing", "ZhuBaJie"],
@@ -757,7 +769,7 @@ def test_invalid_mention_in_assistant_reply_does_not_trigger():
         "没有 @ 任何人的普通回复",
     ])
 
-    collected = run_group_chat_stream(
+    collected = _merged_turns(
         runtime=runtime,
         mentioned_agent_ids=["SunWuKong"],
         all_agent_ids=["SunWuKong", "ShaWuJing", "ZhuBaJie"],
@@ -788,7 +800,7 @@ def test_round2_trigger_message_has_identity_prefix_not_user_prefix():
         "好的，我明白了。",
     ])
 
-    collected = run_group_chat_stream(
+    collected = _merged_turns(
         runtime=runtime,
         mentioned_agent_ids=["SunWuKong"],
         all_agent_ids=["SunWuKong", "ShaWuJing", "ZhuBaJie"],
@@ -821,7 +833,7 @@ def test_streamed_chunks_aggregated_before_mention_scan():
         ["有道理", "，我听你的。"],                      # ShaWuJing round 2
     ])
 
-    collected = run_group_chat_stream(
+    collected = _merged_turns(
         runtime=runtime,
         mentioned_agent_ids=["SunWuKong"],
         all_agent_ids=["SunWuKong", "ShaWuJing", "ZhuBaJie"],
@@ -866,7 +878,7 @@ def test_chain_trigger_across_three_rounds():
         "俺老猪觉得可以。",              # ZhuBaJie r3
     ])
 
-    collected = run_group_chat_stream(
+    collected = _merged_turns(
         runtime=runtime,
         mentioned_agent_ids=["SunWuKong"],
         all_agent_ids=["SunWuKong", "ShaWuJing", "ZhuBaJie"],
@@ -907,7 +919,7 @@ def test_round2_mention_of_already_processed_agent_no_loop():
         "@SunWuKong 我觉得不错。",
     ])
 
-    collected = run_group_chat_stream(
+    collected = _merged_turns(
         runtime=runtime,
         mentioned_agent_ids=["SunWuKong"],
         all_agent_ids=["SunWuKong", "ShaWuJing", "ZhuBaJie"],
@@ -975,7 +987,7 @@ def test_group_chat_waits_for_slow_agents_without_infer_round_deadline():
     runtime = SlowRuntime(sleep_s=0.15)
 
     start = time.monotonic()
-    collected = run_group_chat_stream(
+    collected = _merged_turns(
         runtime=runtime,
         mentioned_agent_ids=["SunWuKong", "ShaWuJing"],
         all_agent_ids=["SunWuKong", "ShaWuJing", "ZhuBaJie"],  # N = 3
@@ -1015,7 +1027,7 @@ def test_group_chat_sse_heartbeat_during_long_wait(monkeypatch):
     runtime = SlowRuntime(sleep_s=0.2)
     heartbeats: list[float] = []
 
-    collected = run_group_chat_stream(
+    collected = _merged_turns(
         runtime=runtime,
         mentioned_agent_ids=["SunWuKong", "ShaWuJing"],
         all_agent_ids=["SunWuKong", "ShaWuJing", "ZhuBaJie"],  # N = 3

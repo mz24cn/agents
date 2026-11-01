@@ -14,11 +14,14 @@ Design:
     resolve_mentions()   — map mention strings to agent_ids
     assemble_agent_context() — build per-agent inference context with
                                 delayed-visibility markers
-    run_group_chat_stream()  — parallel multi-agent orchestration (returns list)
-    run_group_chat_stream_gen()  — generator version of the above (yields messages)
+    run_group_chat_stream_gen()  — parallel multi-agent orchestration; yields
+                                   every Message as it becomes available
 
-The generator version (run_group_chat_stream_gen) is the future; the list
-version is kept for backward compatibility during the transition.
+The generator is the only entry point: the caller (``_handle_infer_stream``)
+writes the SSE frames and persists merged turns, for the streaming endpoint and
+for the buffered ``POST /v1/infer`` alike.  A test or script that wants the
+finished turns calls ``merge_stream_messages(list(gen))`` — the same merge the
+handler runs before writing conversation.json.
 """
 
 from __future__ import annotations
@@ -658,89 +661,6 @@ def assemble_agent_context(
 
 
 # ---------------------------------------------------------------------------
-# Multi-agent parallel orchestration (list version — DEPRECATED)
-# ---------------------------------------------------------------------------
-
-# Keep the original run_group_chat_stream for backward compatibility until
-# run_group_chat_stream_gen is proven in production.
-# The generator version below is the future; this list version remains
-# available during transition and is used by the non-streaming handler path.
-
-
-def run_group_chat_stream(
-    *,
-    runtime,
-    mentioned_agent_ids: list[str],
-    all_agent_ids: list[str],
-    original_messages: list[Message],
-    base_request: InferenceRequest,
-    cancel_event,
-    sse_callback,
-    sse_heartbeat=None,
-    context_manager,
-    session_id: str,
-    agent_manager,
-    model_id: str,
-    tool_ids: list[str],
-    max_rounds: int = 5,
-) -> list[Message]:
-    """Execute one round of group chat inference (returns list of Messages).
-
-    DEPRECATED: Prefer run_group_chat_stream_gen() which behaves as a
-    generator and supports incremental persistence. This list version is
-    kept for the non-streaming handler path during the transition period.
-
-    Called from ``_handle_infer`` (non-streaming) when group-chat routing is
-    active, and from ``_handle_infer_stream`` as the legacy path.
-
-    Parameters:
-        runtime: Runtime instance for model inference.
-        mentioned_agent_ids: Agent IDs that should respond this round.
-        all_agent_ids: All AI agent IDs participating in this group chat.
-            The user is never included (used to build the AGENTS markdown table).
-        original_messages: Raw new messages from the request (no system prompt).
-        base_request: The InferenceRequest built by ``_prepare_infer_request``
-            (used as template for per-agent requests).
-        cancel_event: threading.Event for abort.
-        sse_callback: SSE write callback (frame dict → writes to client).
-        sse_heartbeat: optional zero-argument callback emitting an SSE
-            keep-alive comment frame while waiting on slow agents, so
-            long-idle streams are not dropped by gateways/proxies.
-        context_manager: ContextManager for loading conversation history.
-        session_id: Group chat session ID.
-        agent_manager: AgentManager for resolving agent configs.
-        model_id: Default model ID (may be overridden per agent).
-        tool_ids: Default tool IDs (may be overridden per agent).
-
-    Returns:
-        Collected Message objects from all agents, already tagged with
-        ``agent_id`` and ``name``.
-    """
-    # Delegate to the generator version and consume it into a list.
-    gen = _run_group_chat_stream_gen(
-        runtime=runtime,
-        mentioned_agent_ids=mentioned_agent_ids,
-        all_agent_ids=all_agent_ids,
-        original_messages=original_messages,
-        base_request=base_request,
-        cancel_event=cancel_event,
-        sse_callback=sse_callback,
-        sse_heartbeat=sse_heartbeat,
-        context_manager=context_manager,
-        session_id=session_id,
-        agent_manager=agent_manager,
-        model_id=model_id,
-        tool_ids=tool_ids,
-        max_rounds=max_rounds,
-        stream_chunks=False,
-    )
-    collected: list[Message] = []
-    for msg in gen:
-        collected.append(msg)
-    return collected
-
-
-# ---------------------------------------------------------------------------
 # Public generator interface (the unified future path)
 # ---------------------------------------------------------------------------
 
@@ -764,12 +684,14 @@ def run_group_chat_stream_gen(
     interject_gate=None,
     close_gate=None,
 ) -> Generator[Message, None, None]:
-    """Generator version of group chat inference.
+    """Group-chat inference as a generator of Messages.
 
-    Unlike the list-returning ``run_group_chat_stream``, this function
-    yields Messages incrementally as they are produced by each agent's
+    Yields Messages incrementally as they are produced by each agent's
     ``infer_stream``.  The caller (handler) can do unified SSE writing
-    and incremental persistence without needing callback/notification.
+    and incremental persistence without needing callback/notification; a
+    caller that wants whole turns instead merges the frames afterwards
+    (``merge_stream_messages``) exactly as the handler does before writing
+    conversation.json.
 
     Args:
         sse_callback: Optional callback retained for self-managing tools such
@@ -823,18 +745,14 @@ def _run_group_chat_stream_gen(
     model_id: str,
     tool_ids: list[str],
     max_rounds: int = 5,
-    stream_chunks: bool = True,
     interject_gate=None,
     close_gate=None,
 ) -> Generator[Message, None, None]:
     """Execute group chat inference as a generator of Messages.
 
-    Generator version of ``run_group_chat_stream``. Yields each Message as
-    it becomes available from the parallel agent runners, allowing the
-    caller (handler) to do unified SSE writing and incremental persistence
-    without needing a callback.
-
-    Parameters (same as ``run_group_chat_stream``):
+    Yields each Message as it becomes available from the parallel agent
+    runners, allowing the caller (handler) to do unified SSE writing and
+    incremental persistence without needing a callback.
 
     Yields:
         Message objects as they are produced by each agent's infer_stream.
@@ -1118,6 +1036,14 @@ def _run_group_chat_stream_gen(
                             parsed, agent_manager, all_agent_ids)
                         if resolved:
                             full.mentions = resolved
+                            # The chunks this turn was merged from have already
+                            # been yielded to the caller, and the caller persists
+                            # *those* frames: merge_stream_messages lets the last
+                            # assistant chunk carrying mentions win, so stamping
+                            # the resolved list here is what keeps a mention that
+                            # spanned two chunks in conversation.json.
+                            if asst_buf:
+                                asst_buf[-1].mentions = resolved
                 collected.append(full)
                 asst_buf.clear()
 
@@ -1140,16 +1066,14 @@ def _run_group_chat_stream_gen(
                             # re-rolled: nothing it streamed may become this
                             # agent's turn.
                             asst_buf.clear()
-                            if stream_chunks:
-                                yield msg
+                            yield msg
                             continue
                         msg.name = nickname
                         asst_buf.append(msg)
                     else:
                         _flush_asst(collected)
                         collected.append(msg)
-                    if stream_chunks:
-                        yield msg
+                    yield msg
             except Exception as exc:
                 _logger.error("agent %s inference failed: %s", agent_id, exc)
                 error_msg = Message(
@@ -1159,8 +1083,7 @@ def _run_group_chat_stream_gen(
                     name=nickname,
                 )
                 collected.append(error_msg)
-                if stream_chunks:
-                    yield error_msg
+                yield error_msg
                 asst_buf.clear()
 
             _flush_asst(collected)
@@ -1197,11 +1120,6 @@ def _run_group_chat_stream_gen(
                 for aid in (msg.mentions or []):
                     if aid not in processed_agent_ids:
                         next_trigger_msgs.setdefault(aid, []).append(msg)
-
-            # The legacy list-returning API expects complete, merged turns;
-            # the streaming API instead yields raw deltas above.
-            if not stream_chunks:
-                yield from collected
 
         # --- parallel execution for this round ----------------------------
         round_collected: list[Message] = []
