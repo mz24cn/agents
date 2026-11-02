@@ -1421,6 +1421,44 @@ def _disarm_unobserved_cancel_locked(stream: dict) -> None:
             pass
 
 
+def _frame_channel_is_live(conn_id) -> bool:
+    """Is that tab's shared frame channel connected right now?
+
+    Deliberately read without ``_frame_channels_lock``: callers hold
+    ``_session_stream_lock``, and taking the channel lock here would invert the
+    order ``_drop_frame_channel_locked`` takes (channels -> sessions), i.e. a
+    deadlock risk. A stale read is benign in both directions: a channel that is
+    really going away is dropped within ``FRAME_CHANNEL_GRACE_S``, which re-runs
+    this decision, and a channel that just re-attached rescues the generation.
+    """
+    if not conn_id:
+        return False
+    channel = _frame_channels.get(conn_id)
+    return bool(channel and channel.get("connected"))
+
+
+def note_session_watched_by(session_id: str, conn_id: str) -> None:
+    """Remember which tab watched this generation (per-tab liveness).
+
+    A tab that stops routing *one* session while its channel stays connected has
+    not abandoned the inference: in the chat UI, closing that conversation (or a
+    page teardown) unsubscribes exactly one session. The channel going away is
+    the signal that the browser left, so ``_drop_frame_channel_locked`` re-runs
+    the unobserved check for the generations this tab had watched.
+    """
+    with _session_stream_lock:
+        stream = _session_streams.get(session_id)
+        if stream is not None:
+            stream["watched_by"] = conn_id
+
+
+def _cancel_unobserved_streams_of_conn_locked(conn_id: str) -> None:
+    """Re-check generations whose last watcher was this (now gone) tab."""
+    for session_id, stream in list(_session_streams.items()):
+        if stream.get("watched_by") == conn_id:
+            _cancel_unobserved_stream_locked(session_id, stream, reason="tab_left")
+
+
 def _resolve_unobserved_cancel(session_id: str, cancel_event, reason: str) -> None:
     """Cancel after the grace window, unless an observer came back meanwhile."""
     with _session_stream_lock:
@@ -1430,6 +1468,8 @@ def _resolve_unobserved_cancel(session_id: str, cancel_event, reason: str) -> No
         stream["unobserved_timer"] = None
         if stream["done"] or session_id in _flight_sessions:
             return
+        if _frame_channel_is_live(stream.get("watched_by")):
+            return                      # the tab is still there, only unwatched it
         if stream["starter_connected"] or stream["subscribers"]:
             logging.getLogger("runtime.server").info(
                 "session_stream unobserved_grace_rescued sid=%s reason=%s "
@@ -1460,6 +1500,13 @@ def _cancel_unobserved_stream_locked(session_id: str, stream: dict,
     if stream["done"] or session_id in _flight_sessions:
         return False
     if stream["starter_connected"] or stream["subscribers"]:
+        return False
+    if _frame_channel_is_live(stream.get("watched_by")):
+        # The tab that watched this generation is still connected with its shared
+        # frame channel; it merely stopped routing this session (closing that
+        # conversation unsubscribes it). The user is one click away from resuming
+        # the stream, so this generation is not abandoned: the cancellation runs
+        # when that channel is dropped instead.
         return False
     cancel_event = stream.get("cancel_event")
     if cancel_event is None:
@@ -2101,7 +2148,13 @@ def register_session_stream_with_snapshot(session_id: str, send_fn, after_seq: i
 # Channel ``send_fn``s are only ever invoked by the broker *outside*
 # ``_session_stream_lock``, so they can safely take this lock.
 
-FRAME_CHANNEL_GRACE_S = 15.0
+# A detached channel keeps its per-session subscriptions for this long, so a tab
+# that is merely reconnecting (or throttled because it is in the background, where
+# a 1s timer can be delayed to a minute) does not lose the inferences it watches.
+# The cost of the window is memory plus an inference that outlives a dead tab by
+# up to this long; the cost of a short one is a cancelled run the user never
+# aborted. Overridable for deployments that want the GPU back sooner.
+FRAME_CHANNEL_GRACE_S = 60.0
 FRAME_CHANNEL_QUEUE_MAXSIZE = 8192
 FRAME_CHANNEL_MAX = 64
 
@@ -2172,6 +2225,16 @@ def _new_frame_channel_locked(conn_id: str) -> dict:
     return channel
 
 
+def _frame_channel_grace_s() -> float:
+    raw = os.environ.get("SESSION_FRAME_CHANNEL_GRACE_S", "")
+    if not raw.strip():
+        return FRAME_CHANNEL_GRACE_S
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return FRAME_CHANNEL_GRACE_S
+
+
 def _arm_frame_channel_grace(conn_id: str, generation: int) -> None:
     """Schedule teardown of a detached channel unless it re-attaches."""
     channel = _frame_channels.get(conn_id)
@@ -2191,7 +2254,7 @@ def _arm_frame_channel_grace(conn_id: str, generation: int) -> None:
                 return
             _drop_frame_channel_locked(conn_id, current)
 
-    timer = threading.Timer(FRAME_CHANNEL_GRACE_S, _expire)
+    timer = threading.Timer(_frame_channel_grace_s(), _expire)
     timer.daemon = True
     channel["grace_timer"] = timer
     timer.start()
@@ -2203,6 +2266,10 @@ def _drop_frame_channel_locked(conn_id: str, channel: dict) -> None:
     if timer is not None:
         timer.cancel()
         channel["grace_timer"] = None
+    # Before any subscription is released: the tab being gone is exactly what the
+    # per-tab liveness check must stop rescuing, and releasing subscriptions is
+    # what re-runs that check.
+    channel["connected"] = False
     released = sorted(channel["sessions"])
     for session_id, send_fn in list(channel["sessions"].items()):
         channel["sessions"].pop(session_id, None)
@@ -2212,6 +2279,10 @@ def _drop_frame_channel_locked(conn_id: str, channel: dict) -> None:
             pass
     if _frame_channels.get(conn_id) is channel:
         _frame_channels.pop(conn_id, None)
+    # Generations this tab had already unsubscribed hold no observer at all, so
+    # nothing else would re-evaluate them: this tab leaving is their signal.
+    with _session_stream_lock:
+        _cancel_unobserved_streams_of_conn_locked(conn_id)
     if released:
         # Without this line a dropped channel is invisible in the log, and its
         # released subscriptions look like a spontaneous inference cancellation.
@@ -2316,6 +2387,8 @@ def frame_channel_subscribe(conn_id: str, session_id: str, after_seq: int = -1) 
 
     send_fn = _make_frame_channel_send_fn(channel, session_id)
     registered, snapshot = register_session_stream_with_snapshot(session_id, send_fn, after_seq)
+    if registered:
+        note_session_watched_by(session_id, conn_id)
     with _frame_channels_lock:
         current = _frame_channels.get(conn_id)
         if current is not channel:
@@ -2358,8 +2431,14 @@ def frame_channel_unsubscribe(conn_id: str, session_id: str) -> bool:
             return False
         send_fn = channel["sessions"].pop(session_id, None)
         channel["last_seen"] = time.monotonic()
+        still_watched = session_id in channel["sessions"]
     if send_fn is None:
         return False
+    if not still_watched:
+        # The tab is still connected, so record it as the last watcher: the
+        # generation gets cancelled when the tab goes, not when this one session
+        # stops being routed (closing that conversation does exactly that).
+        note_session_watched_by(session_id, conn_id)
     unsubscribe_session_stream(session_id, send_fn)
     return True
 

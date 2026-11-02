@@ -166,6 +166,27 @@ B 之后：`1 (hub) + 1 (frames) + T`。N=10 也不涨。
   完整交接；`test_zero_grace_restores_the_legacy_interruption` 锁住"0 宽限 = 旧行为"，
   保证这组用例真的能抓到这个回归。
 
+### 第二个回归：会话切到后台就被取消
+
+症状：非飞行模式下，推理中的会话一旦切走（打开别的会话）就必然
+`Error: user interrupted.`。不是有意为之——`App.svelte` 的注释写着页面切换"不影响流式推理"。
+
+链路：会话切到后台时该会话在帧通道上的订阅被释放（`POST /v1/sessions/frames/unsubscribe`）。
+B 之后 starter POST 早已交接并释放，这一退订让 generation 的观察者归零 → 宽限到点 → 取消
+（日志：`session_stream CANCELLED sid=... reason=last_subscriber_left`）。
+即"取消无人观看"的规则把**会话级**退订误读成**浏览器级**离开。
+
+修的是判定粒度：观察者归零后先问"最后观看它的 tab 还连着吗"
+（`note_session_watched_by` 记录 conn，`_frame_channel_is_live` 查通道 `connected`）：
+
+- tab 的帧通道仍在 → 不取消；用户点一下就回来。取消改由该通道被丢弃时触发
+  （`_drop_frame_channel_locked` 对该 conn 看过的 generation 重新判定，reason=`tab_left`）。
+- tab 真走了（关页/跳转/断线超过 `FRAME_CHANNEL_GRACE_S`）→ 照旧进入宽限期后取消。
+- 从不曾有人观看、也没有通道的推理（第三方 API 客户端）→ 照旧立即取消，规则未被削弱。
+
+回归：`tests/test_frame_channel.py::test_closing_a_conversation_does_not_cancel_its_running_inference`
+（切走 → 跨过宽限期不取消、帧仍可补放 → 回来重新订阅 → 关通道才取消）。
+
 实测（`/tmp/probe_b_ledger.py`，客户端模拟 Chrome 的 6 连接/origin 池）：
 
 | 场景 | tab 持有 socket | `/v1/models` 延迟 | 帧完整性 |

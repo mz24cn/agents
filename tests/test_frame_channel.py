@@ -175,6 +175,48 @@ def test_reattached_channel_rescues_a_pending_cancellation():
         assert not cancel_event.is_set()
 
 
+def test_closing_a_conversation_does_not_cancel_its_running_inference():
+    """Unsubscribing one session must not abandon it while its tab stays open.
+
+    Reported regression: a streaming session that goes to the background (the
+    user opens another conversation) gets its frame-channel subscription
+    released, and with the initiating POST already handed off that left the
+    generation with no observer at all. It was then cancelled as if the user had
+    pressed Stop - "Error: user interrupted." on an inference nobody aborted.
+    The tab is still connected, so the tab going away is the abandonment signal.
+    """
+    with patch.dict(os.environ, {"SESSION_UNOBSERVED_GRACE_S": "0.05"}):
+        cancel_event = threading.Event()
+        server_state.begin_session_stream("session-1", cancel_event)
+        server_state.attach_frame_channel("tab-a")
+        assert server_state.frame_channel_subscribe("tab-a", "session-1")[0] is True
+        # The initiating POST handed the session over and released itself.
+        assert server_state.disconnect_session_stream_starter("session-1") is False
+
+        # The user opens another conversation in the same tab.
+        assert server_state.frame_channel_unsubscribe("tab-a", "session-1") is True
+        threading.Event().wait(0.3)               # several times the grace window
+        assert not cancel_event.is_set()
+
+        # The generation keeps running, and keeps its frames for the next visit.
+        server_state.publish_session_stream_frame(
+            "session-1", {"role": "assistant", "delta": "still working"})
+        snapshot = server_state.get_session_stream_snapshot("session-1")
+        assert snapshot["active"] is True
+        assert [item["frame"]["delta"] for item in snapshot["frames"]] == ["still working"]
+
+        # Going back to the conversation re-watches it on the same channel.
+        assert server_state.frame_channel_subscribe("tab-a", "session-1")[0] is True
+        threading.Event().wait(0.3)
+        assert not cancel_event.is_set()
+
+        # Only a tab that is really gone releases the inference.
+        assert server_state.close_frame_channel("tab-a") is True
+        deadline = threading.Event()
+        deadline.wait(0.3)
+        assert cancel_event.is_set()
+
+
 def test_reattach_discards_stale_queue_and_replays_from_cursor():
     server_state.begin_session_stream("session-1", threading.Event())
     server_state.frame_channel_subscribe("tab-a", "session-1")
