@@ -468,17 +468,36 @@ _TOOL_ABORT_HOOKS: dict[str, "object"] = {}
 
 
 def register_tool_abort_hook(tool_name: str, hook) -> None:
-    """Register ``hook(session_id)`` to stop a tool call that exceeded its cap."""
-    _TOOL_ABORT_HOOKS[tool_name] = hook
+    """Register a hook to stop the work behind a call the guard abandoned.
 
-
-def _abort_timed_out_tool(tool_name: str, session_id: Optional[str]) -> bool:
-    """Ask a tool to terminate the work behind a call the guard has abandoned."""
-    hook = _TOOL_ABORT_HOOKS.get(tool_name)
-    if hook is None or not session_id:
-        return False
+    ``hook(session_id)`` is the required shape; a hook may additionally accept
+    a ``tool_use_id`` keyword to stop only the timed-out call instead of every
+    call that session has in flight (see exec_cli, which drives one shared
+    terminal).
+    """
     try:
-        hook(session_id)
+        import inspect
+        takes_tool_use_id = "tool_use_id" in inspect.signature(hook).parameters
+    except (TypeError, ValueError):  # builtins / C callables
+        takes_tool_use_id = False
+    _TOOL_ABORT_HOOKS[tool_name] = (hook, takes_tool_use_id)
+
+
+def _abort_timed_out_tool(
+    tool_name: str,
+    session_id: Optional[str],
+    tool_use_id: Optional[str] = None,
+) -> bool:
+    """Ask a tool to terminate the work behind a call the guard has abandoned."""
+    entry = _TOOL_ABORT_HOOKS.get(tool_name)
+    if entry is None or not session_id:
+        return False
+    hook, takes_tool_use_id = entry
+    try:
+        if takes_tool_use_id:
+            hook(session_id, tool_use_id=tool_use_id or "")
+        else:
+            hook(session_id)
         return True
     except Exception as exc:  # never let cleanup break the inference loop
         _logger.warning("abort hook for %r failed: %s", tool_name, exc)
@@ -2240,10 +2259,27 @@ class Runtime:
                 }
                 for index in expired:
                     pending.remove(index)
+                    (
+                        _ex_index, _ex_name, _ex_args, ex_tool_use_id,
+                        ex_tool_config, _ex_notes, _ex_fn,
+                        ex_ctx, ex_timeout,
+                    ) = specs[index]
+                    # Same contract as the single-call path: the worker is
+                    # abandoned, not cancelled, so ask the tool to stop the
+                    # work it started.  An exec_cli collector left polling the
+                    # session's terminal would otherwise keep consuming output
+                    # and starve every later exec_cli call of that session.
+                    aborted = _abort_timed_out_tool(
+                        ex_tool_config.name,
+                        (ex_ctx or {}).get("session_id"),
+                        tool_use_id=ex_tool_use_id,
+                    )
                     _finalize(
                         index,
-                        f"Error: tool '{specs[index][4].name}' timed out "
-                        f"after {specs[index][-1]:g}s",
+                        f"Error: tool '{ex_tool_config.name}' timed out "
+                        f"after {ex_timeout:g}s"
+                        + ("" if aborted else "; the tool could not be "
+                                      "interrupted and may still be running"),
                     )
                 yield from _yield_ready_in_order()
 
@@ -2472,6 +2508,7 @@ class Runtime:
             # told it timed out.
             aborted = _abort_timed_out_tool(
                 tool_config.name, caller_ctx.get("session_id"),
+                tool_use_id=caller_ctx.get("tool_use_id"),
             )
             return (f"Error: tool '{tool_config.name}' timed out "
                     f"after {timeout:g}s"

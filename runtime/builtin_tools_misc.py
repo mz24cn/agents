@@ -19,6 +19,7 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 import urllib.error
@@ -59,8 +60,12 @@ def _exec_cli(
     - read_after_delay: milliseconds to read before returning regardless of output.
 
     An empty command reads the latest terminal progress without sending input.
-    There is no internal hard cap: the TOOL_EXEC_TIMEOUT guard is the single
-    safety net bounding how long the caller waits for this tool call.
+    There is no internal hard cap: the bound is the ``timeout`` asked for here
+    (which the runtime uses to extend the tool call's deadline) plus the
+    TOOL_EXEC_TIMEOUT guard.  One terminal drives one command, so a call that
+    arrives while the terminal is busy waits its turn instead of running
+    concurrently -- its output is then collected on its own, not mixed with
+    (or consumed by) the command that was already running.
     """
     session_id = get_request_context("session_id")
     if session_id:
@@ -165,7 +170,9 @@ CLI_TOOL_CONFIG = ToolConfig(
         "Execute input in a persistent terminal session and return observed screen output. "
         "Completion is driven by prompt_pattern, timeout, and read_after_delay; "
         "the first satisfied condition returns. Time values are in milliseconds. "
-        "A larger timeout also extends how long this tool call may run."
+        "A larger timeout also extends how long this tool call may run. "
+        "The terminal drives one command at a time: a call issued while another "
+        "command is still running waits for its turn."
     ),
     parameters={
         "type": "object",
@@ -235,13 +242,202 @@ FETCH_TOOL_CONFIG = ToolConfig(
     },
     builtin=True,
 )
+# ---------------------------------------------------------------------------
+# Terminal output access: cursors, never draining
+# ---------------------------------------------------------------------------
+# The terminal's single PTY reader appends every chunk into
+# ``terminal_info["output_buffer"]`` (runtime.server_state).  Reading must
+# never consume what a *different* concurrent exec_cli call has not collected
+# yet, so each reader keeps a cursor (an absolute chunk sequence) and takes
+# only what was appended after it.
+
+def _take_terminal_output(terminal_info: dict, cursor: int) -> tuple[str, int]:
+    """Chunks appended after *cursor*, plus the updated cursor."""
+    from runtime.server_state import take_terminal_output
+    return take_terminal_output(terminal_info, cursor)
+
+
+def _terminal_buffer_end(terminal_info: dict) -> int:
+    """Cursor just past the last chunk buffered right now."""
+    from runtime.server_state import terminal_buffer_end
+    return terminal_buffer_end(terminal_info)
+
+
 def _drain_terminal_buffer(terminal_info: dict) -> str:
-    with terminal_info["buffer_lock"]:
-        if not terminal_info["output_buffer"]:
-            return ""
-        chunk = "".join(terminal_info["output_buffer"])
-        terminal_info["output_buffer"].clear()
-        return chunk
+    """Text new since the last *progress* read (no command was sent).
+
+    Used by the empty-command "what is the terminal showing" read and when
+    picking up what a previous call left behind.  It advances the terminal's
+    own ``read_seq`` cursor instead of clearing the shared buffer, so a call
+    that is still collecting keeps every byte inside its own cursor range.
+    """
+    cursor = terminal_info.get("read_seq", 0)
+    text, new_cursor = _take_terminal_output(terminal_info, cursor)
+    terminal_info["read_seq"] = new_cursor
+    return text
+
+
+# ---------------------------------------------------------------------------
+# One terminal, one command: FIFO queue + cancellation of in-flight calls
+# ---------------------------------------------------------------------------
+
+class _TerminalQueue:
+    """FIFO gate serialising exec_cli calls on one persistent terminal.
+
+    A PTY shell drives a single foreground command, and its screen output
+    cannot be attributed to a call after the fact, so calls that arrive while
+    the terminal is busy wait their turn instead of writing into it -- that
+    interleaving is what made one call return another call's output and left
+    the other waiting for bytes that had already been consumed.
+
+    A waiter that gets aborted gives its turn up (``_cancelled``), so an
+    abandoned call can never stall the queue behind it.
+    """
+
+    def __init__(self):
+        self._cond = threading.Condition()
+        self._next_ticket = 0
+        self._serving = 0
+        self._cancelled: set[int] = set()
+        self._owner = None
+        self._owner_ticket = -1
+        self._owner_started = None
+        self._waiting = 0
+
+    def acquire(self, state: dict, cancel_event: threading.Event) -> bool:
+        """Wait for this call's turn; True once the terminal is ours."""
+        with self._cond:
+            ticket = self._next_ticket
+            self._next_ticket += 1
+            self._waiting += 1
+            try:
+                while True:
+                    if cancel_event.is_set():
+                        self._cancelled.add(ticket)
+                        if self._serving == ticket:
+                            self._advance_locked()
+                        return False
+                    if self._serving == ticket:
+                        self._owner = state
+                        self._owner_ticket = ticket
+                        self._owner_started = time.monotonic()
+                        state["started_at"] = self._owner_started
+                        return True
+                    self._cond.wait(0.2)
+            finally:
+                self._waiting -= 1
+
+    def release(self, state: dict) -> None:
+        with self._cond:
+            if self._owner is not state:
+                return
+            self._owner = None
+            self._owner_started = None
+            if self._serving == self._owner_ticket:
+                self._advance_locked()
+
+    def _advance_locked(self) -> None:
+        self._serving += 1
+        while self._serving in self._cancelled:
+            self._cancelled.discard(self._serving)
+            self._serving += 1
+        self._cond.notify_all()
+
+    def busy(self) -> bool:
+        with self._cond:
+            return self._owner is not None
+
+    def status(self) -> dict:
+        with self._cond:
+            return {
+                "busy": self._owner is not None,
+                "command": self._owner.get("command") if self._owner else "",
+                "held_for": (
+                    time.monotonic() - self._owner_started
+                    if self._owner_started is not None else 0.0),
+                "waiting": self._waiting,
+            }
+
+
+_terminal_state_init_lock = threading.Lock()
+
+
+def _terminal_queue(terminal_info: dict) -> _TerminalQueue:
+    """The terminal's FIFO gate, created on first use (fake terminals work)."""
+    queue = terminal_info.get("command_queue")
+    if queue is None:
+        with _terminal_state_init_lock:
+            queue = terminal_info.get("command_queue")
+            if queue is None:
+                queue = _TerminalQueue()
+                terminal_info["command_queue"] = queue
+    return queue
+
+
+def _register_cli_call(terminal_info: dict, state: dict) -> None:
+    """Track an in-flight exec_cli call so it can be interrupted."""
+    terminal_info.setdefault("cli_calls", []).append(state)
+
+
+def _unregister_cli_call(terminal_info: dict, state: dict) -> None:
+    calls = terminal_info.get("cli_calls") or []
+    for index, item in enumerate(calls):
+        if item is state:                    # identity: never drop a sibling
+            del calls[index]
+            break
+
+
+def _interrupt_terminal(terminal_info: dict) -> None:
+    """Send Ctrl-C so the shell (and whatever runs in it) actually stops."""
+    try:
+        if sys.platform == "win32":
+            proc = terminal_info.get("proc")
+            if proc:
+                proc.write("\x03")
+        else:
+            master_fd = terminal_info.get("master_fd")
+            if master_fd:
+                os.write(master_fd, b"\x03")
+    except Exception as exc:
+        logger.debug("exec_cli interrupt failed: %s", exc)
+
+
+def cancel_running_command(session_id: str, tool_use_id: str = "") -> bool:
+    """Interrupt the exec_cli call(s) still in flight on a session's terminal.
+
+    Abort hook for the runtime: called with the timed-out call's
+    ``tool_use_id`` when a single call exceeded its cap, or without one on a
+    user abort, which stops every call of that session.  The collector loops
+    notice the event and return the output they already have, and Ctrl-C frees
+    the shell so the next call does not inherit a running command's output.
+
+    Without this, a call the guard abandoned kept draining the terminal on its
+    daemon thread and starved every later exec_cli call in the session.
+    """
+    from runtime.server import get_terminal_for_session
+
+    terminal_info = get_terminal_for_session(session_id)
+    if not terminal_info:
+        return False
+    cancelled = False
+    running_cancelled = False
+    for state in list(terminal_info.get("cli_calls") or []):
+        # A tool_use_id targets one call; without one every in-flight call of
+        # the session is stopped.  A call that carries no tool_use_id (context
+        # without one, e.g. a remote child host) can therefore only be stopped
+        # by an untargeted cancel -- that keeps a sibling call's output intact.
+        if tool_use_id and state.get("tool_use_id") != tool_use_id:
+            continue
+        state["cancel"].set()
+        cancelled = True
+        # Ctrl-C only belongs to the terminal when the cancelled call is the
+        # one driving it; interrupting on behalf of a call that is still
+        # queued would kill an innocent command.
+        if state.get("started_at") is not None:
+            running_cancelled = True
+    if running_cancelled:
+        _interrupt_terminal(terminal_info)
+    return cancelled
 
 
 def _strip_terminal_noise(text: str, command: str) -> str:
@@ -261,9 +457,14 @@ _PROMPT_MARKER_RE = re.compile(r"([\w.-]+)@([\w.-]+)")
 
 
 def _read_terminal_buffer(terminal_info: dict) -> str:
-    """Read the terminal output buffer without draining it."""
-    with terminal_info["buffer_lock"]:
-        return "".join(terminal_info.get("output_buffer") or [])
+    """Read what the terminal screen shows, without consuming anything.
+
+    Only the tail of the buffer is joined: prompt derivation looks at the
+    newest lines, and the buffer is no longer cleared by readers, so joining
+    all of it every call would be needlessly expensive.
+    """
+    from runtime.server_state import read_terminal_tail
+    return read_terminal_tail(terminal_info)
 
 
 def _find_prompt_marker(visible_text: str) -> str:
@@ -299,6 +500,12 @@ def _derive_prompt_pattern(terminal_info: dict, max_wait_ms: int = 1500) -> str:
     cached = terminal_info.get("prompt_pattern")
     if cached is not None:
         return cached
+    if _terminal_queue(terminal_info).busy():
+        # Another call is mid-command, so the screen currently shows partial
+        # command output.  Deriving from it could cache "this shell has no
+        # prompt marker" for the whole session and leave every later call
+        # without a precise completion signal; reuse what is known instead.
+        return ""
     try:
         deadline = time.monotonic() + max(100, max_wait_ms) / 1000.0
         no_marker_streak = 0
@@ -337,9 +544,14 @@ def execute_command_in_terminal(
 
     ``timeout`` is the idle window in milliseconds: collection returns once
     no new output has been observed for that long (0 disables idle
-    completion).  There is deliberately no internal hard cap here -- the
-    runtime's TOOL_EXEC_TIMEOUT guard is the single safety net bounding how
-    long the caller waits for this tool call.
+    completion).  There is deliberately no internal hard cap here: the bound
+    is the ``timeout`` the caller asks for, extended by the runtime guard that
+    waits for this tool call.
+
+    One terminal drives one command.  A call that arrives while the terminal
+    is busy queues (FIFO) instead of writing into it, and every call collects
+    only the chunks appended after its own cursor -- concurrent calls can no
+    longer interleave their screen output or consume each other's bytes.
     """
     from runtime.server import get_terminal_for_session
 
@@ -379,18 +591,6 @@ def execute_command_in_terminal(
     read_after_delay_seconds = max(0.0, read_after_delay_value / 1000.0)
     check_interval = env_float("OUTPUT_CHECK_INTERVAL", 0.05)
 
-    if command:
-        with terminal_info["buffer_lock"]:
-            terminal_info["output_buffer"].clear()
-
-        try:
-            write_method(command)
-        except Exception as e:
-            return f"Error writing to terminal: {e}"
-
-    collected = ""
-    last_output_at = time.monotonic()
-    start = last_output_at
     compiled_prompt = None
     if prompt_enabled:
         try:
@@ -398,27 +598,96 @@ def execute_command_in_terminal(
         except re.error as exc:
             return f"Error: invalid prompt_pattern: {exc}"
 
-    while True:
-        chunk = _drain_terminal_buffer(terminal_info)
-        now = time.monotonic()
-        if chunk:
-            collected += chunk
-            last_output_at = now
+    cancel_event = threading.Event()
+    state = {
+        "cancel": cancel_event,
+        "command": command,
+        "tool_use_id": get_request_context("tool_use_id") or "",
+        "started_at": None,
+    }
+    queue = _terminal_queue(terminal_info)
 
-        if raw_enabled and now - start >= read_after_delay_seconds:
-            break
+    if command:
+        # Registered before waiting so a queued call is interruptible too.
+        _register_cli_call(terminal_info, state)
+        try:
+            granted = queue.acquire(state, cancel_event)
+        except BaseException:
+            _unregister_cli_call(terminal_info, state)
+            raise
+        if not granted:
+            _unregister_cli_call(terminal_info, state)
+            status = queue.status()
+            busy_note = (
+                f" (another command is still running: {status['command']!r})"
+                if status["busy"] else ""
+            )
+            logger.info(
+                "exec_cli call cancelled while queued for the terminal%s",
+                busy_note)
+            return (
+                "(interrupted before running: this exec_cli call was queued "
+                "behind another command on the same terminal"
+                f"{busy_note})"
+            )
 
-        if compiled_prompt:
-            visible = _strip_terminal_noise(collected, command)
-            if compiled_prompt.search(visible):
+    # The cursor is taken once the terminal is ours: from here on, whatever the
+    # PTY prints belongs to this call (echo, output, then the shell prompt).
+    cursor = _terminal_buffer_end(terminal_info)
+
+    if command:
+        try:
+            write_method(command)
+        except Exception as e:
+            _unregister_cli_call(terminal_info, state)
+            queue.release(state)
+            return f"Error writing to terminal: {e}"
+
+    collected = ""
+    cancelled = False
+    last_output_at = time.monotonic()
+    start = last_output_at
+
+    try:
+        while True:
+            chunk, cursor = _take_terminal_output(terminal_info, cursor)
+            now = time.monotonic()
+            if chunk:
+                collected += chunk
+                last_output_at = now
+
+            if cancel_event.is_set():
+                cancelled = True
                 break
 
-        if idle_enabled and (collected or not command) and now - last_output_at >= idle_timeout_seconds:
-            break
+            if raw_enabled and now - start >= read_after_delay_seconds:
+                break
 
-        time.sleep(check_interval)
+            if compiled_prompt:
+                visible = _strip_terminal_noise(collected, command)
+                if compiled_prompt.search(visible):
+                    break
+
+            if idle_enabled and (collected or not command) and now - last_output_at >= idle_timeout_seconds:
+                break
+
+            time.sleep(check_interval)
+    finally:
+        if command:
+            # Progress reads (empty command) must not re-report output that a
+            # completed call already returned; advancing read_seq reproduces the
+            # old "buffer was consumed" behaviour without ever taking bytes
+            # away from a call that is still collecting.
+            terminal_info["read_seq"] = max(
+                terminal_info.get("read_seq", 0), cursor)
+            _unregister_cli_call(terminal_info, state)
+            queue.release(state)
 
     result = _strip_terminal_noise(collected, command)
+    if cancelled:
+        note = ("(interrupted: this exec_cli call was cancelled; the command "
+                "it sent may have been stopped before it finished)")
+        return f"{result}\n\n{note}" if result else note
     return result if result else "(empty output)"
 # ---------------------------------------------------------------------------
 # read_image — VLM 图片解读内置工具

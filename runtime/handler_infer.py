@@ -1691,6 +1691,18 @@ class HandlerInferMixin:
         except Exception as exc:
             logger.error("force_abort: kill_active_process failed for %s: %s", session_id, exc)
 
+        # 1b. Interrupt exec_cli calls on the session's persistent terminal.
+        # No hook is registered for the user-abort path, and an abandoned
+        # collector would keep consuming that terminal's output, so every
+        # later exec_cli call of the session would time out.  Without a
+        # tool_use_id this stops all in-flight calls of the session and sends
+        # Ctrl-C, which also frees the shell itself.
+        try:
+            from runtime.builtin_tools import cancel_running_command
+            cancel_running_command(session_id)
+        except Exception as exc:
+            logger.error("force_abort: cancel_running_command failed for %s: %s", session_id, exc)
+
         # 2. Kill all MCP stdio server processes so pending call_tool() unblocks.
         try:
             runtime = self._get_runtime()

@@ -1978,6 +1978,369 @@ def test_terminal_attach_does_not_start_second_reader(monkeypatch):
     assert started == [], f"attach 不应新建 PTY 读取线程: {started!r}"
 
 
+# ---------------------------------------------------------------------------
+# exec_cli：一个持久终端上的并发调用必须串行、且输出按调用归属
+#
+# 现场事故（session 261102_211147）：同一轮并发下发 nvidia-smi 与 lspci 两个
+# exec_cli 调用，共享的 output_buffer 被“先到先取走”地 drain：一个调用返回了
+# 另一个调用的屏幕输出，被抢走输出的调用 collected 永远为空，idle 完成条件
+# （collected or not command）永不触发，只能挂到 TOOL_EXEC_TIMEOUT（215s）；
+# 而这条被 guard 放弃的 daemon worker 仍在 drain 同一个 buffer，于是同一
+# session 之后的每个 exec_cli 调用都被“饿死”（dmesg 220s）。
+# 修复：终端级 FIFO 队列（一个 PTY 只跑一条前台命令）+ 按游标读取输出
+# （读取不再清空共享 buffer）+ 可中断（abort hook，超时/用户中断都不再留毒）。
+# ---------------------------------------------------------------------------
+
+def _open_real_terminal(session_id: str) -> dict:
+    """创建真实持久 PTY 终端（仅 Unix；共享 read_pty -> output_buffer 路径）。"""
+    import sys as _sys
+
+    if _sys.platform == "win32":
+        pytest.skip("unix PTY path")
+    from runtime import server_state as ss
+
+    info = ss.get_or_create_terminal(session_id, cols=100, rows=30)
+    assert info is not None, "无法创建持久终端"
+    return info
+
+
+def _close_real_terminal(session_id: str) -> None:
+    from runtime import server_state as ss
+
+    ss.unregister_terminal_session(f"{session_id}:auto")
+
+
+def _run_cli(session_id: str, command: str, *, tool_use_id: str = "",
+             timeout: int = 3000, prompt_pattern: str = "") -> str:
+    """在“本次调用”的线程里执行 exec_cli 终端路径（worker 线程各自带上下文）。"""
+    from runtime.builtin_tools_misc import execute_command_in_terminal
+    from runtime.common import set_request_context
+
+    set_request_context(session_id=session_id, tool_use_id=tool_use_id)
+    return execute_command_in_terminal(
+        session_id, command, timeout=timeout, prompt_pattern=prompt_pattern)
+
+
+def _warm_terminal(session_id: str) -> str:
+    """等 shell 打印出提示符，并派生出默认 prompt_pattern。"""
+    import runtime.builtin_tools_misc as m
+    from runtime import server_state as ss
+
+    _run_cli(session_id, "true", timeout=2000)
+    terminal_info = ss.get_terminal_for_session(session_id)
+    return m._derive_prompt_pattern(terminal_info) or ""
+
+
+def test_terminal_buffer_reads_use_cursors_and_do_not_consume(monkeypatch):
+    """回归：读取终端输出不得清空共享 buffer（游标只取自己之后的内容）。
+
+    旧实现 _drain_terminal_buffer 会 join+clear，两个并发收集者里谁先轮询谁
+    就把对方的字节吃掉；改成游标后每个读取者只看到自己起点之后的 chunk，
+    进度读取（空 command）也不再摧毁正在收集的那条调用的输出。
+    """
+    import runtime.builtin_tools_misc as m
+    from runtime.server_state import (
+        append_terminal_output, take_terminal_output, terminal_buffer_end)
+
+    ti = _fake_terminal("")
+
+    # 调用 A 取得游标 -> A 自己的输出 -> 调用 B 取得游标 -> B 自己的输出
+    cursor_a = terminal_buffer_end(ti)
+    append_terminal_output(ti, "A-echo\r\n")
+    append_terminal_output(ti, "A-out\r\n")
+    cursor_b = terminal_buffer_end(ti)
+    append_terminal_output(ti, "B-echo\r\n")
+    append_terminal_output(ti, "B-out\r\n")
+
+    text_a, cursor_a = take_terminal_output(ti, cursor_a)
+    text_b, cursor_b = take_terminal_output(ti, cursor_b)
+    assert "A-echo" in text_a and "A-out" in text_a, repr(text_a)
+    # B 的游标是它自己起点之后的内容：A 的字节不会被算到 B 头上，也不会被抢走
+    assert text_b == "B-echo\r\nB-out\r\n", repr(text_b)
+    # 重复读取同一游标是幂等的（不会把已经取过的内容再吞一次）
+    again, _ = take_terminal_output(ti, cursor_b)
+    assert again == "", repr(again)
+
+    # 进度读取（空 command）不摧毁 buffer：尚未取完的一方仍能取到自己的字节
+    late_collector_cursor = terminal_buffer_end(ti) - 2   # 从 "B-echo" 之前起算
+    from runtime.builtin_tools_misc import _drain_terminal_buffer
+
+    assert "A-out" in _drain_terminal_buffer(ti)
+    text_late, _ = take_terminal_output(ti, late_collector_cursor)
+    assert text_late == "B-echo\r\nB-out\r\n", repr(text_late)
+
+
+def test_terminal_buffer_trim_keeps_cursors_aligned(monkeypatch):
+    """无人读取的 buffer 会无界增长：从头裁剪时游标语义必须仍然成立。
+
+    旧实现靠调用方 clear() 释放内存，代价是摧毁其它调用尚未取走的输出。
+    改成只从头裁剪后，output_base 记录“列表第一个 chunk 的绝对序号”，
+    落后于 base 的旧游标被夹到 base（只丢最旧的部分），当前游标不受影响。
+    """
+    from runtime.server_state import (
+        append_terminal_output, take_terminal_output, terminal_buffer_end)
+
+    monkeypatch.setenv("TERMINAL_BUFFER_MAX_CHUNKS", "4")
+    ti = _fake_terminal("")
+    for i in range(10):
+        append_terminal_output(ti, f"c{i}\n")
+
+    assert ti["output_buffer"] == ["c6\n", "c7\n", "c8\n", "c9\n"], (
+        ti["output_buffer"])
+    assert ti["output_base"] == 6 and terminal_buffer_end(ti) == 10
+
+    # 落后于裁剪点的游标：只丢最旧的部分，不会读到错位的内容
+    stale, cursor = take_terminal_output(ti, 0)
+    assert stale == "c6\nc7\nc8\nc9\n", repr(stale)
+    # 未落后的游标不受裁剪影响
+    append_terminal_output(ti, "c10\n")
+    fresh, _ = take_terminal_output(ti, cursor)
+    assert fresh == "c10\n", repr(fresh)
+
+
+def test_exec_cli_concurrent_calls_return_their_own_output():
+    """回归（事故本体）：同一终端上并发的两个 exec_cli 调用不得互拿输出。
+
+    复刻 nvidia-smi / lspci 并发场景：两个调用同时下发，旧实现里第一个结果
+    包含两条命令的全部屏幕输出、第二个调用 215s 超时。现在两个调用各返回
+    自己的输出，且都不含对方的 marker。
+    """
+    import threading
+    sid = "cli-concurrent"
+    _open_real_terminal(sid)
+    try:
+        pattern = _warm_terminal(sid)
+        results: dict = {}
+        threads = [
+            threading.Thread(
+                target=lambda k=k, cmd=cmd: results.__setitem__(
+                    k, _run_cli(sid, cmd, tool_use_id=f"call-{k}",
+                                prompt_pattern=pattern)),
+                name=f"cli-{k}",
+            )
+            for k, cmd in (("a", "echo AAA-OUT; seq 1 30"),
+                           ("b", "echo BBB-OUT; seq 40 70"))
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(30)
+        assert all(not t.is_alive() for t in threads), "exec_cli 调用未返回"
+
+        a, b = results["a"], results["b"]
+        assert "AAA-OUT" in a and "30" in a, repr(a)
+        assert "BBB-OUT" in b and "70" in b, repr(b)
+        assert "BBB-OUT" not in a and "AAA-OUT" not in b, (
+            f"输出串到了别的调用里: a={a!r} b={b!r}")
+    finally:
+        _close_real_terminal(sid)
+
+
+def test_exec_cli_call_on_busy_terminal_waits_its_turn():
+    """一个 PTY 只跑一条前台命令：终端忙时后来的调用排队，而不是交错执行。"""
+    import threading
+    import time
+    sid = "cli-queue"
+    _open_real_terminal(sid)
+    try:
+        pattern = _warm_terminal(sid)
+        results: dict = {}
+
+        def launch(key: str, cmd: str) -> None:
+            t = threading.Thread(
+                target=lambda: results.__setitem__(
+                    key, _run_cli(sid, cmd, tool_use_id=f"call-{key}",
+                                  timeout=8000, prompt_pattern=pattern)),
+                name=f"cli-{key}")
+            t.start()
+            results.setdefault(f"{key}_thread", t)
+
+        start = time.monotonic()
+        launch("slow", "sleep 0.6; echo SLOW-MARK")
+        time.sleep(0.2)
+        launch("fast", "echo FAST-MARK")
+        from runtime import server_state as ss
+        status = ss.get_terminal_for_session(sid)["command_queue"].status()
+        assert status["busy"], "终端持有者未登记，队列无法串行化"
+        for key in ("slow", "fast"):
+            results[f"{key}_thread"].join(30)
+        elapsed = time.monotonic() - start
+
+        assert "SLOW-MARK" in results["slow"], repr(results["slow"])
+        assert "FAST-MARK" in results["fast"], repr(results["fast"])
+        assert "FAST-MARK" not in results["slow"]
+        assert "SLOW-MARK" not in results["fast"], (
+            f"两条命令的输出交错: {results!r}")
+        # 排队而非并行：0.6s 的命令结束后才轮到第二条
+        assert elapsed >= 0.6, f"并发调用未串行，elapsed={elapsed:.2f}s"
+    finally:
+        _close_real_terminal(sid)
+
+
+def test_exec_cli_abandoned_call_is_interruptible_and_not_poisoning():
+    """回归（215s 超时 + 后续调用全挂）：被放弃的 exec_cli 必须可中断。
+
+    guard 放弃一条调用时 worker 线程并不会被取消；旧实现里它继续 drain 共享
+    buffer，于是同一 session 之后每个 exec_cli 调用都拿不到自己的输出（现场
+    里后续 dmesg 也 220s 超时）。abort hook 现在中断该调用（并对 shell 发
+    Ctrl-C），后续调用立即恢复正常。
+    """
+    import threading
+    import time
+    sid = "cli-cancel"
+    _open_real_terminal(sid)
+    try:
+        pattern = _warm_terminal(sid)
+        hang: dict = {}
+        # timeout=60000：模拟一条被上层 guard 放弃、自己却永不结束的调用
+        stuck = threading.Thread(
+            target=lambda: hang.setdefault(
+                "out", _run_cli(sid, "sleep 30; echo NEVER-OUT",
+                                tool_use_id="call-stuck", timeout=60000)),
+            name="cli-stuck")
+        stuck.start()
+        time.sleep(1.0)
+        assert stuck.is_alive(), "卡住的调用提前结束，场景不成立"
+
+        from runtime.builtin_tools_misc import cancel_running_command
+
+        assert cancel_running_command(sid, "call-stuck") is True
+        stuck.join(8)
+        assert not stuck.is_alive(), "abort hook 未能中断在飞的 exec_cli 调用"
+        assert "interrupted" in hang["out"], repr(hang["out"])
+
+        after = _run_cli(sid, "echo AFTER-CANCEL", tool_use_id="call-after",
+                         prompt_pattern=pattern)
+        assert "AFTER-CANCEL" in after, (
+            f"中断后终端被毒化，后续调用拿不到输出: {after!r}")
+    finally:
+        _close_real_terminal(sid)
+
+
+def test_exec_cli_queued_call_interruptible_without_disturbing_running_call():
+    """排队中的调用可被定向中断，且不得替它向 shell 发 Ctrl-C 误伤正在跑的命令。"""
+    import threading
+    import time
+    sid = "cli-queued-cancel"
+    _open_real_terminal(sid)
+    try:
+        pattern = _warm_terminal(sid)
+        holder: dict = {}
+        running = threading.Thread(
+            target=lambda: holder.setdefault(
+                "out", _run_cli(sid, "sleep 1.5; echo SIBLING-DONE",
+                                tool_use_id="call-running", timeout=9000,
+                                prompt_pattern=pattern)),
+            name="cli-running")
+        running.start()
+        time.sleep(0.3)
+
+        queued: dict = {}
+        waiter = threading.Thread(
+            target=lambda: queued.setdefault(
+                "out", _run_cli(sid, "echo QUEUED-OUT",
+                                tool_use_id="call-queued", timeout=3000,
+                                prompt_pattern=pattern)),
+            name="cli-waiter")
+        waiter.start()
+        time.sleep(0.3)
+
+        from runtime.builtin_tools_misc import cancel_running_command
+
+        cancel_running_command(sid, "call-queued")
+        waiter.join(8)
+        assert not waiter.is_alive(), "排队中的调用无法中断"
+        assert "interrupted before running" in queued["out"], repr(queued["out"])
+
+        running.join(20)
+        assert "SIBLING-DONE" in holder["out"], (
+            f"替排队调用发的中断误伤了正在执行的命令: {holder['out']!r}")
+    finally:
+        _close_real_terminal(sid)
+
+
+def test_exec_cli_abort_hook_targets_one_call(monkeypatch):
+    """abort hook 语义：带 tool_use_id 只中断那条调用，不带则中断该 session 全部。"""
+    import threading
+    import runtime.builtin_tools_misc as m
+
+    ti = _fake_terminal("")
+    monkeypatch.setattr(_server, "get_terminal_for_session", lambda sid: ti)
+
+    started = {"cancel": threading.Event(), "tool_use_id": "call-1",
+               "started_at": 1.0, "command": "sleep 30"}
+    queued = {"cancel": threading.Event(), "tool_use_id": "call-2",
+              "started_at": None, "command": "echo later"}
+    ti["cli_calls"] = [started, queued]
+
+    assert m.cancel_running_command("sess-p-1", tool_use_id="call-1") is True
+    assert started["cancel"].is_set()
+    assert not queued["cancel"].is_set(), "定向中断误伤了同 session 的其它调用"
+
+    assert m.cancel_running_command("sess-p-1") is True
+    assert queued["cancel"].is_set(), "无 tool_use_id 的中断应停止全部调用"
+
+    # 终端里没有该调用时返回 False（runtime 据此告知模型“未能中断”）
+    assert m.cancel_running_command("sess-p-1", tool_use_id="call-gone") is False
+
+
+def test_exec_cli_abort_hook_registered_and_takes_tool_use_id(monkeypatch):
+    """exec_cli 必须注册 abort hook，并按 tool_use_id 形状被调用（只停一条调用）。"""
+    import runtime.runtime as rt
+    from runtime.registry import ToolRegistry
+
+    monkeypatch.setattr(rt, "_TOOL_ABORT_HOOKS", dict(rt._TOOL_ABORT_HOOKS))
+    _bt.register_builtin_tools(ToolRegistry())
+
+    entry = rt._TOOL_ABORT_HOOKS.get("exec_cli")
+    assert entry is not None, "exec_cli 未注册 abort hook"
+    hook, takes_tool_use_id = entry
+    assert callable(hook)
+    assert takes_tool_use_id is True, "exec_cli hook 应接收 tool_use_id"
+    # 旧形状（只接 session_id）的 hook 仍然受支持
+    assert rt._TOOL_ABORT_HOOKS["exec_shell"][1] is False
+
+
+def test_round_tool_timeout_invokes_abort_hook(monkeypatch, session_ctx):
+    """回归：轮级并行执行里，超时被放弃的调用也要触发 abort hook。
+
+    单调用路径早已调用 _abort_timed_out_tool，但轮级并行路径只是 _finalize
+    一条超时消息就继续；被放弃的 exec_cli worker 因此永远留在终端里 drain
+    输出。现在两条路径语义一致：能中断就中断，不能中断才提示“可能仍在运行”。
+    """
+    import time
+    import runtime.runtime as rt
+
+    workspace, session_dir = session_ctx
+    monkeypatch.setenv("TOOL_EXEC_TIMEOUT", "0.3")
+    monkeypatch.setattr(rt, "_TOOL_ABORT_HOOKS", dict(rt._TOOL_ABORT_HOOKS))
+
+    aborted: list = []
+
+    def _hook(session_id, tool_use_id=None):
+        aborted.append((session_id, tool_use_id))
+
+    config = ToolConfig(
+        tool_id="terminal_like", tool_type="function", name="terminal_like",
+        description="hangs like a stuck exec_cli collector",
+        parameters={"type": "object", "properties": {}},
+    )
+    registry = ToolRegistry()
+    registry.register(config, callable_fn=lambda: time.sleep(30))
+    rt.register_tool_abort_hook("terminal_like", _hook)
+
+    runtime = Runtime(model_registry=ModelRegistry(), tool_registry=registry)
+    messages = list(runtime._execute_tool_call_round(
+        [{"id": "call-stuck", "name": "terminal_like", "arguments": "{}"}],
+        [config], timestamp=False,
+    ))
+
+    assert aborted == [("sess-1", "call-stuck")], (
+        f"轮级超时未调用 abort hook: {aborted!r}")
+    content = messages[0].content
+    assert "timed out" in content, content
+    assert "could not be interrupted" not in content, content
+
 def test_exec_shell_runs_in_session_workspace(monkeypatch, session_ctx, tmp_path):
     """实际场景：exec_shell 必须在会话 workspace 下执行。
 

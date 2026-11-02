@@ -82,6 +82,7 @@ from runtime.builtin_tools_misc import (  # noqa: F401
     _fetch_url,
     _make_read_image_fn,
     _strip_terminal_noise,
+    cancel_running_command,
     execute_command_in_terminal,
     MISC_TOOLS,
 )
@@ -118,8 +119,18 @@ def register_builtin_tools(tool_registry: ToolRegistry, runtime=None) -> list[st
     # TOOL_EXEC_TIMEOUT instead of abandoning a still-running writer.
     # Imported here: runtime.runtime imports this module lazily, and a
     # module-level import would create an initialisation cycle.
+    from runtime.builtin_tools_misc import (
+        cancel_running_command as cancel_exec_cli_command,
+    )
     from runtime.runtime import register_tool_abort_hook
     register_tool_abort_hook("exec_shell", kill_active_process_soft)
+    # exec_cli drives one persistent PTY per session: a call the guard
+    # abandoned kept collecting that terminal's output, so every later
+    # exec_cli call in the session starved (and a queued one would never
+    # start).  The hook interrupts the call and sends Ctrl-C to the shell.
+    # ``cancel_exec_cli_command`` takes tool_use_id, so only the timed-out
+    # call is stopped; a user abort interrupts all of them.
+    register_tool_abort_hook("exec_cli", cancel_exec_cli_command)
 
     ids = []
     for config, fn in BUILTIN_TOOLS:

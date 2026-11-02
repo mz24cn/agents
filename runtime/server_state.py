@@ -38,6 +38,7 @@ else:
     import termios
 
 from runtime.common import (
+    env_int,
     get_system_encoding,
     estimate_chat_message_tokens,
     estimate_chat_prompt_tokens,
@@ -2402,6 +2403,101 @@ def frame_channel_reset() -> None:
 _terminal_sessions: dict[str, dict] = {}
 _terminal_sessions_lock = threading.Lock()
 
+# ---------------------------------------------------------------------------
+# Terminal output buffer: read with cursors, never by draining
+# ---------------------------------------------------------------------------
+# ``output_buffer`` is the single fan-out target of the terminal's one PTY
+# reader (see get_or_create_terminal's read_pty).  exec_cli collectors used to
+# ``drain`` it (join + clear), which is destructive: with two calls collecting
+# at once, whichever polled first consumed the other's bytes and the loser
+# never saw its own output.  Readers therefore take a *cursor* (an absolute
+# chunk sequence) and get only what was appended after it:
+#
+#   output_seq   chunks ever appended (absolute sequence of the buffer end)
+#   output_base  sequence of the first chunk still kept in the list
+#   read_seq     cursor of the last progress read (empty-command / leftovers)
+#   output_chars characters currently retained (trim bound)
+#
+TERMINAL_BUFFER_MAX_CHUNKS = 4000
+TERMINAL_BUFFER_MAX_CHARS = 4_000_000
+
+
+def _terminal_buffer_fields() -> dict:
+    """Fresh output buffer plus its cursor bookkeeping for a terminal entry."""
+    return {
+        "output_buffer": [],   # decoded PTY chunks, appended by the one reader
+        "buffer_lock": threading.Lock(),
+        "output_seq": 0,
+        "output_base": 0,
+        "read_seq": 0,
+        "output_chars": 0,
+    }
+
+
+def append_terminal_output(terminal_info: dict, text: str) -> None:
+    """Append one decoded PTY chunk and advance the buffer's sequence.
+
+    The list is trimmed from the front instead of being cleared by readers, so
+    a collector's cursor keeps pointing at its own bytes; ``output_base`` keeps
+    the trimmed list aligned with the absolute sequence.  Nothing clears the
+    buffer any more, so the retained window is bounded here (chunk count and
+    total characters).
+    """
+    max_chunks = max(1, env_int("TERMINAL_BUFFER_MAX_CHUNKS",
+                                TERMINAL_BUFFER_MAX_CHUNKS))
+    max_chars = max(1024, env_int("TERMINAL_BUFFER_MAX_CHARS",
+                                  TERMINAL_BUFFER_MAX_CHARS))
+    with terminal_info["buffer_lock"]:
+        buf = terminal_info.setdefault("output_buffer", [])
+        buf.append(text)
+        terminal_info["output_seq"] = terminal_info.get("output_seq", 0) + 1
+        chars = terminal_info.get("output_chars", 0) + len(text)
+        drop = 0
+        while drop < len(buf) and (
+                len(buf) - drop > max_chunks or chars > max_chars):
+            chars -= len(buf[drop])
+            drop += 1
+        if drop:
+            del buf[:drop]
+            terminal_info["output_base"] = (
+                terminal_info.get("output_base", 0) + drop)
+        terminal_info["output_chars"] = chars
+
+
+def terminal_buffer_end(terminal_info: dict) -> int:
+    """Sequence just past the last buffered chunk (a cursor start point)."""
+    with terminal_info["buffer_lock"]:
+        seq = terminal_info.get("output_seq")
+        if seq is None:
+            # Hand-built terminal dicts (tests) that only carry a list.
+            seq = terminal_info.get("output_base", 0) + len(
+                terminal_info.get("output_buffer") or [])
+        return seq
+
+
+def take_terminal_output(terminal_info: dict, cursor: int) -> tuple[str, int]:
+    """Return ``(text appended after cursor, new cursor)``.
+
+    Non-destructive for other readers: nothing is cleared, so a concurrent
+    collector still gets every chunk that belongs to its own cursor range.
+    """
+    with terminal_info["buffer_lock"]:
+        base = terminal_info.get("output_base", 0)
+        buf = terminal_info.get("output_buffer") or []
+        seq = terminal_info.get("output_seq")
+        if seq is None:
+            seq = base + len(buf)
+        start = max(int(cursor), base) - base
+        text = "".join(buf[start:]) if 0 <= start < len(buf) else ""
+        return text, seq
+
+
+def read_terminal_tail(terminal_info: dict, chunks: int = 200) -> str:
+    """Join the last *chunks* buffered chunks (cheap "what's on screen" view)."""
+    with terminal_info["buffer_lock"]:
+        buf = terminal_info.get("output_buffer") or []
+        return "".join(buf[-max(1, chunks):])
+
 
 def get_terminal_session(terminal_id: str) -> Optional[dict]:
     """Get terminal session by terminal_id."""
@@ -2417,8 +2513,7 @@ def register_terminal_session(terminal_id: str, master_fd, pid, sock, session_id
             "pid": pid,
             "sock": sock,
             "session_id": session_id,
-            "output_buffer": [],  # Buffer for collecting command output
-            "buffer_lock": threading.Lock(),
+            **_terminal_buffer_fields(),
             "disconnected_at": None,  # When the session was disconnected (for cleanup)
             "active": True,  # Whether this connection is active
         }
@@ -2477,8 +2572,7 @@ def get_or_create_terminal(
                     "session_id": session_id_short,
                     "active": True,
                     "disconnected_at": None,
-                    "output_buffer": [],
-                    "buffer_lock": threading.Lock(),
+                    **_terminal_buffer_fields(),
                     "shell_kind": "powershell",
                     "send_output": send_output,
                 }
@@ -2504,8 +2598,7 @@ def get_or_create_terminal(
                                         send_output(data)
                                     except Exception:
                                         pass
-                                with terminal_info["buffer_lock"]:
-                                    terminal_info["output_buffer"].append(data)
+                                append_terminal_output(terminal_info, data)
                             else:
                                 logger.debug("read_pty: EOF for %s (win32)", terminal_id)
                                 break
@@ -2557,8 +2650,7 @@ def get_or_create_terminal(
                     "session_id": session_id_short,
                     "active": True,
                     "disconnected_at": None,
-                    "output_buffer": [],
-                    "buffer_lock": threading.Lock(),
+                    **_terminal_buffer_fields(),
                     "shell_kind": os.path.basename(shell or "/bin/bash"),
                     "send_output": send_output,
                 }
@@ -2587,8 +2679,7 @@ def get_or_create_terminal(
                                             send_output(text)
                                         except Exception:
                                             pass
-                                    with terminal_info["buffer_lock"]:
-                                        terminal_info["output_buffer"].append(text)
+                                    append_terminal_output(terminal_info, text)
                                 else:
                                     logger.debug("read_pty: EOF for %s", terminal_id)
                                     break
