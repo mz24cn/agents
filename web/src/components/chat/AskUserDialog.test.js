@@ -194,4 +194,39 @@ describe('AskUserDialog', () => {
     expect(onChoose).toHaveBeenCalledTimes(1)
     expect(onChoose).toHaveBeenCalledWith({ value: '甲' })
   })
+  it('does not answer a question the user cannot see', () => {
+    // 会话切走 / 换了页面时对话框不在屏幕上：倒计时不能替用户做决定，
+    // 问题也不能被自动"回答"掉——它得等用户回来。
+    const onChoose = vi.fn()
+    open({
+      open: false,
+      request: { question: 'q', options: ['甲', '乙'], timeout: 2, defaultOption: '乙' },
+      onChoose,
+      onCancel: () => {},
+    })
+    expect(document.querySelector('.ask-option')).toBeNull()
+    vi.advanceTimersByTime(5000)
+    flushSync()
+    expect(onChoose).not.toHaveBeenCalled()
+  })
+
+  it('says how many other conversations are waiting too', () => {
+    open({
+      open: true,
+      request: { question: 'q', options: ['甲', '乙'], timeout: 0, defaultOption: '' },
+      onChoose: () => {},
+      onCancel: () => {},
+      otherWaiting: 2,
+    })
+    expect(document.querySelector('.ask-queued').textContent).toContain('2')
+    tearDown()
+    open({
+      open: true,
+      request: { question: 'q', options: ['甲', '乙'], timeout: 0, defaultOption: '' },
+      onChoose: () => {},
+      onCancel: () => {},
+      otherWaiting: 0,
+    })
+    expect(document.querySelector('.ask-queued')).toBeNull()
+  })
 })

@@ -23,6 +23,7 @@
     clientToolCallFrames,
     clientToolDefinitions,
     clientToolNames,
+    createQuestionLedger,
     enabledClientToolNames,
     clientToolResultMessage,
     pickUnansweredClientCalls,
@@ -32,7 +33,7 @@
   import { t } from '../../lib/i18n.svelte.js'
   import { forkContextWarning } from '../../lib/session-fork.js'
   import { navigate } from '../../lib/router.svelte.js'
-  import { sessionRestore, sessionDownload, newSessionCreated, sessionDeleted, sessionForked, currentSession, newSessionRequest, terminalOpen, openSessionLogDir } from '../../lib/session-state.svelte.js'
+  import { sessionRestore, sessionDownload, newSessionCreated, sessionDeleted, sessionForked, currentSession, newSessionRequest, terminalOpen, openSessionLogDir, awaitingUserAnswer } from '../../lib/session-state.svelte.js'
   import DownloadProgress from './DownloadProgress.svelte'
   import { collapseSidebar } from '../../lib/sidebar-width.svelte.js'
   import Terminal from '../Terminal.svelte'
@@ -156,12 +157,30 @@
   // Key = session ID (or '__new__' before backend assigns one).
   // Stream callbacks write to their own key; switching sessions just changes which key is displayed.
   let sessionStore = $state({})
-  // Client-side tools this browser runs. They are declared in every request
-  // (`client_tools`), registered on the service as JSON only, and never executed
-  // there: the model calls one, the loop ends, the call comes back to us and the
-  // browser performs it. For AskUser that means this dialog.
-  let askUser = $state(null)        // { request } while a question is open
-  let askUserSettle = $state(null)  // resolves the promise the tool awaits
+  // Client-side tools this browser runs: the model calls one, the service ends
+  // its loop, the call comes back here, and the browser performs it. For AskUser
+  // that means this dialog. They are declared per request only for the tools the
+  // user ticked (see enabledClientNames), never behind their back.
+  //
+  // Questions live in a ledger keyed by session rather than in one dialog slot:
+  // a question survives switching sessions or pages and is only ended by the
+  // user answering it, closing it, or stopping the turn that asked it. `queueTick`
+  // exists so the derived view below re-runs when the (non-reactive) ledger does.
+  const questionLedger = createQuestionLedger()
+  let queueTick = $state(0)
+  const askUserBump = () => { queueTick += 1 }
+  const visibleAskUser = $derived.by(() => {
+    queueTick  // dependency only: the ledger itself is not reactive state
+    return questionLedger.visibleFor(sessionId)
+  })
+  const waitingAnswerSessions = $derived.by(() => {
+    queueTick
+    return questionLedger.pendingSessionIds()
+  })
+  // 侧边栏需要在任何页面都能看到"这条会话在等你回答"，所以镜像到全局状态。
+  $effect(() => {
+    awaitingUserAnswer.sessionIds = waitingAnswerSessions
+  })
   let sessionStreamSubscriptions = {}
   // Sessions whose inference stream is already consumed by this page through
   // the original POST /v1/infer/stream connection. They must not also get a
@@ -1081,27 +1100,29 @@
     _doSend(apiMessages, pendingUserMsg)
   }
 
-  // The dialog *is* the AskUser tool: opening it returns a promise that settles
-  // with the user's choice, which becomes the tool result.
-  function promptAskUser(request) {
-    return new Promise((resolve) => {
-      askUserSettle = resolve
-      askUser = { request }
-    })
+  // The dialog *is* the AskUser tool: queueing a question returns a promise that
+  // settles with the user's choice, which becomes the tool result.
+  function askUserQuestion(sid, callId, request) {
+    const handle = questionLedger.ask(sid, callId, request)
+    askUserBump()
+    return handle
   }
 
-  function settleAskUser(outcome) {
-    const resolve = askUserSettle
-    askUserSettle = null
-    askUser = null
-    if (resolve) resolve(outcome || { value: null, dismissed: true })
+  function settleQuestion(key, outcome) {
+    if (!key || !questionLedger.settle(key, outcome)) return
+    askUserBump()
   }
 
-  // A question must not outlive the turn it belongs to: starting anything new,
-  // switching sessions, or stopping answers it as "the user did not choose", so
-  // the assistant's tool call is never left dangling in the history.
-  function dropPendingAskUser() {
-    if (askUserSettle) settleAskUser({ value: null, dismissed: true })
+  /**
+   * End one session's questions as "no answer".
+   *
+   * Only for turns that are genuinely over: the user stopped the turn, or the
+   * session was deleted. Switching sessions or pages must not do this - the
+   * question stays queued and the dialog is there again when the user comes back.
+   */
+  function abandonQuestions(sid) {
+    if (!sid || !questionLedger.dropSession(sid)) return
+    askUserBump()
   }
 
   /**
@@ -1114,23 +1135,41 @@
   async function handleClientToolCalls(calls, sid) {
     const pending = (calls || []).filter((call) => call && call.name)
     if (!pending.length || !sid) return
-    dropPendingAskUser()
+    const questions = []
     const answers = []
+    const shown = []
+    const answeredNames = []
     for (const call of pending) {
-      // Only a question for the session on screen can be put to the user; any
-      // other case is reported honestly instead of guessed at.
-      const canAsk = sid === sessionId
+      const callKey = call.id || call.call_id || null
+      if (callKey && questionLedger.isQueued(sid, callKey)) continue
       const content = await runClientToolCall(call, {
-        askUser: canAsk ? promptAskUser : async () => ({ value: null, dismissed: true }),
+        // The dialog only renders for the session on screen, so a call for a
+        // session in the background just waits there (marked in the session
+        // list) instead of being answered on the user's behalf.
+        askUser: (request) => {
+          const handle = askUserQuestion(sid, callKey, request)
+          questions.push(handle)
+          return handle.promise
+        },
       })
       const message = clientToolResultMessage(call, content)
       answers.push(message)
+      answeredNames.push(call.name)
       // The service persists submitted messages but does not rebroadcast them as
       // frames, so the answer only shows up here if we show it ourselves.
-      const store = sessionStore[sid]
-      if (store) store.messages = [...store.messages, { ...message, timestamp: new Date().toISOString() }]
+      shown.push({ ...message, timestamp: new Date().toISOString() })
     }
-    answeringClientNames = pending.map((call) => call.name)
+    if (!answers.length) return
+    if (questions.some((handle) => handle.abandoned)) {
+      // The user stopped the turn (or the session went away) while a question was
+      // open: the service repairs the abandoned call when a new turn starts, and
+      // a result posted now would not belong to it.
+      return
+    }
+    if (sessionId !== sid) return
+    answeringClientNames = answeredNames
+    const store = sessionStore[sid]
+    if (store) store.messages = [...store.messages, ...shown]
     _doSend(answers, null)
   }
 
@@ -1157,9 +1196,10 @@
   }
 
   function _doSend(apiMessages, pendingUserMsg, isContinue = false, retryAgentId = null, isResume = false) {
-    // Any new turn supersedes an unanswered question: the service repairs the
-    // abandoned call, and an answer posted afterwards would not belong to it.
-    dropPendingAskUser()
+    // Starting a new turn in *this* session supersedes its unanswered question:
+    // the service repairs the abandoned call, and an answer posted afterwards
+    // would not belong to it. Questions belonging to other sessions stay put.
+    abandonQuestions(sessionId)
     // Each stream writes to its own sessionStore entry via keyRef.
     // keyRef.key may change from '__new__' to the real session ID once the
     // backend assigns one (onInit / first onStreamMsg with session_id).
@@ -1369,7 +1409,9 @@
   }
 
   function handleStop() {
-    dropPendingAskUser()
+    // The turn the question belongs to is over, so its answer can never be used:
+    // end it as "no answer" instead of leaving the dialog open over a dead turn.
+    abandonQuestions(sessionId)
     const key = storeKey(sessionId)
     const store = sessionStore[key]
     if (!sessionId || !store?.isStreaming) return
@@ -2282,6 +2324,8 @@
     if (deletedSid) {
       sessionDeleted.sessionId = null
       delete sessionStore[deletedSid]
+      // 会话没了，它未回答的问题也没有归属了：按“未回答”收尾，别留下悬空的对话框。
+      abandonQuestions(deletedSid)
       // Clean up terminal for deleted session
       if (terminals.has(deletedSid)) {
         destroyTerminal(deletedSid)
@@ -2624,10 +2668,11 @@
   />
 
   <AskUserDialog
-    open={!!askUser}
-    request={askUser?.request ?? null}
-    onChoose={settleAskUser}
-    onCancel={() => settleAskUser({ value: null, dismissed: true })}
+    open={!!visibleAskUser}
+    request={visibleAskUser?.request ?? null}
+    otherWaiting={waitingAnswerSessions.filter((sid) => sid !== sessionId).length}
+    onChoose={(outcome) => settleQuestion(visibleAskUser?.key, outcome)}
+    onCancel={() => settleQuestion(visibleAskUser?.key, { value: null, dismissed: true })}
   />
 
   <ConfirmDialog

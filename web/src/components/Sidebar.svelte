@@ -3,7 +3,7 @@
   import { router, navigate } from '../lib/router.svelte.js'
   import { t } from '../lib/i18n.svelte.js'
   import { sessions, subscribeSessionEvents } from '../lib/api.js'
-  import { sessionRestore, sessionDownload, newSessionCreated, sessionDeleted, sessionForked, currentSession, newSessionRequest, terminalOpen, openSessionLogDir, messageScrollRequest } from '../lib/session-state.svelte.js'
+  import { sessionRestore, sessionDownload, newSessionCreated, sessionDeleted, sessionForked, currentSession, newSessionRequest, terminalOpen, openSessionLogDir, messageScrollRequest, awaitingUserAnswer } from '../lib/session-state.svelte.js'
   import { sidebarWidth, setSidebarWidth, toggleSidebarCollapsed, collapseSidebar, SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH } from '../lib/sidebar-width.svelte.js'
   import SessionCategoryNode from './SessionCategoryNode.svelte'
 
@@ -1530,6 +1530,9 @@
                 {/if}
                 {getSessionDisplay(entry).display}
                 {#if flightSessions.has(entry.session_id)}<span class="session-flight">✈️</span>{/if}
+                {#if awaitingUserAnswer.sessionIds.includes(entry.session_id)}
+                  <span class="session-awaiting" title={t('awaitingUserAnswer')}>❓</span>
+                {/if}
               </button>
               <button
                 class="session-menu-btn"
@@ -2045,6 +2048,15 @@
   }
  .menu-check { margin-left: auto; font-weight: 700; color: #22c55e; }
   .session-flight { margin-left: .35rem; font-size: .9em; vertical-align: -0.1em; }
+  /* 这条会话有一个未回答的 AskUser：切走页面时也需要看得见，所以标记要显眼 */
+  .session-awaiting {
+    margin-left: .35rem;
+    font-size: .9em;
+    vertical-align: -0.1em;
+    color: #d97706;
+    animation: awaiting-pulse 1.6s ease-in-out infinite;
+  }
+  @keyframes awaiting-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
   /* 衍生会话的来源标记：放在标题前，悬停显示「衍生自 …」 */
   .session-fork { margin-right: .3rem; font-size: .9em; opacity: .65; vertical-align: -0.1em; }
 

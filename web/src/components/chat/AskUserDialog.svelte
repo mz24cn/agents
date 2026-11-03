@@ -15,7 +15,7 @@
    * and the theme; the options replace the usual two buttons because they are the
    * choices, not an OK/Cancel decoration.
    */
-  let { open, request = null, onChoose, onCancel } = $props()
+  let { open, request = null, onChoose, onCancel, otherWaiting = 0 } = $props()
 
   let highlight = $state(0)
   let remaining = $state(0)
@@ -157,6 +157,10 @@
         </div>
       </div>
       <p class="ask-hint">{t('askUserKeysHint')}</p>
+      {#if otherWaiting > 0}
+        <!-- 其它会话也在等你回答：问题不会因为切走而消失，但先说清楚还有几个 -->
+        <p class="ask-queued">{t('askUserQueuedOther').replace('{count}', String(otherWaiting))}</p>
+      {/if}
     </div>
   {/if}
 </ConfirmDialog>
@@ -269,6 +273,11 @@
   .ask-hint {
     margin: 10px 0 0 0;
     color: var(--text-secondary);
+    font-size: 0.75rem;
+  }
+  .ask-queued {
+    margin: 6px 0 0 0;
+    color: #d97706;
     font-size: 0.75rem;
   }
   .btn {

@@ -266,3 +266,92 @@ export async function runClientToolCall(call, { askUser } = {}) {
     message: `this browser cannot execute '${call.name}'`,
   })
 }
+
+/**
+ * The unanswered client-tool questions this tab is holding, tagged by session.
+ *
+ * The one-slot dialog this page used to have was a real bug: a question was
+ * thrown away whenever *anything* else happened - switching to another session,
+ * a second handoff arriving, a question in another conversation taking the slot
+ * - and the discarded question resolved as "the user did not choose", so the
+ * model kept reasoning on an answer the user never saw the chance to give.
+ *
+ * A ledger instead of a slot:
+ *
+ *   - every question belongs to the session that asked it, and stays queued
+ *     until that session's user answers it, closes it, or stops that turn;
+ *   - `visibleFor(sessionId)` is what the screen shows, so switching away hides
+ *     a question and switching back restores it, with nothing lost;
+ *   - `dropSession()` is only for the cases where the turn really is over (the
+ *     user pressed stop, the session was deleted) and marks the answer
+ *     `abandoned`, which tells the caller not to post a tool result for it.
+ *
+ * UI-free on purpose: the page can mirror `items` into reactive state however it
+ * likes, and the ownership rules above stay unit testable.
+ */
+export function createQuestionLedger() {
+  let seq = 0
+  let items = []
+  const settlers = new Map()
+
+  return {
+    /** Queued questions, oldest first (read-only copy). */
+    get items() {
+      return items.slice()
+    },
+
+    /**
+     * Queue one question for *sessionId* and return
+     * `{ key, promise, abandoned }`. Resolve `promise` through `settle()`;
+     * `abandoned` flips to true when the queue, not the user, ended it.
+     */
+    ask(sessionId, callId, request) {
+      const key = `q${++seq}`
+      let resolve
+      const promise = new Promise((done) => { resolve = done })
+      const handle = { key, promise, abandoned: false }
+      settlers.set(key, { resolve, handle })
+      items = [...items, { key, session_id: sessionId, call_id: callId, request }]
+      return handle
+    },
+
+    /** Resolve one queued question; unknown keys are already settled. */
+    settle(key, outcome) {
+      const entry = settlers.get(key)
+      if (!entry) return false
+      settlers.delete(key)
+      items = items.filter((item) => item.key !== key)
+      if (outcome && outcome.abandoned) entry.handle.abandoned = true
+      entry.resolve(outcome || { value: null, dismissed: true })
+      return true
+    },
+
+    /** The question this session should show right now (oldest first). */
+    visibleFor(sessionId) {
+      if (!sessionId) return null
+      return items.find((item) => item.session_id === sessionId) || null
+    },
+
+    /** Sessions holding an unanswered question - for the session list marker. */
+    pendingSessionIds() {
+      const seen = []
+      for (const item of items) {
+        if (item.session_id && !seen.includes(item.session_id)) seen.push(item.session_id)
+      }
+      return seen
+    },
+
+    /** Whether this exact call is already queued (re-opening a session must not re-ask). */
+    isQueued(sessionId, callId) {
+      return items.some((item) => item.session_id === sessionId && item.call_id === callId)
+    },
+
+    /** End every question of one session as "no answer"; returns how many. */
+    dropSession(sessionId) {
+      if (!sessionId) return 0
+      const matched = items.filter((item) => item.session_id === sessionId)
+      for (const item of matched) this.settle(item.key, { value: null, dismissed: true, abandoned: true })
+      return matched.length
+    },
+  }
+}

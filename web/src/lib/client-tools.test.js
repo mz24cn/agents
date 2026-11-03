@@ -7,6 +7,7 @@ import {
   clientToolCallFrames,
   clientToolDefinitions,
   clientToolNames,
+  createQuestionLedger,
   clientToolResultMessage,
   enabledClientToolNames,
   normalizeAskUserChoice,
@@ -264,5 +265,86 @@ describe('runClientToolCall', () => {
     const parsed = JSON.parse(content)
     expect(parsed.error).toBe('UnknownClientTool')
     expect(parsed.message).toContain('local_shell')
+  })
+})
+
+describe('the question ledger', () => {
+  // Why this exists: the page used to keep one dialog slot. A question was
+  // thrown away whenever anything else happened - switching sessions, a second
+  // handoff, a question from another conversation - and the discarded question
+  // resolved as "the user did not choose", so the model kept reasoning on an
+  // answer the user never had the chance to see. These are those regressions.
+  const req = (text) => ({ question: text, options: ['a', 'b'], timeout: 0, defaultOption: '' })
+
+  it('keeps a question with the session that asked it', async () => {
+    const ledger = createQuestionLedger()
+    const handle = ledger.ask('s1', 'call_1', req('部署方式？'))
+    expect(ledger.visibleFor('s1').request.question).toBe('部署方式？')
+    expect(ledger.visibleFor('s2')).toBe(null)
+    expect(ledger.pendingSessionIds()).toEqual(['s1'])
+    ledger.settle(handle.key, { value: 'a' })
+    await expect(handle.promise).resolves.toEqual({ value: 'a' })
+    expect(ledger.items).toEqual([])
+  })
+
+  it('does not let another conversation steal the question on screen', async () => {
+    const ledger = createQuestionLedger()
+    const first = ledger.ask('s1', 'call_1', req('第一个问题'))
+    const second = ledger.ask('s2', 'call_2', req('第二个问题'))
+    // Both stay pending; each session sees exactly its own question.
+    expect(ledger.visibleFor('s1').call_id).toBe('call_1')
+    expect(ledger.visibleFor('s2').call_id).toBe('call_2')
+    expect(ledger.pendingSessionIds()).toEqual(['s1', 's2'])
+    ledger.settle(ledger.visibleFor('s2').key, { value: 'b' })
+    // Settling one must not resolve the other: the first user's turn waits.
+    expect(ledger.visibleFor('s1').call_id).toBe('call_1')
+    ledger.settle(first.key, { value: 'a' })
+    await expect(first.promise).resolves.toEqual({ value: 'a' })
+    await expect(second.promise).resolves.toEqual({ value: 'b' })
+  })
+
+  it('shows the oldest question first when one session asks twice', () => {
+    const ledger = createQuestionLedger()
+    ledger.ask('s1', 'call_1', req('先问的'))
+    ledger.ask('s1', 'call_2', req('后问的'))
+    expect(ledger.visibleFor('s1').call_id).toBe('call_1')
+    ledger.settle(ledger.visibleFor('s1').key, { value: 'a' })
+    expect(ledger.visibleFor('s1').call_id).toBe('call_2')
+  })
+
+  it('survives switching away and back', () => {
+    const ledger = createQuestionLedger()
+    ledger.ask('s1', 'call_1', req('切走了还在吗'))
+    expect(ledger.visibleFor('s2')).toBe(null)   // 切到别的会话：这里没有它
+    expect(ledger.visibleFor('s1').call_id).toBe('call_1')  // 切回来：还在
+    expect(ledger.pendingSessionIds()).toEqual(['s1'])
+  })
+
+  it('re-opening a session must not ask the same call twice', () => {
+    const ledger = createQuestionLedger()
+    ledger.ask('s1', 'call_1', req('已经在等了'))
+    expect(ledger.isQueued('s1', 'call_1')).toBe(true)
+    expect(ledger.isQueued('s2', 'call_1')).toBe(false)
+    expect(ledger.isQueued('s1', 'call_9')).toBe(false)
+  })
+
+  it('ends a stopped turn as abandoned, without touching other sessions', async () => {
+    const ledger = createQuestionLedger()
+    const mine = ledger.ask('s1', 'call_1', req('这一轮被停掉了'))
+    const other = ledger.ask('s2', 'call_2', req('别的情况不受影响'))
+    expect(ledger.dropSession('s1')).toBe(1)
+    expect(mine.abandoned).toBe(true)
+    await expect(mine.promise).resolves.toEqual({ value: null, dismissed: true, abandoned: true })
+    expect(ledger.visibleFor('s2').call_id).toBe('call_2')
+    expect(ledger.dropSession('s1')).toBe(0)
+    ledger.settle(other.key, { value: 'a' })
+  })
+
+  it('ignores settling the same question twice', async () => {
+    const ledger = createQuestionLedger()
+    const handle = ledger.ask('s1', 'call_1', req('双击也不会重复送答案'))
+    expect(ledger.settle(handle.key, { value: 'a' })).toBe(true)
+    expect(ledger.settle(handle.key, { value: 'b' })).toBe(false)
+    await expect(handle.promise).resolves.toEqual({ value: 'a' })
   })
 })

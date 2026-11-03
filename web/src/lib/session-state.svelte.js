@@ -48,3 +48,8 @@ export const openSessionLogDir = $state({ path: null, remoteJournal: null, token
 // remoteJournal: { env_id: string, path: string } | null — 会话绑定远程环境且
 //   子端已有 file journal 时，父端 log-dir 响应附带的"软链接"信息（子端会话目录）
 // token: number — 每次点击递增，确保重复打开也能响应
+
+// 客户端工具（AskUser）正在等待用户回答的会话列表：ChatPage 维护，Sidebar 标记。
+// 问题不会因为切会话或切页面而消失，所以需要一个地方让用户看见"哪条会话在等我"。
+export const awaitingUserAnswer = $state({ sessionIds: [] })
+// sessionIds: string[] — 至少有一个未回答 AskUser 问题的会话（按提问先后）
