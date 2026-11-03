@@ -4,7 +4,7 @@
  */
 import { describe, it, expect } from 'vitest'
 import * as fc from 'fast-check'
-import { highlight, escapeHtml } from './highlight.js'
+import { highlight, highlightByLines, escapeHtml } from './highlight.js'
 
 // ---------------------------------------------------------------------------
 // Property Tests
@@ -245,5 +245,70 @@ describe('highlight() unit tests — XSS escaping', () => {
     const result = highlight('a && b', 'bash')
     expect(result).toContain('&amp;')
     expect(result).not.toMatch(/[^&]&[^a]/)
+  })
+})
+
+describe('highlight() unit tests — Python triple-quoted strings', () => {
+  const docstring = ['def f():', '    """', '    doc with def keyword and # hash and 42', '    """', '    x = y'].join('\n')
+
+  it('renders a multi-line triple-quoted string as one hl-docstring span', () => {
+    const result = highlight(docstring, 'python')
+    expect(result).toContain('<span class="hl-docstring">&quot;&quot;&quot;\n    doc with def keyword and # hash and 42\n    &quot;&quot;&quot;</span>')
+  })
+
+  it('does not highlight keywords, comments or numbers inside the docstring', () => {
+    const result = highlight(docstring, 'python')
+    // only the leading "def f():" is a keyword; the docstring body is plain text
+    expect((result.match(/hl-keyword/g) || [])).toHaveLength(1)
+    expect(result).not.toContain('hl-comment')
+    expect(result).not.toContain('hl-number')
+    expect(result).toContain('<span class="hl-keyword">def</span> f():')
+  })
+
+  it("supports ''' triple-single-quoted strings too", () => {
+    const result = highlight("s = '''multi\nline''' # tail", 'python')
+    expect(result).toContain("<span class=\"hl-docstring\">'''multi\nline'''</span>")
+    expect(result).toContain('<span class="hl-comment"># tail</span>')
+  })
+
+  it('single-line strings never span across lines', () => {
+    // An unbalanced quote inside a docstring must not mis-pair quotes on later lines
+    const code = ['"""', 'a " b', '"""', 'slim = {k: v for k in d if k != "frames"}'].join('\n')
+    const result = highlight(code, 'python')
+    expect(result).toContain('<span class="hl-string">&quot;frames&quot;</span>')
+    expect(result).toContain('<span class="hl-keyword">for</span>')
+    const strings = result.match(/<span class="hl-string">[\s\S]*?<\/span>/g) || []
+    expect(strings.every(s => !s.includes('\n'))).toBe(true)
+  })
+})
+
+describe('highlightByLines() unit tests', () => {
+  it('returns one html string per source line', () => {
+    const lines = highlightByLines('a = 1\nb = 2', 'python')
+    expect(lines).toHaveLength(2)
+    expect(lines[0]).toContain('hl-number')
+  })
+
+  it('reopens the docstring span on each line it covers', () => {
+    const lines = highlightByLines('"""\ndoc\ndoc2"""', 'python')
+    expect(lines).toHaveLength(3)
+    expect(lines[0]).toBe('<span class="hl-docstring">&quot;&quot;&quot;</span>')
+    expect(lines[1]).toBe('<span class="hl-docstring">doc</span>')
+    expect(lines[2]).toBe('<span class="hl-docstring">doc2&quot;&quot;&quot;</span>')
+  })
+
+  it('every returned line is standalone valid html (balanced spans)', () => {
+    const code = ['"""', 'doc with def and # and 42', '"""', 'def f(x="a"):', '    return x  # note'].join('\n')
+    for (const line of highlightByLines(code, 'python')) {
+      const opens = (line.match(/<span /g) || []).length
+      const closes = (line.match(/<\/span>/g) || []).length
+      expect(opens).toBe(closes)
+    }
+  })
+
+  it('handles unsupported languages and empty input', () => {
+    expect(highlightByLines('a<b', 'ruby')).toEqual(['a&lt;b'])
+    expect(highlightByLines('', 'python')).toEqual([''])
+    expect(highlightByLines(null, 'python')).toEqual([])
   })
 })

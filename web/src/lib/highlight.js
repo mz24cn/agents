@@ -6,8 +6,8 @@
 const PYTHON_RULES = [
   // Triple-quoted strings / docstrings (highest priority)
   { pattern: /"""[\s\S]*?"""|'''[\s\S]*?'''/g, className: 'hl-docstring' },
-  // Single-line strings
-  { pattern: /"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, className: 'hl-string' },
+  // Single-line strings (must not span lines; escaped newline is allowed)
+  { pattern: /"(?:[^\n"\\]|\\[\s\S])*"|'(?:[^\n'\\]|\\[\s\S])*'/g, className: 'hl-string' },
   // Decorators
   { pattern: /@\w+/g, className: 'hl-decorator' },
   // Comments
@@ -507,26 +507,39 @@ const PYTHON_DOCSTRING_PATTERN = /("""|''')[\s\S]*?\1/
 export function highlightPythonMatches(code) {
   // First pass: mark triple-quoted strings as docstring regions
   const matches = []
+  const docRanges = []
   const docPattern = new RegExp(PYTHON_DOCSTRING_PATTERN.source, 'g')
   let m
   while ((m = docPattern.exec(code)) !== null) {
+    docRanges.push({ start: m.index, end: m.index + m[0].length })
     matches.push({ start: m.index, end: m.index + m[0].length, text: m[0], className: 'hl-docstring' })
   }
 
   // Second pass: apply remaining rules only outside docstring regions
-  const reserved = new Set()
-  for (const d of matches) {
-    for (let i = d.start; i < d.end; i++) reserved.add(i)
+  let di = 0
+  const inDocstring = (index) => {
+    while (di < docRanges.length && docRanges[di].end <= index) di++
+    return di < docRanges.length && index >= docRanges[di].start && index < docRanges[di].end
   }
 
   for (const rule of PYTHON_RULES) {
+    // Docstring regions are already handled by the first pass
+    if (rule.className === 'hl-docstring') continue
     rule.pattern.lastIndex = 0
+    // each rule restarts scanning from the beginning, so the pointer must too
+    di = 0
     let cursor = 0
     while ((m = rule.pattern.exec(code)) !== null) {
-      if (reserved.has(m.index) || m.index < cursor) continue
-      if (m.index + m[0].length > cursor) {
-        matches.push({ start: m.index, end: m.index + m[0].length, text: m[0], className: rule.className })
-        cursor = m.index + m[0].length
+      const end = m.index + m[0].length
+      if (inDocstring(m.index) || m.index < cursor) {
+        // Resume just after this match's start: skipping its whole span would
+        // mis-pair the quotes that follow it
+        if (rule.pattern.lastIndex < m.index + 1) rule.pattern.lastIndex = m.index + 1
+        continue
+      }
+      if (end > cursor) {
+        matches.push({ start: m.index, end, text: m[0], className: rule.className })
+        cursor = end
       }
     }
   }
