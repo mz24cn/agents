@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""online_debugger.py — Python 进程「异常快照 + 只读 inspector + Coder agent 诊断」最小实现。
+"""online_debugger.py — Python 进程「异常快照 + client side tool calls 诊断」最小实现。
 
-接入方式（任何 Python 程序）：
-    import online_debugger as debugger   # 旧调用点写法（debugger.start/report）保持不变
+接入方式（任何 Python 程序，和旧版完全一致）：
+    import online_debugger as debugger
     debugger.start(project="X7991")      # 程序启动时调用一次（幂等）
     ...
     try:
@@ -13,43 +13,53 @@
 
 组成：
 1. 异常快照：沿 exc.__traceback__ 抓每帧的文件/行/函数/源码行/局部变量（截断）。
-   traceback 持有帧对象引用，函数已退出后 f_locals 依然可读，所以快照是"案发瞬间"
-   的真实数据。合成异常（无 __traceback__）退化为抓当前调用栈。
-2. 只读 inspector：标准库 http.server，绑 127.0.0.1，默认端口 51110（占用则自动+1）。
-   GET /（管理首页）/status /threads /frame?fid= /events /event?eid= /help
-   诊断 agent 不需要 MCP，直接用 exec_shell + curl 查询进程实时数据；
-   /eval /setting /redispatch 是管理操作通道（同样只绑回环）。
-3. 诊断闭环：worker（异步）或 report 调用点（sync）把「快照 + inspector 接口说明」
-   拼成 user prompt，POST {agents_url}/v1/infer（agent_ids=["Coder"],
-   workspace=事发源码目录, session_id="new"）。agent 基于现场数据定位根因、必要时
-   直接改码；会话全过程（含每次工具调用）由 agentsvc 按 session_id 落盘备查，
-   最终报告（## 问题 / ## 根因 / ## 修改 / ## 验证/风险 / ## 后续动作）打印到 stdout。
+   traceback 持有帧对象引用，函数已退出后 f_locals 依然可读，所以快照是"案发瞬间"的
+   真实数据。合成异常（无 __traceback__）退化为抓当前调用栈。
+2. 现场查询 = client side tool calls（本版核心改动）：
+   旧版在这里嵌一个只读 HTTP inspector（127.0.0.1:51110），让诊断 agent 用 exec_shell +
+   curl 去查——于是要开端口、要配 CLI 工具、还要防端口占用。现在改成把同样的只读现场接口
+   声明成 **客户端工具**（tool_type="client_side"）随推理请求下发：
+     debugger_status / debugger_events / debugger_event / debugger_frame /
+     debugger_threads / debugger_eval（可选，默认开）
+   服务端只有注册 JSON，没有任何可执行实体；模型一旦调用它们，推理循环**正常退出**并把
+   调用交回本进程，本进程就地读现场执行，再把结果（role="tool" + tool_use_id）连同同一个
+   session_id 再发一次 /v1/infer，服务端按 session id 合并会话历史继续推理。
+   ⇒ 不需要监听任何端口，不需要 exec_shell/CLI/curl；诊断 agent 用它在服务端自己的
+     read_file / search_code / edit_file 读改源码（服务端工具），两条执行侧在同一会话里混用，
+     甚至同一轮并行调用里两边都有（服务端那半在服务端跑，客户端那半交回本进程）。
+3. 诊断闭环：worker（异步）或 report 调用点（sync）把「快照 + 现场工具说明」拼成 user
+   prompt，POST {agents_url}/v1/infer（agent_ids=["Coder"], workspace=事发源码目录,
+   session_id="new"），然后按上面的交回机制反复续跑，直到模型给出最终报告（## 问题 /
+   ## 根因 / ## 修改 / ## 验证/风险 / ## 后续动作）打印到 stdout。会话全程（含每次工具
+   调用）由 agentsvc 按 session_id 落盘备查。
 4. 错误指纹：异常类型 + 栈帧函数序列的 md5，内存 map；同一指纹进程内只派发一次；
    sync 模式额外落一个跨进程冷却文件（~/.debugger_cooldown.json），短命子进程反复
    踩同一坑时不会每次阻塞去诊断。
 
 配置优先级：start() 参数 > 环境变量 > 默认值
     DEBUGGER_ENABLED=0                   整套关闭
-    DEBUGGER_AGENT_ENABLED=0             观察模式：只做快照+inspector，不派发 Coder
-    DEBUGGER_INSPECTOR_PORT=51110
+    DEBUGGER_AGENT_ENABLED=0             观察模式：只做快照，不派发 Coder
     DEBUGGER_AGENTS_URL=http://localhost:7988
     DEBUGGER_AGENT_ID=Coder
+    DEBUGGER_AGENT_ID= + DEBUGGER_MODEL_ID=xxx   不用 agent，直接指定服务端模型
     DEBUGGER_MAX_ROUNDS=30               可选：agent 工具轮数上限；默认不设(null)，由 agent service 自身控制
+    DEBUGGER_HANDOFF_ROUNDS=30           客户端工具交回轮次上限（防会话无限往返）
+    DEBUGGER_STREAM=1                    用 /v1/infer/stream（SSE）跑诊断，默认关（用 /v1/infer）
+    DEBUGGER_EVAL=0                      禁用 debugger_eval（默认允许在本地进程求值表达式）
     DEBUGGER_SYNC=1                      子进程模式：report 就地同步诊断（默认关）
     DEBUGGER_SYNC_TIMEOUT=900            sync 诊断最长等待（秒）
     DEBUGGER_COOLDOWN_SEC=1800           sync 模式同指纹跨进程冷却窗口（秒）
-    DEBUGGER_AGENT_TIMEOUT=1200          单次诊断超时（秒）
+    DEBUGGER_AGENT_TIMEOUT=1200          单次 HTTP 请求超时（秒）
 
 安全/边界：
-- inspector 查询接口只读、只绑回环；/ 首页提供 eval/开关派发/再派发 等管理操作（能改
-  进程状态，仅限本机使用）；handler 自身异常一律吞掉。
+- 现场接口只读为主；唯一"可改进程状态"的是 debugger_eval，默认开启但只在**本进程内**
+  执行（没有任何网络端口暴露它），设 DEBUGGER_EVAL=0 即可关掉。
 - report() 永不抛异常；队列满即丢；诊断线程为 daemon，随主进程退出。
 - 局部变量 repr 截断 200 字符、每帧最多 30 个；conn/cur/self/response 等对象剔除，
   避免大对象与敏感内容进入快照和 prompt。
 """
 
 import hashlib
-import html
 import itertools
 import json
 import linecache
@@ -61,21 +71,22 @@ import time
 import urllib.error
 import urllib.request
 from collections import OrderedDict
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
 
 # ---------------------------------------------------------------- 配置与全局状态
 
 _DEFAULTS = {
     "project": None,
-    "inspector_port": 51110,
-    "inspector_bind": "127.0.0.1",
     "agents_url": "http://localhost:7988",
     "agent_id": "Coder",
+    # agent_id 设为空串时改用这个 model_id（服务端没有配 Coder agent 时也能跑）
+    "model_id": "",
     # 默认不设（null）：不自行指定工具轮数，交由 agent service 自身的次数控制
     "max_rounds": None,
+    "handoff_rounds": 30,
     "agent_timeout": 1200,
     "agent_enabled": True,
+    "eval_enabled": True,
+    "stream": False,
     "max_events": 32,
     "sync": False,          # True：report() 就地同步诊断（短命子进程用）
     "sync_timeout": 900,    # sync 诊断最长等待（秒）
@@ -84,19 +95,18 @@ _DEFAULTS = {
 }
 
 _CFG = dict(_DEFAULTS)
-_CFG["port"] = None          # 实际绑定的 inspector 端口
 _CFG["started"] = None       # epoch 秒
 
 _LOCK = threading.Lock()
 _EVENTS = OrderedDict()      # eid -> event dict（完整快照，traceback 使帧保活）
 _FINGERPRINTS = {}           # fp   -> {"count","first_ts","last_ts","eid","dispatched","reported"}
-_FRAME_CACHE = OrderedDict() # fid  -> {"file","line","func","snap"}（LRU，强引用帧避免 id 复用错帧）
+_FRAME_CACHE = OrderedDict() # fid  -> {"frame","snap"}（LRU，强引用帧避免 id 复用错帧）
 _FRAME_CACHE_MAX = 512
 _QUEUE = queue.Queue(maxsize=64)
 _WORKER_LOCK = threading.Lock()
 _COOLDOWN_LOCK = threading.Lock()
-_STATE = {"started": False, "server": None, "worker": False,
-          "dispatch_ok": 0, "dispatch_fail": 0}
+_STATE = {"started": False, "worker": False,
+          "dispatch_ok": 0, "dispatch_fail": 0, "handoffs": 0}
 
 # 大对象/敏感对象黑名单：不进快照（精确名 + *_conn / *_cursor 这类后缀变体）
 _SKIP_LOCALS = frozenset({
@@ -109,11 +119,19 @@ _SKIP_SUFFIXES = tuple(f"_{t}" for t in _SKIP_LOCALS)
 def _is_skipped_local(name):
     return name in _SKIP_LOCALS or name.endswith(_SKIP_SUFFIXES)
 
+
 # ---------------------------------------------------------------- 小工具
 
 
 def _now():
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+
+def _print(msg):
+    try:
+        print(f"[debugger] {msg}")
+    except Exception:
+        pass
 
 
 def _safe_repr(obj, limit=200):
@@ -136,7 +154,7 @@ def _register_frame(fid, frame, snap):
 
 
 def _capture_frame(frame, lineno=None, max_vars=30):
-    """把一帧序列化成 dict 并注册进 fid 缓存（inspector 可按 fid 复查）。"""
+    """把一帧序列化进 dict，并按 fid 注册（客户端工具可按 fid 复查）。"""
     code = frame.f_code
     if lineno is None:
         lineno = frame.f_lineno
@@ -209,7 +227,6 @@ def _derive_workspace(frames):
     return os.getcwd()
 
 
-
 def report(step, exc):
     """在 except 块里调用：抓异常瞬间快照，按指纹去重后派发（异步入队 / sync 就地）。永不抛异常。"""
     try:
@@ -249,7 +266,7 @@ def report(step, exc):
                 rec["last_ts"] = ts
                 event["count"] = rec["count"]
         if dispatch and _CFG["sync"]:
-            _dispatch_sync(event)   # 子进程：阻塞到诊断结束（进程还活着，现场可实时 curl）
+            _dispatch_sync(event)   # 子进程：阻塞到诊断结束（进程还活着，现场可实时查）
         elif dispatch:
             try:
                 _QUEUE.put_nowait(event)
@@ -263,35 +280,195 @@ def report(step, exc):
         return None
 
 
-def _print(msg):
+# ---------------------------------------------------------------- 现场接口（客户端工具的实现体）
+#
+# 这些函数就是 client side tool 的**本地**实现：模型调用对应工具时，推理循环在
+# 服务端正常退出，调用被交回本进程，由 _execute_client_tool() 就地跑完，再把结果
+# 作为 role="tool" 消息带同一个 session_id 送回。全程没有网络端口。
+
+
+def _status():
+    with _LOCK:
+        n_fp = len(_FINGERPRINTS)
+    return {"pid": os.getpid(), "project": _CFG["project"],
+            "python": sys.version.split()[0],
+            "started": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(_CFG["started"] or 0)),
+            "uptime_sec": int(time.time() - (_CFG["started"] or time.time())),
+            "threads": threading.active_count(),
+            "thread_names": [t.name for t in threading.enumerate()][:40],
+            "cwd": os.getcwd(),
+            "events_stored": len(_EVENTS), "fingerprints": n_fp,
+            "queued": _QUEUE.qsize(),
+            "dispatch_ok": _STATE["dispatch_ok"],
+            "dispatch_fail": _STATE["dispatch_fail"],
+            "client_tool_handoffs": _STATE["handoffs"],
+            "agent": f"{_CFG['agent_id']}@{_CFG['agents_url']}",
+            "max_rounds": _CFG["max_rounds"],      # null = 由 agent service 自身的次数控制
+            "agent_enabled": _CFG["agent_enabled"],
+            "eval_enabled": _CFG["eval_enabled"],
+            "sync": _CFG["sync"]}
+
+
+def _all_threads_snapshot():
+    names = {t.ident: t.name for t in threading.enumerate()}
+    out = []
+    for tid, top in sys._current_frames().items():
+        chain, f = [], top
+        while f is not None and len(chain) < 20:
+            chain.append(_capture_frame(f))
+            f = f.f_back
+        out.append({"tid": tid, "name": names.get(tid, "?"), "frames": chain})  # 栈顶在前
+    return out
+
+
+def _events_summary():
+    with _LOCK:
+        fp_info = {fp: rec["count"] for fp, rec in _FINGERPRINTS.items()}
+        evs = [
+            {"eid": e["eid"], "fingerprint": e["fingerprint"], "step": e["step"],
+             "type": e["type"], "msg": e["msg"][:200], "ts": e["ts"],
+             "count": _FINGERPRINTS.get(e["fingerprint"], {}).get("count", 1),
+             "dispatched": _FINGERPRINTS.get(e["fingerprint"], {}).get("dispatched"),
+             "session_id": e.get("session_id")}
+            for e in _EVENTS.values()
+        ]
+    return {"events": evs, "fingerprints": fp_info}
+
+
+def _frame_snapshot(fid):
+    with _LOCK:
+        hit = _FRAME_CACHE.get(fid)
+        if hit:
+            _FRAME_CACHE.move_to_end(fid)
+    if not hit:
+        return {"error": f"fid={fid} 不在缓存（先从 debugger_event 或 debugger_threads 取）"}
+    return {"fid": fid, "queried_at": _now(), **hit["snap"]}
+
+
+def _eval_expr(expr, fid=""):
+    if not _CFG["eval_enabled"]:
+        return {"ok": False,
+                "error": "debugger_eval 已被 DEBUGGER_EVAL=0 关闭"}
+    if not str(expr or "").strip():
+        return {"ok": False, "error": "expr 必填"}
+    if fid:
+        with _LOCK:
+            hit = _FRAME_CACHE.get(fid)
+            if hit:
+                _FRAME_CACHE.move_to_end(fid)
+        if not hit:
+            return {"ok": False, "error": f"fid={fid} 不在缓存（先从 debugger_event 或 debugger_threads 取）"}
+        fr = hit["frame"]
+        ns = dict(fr.f_globals)
+        ns.update(fr.f_locals)     # 快照帧：函数已退出但 traceback 让 f_locals 保活
+        scope = f"帧 {hit['snap'].get('func')}()@{hit['snap'].get('line')}"
+    else:
+        ns = dict(globals())       # debugger 模块作用域：_EVENTS/_CFG/_STATE 及全部内部函数
+        scope = "debugger 模块作用域"
     try:
-        print(f"[debugger] {msg}")
-    except Exception:
-        pass
+        result = eval(expr, ns)    # 只在本进程内求值；不暴露在任何端口上
+        return {"ok": True, "scope": scope, "expr": expr,
+                "result": _safe_repr(result, 4000)}
+    except Exception as e:
+        return {"ok": False, "scope": scope, "expr": expr,
+                "error": f"{type(e).__name__}: {e}"}
+
+
+# 工具名 -> 处理函数（arguments 已解析为 dict）
+_CLIENT_HANDLERS = {
+    "debugger_status": lambda a: _status(),
+    "debugger_threads": lambda a: {"threads": _all_threads_snapshot()},
+    "debugger_events": lambda a: _events_summary(),
+    "debugger_event": lambda a: (
+        _EVENTS.get(a.get("eid") or "") or {"error": f"eid={a.get('eid')} 不存在或已被环形淘汰"}),
+    "debugger_frame": lambda a: _frame_snapshot(a.get("fid") or ""),
+    "debugger_eval": lambda a: _eval_expr(a.get("expr") or "", a.get("fid") or ""),
+}
+
+# 随推理请求下发的客户端工具注册 JSON（服务端只存这些描述，不执行）
+_CLIENT_TOOLS = [
+    {"name": "debugger_status",
+     "description": "目标进程概况：pid、启动时间、运行时长、线程数、事件数、诊断派发统计",
+     "parameters": {"type": "object", "properties": {}}},
+    {"name": "debugger_events",
+     "description": "已捕获的错误事件列表：eid、指纹、出现次数、是否已派发、session_id",
+     "parameters": {"type": "object", "properties": {}}},
+    {"name": "debugger_event",
+     "description": "某个错误事件的完整快照（异常链 + 各帧 fid/源码行/局部变量）",
+     "parameters": {"type": "object",
+                    "properties": {"eid": {"type": "string", "description": "事件 id"}},
+                    "required": ["eid"]}},
+    {"name": "debugger_frame",
+     "description": "指定 fid 在捕获时刻的局部变量与源码行（异常快照帧同样可查）",
+     "parameters": {"type": "object",
+                    "properties": {"fid": {"type": "string", "description": "帧 id"}},
+                    "required": ["fid"]}},
+    {"name": "debugger_threads",
+     "description": "所有线程当前调用栈；每帧含 fid，可用 debugger_frame 复查其局部变量",
+     "parameters": {"type": "object", "properties": {}}},
+    {"name": "debugger_eval",
+     "description": "在目标进程内求值一个 Python 表达式（fid 给了就在该快照帧作用域求值，"
+                    "否则在 debugger 模块作用域）；只读用途为主",
+     "parameters": {"type": "object",
+                    "properties": {"expr": {"type": "string", "description": "表达式"},
+                                   "fid": {"type": "string", "description": "可选：快照帧 id"}},
+                    "required": ["expr"]}},
+]
+
+
+def _client_tools_payload():
+    """本次会话要下发的客户端工具定义（DEBUGGER_EVAL=0 时连描述都不给）。"""
+    if _CFG["eval_enabled"]:
+        return list(_CLIENT_TOOLS)
+    return [t for t in _CLIENT_TOOLS if t["name"] != "debugger_eval"]
+
+
+def _execute_client_tool(name, arguments):
+    """本地执行一个客户端工具调用，返回结果字符串（作为 role="tool" 内容回传）。"""
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments or "{}")
+        except ValueError:
+            arguments = {}
+    if not isinstance(arguments, dict):
+        arguments = {}
+    handler = _CLIENT_HANDLERS.get(name)
+    if handler is None:
+        return json.dumps({"error": f"本进程未实现客户端工具 {name}"}, ensure_ascii=False)
+    try:
+        payload = handler(arguments)
+    except Exception as e:  # 现场查询失败也要正常回答这次调用
+        payload = {"error": f"{type(e).__name__}: {e}"}
+    return json.dumps(payload, ensure_ascii=False, default=str)
 
 
 # ---------------------------------------------------------------- Coder agent 调用
 
-_SKILL_TMPL = """你是运行时故障诊断代理，代号 {agent_id}。目标程序 {project}（pid={pid}，启动于 {started}）内置了一个只读 HTTP inspector，基址 http://127.0.0.1:{port}。诊断必须基于它返回的第一手现场数据，不要凭空推理。
+_SKILL_TMPL = """你是运行时故障诊断代理，代号 {agent_id}。目标程序 {project}（pid={pid}，启动于 {started}）\
+内置了 debugger，把「进程现场查询」以 **client side tool calls** 的形式提供给你：这些工具在服务端\
+只有注册 JSON、不会由服务端执行，你调用它们时推理循环会正常结束，由目标进程就地执行并把结果回传到\
+同一个会话（session_id={sid_preview}）继续。诊断必须基于这些工具返回的第一手现场数据，不要凭空推理。
 
-接口（全部 GET，返回 JSON）：
-  /status                       进程概况与统计
-  /threads                      所有线程当前调用栈；每帧含 fid，可用 /frame 复查其局部变量
-  /frame?fid=<fid>              指定帧在捕获时刻的局部变量与源码行（异常快照帧同样可查）
-  /events                       已捕获错误事件列表：eid、指纹、出现次数、是否已派发
-  /event?eid=<eid>              某错误的完整快照（含各帧 fid）
-  /help                         以上接口说明
-示例：
-  curl -s http://127.0.0.1:{port}/events
-  curl -s "http://127.0.0.1:{port}/event?eid={eid}"
-  curl -s "http://127.0.0.1:{port}/frame?fid=7f8e9a0b1c2d"
+可用现场工具（就在本会话的工具列表里）：
+  debugger_status                      进程概况与统计
+  debugger_events                      已捕获错误事件列表：eid、指纹、出现次数、是否已派发
+  debugger_event(eid)                  某错误的完整快照（含各帧 fid）
+  debugger_frame(fid)                  指定帧在捕获时刻的局部变量与源码行（异常快照帧同样可查）
+  debugger_threads                     所有线程当前调用栈；每帧含 fid，可用 debugger_frame 复查局部变量
+  debugger_eval(expr[, fid])           在目标进程内求值表达式（fid 给了就在该帧作用域，否则在 debugger 模块作用域）
+示例子任务：
+  先 debugger_event(eid="{eid}") 读全量快照，缺什么现场数据就再调 debugger_frame(fid=...) 或\
+  debugger_eval（允许多轮，缺什么补什么）。
 说明：局部变量 repr 截断到 200 字符、每帧最多 30 个；conn/cur/self/response 等对象被剔除；
-快照是异常瞬间的数据；线程实时状态用 /threads 现抓现查；inspector 只读，不会改变进程状态。
-工作区：本次会话 workspace 已设为 {workspace}，exec_shell 的 cwd 以及 read_file/search_code/
-edit_file 都在该目录下工作，源码请直接读文件，不必经 inspector。
+快照是异常瞬间的数据；线程实时状态用 debugger_threads 现抓现查；现场查询只读，不会改变进程状态
+（eval 除外，它只在本进程内求值）。
+工作区：本次会话 workspace 已设为 {workspace}，你在服务端自己的工具（exec_shell 的 cwd、
+read_file/search_code/edit_file）都在该目录下工作，源码请直接读文件，不必经 debugger。
+注意：服务端工具（read_file/search_code/edit_file/exec_shell）由服务端执行，现场工具由目标进程执行，
+两者可以在同一轮并行调用里混用。
 
 任务：
-1) 先读下方异常快照，缺什么现场数据就 curl 补什么（允许多轮）。
+1) 先读下方异常快照，缺什么现场数据就用现场工具补什么（允许多轮）。
 2) 用 read_file / search_code 阅读涉事源码，定位根因。
 3) 处置规则：
    - 代码缺陷且有把握修复：用 edit_file 直接做最小化修改（改动文件即可，勿重启进程）。
@@ -324,7 +501,7 @@ def _build_prompt(event):
         project=event.get("project") or "?",
         pid=event.get("pid"),
         started=time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(_CFG["started"] or time.time())),
-        port=_CFG["port"],
+        sid_preview="(首次请求后由服务端分配)",
         eid=event["eid"],
         step=event["step"],
         snapshot=json.dumps(slim, ensure_ascii=False, indent=1),
@@ -332,61 +509,201 @@ def _build_prompt(event):
     )
 
 
-def _call_agent(prompt, workspace):
-    """POST {agents_url}/v1/infer（非流式），返回 (ok, 最终文本或错误, session_id)。"""
-    payload = {
-        "agent_ids": [_CFG["agent_id"]],
-        # 必须用 messages：agent 带 system_prompt 时服务端会组装 messages，
-        # 裸 text 字段会被空 messages 挤掉（上游报 "no user query found"）。
-        "messages": [{"role": "user", "content": prompt}],
-        # 工作区 = 事发源码所在目录，agent 的 exec_shell(cwd)/search_code/read_file 都锚定到这里
-        "workspace": workspace,
-        # "new"：让 agentsvc 新建会话并完整记录全过程（含每轮工具调用）。非流式与
-        # 流式共用服务端同一条推理管线：输入轮在推理开始前就落盘、每个完整轮次增量
-        # 落盘，所以跑的过程中就能凭 id 在 Web 侧回查这条会话，必要时也能用
-        # POST /v1/infer/abort 把它停掉（诊断跑几十分钟时很值钱）。
-        "session_id": "new",
-    }
-    # max_rounds 为 null 时不带 max_tool_rounds：推理循环次数交给 agent service 自身
-    # 决定（服务端是 body.get("max_tool_rounds") or env_int("MAX_TOOL_ROUNDS", 200)）。
-    if _CFG["max_rounds"]:
-        payload["max_tool_rounds"] = int(_CFG["max_rounds"])
+def _post_json(path, payload):
+    """POST {agents_url}{path} 非流式，返回 (status, dict)。"""
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
-        url=f"{_CFG['agents_url']}/v1/infer", data=body,
+        url=f"{_CFG['agents_url']}{path}", data=body,
         headers={"Content-Type": "application/json"}, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=_CFG["agent_timeout"]) as r:
-            data = json.loads(r.read().decode("utf-8", "replace"))
+            return r.status, json.loads(r.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as e:
         # 500 也带 JSON 信封：失败或被中止的推理如今同样完整落盘，所以能从响应体
         # 里拿回 session_id，用户可以到 Web 侧打开这条会话看它跑到的最后一个轮次。
-        raw = ""
-        sid = None
         try:
             raw = e.read().decode("utf-8", "replace")
         except Exception:
             raw = ""
         try:
             parsed = json.loads(raw)
-            sid = parsed.get("session_id")
-            raw = str(parsed.get("error") or raw)
         except Exception:
-            pass
-        return False, f"HTTP {e.code} {raw[:800]}", sid
+            parsed = {}
+        return e.code, parsed or {"error": raw[:800]}
     except Exception as e:
-        return False, f"调用 {_CFG['agents_url']}/v1/infer 失败: {e!r}", None
-    sid = data.get("session_id")
-    if not data.get("success", True):
-        return False, str(data.get("error"))[:2000], sid
+        return 0, {"error": f"调用 {_CFG['agents_url']}{path} 失败: {e!r}"}
+
+
+def _post_stream(path, payload):
+    """POST {agents_url}{path} 走 SSE，把流重建成与 /v1/infer 同构的信封。
+
+    交回的客户端工具调用有两个来源：服务端显式的 status=client_tool_calls 帧，以及
+    "按工具名识别 + 本轮没有 tool 结果回应它"的兜底判定（并行调用里服务端那半有结果）。
+    """
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url=f"{_CFG['agents_url']}{path}", data=body,
+        headers={"Content-Type": "application/json"}, method="POST")
+    envelope = {"messages": [], "client_tool_calls": []}
+    client_tool_names = {t["name"] for t in _client_tools_payload()}
+    announced, answered, reported = [], set(), []
+    try:
+        with urllib.request.urlopen(req, timeout=_CFG["agent_timeout"]) as r:
+            for line in r:
+                line = line.decode("utf-8", "replace").strip()
+                if not line.startswith("data: ") or line == "data: [DONE]":
+                    continue
+                try:
+                    frame = json.loads(line[6:])
+                except ValueError:
+                    continue
+                if frame.get("session_id"):
+                    envelope["session_id"] = frame["session_id"]
+                role = frame.get("role")
+                if role == "assistant" and frame.get("tool_calls"):
+                    announced.extend(_merge_tool_call_frames(frame["tool_calls"]))
+                elif role == "tool":
+                    answered.add(frame.get("tool_use_id"))
+                elif (role == "status"
+                      and frame.get("status") == "client_tool_calls"):
+                    reported = frame.get("client_tool_calls") or []
+                if not role:
+                    continue   # init / usage 等控制帧不是 message
+                # 正文是分帧下发的：把连续的 assistant 帧拼成一条，才能拿到完整报告
+                prev = envelope["messages"][-1] if envelope["messages"] else None
+                if (role == "assistant" and not frame.get("tool_calls")
+                        and prev is not None and prev.get("role") == "assistant"
+                        and not prev.get("tool_calls")):
+                    prev["content"] = (prev.get("content") or "") + (frame.get("content") or "")
+                    if frame.get("thinking"):
+                        prev["thinking"] = (prev.get("thinking") or "") + frame["thinking"]
+                    continue
+                envelope["messages"].append(dict(frame))
+    except urllib.error.HTTPError as e:
+        try:
+            raw = e.read().decode("utf-8", "replace")
+        except Exception:
+            raw = ""
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            parsed = {}
+        return e.code, parsed or {"error": raw[:800]}
+    except Exception as e:
+        return 0, {"error": f"调用 {_CFG['agents_url']}{path} 失败: {e!r}"}
+    envelope["success"] = True
+    envelope["client_tool_calls"] = reported or [
+        c for c in announced if c["name"] in client_tool_names and c["id"] not in answered
+    ]
+    return 200, envelope
+
+
+def _merge_tool_call_frames(calls):
+    """把流式 assistant 帧里被切碎的工具调用片段拼回完整调用（按 _index 归并）。"""
+    merged = OrderedDict()
+    for index, call in enumerate(calls):
+        key = call.get("_index")
+        if key is None:
+            key = call.get("index")
+        if key is None:
+            key = call.get("id") or index
+        slot = merged.setdefault(key, {"id": None, "name": "", "arguments": ""})
+        if call.get("id"):
+            slot["id"] = call["id"]
+        nested = call.get("function") or {}
+        name = call.get("name") or nested.get("name")
+        if name:
+            slot["name"] += name
+        arguments = call.get("arguments")
+        if arguments is None:
+            arguments = nested.get("arguments")
+        if isinstance(arguments, dict):
+            arguments = json.dumps(arguments, ensure_ascii=False)
+        if arguments:
+            slot["arguments"] += arguments
+    return [c for c in merged.values() if c["name"] or c["id"]]
+
+
+def _identity_payload() -> dict:
+    """以哪个身份跑：agent（带它自己的 system prompt 与服务端工具）或裸 model_id。
+
+    DEBUGGER_AGENT_ID= （空）+ DEBUGGER_MODEL_ID=xxx 可以不要 agent，直接指定模型；
+    这种情况下服务端工具就只有请求里 tool_ids 给的那些。
+    """
+    if _CFG["agent_id"]:
+        return {"agent_ids": [_CFG["agent_id"]]}
+    return {"model_id": _CFG["model_id"]}
+
+
+def _call_agent(prompt, workspace):
+    """跑完整诊断闭环（含多轮客户端工具交回），返回 (ok, 最终文本或错误, session_id)。"""
+    payload = {
+        **_identity_payload(),
+        # 必须用 messages：agent 带 system_prompt 时服务端会组装 messages，
+        # 裸 text 字段会被空 messages 挤掉（上游报 "no user query found"）。
+        "messages": [{"role": "user", "content": prompt}],
+        # 工作区 = 事发源码所在目录，agent 在服务端的 exec_shell(cwd)/search_code/read_file 都锚定这里
+        "workspace": workspace,
+        # "new"：让 agentsvc 新建会话并完整记录全过程（含每轮工具调用）。非流式与
+        # 流式共用服务端同一条推理管线：输入轮在推理开始前就落盘、每个完整轮次增量
+        # 落盘，所以跑的过程中就能凭 id 在 Web 侧回查这条会话，必要时也能用
+        # POST /v1/infer/abort 把它停掉（诊断跑几十分钟时很值钱）。
+        "session_id": "new",
+        # 客户端工具：只随本次会话下发，不进服务端 ToolRegistry（GET /v1/tools 查不到），
+        # 服务端也不会执行它们；后续续跑请求不必重复带，服务端按 session 记录继续可见。
+        "client_tools": _client_tools_payload(),
+    }
+    # max_rounds 为 null 时不带 max_tool_rounds：推理循环次数交给 agent service 自身
+    # 决定（服务端是 body.get("max_tool_rounds") or env_int("MAX_TOOL_ROUNDS", 200)）。
+    if _CFG["max_rounds"]:
+        payload["max_tool_rounds"] = int(_CFG["max_rounds"])
+
+    session_id = None
     final = None
-    for m in data.get("messages") or []:
-        if m.get("role") == "assistant" and (m.get("content") or "").strip():
-            final = m["content"]
-    if final is None:
-        return False, "agent 无最终文本回复: " + json.dumps(
-            (data.get("messages") or [])[-1:], ensure_ascii=False)[:1500], sid
-    return True, final, sid
+    handoff_round = 0
+    path = "/v1/infer/stream" if _CFG["stream"] else "/v1/infer"
+    while True:
+        status, data = (_post_stream(path, payload) if _CFG["stream"]
+                        else _post_json(path, payload))
+        session_id = data.get("session_id") or session_id
+        if status != 200:
+            return False, str(data.get("error") or f"HTTP {status}")[:2000], session_id
+        for m in data.get("messages") or []:
+            if m.get("role") == "assistant" and (m.get("content") or "").strip():
+                final = m["content"]
+        pending = data.get("client_tool_calls") or []
+        if not pending:
+            if final is None:
+                return False, "agent 无最终文本回复: " + json.dumps(
+                    (data.get("messages") or [])[-1:], ensure_ascii=False)[:1500], session_id
+            return True, final, session_id
+
+        # 模型调用了客户端工具：本进程就地执行，结果 + session id 再请求一次推理会话。
+        handoff_round += 1
+        with _LOCK:
+            _STATE["handoffs"] += 1
+        if handoff_round > int(_CFG["handoff_rounds"]):
+            return False, (f"客户端工具交回轮次超过 {int(_CFG['handoff_rounds'])} 次，"
+                           f"中止（session_id={session_id}）"), session_id
+        results = []
+        for call in pending:
+            results.append({
+                "role": "tool",
+                "name": call.get("name"),
+                "tool_use_id": call.get("id"),
+                "content": _execute_client_tool(call.get("name"), call.get("arguments")),
+            })
+        payload = {
+            **_identity_payload(),
+            "workspace": workspace,
+            "session_id": session_id,
+            # 工具集要和首轮一致（服务端不替请求补工具）；client_tools 重复带一次最
+            # 稳妥——服务端也会从会话记录里恢复，显式带上则不依赖会话 meta 的存续。
+            "client_tools": _client_tools_payload(),
+            "messages": results,
+        }
+        if _CFG["max_rounds"]:
+            payload["max_tool_rounds"] = int(_CFG["max_rounds"])
 
 
 # ---------------------------------------------------------------- sync 模式跨进程冷却
@@ -449,7 +766,7 @@ def _run_diagnosis(ev, box=None):
         ev["session_id"] = sid
         ev["dispatched_at"] = _now()
     _print(f"eid={ev['eid']} fp={fp} 诊断{'完成' if ok else '失败'} "
-           f"session_id={sid or '?'}")
+           f"session_id={sid or '?'} 本地工具执行={_STATE['handoffs']} 次")
     _print("——诊断报告——\n" + str(text)[:2000] + "\n——报告结束——")
     if box is not None:
         box.update({"ok": ok, "text": text, "session_id": sid})
@@ -457,7 +774,7 @@ def _run_diagnosis(ev, box=None):
 
 def _dispatch_sync(ev):
     """在独立线程里跑诊断并 join 等待：超时也要放行，主进程不能因诊断挂死。
-    等待期间进程保持存活，inspector 在线，agent 可以实时 curl 现场。"""
+    等待期间进程保持存活，现场工具可被实时查询（模型每调一次都由本进程就地执行）。"""
     if _cooldown_hit(ev["fingerprint"]):
         return
     box = {}
@@ -467,7 +784,7 @@ def _dispatch_sync(ev):
     t.join(max(30, _CFG["sync_timeout"]))
     if t.is_alive():
         _print(f"eid={ev['eid']} 同步诊断超过 {_CFG['sync_timeout']}s 未返回，"
-               f"放弃等待（进程继续退出，inspector 随之消失）")
+               f"放弃等待（进程继续退出，现场工具随之不可用）")
 
 
 def _worker_loop():
@@ -492,275 +809,45 @@ def _start_worker():
                      daemon=True).start()
 
 
-# ---------------------------------------------------------------- inspector (http.server)
-
-
-class _HttpError(Exception):
-    def __init__(self, code, payload):
-        self.code, self.payload = code, payload
-
-
-def _all_threads_snapshot():
-    names = {t.ident: t.name for t in threading.enumerate()}
-    me = threading.get_ident()
-    out = []
-    for tid, top in sys._current_frames().items():
-        chain, f = [], top
-        while f is not None and len(chain) < 20:
-            chain.append(_capture_frame(f))
-            f = f.f_back
-        out.append({"tid": tid, "name": names.get(tid, "?"),
-                    "is_inspector_handler": tid == me,
-                    "frames": chain})  # 栈顶在前
-    return out
-
-
-def _events_summary():
-    with _LOCK:
-        fp_info = {fp: rec["count"] for fp, rec in _FINGERPRINTS.items()}
-        evs = [
-            {"eid": e["eid"], "fingerprint": e["fingerprint"], "step": e["step"],
-             "type": e["type"], "msg": e["msg"][:200], "ts": e["ts"],
-             "count": _FINGERPRINTS.get(e["fingerprint"], {}).get("count", 1),
-             "dispatched": _FINGERPRINTS.get(e["fingerprint"], {}).get("dispatched"),
-             "session_id": e.get("session_id")}
-            for e in _EVENTS.values()
-        ]
-    return {"events": evs, "fingerprints": fp_info}
-
-
-def _h_eval(query):
-    expr = (query.get("expr") or [""])[0]
-    fid = (query.get("fid") or [""])[0]
-    if not expr.strip():
-        raise _HttpError(400, {"error": "expr 必填"})
-    if fid:
-        with _LOCK:
-            hit = _FRAME_CACHE.get(fid)
-            if hit:
-                _FRAME_CACHE.move_to_end(fid)
-        if not hit:
-            raise _HttpError(404, {"error": f"fid={fid} 不在缓存（先从 /event 或 /threads 取）"})
-        fr = hit["frame"]
-        ns = dict(fr.f_globals)
-        ns.update(fr.f_locals)     # 快照帧：函数已退出但 traceback 让 f_locals 保活
-        snap = hit["snap"]
-        scope = f"帧 {snap.get('func')}()@{snap.get('line')}"
-    else:
-        ns = dict(globals())       # debugger 模块作用域：可用 _EVENTS/_CFG/_STATE 及全部内部函数
-        scope = "debugger 模块作用域"
-    try:
-        result = eval(expr, ns)    # 管理入口：只绑 127.0.0.1，运行任意表达式是有意的
-        return {"ok": True, "scope": scope, "expr": expr,
-                "result": _safe_repr(result, 4000)}
-    except Exception as e:
-        return {"ok": False, "scope": scope, "expr": expr,
-                "error": f"{type(e).__name__}: {e}"}
-
-
-def _h_setting(query):
-    v = (query.get("agent_enabled") or [""])[0]
-    if v not in ("0", "1"):
-        raise _HttpError(400, {"error": "当前仅支持 agent_enabled=0|1"})
-    _CFG["agent_enabled"] = v == "1"
-    if _CFG["agent_enabled"] and not _CFG["sync"]:
-        _start_worker()
-    _print(f"agent_enabled -> {_CFG['agent_enabled']}")
-    return {"ok": True, "agent_enabled": _CFG["agent_enabled"],
-            "sync": _CFG["sync"]}
-
-
-def _h_redispatch(query):
-    eid = (query.get("eid") or [""])[0]
-    with _LOCK:
-        ev = _EVENTS.get(eid)
-    if not ev:
-        raise _HttpError(404, {"error": f"eid={eid} 不存在或已被环形淘汰"})
-    if _CFG["sync"]:
-        threading.Thread(target=_run_diagnosis, args=(ev,),
-                         name="debugger-redispatch", daemon=True).start()
-        return {"ok": True, "eid": eid, "mode": "sync-thread"}
-    _start_worker()
-    try:
-        _QUEUE.put_nowait(ev)
-    except queue.Full:
-        raise _HttpError(503, {"error": "诊断队列已满"})
-    return {"ok": True, "eid": eid, "mode": "queued"}
-
-
-def _index_html():
-    esc = html.escape
-    st = _route("/status", {})
-    rows = []
-    for e in _events_summary()["events"]:
-        cells = [e["ts"][:19], e["eid"], str(e["step"]), e["type"],
-                 (e["msg"] or "")[:80], str(e["count"]),
-                 "已派发" if e["dispatched"] else "未",
-                 e.get("session_id") or ""]
-        ops = (f"<a href='/event?eid={e['eid']}'>快照</a> "
-               f"<a href='/redispatch?eid={e['eid']}'>再诊断</a>")
-        rows.append("<tr><td>" + "</td><td>".join(esc(c) for c in cells)
-                    + f"</td><td>{ops}</td></tr>")
-    table = ("<table><tr><th>时间</th><th>eid</th><th>步骤</th><th>类型</th><th>消息</th>"
-             "<th>次数</th><th>诊断</th><th>session_id</th><th>操作</th></tr>"
-             + ("".join(rows) or "<tr><td colspan=9>（暂无事件）</td></tr>") + "</table>")
-    toggle = ("<a href='/setting?agent_enabled=0'>■ 关闭诊断派发</a>"
-              if _CFG["agent_enabled"] else
-              "<a href='/setting?agent_enabled=1'>▶ 启动诊断派发</a>")
-    css = ("body{font-family:system-ui,sans-serif;margin:24px;background:#fafafa;color:#222}"
-           "table{border-collapse:collapse;background:#fff}"
-           "td,th{border:1px solid #ddd;padding:4px 8px;font-size:13px}"
-           "input[type=text]{padding:4px}input[type=submit]{padding:4px 16px}"
-           ".warn{color:#a33}")
-    return (f"<!doctype html><meta charset='utf-8'>"
-            f"<title>debugger · {esc(str(st['project']))}</title><style>{css}</style>"
-            f"<h2>debugger — {esc(str(st['project']))}</h2>"
-            f"<p>pid={st['pid']} · {esc(str(st['python']))} · "
-            f"inspector :{st['inspector_port']} · 运行 {st['uptime_sec']}s · "
-            f"线程 {st['threads']}<br>"
-            f"agent={esc(str(st['agent']))} · 派发 ok {st['dispatch_ok']} / fail {st['dispatch_fail']}"
-            f" · 队列 {st['queued']} · 指纹 {st['fingerprints']} · 事件 {st['events_stored']}"
-            f" · 模式 <b>{'sync' if st['sync'] else 'async'}</b>"
-            f" · 诊断开关 <b>{st['agent_enabled']}</b>　{toggle}</p>"
-            f"<h3>错误事件</h3>{table}"
-            f"<h3>表达式求值（eval）</h3>"
-            f"<form method='get' action='/eval'>"
-            f"<input type='text' name='expr' size='70' required "
-            f"placeholder='如 len(_EVENTS) 或 _CFG[&quot;agents_url&quot;]'> "
-            f"<input type='text' name='fid' size='16' placeholder='fid 可选'>"
-            f"<input type='submit' value='执行'></form>"
-            f"<p class='warn'>eval 在目标进程内执行任意表达式（可读可改）；"
-            f"填 fid 时在该快照帧的作用域求值（局部变量可用），留空则在 debugger 模块作用域。</p>"
-            f"<p><a href='/help'>接口</a> · <a href='/status'>status</a> · "
-            f"<a href='/threads'>线程实时栈</a></p>")
-
-
-def _route(path, query):
-    if path == "/status":
-        with _LOCK:
-            n_fp = len(_FINGERPRINTS)
-        return {"pid": os.getpid(), "project": _CFG["project"],
-                "python": sys.version.split()[0],
-                "inspector_port": _CFG["port"],
-                "started": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(_CFG["started"] or 0)),
-                "uptime_sec": int(time.time() - (_CFG["started"] or time.time())),
-                "threads": threading.active_count(),
-                "events_stored": len(_EVENTS), "fingerprints": n_fp,
-                "queued": _QUEUE.qsize(),
-                "dispatch_ok": _STATE["dispatch_ok"],
-                "dispatch_fail": _STATE["dispatch_fail"],
-                "agent": f"{_CFG['agent_id']}@{_CFG['agents_url']}",
-                "max_rounds": _CFG["max_rounds"],   # null = 由 agent service 自身的次数控制
-                "agent_enabled": _CFG["agent_enabled"], "sync": _CFG["sync"]}
-    if path == "/threads":
-        return {"threads": _all_threads_snapshot()}
-    if path == "/frame":
-        fid = (query.get("fid") or [""])[0]
-        with _LOCK:
-            hit = _FRAME_CACHE.get(fid)
-            if hit:
-                _FRAME_CACHE.move_to_end(fid)
-        if not hit:
-            raise _HttpError(404, {"error": f"fid={fid} 不在缓存（先调 /threads 或 /event 注册）"})
-        return {"fid": fid, "captured_at": time.time(), **hit["snap"]}
-    if path == "/events":
-        return _events_summary()
-    if path == "/event":
-        eid = (query.get("eid") or [""])[0]
-        with _LOCK:
-            ev = _EVENTS.get(eid)
-        if not ev:
-            raise _HttpError(404, {"error": f"eid={eid} 不存在或已被环形淘汰"})
-        return ev
-    if path == "/eval":
-        return _h_eval(query)
-    if path == "/setting":
-        return _h_setting(query)
-    if path == "/redispatch":
-        return _h_redispatch(query)
-    if path == "/help":
-        return {"endpoints": ["/ (管理首页 HTML)", "/status", "/threads",
-                              "/frame?fid=<fid>", "/events", "/event?eid=<eid>",
-                              "/eval?expr=<expr>[&fid=<fid>]",
-                              "/setting?agent_enabled=0|1",
-                              "/redispatch?eid=<eid>", "/help"],
-                "note": "查询接口只读；eval/setting/redispatch 是管理通道（仅 127.0.0.1）"}
-    raise _HttpError(404, {"error": f"未知路径 {path}，试试 /help"})
-
-
-class _Handler(BaseHTTPRequestHandler):
-    def _send(self, status, body, ctype):
-        try:
-            self.send_response(status)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        except Exception:
-            pass  # 客户端断开等，静默
-
-    def do_GET(self):  # noqa: N802
-        parsed = urlparse(self.path)
-        if parsed.path == "/":
-            try:
-                self._send(200, _index_html().encode("utf-8"),
-                           "text/html; charset=utf-8")
-            except Exception as e:
-                self._send(500, f"首页渲染失败: {e!r}".encode("utf-8"),
-                           "text/plain; charset=utf-8")
-            return
-        try:
-            payload = _route(parsed.path, parse_qs(parsed.query))
-            status = 200
-        except _HttpError as e:
-            status, payload = e.code, e.payload
-        except Exception as e:
-            status, payload = 500, {"error": f"inspector 内部错误: {e!r}"}
-        self._send(status,
-                   json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8"),
-                   "application/json; charset=utf-8")
-
-    def log_message(self, *args):  # 静音访问日志
-        pass
-
-
-def _pick_port(bind, base):
-    for p in range(base, base + 16):
-        try:
-            srv = ThreadingHTTPServer((bind, p), _Handler)
-            return srv, p
-        except OSError:
-            continue
-    raise OSError(f"端口 {base}..{base + 15} 全部不可用")
-
-
 # ---------------------------------------------------------------- 启动入口
 
 
-def start(project=None, inspector_port=None, agents_url=None, agent_id=None,
-          agent_enabled=None, sync=None, max_rounds=None, **kwargs):
-    """启动 inspector + 诊断通道；幂等。sync=True 时 report() 就地同步诊断
-    （短命子进程用，不常驻 worker），否则后台 worker 异步派发。
-    max_rounds=None（默认）不自行指定推理循环次数，由 agent service 自身的次数控制决定。"""
+def start(project=None, agents_url=None, agent_id=None, model_id=None,
+          agent_enabled=None, sync=None, max_rounds=None, stream=None,
+          eval_enabled=None, handoff_rounds=None, **kwargs):
+    """启动诊断通道（幂等）。sync=True 时 report() 就地同步诊断（短命子进程用，
+    不常驻 worker），否则后台 worker 异步派发。
+    max_rounds=None（默认）不自行指定工具轮数，由 agent service 自身的次数控制决定；
+    stream=True 用 /v1/infer/stream 跑诊断；eval_enabled=False 连 debugger_eval 的
+    注册 JSON 都不下发（现场工具只剩只读那几个）。"""
     if _STATE["started"]:
         return True
-    if os.environ.get("DEBUGGER_ENABLED", "1") == "0":
-        return False
     with _LOCK:
         if _STATE["started"]:
             return True
         _CFG["project"] = project or os.path.basename(os.getcwd())
-        _CFG["inspector_port"] = int(inspector_port or os.environ.get(
-            "DEBUGGER_INSPECTOR_PORT", _DEFAULTS["inspector_port"]))
         _CFG["agents_url"] = (agents_url or os.environ.get(
             "DEBUGGER_AGENTS_URL") or _DEFAULTS["agents_url"]).rstrip("/")
-        _CFG["agent_id"] = agent_id or os.environ.get(
-            "DEBUGGER_AGENT_ID", _DEFAULTS["agent_id"])
+        # agent_id 传空串（或 DEBUGGER_AGENT_ID=）表示不用 agent，改走 DEBUGGER_MODEL_ID
+        _CFG["agent_id"] = (
+            agent_id if agent_id is not None
+            else os.environ.get("DEBUGGER_AGENT_ID", _DEFAULTS["agent_id"])
+        ) or ""
+        _CFG["model_id"] = model_id or os.environ.get(
+            "DEBUGGER_MODEL_ID", _DEFAULTS["model_id"])
+        if not _CFG["agent_id"] and not _CFG["model_id"]:
+            _CFG["agent_id"] = _DEFAULTS["agent_id"]  # 两者都没给，回到默认 agent
         # max_rounds：start 参数 > 环境变量 > 默认(null)；null 或非法值都不带 max_tool_rounds，
         # 推理循环次数交给 agent service 自身的次数控制（它有自己的默认/环境变量）。
         _rounds = max_rounds if max_rounds is not None else os.environ.get("DEBUGGER_MAX_ROUNDS", "")
         _CFG["max_rounds"] = int(_rounds) if str(_rounds).strip().isdigit() else None
-        _CFG["agent_timeout"] = int(os.environ.get("DEBUGGER_AGENT_TIMEOUT", _DEFAULTS["agent_timeout"]))
+        _CFG["agent_timeout"] = int(os.environ.get(
+            "DEBUGGER_AGENT_TIMEOUT", _DEFAULTS["agent_timeout"]))
+        _CFG["handoff_rounds"] = int(handoff_rounds or os.environ.get(
+            "DEBUGGER_HANDOFF_ROUNDS", _DEFAULTS["handoff_rounds"]))
+        _CFG["stream"] = bool(stream) or os.environ.get("DEBUGGER_STREAM", "") == "1"
+        _CFG["eval_enabled"] = not (
+            eval_enabled is False or os.environ.get("DEBUGGER_EVAL", "") == "0")
         _CFG["sync"] = bool(sync) or os.environ.get("DEBUGGER_SYNC", "") == "1"
         _CFG["sync_timeout"] = int(os.environ.get(
             "DEBUGGER_SYNC_TIMEOUT", _DEFAULTS["sync_timeout"]))
@@ -772,24 +859,15 @@ def start(project=None, inspector_port=None, agents_url=None, agent_id=None,
             _CFG["agent_enabled"] = bool(agent_enabled)
         if os.environ.get("DEBUGGER_AGENT_ENABLED") == "0":
             _CFG["agent_enabled"] = False  # 观察模式
-        try:
-            srv, port = _pick_port(_CFG["inspector_bind"], _CFG["inspector_port"])
-        except Exception as e:
-            _print(f"inspector 启动失败: {e!r}（诊断快照功能降级为仅入队）")
-            srv, port = None, None
-        _CFG["port"] = port
         _CFG["started"] = time.time()
-        _STATE["server"] = srv
         _STATE["started"] = True
-        if srv is not None:
-            t = threading.Thread(target=srv.serve_forever,
-                                 name="debugger-inspector", daemon=True)
-            t.start()
         if _CFG["agent_enabled"] and not _CFG["sync"]:
             _start_worker()
-    _print(f"已启动：inspector=http://{_CFG['inspector_bind']}:{port} "
-           f"agent={_CFG['agent_id']}@{_CFG['agents_url']} "
+    _print(f"已启动：agent={_CFG['agent_id']}@{_CFG['agents_url']} "
+           f"现场接口=client side tool calls（{len(_client_tools_payload())} 个，无监听端口） "
            f"轮数上限={_CFG['max_rounds'] or 'agent service 自身默认'} "
+           f"交回轮数上限={_CFG['handoff_rounds']} "
+           f"通道={'流式' if _CFG['stream'] else '非流式'} "
            f"模式={'同步' if _CFG['sync'] else '异步'} "
            f"诊断={'开' if _CFG['agent_enabled'] else '关(仅现场快照)'}")
     return True
