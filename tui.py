@@ -5,6 +5,7 @@ Implements the frozen flow of ``docs/tui-contract.md`` §4.4:
 
     python tui.py [--port N] [--token T] [--login] [--session ID] [--new]
                   [--register <parent-setup-url>] [--plain]
+                  [--local-shell] [--local-shell-cwd PATH] [--no-ask-user]
 
 1. parse arguments; resolve the service address (contract §3.2:
    ``--port`` > ``AGENTS_URL`` from ``$AGENTS_RUNTIME_DIR/env.json``
@@ -120,6 +121,15 @@ def build_parser() -> argparse.ArgumentParser:
                              "失败退出码 1，成功打印一行后继续")
     parser.add_argument("--plain", action="store_true",
                         help="纯文本模式（无 ANSI / 无备用屏，便于 tee 日志）")
+    parser.add_argument("--local-shell", action="store_true",
+                        help="额外注册客户端工具 local_shell：模型可以让**这台机器**执行 "
+                             "shell 命令（Linux/macOS 用 bash，Windows 用 PowerShell）。"
+                             "默认关闭：本机 shell 由模型驱动只在连远端 agentsvc 时才有意义")
+    parser.add_argument("--local-shell-cwd", default="", metavar="PATH",
+                        help="--local-shell 的工作目录（缺省为 TUI 进程的当前目录）")
+    parser.add_argument("--no-ask-user", dest="ask_user", action="store_false",
+                        help="不声明客户端工具 AskUser：模型不能弹窗向本机用户提问"
+                             "（默认允许——终端里这是模型问人的唯一途径）")
     return parser
 
 
@@ -226,6 +236,9 @@ def main(argv: "list[str] | None" = None) -> int:
         new_session=bool(args.new),
         plain=bool(args.plain),
         register_result=register_result,
+        local_shell=bool(getattr(args, "local_shell", False)),
+        ask_user=bool(getattr(args, "ask_user", True)),
+        local_shell_cwd=str(getattr(args, "local_shell_cwd", "") or ""),
     )
     try:
         code = run(client, options)

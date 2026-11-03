@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import re
 import sys
+import time
 import unicodedata
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Sequence, Tuple
@@ -33,7 +34,7 @@ __all__ = [
     "pad_right", "paint",
     "COLOR_256", "tunnel_badge",
     "FrameWriter", "TitleBar", "StatusBar", "InputLine", "TranscriptView",
-    "SelectorItem", "Selector", "TextPage", "TuiUI", "PlainUI",
+    "SelectorItem", "Selector", "QuestionModal", "TextPage", "TuiUI", "PlainUI",
 ]
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
@@ -715,6 +716,105 @@ class Selector:
         while len(lines) < height:
             lines.append("")
         return lines[:height]
+
+
+class QuestionModal(Selector):
+    """Modal question + options for a client-side ``AskUser`` call.
+
+    The agent service registers ``AskUser`` as JSON only and never runs it: the
+    model calls it, the loop stops, and the call is handed back to this client.
+    The question therefore belongs here, in the user's own front end, with the
+    option list navigated exactly like ``/sessions`` (arrows / Enter) plus two
+    shortcuts that fit a decision: the option number, and ``Tab`` to jump
+    between the default option and the rest.
+
+    ``timeout`` is the model's own parameter: ``0`` (the default) means the
+    question stays open until the user answers.  A positive value draws a
+    countdown and pre-selects ``default_option``, which is what gets chosen when
+    the countdown runs out - see :meth:`expired`.
+    """
+
+    def __init__(self, question: str, options: Sequence[str],
+                 on_select: Optional[Callable[[Optional[str]], None]] = None,
+                 title: str = "AskUser", timeout: int = 0,
+                 default_option: Optional[str] = None,
+                 deadline: Optional[float] = None) -> None:
+        items = [SelectorItem(name=str(option), value=str(option)) for option in options]
+        super().__init__(title, items, on_select=None)
+        self.question = str(question or "")
+        self.options: List[str] = [str(option) for option in options]
+        self.on_choice = on_select
+        self.timeout = int(timeout or 0)
+        self.default_option = default_option
+        self.deadline = deadline
+        try:
+            self.index = self.options.index(default_option) if default_option else 0
+        except ValueError:
+            self.index = 0
+
+    # ``Selector.on_select`` stays unused here; keep one obvious entry point.
+    def choose(self, answer: Optional[str]) -> None:
+        if self.on_choice is not None:
+            self.on_choice(answer)
+
+    def pick_index(self, position: int) -> None:
+        """Pick the option typed as a number (1-based)."""
+        if 1 <= position <= len(self.options):
+            self.choose(self.options[position - 1])
+
+    def expired(self, now: float) -> bool:
+        """True when the countdown ran out without an answer."""
+        return self.deadline is not None and now >= self.deadline
+
+    def remaining(self, now: float) -> float:
+        if self.deadline is None:
+            return 0.0
+        return max(0.0, self.deadline - now)
+
+    def _footer(self, width: int, now: float) -> str:
+        keys = "↑/↓ 选择 · 数字直达 · Enter 确认 · Esc 取消"
+        if self.timeout > 0:
+            left = int(self.remaining(now) + 0.5)
+            default = self.default_option or "（未指定默认选项）"
+            keys = f"{keys} · {left}s 后自动选择: {default}"
+        else:
+            keys = f"{keys} · 等待选择，不限时"
+        return paint(truncate_to_width(keys, width), "system")
+
+    def render(self, width: int, height: int) -> List[str]:
+        lines: List[str] = [paint(truncate_to_width(self.title, width), "system")]
+        for wrapped in wrap_text(self.question, max(4, width - 2)):
+            lines.append(truncate_to_width(wrapped, width))
+        if not self.question:
+            lines.append("")
+        lines.append("")
+
+        body_h = max(0, height - len(lines) - 1)
+        # Keep at least one line for the options and the footer.
+        if body_h < 2:
+            lines = lines[:max(0, height - 2)]
+            body_h = max(1, height - len(lines) - 1)
+        option_h = max(1, body_h - 1)
+        if self.index < self.scroll:
+            self.scroll = self.index
+        if self.index >= self.scroll + option_h and option_h > 0:
+            self.scroll = self.index - option_h + 1
+        visible = self.items[self.scroll:self.scroll + option_h]
+        for offset, item in enumerate(visible):
+            i = self.scroll + offset
+            label = f"{i + 1}. {item.name}"
+            text = truncate_to_width(("> " if i == self.index else "  ") + label,
+                                     max(1, width - 2))
+            if i == self.index:
+                text = "\x1b[7m" + text + _RESET
+            lines.append(text)
+        while len(lines) - 1 < height - 1:
+            lines.append("")
+        lines.insert(height - 1, self._footer(width, time.monotonic()))
+        lines = lines[:height]
+        while len(lines) < height:
+            lines.append("")
+        return lines
 
 
 class TextPage:

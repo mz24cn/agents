@@ -21,12 +21,15 @@ factory / terminal / plain console through :class:`App`.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
+from tui import client_tools as ct_mod
 from tui import term as term_mod
 from tui import ui as ui_mod
 from tui.chat_client import ApiError
@@ -44,6 +47,9 @@ class TuiOptions:
     new_session: bool = False            # --new
     plain: bool = False                  # --plain 纯文本模式
     register_result: Optional[dict] = None  # --register 的结果（欢迎横幅）
+    local_shell: bool = False            # --local-shell：额外提供本地 shell 客户端工具
+    ask_user: bool = True              # --no-ask-user：模型不能向用户提问（不声明 AskUser）
+    local_shell_cwd: str = ""            # --local-shell-cwd：该工具的工作目录（缺省 cwd）
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -64,6 +70,7 @@ _KEYMAP_ROWS = [
     ("↑/↓", "输入为空→转写区滚动；非空→历史输入"),
     ("←/→/Backspace/Delete", "输入编辑"),
     ("Tab", "命令补全"),
+    ("数字 1-9", "AskUser 提问时直达该编号选项"),
     ("Esc", "关闭模态/补全；其他忽略"),
     ("PageUp/PageDown", "整页滚动转写区"),
 ]
@@ -162,6 +169,22 @@ class App:
         self._dirty = False
         self._completion = None
         self._ui: Optional[ui_mod.TuiUI] = None
+
+        # --- client-side tools (AskUser, and optionally the local shell) ---
+        # The agent service only *registers* these: name, description, schema.
+        # When the model calls one the loop stops and hands the call back, and
+        # answering it is this client's job - see tui/client_tools.py.
+        self.local_shell = bool(getattr(opts, "local_shell", False))
+        # Where a handed-back local_shell command runs: the *caller's* machine,
+        # never the service workspace the title bar shows.
+        self.shell_cwd = str(getattr(opts, "local_shell_cwd", "") or "") or os.getcwd()
+        self.ask_user = bool(getattr(opts, "ask_user", True))
+        self.client_tools = ct_mod.client_tool_definitions(self.local_shell, self.ask_user)
+        self._handoff_calls: List[dict] = []   # named by the service
+        self._declared_calls: List[dict] = []  # assistant tool_call frames
+        self._answered_ids: set = set()        # tool result frames seen
+        self._client_pending: List[dict] = []
+        self._client_results: List[dict] = []
 
         self._commands = {
             "new": self._cmd_new,
@@ -486,7 +509,18 @@ class App:
         if key == term_mod.KEY_ESC:
             self._ui.modal = None
             return
-        if isinstance(modal, ui_mod.Selector):
+        if isinstance(modal, ui_mod.QuestionModal):
+            # Only reachable if a question is left open across a tick; the app
+            # normally blocks inside ``_question_modal`` while it is up.
+            if key == term_mod.KEY_ENTER:
+                item = modal.selected()
+                self._ui.modal = None
+                modal.choose(str(item.value) if item is not None else None)
+            elif key in (term_mod.KEY_UP, term_mod.KEY_DOWN):
+                modal.move(-1 if key == term_mod.KEY_UP else 1)
+            elif key.isdigit():
+                modal.pick_index(int(key))
+        elif isinstance(modal, ui_mod.Selector):
             if key == term_mod.KEY_UP:
                 modal.move(-1)
             elif key == term_mod.KEY_DOWN:
@@ -537,6 +571,7 @@ class App:
             "messages": [{"role": "user", "content": text}],
             "stream": True,
             "session_id": session,
+            "client_tools": self.client_tools,
         }
         if self.agent_id:
             body["agent_ids"] = [self.agent_id]
@@ -549,12 +584,19 @@ class App:
             "stream": True,
             "session_id": self.session_id,
             "continue": True,
+            "client_tools": self.client_tools,
         }
         if self.agent_id:
             body["agent_ids"] = [self.agent_id]
         self._start_stream(body)
 
     def _start_stream(self, body: dict) -> None:
+        # Each run starts from a clean slate: a handoff is only ever about the
+        # calls declared by *this* run.
+        self._handoff_calls = []
+        self._declared_calls = []
+        self._answered_ids = set()
+
         def on_event(event, data):
             try:
                 self.transcript.append_frame(event, data)
@@ -575,6 +617,9 @@ class App:
             self._drain_plain()
 
     def _handle_event_side(self, event: str, data: dict) -> None:
+        if event == "message":
+            self._observe_client_tool_frames(data)
+            return
         if event == "init":
             sid = data.get("session_id")
             if sid:
@@ -596,6 +641,7 @@ class App:
         self.handle = None
         if self.plain:
             self.plain_io.sync(self._provider())
+        self._after_stream()
 
     def _abort(self) -> None:
         handle = self.handle
@@ -616,6 +662,205 @@ class App:
         self.plain_io.sync(self._provider())
         self._streaming = False
         self.handle = None
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Client-side tools: AskUser / local_shell
+    #
+    # The agent service only registers these tools (name, description, schema)
+    # and never runs them: the model calls one, the loop ends normally, and the
+    # call is handed back.  Everything below is the terminal answering it.
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _observe_client_tool_frames(self, data: dict) -> None:
+        """Remember what this run declared, answered, or was told to run locally."""
+        if not isinstance(data, dict):
+            return
+        role = data.get("role")
+        if role == "status" and data.get("status") == "client_tool_calls":
+            calls = data.get("client_tool_calls")
+            if isinstance(calls, list):
+                self._handoff_calls = [c for c in calls if isinstance(c, dict)]
+            return
+        if role == "assistant" and data.get("tool_calls"):
+            self._declared_calls.append(data)
+        elif role == "tool":
+            answered = data.get("tool_use_id") or data.get("tool_call_id")
+            if answered:
+                self._answered_ids.add(answered)
+
+    def _after_stream(self) -> None:
+        """Run whatever the service handed back, then resume the same session."""
+        calls = list(self._handoff_calls)
+        if not calls:
+            # A service that ends the stream without naming the handoff still
+            # leaves the same trace: the call was declared and never answered.
+            calls = ct_mod.pending_client_calls_from_messages(
+                self._declared_calls, ct_mod.client_tool_names(self.local_shell, self.ask_user)
+            )
+        if not calls:
+            return
+        self._client_pending = list(calls)
+        self._client_results = []
+        self._run_next_client_tool()
+
+    def _run_next_client_tool(self) -> None:
+        """Execute the pending client-side calls in order, then resume."""
+        while self._client_pending:
+            call = self._client_pending.pop(0)
+            name = str(call.get("name") or "")
+            arguments = call.get("arguments")
+            if name == "AskUser" and not self.plain and self._ui is not None:
+                content = self._ask_user_modal(call)
+            else:
+                content = ct_mod.run_client_tool(
+                    name, arguments,
+                    ask_user=self._ask_user_plain,
+                    workspace=self.shell_cwd,
+                    include_shell=self.local_shell,
+                )
+            self._echo_client_result(name, arguments, content)
+            self._client_results.append(ct_mod.tool_result_message(call, content))
+        self._resume_after_client_tools()
+
+    def _echo_client_result(self, name: str, arguments, content: str) -> None:
+        """Say what ran locally; a handed-back tool result is never streamed."""
+        if name != "local_shell":
+            return
+        args = ct_mod.parse_arguments(arguments)
+        raw = str(args.get("command") or args.get("_raw") or "").strip()
+        command = raw.splitlines()[0] if raw else ""
+        outcome = str(content)
+        try:
+            parsed = json.loads(content)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            if parsed.get("error"):
+                outcome = str(parsed.get("message") or parsed.get("error"))
+            else:
+                outcome = f"exit_code={parsed.get('exit_code')}"
+                if parsed.get("truncated"):
+                    outcome += "，输出已截断"
+        self._emit_system(
+            f"本地 shell（cwd={self.shell_cwd}）：{command}\n  → {outcome}"
+        )
+
+    def _ask_user_modal(self, call: dict) -> str:
+        """Ask on screen (modal + countdown); return the tool result text."""
+        args = ct_mod.parse_arguments(call.get("arguments"))
+        question, options, timeout, default = ct_mod.question_request(args)
+        if not options:
+            self._emit_system(f"AskUser 未给出选项，无法作答：{question}")
+            return ct_mod.CANCELLED_ANSWER
+        deadline = None if timeout <= 0 else time.monotonic() + timeout
+        self._emit_system(f"AskUser：{question}")
+        answer = self._question_modal(question, options, timeout, default, deadline)
+        # One place decides what an answer/no-answer means for the model.
+        return ct_mod.run_ask_user(args, lambda *a: answer)
+
+    def _question_modal(self, question: str, options: List[str], timeout: int,
+                        default: Optional[str],
+                        deadline: Optional[float]) -> Optional[str]:
+        """Blocking question modal; returns the option text or ``None``.
+
+        ``None`` means "the user gave no answer" - which is what lets
+        :func:`tui.client_tools.run_ask_user` fall back to ``default_option``
+        once the countdown expired, and report a dismissal otherwise.  The loop
+        is deliberately scoped here: no inference is running while the user is
+        deciding, so the main loop does not have to model this state.
+        """
+        if self._ui is None:
+            return None
+        modal = ui_mod.QuestionModal(
+            question, options, title="AskUser", timeout=timeout,
+            default_option=default, deadline=deadline,
+        )
+        previous = self._ui.modal
+        self._ui.modal = modal
+        answer: Optional[str] = None
+        try:
+            while True:
+                self._ui.draw()
+                key = self.term.read_key(timeout=0.05)
+                if key in (term_mod.KEY_ESC, term_mod.KEY_CTRL_C):
+                    answer = None
+                    break
+                if key == term_mod.KEY_ENTER:
+                    item = modal.selected()
+                    answer = str(item.value) if item is not None else None
+                    break
+                if key in (term_mod.KEY_UP, "k"):
+                    modal.move(-1)
+                elif key in (term_mod.KEY_DOWN, "j"):
+                    modal.move(1)
+                elif key is not None and key.isdigit():
+                    position = int(key)
+                    if 1 <= position <= len(options):
+                        answer = options[position - 1]
+                        break
+                if modal.expired(time.monotonic()):
+                    # Do not invent a choice here: run_ask_user applies
+                    # default_option, and says out loud that it was automatic.
+                    self._emit_system(
+                        f"AskUser 等待超时（{timeout}s）"
+                        + (f"，自动选择：{default}" if default else "，未指定默认选项")
+                    )
+                    answer = None
+                    break
+                if self._input_exhausted():
+                    # Headless / piped input: no key will ever arrive.
+                    break
+        finally:
+            self._ui.modal = previous
+        if answer is not None:
+            self._emit_system(f"已选择：{answer}")
+        return answer
+
+    def _ask_user_plain(self, question: str, options: List[str], timeout: int,
+                        default: Optional[str],
+                        deadline: Optional[float]) -> Optional[str]:
+        """Plain-mode AskUser: print the question, read one answer line."""
+        lines = [f"[AskUser] {question}"]
+        lines += [f"  {i + 1}. {option}" for i, option in enumerate(options)]
+        if timeout > 0:
+            lines.append(
+                f"  （{timeout}s 未作答"
+                + (f"，自动选择：{default}）" if default else "，且未指定默认选项）")
+        )
+        else:
+            lines.append("  （不限时等待；输入编号或选项原文）")
+        for line in lines:
+            try:
+                self.plain_io.system(line)
+            except Exception:  # noqa: BLE001 - console output is best effort
+                pass
+        try:
+            line = self.plain_io.readline("选择> ")
+        except Exception:  # noqa: BLE001 - an unreadable console means no answer
+            return None
+        if line is None:
+            return None
+        return line.strip()
+
+    def _resume_after_client_tools(self) -> None:
+        """Post the locally produced tool results back into the same session."""
+        results = self._client_results
+        self._client_results = []
+        if not results:
+            return
+        if not self.session_id or self.session_id == "new":
+            self._emit_system("本地工具结果无法回送：会话尚未建立（无 session_id）。")
+            return
+        body = {
+            "model_id": self.model_id,
+            "messages": results,
+            "stream": True,
+            "session_id": self.session_id,
+            "client_tools": self.client_tools,
+        }
+        if self.agent_id:
+            body["agent_ids"] = [self.agent_id]
+        self._start_stream(body)
 
     # ══════════════════════════════════════════════════════════════════
     # Plain loop
