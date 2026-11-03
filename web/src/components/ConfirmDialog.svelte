@@ -12,12 +12,20 @@
     onConfirm,
     onCancel,
     hideCancel = false,
+    // Body content for dialogs that need more than a title + message (e.g. the
+    // AskUser question with its option list); rendered above the action row.
+    children = undefined,
+    // Some dialogs own their own actions (AskUser's options *are* the buttons).
+    hideActions = false,
+    // Escape is the cancel gesture; dialogs whose cancel path is not a plain
+    // "dismiss" can point it at their own handler.
+    onEscape = undefined,
   } = $props()
 
   $effect(() => {
     if (!open) return
     const handler = (e) => {
-      if (e.key === 'Escape') onCancel()
+      if (e.key === 'Escape') (onEscape ? onEscape() : onCancel())
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
@@ -25,14 +33,17 @@
 </script>
 
 {#if open}
-  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
   <div class="overlay" onclick={onCancel}>
-    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <!-- Clicking inside the panel must not close it; Escape and the buttons do. -->
+    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
     <div class="dialog" onclick={(e) => e.stopPropagation()}>
       <h3 class="dialog-title">{title}</h3>
       {#if message}
         <p class="dialog-message">{message}</p>
       {/if}
+      {@render children?.()}
+      {#if !hideActions}
       <div class="dialog-actions">
         {#if !hideCancel}
         <button class="btn btn-cancel" onclick={onCancel}>{cancelText}</button>
@@ -46,6 +57,7 @@
           <button class="btn btn-confirm" onclick={onConfirm}>{confirmText}</button>
         {/if}
       </div>
+      {/if}
     </div>
   </div>
 {/if}

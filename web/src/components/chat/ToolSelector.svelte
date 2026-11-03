@@ -1,6 +1,7 @@
 <script>
   import { catalog, loadTools } from '../../lib/catalog-state.svelte.js'
   import { t } from '../../lib/i18n.svelte.js'
+  import { groupTools, groupIcon, groupName } from '../../lib/tool-groups.js'
 
   // 简化设计：工具清单无论本地/远程执行都只取母环境（catalog），
   // 因此不再有远程覆盖列表。
@@ -16,32 +17,19 @@
   let expanded = $state(false)
   let expandedGroups = $state(new Set())
 
-  let groups = $derived.by(() => {
-    const map = new Map()
-    for (const tool of toolList) {
-      let key
-      if (tool.tool_type === 'mcp' && tool.mcp_server_name) key = `mcp:${tool.mcp_server_name}`
-      else if (tool.tool_type === 'function') key = 'function'
-      else if (tool.tool_type === 'skill') key = 'skill'
-      else key = tool.tool_type ?? 'other'
-      if (!map.has(key)) map.set(key, [])
-      map.get(key).push(tool)
-    }
-    return map
-  })
+  // The same grouping rules as the tools page: a new tool type shows up here
+  // automatically instead of degrading to its raw key (client_side used to
+  // render as a bare "client_side" group with no label).
+  let typeLabels = $derived.by(() => ({
+    client_side: t('clientSideTools'),
+    function: t('functionTools'),
+    skill: t('skillTools'),
+  }))
+
+  let groups = $derived(groupTools(toolList, typeLabels))
 
   function groupLabel(key) {
-    if (key.startsWith('mcp:')) return key.slice(4)
-    if (key === 'function') return t('functionTools')
-    if (key === 'skill') return t('skillTools')
-    return key
-  }
-
-  function groupIcon(key) {
-    if (key.startsWith('mcp:')) return '⚡'
-    if (key === 'function') return '𝑓'
-    if (key === 'skill') return '★'
-    return '•'
+    return groupName(key, typeLabels)
   }
 
   function toggleTool(toolId) {

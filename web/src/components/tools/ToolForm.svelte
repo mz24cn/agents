@@ -43,6 +43,10 @@
   let testDialogTitle = $state('')
   let testDialogMessage = $state('')
 
+  // Whether the placeholders should describe a client-side tool: the AskUser
+  // schema in the placeholder is the whole example, no extra panel needed.
+  const isClientSide = $derived(tool_type === 'client_side')
+
   function validate() {
     const e = {}
     if (tool_type === 'mcp') {
@@ -61,6 +65,8 @@
     } else if (tool_type === 'skill') {
       if (!skill_dir.trim()) e.skill_dir = t('skillDirRequired')
     } else {
+      // function and client_side share the registration JSON; only a function
+      // tool additionally needs its executable entity (file + function name).
       if (!name.trim()) e.name = t('toolNameRequired')
       if (!description.trim()) e.description = t('toolDescRequired')
       if (!parameters_text.trim()) {
@@ -68,8 +74,10 @@
       } else {
         try { JSON.parse(parameters_text) } catch { e.parameters = t('jsonInvalid') }
       }
-      if (!function_file_path.trim()) e.function_file_path = t('functionFileRequired')
-      if (!function_name.trim()) e.function_name = t('functionNameRequired')
+      if (tool_type === 'function') {
+        if (!function_file_path.trim()) e.function_file_path = t('functionFileRequired')
+        if (!function_name.trim()) e.function_name = t('functionNameRequired')
+      }
     }
     errors = e
     return Object.keys(e).length === 0
@@ -81,6 +89,16 @@
     }
     if (tool_type === 'skill') {
       return { tool_type: 'skill', skill_dir: skill_dir.trim() }
+    }
+    if (tool_type === 'client_side') {
+      // Nothing to import or connect: the server validates the registration
+      // JSON it will hand to the model, and never executes the tool itself.
+      return {
+        tool_type: 'client_side',
+        name: name.trim(),
+        description: description.trim(),
+        parameters: JSON.parse(parameters_text),
+      }
     }
     return {
       tool_type: 'function',
@@ -178,6 +196,8 @@
         })
       } else if (result.tool_type === 'skill') {
         testDialogMessage = t('skillTestSuccess', { path: result.skill_md_path })
+      } else if (result.tool_type === 'client_side') {
+        testDialogMessage = t('clientSideTestSuccess', { name: result.name })
       } else {
         testDialogMessage = t('functionTestSuccess', { name: result.function_name })
       }
@@ -211,7 +231,7 @@
   <div class="form-group">
     <span class="radio-label">{t('toolTypeLabel')} <span class="required">{t('required')}</span></span>
     <div class="radio-group">
-      {#each [['function','Function'],['mcp','MCP'],['skill','Skill']] as [val, label]}
+      {#each [['function','Function'],['mcp','MCP'],['skill','Skill'],['client_side', t('clientSideToolType')]] as [val, label]}
         <label class="radio-item" class:disabled={isEdit || isMcpEdit}>
           <input type="radio" name="tool_type" value={val} bind:group={tool_type} disabled={isEdit || isMcpEdit} />
           {label}
@@ -235,37 +255,45 @@
       <span class="hint">{t('skillDirHint')}</span>
     </div>
   {:else}
+    {#if tool_type === 'client_side'}
+      <div class="form-note">{t('clientSideHint')}</div>
+    {/if}
     <div class="form-group">
       <label for="name">{t('name')} <span class="required">{t('required')}</span></label>
-      <input id="name" type="text" bind:value={name} placeholder={t('toolNamePlaceholder')} />
+      <input id="name" type="text" bind:value={name} placeholder={isClientSide ? t('clientSideNamePlaceholder') : t('toolNamePlaceholder')} />
       {#if errors.name}<span class="field-error">{errors.name}</span>{/if}
     </div>
 
     <div class="form-group">
       <label for="description">{t('description')} <span class="required">{t('required')}</span></label>
-      <textarea id="description" bind:value={description} rows="2" placeholder={t('toolDescPlaceholder')}></textarea>
+      <textarea id="description" bind:value={description} rows="2" placeholder={isClientSide ? t('clientSideDescPlaceholder') : t('toolDescPlaceholder')}></textarea>
       {#if errors.description}<span class="field-error">{errors.description}</span>{/if}
     </div>
 
     <div class="form-group">
       <label for="parameters">Parameters (JSON Schema) <span class="required">{t('required')}</span></label>
-      <JsonEditor id="parameters" bind:value={parameters_text} rows={6} placeholder={t('parametersPlaceholder')} />
+      <JsonEditor id="parameters" bind:value={parameters_text} rows={6} placeholder={isClientSide ? t('clientSideParamsPlaceholder') : t('parametersPlaceholder')} />
       {#if errors.parameters}<span class="field-error">{errors.parameters}</span>{/if}
+      {#if tool_type === 'client_side'}
+        <span class="hint">{t('clientSideParametersHint')}</span>
+      {/if}
     </div>
 
-    <div class="form-group">
-      <label for="function_file_path">{t('functionFilePath')} <span class="required">{t('required')}</span></label>
-      <input id="function_file_path" type="text" bind:value={function_file_path} placeholder={t('functionFilePathPlaceholder')} />
-      {#if errors.function_file_path}<span class="field-error">{errors.function_file_path}</span>{/if}
-      <span class="hint">{t('functionFilePathHint')}</span>
-    </div>
+    {#if tool_type === 'function'}
+      <div class="form-group">
+        <label for="function_file_path">{t('functionFilePath')} <span class="required">{t('required')}</span></label>
+        <input id="function_file_path" type="text" bind:value={function_file_path} placeholder={t('functionFilePathPlaceholder')} />
+        {#if errors.function_file_path}<span class="field-error">{errors.function_file_path}</span>{/if}
+        <span class="hint">{t('functionFilePathHint')}</span>
+      </div>
 
-    <div class="form-group">
-      <label for="function_name">{t('functionName')} <span class="required">{t('required')}</span></label>
-      <input id="function_name" type="text" bind:value={function_name} placeholder={t('functionNamePlaceholder')} />
-      {#if errors.function_name}<span class="field-error">{errors.function_name}</span>{/if}
-      <span class="hint">{t('functionNameHint')}</span>
-    </div>
+      <div class="form-group">
+        <label for="function_name">{t('functionName')} <span class="required">{t('required')}</span></label>
+        <input id="function_name" type="text" bind:value={function_name} placeholder={t('functionNamePlaceholder')} />
+        {#if errors.function_name}<span class="field-error">{errors.function_name}</span>{/if}
+        <span class="hint">{t('functionNameHint')}</span>
+      </div>
+    {/if}
   {/if}
 
   <div class="form-group">
@@ -302,6 +330,7 @@
   .btn-back:hover:not(:disabled) { background: var(--border); color: var(--text); }
   .btn-back:disabled { opacity: 0.5; cursor: not-allowed; }
   .form-error { background: var(--danger); color: #fff; padding: 8px 12px; border-radius: 6px; margin-bottom: 16px; font-size: 0.9rem; }
+    .form-note { background: var(--bg-secondary); border: 1px solid var(--border); border-left: 3px solid var(--primary); border-radius: 6px; padding: 10px 12px; margin-bottom: 14px; color: var(--text-secondary); font-size: 0.85rem; line-height: 1.5; }
   .form-group { margin-bottom: 14px; display: flex; flex-direction: column; }
   label { margin-bottom: 4px; font-size: 0.9rem; color: var(--text-secondary); }
   .required { color: var(--danger); }

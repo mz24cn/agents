@@ -34,9 +34,16 @@
       <span class="detail-label">{t('toolType')}</span>
       <span class="detail-value">
         {tool.tool_type}
+        {#if tool.tool_type === 'client_side'}<span class="badge-client">CLIENT</span>{/if}
         {#if tool.builtin}<span class="badge-builtin">{t('builtin')}</span>{/if}
       </span>
     </div>
+    {#if tool.tool_type === 'client_side'}
+      <div class="detail-row">
+        <span class="detail-label">{t('clientSideTools')}</span>
+        <span class="detail-value">{t('clientSideHint')}</span>
+      </div>
+    {/if}
     <div class="detail-row">
       <span class="detail-label">{t('toolDescription')}</span>
       <span class="detail-value">{tool.description}</span>
@@ -69,6 +76,7 @@
   .btn-test:hover { opacity: 0.85; }
   .btn-close { padding: 6px 16px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg-secondary); color: var(--text); cursor: pointer; font-size: 0.85rem; }
   .btn-close:hover { opacity: 0.8; }
+  .badge-client { display: inline-block; font-size: 0.7rem; padding: 1px 6px; border-radius: 4px; font-weight: 700; background: #7c3aed22; color: #7c3aed; margin-left: 6px; }
   .badge-builtin { display: inline-block; font-size: 0.7rem; padding: 1px 6px; border-radius: 4px; font-weight: 700; background: #16a34a22; color: #16a34a; margin-left: 6px; }
   .detail-body { display: flex; flex-direction: column; gap: 12px; }
   .detail-row { display: flex; flex-direction: column; gap: 4px; }

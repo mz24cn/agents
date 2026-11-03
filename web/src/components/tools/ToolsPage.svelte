@@ -4,6 +4,7 @@
   import ToolDetail from './ToolDetail.svelte'
   import ConfirmDialog from '../ConfirmDialog.svelte'
   import { t } from '../../lib/i18n.svelte.js'
+  import { groupTools, groupBadge, groupName } from '../../lib/tool-groups.js'
 
   let { onEdit = null, onEditMcpTool = null, onTestCall = null, sortByTimeDesc = false } = $props()
 
@@ -43,25 +44,18 @@
     } catch { /* ignore */ }
   }
 
-  let groups = $derived.by(() => {
-    const map = new Map()
-    for (const tool of toolList) {
-      let key
-      if (tool.tool_type === 'mcp' && tool.mcp_server_name) key = `mcp:${tool.mcp_server_name}`
-      else if (tool.tool_type === 'function') key = 'function'
-      else if (tool.tool_type === 'skill') key = 'skill'
-      else key = tool.tool_type ?? 'other'
-      if (!map.has(key)) map.set(key, [])
-      map.get(key).push(tool)
-    }
-    return map
-  })
+  // Grouping rules live in lib/tool-groups.js so the chat's picker and this
+  // page cannot drift apart again.
+  let typeLabels = $derived.by(() => ({
+    client_side: t('clientSideTools'),
+    function: t('functionTools'),
+    skill: t('skillTools'),
+  }))
+
+  let groups = $derived(groupTools(toolList, typeLabels))
 
   function groupLabel(key) {
-    if (key.startsWith('mcp:')) return key.slice(4)
-    if (key === 'function') return t('functionTools')
-    if (key === 'skill') return t('skillTools')
-    return key
+    return groupName(key, typeLabels)
   }
 
   function isMcpGroup(key) { return key.startsWith('mcp:') }
@@ -153,19 +147,20 @@
       <div class="empty">{t('noTools2')}</div>
     {:else if toolList.length > 0}
       <div class="groups-wrap">
-        {#each [...groups.entries()] as [key, groupTools] (key)}
+        {#each [...groups.entries()] as [key, toolsInGroup] (key)}
           {@const collapsed = !expandedGroups.has(key)}
+          {@const badge = groupBadge(key)}
           <div class="group-block">
             <div class="group-header">
               <button class="collapse-btn" onclick={() => toggleCollapse(key)}>
                 {collapsed ? '▶' : '▼'}
               </button>
               <span class="group-title">
-                {#if isMcpGroup(key)}
-                  <span class="badge badge-mcp">MCP</span>
+                {#if badge}
+                  <span class="badge {badge.className}">{badge.text}</span>
                 {/if}
                 {groupLabel(key)}
-                <span class="group-count">{t('toolCount', { n: groupTools.length })}</span>
+                <span class="group-count">{t('toolCount', { n: toolsInGroup.length })}</span>
               </span>
               {#if isMcpGroup(key)}
                 {@const serverName = key.slice(4)}
@@ -212,7 +207,7 @@
                   </tr>
                 </thead>
                 <tbody>
-                  {#each groupTools as tool (tool.tool_id)}
+                  {#each toolsInGroup as tool (tool.tool_id)}
                     <tr>
                       <td class="nowrap">{tool.tool_id}</td>
                       <td class="nowrap">
@@ -277,6 +272,9 @@
   .group-title { flex: 1; display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 0.9rem; color: var(--text); }
   .badge { font-size: 0.7rem; padding: 1px 6px; border-radius: 4px; font-weight: 700; }
   .badge-mcp { background: #2563eb22; color: #2563eb; }
+  .badge-client { background: #7c3aed22; color: #7c3aed; }
+  .badge-function { background: #0891b222; color: #0891b2; }
+  .badge-skill { background: #d9770622; color: #d97706; }
   .mcp-server-type { color: var(--primary); font-size: 0.8rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 320px; margin-left: auto; }
   .badge-builtin { font-size: 0.7rem; padding: 1px 6px; border-radius: 4px; font-weight: 700; background: #16a34a22; color: #16a34a; }
   .group-count { font-weight: normal; font-size: 0.8rem; color: var(--text-secondary); }

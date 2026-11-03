@@ -714,6 +714,35 @@ const translations = {
     skillDirPlaceholder: '例如: ~/skills/my_skill 或 /home/user/skills/my_skill 或 ./skills/my_skill',
     skillDirHint: '文件夹内须包含 SKILL.md（配置名称和描述），路径支持 ~/ 开头的用户目录',
     mcpConfigHint: '支持 stdio（command）和 HTTP（url）两种模式，可一次配置多个 MCP server，工具将在首次调用时自动启动',
+    clientSideToolType: 'Client Side 工具',
+    clientSideTools: '客户端工具',
+    clientSideHint: '客户端工具由调用方自己执行：服务端只保存这份注册 JSON（名称 / 描述 / 参数 Schema），把它交给模型，但不会尝试执行。模型一旦调用它，推理循环正常结束；调用方在本地执行工具后，把工具结果连同 session id 再次提交推理请求，服务端按 session id 把结果并入会话历史并继续循环。也可以在推理请求的 client_tools 数组中即时提供，无需在此注册。',
+    clientSideParametersHint: '参数 Schema 原样提供给模型；实际执行与参数校验由调用方负责（上面空着时的占位内容就是内置 AskUser 工具的真实参数）',
+    clientSideTestSuccess: '注册 JSON 有效：服务端不会执行该工具，由调用方在本地执行',
+
+    // AskUser: the client-side tool every front end implements for itself.
+    askUserTitle: '模型在等你决定',
+    askUserCountdown: '{seconds} 秒后自动决定',
+    askUserWaitForever: '等待你的选择（不会超时）',
+    askUserDefaultBadge: '超时默认',
+    askUserOther: '其它…',
+    askUserDismiss: '不回答',
+    askUserKeysHint: '↑↓ 选择 · Enter 确认 · 数字键直达 · Tab 自由输入 · Esc 不回答',
+    askUserFreeTextPlaceholder: '以上都不合适，写下你自己的答案…',
+
+    // The registration form's client-side examples are the real AskUser tool.
+    clientSideNamePlaceholder: '例如: AskUser',
+    clientSideDescPlaceholder: '例如: 向用户提一个只有用户能决定的问题，并把用户选中的选项原样返回',
+    clientSideParamsPlaceholder: `{
+  "type": "object",
+  "properties": {
+    "question": { "type": "string", "description": "要问用户的问题" },
+    "options": { "type": "array", "items": { "type": "string" }, "minItems": 2 },
+    "timeout": { "type": "integer", "default": 0, "description": "0 表示一直等待" },
+    "default_option": { "type": "string", "description": "超时后自动选用的选项" }
+  },
+  "required": ["question", "options"]
+}`,
     toolConfigTestFailed: '工具测试失败',
     mcpConfigTestFailed: 'MCP 服务器连接测试失败',
     mcpTestSuccess: '连接成功！发现 {count} 个工具：{tools}',
@@ -1455,6 +1484,35 @@ const translations = {
     skillDirPlaceholder: 'e.g. ~/skills/my_skill or /home/user/skills/my_skill or ./skills/my_skill',
     skillDirHint: 'Directory must contain SKILL.md; name and description are read from its front-matter. Supports ~/ home directory paths',
     mcpConfigHint: 'Supports stdio (command) and HTTP (url) modes; multiple servers can be configured at once and tools start automatically on first call',
+    clientSideToolType: 'Client Side tool',
+    clientSideTools: 'Client-side tools',
+    clientSideHint: 'A client-side tool is executed by the caller: the agent service stores only this registration JSON (name / description / parameter schema) and offers it to the model, but never runs it. Once the model calls it, the inference loop ends normally; the caller executes the tool locally and submits the result together with the session id, and the service merges it into the conversation and keeps looping. A client tool can also be supplied on the fly through the client_tools array of an inference request, without registering it here.',
+    clientSideParametersHint: 'The schema is handed to the model as-is; executing the tool and validating its arguments is the caller\'s job (what the empty field shows as a placeholder is the real parameter schema of the built-in AskUser tool)',
+    clientSideTestSuccess: 'Registration JSON is valid: the service never executes this tool, the caller does',
+
+    // AskUser: the client-side tool every front end implements for itself.
+    askUserTitle: 'The model needs your decision',
+    askUserCountdown: 'deciding in {seconds}s',
+    askUserWaitForever: 'Waiting for your choice (no timeout)',
+    askUserDefaultBadge: 'default',
+    askUserOther: 'Other…',
+    askUserDismiss: 'No answer',
+    askUserKeysHint: '↑↓ to move · Enter to choose · a number to jump · Tab for free text · Esc for no answer',
+    askUserFreeTextPlaceholder: 'None of these fit — write your own answer…',
+
+    // The registration form's client-side examples are the real AskUser tool.
+    clientSideNamePlaceholder: 'e.g. AskUser',
+    clientSideDescPlaceholder: 'e.g. Ask the user a question only the user can settle, and return the chosen option verbatim',
+    clientSideParamsPlaceholder: `{
+  "type": "object",
+  "properties": {
+    "question": { "type": "string", "description": "The question to ask the user" },
+    "options": { "type": "array", "items": { "type": "string" }, "minItems": 2 },
+    "timeout": { "type": "integer", "default": 0, "description": "0 waits forever" },
+    "default_option": { "type": "string", "description": "Applied if the countdown expires" }
+  },
+  "required": ["question", "options"]
+}`,
     toolConfigTestFailed: 'Tool test failed',
     mcpConfigTestFailed: 'MCP server connection test failed',
     mcpTestSuccess: 'Connection successful! Found {count} tools: {tools}',

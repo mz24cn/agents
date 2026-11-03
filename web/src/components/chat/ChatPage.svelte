@@ -17,6 +17,17 @@
   import { buildFileJournalTurnKeyMap } from '../../lib/file-journals.js'
   import { restoreFileRefTags } from '../../lib/file-ref.js'
   import { mergeToolCallDeltas, startsNewToolCallRound } from '../../lib/stream-messages.js'
+  import AskUserDialog from './AskUserDialog.svelte'
+  import {
+    askUserRequest,
+    clientToolCallFrames,
+    clientToolDefinitions,
+    clientToolNames,
+    enabledClientToolNames,
+    clientToolResultMessage,
+    pickUnansweredClientCalls,
+    runClientToolCall,
+  } from '../../lib/client-tools.js'
   import { assistantIndexForToolCall, insertToolMessage } from '../../lib/stream-tool-placement.js'
   import { t } from '../../lib/i18n.svelte.js'
   import { forkContextWarning } from '../../lib/session-fork.js'
@@ -58,6 +69,15 @@
 
   let selectedModelId = $state(localStorage.getItem(STORAGE_MODEL_KEY) ?? '')
   let selectedToolIds = $state(JSON.parse(localStorage.getItem(STORAGE_TOOLS_KEY) ?? '[]'))
+  // 客户端工具跟其它工具一样，由工具列表的勾选决定：模型能弹出 AskUser 对话框，
+  // 就说明用户确实启用过它。以前每轮请求都无条件声明，结果用户没勾选也会被弹窗。
+  let enabledClientNames = $derived(
+    enabledClientToolNames(
+      selectedToolIds.map((id) => catalog.tools.items.find((tool) => tool.tool_id === id))
+    )
+  )
+  // 问题已经摆在用户面前时，这一轮的续跑要继续带着它，哪怕对话框开着时被取消了勾选。
+  let answeringClientNames = $state([])
   let errorMsg = $state('')
   // 输入草稿：从本地存储初始化，新打开页面 / 切换到会话页时还原未发送的输入（含 <file> 引用文本）
   let inputText = $state('')
@@ -136,6 +156,12 @@
   // Key = session ID (or '__new__' before backend assigns one).
   // Stream callbacks write to their own key; switching sessions just changes which key is displayed.
   let sessionStore = $state({})
+  // Client-side tools this browser runs. They are declared in every request
+  // (`client_tools`), registered on the service as JSON only, and never executed
+  // there: the model calls one, the loop ends, the call comes back to us and the
+  // browser performs it. For AskUser that means this dialog.
+  let askUser = $state(null)        // { request } while a question is open
+  let askUserSettle = $state(null)  // resolves the promise the tool awaits
   let sessionStreamSubscriptions = {}
   // Sessions whose inference stream is already consumed by this page through
   // the original POST /v1/infer/stream connection. They must not also get a
@@ -302,6 +328,7 @@
     const keyRef = { key: sid }
     const aIdxRef = { value: -1, groupMode: false, groupMap: {} }
     const frameBatcher = createStreamFrameBatcher((msg) => {
+      if (noteClientToolFrame(msg, keyRef)) return
       const { __streamSeq: streamSeq, ...frame } = msg
       // Remember the last *applied* frame so a re-subscription (lost channel
       // entry, reconnect) resumes exactly where this page stopped.
@@ -1054,7 +1081,85 @@
     _doSend(apiMessages, pendingUserMsg)
   }
 
+  // The dialog *is* the AskUser tool: opening it returns a promise that settles
+  // with the user's choice, which becomes the tool result.
+  function promptAskUser(request) {
+    return new Promise((resolve) => {
+      askUserSettle = resolve
+      askUser = { request }
+    })
+  }
+
+  function settleAskUser(outcome) {
+    const resolve = askUserSettle
+    askUserSettle = null
+    askUser = null
+    if (resolve) resolve(outcome || { value: null, dismissed: true })
+  }
+
+  // A question must not outlive the turn it belongs to: starting anything new,
+  // switching sessions, or stopping answers it as "the user did not choose", so
+  // the assistant's tool call is never left dangling in the history.
+  function dropPendingAskUser() {
+    if (askUserSettle) settleAskUser({ value: null, dismissed: true })
+  }
+
+  /**
+   * Run handed-back client tool calls and continue the loop with the answers.
+   *
+   * The service ended its loop normally with these calls declared and
+   * unanswered; one more request carrying a `role: 'tool'` message per call is
+   * what lets it read them and go on.
+   */
+  async function handleClientToolCalls(calls, sid) {
+    const pending = (calls || []).filter((call) => call && call.name)
+    if (!pending.length || !sid) return
+    dropPendingAskUser()
+    const answers = []
+    for (const call of pending) {
+      // Only a question for the session on screen can be put to the user; any
+      // other case is reported honestly instead of guessed at.
+      const canAsk = sid === sessionId
+      const content = await runClientToolCall(call, {
+        askUser: canAsk ? promptAskUser : async () => ({ value: null, dismissed: true }),
+      })
+      const message = clientToolResultMessage(call, content)
+      answers.push(message)
+      // The service persists submitted messages but does not rebroadcast them as
+      // frames, so the answer only shows up here if we show it ourselves.
+      const store = sessionStore[sid]
+      if (store) store.messages = [...store.messages, { ...message, timestamp: new Date().toISOString() }]
+    }
+    answeringClientNames = pending.map((call) => call.name)
+    _doSend(answers, null)
+  }
+
+  // Client-side calls are named by one status frame; collect them where the
+  // frames are consumed and act once the stream is over.
+  function noteClientToolFrame(msg, keyRef) {
+    const frames = clientToolCallFrames(msg)
+    if (frames === null) return false
+    keyRef.pendingClientCalls = [...(keyRef.pendingClientCalls || []), ...frames]
+    return true
+  }
+
+  // Page reload / reopening a session: a client tool call that was never
+  // answered is still outstanding, and the question belongs to the user again.
+  function maybeResumeClientTools(sid, messages) {
+    if (!sid || !messages?.length) return
+    const last = messages[messages.length - 1]
+    // Anything the user did after the question supersedes it (the service
+    // repairs abandoned calls when a new turn starts); only the still-open tip
+    // of the conversation is worth re-asking.
+    if (last?.role !== 'assistant') return
+    const pending = pickUnansweredClientCalls(messages, clientToolNames())
+    if (pending.length) void handleClientToolCalls(pending, sid)
+  }
+
   function _doSend(apiMessages, pendingUserMsg, isContinue = false, retryAgentId = null, isResume = false) {
+    // Any new turn supersedes an unanswered question: the service repairs the
+    // abandoned call, and an answer posted afterwards would not belong to it.
+    dropPendingAskUser()
     // Each stream writes to its own sessionStore entry via keyRef.
     // keyRef.key may change from '__new__' to the real session ID once the
     // backend assigns one (onInit / first onStreamMsg with session_id).
@@ -1070,6 +1175,14 @@
     // 继续推理时不携带新用户消息（messages: [] + continue: true），
     // 后端基于会话既有上下文再跑一轮推理。
     const reqBody = { model_id: selectedModelId, tool_ids: selectedToolIds, messages: (isContinue || isResume) ? [] : apiMessages, stream: true }
+    // Client-side tools ride along as JSON definitions: the service merges them
+    // into the model's tool set and hands back whatever the model calls them
+    // with, instead of running them itself. Only the ones the user ticked (plus
+    // the answer we are posting now) - sending [] also clears a set that an
+    // earlier request of this session declared.
+    const declaredClientNames = [...new Set([...enabledClientNames, ...answeringClientNames])]
+    answeringClientNames = []
+    reqBody.client_tools = clientToolDefinitions(declaredClientNames)
     if (isContinue) {
       reqBody.continue = true
       if (retryAgentId) reqBody.retry_agent_id = retryAgentId
@@ -1202,16 +1315,19 @@
     const frameBatcher = createStreamFrameBatcher((msg) => onStreamMsg(msg, aIdxRef, pendingFirstUserMsg, wasNewSession, keyRef))
     inferStream(
       reqBody,
-      (msg, eventName) => frameBatcher.push(eventName === 'usage'
-        ? {
-            role: 'usage',
-            agent_id: msg.agent_id,
-            name: msg.name,
-            content: JSON.stringify(Object.fromEntries(
-              Object.entries(msg).filter(([key]) => !['agent_id', 'assistant_id', 'name'].includes(key))
-            )),
-          }
-        : msg),
+      (msg, eventName) => {
+        if (noteClientToolFrame(msg, keyRef)) return
+        frameBatcher.push(eventName === 'usage'
+          ? {
+              role: 'usage',
+              agent_id: msg.agent_id,
+              name: msg.name,
+              content: JSON.stringify(Object.fromEntries(
+                Object.entries(msg).filter(([key]) => !['agent_id', 'assistant_id', 'name'].includes(key))
+              )),
+            }
+          : msg)
+      },
       // Keep direct ownership until the authoritative done_* status event.
       // [DONE] is sent before the backend has necessarily finished persistence,
       // broker shutdown, and status broadcasting; releasing here can make the
@@ -1253,6 +1369,7 @@
   }
 
   function handleStop() {
+    dropPendingAskUser()
     const key = storeKey(sessionId)
     const store = sessionStore[key]
     if (!sessionId || !store?.isStreaming) return
@@ -1732,6 +1849,10 @@
       // Refresh file journals list after stream completes
       loadFileJournals(sessionId)
     }
+    if (keyRef.pendingClientCalls?.length) {
+      const sid = keyRef.key === '__new__' ? sessionId : keyRef.key
+      void handleClientToolCalls(keyRef.pendingClientCalls, sid)
+    }
   }
 
   function toggleCollapse(startIndex) {
@@ -2048,6 +2169,7 @@
       sessionRestored = true
       shouldScrollToBottom = false
       loadDraftFor(sid)
+      maybeResumeClientTools(sid, msgs)
 
       // 优先使用 meta 中的设置（向下兼容：旧会话可能没有 meta）
       if (meta) {
@@ -2499,6 +2621,13 @@
     onCustom={keepFilesAndRevoke}
     onConfirm={confirmForceRevoke}
     onCancel={cancelForceRevoke}
+  />
+
+  <AskUserDialog
+    open={!!askUser}
+    request={askUser?.request ?? null}
+    onChoose={settleAskUser}
+    onCancel={() => settleAskUser({ value: null, dismissed: true })}
   />
 
   <ConfirmDialog
