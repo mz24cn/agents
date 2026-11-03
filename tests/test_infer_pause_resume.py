@@ -27,7 +27,7 @@ from runtime import server_state
 from runtime.common import _thread_local, clear_request_context, set_request_context
 from runtime.group_chat import run_group_chat_stream_gen
 from runtime.handler_infer import HandlerInferMixin
-from runtime.models import InferenceRequest, Message, ModelConfig
+from runtime.models import InferenceRequest, Message, ModelConfig, ToolConfig
 from runtime.registry import ModelRegistry, ToolRegistry
 from runtime.runtime import Runtime
 from runtime.server_state import (
@@ -956,3 +956,109 @@ def _post_json_delete(srv, session_id):
             return resp.status, json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         return exc.code, json.loads(exc.read().decode("utf-8") or "{}")
+
+
+# ---------------------------------------------------------------------------
+# 5. Resume re-binds inference parameters from the resume request itself
+# ---------------------------------------------------------------------------
+
+
+def _capture_model_calls(side_effect):
+    """Wrap a model side effect, capturing each OpenAI request body sent."""
+    captured = []
+
+    def wrapper(request, **kwargs):
+        try:
+            captured.append(json.loads(request.data.decode("utf-8")))
+        except Exception:
+            captured.append({})
+        return side_effect(request, **kwargs)
+
+    return captured, wrapper
+
+
+def _tool_names(body):
+    names = set()
+    for tool in body.get("tools") or []:
+        fn = tool.get("function") or tool
+        if fn.get("name"):
+            names.add(fn["name"])
+    return names
+
+
+def _seed_paused_history(cm):
+    session_id = cm.create_session()
+    cm.save_conversation(session_id, [
+        _turn("user", "go", timestamp="2026-08-12T15:00:00"),
+        _turn("assistant", "", timestamp="2026-08-12T15:00:01",
+              tool_calls=[{"id": "call_1", "name": "echo", "arguments": "{}"}]),
+        _turn("tool", "echo result", timestamp="2026-08-12T15:00:02",
+              name="echo", tool_use_id="call_1"),
+    ])
+    return session_id
+
+
+def _register_second_model_and_tool(srv):
+    srv._runtime._model_registry.register(ModelConfig(
+        model_id="model-b", api_base="http://localhost:9999",
+        model_name="model-B-label", api_protocol="openai",
+    ))
+    srv._runtime._tool_registry.register(
+        ToolConfig(tool_id="alpha", tool_type="function", name="alpha",
+                   description="alpha tool", parameters={}),
+        callable_fn=lambda **kw: "alpha result",
+    )
+
+
+def test_resume_applies_fresh_model_and_tool_selection(continue_server):
+    """暂停时换模型、换工具，恢复请求携带的新参数作用于新一轮：推理参数是
+    generation（请求）级绑定，暂停不会把参数冻结在暂停时刻。"""
+    srv = continue_server
+    session_id = _seed_paused_history(srv._context_manager)
+    _register_second_model_and_tool(srv)
+
+    captured, wrapper = _capture_model_calls(
+        _scripted_urlopen([_openai_sse_text("switched")])
+    )
+    status, body = _post_stream(srv, {
+        "session_id": session_id,
+        "model_id": "model-b",
+        "tool_ids": ["alpha"],
+        "resume": True,
+        "messages": [],
+    }, wrapper)
+    assert status == 200, f"resume failed: {body[:500]}"
+    assert "switched" in body
+
+    assert captured, "model API was not called"
+    sent = captured[-1]
+    assert sent.get("model") == "model-B-label"
+    assert _tool_names(sent) == {"alpha"}
+
+
+def test_resume_agent_switch_rebinds_model_and_tools(continue_server):
+    """暂停时换 AI 代理：代理配置里的 model/tool 绑定在恢复的新一轮生效
+    （请求体里的旧 model_id/tool_ids 会被代理配置覆盖，与普通发送一致）。"""
+    srv = continue_server
+    session_id = _seed_paused_history(srv._context_manager)
+    _register_second_model_and_tool(srv)
+    srv._agent_manager.create(agent_id="AgentA", model_id="test-model", nickname="A", tool_ids=["echo"])
+    srv._agent_manager.create(agent_id="AgentB", model_id="model-b", nickname="B", tool_ids=["alpha"])
+
+    captured, wrapper = _capture_model_calls(
+        _scripted_urlopen([_openai_sse_text("rebound")])
+    )
+    status, body = _post_stream(srv, {
+        "session_id": session_id,
+        "agent_ids": ["AgentB"],
+        "model_id": "test-model",   # stale on purpose; the agent binding wins
+        "tool_ids": ["echo"],       # stale on purpose; the agent binding wins
+        "resume": True,
+        "messages": [],
+    }, wrapper)
+    assert status == 200, f"resume failed: {body[:500]}"
+
+    assert captured, "model API was not called"
+    sent = captured[-1]
+    assert sent.get("model") == "model-B-label"
+    assert _tool_names(sent) == {"alpha"}

@@ -456,6 +456,58 @@ def _merge_single_agent_stream_messages(
     return turns, last_stat
 
 
+def pending_client_tool_calls(merged_turns: list, client_tool_names) -> list:
+    """Tool calls of a run that only the caller can answer.
+
+    A client-side tool (``tool_type='client_side'``) has no executable entity in
+    the agent service, so the inference loop leaves its call declared but
+    unanswered and ends normally.  Given the merged conversation turns of one run
+    (as produced by :func:`merge_stream_messages`) and the names/ids of the
+    session's client-side tools, this returns those handoff calls in declaration
+    order as ``{"id", "name", "arguments"}``, so a caller knows exactly what to
+    execute locally before resuming the same session.
+
+    Calls that did receive a ``role="tool"`` result inside the same run are
+    skipped: only a genuinely unanswered client-side call is a handoff.
+    """
+    names = set(client_tool_names or ())
+    if not names:
+        return []
+
+    def _field(obj, key):
+        return obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
+
+    answered = {
+        _field(turn, "tool_use_id")
+        for turn in merged_turns
+        if _field(turn, "role") == "tool"
+    }
+    answered.discard(None)
+
+    pending: list = []
+    for turn in merged_turns:
+        if _field(turn, "role") != "assistant":
+            continue
+        tool_calls = _field(turn, "tool_calls")
+        for call in tool_calls or []:
+            if not isinstance(call, dict):
+                continue
+            name = call.get("name", "")
+            if name not in names:
+                continue
+            call_id = call.get("id") or call.get("tool_use_id")
+            if call_id and call_id in answered:
+                continue
+            arguments = call.get("arguments", "{}")
+            if not isinstance(arguments, str):
+                try:
+                    arguments = json.dumps(arguments, ensure_ascii=False)
+                except (TypeError, ValueError):
+                    arguments = "{}"
+            pending.append({"id": call_id, "name": name, "arguments": arguments})
+    return pending
+
+
 def merge_stream_messages(stream_messages: list) -> tuple[list, Optional[dict]]:
     """Merge streamed messages without mixing concurrent agent buffers.
 

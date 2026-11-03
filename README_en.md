@@ -19,7 +19,7 @@ A minimal, zero-dependency Agent Service built with the pure Python standard lib
 - **Zero third-party dependencies** — core runtime uses only Python standard library
 - **Self-bootstrapping agents** — bootstrap runnable coding agents from project context, model/tool configuration, prompts, skills, and session state
 - **Multi-protocol support** — OpenAI-compatible API, Ollama native `/api/chat`, and Anthropic Messages API
-- **Three tool types** — in-process Function tools, MCP (Model Context Protocol) tools, and Skills
+- **Four tool types** — in-process Function tools, MCP (Model Context Protocol) tools, Skills, and Client Side tools (the server keeps only the registration JSON and never executes them: the model call is handed back to the client, which runs it locally and resumes the same session)
 - **Direct MCP/function tool invocation** — bypass the LLM and call MCP/function tools directly, 100% reliability; optionally return parsed JSON with `format: "json"`
 - **Skill progressive disclosure** — first round exposes only skill summary; full `SKILL.md` is injected only when the model selects the skill
 - **Streaming inference** — real-time token streaming with thinking/reasoning content support
@@ -376,6 +376,8 @@ change takes effect after a restart.
 
 > **Note:** The `session_id` field is optional. Use `"new"` to create a new session, an existing session ID to resume a conversation, or omit it for stateless inference.
 
+**Client-side tools:** a request body may carry a `client_tools` array — each entry is just the tool registration JSON (`name` / `description` / `parameters`, or the OpenAI-shaped `{"type":"function","function":{…}}`). Such tools join only this session's tool list, never the server-side `ToolRegistry`, and the server never executes them: as soon as the model calls one, the inference loop **exits normally**, and the unanswered calls are handed back — via the `client_tool_calls` field of `/v1/infer`, or the streaming frame `{"role":"status","status":"client_tool_calls","client_tool_calls":[…]}`. The client executes them locally and re-issues the request with the results as `{"role":"tool","tool_use_id":<call id>,"name":<tool>,"content":<result>}` plus **the same `session_id`**; the server merges the session history with those results and keeps reasoning. Pre-registering with `POST /v1/tools` and `tool_type: "client_side"` then selecting through `tool_ids` works too (session definitions win on name collisions). Within one parallel round, server-side tools still run on the server while client-side ones are handed back. See [client-side tool calls](docs/introduce-client-side-tools.md).
+
 ### Web UI
 
 ![Web UI Screenshot](resources/screenshot_tools.jpg)
@@ -419,6 +421,7 @@ Features:
 | `examples/example_vlm_tool_call.py` | VLM reads an image, understands the instruction in it, and calls built-in `write_file`/`exec_shell` tools to execute |
 | `examples/example_browser_use.py` | Client/server split: server registers chrome-devtools MCP; client calls `/v1/tools/call` to open a page directly, then `/v1/infer/stream` to let the LLM inspect and interact with the browser |
 | `examples/example_stream_as_infer.py` | Use `/v1/infer/stream` (SSE) to receive streaming tokens and reassemble them into the same JSON structure as `/v1/infer` — avoids idle-timeout disconnections on long-running inference |
+| `examples/example_client_side_tools.py` | Server-side plus client-side tools together: a pre-registered `client_side` tool and just-in-time session tools, called in the same parallel round; the client executes its share locally and resumes the same `session_id` |
 | `examples/example_multi_agents.py` | Plan Mode: Software Architect (Plan) delegates subtasks to MainAgent via the `delegate` tool. Demonstrates prompt templates, MCP tools, and hierarchical task delegation with automatic TOOLS markdown generation |
 
 ### Data Persistence

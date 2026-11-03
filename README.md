@@ -12,6 +12,10 @@
 
 ## 📰 更新动态（News）
 
+### 2026-11-03
+
+- **客户端工具调用（Client Side Tool Calls）** — 工具多了第四种类型 `client_side`：服务端只保留注册 JSON 并把它交给模型，自己永不执行。模型一旦调用，推理循环正常收尾，未应答的调用交回调用方；调用方本地执行后，用同一个 `session_id` 把结果送回，服务端把会话历史与结果合并后继续推理。工具可在 Setup / `POST /v1/tools` 里预注册再按 `tool_ids` 选用，也可在推理请求里即时下发 `client_tools`（只在本次会话可见）。同一轮并行调用可以横跨两侧：服务端工具在服务端跑完，客户端工具才交回。产品自带两个客户端工具——`AskUser` 让模型遇到只有用户能拍板的事就直接提问（浏览器弹窗 / TUI 选择器，2–8 个选项，可选超时与超时默认项，已预注册），`local_shell` 让远程 agent 在客户端机器上执行命令，仅在 TUI 用 `--local-shell` 显式开启。示例见 [`examples/example_client_side_tools.py`](examples/example_client_side_tools.py)，全文见 [客户端工具调用](docs/introduce-client-side-tools.md)。
+
 ### 2026-10-31
 
 - **会话可用性增强** — 推理跑起来之后，会话不再只能「等它结束」或「推倒重来」，长会话也不会一开口就撑爆上下文。

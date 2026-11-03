@@ -7,7 +7,7 @@
 - **零第三方依赖** — 核心运行时仅使用 Python 标准库
 - **自举式 Agent** — 基于项目上下文、模型/工具配置、提示词、Skill 和会话状态自举可运行的编码 Agent
 - **多协议支持** — OpenAI 兼容 API、Ollama 原生 `/api/chat` 和 Anthropic Messages API
-- **三种工具类型** — 进程内 Function 工具、MCP（模型上下文协议）工具、Skill 技能
+- **四种工具类型** — 进程内 Function 工具、MCP（模型上下文协议）工具、Skill 技能、Client Side 客户端工具（服务端只有注册 JSON、不执行，模型调用后交回客户端本地执行再续跑同一会话）
 - **MCP/function工具直接调用** — 可绕过大模型直接调用MCP/function工具，可靠性100%；支持通过 `format: "json"` 返回解析后的 JSON
 - **Skill 渐进披露** — 第一轮推理仅暴露技能摘要，大模型选择后才注入完整 `SKILL.md`
 - **流式推理** — 实时 token 流式输出，支持 thinking/reasoning 内容
@@ -355,6 +355,8 @@ python app.py 0.0.0.0:9000 # 自定义主机和端口（重载 AGENTS_URL）
 
 > **注意：** `session_id` 字段为可选参数。传入 `"new"` 创建新会话，传入已有会话 ID 恢复对话，或省略该字段进行无状态推理。
 
+**客户端工具（client-side tools）：** 推理请求体可带 `client_tools` 数组——每项就是工具注册 JSON（`name` / `description` / `parameters`，也可写成 OpenAI 的 `{"type":"function","function":{…}}` 形态）。这类工具只进本次会话的工具清单、不进服务端 `ToolRegistry`，服务端永远不会执行它：模型一旦调用，循环即**正常退出**，未应答的调用经 `/v1/infer` 的 `client_tool_calls` 字段、或流式的 `{"role":"status","status":"client_tool_calls","client_tool_calls":[…]}` 帧交回客户端。客户端本地执行后，把结果按 `{"role":"tool","tool_use_id":<调用 id>,"name":<工具名>,"content":<结果>}` 连同**同一个 `session_id`** 再发一次请求，服务端会把会话历史与这些结果合并后继续推理。也可以事先 `POST /v1/tools` 注册 `tool_type: "client_side"` 的工具、再用 `tool_ids` 选用（同名时以会话内声明为准）。同一轮并行调用里服务端工具照常在服务端执行、客户端工具交回客户端。详见 [客户端工具调用](docs/introduce-client-side-tools.md)。
+
 ### Web UI 管理控制台
 
 ![Web UI 截图](resources/screenshot_chat.jpg)
@@ -398,6 +400,7 @@ npm run build
 | `examples/example_vlm_tool_call.py` | VLM 读取图片中的文字指令，自动调用内置 `write_file`/`exec_shell` 工具执行 |
 | `examples/example_browser_use.py` | 客户端/服务端分离：Server 注册 chrome-devtools MCP；Client 通过 `/v1/tools/call` 直接打开页面，再通过 `/v1/infer/stream` 让大模型操控浏览器 |
 | `examples/example_stream_as_infer.py` | 通过 `/v1/infer/stream`（SSE）接收流式 token，在本地拼装成与 `/v1/infer` 完全一致的 JSON 结果，彻底规避长时推理的网关/代理 idle timeout 断连问题；支持 `--compare` 参数同时调用两个接口对比结果 |
+| `examples/example_client_side_tools.py` | 服务端工具 + 客户端工具同时使用：预注册 `client_side` 工具与会话内即时声明并用，模型同一轮并行调用两侧；客户端本地执行后带 `session_id` 续跑同一会话 |
 | `examples/example_multi_agents.py` | 规划模式：软件架构师(Plan) 通过 `delegate` 工具将子任务委派给 MainAgent 执行。演示提示词模板、MCP 工具、层级化任务委派，以及自动生成 TOOLS markdown 表格 |
 
 ### 数据持久化

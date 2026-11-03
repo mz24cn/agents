@@ -241,13 +241,27 @@ class ModelConfig:
         )
 
 
+#: Tool type whose execution lives in the *caller*, not in the agent service.
+#:
+#: A client-side tool is a function tool stripped of its executable entity:
+#: only the registration JSON (name / description / parameter schema) exists on
+#: the server, so the model can call it exactly like any other tool, but the
+#: inference loop hands the call back to the client instead of running it.  See
+#: ``Runtime._partition_tool_calls_by_execution_side`` and
+#: ``HandlerInferMixin._parse_client_tools``.
+CLIENT_SIDE_TOOL_TYPE = "client_side"
+
+#: Tool types the registry / Setup page accept for registered tools.
+TOOL_TYPES = ("function", "mcp", "skill", CLIENT_SIDE_TOOL_TYPE)
+
+
 @dataclass
 class ToolConfig:
-    """Configuration for a tool (function, MCP, or skill).
+    """Configuration for a tool (function, MCP, skill, or client-side).
 
     Attributes:
         tool_id: Unique identifier for this tool.
-        tool_type: Type of tool - "function", "mcp", or "skill".
+        tool_type: Type of tool - "function", "mcp", "skill", or "client_side".
         name: Display name of the tool.
         description: Human-readable description.
         parameters: OpenAI function calling JSON Schema for parameters.
@@ -276,6 +290,61 @@ class ToolConfig:
 
     def __post_init__(self):
         self.labels = parse_labels(self.labels)
+
+    def is_client_side(self) -> bool:
+        """Whether this tool is executed by the caller instead of the service.
+
+        A client-side tool carries no callable, no MCP server and no skill
+        directory: the registration JSON *is* the whole tool.  The inference
+        loop still offers it to the model, but a call to it ends the round's
+        server-side work and is handed back to the client.
+        """
+        return self.tool_type == CLIENT_SIDE_TOOL_TYPE
+
+    @classmethod
+    def from_session_definition(cls, data: object, position: int = 0) -> "ToolConfig":
+        """Build a session-scoped client-side tool from inference-request JSON.
+
+        Both natural shapes a client sends are accepted:
+
+        * ToolConfig-shaped:  ``{"name", "description", "parameters"}``
+        * OpenAI function schema: ``{"type": "function",
+          "function": {"name", "description", "parameters"}}``
+
+        ``tool_type`` is always forced to ``client_side`` — the service must
+        never execute these tools, whatever the client asked for.  The tool_id
+        defaults to the name so the definition can be recognised again when the
+        session's tool results come back.
+        """
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"client tool #{position} must be a JSON object, "
+                f"got {type(data).__name__}"
+            )
+        spec = data
+        nested = data.get("function")
+        if isinstance(nested, dict):
+            spec = {**nested, **{
+                k: v for k, v in data.items() if k == "tool_id"
+            }}
+        name = str(spec.get("name") or spec.get("tool_id") or "").strip()
+        if not name:
+            raise ValueError(f"client tool #{position} requires a 'name'")
+        parameters = spec.get("parameters")
+        if parameters is None:
+            parameters = {"type": "object", "properties": {}}
+        if not isinstance(parameters, dict):
+            raise ValueError(
+                f"client tool '{name}' parameter schema must be a JSON object"
+            )
+        return cls(
+            tool_id=str(spec.get("tool_id") or name),
+            tool_type=CLIENT_SIDE_TOOL_TYPE,
+            name=name,
+            description=str(spec.get("description") or ""),
+            parameters=parameters,
+            labels=parse_labels(spec.get("labels", [])),
+        )
 
     def to_dict(self) -> dict:
         """Serialize to a dictionary, omitting None optional fields."""
@@ -343,6 +412,12 @@ class InferenceRequest:
             callable that executes in the bound child environment). When set,
             the runtime uses it directly as the tool set exposed to the model
             instead of resolving tool_ids against the parent ToolRegistry.
+        client_tools: Session-scoped client-side tool definitions (always
+            ``tool_type="client_side"``).  They join the tool set sent to the
+            model for this request without ever being registered in the
+            ToolRegistry, so ``GET /v1/tools`` and every other session stay
+            unaware of them.  A model call to one ends the loop and hands the
+            call back to the caller.
         messages: Optional pre-built message list.
         text: Optional plain text input (convenience shortcut).
         stream: Whether to use streaming response mode.
@@ -353,6 +428,7 @@ class InferenceRequest:
     model_config_override: Optional[ModelConfig] = None
     tool_ids: list = field(default_factory=list)
     tools: Optional[list] = None
+    client_tools: Optional[list] = None
     messages: Optional[list] = None
     text: Optional[str] = None
     stream: bool = False
@@ -428,6 +504,11 @@ class InferenceResult:
         error: Error description if success is False.
         error_code: Machine-readable error code if success is False.
         stat: Aggregated token and timing statistics across all inference rounds.
+        client_tool_calls: Set when the loop stopped because the model asked
+            for client-side tool(s): the pending calls, in declaration order
+            (``{"id", "name", "arguments"}``).  They were deliberately not
+            executed and have no tool result in ``messages`` — the caller runs
+            them and resumes the same session with the results.
     """
 
     success: bool
@@ -435,3 +516,4 @@ class InferenceResult:
     error: Optional[str] = None
     error_code: Optional[str] = None
     stat: Optional["TokenStat"] = None
+    client_tool_calls: Optional[list] = None

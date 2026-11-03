@@ -29,7 +29,13 @@ from runtime.common import (
     env_int,
 )
 from runtime.builtin_tools_coding import _FileJournalManagerHolder
-from runtime.models import InferenceRequest, Message, ModelConfig
+from runtime.models import (
+    CLIENT_SIDE_TOOL_TYPE,
+    InferenceRequest,
+    Message,
+    ModelConfig,
+    ToolConfig,
+)
 from runtime.server_state import (
     _session_stream_lock,
     _session_streams,
@@ -46,6 +52,7 @@ from runtime.server_state import (
     InLoopContextCompressor,
     mark_session_stream_persisted,
     merge_stream_messages,
+    pending_client_tool_calls,
     publish_session_stream_frame,
     queue_infer_interjection,
     request_pause_infer,
@@ -269,6 +276,10 @@ class BufferedInferSink(InferSink):
         self.session_id: Optional[str] = None
         self.collected: list[Message] = []
         self.error_text: Optional[str] = None
+        #: Names/ids of this session's client-side tools, used to report the
+        #: tool calls the loop handed back instead of executing (see
+        #: :func:`runtime.server_state.pending_client_tool_calls`).
+        self.client_tool_names: set = set()
 
     def begin(self, session_id: Optional[str]) -> None:
         self.started = True
@@ -278,6 +289,10 @@ class BufferedInferSink(InferSink):
         """Bind the pipeline's own state so the envelope can be rebuilt."""
         self.session_id = session_id
         self.collected = collected
+
+    def attach_client_tools(self, names) -> None:
+        """Tell the sink which tools the caller executes for itself."""
+        self.client_tool_names = set(names or ())
 
     def write(self, payload: bytes) -> None:
         return None
@@ -296,6 +311,10 @@ class BufferedInferSink(InferSink):
         ``stat`` / ``error``, 200 on a clean run and 500 when a round failed.
         ``merge_stream_messages`` is the very same merge the persister uses, so
         the response matches what was written to ``conversation.json``.
+
+        A run that ended on a client-side tool call additionally carries
+        ``client_tool_calls``: the unanswered calls (``id`` / ``name`` /
+        ``arguments``) the caller executes locally before resuming the session.
         """
         collected = self.collected
         merged_turns, merged_last_stat = merge_stream_messages(collected)
@@ -332,7 +351,38 @@ class BufferedInferSink(InferSink):
                         break
         if stat_dict is not None:
             envelope["stat"] = stat_dict
+        if self.client_tool_names:
+            # A client-side tool call is a *normal* end of the loop, not an
+            # error: report the calls the caller must run locally so it can
+            # resume this same session with their results.
+            handoff = pending_client_tool_calls(merged_turns, self.client_tool_names)
+            if handoff:
+                envelope["client_tool_calls"] = handoff
         return (200 if success else 500), envelope
+
+
+def _build_infer_session_extra_meta(body: dict, request: InferenceRequest) -> Optional[dict]:
+    """Session ``meta`` fields describing how this inference run was configured.
+
+    ``client_tools`` is the session-scoped half of the client-side tool feature:
+    definitions the caller shipped with the request instead of registering them.
+    Recording them in the session meta is what makes "visible in this session
+    only" survive a follow-up request that omits the field (e.g. the request
+    carrying the tool results) — while the global ToolRegistry, and therefore
+    ``GET /v1/tools`` and every other session, never learns about them.
+    """
+    meta: dict = {}
+    if body.get("remote_env"):
+        meta["remote_env"] = body["remote_env"]
+    if request.client_tools:
+        meta["client_tools"] = [config.to_dict() for config in request.client_tools]
+    elif body.get("client_tools") == []:
+        # An explicitly empty list is the caller taking the tools back (the web
+        # client sends ``[]`` when the user unticks them).  Skipping the write
+        # because it is falsy would leave the old list in the meta, ready to be
+        # resurrected by the next request that omits the field.
+        meta["client_tools"] = []
+    return meta or None
 
 
 class HandlerInferMixin:
@@ -811,11 +861,33 @@ class HandlerInferMixin:
                             msg.arguments["AGENTS"] = agents_markdown
                         break
 
+        # --- Client-side tools ------------------------------------------------
+        # Client-side tools are function tools without their executable entity:
+        # the service shows the registration JSON to the model, but the caller
+        # runs the tool and answers with the result on the same session.  They
+        # reach a session two ways:
+        #   * pre-registered as a ``client_side`` row in the ToolRegistry and
+        #     selected through ``tool_ids`` like any other tool;
+        #   * shipped with this request as ``client_tools`` (array of tool
+        #     description JSON).  Those are session-scoped: never registered, so
+        #     neither ``GET /v1/tools`` nor any other session sees them.  A later
+        #     request of the same session may omit the field — the definitions
+        #     persisted in the session meta are then restored, so the model keeps
+        #     seeing them for the whole conversation.
+        try:
+            client_tools = self._resolve_session_client_tools(
+                body, context_manager, session_id if use_session else None,
+            )
+        except ValueError as exc:
+            self._send_json_error(400, str(exc))
+            return None
+
         request = InferenceRequest(
             model_id=body["model_id"],
             model_config_override=model_override,
             tool_ids=tool_ids,
             tools=remote_selected,
+            client_tools=client_tools,
             messages=assembled_messages,
             text=body.get("text"),
             stream=True,
@@ -851,6 +923,68 @@ class HandlerInferMixin:
 
         agent_nickname = agent.get("nickname") if agent else None
         return body, request, session_id, use_session, original_messages, context_manager, agent_ids, agent_nickname, body["model_id"], tool_ids, workspace, remote_proxy
+
+    def _resolve_session_client_tools(
+        self, body: dict, context_manager, session_id: Optional[str],
+    ) -> list:
+        """Parse the request's ``client_tools`` into session-scoped ToolConfigs.
+
+        Accepts both ToolConfig-shaped objects and OpenAI function schemas
+        (``ToolConfig.from_session_definition``); every entry is forced to
+        ``tool_type='client_side'`` so nothing here can execute it.  When the
+        field is absent for an existing session, the definitions persisted in
+        that session's meta are restored instead: the tools belong to the
+        conversation, not to one HTTP request.
+        """
+        raw = body.get("client_tools")
+        if raw is None:
+            if session_id is None:
+                return []
+            try:
+                meta = context_manager.get_session_meta(session_id) or {}
+            except (OSError, ValueError):
+                meta = {}
+            raw = meta.get("client_tools")
+            if raw is None:
+                return []
+        if not isinstance(raw, list):
+            raise ValueError(
+                "client_tools must be an array of client tool description JSON"
+            )
+        client_tools: list = []
+        seen: set = set()
+        for position, item in enumerate(raw):
+            try:
+                config = ToolConfig.from_session_definition(item, position)
+            except ValueError as exc:
+                raise ValueError(f"Invalid client_tools[{position}]: {exc}") from exc
+            for key in (config.name, config.tool_id):
+                if key in seen:
+                    raise ValueError(
+                        f"Duplicate client tool name/tool_id: {key}"
+                    )
+            seen.update((config.name, config.tool_id))
+            client_tools.append(config)
+        return client_tools
+
+    def _client_side_tool_names(self, request: InferenceRequest) -> set:
+        """Names and tool_ids of every client-side tool visible to a request.
+
+        Covers both registration routes — the session-provided definitions and
+        pre-registered ``client_side`` registry rows selected through
+        ``tool_ids`` — so the handoff a run produced can be recognised
+        afterwards (``pending_client_tool_calls``).
+        """
+        names: set = set()
+        for config in (request.client_tools or []):
+            names.update({config.name, config.tool_id})
+        registry = self._get_runtime()._tool_registry
+        for tool_id in (request.tool_ids or []):
+            config = registry.get(tool_id)
+            if config is not None and config.tool_type == CLIENT_SIDE_TOOL_TYPE:
+                names.update({config.name, config.tool_id, config.tool_name or ""})
+        names.discard("")
+        return names
 
     def _finalize_file_journal(self) -> None:
         """Best-effort turn-level reconciliation of registered file changes."""
@@ -1072,6 +1206,11 @@ class HandlerInferMixin:
         # valid for the whole run.  The SSE sink ignores this.
         if sink.buffered:
             sink.attach(session_id=session_id, collected=collected_messages)
+            # So a non-streaming response can name the tool calls the loop left
+            # for the caller instead of executing them.
+            attach_client_tools = getattr(sink, "attach_client_tools", None)
+            if attach_client_tools is not None:
+                attach_client_tools(self._client_side_tool_names(request))
         # A single SSE connection may receive frames from nested-tool worker
         # threads as well as the HTTP handler thread.  Serialize every write so
         # JSON events and heartbeat comments can never interleave.
@@ -1233,7 +1372,7 @@ class HandlerInferMixin:
             model_id=model_id,
             tool_ids=tool_ids,
             workspace=workspace,
-            extra_meta={"remote_env": _body["remote_env"]} if _body.get("remote_env") else None,
+            extra_meta=_build_infer_session_extra_meta(_body, request),
             is_active=lambda: self._is_active_stream(session_id, cancel_event),
             on_incremental_persist=lambda: mark_session_stream_persisted(
                 session_id, latest_stream_seq, owner_event=cancel_event,
@@ -1440,6 +1579,28 @@ class HandlerInferMixin:
             # that as completion even though the replacement is still running.
             if session_id is not None and not self._is_active_stream(session_id, cancel_event):
                 return
+
+            # Client-side tool handoff: this run stopped on tool call(s) the
+            # service must not execute (``tool_type='client_side'``).  Say so
+            # explicitly — a streaming caller can otherwise only infer it from
+            # the tool names it declared — and do it before [DONE] so the frame
+            # is part of this response, not a race after the stream closed.
+            try:
+                _client_names = self._client_side_tool_names(request)
+            except Exception:  # noqa: BLE001 - never break the stream over this
+                _client_names = set()
+            if _client_names:
+                client_handoff = pending_client_tool_calls(
+                    [m.to_dict() for m in collected_messages if hasattr(m, "to_dict")],
+                    _client_names,
+                )
+                if client_handoff and client_connected:
+                    _sse_write({
+                        "role": "status",
+                        "source": "system",
+                        "status": "client_tool_calls",
+                        "client_tool_calls": client_handoff,
+                    })
 
             # Reconcile file snapshots before announcing completion so a
             # client fetching the journal immediately after [DONE] sees the

@@ -39,7 +39,13 @@ from runtime.handler_base import (
     _SESSION_GZIP_CACHE_MAX,
 )
 from runtime.model_probe import ModelProbeError, probe_models
-from runtime.models import ModelConfig, ToolConfig, _resolve_env_placeholders
+from runtime.models import (
+    CLIENT_SIDE_TOOL_TYPE,
+    TOOL_TYPES,
+    ModelConfig,
+    ToolConfig,
+    _resolve_env_placeholders,
+)
 from runtime.remote_env_manager import (
     build_setup_request_url,
     normalize_setup_url,
@@ -473,12 +479,24 @@ class HandlerApiMixin:
         elif body.get("tool_type") == "skill" and "tool_id" not in body:
             # For skill tools, generate tool_id from skill name if not provided
             body.setdefault("tool_id", f"skill-{body.get('name', '')}")
+        elif body.get("tool_type") == CLIENT_SIDE_TOOL_TYPE and "tool_id" not in body:
+            # A client-side tool is the executable-less simplification of a
+            # function tool: only the registration JSON lives on the server.
+            body.setdefault("tool_id", f"{CLIENT_SIDE_TOOL_TYPE}-{body.get('name', '')}")
 
         required = ["tool_id", "tool_type", "name", "description", "parameters"]
         for field in required:
             if field not in body or not str(body[field]).strip():
                 self._send_json_error(400, f"Missing required field: {field}")
                 return
+        if body.get("tool_type") not in TOOL_TYPES:
+            self._send_json_error(
+                400,
+                "Invalid tool_type: "
+                f"{body.get('tool_type')!r} (expected one of "
+                + ", ".join(TOOL_TYPES) + ")",
+            )
+            return
 
         now = datetime.datetime.now().isoformat()
         body.setdefault("created_at", now)
@@ -938,8 +956,35 @@ class HandlerApiMixin:
                     ],
                 }
 
+            elif tool_type == CLIENT_SIDE_TOOL_TYPE:
+                # Nothing to import, connect or read: a client-side tool has no
+                # executable entity on this side, its registration JSON *is* the
+                # tool.  Validate what the model and the caller both rely on.
+                client_name = str(body.get("name", "")).strip()
+                client_parameters = body.get("parameters")
+                if not client_name:
+                    raise ValueError("name is required")
+                if not isinstance(client_parameters, dict):
+                    raise ValueError("parameters must be a JSON object")
+                if client_parameters.get("type", "object") != "object":
+                    raise ValueError('parameters schema must have "type": "object"')
+                result = {
+                    "status": "ok",
+                    "tool_type": CLIENT_SIDE_TOOL_TYPE,
+                    "name": client_name,
+                    "note": (
+                        "client-side tool: the agent service keeps only this "
+                        "registration JSON and never executes it; the caller "
+                        "runs it locally and posts the result back to the same "
+                        "session as a role='tool' message"
+                    ),
+                }
+
             else:
-                raise ValueError("tool_type must be function, skill, or mcp")
+                raise ValueError(
+                    "tool_type must be function, skill, mcp, or "
+                    f"{CLIENT_SIDE_TOOL_TYPE}"
+                )
 
             self._send_json_response(200, result)
         except Exception as exc:

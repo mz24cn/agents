@@ -1,0 +1,615 @@
+"""Client-side tool calls: registration, loop handoff, and session resume.
+
+A client-side tool (``tool_type="client_side"``) is a function tool stripped of
+its executable entity: the agent service keeps only the registration JSON, hands
+the definition to the model, and never runs the tool itself.  When the model
+calls one, the inference loop ends *normally* and the call is handed back; the
+caller executes it locally and resumes the same session with the result.
+
+These tests pin the whole contract:
+
+1. ``ToolConfig`` accepts the new type and both shapes of a session-provided
+   definition (ToolConfig-shaped and OpenAI function schema).
+2. A call to a client-side tool stops the loop with no fabricated tool result.
+3. Parallel tool calls that straddle both execution sides are partitioned: the
+   server-side call still runs, the client-side one is handed back.
+4. ``client_tools`` shipped with a request are visible to the model for that
+   session only — never in the ToolRegistry.
+5. The non-streaming envelope names the pending calls (``client_tool_calls``),
+   and a follow-up request carrying the results merges them into the session by
+   session id and continues the loop.
+
+The model is a real local SSE endpoint rather than a monkeypatched
+``urlopen``, so the test's own HTTP calls to the agent service stay real.
+"""
+
+import contextlib
+import http.server
+import io
+import json
+import threading
+import urllib.error
+import urllib.request
+from unittest.mock import patch
+
+from runtime.models import (
+    CLIENT_SIDE_TOOL_TYPE,
+    InferenceRequest,
+    ModelConfig,
+    ToolConfig,
+)
+from runtime.registry import ModelRegistry, ToolRegistry
+from runtime.runtime import Runtime
+from runtime.server import RuntimeHTTPServer
+from runtime.server_state import pending_client_tool_calls
+
+
+# ---------------------------------------------------------------------------
+# Fake model transport
+# ---------------------------------------------------------------------------
+
+class _FakeModelHandler(http.server.BaseHTTPRequestHandler):
+    """Replays scripted OpenAI SSE bodies and records every request payload."""
+
+    def do_POST(self) -> None:  # noqa: N802
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            self.server.seen.append(json.loads(raw.decode("utf-8")))
+        except (ValueError, UnicodeDecodeError):
+            self.server.seen.append({})
+        index = self.server.index
+        self.server.index += 1
+        if not self.server.streams:
+            body = b"data: [DONE]\n\n"
+        else:
+            body = self.server.streams[min(index, len(self.server.streams) - 1)].getvalue()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args) -> None:
+        return
+
+
+@contextlib.contextmanager
+def _fake_model_server(streams: list[io.BytesIO]):
+    """Serve *streams*, one per model call; yield ``(base_url, seen)``."""
+    seen: list[dict] = []
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _FakeModelHandler)
+    httpd.seen = seen
+    httpd.streams = streams
+    httpd.index = 0
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{httpd.server_address[1]}", seen
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+
+
+def _make_model_registry(api_base: str = "http://127.0.0.1:9999") -> ModelRegistry:
+    registry = ModelRegistry()
+    registry.register(ModelConfig(
+        model_id="test-model",
+        api_base=api_base,
+        model_name="test",
+        api_protocol="openai",
+    ))
+    return registry
+
+
+def _sse(lines: list[str]) -> io.BytesIO:
+    return io.BytesIO("".join(lines).encode("utf-8"))
+
+
+def _sse_tool_calls(calls: list[tuple[str, str, str]]) -> io.BytesIO:
+    """One OpenAI SSE stream declaring several parallel tool calls."""
+    lines = []
+    for index, (name, call_id, arguments) in enumerate(calls):
+        lines.append("data: " + json.dumps({
+            "choices": [{
+                "delta": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "index": index,
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": arguments},
+                    }],
+                }
+            }]
+        }) + "\n\n")
+    lines.append("data: [DONE]\n\n")
+    return _sse(lines)
+
+
+def _sse_content(text: str) -> io.BytesIO:
+    return _sse([
+        "data: " + json.dumps({
+            "choices": [{"delta": {"role": "assistant", "content": text}}]
+        }) + "\n\n",
+        "data: [DONE]\n\n",
+    ])
+
+
+def _server_tool() -> str:
+    return "server-side result"
+
+
+def _make_runtime(api_base: str, extra_tools: list[ToolConfig] | None = None) -> Runtime:
+    tool_registry = ToolRegistry()
+    tool_registry.register(
+        ToolConfig(
+            tool_id="function-server_echo",
+            tool_type="function",
+            name="server_echo",
+            description="A server-side tool that runs here",
+            parameters={"type": "object", "properties": {}},
+        ),
+        callable_fn=_server_tool,
+    )
+    tool_registry.register(ToolConfig(
+        tool_id=f"{CLIENT_SIDE_TOOL_TYPE}-probe",
+        tool_type=CLIENT_SIDE_TOOL_TYPE,
+        name="probe",
+        description="Executed by the caller",
+        parameters={"type": "object", "properties": {"target": {"type": "string"}}},
+    ))
+    for config in extra_tools or []:
+        tool_registry.register(config)
+    return Runtime(
+        model_registry=_make_model_registry(api_base),
+        tool_registry=tool_registry,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 1. ToolConfig / session definition parsing
+# ---------------------------------------------------------------------------
+
+def test_client_side_tool_config_is_marked_client_side() -> None:
+    config = ToolConfig(
+        tool_id="client-x", tool_type=CLIENT_SIDE_TOOL_TYPE, name="x",
+        description="d", parameters={"type": "object", "properties": {}},
+    )
+    assert config.is_client_side() is True
+    function_tool = ToolConfig(
+        tool_id="function-x", tool_type="function", name="x",
+        description="d", parameters={},
+    )
+    assert function_tool.is_client_side() is False
+    # Round-trips through the registry JSON unchanged.
+    assert ToolConfig.from_dict(config.to_dict()).is_client_side()
+
+
+def test_session_definition_accepts_both_shapes() -> None:
+    plain = ToolConfig.from_session_definition({
+        "name": "read_local_file",
+        "description": "Read a file on the caller machine",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+    })
+    assert plain.tool_type == CLIENT_SIDE_TOOL_TYPE
+    assert plain.tool_id == "read_local_file"
+    assert plain.parameters["properties"]["path"]["type"] == "string"
+
+    openai_shape = ToolConfig.from_session_definition({
+        "type": "function",
+        "function": {
+            "name": "local_exec",
+            "description": "Run a command locally",
+            "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+        },
+    })
+    assert openai_shape.name == "local_exec"
+    assert openai_shape.tool_type == CLIENT_SIDE_TOOL_TYPE
+
+    # A caller cannot smuggle an executable type in: the service never runs it.
+    sneaky = ToolConfig.from_session_definition({
+        "name": "sneaky", "tool_type": "function",
+        "function_file_path": "/etc/evil.py", "function_name": "boom",
+    })
+    assert sneaky.tool_type == CLIENT_SIDE_TOOL_TYPE
+    assert sneaky.function_file_path is None
+
+    try:
+        ToolConfig.from_session_definition({"description": "nameless"})
+    except ValueError as exc:
+        assert "name" in str(exc)
+    else:
+        raise AssertionError("a client tool without a name must be rejected")
+
+
+# ---------------------------------------------------------------------------
+# 2. A client-side call ends the loop normally (streaming)
+# ---------------------------------------------------------------------------
+
+def test_client_side_call_ends_loop_without_fabricated_result() -> None:
+    streams = [_sse_tool_calls([("probe", "call_c1", '{"target": "app"}')])]
+    with _fake_model_server(streams) as (api_base, seen):
+        runtime = _make_runtime(api_base)
+        request = InferenceRequest(
+            model_id="test-model",
+            tool_ids=[f"{CLIENT_SIDE_TOOL_TYPE}-probe"],
+            text="probe the target",
+            stream=True,
+        )
+        collected = list(runtime.infer_stream(request))
+
+    # The loop asked the model exactly once: a client-side call is a normal
+    # exit, not a round to keep looping on.
+    assert len(seen) == 1
+    assert [m.role for m in collected if m.role == "tool"] == []
+    declared = [
+        call for m in collected if m.role == "assistant" and m.tool_calls
+        for call in m.tool_calls
+    ]
+    assert [c["name"] for c in declared] == ["probe"]
+    # The definition reached the model like any other tool.
+    sent_tools = [t["function"]["name"] for t in seen[0].get("tools", [])]
+    assert "probe" in sent_tools
+
+
+def test_mixed_parallel_round_runs_server_tool_and_hands_over_the_rest() -> None:
+    """One model round declaring both sides: server runs, client is handed back."""
+    streams = [
+        _sse_tool_calls([
+            ("server_echo", "call_s1", "{}"),
+            ("probe", "call_c1", '{"target": "app"}'),
+        ]),
+        _sse_content("should not be reached"),
+    ]
+    with _fake_model_server(streams) as (api_base, seen):
+        runtime = _make_runtime(api_base)
+        request = InferenceRequest(
+            model_id="test-model",
+            tool_ids=["function-server_echo", f"{CLIENT_SIDE_TOOL_TYPE}-probe"],
+            text="both at once",
+            stream=True,
+        )
+        collected = list(runtime.infer_stream(request))
+
+    assert len(seen) == 1, "the loop must not continue after a client-side call"
+    tool_msgs = [m for m in collected if m.role == "tool"]
+    assert [m.name for m in tool_msgs] == ["server_echo"], (
+        "only the server-side half of the round runs here"
+    )
+    assert tool_msgs[0].content == "server-side result"
+    # The client-side call stays declared but unanswered.
+    answered = {m.tool_use_id for m in tool_msgs}
+    declared = [
+        call for m in collected if m.role == "assistant" and m.tool_calls
+        for call in m.tool_calls
+    ]
+    assert {c["id"] for c in declared} == {"call_s1", "call_c1"}
+    assert "call_c1" not in answered
+
+    pending = pending_client_tool_calls(
+        [{"role": "assistant", "tool_calls": declared},
+         {"role": "tool", "tool_use_id": "call_s1"}],
+        {"probe"},
+    )
+    assert pending == [{
+        "id": "call_c1", "name": "probe", "arguments": '{"target": "app"}',
+    }]
+
+
+# ---------------------------------------------------------------------------
+# 3. Session-provided client tools never enter the registry
+# ---------------------------------------------------------------------------
+
+def test_session_client_tools_are_invisible_to_the_registry() -> None:
+    streams = [_sse_tool_calls([("ad_hoc_tool", "call_a1", "{}")])]
+    with _fake_model_server(streams) as (api_base, seen):
+        runtime = _make_runtime(api_base)
+        request = InferenceRequest(
+            model_id="test-model",
+            tool_ids=[],
+            client_tools=[ToolConfig.from_session_definition({
+                "name": "ad_hoc_tool",
+                "description": "Defined for this session only",
+                "parameters": {"type": "object", "properties": {}},
+            })],
+            text="use the ad-hoc tool",
+            stream=True,
+        )
+        collected = list(runtime.infer_stream(request))
+
+    sent_tools = [t["function"]["name"] for t in seen[0].get("tools", [])]
+    assert sent_tools == ["ad_hoc_tool"], "the model must see the session tool"
+    assert runtime._tool_registry.get("ad_hoc_tool") is None, (
+        "a session-provided tool must not leak into the ToolRegistry"
+    )
+    assert [m.role for m in collected if m.role == "tool"] == []
+
+
+def test_call_tool_refuses_a_client_side_tool() -> None:
+    runtime = _make_runtime("http://127.0.0.1:9999")
+    result = runtime.call_tool(f"{CLIENT_SIDE_TOOL_TYPE}-probe", {})
+    assert "client-side tool" in result
+
+
+# ---------------------------------------------------------------------------
+# 4. End to end over HTTP: handoff, envelope, resume by session id
+# ---------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def _running_server(tmp_path, api_base: str):
+    chats_dir = tmp_path / "chats"
+    with contextlib.ExitStack() as stack:
+        for target, value in (
+            ("runtime.server._MODELS_PATH", "models.json"),
+            ("runtime.server._TOOLS_PATH", "tools.json"),
+            ("runtime.server._PROMPT_TEMPLATES_PATH", "prompt_templates.json"),
+            ("runtime.server._DATA_DIR", "."),
+        ):
+            stack.enter_context(patch(target, str(tmp_path / value)))
+        srv = RuntimeHTTPServer(
+            _make_runtime(api_base), chats_dir=str(chats_dir),
+        )
+        srv.start_background(host="127.0.0.1", port=0)
+        try:
+            yield srv, str(chats_dir)
+        finally:
+            srv.stop()
+
+
+def _post(base: str, path: str, payload: dict) -> tuple[int, dict]:
+    req = urllib.request.Request(
+        base + path,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", "replace")
+        try:
+            return exc.code, json.loads(raw)
+        except ValueError:
+            return exc.code, {"error": raw}
+
+
+def _conversation(chats_dir: str, session_id: str) -> dict:
+    with open(f"{chats_dir}/{session_id}/conversation.json", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def test_non_streaming_handoff_and_resume(tmp_path) -> None:
+    """Both execution sides in one session, over the non-streaming endpoint.
+
+    Round 1: the model declares a server-side and a client-side call in the same
+    message.  The server runs its own, then stops and reports the pending call.
+    Round 2: the caller posts the local result with the same session id; the
+    service merges it into the session history and the loop continues.
+    """
+    streams = [
+        _sse_tool_calls([
+            ("server_echo", "call_s1", "{}"),
+            ("frame_probe", "call_c1", '{"fid": "f1"}'),
+        ]),
+        _sse_content("diagnosis: null pointer in frame f1"),
+    ]
+    with _fake_model_server(streams) as (api_base, seen):
+        with _running_server(tmp_path, api_base) as (srv, chats_dir):
+            base = f"http://127.0.0.1:{srv.port}"
+
+            status, envelope = _post(base, "/v1/infer", {
+                "model_id": "test-model",
+                "tool_ids": ["function-server_echo"],
+                "workspace": str(tmp_path),
+                "session_id": "new",
+                "messages": [{"role": "user", "content": "inspect frame f1"}],
+                "client_tools": [{
+                    "name": "frame_probe",
+                    "description": "Dump a frame from the caller's process",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"fid": {"type": "string"}},
+                    },
+                }],
+            })
+
+            assert status == 200, envelope
+            session_id = envelope["session_id"]
+
+            # The envelope names exactly the call the caller has to run locally.
+            assert envelope.get("client_tool_calls") == [{
+                "id": "call_c1", "name": "frame_probe",
+                "arguments": '{"fid": "f1"}',
+            }], envelope
+
+            turns = _conversation(chats_dir, session_id)["messages"]
+            # The server-side half ran; the client-side call was left unanswered.
+            assert [t["role"] for t in turns] == ["user", "assistant", "tool"]
+            assert [t.get("name") for t in turns if t["role"] == "tool"] == ["server_echo"]
+            assistant_calls = turns[1]["tool_calls"]
+            assert [c["name"] for c in assistant_calls] == ["server_echo", "frame_probe"]
+
+            # Session-scoped: the ad-hoc tool is nowhere in the server registry.
+            assert srv._runtime._tool_registry.get("frame_probe") is None
+            tools_status, tools_body = _get_json(base, "/v1/tools")
+            assert tools_status == 200
+            assert "frame_probe" not in json.dumps(tools_body)
+
+            # The definitions were recorded on the session itself, so a later
+            # request of this session keeps showing them to the model.
+            assert _conversation(chats_dir, session_id)["meta"]["client_tools"][0]["name"] == "frame_probe"
+
+            # ---- resume with the locally executed result --------------------
+            status, resumed = _post(base, "/v1/infer", {
+                "model_id": "test-model",
+                "tool_ids": ["function-server_echo"],
+                "workspace": str(tmp_path),
+                "session_id": session_id,
+                "messages": [{
+                    "role": "tool",
+                    "name": "frame_probe",
+                    "tool_use_id": "call_c1",
+                    "content": "locals: x=None",
+                }],
+            })
+
+            assert status == 200, resumed
+            assert "client_tool_calls" not in resumed
+            assert any(
+                "null pointer" in (m.get("content") or "")
+                for m in resumed["messages"] if m["role"] == "assistant"
+            ), resumed
+
+            # The second model request carried the session history *and* the
+            # local tool result, in protocol order.
+            second_request = seen[-1]
+            roles = [m["role"] for m in second_request["messages"]]
+            assert roles[-1] == "tool", roles
+            tool_result = second_request["messages"][-1]
+            assert tool_result["tool_call_id"] == "call_c1"
+            assert tool_result["content"] == "locals: x=None"
+            # client_tools was omitted by the caller and restored from the session.
+            sent_tools = [t["function"]["name"] for t in second_request.get("tools", [])]
+            assert "frame_probe" in sent_tools
+
+            turns = _conversation(chats_dir, session_id)["messages"]
+            assert [t.get("name") for t in turns if t["role"] == "tool"] == [
+                "server_echo", "frame_probe",
+            ]
+
+
+def test_an_empty_declaration_takes_the_tool_back_from_the_session(tmp_path) -> None:
+    """``client_tools: []`` is the caller revoking the tools, not saying nothing.
+
+    The web client used to declare AskUser on every request, so a model could
+    open a question dialog in a conversation where the user had never enabled
+    the tool.  Now the picker decides, and un-ticking has to survive the session:
+    a request that declares ``[]`` must clear the list the session remembered,
+    so even a later request that omits the field does not hand the tool back.
+    """
+    probe = {
+        "name": "frame_probe",
+        "description": "Ask the caller a question",
+        "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
+    }
+    streams = [
+        _sse_tool_calls([("frame_probe", "call_c1", '{"q": "which?"}')]),
+        _sse_content("no question then"),
+        _sse_content("still no question"),
+    ]
+    with _fake_model_server(streams) as (api_base, seen):
+        with _running_server(tmp_path, api_base) as (srv, chats_dir):
+            base = f"http://127.0.0.1:{srv.port}"
+
+            # 1. enabled: the call is handed back, and the session remembers it.
+            status, first = _post(base, "/v1/infer", {
+                "model_id": "test-model", "tool_ids": [], "workspace": str(tmp_path),
+                "session_id": "new", "messages": [{"role": "user", "content": "pick a plan"}],
+                "client_tools": [probe],
+            })
+            assert status == 200, first
+            session_id = first["session_id"]
+            assert [c["name"] for c in first.get("client_tool_calls", [])] == ["frame_probe"]
+            assert "frame_probe" in [t["function"]["name"] for t in seen[-1].get("tools", [])]
+
+            # 2. revoked: the model is not even offered the tool.
+            status, second = _post(base, "/v1/infer", {
+                "model_id": "test-model", "tool_ids": [], "workspace": str(tmp_path),
+                "session_id": session_id,
+                "messages": [{"role": "user", "content": "actually, decide yourself"}],
+                "client_tools": [],
+            })
+            assert status == 200, second
+            assert not second.get("client_tool_calls"), second
+            assert "frame_probe" not in [t["function"]["name"] for t in seen[-1].get("tools", [])]
+            assert _conversation(chats_dir, session_id)["meta"].get("client_tools") == []
+
+            # 3. and it stays revoked when the field is left out entirely: the
+            #    session no longer remembers a list to restore.
+            status, third = _post(base, "/v1/infer", {
+                "model_id": "test-model", "tool_ids": [], "workspace": str(tmp_path),
+                "session_id": session_id,
+                "messages": [{"role": "user", "content": "one more round"}],
+            })
+            assert status == 200, third
+            assert not third.get("client_tool_calls"), third
+            assert "frame_probe" not in [t["function"]["name"] for t in seen[-1].get("tools", [])]
+
+
+def _get_json(base: str, path: str) -> tuple[int, dict]:
+    try:
+        with urllib.request.urlopen(base + path, timeout=5) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        return exc.code, {}
+
+
+def test_streaming_handoff_is_observable_by_tool_name(tmp_path) -> None:
+    """A streaming client detects the handoff from the streamed tool call.
+
+    The assistant frame declares the client-side call and no tool result frame
+    for it ever follows, which is the signal the caller acts on.
+    """
+    streams = [_sse_tool_calls([("probe", "call_c9", "{}")])]
+    with _fake_model_server(streams) as (api_base, _seen):
+        with _running_server(tmp_path, api_base) as (srv, _chats_dir):
+            base = f"http://127.0.0.1:{srv.port}"
+            body = json.dumps({
+                "model_id": "test-model",
+                "tool_ids": [f"{CLIENT_SIDE_TOOL_TYPE}-probe"],
+                "workspace": str(tmp_path),
+                "session_id": "new",
+                "messages": [{"role": "user", "content": "probe it"}],
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                base + "/v1/infer/stream", data=body,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read().decode("utf-8", "replace")
+
+    frames = [
+        json.loads(line[6:]) for line in raw.splitlines()
+        if line.startswith("data: ") and line[6:] != "[DONE]"
+    ]
+    declared = [
+        call for f in frames
+        if f.get("role") == "assistant" and f.get("tool_calls")
+        for call in f["tool_calls"]
+    ]
+    assert [c.get("name") for c in declared if c.get("name")] == ["probe"]
+    assert not [f for f in frames if f.get("role") == "tool"], (
+        "the service must not answer a client-side call itself"
+    )
+    # The stream also says so explicitly, just before [DONE].
+    handoff_frames = [
+        f for f in frames
+        if f.get("role") == "status" and f.get("status") == "client_tool_calls"
+    ]
+    assert len(handoff_frames) == 1, frames
+    assert handoff_frames[0]["client_tool_calls"] == [{
+        "id": declared[0]["id"], "name": "probe", "arguments": "{}",
+    }]
+
+
+def test_server_only_rounds_still_loop_as_before() -> None:
+    """Sanity: the client-side exit did not disturb the existing loop behaviour."""
+    streams = [
+        _sse_tool_calls([("server_echo", "call_s9", "{}")]),
+        _sse_content("done"),
+    ]
+    with _fake_model_server(streams) as (api_base, seen):
+        runtime = _make_runtime(api_base)
+        request = InferenceRequest(
+            model_id="test-model",
+            tool_ids=["function-server_echo"],
+            text="server only",
+            stream=True,
+        )
+        collected = list(runtime.infer_stream(request))
+
+    assert len(seen) == 2
+    assert [m.name for m in collected if m.role == "tool"] == ["server_echo"]
+    assert any(m.content == "done" for m in collected if m.role == "assistant")

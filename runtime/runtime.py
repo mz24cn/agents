@@ -559,6 +559,54 @@ from runtime.protocols import PROTOCOL_MAP
 from runtime.registry import ModelRegistry, ToolRegistry
 
 
+def _merge_session_client_tools(tools: list, client_tools: Optional[list]) -> list:
+    """Add request-scoped client-side tools to the tool set sent to the model.
+
+    ``InferenceRequest.client_tools`` is the "immediately provided" half of the
+    client-side tool feature: a caller that does not want its tool to live in
+    the global ToolRegistry (and therefore in every other session and in
+    ``GET /v1/tools``) sends its definition JSON with the request instead.
+
+    A session-provided definition replaces any registry entry with the same
+    name or tool_id: the caller owns its own tools, and shadowing keeps the
+    schema the model sees identical to the implementation the caller runs.
+    """
+    if not client_tools:
+        return tools
+    merged = list(tools)
+    for client_tool in client_tools:
+        merged = [
+            tc for tc in merged
+            if tc.name != client_tool.name and tc.tool_id != client_tool.tool_id
+        ]
+        merged.append(client_tool)
+    return merged
+
+
+def _client_tool_handoff(calls: list) -> list:
+    """Normalize pending client-side tool calls for the caller.
+
+    Returned in declaration order as ``{"id", "name", "arguments"}`` so a
+    client can dispatch each call locally and answer with a matching
+    ``role="tool"`` message (``tool_use_id`` = ``id``) on the next request of
+    the same session.
+    """
+    pending: list = []
+    for call in calls:
+        arguments = call.get("arguments", "{}")
+        if not isinstance(arguments, str):
+            try:
+                arguments = json.dumps(arguments, ensure_ascii=False)
+            except (TypeError, ValueError):
+                arguments = "{}"
+        pending.append({
+            "id": call.get("id") or call.get("tool_use_id"),
+            "name": call.get("name", ""),
+            "arguments": arguments,
+        })
+    return pending
+
+
 def _max_rounds_note(max_rounds: int, pending_calls: Optional[list] = None) -> str:
     """Build the plain-text note appended when the max tool-call rounds is hit.
 
@@ -806,6 +854,17 @@ class Runtime:
     inference session. Handles the tool call loop automatically,
     dispatching tool_calls responses to the appropriate tool and feeding
     results back to the model.
+
+    The tool loop ends on any of these conditions:
+
+    * the model round carried no tool call — the answer is complete;
+    * the model round called a *client-side* tool (``tool_type='client_side'``)
+      — a **normal** exit: server-side calls of that very round still run, the
+      client-side call(s) stay declared but unanswered, and the caller executes
+      them locally and resumes the same session with their results (see
+      :meth:`_partition_tool_calls_by_execution_side`);
+    * ``max_tool_rounds`` is exhausted, or the caller aborts / soft-pauses the
+      generation — these are the abnormal exits.
     """
 
     def __init__(
@@ -1070,14 +1129,19 @@ class Runtime:
             3. Select Protocol Adapter based on api_protocol
             4. Normalize input messages
             5. Build and send HTTP request via urllib.request
-            6. Parse response; if tool_calls present, execute tools and loop
-            7. Stop when no tool calls or max_tool_rounds reached
+            6. Parse response; if tool_calls present, execute the server-side
+               ones and loop
+            7. Stop when no tool calls remain, when the model called a
+               client-side tool (the call is handed back to the caller), or
+               when max_tool_rounds is reached
 
         Args:
             request: The inference request specifying model, tools, and input.
 
         Returns:
-            An InferenceResult with the conversation history and status.
+            An InferenceResult with the conversation history and status.  When
+            the loop stopped on client-side tool call(s), ``success`` stays
+            ``True`` and ``client_tool_calls`` lists the pending calls.
         """
         # 1. Get model config
         model_config = request.model_config_override
@@ -1104,6 +1168,9 @@ class Runtime:
                 tool_config = self._tool_registry.get(tool_id)
                 if tool_config is not None:
                     tools.append(tool_config)
+        # Session-scoped client-side tools: visible to the model for this
+        # request only, never registered in the ToolRegistry.
+        tools = _merge_session_client_tools(tools, request.client_tools)
 
         # 3. Select protocol adapter
         protocol_name = model_config.api_protocol
@@ -1130,6 +1197,9 @@ class Runtime:
         # budget but is counted per rollout, since every round below starts with
         # a fresh transport-retry ``attempt`` counter.
         degenerate_retry_count = 0
+        #: Pending client-side tool calls handed back to the caller; set when the
+        #: model called a ``client_side`` tool (see the loop's exit conditions).
+        client_tool_handoff: Optional[list] = None
         while True:
             # Dynamically throttle very long/fast tool-call loops before the
             # next model API request, if MAX_INFER_PER_MINUTE is configured.
@@ -1293,7 +1363,28 @@ class Runtime:
             # Determine tool calls to execute
             tool_calls_to_execute = assistant_msg.tool_calls
 
+            # Client-side tool calls are executed by the caller, never here.
+            # They end the loop normally: the server-side calls declared in the
+            # very same round (parallel calls may straddle both execution
+            # sides) are still run, while the client-side call(s) stay
+            # declared-but-unanswered so the caller can answer them on the next
+            # request of this same session.
+            tool_calls_to_execute, client_calls = (
+                self._partition_tool_calls_by_execution_side(
+                    tool_calls_to_execute, tools,
+                )
+            )
+            if client_calls:
+                client_tool_handoff = _client_tool_handoff(client_calls)
+
             if not tool_calls_to_execute:
+                if client_tool_handoff:
+                    _logger.info(
+                        "infer: %d client-side tool call(s) handed back to the "
+                        "caller; ending the loop normally",
+                        len(client_tool_handoff),
+                    )
+                    break
                 # No tool call — inference complete
                 break
 
@@ -1328,6 +1419,14 @@ class Runtime:
                     tool_calls_to_execute, tools, timestamp=False,
                 ):
                     messages.append(tool_msg)
+                if client_tool_handoff:
+                    # Server-side half of this round is done; hand the rest over.
+                    _logger.info(
+                        "infer: server-side calls of a mixed round executed; "
+                        "ending the loop for %d client-side call(s)",
+                        len(client_tool_handoff),
+                    )
+                    break
                 _logger.info("infer: tool-call batch done, continuing to next round")
                 continue
 
@@ -1414,13 +1513,26 @@ class Runtime:
                 _logger.info("infer_stream: skill triggered, continuing to next round")
             else:
                 _logger.info("infer_stream: normal tool call done, continuing to next round")
+            if client_tool_handoff:
+                # Server-side half of this round is done; hand the rest over.
+                _logger.info(
+                    "infer: server-side calls of a mixed round executed; "
+                    "ending the loop for %d client-side call(s)",
+                    len(client_tool_handoff),
+                )
+                break
             # Continue to next round of inference (both skill and normal tools)
             continue
 
         # Attach overall_ms to the last round's stat
         if last_stat is not None:
             last_stat.overall_ms = (time.monotonic() - overall_start) * 1000
-        return InferenceResult(success=True, messages=messages, stat=last_stat)
+        return InferenceResult(
+            success=True,
+            messages=messages,
+            stat=last_stat,
+            client_tool_calls=client_tool_handoff,
+        )
 
     # ------------------------------------------------------------------
     # Direct tool call (public API)
@@ -1489,6 +1601,18 @@ class Runtime:
                 tool_config = self._find_tool_by_name(tool_id)
             if tool_config is None:
                 return f"Error: tool '{tool_id}' not found in registry"
+
+        if tool_config.is_client_side():
+            # A client-side tool has no executable entity on this side: its
+            # registration JSON is the whole tool.  Reaching this point means a
+            # caller (or a stale conversation replay) asked the service to run
+            # something only the client can run.
+            return (
+                f"Error: '{tool_config.name}' is a client-side tool "
+                f"(tool_type='client_side'): the agent service holds only its "
+                f"registration JSON, the caller must execute it and send the "
+                f"result back as a role='tool' message for the same session"
+            )
 
         # --- MCP base64 pre-processing (gated by _needs_mcp_base64_handling) ---
         mcp_base64 = base64_auto and self._needs_mcp_base64_handling(tool_config)
@@ -2285,6 +2409,46 @@ class Runtime:
 
         yield from _yield_ready_in_order()
 
+    def _is_client_side_tool(
+        self, tool_name: str, tools: Optional[list] = None,
+    ) -> bool:
+        """Whether a tool call must be executed by the caller, not here.
+
+        Resolution mirrors tool *execution* (:meth:`_find_tool_by_name`), so a
+        registered ``client_side`` tool is recognised exactly the way the loop
+        would have run it — including session-provided definitions
+        (``InferenceRequest.client_tools``), which are not in the registry at
+        all and only exist inside this request's tool scope.
+        """
+        if not tool_name:
+            return False
+        config = self._find_tool_by_name(tool_name, scope=tools)
+        if config is None and tools is not None:
+            # Not in the allow-list the model was given: fall back to the
+            # registry so a stale call replayed from old conversation history
+            # is still classified correctly (and never executed here).
+            config = self._find_tool_by_name(tool_name)
+        return bool(config and config.is_client_side())
+
+    def _partition_tool_calls_by_execution_side(
+        self, tool_calls: list[dict], tools: Optional[list] = None,
+    ) -> tuple[list[dict], list[dict]]:
+        """Split one model round's tool calls into (server, client) batches.
+
+        A single assistant message may issue parallel calls that straddle both
+        execution sides — e.g. an MCP web search the service runs next to a
+        local ``read_file`` only the caller can honour.  Server-side calls keep
+        running here, in declaration order; client-side calls are held back.
+        """
+        server_calls: list[dict] = []
+        client_calls: list[dict] = []
+        for call in tool_calls or []:
+            if self._is_client_side_tool(call.get("name", ""), tools):
+                client_calls.append(call)
+            else:
+                server_calls.append(call)
+        return server_calls, client_calls
+
     def _execute_tool_call_round(
         self,
         tool_calls: list[dict],
@@ -2908,6 +3072,13 @@ class Runtime:
         streaming. If no tools are specified, behaves as a simple single-round
         streaming call.
 
+        A call to a client-side tool (``tool_type='client_side'``) is the other
+        normal way out of the loop: the round's server-side calls still execute
+        and stream, the client-side call(s) are left without a tool result, and
+        the generator returns.  The caller runs them locally and resumes this
+        same session with the results, which are merged into the session's
+        message array by session id.
+
         Yields special marker Messages to help callers distinguish phases:
         - role="function": tool execution result (name field = tool name)
         - role="system": skill disclosure injection
@@ -2978,6 +3149,9 @@ class Runtime:
                 tc = self._tool_registry.get(tool_id)
                 if tc is not None:
                     tools.append(tc)
+        # Session-scoped client-side tools: visible to the model for this
+        # request only, never registered in the ToolRegistry.
+        tools = _merge_session_client_tools(tools, request.client_tools)
 
         protocol_name = model_config.api_protocol
         protocol_cls = PROTOCOL_MAP.get(protocol_name)
@@ -3008,6 +3182,9 @@ class Runtime:
         pre_output_retry_count = 0
         # Retry budget for rounds aborted by the per-round output cap.
         output_cap_retry_count = 0
+        #: Pending client-side tool calls handed back to the caller; set when the
+        #: model called a ``client_side`` tool (see the loop's exit conditions).
+        client_tool_handoff: Optional[list] = None
         while True:
             # Check cancel_event before each round (including before model API call)
             # so we don't block on a long urlopen timeout after a forced abort.
@@ -3624,6 +3801,20 @@ class Runtime:
             # Determine tool calls to execute
             tool_calls_to_execute = all_tool_calls
 
+            # Client-side tool calls are executed by the caller, never here.
+            # They end the loop normally: the server-side calls declared in the
+            # very same round (parallel calls may straddle both execution
+            # sides) are still run, while the client-side call(s) stay
+            # declared-but-unanswered so the caller can answer them on the next
+            # request of this same session.
+            tool_calls_to_execute, client_calls = (
+                self._partition_tool_calls_by_execution_side(
+                    tool_calls_to_execute, tools,
+                )
+            )
+            if client_calls:
+                client_tool_handoff = _client_tool_handoff(client_calls)
+
             # No tool call — done; yield stat and return
             if not tool_calls_to_execute:
                 stat_dict: dict = {
@@ -3649,6 +3840,17 @@ class Runtime:
                 if ttft_ms is not None:
                     stat_dict["ttft_ms"] = round(ttft_ms, 1)
                 yield Message(role="usage", timestamp=_now_iso(), name="round", content=json.dumps(stat_dict))
+                if client_tool_handoff:
+                    # Normal exit, not an interruption: every server-side call
+                    # of this round is done and persisted, the client-side
+                    # call(s) are left unanswered on purpose.  The client runs
+                    # them and resumes this same session with their results.
+                    _logger.info(
+                        "infer_stream: %d client-side tool call(s) handed back "
+                        "to the caller; ending the loop normally",
+                        len(client_tool_handoff),
+                    )
+                    return
                 # The model is done with this turn, but a user message that
                 # landed while this last round was streaming means the turn is
                 # NOT over.  ``close_gate`` makes that call atomically with the
@@ -3758,6 +3960,15 @@ class Runtime:
                 ):
                     messages.append(tool_msg)
                     yield tool_msg
+                if client_tool_handoff:
+                    # Server-side half of this round is done and persisted; hand
+                    # the client-side call(s) over and end the loop normally.
+                    _logger.info(
+                        "infer_stream: mixed round finished, %d client-side "
+                        "tool call(s) handed back to the caller",
+                        len(client_tool_handoff),
+                    )
+                    return
                 # The round is complete (assistant output + tool results).  Give
                 # the caller a chance to compress the session and rebuild the
                 # context before the next round re-sends it to the model.
@@ -3841,6 +4052,15 @@ class Runtime:
                 messages.append(tool_msg)
                 yield tool_msg
 
+            if client_tool_handoff:
+                # Server-side half of this round is done and persisted; hand the
+                # client-side call(s) over and end the loop normally.
+                _logger.info(
+                    "infer_stream: mixed round finished, %d client-side tool "
+                    "call(s) handed back to the caller",
+                    len(client_tool_handoff),
+                )
+                return
             # Skill rounds count as a completed tool round too: the disclosed
             # skill body / tool result is already appended and persisted.
             messages = self._maybe_refresh_context(
