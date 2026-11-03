@@ -14,7 +14,7 @@
 
 ### 2026-11-03
 
-- **客户端工具调用（Client Side Tool Calls）** — 工具多了第四种类型 `client_side`：服务端只保留注册 JSON 并把它交给模型，自己永不执行。模型一旦调用，推理循环正常收尾，未应答的调用交回调用方；调用方本地执行后，用同一个 `session_id` 把结果送回，服务端把会话历史与结果合并后继续推理。工具可在 Setup / `POST /v1/tools` 里预注册再按 `tool_ids` 选用，也可在推理请求里即时下发 `client_tools`（只在本次会话可见）。同一轮并行调用可以横跨两侧：服务端工具在服务端跑完，客户端工具才交回。产品自带两个客户端工具——`AskUser` 让模型遇到只有用户能拍板的事就直接提问（浏览器弹窗 / TUI 选择器，2–8 个选项，可选超时与超时默认项，已预注册），`local_shell` 让远程 agent 在客户端机器上执行命令，仅在 TUI 用 `--local-shell` 显式开启。示例见 [`examples/example_client_side_tools.py`](examples/example_client_side_tools.py)，全文见 [客户端工具调用](docs/introduce-client-side-tools.md)。
+- **客户端工具调用（Client Side Tool Calls）** — 工具多了第四种类型 `client_side`：服务端只保留注册 JSON 并把它交给模型，自己永不执行。模型一旦调用，推理循环正常收尾，未应答的调用交回调用方；调用方本地执行后，用同一个 `session_id` 把结果送回，服务端把会话历史与结果合并后继续推理。工具可在 Setup / `POST /v1/tools` 里预注册再按 `tool_ids` 选用，也可在推理请求里即时下发 `client_tools`（只在本次会话可见）。同一轮并行调用可以横跨两侧：服务端工具在服务端跑完，客户端工具才交回。产品自带两个客户端工具——`AskUser` 让模型遇到只有用户能拍板的事就直接提问（浏览器弹窗 / TUI 选择器，2–8 个选项，可选超时与超时默认项），它像 `write_file` 那类内置工具一样在服务启动时自动注册、带内置标记、不写进 tools.json，开箱就能用；`local_shell` 让远程 agent 在客户端机器上执行命令，仅在 TUI 用 `--local-shell` 显式开启。示例见 [`examples/example_client_side_tools.py`](examples/example_client_side_tools.py)，全文见 [客户端工具调用](docs/introduce-client-side-tools.md)。
 
 - **在线调试器（`accessories/online_debugger.py` / `online_debugger.js`）** — 崩溃现场直接交给 agent 诊断：快照、事件、栈帧、源码、帧内求值、状态这六个现场接口都是会话内的客户端工具，在事发进程本地执行，结果带同一个 `session_id` 续跑；不监听端口、不依赖 CLI 工具，跨线程与跨进程的边界由会话续跑承载。Python 版与零依赖 JavaScript 版能力等价。
 

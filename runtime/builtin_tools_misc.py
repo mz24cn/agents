@@ -5,6 +5,8 @@ This module holds the remaining built-in tools:
   - exec_cli: persistent terminal execution (with its terminal helpers)
   - fetch:    HTTP fetch
   - read_image: VLM image understanding (callable injected at register time)
+  - AskUser:  a *client-side* tool (config only: the client runs it, so there
+              is deliberately no callable here)
 
 The tool configs and callables are aggregated and registered by
 ``runtime.builtin_tools`` (the facade module).
@@ -12,6 +14,7 @@ The tool configs and callables are aggregated and registered by
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -24,6 +27,7 @@ import time
 import urllib.request
 import urllib.error
 
+from runtime.client_tools import ASKUSER_CLIENT_TOOL
 from runtime.common import (
     SYSTEM_ENCODING,
     heal_std_handles,
@@ -33,7 +37,7 @@ from runtime.common import (
     env_float,
     env_int,
 )
-from runtime.models import InferenceRequest, Message, ToolConfig
+from runtime.models import CLIENT_SIDE_TOOL_TYPE, InferenceRequest, Message, ToolConfig
 
 logger = logging.getLogger("runtime.builtin_tools")
 
@@ -810,6 +814,33 @@ READ_IMAGE_TOOL_CONFIG = ToolConfig(
     },
     builtin=True,
 )
+
+
+# ---------------------------------------------------------------------------
+# Built-in *client-side* tool: AskUser
+#
+# A client-side tool is declared to the model and executed by the client, so
+# there is no callable here on purpose -- the service must never run it.  Its
+# name / description / parameters come from runtime.client_tools, which the web
+# and TUI clients mirror; test_client_tool_catalogue.py keeps the three copies
+# from drifting apart.
+#
+# Like every other built-in it is registered at start-up and deliberately not
+# written to tools.json (ToolRegistry.save() skips builtin=True), so a fresh
+# install can use it without registering anything by hand.  local_shell is NOT
+# here: letting the service hand shell execution over to a client has to be
+# something the client itself opts into.
+# ---------------------------------------------------------------------------
+ASKUSER_TOOL_CONFIG = ToolConfig(
+    tool_id=ASKUSER_CLIENT_TOOL["name"],
+    tool_type=CLIENT_SIDE_TOOL_TYPE,
+    name=ASKUSER_CLIENT_TOOL["name"],
+    description=ASKUSER_CLIENT_TOOL["description"],
+    parameters=copy.deepcopy(ASKUSER_CLIENT_TOOL["parameters"]),
+    builtin=True,
+)
+
+CLIENT_SIDE_BUILTIN_TOOLS = [ASKUSER_TOOL_CONFIG]
 
 
 # ---------------------------------------------------------------------------

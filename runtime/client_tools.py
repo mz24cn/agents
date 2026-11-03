@@ -7,12 +7,17 @@ That means every front end needs its own implementation, so the same contract
 exists three times on purpose:
 
 ======================  ==========================================================
-``runtime/client_tools.py``   this module — the specification, the registration
-                              JSON (``--register`` writes it into ``tools.json``)
-                              and the cross-implementation contract test
+``runtime/client_tools.py``   this module — the specification, the built-in
+                              registration (``builtin_configs()``) and the
+                              cross-implementation contract test
 ``web/src/lib/client-tools.js``  browser implementation (custom dialog)
 ``tui/client_tools.py``       terminal implementation (question modal + shell)
 ======================  ==========================================================
+
+AskUser is registered as a built-in tool at start-up
+(``runtime.builtin_tools.register_builtin_tools``), so it is available without
+anyone registering it by hand, and being built in keeps it out of
+``tools.json``.
 
 ``tests/test_client_tool_catalogue.py`` keeps the three in agreement on the
 names, parameters and required fields, so a front end can never silently drift
@@ -23,7 +28,6 @@ from __future__ import annotations
 
 import copy
 import json
-import pathlib
 from typing import Any, Dict, List
 
 # ---------------------------------------------------------------------------
@@ -144,25 +148,6 @@ def definition(name: str) -> Dict[str, Any]:
     return {}
 
 
-def as_registration(name: str, runtime_dir: str = "~/.agents_runtime") -> Dict[str, Any]:
-    """The catalogue entry shaped for a ``tools.json`` row.
-
-    Mirrors what ``POST /v1/tools`` would generate for a client-side tool: the
-    id is namespaced by type, and nothing about execution is recorded.
-    """
-    entry = definition(name)
-    if not entry:
-        raise KeyError(f"unknown client tool: {name}")
-    return {
-        "tool_id": f"client_side-{entry['name']}",
-        "tool_type": "client_side",
-        "name": entry["name"],
-        "description": entry["description"],
-        "parameters": copy.deepcopy(entry["parameters"]),
-        "builtin": False,
-    }
-
-
 def validate(entry: Dict[str, Any]) -> str:
     """Return ``""`` when *entry* is a usable client tool definition, else why."""
     name = entry.get("name")
@@ -185,85 +170,34 @@ def validate(entry: Dict[str, Any]) -> str:
     return ""
 
 
-def register(runtime_dir: str = "~/.agents_runtime", names: List[str] | None = None) -> str:
-    """Append the catalogue's client tools to ``<runtime_dir>/tools.json``.
+def builtin_configs() -> List[Any]:
+    """The built-in ``ToolConfig`` rows this project ships for its front ends.
 
-    Idempotent: a row whose ``tool_id`` is already present keeps its own content
-    (an edited description or schema is the user's, not ours to overwrite) and is
-    reported as skipped.  The file is written atomically, keeping the same style
-    as the service's own writes, and the previous content is left beside it as
-    ``tools.json.bak``.
+    ``runtime.builtin_tools.register_builtin_tools()`` registers them at
+    start-up, the same way it registers ``read_file`` or ``exec_shell``, so a
+    fresh install needs no manual registration.  Only AskUser is built in:
+    ``local_shell`` hands command execution to the user's machine, which has to
+    be something the client opts into (``tui --local-shell``).
+
+    Built-in rows are also never written to ``tools.json`` --
+    ``ToolRegistry.save()`` skips ``builtin=True`` -- so nothing to clean up
+    there either.
     """
-    path = pathlib.Path(runtime_dir).expanduser() / "tools.json"
-    if path.exists():
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (ValueError, OSError) as exc:
-            return f"{path}: unreadable tools.json ({exc}); nothing changed"
-        if not isinstance(data, list):
-            return f"{path}: tools.json is not a JSON array; nothing changed"
-    else:
-        data = []
+    from runtime.builtin_tools_misc import CLIENT_SIDE_BUILTIN_TOOLS
 
-    known = {
-        row.get("tool_id") for row in data if isinstance(row, dict)
-    } | {
-        f"client_side-{row.get('name')}"
-        for row in data if isinstance(row, dict) and row.get("tool_type") == "client_side"
-    }
-    added: List[str] = []
-    for name in (names or [entry["name"] for entry in CATALOGUE]):
-        row = as_registration(name)
-        problem = validate(definition(name))
-        if problem:
-            return f"{name}: invalid catalogue entry ({problem}); nothing changed"
-        if row["tool_id"] in known or row["name"] in {
-            r.get("name") for r in data if isinstance(r, dict)
-        }:
-            continue
-        data.append(row)
-        known.add(row["tool_id"])
-        added.append(row["tool_id"])
-
-    if not added:
-        return f"{path}: already registered, nothing to do"
-
-    if path.exists():
-        try:
-            path.with_name("tools.json.bak").write_text(
-                path.read_text(encoding="utf-8"), encoding="utf-8"
-            )
-        except OSError:
-            pass
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(path)
-    return f"{path}: registered {', '.join(added)}"
+    return list(CLIENT_SIDE_BUILTIN_TOOLS)
 
 
 if __name__ == "__main__":  # pragma: no cover - operator convenience
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Register the shipped client-side tools in tools.json"
-    )
-    parser.add_argument(
-        "--runtime-dir", default="~/.agents_runtime",
-        help="directory holding tools.json (default: ~/.agents_runtime)",
+        description="Show the shipped client-side tool definitions"
     )
     parser.add_argument(
         "--name", action="append", dest="names",
-        help="only register this tool name; repeatable (default: every catalogue entry)",
-    )
-    parser.add_argument(
-        "--print", action="store_true", dest="show",
-        help="print the registration JSON instead of writing it",
+        help="only show this tool name; repeatable (default: every catalogue entry)",
     )
     args = parser.parse_args()
-    if args.show:
-        print(json.dumps(
-            [as_registration(n) for n in (args.names or [e["name"] for e in CATALOGUE])],
-            indent=2, ensure_ascii=False,
-        ))
-    else:
-        print(register(args.runtime_dir, args.names))
+    names = args.names or [entry["name"] for entry in CATALOGUE]
+    print(json.dumps([definition(n) for n in names], indent=2, ensure_ascii=False))

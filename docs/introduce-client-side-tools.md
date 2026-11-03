@@ -100,7 +100,8 @@ Setup / Tools 页面里客户端工具带紫色 `CLIENT` 徽标，表单不再�
 
 ## 五、随产品附带的客户端工具：`AskUser` 与 `local_shell`
 
-规范集中在 [`runtime/client_tools.py`](../runtime/client_tools.py)（名称、描述、参数 Schema、注册用 JSON），
+规范集中在 [`runtime/client_tools.py`](../runtime/client_tools.py)（名称、描述、参数 Schema），
+并作为**内置工具**在启动时注册（`runtime/builtin_tools_misc.py` 的 `ASKUSER_TOOL_CONFIG`），
 两端各自实现：浏览器 `web/src/lib/client-tools.js` + `web/src/components/chat/AskUserDialog.svelte`，
 终端 `tui/client_tools.py` + `tui/ui.py` 的 `QuestionModal`。`tests/test_client_tool_catalogue.py`
 把三者的名称、参数和返回文案钉在一起，防止漂移。
@@ -110,12 +111,16 @@ Setup / Tools 页面里客户端工具带紫色 `CLIENT` 徽标，表单不再�
 `default_option`（倒计时结束时自动选择的选项）。返回值就是用户选中的那个选项原文，
 模型可以照抄。服务端只登记这份 JSON、把它交给模型，从不执行；模型一调用，本轮推理正常结束，
 调用方弹窗/选择器收集答案，再把选项作为 `role: "tool"` 结果送回同一个 `session_id` 继续推理。
-它已注册进 `~/.agents_runtime/tools.json`（`tool_id: client_side-AskUser`）。**是否交给模型，由客户端决定，
+它是**内置工具**（`ASKUSER_TOOL_CONFIG`，`tool_id: AskUser`，`builtin: true`），和 `write_file`
+那类内置工具一样在服务启动时自动注册、带内置标记，并且**不写进 `tools.json`**
+（`ToolRegistry.save()` 跳过内置）——开箱可用，不需要用户自己注册一条。
+**是否交给模型，由客户端决定，
 而不是每轮自动声明**：网页只在工具列表勾选了它时才在 `client_tools` 里声明，没勾选就显式传空数组——
 这也会清掉会话此前记住的那份，取消勾选就是收回；TUI 没有工具列表可勾，默认声明，`--no-ask-user` 关掉
 （终端里这是模型问人的唯一途径）。曾经每轮无条件声明，结果用户没启用也会被弹窗，这是错的。
 用户没有选择时不会伪造答案：返回
-`(the user closed the question without choosing)`，或者超时自动选时明确标注
+`(the user closed the question without choosing)`，
+或者超时自动选时明确标注
 `(auto-selected: the user did not answer within Ns)`。
 
 **`local_shell`——只在 TUI 且刻意开启时才存在。** `tui.py --local-shell`
@@ -127,7 +132,7 @@ Setup / Tools 页面里客户端工具带紫色 `CLIENT` 徽标，表单不再�
 `powershell.exe -NoProfile -NonInteractive -Command`。刻意简化：无后台模式、
 无 workspace git 快照、无 abort 钩子——交回一轮不是做这些的地方。
 
-界面上也给了它们位置，分组规则集中在 `web/src/lib/tool-groups.js` 一处：工具页按类型分组并给每组一个类型徽标（`CLIENT` / `FUNCTION` / `SKILL` / `MCP`，客户端工具排最前），聊天页的工具选择器用同一套分组与命名——此前它不认识 `client_side`，那一组只显示成裸的 `client_side`。在聊天页勾上 `client_side-AskUser`（走的是 `tool_ids`，不是请求里的 `client_tools`）同样会被交回浏览器，由页面弹窗接住。
+界面上也给了它们位置，分组规则集中在 `web/src/lib/tool-groups.js` 一处：工具页按类型分组并给每组一个类型徽标（`CLIENT` / `FUNCTION` / `SKILL` / `MCP`，客户端工具排最前），聊天页的工具选择器用同一套分组与命名——此前它不认识 `client_side`，那一组只显示成裸的 `client_side`。在聊天页勾上内置的 `AskUser`（走的是 `tool_ids`，不是请求里的 `client_tools`）同样会被交回浏览器，由页面弹窗接住。
 
 ## 六、示例与测试
 

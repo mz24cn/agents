@@ -74,7 +74,9 @@ from runtime.builtin_tools_agent import (  # noqa: F401
 )
 
 from runtime.builtin_tools_misc import (  # noqa: F401
+    ASKUSER_TOOL_CONFIG,
     CLI_TOOL_CONFIG,
+    CLIENT_SIDE_BUILTIN_TOOLS,
     FETCH_TOOL_CONFIG,
     READ_IMAGE_TOOL_CONFIG,
     _drain_terminal_buffer,
@@ -153,5 +155,14 @@ def register_builtin_tools(tool_registry: ToolRegistry, runtime=None) -> list[st
     tool_registry.register(TALK_TO_TOOL_CONFIG, callable_fn=talk_to_fn)
     ids.append("delegate")
     ids.append("talk_to")
+
+    # Built-in client-side tools (AskUser): register the *config* only, never a
+    # callable. The tool then appears in the tool list and can be selected like
+    # any other, but the service never runs it -- a call is handed back to the
+    # client (docs/introduce-client-side-tools.md §3). Being builtin also keeps
+    # it out of tools.json, so a fresh install needs no manual registration.
+    for config in CLIENT_SIDE_BUILTIN_TOOLS:
+        tool_registry.register(config)
+        ids.append(config.tool_id)
 
     return ids

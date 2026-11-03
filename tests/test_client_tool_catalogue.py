@@ -3,10 +3,11 @@
 A client-side tool is only a promise: the agent service stores the JSON, shows
 it to the model, and never runs it.  Whoever drives the session has to keep the
 promise, so the contract exists three times - ``runtime/client_tools.py`` (the
-specification and the registration), ``tui/client_tools.py`` (terminal),
-``web/src/lib/client-tools.js`` (browser).  Nothing stops one of them from
-drifting silently, and the failure is invisible until a model asks a question
-that its own client cannot answer.  This test is what keeps them honest.
+specification, registered as a built-in tool), ``tui/client_tools.py``
+(terminal), ``web/src/lib/client-tools.js`` (browser).  Nothing stops one of
+them from drifting silently, and the failure is invisible until a model asks a
+question that its own client cannot answer.  This test is what keeps them
+honest.
 """
 
 import json
@@ -191,34 +192,52 @@ def test_clients_report_an_unanswered_question_in_the_same_words():
         assert phrase in (REPO / "tui" / "client_tools.py").read_text(encoding="utf-8")
 
 
-def test_registration_lands_in_tools_json_and_stays_put(tmp_path):
-    message = catalogue.register(str(tmp_path), ["AskUser"])
-    assert "client_side-AskUser" in message
-    data = json.loads((tmp_path / "tools.json").read_text(encoding="utf-8"))
-    row = [item for item in data if item["tool_id"] == "client_side-AskUser"][0]
-    assert row["tool_type"] == "client_side"
-    assert row["name"] == "AskUser"
-    assert row["parameters"] == catalogue.ASKUSER_CLIENT_TOOL["parameters"]
-    # Nothing about execution: the service must not try to run this tool.
-    assert "function_file_path" not in row and "function_name" not in row
+def test_askuser_is_registered_as_a_builtin_tool():
+    """AskUser ships the way ``write_file`` does: registered at start-up.
 
-    again = catalogue.register(str(tmp_path), ["AskUser"])
-    assert "already registered" in again
-    data_after = json.loads((tmp_path / "tools.json").read_text(encoding="utf-8"))
-    assert len(data_after) == len(data)
+    A user must not have to register anything by hand to get the question tool,
+    and the service must still be unable to run it.
+    """
+    from runtime.builtin_tools import register_builtin_tools
+    from runtime.registry import ToolRegistry
+
+    registry = ToolRegistry()
+    ids = register_builtin_tools(registry)
+    assert "AskUser" in ids
+
+    config = registry.get("AskUser")
+    assert config is not None
+    assert config.tool_type == "client_side"
+    assert config.builtin is True
+    assert config.is_client_side()
+    # The catalogue stays the single source of truth for what the model is told.
+    assert config.description == catalogue.ASKUSER_CLIENT_TOOL["description"]
+    assert config.parameters == catalogue.ASKUSER_CLIENT_TOOL["parameters"]
+    # No callable on purpose: a client-side tool call is handed back, never run
+    # here, so registering one would be the service breaking its own contract.
+    assert registry.get_callable("AskUser") is None
 
 
-def test_registration_keeps_an_edited_row_the_operator_changed(tmp_path):
-    catalogue.register(str(tmp_path), ["AskUser"])
+def test_a_builtin_tool_never_lands_in_tools_json(tmp_path):
+    """Built-ins are re-registered at every start-up; persisting them only lets
+    a stale copy of the row come back and shadow the shipped one."""
+    from runtime.registry import ToolRegistry
+
+    registry = ToolRegistry()
+    for config in catalogue.builtin_configs():
+        registry.register(config)
+
     path = tmp_path / "tools.json"
-    data = json.loads(path.read_text(encoding="utf-8"))
-    data[0]["description"] = "a narrower question, on purpose"
-    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    registry.save(str(path))
+    assert json.loads(path.read_text(encoding="utf-8")) == []
 
-    message = catalogue.register(str(tmp_path), ["AskUser"])
-    assert "already registered" in message
-    after = json.loads(path.read_text(encoding="utf-8"))
-    assert after[0]["description"] == "a narrower question, on purpose"
+
+def test_local_shell_is_not_a_builtin_tool():
+    """Handing shell execution to whoever drives the session is opt-in; the
+    service must not offer it on its own."""
+    names = [config.name for config in catalogue.builtin_configs()]
+    assert names == ["AskUser"]
+    assert "local_shell" in [entry["name"] for entry in catalogue.CATALOGUE]
 
 
 def test_terminal_answers_and_web_answers_agree_on_the_result_text():
