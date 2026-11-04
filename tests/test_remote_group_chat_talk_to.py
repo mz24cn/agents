@@ -64,7 +64,9 @@ class CaptureRuntime:
         self._tool_registry = tool_registry
         self.captured = []
 
-    def infer_stream(self, request, cancel_event=None):
+    def infer_stream(self, request, cancel_event=None,
+                   on_round_complete=None, on_context_overflow=None,
+                   **_pipeline_kwargs):
         self.captured.append(request)
         yield Message(role="assistant", content="ok")
 

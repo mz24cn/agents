@@ -754,7 +754,8 @@ class _GroupScriptRuntime:
         self._lock = threading.Lock()
         self.requests = []
 
-    def infer_stream(self, request, cancel_event=None, on_round_complete=None):
+    def infer_stream(self, request, cancel_event=None, on_round_complete=None,
+                   on_context_overflow=None, **_pipeline_kwargs):
         with self._lock:
             idx = len(self.requests)
             self.requests.append(request)

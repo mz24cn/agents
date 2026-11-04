@@ -33,7 +33,7 @@ import queue
 import re
 import threading
 from dataclasses import dataclass
-from typing import Generator, Optional
+from typing import Callable, Generator, Optional
 
 from runtime.common import (
     get_request_context,
@@ -42,6 +42,7 @@ from runtime.common import (
     snapshot_request_context,
 )
 from runtime.models import Message, InferenceRequest
+from runtime.server_state import InLoopContextCompressor
 
 _logger = logging.getLogger("runtime.group_chat")
 
@@ -50,6 +51,126 @@ _logger = logging.getLogger("runtime.group_chat")
 # the stream alive so final frames (e.g. the timeout error) actually reach
 # the browser instead of being silently lost.
 _GROUP_CHAT_HEARTBEAT_INTERVAL = 25.0
+
+
+# One session, several agents: compressing it rewrites summary.md and the
+# conversation window, so the agents of a group must never compress concurrently.
+_group_chat_compress_locks: dict = {}
+_group_chat_compress_locks_guard = threading.Lock()
+
+
+def _compression_lock_for(session_id: str) -> threading.Lock:
+    """The lock every agent of *session_id* shares for compression work."""
+    with _group_chat_compress_locks_guard:
+        lock = _group_chat_compress_locks.get(session_id)
+        if lock is None:
+            lock = threading.Lock()
+            _group_chat_compress_locks[session_id] = lock
+        return lock
+
+
+class _FrameWatermark:
+    """Frames the group-chat workers produced vs frames the caller consumed.
+
+    Workers hand their frames to an unbounded queue and routinely run ahead of
+    the HTTP drain loop; a frame only reaches ``conversation.json`` after the
+    drain loop has yielded it and the handler has persisted it.  An in-loop
+    compressor rebuilds the context *from disk*, so it may only do that once
+    nothing is outstanding -- otherwise the very tool round the agent is standing
+    in would be missing from the rebuilt request and the model would be waiting
+    for tool results that no longer exist.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._produced = 0
+        self._consumed = 0
+
+    def produced(self) -> None:
+        with self._lock:
+            self._produced += 1
+
+    def consumed(self) -> None:
+        with self._lock:
+            self._consumed += 1
+
+    def settled(self) -> bool:
+        """True while every produced frame has been handed on."""
+        with self._lock:
+            return self._consumed >= self._produced
+
+
+class GroupChatContextCompressor(InLoopContextCompressor):
+    """Mid-loop / pre-send context compression for one agent of a group chat.
+
+    The single-agent compressor rebuilds an in-flight request with
+    ``ContextManager.assemble_context`` -- a session-centric view.  A group-chat
+    agent must not get that view: it would see the other agents' assistant turns
+    as its own voice (and would lose the ``[群聊]`` bystander markers, the
+    promoted group system turn and its own framing).  This subclass rebuilds
+    through :func:`assemble_agent_context`, i.e. exactly the request the agent
+    would have been given at the start of the turn, only smaller.
+
+    Two further group-specific constraints:
+
+    * the session is shared, so compression is serialised per session;
+    * the window of the rebuilt request comes from
+      ``ContextManager.select_unsummarized_turns`` -- the same floored window the
+      turn start uses.
+    """
+
+    def __init__(
+        self,
+        *,
+        agent_id: str,
+        agent: dict,
+        agents_markdown: str = "",
+        dispatch_agents_markdown: Optional[str] = None,
+        **base_kwargs,
+    ) -> None:
+        super().__init__(**base_kwargs)
+        self._agent_id = agent_id
+        self._agent = agent
+        self._agents_markdown = agents_markdown
+        self._dispatch_agents_markdown = dispatch_agents_markdown
+        self._session_lock = _compression_lock_for(base_kwargs.get("session_id") or "")
+
+    def __call__(self, messages: list, round_total_tokens: int,
+                 max_context: int = 0) -> Optional[list]:
+        with self._session_lock:
+            return super().__call__(messages, round_total_tokens, max_context)
+
+    def ensure_within_budget(self, messages: list, input_budget: int,
+                             estimate, max_context: int = 0):
+        with self._session_lock:
+            return super().ensure_within_budget(
+                messages, input_budget, estimate, max_context,
+            )
+
+    def _rebuild_from_disk(self) -> Optional[list]:
+        """Re-assemble this agent's request from the persisted session."""
+        try:
+            turns = self.context_manager.load_conversation(self.session_id)
+        except (FileNotFoundError, ValueError):
+            return None
+        if not turns:
+            return None
+        summary_text, summary_fm = self.context_manager.get_summary(self.session_id)
+        memory_entries: list = []
+        if summary_text.strip():
+            turns = self.context_manager.select_unsummarized_turns(turns, summary_fm)
+            memory_entries = self.context_manager.get_memory_entries(self.session_id)
+        rebuilt = assemble_agent_context(
+            self._agent_id,
+            self._agent,
+            turns,
+            None,
+            agents_markdown=self._agents_markdown,
+            dispatch_agents_markdown=self._dispatch_agents_markdown,
+            summary_text=summary_text,
+            memory_entries=memory_entries,
+        )
+        return rebuilt or None
 
 
 @dataclass(frozen=True)
@@ -683,6 +804,7 @@ def run_group_chat_stream_gen(
     agent_manager,
     model_id: str,
     tool_ids: list[str],
+    session_ready: Optional[Callable[[], bool]] = None,
     max_rounds: int = 5,
     interject_gate=None,
     close_gate=None,
@@ -721,6 +843,7 @@ def run_group_chat_stream_gen(
         agent_manager=agent_manager,
         model_id=model_id,
         tool_ids=tool_ids,
+        session_ready=session_ready,
         max_rounds=max_rounds,
         interject_gate=interject_gate,
         close_gate=close_gate,
@@ -747,6 +870,7 @@ def _run_group_chat_stream_gen(
     agent_manager,
     model_id: str,
     tool_ids: list[str],
+    session_ready: Optional[Callable[[], bool]] = None,
     max_rounds: int = 5,
     interject_gate=None,
     close_gate=None,
@@ -797,6 +921,7 @@ def _run_group_chat_stream_gen(
     # Frames handed to the round queue are only persisted after the drain
     # loop has yielded them, so a context rebuild from disk has to wait for
     # the queue to drain (see GroupChatContextCompressor).
+    watermark = _FrameWatermark()
 
     agents_markdown = build_agents_markdown(
         all_agent_ids, agent_manager, include_user_row=True,
@@ -976,6 +1101,33 @@ def _run_group_chat_stream_gen(
                 max_tool_rounds=base_request.max_tool_rounds,
             )
 
+            # A group-chat agent can run hundreds of tool rounds inside one wave,
+            # re-sending its whole message list every round -- exactly how one
+            # manager reached 471 777 prompt tokens on a 196 608-token model.  The
+            # single-agent path hands its loop a compressor; group chat used to
+            # call infer_stream bare, so the pre-send guard could only warn and no
+            # in-loop compression ever happened (context guard count in that
+            # session's log: 0).
+            #
+            # The compressor measures against THIS agent's model window, rebuilds
+            # the agent-centric request, and refuses to rebuild while frames of
+            # this run are still waiting to be persisted.
+            context_compressor: Optional[GroupChatContextCompressor] = None
+            if context_manager is not None and session_id:
+                context_compressor = GroupChatContextCompressor(
+                    context_manager=context_manager,
+                    session_id=session_id,
+                    ready=lambda: (
+                        watermark.settled()
+                        and (session_ready is None or session_ready())
+                    ),
+                    inference_model_id=agent_model_id or "",
+                    agent_id=agent_id,
+                    agent=agent,
+                    agents_markdown=agents_markdown,
+                    dispatch_agents_markdown=dispatch_agents_markdown,
+                )
+
             asst_buf: list[Message] = []
 
             def _flush_asst(collected: list[Message]) -> None:
@@ -1052,8 +1204,15 @@ def _run_group_chat_stream_gen(
 
             collected: list[Message] = []
             try:
-                for msg in runtime.infer_stream(request,
-                                                cancel_event=cancel_event):
+                for msg in runtime.infer_stream(
+                    request,
+                    cancel_event=cancel_event,
+                    on_round_complete=context_compressor,
+                    on_context_overflow=(
+                        context_compressor.ensure_within_budget
+                        if context_compressor is not None else None
+                    ),
+                ):
                     msg.agent_id = agent_id
                     if msg.role == "usage":
                         try:
@@ -1140,6 +1299,7 @@ def _run_group_chat_stream_gen(
                 normalized = dict(frame)
                 normalized.setdefault("agent_id", owner_agent_id)
                 _msg_queue.put((owner_agent_id, _NestedStreamFrame(normalized)))
+                watermark.produced()
             return _callback
 
         def _agent_worker(agent_id: str) -> None:
@@ -1157,6 +1317,7 @@ def _run_group_chat_stream_gen(
                     nested_stream_callback=nested_stream_callback,
                 ):
                     _msg_queue.put((agent_id, msg))
+                    watermark.produced()
             except Exception as exc:
                 _logger.error("group chat agent_worker %s failed: %s", agent_id, exc)
                 err = Message(
@@ -1167,6 +1328,7 @@ def _run_group_chat_stream_gen(
                     if agent_manager.get(agent_id) else agent_id,
                 )
                 _msg_queue.put((agent_id, err))
+                watermark.produced()
             finally:
                 journal_manager = get_request_context("file_journal_manager")
                 if journal_manager is not None:
@@ -1226,6 +1388,7 @@ def _run_group_chat_stream_gen(
                                 sse_callback(msg.frame)
                             except Exception:
                                 pass
+                        watermark.consumed()
                         continue
                     if msg is None:
                         if event_agent_id not in completed_agent_ids:
@@ -1237,6 +1400,9 @@ def _run_group_chat_stream_gen(
                     got_any = True
                     round_collected.append(msg)
                     yield msg
+                    # The caller (handler) has now appended and incrementally persisted
+                    # this frame; a resumed generator is the proof of that.
+                    watermark.consumed()
 
             if remaining <= 0:
                 break

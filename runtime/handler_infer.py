@@ -1492,6 +1492,16 @@ class HandlerInferMixin:
                     agent_manager=self.server.agent_manager,  # type: ignore[attr-defined]
                     model_id=model_id,
                     tool_ids=tool_ids,
+                    # Rebuilding an agent's context mid-loop reads the session
+                    # from disk: only safe while this stream still owns the
+                    # session and its frames are already persisted (same rule as
+                    # the single-agent compressor below).
+                    session_ready=(
+                        (
+                            self._is_active_stream(session_id, cancel_event)
+                            and conversation_persister.is_current(collected_messages)
+                        ) if session_id is not None else None
+                    ),
                     interject_gate=_group_interject_gate,
                     close_gate=_group_close_gate,
                 )
