@@ -342,13 +342,19 @@ def estimate_chat_prompt_tokens_capped(
 # budget, let the request through, and the provider answered
 # ``request exceeds the context window: prompt (471777 tokens) leaves no room to
 # answer`` -- a 2.59x gap that no threshold could survive.
+# A sample outside this band is not tokenizer drift; it means the estimate was
+# taken over a different message list than the request the provider answered for
+# (a provider that counts the reply, a rebuilt request, a cached prompt report).
+# Folding one in -- even clamped -- would mis-calibrate every later request of
+# that model, so the sample is dropped instead.
 _CALIBRATION_MIN_FACTOR = 0.5
 _CALIBRATION_MAX_FACTOR = 8.0
-# A ratio beyond this cannot be tokenizer drift; it means the estimate was taken
-# over a different message list than the request the provider answered for.
-_CALIBRATION_RATIO_LIMIT = 20.0
 _CALIBRATION_EWMA_NEW = 0.4
 _CALIBRATION_MAX_MODELS = 64
+# Log a recalibration once it is both a real change and a big enough correction
+# to explain a guard decision to whoever reads the log.
+_CALIBRATION_NOTABLE_FACTOR = 1.5
+_CALIBRATION_LOG_DELTA = 0.05
 _prompt_token_factors: dict = {}
 _prompt_token_factors_lock = threading.Lock()
 
@@ -368,8 +374,8 @@ def record_prompt_token_calibration(
         actual: ``prompt_tokens`` the provider reported for that request.
 
     Returns:
-        The new factor, or ``None`` when the sample was rejected (unknown model,
-        missing numbers, or an implausible ratio).
+        The new factor, or ``None`` when nothing was recorded (unknown model,
+        missing numbers, or a ratio outside the credible band).
     """
     key = (model_id or "").strip()
     if not key:
@@ -383,14 +389,13 @@ def record_prompt_token_calibration(
         return None
 
     ratio = actual_value / estimate_value
-    if ratio != ratio or ratio <= 0.0 or ratio > _CALIBRATION_RATIO_LIMIT:
+    if not (_CALIBRATION_MIN_FACTOR <= ratio <= _CALIBRATION_MAX_FACTOR):
         return None
-    factor = min(_CALIBRATION_MAX_FACTOR, max(_CALIBRATION_MIN_FACTOR, ratio))
 
     with _prompt_token_factors_lock:
         merged = (
             _prompt_token_factors.get(key, 1.0) * (1.0 - _CALIBRATION_EWMA_NEW)
-            + factor * _CALIBRATION_EWMA_NEW
+            + ratio * _CALIBRATION_EWMA_NEW
         )
         # Re-inserting keeps dict order == least-recently-used order.
         _prompt_token_factors.pop(key, None)
@@ -430,26 +435,43 @@ def clear_prompt_token_calibration(model_id: str = "") -> None:
             _prompt_token_factors.clear()
 
 
+def is_notable_prompt_token_calibration(factor: object, previous: object) -> bool:
+    """Whether a recalibration is worth a log line.
+
+    Both conditions matter: a 0.01 shift explains nothing, and a big shift on a
+    model that still measures close to its own estimate is not the reason a
+    request was refused.
+    """
+    try:
+        value = float(factor)
+        before = float(previous)
+    except (TypeError, ValueError):
+        return False
+    return (value >= _CALIBRATION_NOTABLE_FACTOR
+            and abs(value - before) >= _CALIBRATION_LOG_DELTA)
+
+
 def estimate_chat_prompt_tokens_calibrated(
     messages: object, tools: object = None, model_id: str = "", cap: int = 0
 ) -> int:
     """Prompt estimate for *model_id*, scaled by that model's measured factor.
 
     Same walk as :func:`estimate_chat_prompt_tokens_capped`, so ``cap`` still
-    means "stop as soon as the answer is known" -- except that when the model is
-    known to *under*-estimate (factor < 1) the walk goes on until the scaled
-    total would pass *cap*, so a factor below 1 can never turn the guard blind
-    by stopping the walk early.
+    means "stop as soon as the answer is known": the walk is bounded by
+    ``cap / factor`` and the scaled total is what gets compared with *cap*, so a
+    correction cannot hide behind an early stop.
+
+    A measured factor below ``1.0`` is kept in the table but **not** applied.
+    This number feeds a "may I send this?" decision: calibration may only make
+    that stricter, never more permissive.  When no factor (or 1.0) is in force
+    the plain capped walk is used, cap and all.
     """
     factor = get_prompt_token_calibration(model_id)
-    walk_cap = 0
-    if cap > 0:
-        walk_cap = int(cap / factor) if factor != 1.0 else cap
-        walk_cap = max(1, walk_cap)
+    if factor <= 1.0:
+        return estimate_chat_prompt_tokens_capped(messages, tools, cap)
+    walk_cap = max(1, int(cap / factor)) if cap > 0 else 0
     base = estimate_chat_prompt_tokens_capped(messages, tools, walk_cap)
-    if base <= 0 or factor == 1.0:
-        return base
-    return max(1, int(base * factor))
+    return max(1, int(base * factor)) if base > 0 else base
 
 
 # ---------------------------------------------------------------------------

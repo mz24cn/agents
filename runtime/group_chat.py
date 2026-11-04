@@ -99,6 +99,27 @@ class _FrameWatermark:
         with self._lock:
             return self._consumed >= self._produced
 
+    def outstanding(self) -> int:
+        with self._lock:
+            return max(0, self._produced - self._consumed)
+
+
+def _context_is_rebuildable(watermark: "_FrameWatermark",
+                            session_ready: Optional[Callable[[], bool]]) -> bool:
+    """Whether this agent's context may be rebuilt from disk right now.
+
+    Logged because the alternative is a compressor that quietly declines to
+    compress and an operator watching a request that keeps growing.
+    """
+    pending = watermark.outstanding()
+    if pending:
+        _logger.info(
+            "group chat: context not rebuilt from disk yet, %d frame(s) of this"
+            " run are not persisted", pending,
+        )
+        return False
+    return True if session_ready is None else bool(session_ready())
+
 
 class GroupChatContextCompressor(InLoopContextCompressor):
     """Mid-loop / pre-send context compression for one agent of a group chat.
@@ -1117,10 +1138,7 @@ def _run_group_chat_stream_gen(
                 context_compressor = GroupChatContextCompressor(
                     context_manager=context_manager,
                     session_id=session_id,
-                    ready=lambda: (
-                        watermark.settled()
-                        and (session_ready is None or session_ready())
-                    ),
+                    ready=lambda: _context_is_rebuildable(watermark, session_ready),
                     inference_model_id=agent_model_id or "",
                     agent_id=agent_id,
                     agent=agent,

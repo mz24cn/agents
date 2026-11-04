@@ -29,6 +29,7 @@ from runtime.common import (
     estimate_chat_prompt_tokens_calibrated,
     estimate_llm_tokens,
     get_prompt_token_calibration,
+    is_notable_prompt_token_calibration,
     record_prompt_token_calibration,
     set_prompt_token_calibration,
 )
@@ -107,19 +108,22 @@ def test_implausible_samples_are_refused_rather_than_believed():
     assert record_prompt_token_calibration("m", 500, 0) is None
     assert record_prompt_token_calibration("m", 500, None) is None
     assert record_prompt_token_calibration("", 500, 900) is None
-    # A 20x ratio means the estimate was taken over a different message list;
-    # folding it in would poison every later decision.
+    # A ratio this far out is not tokenizer drift; the estimate was taken over a
+    # different message list (a provider that counts the reply, a cached prompt
+    # report).  Clamping it into the table would mis-calibrate every later
+    # request of that model, so the sample is dropped instead.
     assert record_prompt_token_calibration("m", 100, 100_000) is None
+    assert record_prompt_token_calibration("m", 100_000, 100) is None
     assert get_prompt_token_calibration("m") == 1.0
 
 
-def test_the_factor_stays_inside_its_bounds():
-    for _ in range(12):
-        factor = record_prompt_token_calibration("m", 100, 900)
-    assert factor <= 8.0
-    for _ in range(12):
-        factor = record_prompt_token_calibration("m", 100, 1)
-    assert factor >= 0.5
+def test_the_credible_band_is_inclusive():
+    assert record_prompt_token_calibration("hi", 100, 800) == pytest.approx(
+        1.0 * 0.6 + 0.4 * 8.0)
+    assert record_prompt_token_calibration("lo", 800, 400) == pytest.approx(
+        1.0 * 0.6 + 0.4 * 0.5)
+    assert record_prompt_token_calibration("over", 100, 801) is None
+    assert record_prompt_token_calibration("under", 801, 400) is None
 
 
 def test_calibration_is_per_model():
@@ -146,18 +150,34 @@ def test_calibrated_estimate_scales_the_whole_request():
     assert calibrated == 2 * estimate_chat_prompt_tokens(messages, None)
 
 
-def test_a_low_factor_does_not_shorten_the_capped_walk():
-    """factor < 1 must not let the capped walk stop before the real verdict."""
+def test_a_measured_overestimate_never_relaxes_the_guard():
+    """A model that measures *smaller* than we guess keeps its measurement, but
+    the number feeding "may I send this?" is never made more permissive."""
     messages = [{"role": "user", "content": "x" * 4000}]
-    full = estimate_chat_prompt_tokens(messages, None)
+    raw = estimate_chat_prompt_tokens(messages, None)
     set_prompt_token_calibration("m", 0.6)
-    cap = full // 2
 
-    calibrated = estimate_chat_prompt_tokens_calibrated(messages, None, "m", cap)
+    assert get_prompt_token_calibration("m") == 0.6
+    assert estimate_chat_prompt_tokens_calibrated(messages, None, "m") == raw
+    assert estimate_chat_prompt_tokens_calibrated(
+        messages, None, "m", raw // 2) == raw
 
-    # Stopping the walk at *cap* and then scaling would have reported ~cap*0.6
-    # and pronounced this request a fit.  The walk runs to cap/factor instead.
-    assert calibrated > cap, "the request was pronounced a fit on a truncated walk"
+
+def test_a_factor_above_one_is_applied_and_the_cap_is_respected():
+    messages = [{"role": "user", "content": "x" * 4000}]
+    raw = estimate_chat_prompt_tokens(messages, None)
+    set_prompt_token_calibration("m", 2.0)
+
+    capped = estimate_chat_prompt_tokens_calibrated(messages, None, "m", raw // 2)
+
+    assert capped > raw // 2, "the walk stopped before the scaled verdict"
+
+
+def test_only_a_notable_recalibration_is_logged():
+    assert not is_notable_prompt_token_calibration(None, 1.0)
+    assert not is_notable_prompt_token_calibration(1.02, 1.0)   # noise
+    assert not is_notable_prompt_token_calibration(1.2, 0.4)    # still near 1.0
+    assert is_notable_prompt_token_calibration(2.6, 1.0)
 
 
 # ----------------------------------------------------------------------
@@ -293,3 +313,37 @@ def test_an_echoed_estimate_is_not_counted_as_a_measurement(monkeypatch):
     list(runtime.infer_stream(InferenceRequest(model_id="quiet", text="hi")))
 
     assert get_prompt_token_calibration("quiet") == pytest.approx(2.5)
+
+
+def test_the_correction_is_anchored_on_the_raw_estimate(monkeypatch):
+    """The stored factor is anchored on the plain heuristic, not on a number
+    that already carries it.
+
+    The request is measured with a factor of 2.0 in force.  Dividing that out is
+    what keeps the table converging on the truth; folding the calibrated figure
+    in instead would read this round's provider count as a 0.6x ratio and drag
+    the factor down instead of up.
+    """
+    registry = ModelRegistry()
+    registry.register(ModelConfig(model_id="iq3", api_base="http://x",
+                                  model_name="iq3", max_context=196_608))
+    runtime = Runtime(registry, ToolRegistry())
+    set_prompt_token_calibration("iq3", 2.0)
+
+    sse = (
+        b'data: {"choices":[{"index":0,"delta":{"content":"ok"}}]}\n\n'
+        b'data: {"choices":[{"index":0,"delta":{}}],'
+        b'"usage":{"prompt_tokens":60000,"completion_tokens":3}}\n\n'
+        b'data: [DONE]\n\n'
+    )
+    monkeypatch.setattr("urllib.request.urlopen",
+                        lambda request, **kwargs: _Response(sse))
+
+    list(runtime.infer_stream(InferenceRequest(model_id="iq3",
+                                               text="x" * 200_000)))
+
+    factor = get_prompt_token_calibration("iq3")
+    # The heuristic lands near 50 000 here, so the true ratio is ~1.2 and the
+    # EWMA moves 2.0 -> ~1.7.  Working from the calibrated 100 000 instead would
+    # have read a 0.6 ratio and produced ~1.4.
+    assert 1.55 < factor < 2.0, f"factor {factor} is not anchored on the raw guess"

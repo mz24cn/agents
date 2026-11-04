@@ -30,10 +30,10 @@ from runtime.common import (
     snapshot_request_context,
     restore_request_context,
     estimate_chat_prompt_tokens,
-    estimate_chat_prompt_tokens_capped,
     estimate_chat_prompt_tokens_calibrated,
     get_prompt_token_calibration,
     record_prompt_token_calibration,
+    is_notable_prompt_token_calibration,
     estimate_message_payload_tokens,
     env_int,
 )
@@ -3286,10 +3286,18 @@ class Runtime:
             # turn.  Measuring here — rather than at the end of the previous
             # round, which is where compression is cheap and unhurried — is what
             # makes the number true of the request about to be sent.
-            messages, context_error, _guard_estimate = (
+            messages, context_error, sent_prompt_estimate = (
                 self._guard_context_before_send(
                     messages, tools, model_config, on_context_overflow,
                 )
+            )
+            # The factor that number was measured with.  The provider's exact
+            # count arrives with the response, and the correction has to be
+            # anchored on the raw heuristic: keep the factor as it was *at send
+            # time*, because another round of this same model (a group-chat
+            # thread, another session) may have updated the table meanwhile.
+            sent_prompt_calibration = get_prompt_token_calibration(
+                getattr(model_config, "model_id", "") or request.model_id
             )
             if context_error:
                 yield Message(role="assistant", timestamp=_now_iso(), content=context_error)
@@ -3557,6 +3565,33 @@ class Runtime:
                             round_cached_input = u.get("cached_input_tokens")
                             round_new_token_cache = u.get("new_token_cache")
                             round_usage_reported = u.get("usage_reported") is not False
+                            if round_usage_reported and sent_prompt_estimate > 0:
+                                # The provider just counted this exact request.
+                                # Fold that measurement into the model's
+                                # estimate -- dividing out the factor the guard
+                                # already applied, so the stored value stays
+                                # anchored on the raw heuristic instead of
+                                # compounding round after round.
+                                _model_key = (getattr(model_config, "model_id", "")
+                                              or request.model_id)
+                                _raw_estimate = (
+                                    sent_prompt_estimate / sent_prompt_calibration
+                                    if sent_prompt_calibration > 0
+                                    else sent_prompt_estimate
+                                )
+                                _factor = record_prompt_token_calibration(
+                                    _model_key, _raw_estimate, round_prompt,
+                                )
+                                if (is_notable_prompt_token_calibration(
+                                        _factor, sent_prompt_calibration)):
+                                    _logger.info(
+                                        "token estimator calibrated for model=%s:"
+                                        " estimated ~%d, provider reported %d prompt"
+                                        " tokens -> factor %.2f (was %.2f)",
+                                        _model_key, int(sent_prompt_estimate),
+                                        int(round_prompt), _factor,
+                                        sent_prompt_calibration,
+                                    )
                         except (json.JSONDecodeError, ValueError, AttributeError):
                             pass
                         continue
@@ -3840,25 +3875,9 @@ class Runtime:
                 round_cached_input = None
                 round_new_token_cache = None
 
-            # Feed the provider's measurement back into this model's estimate.
-            # Every threshold the context guard applies is a percentage of the
-            # estimate, so an estimate that is 2.6x low makes all of them 2.6x
-            # late.  The estimate still carries the factor that was in force
-            # when the request was sent, so that factor is divided out here --
-            # recording it again would compound the correction on every round.
-            calibrated_model_id = (
-                getattr(inference_model_config, "model_id", "") or ""
-            )
-            if round_usage_reported and round_prompt > 0 and calibrated_model_id:
-                applied = get_prompt_token_calibration(calibrated_model_id)
-                measured_estimate = estimate_chat_prompt_tokens_calibrated(
-                    request_messages, tools if tools else None, calibrated_model_id,
-                )
-                if applied and measured_estimate > 0:
-                    record_prompt_token_calibration(
-                        calibrated_model_id, measured_estimate / applied,
-                        round_prompt,
-                    )
+            # The provider's measurement was folded into this model's estimate
+            # when the usage frame arrived above (anchored on the estimate the
+            # pre-send guard made, not on a re-computation here).
 
             total_prompt += round_prompt
             total_completion += round_completion

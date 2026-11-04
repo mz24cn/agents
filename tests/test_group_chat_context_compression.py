@@ -25,6 +25,7 @@ from runtime.context_manager import ContextManager
 from runtime.group_chat import (
     GroupChatContextCompressor,
     _FrameWatermark,
+    _context_is_rebuildable,
     _compression_lock_for,
     run_group_chat_stream_gen,
 )
@@ -177,11 +178,11 @@ def test_watermark_gates_the_from_disk_rebuild(tmp_path):
     watermark = _FrameWatermark()
     compressor = _compressor(
         cm, "s-group",
-        ready=lambda: watermark.settled(),
+        ready=lambda: _context_is_rebuildable(watermark, None),
     )
 
     watermark.produced()          # a frame is still travelling to the caller
-    assert watermark.settled() is False
+    assert watermark.outstanding() == 1
     assert compressor([], 10 ** 9, 196_608) is None
     replacement, after = compressor.ensure_within_budget(
         [Message(role="user", content="x" * 4000)], input_budget=10,
@@ -189,9 +190,24 @@ def test_watermark_gates_the_from_disk_rebuild(tmp_path):
     assert not loads, "rebuilt from disk while a frame was still unpersisted"
 
     watermark.consumed()
-    assert watermark.settled() is True
+    assert watermark.outstanding() == 0
     compressor([], 10 ** 9, 196_608)
     assert loads, "the compressor never read the session once it was safe"
+
+
+def test_the_rebuild_gate_reports_why_it_declined(tmp_path, caplog):
+    """A compressor that silently refuses to compress looks like a compressor
+    that is not needed; the log has to say which it was."""
+    watermark = _FrameWatermark()
+    watermark.produced()
+    with caplog.at_level("INFO", logger="runtime.group_chat"):
+        assert _context_is_rebuildable(watermark, None) is False
+    assert "not persisted" in caplog.text
+
+    watermark.consumed()
+    assert _context_is_rebuildable(watermark, lambda: True) is True
+    assert _context_is_rebuildable(watermark, lambda: False) is False
+    assert _context_is_rebuildable(watermark, None) is True
 
 
 def test_group_chat_hands_each_agent_its_own_compressor(tmp_path):
