@@ -159,6 +159,13 @@ _CJK_TOKEN_CHAR_RE = re.compile(
 )
 _CJK_TOKEN_RUN_RE = re.compile(_CJK_TOKEN_CHAR_RE.pattern + "+")
 
+# A literal backslash escape as it appears in the *text* a model is shown:
+# ``\uXXXX`` (six characters, the shape json.dumps writes for every non-ASCII
+# character) or any other two-character escape such as ``\n`` / ``\"`` / ``\\``.
+# Only searched when the text actually contains a backslash, so the common case
+# stays a single regex pass.
+_LITERAL_ESCAPE_RE = re.compile(r"\\u[0-9a-fA-F]{4}|\\.")
+
 
 def _is_cjk_token_char(char: str) -> bool:
     """Return whether *char* is normally close to one tokenizer token.
@@ -192,7 +199,22 @@ def estimate_llm_tokens(text: object) -> int:
         return 0
     cjk_chars = sum(len(run) for run in _CJK_TOKEN_RUN_RE.findall(value))
     other_chars = len(value) - cjk_chars
-    return cjk_chars + ((other_chars + 3) // 4 if other_chars else 0)
+    escapes = 0
+    if "\\" in value:
+        # A literal escape sequence is not ordinary Latin text.  A real BPE
+        # tokenizer splits ``\u5f00`` into several pieces (backslash, "u", and
+        # the hex digits are commonly separate tokens), so six ASCII characters
+        # cost about four tokens rather than the 1.5 that "four characters per
+        # token" would charge.  Tool payloads are soaked in them:
+        # ``json.dumps`` with the default ``ensure_ascii=True`` rewrites every
+        # Chinese character of a shell output into such an escape, and one real
+        # 471 777-token request was under-estimated at 181 983 exactly this way
+        # (78 145 escapes = 65.9 % of the characters of that message).
+        for run in _LITERAL_ESCAPE_RE.findall(value):
+            other_chars -= len(run)
+            escapes += 4 if len(run) == 6 else 1
+    return (cjk_chars + escapes
+            + ((other_chars + 3) // 4 if other_chars else 0))
 
 
 def _message_field(message: object, field: str, default=None):
@@ -306,6 +328,128 @@ def estimate_chat_prompt_tokens_capped(
         if cap > 0 and total > cap:
             return total
     return total
+
+
+# ---------------------------------------------------------------------------
+# Prompt-token calibration
+# ---------------------------------------------------------------------------
+
+# A character-class estimate is a guess; the ``prompt_tokens`` a provider reports
+# is a measurement.  Folding the ratio between the two back into the estimate is
+# what makes the pre-send context guard mean anything: every threshold expressed
+# as a percentage of the window is off by exactly the factor the guess is off by.
+# In one real 192 608-token case the guard measured 181 983 against an 188 416
+# budget, let the request through, and the provider answered
+# ``request exceeds the context window: prompt (471777 tokens) leaves no room to
+# answer`` -- a 2.59x gap that no threshold could survive.
+_CALIBRATION_MIN_FACTOR = 0.5
+_CALIBRATION_MAX_FACTOR = 8.0
+# A ratio beyond this cannot be tokenizer drift; it means the estimate was taken
+# over a different message list than the request the provider answered for.
+_CALIBRATION_RATIO_LIMIT = 20.0
+_CALIBRATION_EWMA_NEW = 0.4
+_CALIBRATION_MAX_MODELS = 64
+_prompt_token_factors: dict = {}
+_prompt_token_factors_lock = threading.Lock()
+
+
+def record_prompt_token_calibration(
+    model_id: str, estimated: object, actual: object
+) -> Optional[float]:
+    """Fold one provider measurement into *model_id*'s estimate factor.
+
+    Args:
+        model_id: Model the measurement belongs to (tokenizer-dependent, so the
+            factor is per model).
+        estimated: What :func:`estimate_chat_prompt_tokens_capped` said for the
+            request that was sent, *after* the factor in force at that moment
+            was applied -- pass the raw estimate and de-apply the old factor at
+            the call site, or the correction compounds on every round.
+        actual: ``prompt_tokens`` the provider reported for that request.
+
+    Returns:
+        The new factor, or ``None`` when the sample was rejected (unknown model,
+        missing numbers, or an implausible ratio).
+    """
+    key = (model_id or "").strip()
+    if not key:
+        return None
+    try:
+        estimate_value = int(estimated or 0)
+        actual_value = int(actual or 0)
+    except (TypeError, ValueError):
+        return None
+    if estimate_value <= 0 or actual_value <= 0:
+        return None
+
+    ratio = actual_value / estimate_value
+    if ratio != ratio or ratio <= 0.0 or ratio > _CALIBRATION_RATIO_LIMIT:
+        return None
+    factor = min(_CALIBRATION_MAX_FACTOR, max(_CALIBRATION_MIN_FACTOR, ratio))
+
+    with _prompt_token_factors_lock:
+        merged = (
+            _prompt_token_factors.get(key, 1.0) * (1.0 - _CALIBRATION_EWMA_NEW)
+            + factor * _CALIBRATION_EWMA_NEW
+        )
+        # Re-inserting keeps dict order == least-recently-used order.
+        _prompt_token_factors.pop(key, None)
+        _prompt_token_factors[key] = merged
+        while len(_prompt_token_factors) > _CALIBRATION_MAX_MODELS:
+            _prompt_token_factors.pop(next(iter(_prompt_token_factors)))
+        return merged
+
+
+def get_prompt_token_calibration(model_id: str) -> float:
+    """Current estimate->actual factor for *model_id* (``1.0`` when unmeasured)."""
+    key = (model_id or "").strip()
+    if not key:
+        return 1.0
+    with _prompt_token_factors_lock:
+        return _prompt_token_factors.get(key, 1.0)
+
+
+def set_prompt_token_calibration(model_id: str, factor: float) -> None:
+    """Pin *model_id*'s factor; used by tests and by operator diagnostics."""
+    key = (model_id or "").strip()
+    if not key:
+        return
+    with _prompt_token_factors_lock:
+        _prompt_token_factors.pop(key, None)
+        _prompt_token_factors[key] = max(
+            _CALIBRATION_MIN_FACTOR, min(_CALIBRATION_MAX_FACTOR, float(factor))
+        )
+
+
+def clear_prompt_token_calibration(model_id: str = "") -> None:
+    """Forget measured factors (all of them, or just *model_id*)."""
+    with _prompt_token_factors_lock:
+        if model_id:
+            _prompt_token_factors.pop((model_id or "").strip(), None)
+        else:
+            _prompt_token_factors.clear()
+
+
+def estimate_chat_prompt_tokens_calibrated(
+    messages: object, tools: object = None, model_id: str = "", cap: int = 0
+) -> int:
+    """Prompt estimate for *model_id*, scaled by that model's measured factor.
+
+    Same walk as :func:`estimate_chat_prompt_tokens_capped`, so ``cap`` still
+    means "stop as soon as the answer is known" -- except that when the model is
+    known to *under*-estimate (factor < 1) the walk goes on until the scaled
+    total would pass *cap*, so a factor below 1 can never turn the guard blind
+    by stopping the walk early.
+    """
+    factor = get_prompt_token_calibration(model_id)
+    walk_cap = 0
+    if cap > 0:
+        walk_cap = int(cap / factor) if factor != 1.0 else cap
+        walk_cap = max(1, walk_cap)
+    base = estimate_chat_prompt_tokens_capped(messages, tools, walk_cap)
+    if base <= 0 or factor == 1.0:
+        return base
+    return max(1, int(base * factor))
 
 
 # ---------------------------------------------------------------------------

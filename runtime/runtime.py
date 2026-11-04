@@ -31,6 +31,9 @@ from runtime.common import (
     restore_request_context,
     estimate_chat_prompt_tokens,
     estimate_chat_prompt_tokens_capped,
+    estimate_chat_prompt_tokens_calibrated,
+    get_prompt_token_calibration,
+    record_prompt_token_calibration,
     estimate_message_payload_tokens,
     env_int,
 )
@@ -2898,7 +2901,7 @@ class Runtime:
         tools: Optional[list],
         model_config: object,
         on_context_overflow: Optional[Callable],
-    ) -> tuple[list, str]:
+    ) -> tuple[list, str, int]:
         """Measure the request that is about to be sent; make it fit, or refuse.
 
         The mid-loop compression hook (:meth:`_maybe_refresh_context`) measures
@@ -2915,20 +2918,36 @@ class Runtime:
         context — and no LLM call.  ``max_context == 0`` (window unknown) keeps
         the previous behaviour: nothing is measured and nothing is refused.
 
-        Returns ``(messages, error)``: ``error`` is empty when the request may
-        be sent (``messages`` possibly replaced by a rebuilt/trimmed list), and
-        non-empty when the caller must emit it instead of burning a round-trip
-        the provider would reject.
+        Returns ``(messages, error, estimated)``: ``error`` is empty when the
+        request may be sent (``messages`` possibly replaced by a rebuilt/trimmed
+        list), and non-empty when the caller must emit it instead of burning a
+        round-trip the provider would reject.  ``estimated`` is the measured size
+        of the request the caller should send, in the same calibrated units the
+        verdict used (0 when nothing was measured).
         """
         budget = self._context_send_budget_tokens(model_config)
         if budget <= 0:
-            return messages, ""
+            return messages, "", 0
 
         window = int(getattr(model_config, "max_context", 0) or 0)
+        model_id = getattr(model_config, "model_id", "") or ""
         tool_schemas = tools if tools else None
-        estimated = estimate_chat_prompt_tokens_capped(messages, tool_schemas, budget)
+
+        def _estimate(msgs: list) -> int:
+            """Prompt estimate for this model, corrected by what it measures.
+
+            A character-class estimate is a guess.  For one real 192K model the
+            guess said 181 983 and the provider counted 471 777 -- the guard had
+            "verified" the request.  Once a model has been observed, its measured
+            ratio is folded into every measurement, here and in the overflow hook.
+            """
+            return estimate_chat_prompt_tokens_calibrated(
+                msgs, tool_schemas, model_id, budget,
+            )
+
+        estimated = _estimate(messages)
         if estimated <= budget:
-            return messages, ""
+            return messages, "", estimated
 
         if on_context_overflow is None:
             # Nothing can be done (no session context to compress, e.g. a
@@ -2939,13 +2958,13 @@ class Runtime:
                 "compress it",
                 estimated, budget, window,
             )
-            return messages, ""
+            return messages, "", estimated
 
         try:
             replacement, after = on_context_overflow(
                 messages,
                 budget,
-                lambda msgs: estimate_chat_prompt_tokens_capped(msgs, tool_schemas, budget),
+                _estimate,
                 window,
             )
         except Exception:  # never let the guard itself break the loop
@@ -2954,14 +2973,13 @@ class Runtime:
                 "estimated=%d budget=%d",
                 estimated, budget,
             )
-            return messages, ""
+            return messages, "", estimated
 
         if replacement:
             messages = list(replacement)
         if after <= budget:
-            return messages, ""
+            return messages, "", after
 
-        model_id = getattr(model_config, "model_id", "") or "?"
         _logger.warning(
             "context guard: refusing to send | model=%s estimated=%d budget=%d "
             "window=%d messages=%d",
@@ -2973,7 +2991,7 @@ class Runtime:
             f"{window - budget} kept for the reply). It was compressed and its "
             f"oversized output offloaded to files, which was not enough. Start a "
             f"new session, or split this step into smaller pieces."
-        )
+        ), after
 
     def _maybe_refresh_context(
         self,
@@ -3234,8 +3252,10 @@ class Runtime:
             # turn.  Measuring here — rather than at the end of the previous
             # round, which is where compression is cheap and unhurried — is what
             # makes the number true of the request about to be sent.
-            messages, context_error = self._guard_context_before_send(
-                messages, tools, model_config, on_context_overflow,
+            messages, context_error, _guard_estimate = (
+                self._guard_context_before_send(
+                    messages, tools, model_config, on_context_overflow,
+                )
             )
             if context_error:
                 yield Message(role="assistant", timestamp=_now_iso(), content=context_error)
@@ -3772,8 +3792,11 @@ class Runtime:
             # schemas sent in this model round and the fully assembled response,
             # not from this HTTP request's newest user-message characters.
             if not round_usage_reported:
-                round_prompt = estimate_chat_prompt_tokens(
+                # Same yardstick the context guard uses, so the reported
+                # figure and the guard's decisions cannot disagree.
+                round_prompt = estimate_chat_prompt_tokens_calibrated(
                     request_messages, tools if tools else None,
+                    getattr(inference_model_config, "model_id", "") or "",
                 )
                 round_completion = estimate_message_payload_tokens({
                     "content": full_content,
@@ -3782,6 +3805,26 @@ class Runtime:
                 })
                 round_cached_input = None
                 round_new_token_cache = None
+
+            # Feed the provider's measurement back into this model's estimate.
+            # Every threshold the context guard applies is a percentage of the
+            # estimate, so an estimate that is 2.6x low makes all of them 2.6x
+            # late.  The estimate still carries the factor that was in force
+            # when the request was sent, so that factor is divided out here --
+            # recording it again would compound the correction on every round.
+            calibrated_model_id = (
+                getattr(inference_model_config, "model_id", "") or ""
+            )
+            if round_usage_reported and round_prompt > 0 and calibrated_model_id:
+                applied = get_prompt_token_calibration(calibrated_model_id)
+                measured_estimate = estimate_chat_prompt_tokens_calibrated(
+                    request_messages, tools if tools else None, calibrated_model_id,
+                )
+                if applied and measured_estimate > 0:
+                    record_prompt_token_calibration(
+                        calibrated_model_id, measured_estimate / applied,
+                        round_prompt,
+                    )
 
             total_prompt += round_prompt
             total_completion += round_completion
