@@ -387,19 +387,27 @@ def test_template_agents_placeholder_is_always_overwritten_with_dispatch_roster(
     assert "| 沙和尚 | ShaWuJing |" in sys_msg.arguments["AGENTS"]
     assert "| 猪八戒 | ZhuBaJie |" in sys_msg.arguments["AGENTS"]
     # Generic group framing still uses the full participant roster + user row.
-    assert "{{AGENTS}}" not in sys_msg.arguments["GC_FRAMING"]
-    assert "| 孙悟空 | SunWuKong |" in sys_msg.arguments["GC_FRAMING"]
-    assert "| 用户 | user |" in sys_msg.arguments["GC_FRAMING"]
+    # It no longer rides on a template argument: a renderer only substitutes the
+    # placeholders a template *names*, and these templates name only AGENTS --
+    # which is exactly how a whole rolling summary once vanished without a trace.
+    assert sys_msg.arguments.get("GC_FRAMING") is None
+    assert sys_msg.render_suffix
+    assert "{{AGENTS}}" not in sys_msg.render_suffix
+    assert "| 孙悟空 | SunWuKong |" in sys_msg.render_suffix
+    assert "| 用户 | user |" in sys_msg.render_suffix
 
     # Simulate Runtime._normalize_messages template rendering: the actual
-    # outbound model request must contain no literal placeholder.
+    # outbound model request must contain no literal placeholder, and the
+    # framing must survive a template that never mentions it.
     template_text = "可调度目录：\n{{AGENTS}}\n\n{{GC_FRAMING}}"
     rendered = template_text
     for key, value in sys_msg.arguments.items():
         rendered = rendered.replace(f"{{{{{key}}}}}", str(value))
     assert "{{AGENTS}}" not in rendered
     assert dispatch_roster in rendered
-    assert full_roster in rendered
+    # The full roster no longer travels as an argument, so a template that
+    # names only AGENTS shows just the dispatch roster at this stage...
+    assert full_roster not in rendered
 
     # Actual Runtime template rendering path (the exact layer that writes
     # request_*.json) must also contain no literal placeholder.
@@ -417,7 +425,15 @@ def test_template_agents_placeholder_is_always_overwritten_with_dispatch_roster(
     )
     final_system = runtime._normalize_messages(request)[0].content
     assert "{{AGENTS}}" not in final_system
+    assert "{{GC_FRAMING}}" not in final_system  # retired placeholder is erased
     assert dispatch_roster in final_system
+    # ...and the real render path appends the framing, full roster included.
+    assert full_roster in final_system
+    # Normalizing twice (the tool loop re-normalizes on every round) must not
+    # duplicate the framing.
+    twice = runtime._normalize_messages(request)[0].content
+    assert twice == final_system
+    assert final_system.count("| 用户 | user |") == 1
     assert full_roster in final_system
 
 

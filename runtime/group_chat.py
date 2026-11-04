@@ -382,10 +382,12 @@ def _normalize_for_model(messages: list[Message], agent_id: str) -> list[Message
             if normalized and normalized[-1].role == "system":
                 prev = normalized[-1]
                 if prev.prompt_template:
-                    if prev.arguments is None:
-                        prev.arguments = {}
-                    prev.arguments["GC_FRAMING"] = (
-                        (prev.arguments.get("GC_FRAMING") or "")
+                    # A template-backed system message is re-rendered from its
+                    # template on every request, which overwrites ``content``;
+                    # text merged in here therefore has to ride on
+                    # ``render_suffix`` or it disappears.
+                    prev.render_suffix = (
+                        (prev.render_suffix or "")
                         + "\n\n" + (msg.content or "")
                     )
                 else:
@@ -470,9 +472,6 @@ def _build_agent_system_messages(
     """
     messages: list[Message] = []
 
-    # Group-chat framing (prepend "\n\n" when merging with agent prompt).
-    _GC_FRAMING = "\n\n" + _GC_DEFAULT_PROMPT
-
     sys_prompt: str = agent.get("system_prompt", "")
     template_id = agent.get("template_id")
     template_args = agent.get("template_arguments", {})
@@ -493,10 +492,16 @@ def _build_agent_system_messages(
         # value: the dispatch roster when talk_to is active, otherwise empty.
         # This prevents stale/literal template arguments from leaking.
         sys_msg.arguments["AGENTS"] = dispatch_agents_markdown or ""
-        # GC_FRAMING describes the whole group and uses the full participant
-        # roster (including user), not the dispatch roster.
+        # The group framing describes the whole group and uses the full
+        # participant roster (including the user row), not the dispatch roster.
+        # It cannot be handed over as a template argument: a template only sees
+        # the placeholders it names, and the shipped manager templates name only
+        # ``AGENTS`` -- so a ``{{GC_FRAMING}}`` argument was silently dropped and
+        # the agent was told "see the Summary above" while never being given one.
+        # ``render_suffix`` is appended after rendering, whatever the template
+        # happens to contain.
         if agents_markdown:
-            sys_msg.arguments["GC_FRAMING"] = _GC_FRAMING.replace(
+            sys_msg.render_suffix = "\n\n" + _GC_DEFAULT_PROMPT.replace(
                 "{{AGENTS}}", agents_markdown,
             )
     elif sys_prompt:
@@ -554,12 +559,10 @@ def _build_agent_system_messages(
         if messages and messages[-1].role == "system":
             sys_msg = messages[-1]
             if sys_msg.prompt_template:
-                if sys_msg.arguments is None:
-                    sys_msg.arguments = {}
-                existing_framing = sys_msg.arguments.get("GC_FRAMING", "")
-                sys_msg.arguments["GC_FRAMING"] = (
-                    existing_framing + "\n\n" + extra_block
-                    if existing_framing else extra_block
+                # Appending to ``content`` here is pointless: the renderer
+                # replaces ``content`` from the template on every request.
+                sys_msg.render_suffix = (
+                    (sys_msg.render_suffix or "") + "\n\n" + extra_block
                 )
             else:
                 sys_msg.content = (sys_msg.content or "") + "\n\n" + extra_block
@@ -779,21 +782,21 @@ def _run_group_chat_stream_gen(
         summary_text, summary_fm = context_manager.get_summary(session_id)
         if summary_text.strip():
             memory_entries = context_manager.get_memory_entries(session_id)
-            k = getattr(context_manager, '_recent_turns_k', 10)
-            summarized_up_to = summary_fm.get("summarized_up_to_turn", -1)
-            if isinstance(summarized_up_to, int) and summarized_up_to >= 0:
-                recent_start = max(0, len(existing_turns) - k)
-                if recent_start <= summarized_up_to:
-                    recent_start = min(summarized_up_to + 1, len(existing_turns))
-                while (recent_start < len(existing_turns)
-                       and recent_start > 0
-                       and existing_turns[recent_start].role == "tool"):
-                    recent_start -= 1
-                while (recent_start < len(existing_turns)
-                       and recent_start > 0
-                       and existing_turns[recent_start].role not in ("user", "system")):
-                    recent_start -= 1
-                existing_turns = existing_turns[recent_start:]
+            # One window arithmetic for every path: the same floored, tool-chain-
+            # complete window a single-agent turn assembles
+            # (``ContextManager.select_unsummarized_turns``).  This path used to
+            # keep a private copy of the calculation, and that copy had no floor:
+            # a manager that ran 94 tool rounds without a new user turn walked
+            # "K = 10" back to the previous user message and re-sent 96 turns /
+            # 711 996 characters -- 84 of them already inside the summary it was
+            # also sending -- to a model with a 196 608-token window.
+            existing_turns = context_manager.select_unsummarized_turns(
+                existing_turns, summary_fm,
+            )
+
+    # Frames handed to the round queue are only persisted after the drain
+    # loop has yielded them, so a context rebuild from disk has to wait for
+    # the queue to drain (see GroupChatContextCompressor).
 
     agents_markdown = build_agents_markdown(
         all_agent_ids, agent_manager, include_user_row=True,

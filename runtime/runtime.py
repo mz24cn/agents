@@ -898,6 +898,36 @@ class Runtime:
     # Input normalization
     # ------------------------------------------------------------------
 
+    #: Template placeholders the runtime stopped feeding a value to.  They are
+    #: scrubbed from templates that still mention them, so an old template can
+    #: never show a literal ``{{GC_FRAMING}}`` to the model.  Group-chat framing,
+    #: the rolling summary and structured memory now arrive through
+    #: ``Message.render_suffix``, which needs no placeholder in the template.
+    _RETIRED_TEMPLATE_PLACEHOLDERS = ("{{GC_FRAMING}}",)
+
+    @classmethod
+    def _append_render_suffix(cls, content: str, message: object) -> str:
+        """Apply ``Message.render_suffix`` to a rendered system message.
+
+        Runtime-owned context (group framing, ``## Summary``, ``## Memory``) used
+        to be handed over as template arguments.  A template only substitutes the
+        placeholders it *names*: the shipped manager templates name just
+        ``AGENTS``, so the framing and the summary were dropped without a trace
+        and the model was left holding a sentence pointing at a summary it had
+        never been given.  This appends that text after rendering instead, and
+        erases placeholders of retired arguments so they never leak as literals.
+
+        Idempotent: the tool loop re-normalizes the same request on every round,
+        and a suffix already present is never appended twice.
+        """
+        for placeholder in cls._RETIRED_TEMPLATE_PLACEHOLDERS:
+            if placeholder in content:
+                content = content.replace(placeholder, "")
+        suffix = getattr(message, "render_suffix", None) or ""
+        if not suffix or suffix in content:
+            return content
+        return f"{content}\n\n{suffix}"
+
     def _normalize_messages(self, request: InferenceRequest, model_config=None) -> list:
         """Normalize request input into a list of Message objects.
 
@@ -940,7 +970,11 @@ class Runtime:
                         if msg.arguments:
                             for key, value in msg.arguments.items():
                                 content = content.replace(f"{{{{{key}}}}}", str(value))
-                        msg.content = content
+                        msg.content = self._append_render_suffix(content, msg)
+                elif getattr(msg, "render_suffix", None):
+                    msg.content = self._append_render_suffix(
+                        msg.content or "", msg,
+                    )
             return self._apply_vlm_image_fallback(
                 model_config,
                 self._drop_history_images(messages, getattr(request, "image_resolver", None)))

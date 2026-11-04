@@ -104,6 +104,15 @@ class Message:
     # besides XML-style markup, and is being re-rolled — without it the
     # discarded attempt's output would be concatenated with the re-roll's.
     discard_stream_output: Optional[bool] = None
+    # Internal, in-memory text (never persisted / never sent to clients): extra
+    # body to append to this message AFTER its ``prompt_template`` has been
+    # rendered, by ``Runtime._normalize_messages``.  Runtime-owned context --
+    # group-chat framing, the rolling summary, structured memory -- cannot ride
+    # on ``arguments``: a template only substitutes the placeholders it names, so
+    # an unnamed one is silently dropped and the injected text vanishes without a
+    # trace.  Anything concatenated into ``content`` is lost the same way, because
+    # the renderer overwrites ``content`` from the template on every request.
+    render_suffix: Optional[str] = None
 
     def to_dict(self) -> dict:
         """Serialize to a dictionary, omitting None fields."""

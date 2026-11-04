@@ -537,15 +537,16 @@ def _make_talk_to_fn(runtime, thread_local):
                     role="system", content="",
                     prompt_template=template_id, arguments=dict(template_args or {}),
                 )
-                # 注入 AGENTS 和 GC_FRAMING 到 arguments 中，供模板渲染使用。
+                # 注入 AGENTS 到 arguments 中，供模板渲染使用。
                 # If talk_to is active, even an empty roster is authoritative:
                 # render {{AGENTS}} as empty rather than leaking the literal.
+                # 群聊框架文本改走 render_suffix：模板只替换它命名的占位符，
+                # 未命名的 arguments 会被无声丢弃（见 Runtime._append_render_suffix）。
                 if "talk_to" in agent_tool_ids:
                     if sys_msg.arguments is None:
                         sys_msg.arguments = {}
                     sys_msg.arguments["AGENTS"] = agents_md
-                    _GC_FRAMING = "\n\n" + _GC_DEFAULT_PROMPT
-                    sys_msg.arguments["GC_FRAMING"] = _GC_FRAMING.replace(
+                    sys_msg.render_suffix = "\n\n" + _GC_DEFAULT_PROMPT.replace(
                         "{{AGENTS}}", agents_md,
                     )
                 messages.append(sys_msg)

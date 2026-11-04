@@ -3347,6 +3347,117 @@ class ContextManager:
             return None
         return {"role": "system", "content": "\n\n".join(parts)}
 
+    @staticmethod
+    def _turn_role(turn: object) -> str:
+        """Role of a turn that may be a ``Turn`` or a plain dict."""
+        if isinstance(turn, dict):
+            return str(turn.get("role") or "")
+        return str(getattr(turn, "role", "") or "")
+
+    @staticmethod
+    def _turn_tool_calls(turn: object) -> list:
+        """``tool_calls`` of a turn that may be a ``Turn`` or a plain dict."""
+        if isinstance(turn, dict):
+            return turn.get("tool_calls") or []
+        return getattr(turn, "tool_calls", None) or []
+
+    def select_unsummarized_turns(self, turns: list, summary_fm: Optional[dict]) -> list:
+        """The verbatim tail of *turns* a compressed session still sends.
+
+        This is the single authority for the "recent K turns" window, used by
+        :meth:`assemble_context` (one session, one model) AND by group chat (N
+        agents over one session).  Group chat used to carry its own copy of the
+        arithmetic, and that copy caused a real
+        ``request exceeds the context window: prompt (471777 tokens) leaves no
+        room to answer``: the agent had run 94 tool rounds with no new user turn,
+        so its "walk back to the start of this turn" loop walked from turn 1371
+        to turn 1285 -- 96 turns / 711 996 characters, 84 of them already inside
+        the summary it was also sending.
+
+        Rules, in order:
+
+        1. ``floor = summarized_up_to_turn + 1``: every turn at or below the
+           floor is covered by the summary and must never be replayed verbatim;
+        2. the window starts at ``max(len(turns) - K, floor)``;
+        3. protocol integrity: a window may never *begin* with a tool result
+           whose ``assistant(tool_use)`` sits outside it, so either pull that
+           assistant in (the only sanctioned exception to rule 1) or drop the
+           orphan tool results;
+        4. walking back to the turn's first ``user``/``system`` frame stops at the
+           floor, and rule 3 is re-checked after the walk;
+        5. a system turn at the head of the window is skipped -- it is already
+           merged into the single system message the caller builds.
+
+        Args:
+            turns: Conversation turns (``Turn`` objects, or dicts of the same
+                shape -- group chat hands over round-2+ turns it built itself).
+            summary_fm: Front-matter of ``summary.md`` (:meth:`get_summary`).
+
+        Returns:
+            The slice of *turns* that stays verbatim.  Never longer than the
+            turns list.
+        """
+        if not turns:
+            return []
+
+        fm = summary_fm or {}
+        summarized_up_to = fm.get("summarized_up_to_turn", -1)
+        if not isinstance(summarized_up_to, int) or isinstance(summarized_up_to, bool):
+            summarized_up_to = -1
+        summarized_up_to = min(summarized_up_to, len(turns) - 1)
+        floor = max(0, summarized_up_to + 1)
+
+        k = self._recent_turns_k
+        start = max(max(0, len(turns) - k), floor)
+        start = min(start, len(turns))
+
+        def _matching_assistant(cursor: int) -> int:
+            """Index of the assistant(tool_use) that owns the tool run at *cursor*."""
+            cursor -= 1
+            while cursor >= 0 and self._turn_role(turns[cursor]) == "tool":
+                cursor -= 1
+            if cursor >= 0 and self._turn_role(turns[cursor]) == "assistant" \
+                    and self._turn_tool_calls(turns[cursor]):
+                return cursor
+            return -1
+
+        # Rule 3 (before the walk back): start of the window is a tool result.
+        may_precede_floor = False
+        if 0 < start < len(turns) and self._turn_role(turns[start]) == "tool":
+            owner = _matching_assistant(start)
+            if owner >= 0:
+                start = owner
+                may_precede_floor = start < floor
+            else:
+                while start < len(turns) and self._turn_role(turns[start]) == "tool":
+                    start += 1
+
+        # Rule 4: take the whole turn, but never past what the summary covers.
+        while (floor < start < len(turns)
+               and self._turn_role(turns[start]) not in ("user", "system")):
+            start -= 1
+
+        # Rule 3 again: the walk may have landed on a tool result of a round
+        # whose assistant is still outside the window -- an orphan tool_result is
+        # rejected outright by providers such as Anthropic ("No tool call found
+        # for function call output").
+        if 0 < start < len(turns) and self._turn_role(turns[start]) == "tool":
+            owner = _matching_assistant(start)
+            if owner >= 0:
+                start = owner
+                may_precede_floor = True
+            else:
+                while start < len(turns) and self._turn_role(turns[start]) == "tool":
+                    start += 1
+
+        if start < floor and not may_precede_floor:
+            start = floor
+        if start < len(turns) and self._turn_role(turns[start]) == "system":
+            start += 1                       # rule 5
+
+        return turns[start:]
+
+
     def assemble_context(
         self,
         session_id: str,
@@ -3475,62 +3586,13 @@ class ContextManager:
         ]
 
         # 3. Recent/unsummarized turns.
-        k = self._recent_turns_k
-        summarized_up_to = summary_fm.get("summarized_up_to_turn", -1)
-        if not isinstance(summarized_up_to, int):
-            summarized_up_to = -1
-        if turns:
-            summarized_up_to = min(summarized_up_to, len(turns) - 1)
-        else:
-            summarized_up_to = -1
-        unsummarized_floor = max(0, summarized_up_to + 1)
-        recent_start = max(max(0, len(turns) - k), unsummarized_floor)
-        recent_start = min(recent_start, len(turns))
-        allow_before_floor_for_tool_chain = False
-        if 0 < recent_start < len(turns) and turns[recent_start].role == "tool":
-            cursor = recent_start - 1
-            while cursor >= 0 and turns[cursor].role == "tool":
-                cursor -= 1
-            if cursor >= 0 and turns[cursor].role == "assistant" and turns[cursor].tool_calls:
-                # Protocol integrity first: if the window starts from a tool_result,
-                # include its matching assistant(tool_use) even if that assistant
-                # is in summarized area.
-                recent_start = cursor
-                allow_before_floor_for_tool_chain = recent_start < unsummarized_floor
-            else:
-                while recent_start < len(turns) and turns[recent_start].role == "tool":
-                    recent_start += 1
-        while (
-            unsummarized_floor < recent_start < len(turns)
-            and turns[recent_start].role not in ("user", "system")
-        ):
-            recent_start -= 1
-        # Second tool-chain integrity check: the backtrack loop above may have
-        # moved recent_start onto a tool message whose matching assistant is
-        # still outside the window (in the summarized area).  Without the
-        # matching assistant(tool_use), Claude API will reject the orphan
-        # tool_result with "No tool call found for function call output".
-        if 0 < recent_start < len(turns) and turns[recent_start].role == "tool":
-            cursor = recent_start - 1
-            while cursor >= 0 and turns[cursor].role == "tool":
-                cursor -= 1
-            if cursor >= 0 and turns[cursor].role == "assistant" and turns[cursor].tool_calls:
-                recent_start = cursor
-                allow_before_floor_for_tool_chain = True  # allow going before floor
-            else:
-                # No matching assistant found — skip orphan tool results
-                while recent_start < len(turns) and turns[recent_start].role == "tool":
-                    recent_start += 1
-        if recent_start < unsummarized_floor and not allow_before_floor_for_tool_chain:
-            recent_start = unsummarized_floor
-        if recent_start < len(turns) and turns[recent_start].role == "system":
-            recent_start += 1
-        recent_turns = turns[recent_start:]
+        recent_turns = self.select_unsummarized_turns(turns, summary_fm)
         turn_msgs = [
             turn_to_message_dict(t)
             for t in recent_turns
             if t.role != "system"
         ]
+
 
         # 3b. User-anchor guarantee.  Several providers (Ollama and some
         #     OpenAI-compatible servers) reject a request whose messages contain
