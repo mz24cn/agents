@@ -76,7 +76,7 @@
 <line x1="672" y1="614" x2="1188" y2="614" stroke="#fcd34d" stroke-width="1" opacity="0.6"/>
 <circle cx="670" cy="640" r="5" fill="#d97706"/>
 <text x="684" y="645" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="17" font-weight="700" fill="#b45309">超时控制</text>
-<text x="684" y="670" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="15" fill="#374151">EXEC_DEFAULT_TIMEOUT 默认 30 秒</text>
+<text x="684" y="670" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="15" fill="#374151">EXEC_DEFAULT_TIMEOUT 默认 180 秒</text>
 <text x="684" y="694" font-family="'PingFang SC','Microsoft YaHei','Noto Sans SC','Source Han Sans SC',sans-serif" font-size="15" fill="#374151">超时即杀进程</text>
 <line x1="672" y1="706" x2="1188" y2="706" stroke="#fcd34d" stroke-width="1" opacity="0.6"/>
 <circle cx="670" cy="732" r="5" fill="#d97706"/>

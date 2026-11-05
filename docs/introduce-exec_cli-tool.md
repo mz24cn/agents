@@ -26,7 +26,7 @@
 | **有无状态** | 有状态：工作目录、环境变量、前台进程、SSH 登录态、容器上下文全部保留 | 无状态：每次都是全新进程 |
 | **交互能力** | 有真实 TTY，可与任意交互式程序对话（ssh、mysql、容器等） | 无 TTY（`TERM=dumb`），无交互能力，无法"留在程序里" |
 | **返回值** | 终端**可见屏幕输出**（自动剥离控制字符噪声） | 结构化 JSON：`{exit_code, stdout, stderr, truncated}` |
-| **超时控制** | 由完成条件驱动；外层受 `TOOL_EXEC_TIMEOUT` 守卫（默认 **200 秒**），`timeout` 传大值可延长本次调用允许的运行时间 | 默认 `EXEC_DEFAULT_TIMEOUT`（**30 秒**），超时即杀进程 |
+| **超时控制** | 由完成条件驱动；外层受 `TOOL_EXEC_TIMEOUT` 守卫（默认 **200 秒**），`timeout` 传大值可延长本次调用允许的运行时间 | 默认 `EXEC_DEFAULT_TIMEOUT`（**180 秒** = `TOOL_EXEC_TIMEOUT` − 20 秒余量），超时即杀进程 |
 | **输出限制** | 由完成条件驱动收集，可滚动式读取 | 硬截断 1000 行 / 每行 1000 列 |
 | **并发** | 每个会话支持**多个并发终端**，可一个终端跑长任务、另一个终端继续干活；**同一个终端一次只驱动一条命令**，同一终端上的并发调用按 FIFO 排队，输出各归其主 | 单次调用，无并发概念 |
 | **兜底机制** | 终端不可用时**自动回退**为 subprocess 单次执行 | — |
@@ -60,7 +60,7 @@
 - `read_after_delay` 计时到 → 无论有无输出都返回；
 - 三者之上，本次调用整体还受运行时 `TOOL_EXEC_TIMEOUT` 守卫（默认 200 秒）约束：`timeout` 参数会叠加在这个基础值之上（数值 ≥5000 按毫秒、更小按秒解释），因此传大 `timeout` 既拉长静默窗口、也拉长允许运行的最长时间。到限后调用方收到超时错误，运行时同时**中断这条 exec_cli 调用**（exec_cli 注册了 abort hook：停止收集并对 shell 发 `Ctrl-C`），不会留下一条还在吞终端输出的后台收集器；用户按 Stop 同样会中断在飞的 exec_cli 调用。命令未跑完前仍可随时用空 `command` 读回进度——Agent 不会被一条卡死的命令永久挂起。
 
-> 环境变量速查：`TOOL_EXEC_TIMEOUT`（默认 200s，所有工具调用的外层守卫上限；exec_cli 通过 `timeout` 参数在其上叠加）、`EXEC_DEFAULT_TIMEOUT`（默认 30s，exec_shell 默认超时）、`OUTPUT_CHECK_INTERVAL`（默认 0.05s，终端输出轮询间隔）。
+> 环境变量速查：`TOOL_EXEC_TIMEOUT`（默认 200s，所有工具调用的外层守卫上限；exec_cli 通过 `timeout` 参数在其上叠加）、`EXEC_DEFAULT_TIMEOUT`（默认 180s，即 `TOOL_EXEC_TIMEOUT` 200s − 20s 余量；exec_shell 默认超时）、`OUTPUT_CHECK_INTERVAL`（默认 0.05s，终端输出轮询间隔）。
 
 ---
 
