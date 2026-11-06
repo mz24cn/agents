@@ -14,6 +14,7 @@ or reach the parent's address.
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import http.server
 import io
@@ -35,11 +36,19 @@ import runtime.handler_api as handler_api_module
 from runtime.handler_api import _platform_arch, _platform_os
 from runtime.remote_env_manager import (
     RemoteEnvManager,
+    SECONDARY_TOKEN_HEADER,
+    attach_url_credentials,
+    auth_headers,
+    basic_auth_header,
     build_setup_request_url,
     canonical_setup_url,
+    mask_url_credentials,
     normalize_setup_url,
     snapshot_from_hello,
+    strip_url_credentials,
+    url_credentials,
 )
+from runtime.remote_tool_proxy import child_endpoint
 from runtime.registry import ModelRegistry, ToolRegistry
 from runtime.runtime import Runtime
 from runtime.server import RuntimeHTTPServer
@@ -129,6 +138,106 @@ class TestBuildSetupRequestUrl:
         assert params["source"] == "http://parent:7988/v1/setup?token=p"
         assert params["frontend_build"] == "250908_120000"
         assert params["last_config"] == "250908_120000"
+
+
+class TestCredentialBearingSetupUrl:
+    """第四种 SETUP_SOURCE / 环境 URL 形态：``https://user:password@host:port/``。
+
+    这个凭据既可能是环境前面那道 Basic 认证网关的，也可能是环境自身的访问
+    密码（母环境 ``/v1/`` 也接受它）。要点是 userinfo **不能留在 netloc**：
+    ``http.client`` 会把 ``user:pass@host`` 整体当主机名去解析（连不上，且
+    错误信息里看不出原因），拨号前必须换成 ``Authorization: Basic``。
+    """
+
+    URL = "https://gw:secret@proxy.example.com:27988/"
+
+    def test_userinfo_is_split_off_the_host(self):
+        n = normalize_setup_url(self.URL)
+        assert n["id"] == "https://proxy.example.com:27988"
+        assert n["netloc"] == "proxy.example.com:27988"
+        assert n["username"] == "gw"
+        assert n["password"] == "secret"
+        assert n["userinfo"] == "gw:secret@"
+
+    def test_credentials_never_reach_the_record_id(self):
+        # 记录 id 是展示标识，也是 remote_envs.json 的键：密码不进 id，带凭据
+        # 与不带的写法因此归并成同一条记录。
+        bare = normalize_setup_url("https://proxy.example.com:27988/")
+        assert normalize_setup_url(self.URL)["id"] == bare["id"]
+        assert "secret" not in bare["id"]
+
+    def test_canonical_and_request_urls_keep_the_credential(self):
+        assert canonical_setup_url(self.URL) == \
+            "https://gw:secret@proxy.example.com:27988/v1/setup"
+        assert build_setup_request_url(self.URL, {"op": "hello"}) == \
+            "https://gw:secret@proxy.example.com:27988/v1/setup?op=hello"
+
+    def test_percent_encoded_password_round_trip(self):
+        # 密码里的 @ : / 用百分号编码写，解析回原值；重新拼回的规范 URL 仍可解析
+        n = normalize_setup_url("https://user%40name:p%40ss%3Ax@host:7988/")
+        assert (n["username"], n["password"]) == ("user@name", "p@ss:x")
+        again = normalize_setup_url(canonical_setup_url("https://user%40name:p%40ss%3Ax@host:7988/"))
+        assert (again["username"], again["password"]) == ("user@name", "p@ss:x")
+
+    def test_basic_header_is_the_url_credential(self):
+        assert basic_auth_header("gw", "secret") == "Basic Z3c6c2VjcmV0"
+        user, password, auth = url_credentials(self.URL)
+        assert (user, password) == ("gw", "secret")
+        assert auth == "Basic Z3c6c2VjcmV0"
+        assert url_credentials("http://host:7988/") == ("", "", "")
+
+    def test_attach_moves_credential_into_the_header(self):
+        url, headers = attach_url_credentials(build_setup_request_url(self.URL, {"op": "hello"}))
+        assert url == "https://proxy.example.com:27988/v1/setup?op=hello"
+        assert headers == {"Authorization": "Basic Z3c6c2VjcmV0"}
+        assert strip_url_credentials(self.URL) == "https://proxy.example.com:27988/"
+
+    def test_attach_keeps_an_explicit_authorization(self):
+        # 一次调用只能有一种认证；已显式给了 header 时不再从 URL 合成
+        url, headers = attach_url_credentials(self.URL, {"Authorization": "Bearer as_x"})
+        assert url == "https://proxy.example.com:27988/"
+        assert headers == {"Authorization": "Bearer as_x"}
+
+    def test_attach_is_a_no_op_without_credential(self):
+        url, headers = attach_url_credentials("http://host:7988/v1/setup", {"Accept": "application/json"})
+        assert url == "http://host:7988/v1/setup"
+        assert headers == {"Accept": "application/json"}
+
+    def test_auth_headers_splits_two_credentials(self):
+        # 只有一种凭据时就是普通的 Authorization；两种都有时凭据占 Authorization
+        # （它是过网关的那一把），token 走自己的头，不进 URL
+        assert auth_headers("st_x") == {"Authorization": "Bearer st_x"}
+        assert auth_headers("", "Basic dXNlcjpwdw==") == {"Authorization": "Basic dXNlcjpwdw=="}
+        assert auth_headers("st_x", "Basic dXNlcjpwdw==") == {
+            "Authorization": "Basic dXNlcjpwdw==",
+            SECONDARY_TOKEN_HEADER: "st_x",
+        }
+        assert auth_headers() == {}
+
+    def test_ipv6_literal_keeps_its_brackets(self):
+        assert normalize_setup_url("http://user:pw@[::1]:7988/")["id"] == "http://[::1]:7988"
+
+    def test_userinfo_without_host_is_rejected(self):
+        with pytest.raises(ValueError):
+            normalize_setup_url("https://user:pw@")
+
+    def test_mask_hides_the_password(self):
+        # 界面/状态里出现的地址都是掩码版
+        assert mask_url_credentials(self.URL) == "https://gw:***@proxy.example.com:27988/"
+        assert mask_url_credentials("http://user@host:7988/") == "http://user@host:7988/"
+        assert mask_url_credentials("http://host:7988/") == "http://host:7988/"
+
+    def test_child_endpoint_splits_credential_from_dial_base(self):
+        # 工具代理 / env-proxy 桥：base 必须可建连，凭据单独作为 header 值
+        base, token, basic = child_endpoint({
+            "url": "http://gw:pw@127.0.0.1:7988/sub/v1/setup?token=st_x",
+        })
+        assert base == "http://127.0.0.1:7988/sub"
+        assert token == "st_x"
+        assert basic == "Basic " + base64.b64encode(b"gw:pw").decode()
+        base, token, basic = child_endpoint({"url": "http://user:pw@127.0.0.1:7988/v1/setup"})
+        assert (base, token, basic) == ("http://127.0.0.1:7988", "", "Basic " + base64.b64encode(b"user:pw").decode())
+        assert child_endpoint({"url": "http://127.0.0.1:7988/v1/setup"})[2] == ""
 
 
 class TestSnapshotFromHello:
@@ -437,6 +546,146 @@ def _make_tar_bytes(files):
             info.size = len(data)
             tar.addfile(info, io.BytesIO(data))
     return bio.getvalue()
+
+
+class TestCredentialUrlEndToEnd:
+    """凭据写在 URL 里（``:密码@``）时对真实子环境的调用。
+
+    登记探测（GET hello）、刷新状态、浏览器桥（GET/POST 子环境 API）都只靠
+    ``Authorization: Basic`` 授权，不带 ``?token=``。子环境开了访问密码也连得通
+    —— 这正是旧写法做不到的（userinfo 留在 host 里，连 DNS 都过不去）。
+    """
+
+    @staticmethod
+    def _enable_child_auth(child, password: str) -> None:
+        status, config = _request(child, "POST", "/v1/auth/config", {"password": password})
+        assert status == 200
+        assert config.get("setup_token")
+
+    def test_add_refresh_and_bridge_share_the_url_credential(self, server, tmp_path):
+        ws = tmp_path / "cred_child_ws"
+        ws.mkdir()
+        (ws / "secret.txt").write_text("top secret", encoding="utf-8")
+        with _real_child_server(tmp_path, name="child_credential_url",
+                                workspace=str(ws)) as (child, _data):
+            _wait_child_hello(child)
+            self._enable_child_auth(child, "child-pass")
+
+            status, body = _request(
+                server, "POST", "/v1/remote-envs",
+                {"url": f"http://gateway:child-pass@127.0.0.1:{child.port}/v1/setup"},
+            )
+            assert status == 200, body
+            env = body["envs"][0]
+            # 记录 id 只有可建连的 host（密码不进 id，也不进 remote_envs.json 的键）；
+            # 拨号用的 URL 保留凭据
+            assert env["id"] == f"http://127.0.0.1:{child.port}"
+            assert "child-pass" in env["url"]
+
+            status, body = _request(
+                server, "POST",
+                f"/v1/remote-envs/{urllib.parse.quote(env['id'], safe='')}/hello",
+            )
+            assert status == 200, body
+            assert body.get("ok") is True
+
+            # 浏览器的文件视图走的是另一条桥（GET/POST 子环境 API）：同一份凭据
+            status, raw = _bridge(server, env["id"],
+                                  "/v1/workspace/list?path=.&page=1&page_size=50&restrict=0")
+            assert status == 200, raw[:200]
+            data = json.loads(raw)
+            names = [e.get("name") for e in data.get("entries", data.get("files", []))]
+            assert "secret.txt" in names, (names, raw[:300])
+            status, raw = _bridge(server, env["id"], "/v1/workspace/mkdir",
+                                  method="POST", payload={"parent_path": ".", "name": "cred_dir"})
+            assert status == 200, raw[:200]
+            assert (ws / "cred_dir").is_dir()
+
+    def test_password_and_token_together_reach_the_child(self, server, tmp_path):
+        """一把 URL 里同时放网关口令和子环境 token。
+
+        一个请求只有一个 ``Authorization``：URL 里的凭据占它（过网关靠的是它），
+        token 改放 ``X-Agent-Service-Token``。这里的凭据故意不是子环境的口令，
+        所以能不能通，全看 token 有没有跟着走过 POST。
+        """
+        ws = tmp_path / "cred_child_ws_both"
+        ws.mkdir()
+        with _real_child_server(tmp_path, name="child_credential_both",
+                                workspace=str(ws)) as (child, _data):
+            _wait_child_hello(child)
+            status, config = _request(child, "POST", "/v1/auth/config",
+                                      {"password": "child-pass"})
+            assert status == 200, config
+            setup_token = config["setup_token"]
+
+            status, body = _request(
+                server, "POST", "/v1/remote-envs",
+                {"url": f"http://gateway:gateway-secret@127.0.0.1:{child.port}"
+                        f"/v1/setup?token={setup_token}"},
+            )
+            assert status == 200, body
+            env = body["envs"][0]
+            assert env["id"] == f"http://127.0.0.1:{child.port}"
+
+            status, raw = _bridge(server, env["id"], "/v1/workspace/mkdir",
+                                  method="POST",
+                                  payload={"parent_path": ".", "name": "both_dir"})
+            assert status == 200, raw[:200]
+            assert (ws / "both_dir").is_dir()
+
+    def test_wrong_password_is_reported_as_child_auth(self, server, tmp_path):
+        with _real_child_server(tmp_path, name="child_credential_bad") as (child, _data):
+            _wait_child_hello(child)
+            self._enable_child_auth(child, "child-pass")
+            status, body = _request(
+                server, "POST", "/v1/remote-envs",
+                {"url": f"http://gw:nope@127.0.0.1:{child.port}/v1/setup"},
+            )
+            assert status == 400
+            assert body["error"] == "child_auth"
+
+    def test_userinfo_stays_off_the_request_line_and_host(self, server):
+        # 一次拨号发出去的东西：请求行与 Host 里都不能有 '@'（那是旧写法失败的
+        # 根因），凭据只出现在 Authorization 头
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                seen.append((self.path, self.headers.get("Host"),
+                             self.headers.get("Authorization")))
+                data = json.dumps({
+                    "frontend_build": "250101_000000",
+                    "backend_build": "250101_000000",
+                }).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        try:
+            port = httpd.server_address[1]
+            env_id = _seed_env(
+                server, f"http://127.0.0.1:{port}",
+                f"http://gw:pw@127.0.0.1:{port}/v1/setup",
+            )
+            status, body = _request(
+                server, "POST",
+                f"/v1/remote-envs/{urllib.parse.quote(env_id, safe='')}/hello",
+            )
+            assert status == 200, body
+            path, host, auth = seen[-1]
+            assert "@" not in path
+            assert "@" not in (host or "")
+            assert auth == "Basic " + base64.b64encode(b"gw:pw").decode("ascii")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
 
 
 class TestRemoteEnvsEndpoints:

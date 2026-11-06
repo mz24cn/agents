@@ -47,9 +47,12 @@ from runtime.models import (
     _resolve_env_placeholders,
 )
 from runtime.remote_env_manager import (
+    attach_url_credentials,
     build_setup_request_url,
     normalize_setup_url,
     snapshot_from_hello,
+    strip_url_credentials,
+    url_credentials,
 )
 from runtime.skill_manager import SkillManager
 from runtime.tunnel_protocol import is_tunnel_env_id
@@ -1064,10 +1067,18 @@ class HandlerApiMixin:
             status, _headers, data = manager.call_env(
                 env_id, method, url, headers=headers, body=body, timeout=timeout)
             return int(status), bytes(data or b"")
+        # A URL may carry its credentials inline (``https://user:pass@host:port/``,
+        # the fourth SETUP_SOURCE shape). http.client cannot dial such a netloc --
+        # it would resolve ``user:pass@host`` as a hostname -- so move the
+        # userinfo into an Authorization: Basic header, the form a password
+        # gateway (and this server's own auth gate) expects.
+        url, extra_headers = attach_url_credentials(url)
         try:
             request = urllib.request.Request(url, data=body, method=method)
             if body is not None:
                 request.add_header("Content-Type", content_type)
+            for name, value in extra_headers.items():
+                request.add_header(name, value)
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 return int(response.status), response.read()
         except urllib.error.HTTPError as exc:
@@ -1354,13 +1365,17 @@ class HandlerApiMixin:
                 "backend_build": local["backend_build"],
                 "last_config": local["last_config"],
             })
+            # Credentials inline in the registered URL (SETUP_SOURCE shape
+            # ``https://user:pass@host:port/``) go into an Authorization header:
+            # the netloc form cannot be dialed by http.client.
+            push_url, push_headers = attach_url_credentials(push_url, {
+                "Content-Type": "application/gzip",
+                "User-Agent": "Agent-Service-Updater/1",
+            })
             try:
                 request = urllib.request.Request(
                     push_url, data=tar_data, method="POST",
-                    headers={
-                        "Content-Type": "application/gzip",
-                        "User-Agent": "Agent-Service-Updater/1",
-                    },
+                    headers=push_headers,
                 )
                 with urllib.request.urlopen(request, timeout=300) as resp:
                     payload = json.loads(resp.read())
@@ -1826,7 +1841,13 @@ class HandlerApiMixin:
             with update_lock:
                 self.server.update_in_progress = False
 
-        parsed = urllib.parse.urlsplit(source)
+        # ``source`` may carry its credentials inline (the
+        # ``https://user:pass@host:port/`` SETUP_SOURCE shape). The netloc form
+        # cannot be dialed (http.client would resolve the whole thing as a
+        # hostname), so the URL is dialed clean and the credential travels as
+        # ``Authorization: Basic`` -- what a password gateway expects.
+        _source_user, _source_password, basic_auth = url_credentials(source)
+        parsed = urllib.parse.urlsplit(strip_url_credentials(source))
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             release_update_lock()
             self._send_json_error(400, "SETUP_SOURCE must be an http(s) URL")
@@ -1854,13 +1875,26 @@ class HandlerApiMixin:
         ))
 
         try:
-            request = urllib.request.Request(update_url, headers={"User-Agent": "Agent-Service-Updater/1"})
+            download_headers = {"User-Agent": "Agent-Service-Updater/1"}
+            if basic_auth:
+                download_headers["Authorization"] = basic_auth
+            request = urllib.request.Request(update_url, headers=download_headers)
             with urllib.request.urlopen(request, timeout=120) as response:
                 tar_data = response.read()
         except urllib.error.HTTPError as exc:
             release_update_lock()
             if exc.code == 304:
                 self._send_json_response(200, {"updated": False, "restart_backend": False})
+                return
+            if exc.code in (401, 403):
+                # 授权被拒：更新源需要 token 或密码。直接说清楚该补什么，
+                # 而不是回一句看不出原因的 "HTTP 401"。
+                self._send_json_response(400, {
+                    "error": "source_auth",
+                    "message": f"Update source rejected the download (HTTP {exc.code}): "
+                               "give it a setup link with ?token=..., or a credential "
+                               "as https://user:password@host:port/.",
+                })
                 return
             self._send_json_error(502, f"Update source returned HTTP {exc.code}")
             return

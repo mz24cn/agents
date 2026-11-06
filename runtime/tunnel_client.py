@@ -40,7 +40,7 @@ from typing import Optional
 
 from runtime.auth_manager import COOKIE_NAME
 from runtime.common import atomic_write_text, get_workspace
-from runtime.remote_env_manager import normalize_setup_url
+from runtime.remote_env_manager import auth_headers, basic_auth_header, normalize_setup_url
 from runtime.tunnel_protocol import (
     CAP_REQ_CHUNK_ID,
     CAP_RESP_CHUNK_ID,
@@ -228,11 +228,15 @@ class TunnelClient:
     # ------------------------------------------------------------------
 
     def status(self) -> dict:
-        enabled, base, token, _err = self._read_config()
+        enabled, base, token, basic, _err = self._read_config()
         parent = base
         if token:
             masked = token[:3] + "…" + token[-2:] if len(token) > 8 else "****"
             parent = f"{base} (token {masked})"
+        if basic:
+            # The URL carried a credential (``https://user:pass@host:port/``);
+            # say it is configured without repeating the password.
+            parent = f"{parent} (credential)"
         with self._state_lock:
             state = dict(self._state)
         return {
@@ -261,13 +265,17 @@ class TunnelClient:
             except ValueError as exc:
                 return (False, f"母环境地址无效: {exc}", {})
             try:
+                # Persisted verbatim (a ``user:password@`` credential included):
+                # the dial loop re-reads this value and needs the credential to
+                # get through a password gateway on every later redial.
                 self._env_manager.set("SETUP_SOURCE", raw)
             except Exception as exc:
                 return (False, f"Cannot persist SETUP_SOURCE: {exc}", {})
             base = f"{norm['scheme']}://{norm['netloc']}"
             token = next((v for k, v in norm["query"] if k == "token"), "")
+            basic = basic_auth_header(norm["username"], norm["password"])
         else:
-            _enabled, base, token, err = self._read_config()
+            _enabled, base, token, basic, err = self._read_config()
             if not base:
                 return (False, err or "SETUP_SOURCE is not configured", {})
         tunnel_id = self._ensure_tunnel_id()
@@ -275,8 +283,12 @@ class TunnelClient:
         url = base + "/v1/tunnel/register"
         body = json.dumps({"tunnel_id": tunnel_id, "snapshot": snapshot}).encode("utf-8")
         headers = {"Content-Type": "application/json"}
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
+        # A request carries one Authorization header. When the URL supplies both
+        # a credential and a token (a gateway in front of the parent *and* the
+        # parent's own authorization), the credential takes Authorization -- it
+        # is the one that gets through the gateway -- and the token rides in its
+        # own header (see remote_env_manager.auth_headers).
+        headers.update(auth_headers(token, basic))
         try:
             with urllib.request.urlopen(
                 urllib.request.Request(url, data=body, headers=headers, method="POST"),
@@ -286,6 +298,11 @@ class TunnelClient:
         except urllib.error.HTTPError as exc:
             detail = _json_body_or_empty(exc.read())
             message = detail.get("error") or detail.get("message") or f"HTTP {exc.code}"
+            if exc.code in (401, 403):
+                message += (
+                    " — the parent needs its setup link (?token=...) or a "
+                    "credential written as https://user:password@host:port/"
+                )
             return (False, f"Parent rejected registration: {message}", {})
         except Exception as exc:
             return (False, f"Cannot reach parent environment: {exc}", {})
@@ -296,13 +313,15 @@ class TunnelClient:
 
     def request_unregister(self) -> tuple:
         """Remove this environment from its parent and stop dialing."""
-        _enabled, base, token, _err = self._read_config()
+        _enabled, base, token, basic, _err = self._read_config()
         tunnel_id = self._tunnel_id
         if base and tunnel_id:
             url = base + "/v1/tunnel/register?tunnel_id=" + urllib.parse.quote(tunnel_id)
             headers = {"Content-Type": "application/json"}
-            if token:
-                headers["Authorization"] = f"Bearer {token}"
+            # Same rule as the register call: one Authorization header, so a URL
+            # carrying both a credential and a token sends the credential there
+            # and the token in its own header.
+            headers.update(auth_headers(token, basic))
             try:
                 urllib.request.urlopen(
                     urllib.request.Request(url, data=b"", headers=headers, method="DELETE"),
@@ -325,7 +344,16 @@ class TunnelClient:
     # ------------------------------------------------------------------
 
     def _read_config(self) -> tuple:
-        """Return (enabled, parent_base_url, token, error_message)."""
+        """Return (enabled, parent_base_url, token, basic_auth, error_message).
+
+        ``base`` never carries credentials: an environment URL written as
+        ``https://user:pass@host:port/`` has its userinfo split off
+        (:func:`runtime.remote_env_manager.normalize_setup_url`), and
+        ``basic_auth`` holds the ``Authorization`` value built from it. The
+        register POST, the WS tunnel handshake and the unregister DELETE cannot
+        carry a ``?token=``, so this header is how such a credential reaches the
+        parent (or the password gateway in front of it).
+        """
         try:
             env = self._env_manager.read()
         except Exception:
@@ -333,14 +361,15 @@ class TunnelClient:
         enabled = str(env.get("TUNNEL_ENABLED", "")) == "1"
         raw = str(env.get("SETUP_SOURCE", "") or "").strip()
         if not raw:
-            return (enabled, "", "", "SETUP_SOURCE 未配置（母环境地址）")
+            return (enabled, "", "", "", "SETUP_SOURCE 未配置（母环境地址）")
         try:
             norm = normalize_setup_url(raw)
         except ValueError as exc:
-            return (enabled, "", "", f"SETUP_SOURCE 无效: {exc}")
+            return (enabled, "", "", "", f"SETUP_SOURCE 无效: {exc}")
         base = f"{norm['scheme']}://{norm['netloc']}"
         token = next((v for k, v in norm["query"] if k == "token"), "")
-        return (enabled, base, token, "")
+        basic = basic_auth_header(norm["username"], norm["password"])
+        return (enabled, base, token, basic, "")
 
     def _parent_ws_url(self, base: str, token: str) -> str:
         ws_base = base.replace("http://", "ws://", 1).replace("https://", "wss://", 1)
@@ -428,7 +457,7 @@ class TunnelClient:
     def _loop(self) -> None:
         backoff = RECONNECT_MIN
         while not self._stop_evt.is_set():
-            enabled, base, token, err = self._read_config()
+            enabled, base, token, basic, err = self._read_config()
             if not enabled:
                 # Keep "unregistered" stable (the parent removed this
                 # environment) until the user explicitly registers again;
@@ -446,7 +475,7 @@ class TunnelClient:
             tunnel_id = self._ensure_tunnel_id()
             try:
                 self._set_state("connecting")
-                outcome = self._dial_once(base, token, tunnel_id)
+                outcome = self._dial_once(base, token, tunnel_id, basic)
             except WSClientError as exc:
                 self._set_state("error", f"connect: {exc}")
                 self._wait_wake(backoff)
@@ -472,14 +501,20 @@ class TunnelClient:
             # "closed" — transient disconnect; redial after a short pause.
             self._wait_wake(backoff)
 
-    def _dial_once(self, base: str, token: str, tunnel_id: str) -> str:
+    def _dial_once(self, base: str, token: str, tunnel_id: str, basic: str = "") -> str:
         """One connect+serve cycle.
 
         Returns a terminal outcome: "closed", "not-registered",
         "deregistered", or "replaced".
         """
         url = self._parent_ws_url(base, token)
-        ws = WSClient.connect(url, timeout=15.0)
+        # Credentials from an environment URL written as
+        # ``https://user:pass@host:port/`` cannot travel in the URL (the
+        # handshake's request target would carry the password and the Host
+        # would be wrong), so they go in the Authorization header. The parent
+        # accepts it on the GET upgrade like on any other /v1/ call.
+        extra_headers = {"Authorization": basic} if basic else None
+        ws = WSClient.connect(url, timeout=15.0, extra_headers=extra_headers)
         self._live_ws = ws
         ws.set_timeout(STALE_AFTER + 5.0)
         try:

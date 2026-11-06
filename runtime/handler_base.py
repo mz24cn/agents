@@ -10,6 +10,7 @@ Zero third-party dependencies — only Python standard library.
 
 from __future__ import annotations
 
+import base64
 import datetime
 import gzip
 import hashlib
@@ -39,6 +40,7 @@ else:
 
 from runtime import wsutil
 from runtime.auth_manager import AuthManager, COOKIE_NAME
+from runtime.remote_env_manager import SECONDARY_TOKEN_HEADER
 from runtime.runtime import Runtime
 from runtime.server_state import (
     get_or_create_terminal,
@@ -522,6 +524,28 @@ class HandlerBaseMixin:
             return auth[7:].strip()
         return ""
 
+    def _basic_credentials(self) -> tuple[str, str]:
+        """``(username, password)`` from this request's ``Authorization: Basic``.
+
+        Both empty when the header is absent or malformed. An environment URL
+        written as ``https://user:pass@host:port/`` sends exactly this header on
+        every call (:func:`runtime.remote_env_manager.attach_url_credentials`
+        moves the URL userinfo into it), so a deployment fronted by a
+        password gateway -- or one whose access password *is* that credential --
+        authenticates on all of its own calls instead of only on the
+        token-carrying ones.
+        """
+        header = str(self.headers.get("Authorization") or "").strip()
+        scheme, _sep, value = header.partition(" ")
+        if scheme.lower() != "basic" or not value:
+            return "", ""
+        try:
+            decoded = base64.b64decode(value, validate=True).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            return "", ""
+        username, _sep, password = decoded.partition(":")
+        return username, password
+
     def _is_authorized(self, method: str, path: str) -> bool:
         # Everything except the /v1/ JSON API (including the /v1/terminals/ws
         # terminal endpoint, which spawns a real shell) is public (static files, etc.).
@@ -592,6 +616,32 @@ class HandlerBaseMixin:
             auth_manager.verify_api_key(bearer)
             or auth_manager.verify_setup_token(bearer)
         ):
+            return True
+
+        # The token half of an environment URL that carries *both* a credential
+        # and a token (a password gateway in front of the peer plus the peer's
+        # own authorization). One request has one Authorization header, and the
+        # credential needs it, so the token rides in its own header -- same
+        # credential and privilege as the Bearer form above.
+        secondary = str(self.headers.get(SECONDARY_TOKEN_HEADER) or "").strip()
+        if secondary and (
+            auth_manager.verify_api_key(secondary)
+            or auth_manager.verify_setup_token(secondary)
+        ):
+            return True
+
+        # Authorization: Basic carries the credential half of an environment
+        # URL written as ``https://user:pass@host:port/`` (the URL userinfo is
+        # moved into this header before dialing, see
+        # runtime.remote_env_manager.attach_url_credentials). It is accepted on
+        # every /v1/ call because the calls that carry it cannot carry a
+        # ?token=: the WS tunnel handshake (a GET upgrade request),
+        # POST /v1/tunnel/register, POST /v1/setup?op=push and the tool-proxy
+        # calls. The password is the same credential POST /v1/auth/login
+        # accepts, so this adds no new privilege -- it only lets the
+        # credential already present in SETUP_SOURCE authenticate.
+        _username, password = self._basic_credentials()
+        if password and auth_manager.verify_password(password):
             return True
 
         return False

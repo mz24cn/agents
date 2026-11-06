@@ -431,6 +431,107 @@ def test_register_with_parent_address_persists_setup_source(tmp_path):
 # Browser bridge: /v1/env-proxy/{env_id}/... (HTTP + terminal WS)
 # ---------------------------------------------------------------------------
 
+def test_tunnel_register_with_password_in_parent_url(tmp_path):
+    """母环境地址写成 ``http://账号:母环境密码@host:port/``（不带 ``?token=``）。
+
+    这种写法的凭据既可能是环境前面那道 Basic 认证网关的，也可能是母环境自身的
+    访问密码。两者都换算成 ``Authorization: Basic`` 送出（WS 握手与 register /
+    unregister 都带上）；userinfo 不能留在 host 上（http.client 会把整串当主机名
+    解析），也不能进母环境的记录 id。
+    """
+    with _real_server(tmp_path, "parent_data") as parent, \
+         _real_server(tmp_path, "child_data", workspace=tmp_path / "child_ws") as child:
+        parent_srv, _ = parent
+        child_srv, child_data = child
+
+        # 母环境开启访问密码：没有凭据的反向连接会被 401 拒掉
+        status, config = _request(parent_srv, "POST", "/v1/auth/config", {"password": "parent-pass"})
+        assert status == 200, config
+        assert config.get("setup_token")
+        parent_api_key = config.get("api_key")
+        assert parent_api_key, config
+
+        addr = f"http://gateway:parent-pass@127.0.0.1:{parent_srv.port}/"
+        status, body = _request(child_srv, "POST", "/v1/tunnel/parent/register", {"parent": addr})
+        assert status == 200, body
+        env_id = body["env_id"]
+
+        # 原样落盘（不改写），凭据留在 SETUP_SOURCE 里
+        env = json.loads((child_data / "env.json").read_text(encoding="utf-8"))
+        assert env["SETUP_SOURCE"] == addr
+
+        def _online():
+            status, listing = _request(
+                parent_srv, "GET", "/v1/remote-envs",
+                headers={"Authorization": f"Bearer {parent_api_key}"},
+            )
+            assert status == 200, listing
+            entry = next((e for e in listing["envs"] if e.get("id") == env_id), None)
+            return entry if entry and entry.get("online") is True else None
+
+        entry = _wait_until(_online, message="tunnel online authorized by the URL credential")
+        # 密码不落母环境的记录
+        assert "parent-pass" not in json.dumps(entry)
+
+        # 隧道另一侧照常可调用（母环境反手请求子端 hello）
+        status, hello = _request(
+            parent_srv, "POST", f"/v1/remote-envs/{urllib.parse.quote(env_id, safe='')}/hello",
+            headers={"Authorization": f"Bearer {parent_api_key}"},
+        )
+        assert status == 200, hello
+        assert hello.get("ok") is True, hello
+
+        status, body = _request(child_srv, "POST", "/v1/tunnel/parent/unregister")
+        assert status == 200, body
+        assert body.get("ok") is True, body
+
+
+def test_tunnel_register_with_password_and_token_in_parent_url(tmp_path):
+    """母环境地址同时带 ``账号:口令@`` 和 ``?token=``（前面有网关、母环境又开了授权）。
+
+    一个请求只有一个 ``Authorization``：URL 里的凭据占它。这里它故意不是母环境的
+    口令，所以 register / unregister 能不能成，全看 token 有没有跟着走
+    ``X-Agent-Service-Token``（WS 拨号是 GET，token 仍在查询参数里）。
+    """
+    with _real_server(tmp_path, "parent_data") as parent, \
+         _real_server(tmp_path, "child_data", workspace=tmp_path / "child_ws") as child:
+        parent_srv, _ = parent
+        child_srv, child_data = child
+
+        status, config = _request(parent_srv, "POST", "/v1/auth/config", {"password": "parent-pass"})
+        assert status == 200, config
+        setup_token = config.get("setup_token")
+        assert setup_token, config
+        parent_api_key = config.get("api_key")
+        assert parent_api_key, config
+
+        addr = (f"http://gateway:gateway-secret@127.0.0.1:{parent_srv.port}"
+                f"/v1/setup?token={setup_token}")
+        status, body = _request(child_srv, "POST", "/v1/tunnel/parent/register", {"parent": addr})
+        assert status == 200, body
+        env_id = body["env_id"]
+
+        env = json.loads((child_data / "env.json").read_text(encoding="utf-8"))
+        assert env["SETUP_SOURCE"] == addr
+
+        def _online():
+            status, listing = _request(
+                parent_srv, "GET", "/v1/remote-envs",
+                headers={"Authorization": f"Bearer {parent_api_key}"},
+            )
+            assert status == 200, listing
+            entry = next((e for e in listing["envs"] if e.get("id") == env_id), None)
+            return entry if entry and entry.get("online") is True else None
+
+        entry = _wait_until(_online, message="tunnel online with credential + token")
+        # id 与记录里都不该出现口令或 token
+        assert "gateway-secret" not in json.dumps(entry)
+
+        status, body = _request(child_srv, "POST", "/v1/tunnel/parent/unregister")
+        assert status == 200, body
+        assert body.get("ok") is True, body
+
+
 class _WsBrowserSock:
     """Browser-style WebSocket client socket (masked frames), with a pending
     buffer for bytes that arrived glued to the handshake response."""

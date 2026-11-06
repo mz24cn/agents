@@ -24,6 +24,7 @@ remote_envs.json 只是本环境的本地管理元数据：与 env.json 一样�
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -53,20 +54,32 @@ SNAPSHOT_TEXT_KEYS = ("app_title", "app_logo", "arch", "os", "workspace")
 def normalize_setup_url(url: str) -> dict:
     """归一化一个 SETUP_SOURCE 风格的环境 URL。
 
-    接受三种形态（与构建版本页的 SETUP_SOURCE 输入框相同）：
+    接受四种形态（与构建版本页的 SETUP_SOURCE 输入框相同）：
 
     * ``http://172.28.70.13:7988/``
     * ``http://172.28.70.13:7988/v1/setup``
     * ``http://172.28.70.13:7988/v1/setup?token=...``
+    * ``https://user:pass@proxy.example.com:27988/`` —— 地址里带 userinfo 凭据。
+      凭据被拆到 ``username`` / ``password``，``id`` / ``netloc`` 只留
+      host:port：``http.client`` 无法用带 ``user:pass@`` 的 netloc 建连
+      （会把整串当主机名去解析），代理与服务端要的是 ``Authorization:
+      Basic``，所以拨号前统一换成 header（见 :func:`attach_url_credentials`）。
+      这个凭据可能是环境前面那道 Basic 认证反向代理的，也可能是母环境自身的
+      访问密码（``AuthManager.verify_password`` 接受它）。
 
     Returns:
         dict，包含：
 
-        * ``id`` — 稳定标识 ``scheme://netloc``，作为环境记录的去重键；
+        * ``id`` — 稳定标识 ``scheme://host:port``，作为环境记录的去重键；
+          **不含凭据**，同一环境带不带凭据都归并成同一条记录；
         * ``scheme`` / ``netloc`` / ``path`` — 归一化后的地址各部分，
-          path 固定为指向 ``/v1/setup`` 的路径；
+          netloc 不含凭据，path 固定为指向 ``/v1/setup`` 的路径；
         * ``query`` — 需要保留的查询参数 (key, value) 列表（剔除 op 等
-          由具体请求决定的参数）。
+          由具体请求决定的参数）；
+        * ``username`` / ``password`` — URL 携带的凭据（已百分号解码），
+          无凭据时为空串；
+        * ``userinfo`` — 重新百分号编码后的 ``user:pass@``（拼回规范 URL
+          用，凭据要在 remote_envs.json 里留得住）。
 
     Raises:
         ValueError: 不是合法的 http(s) URL 时。
@@ -78,7 +91,17 @@ def normalize_setup_url(url: str) -> dict:
     try:
         parsed.port  # 非数字端口在这里抛出 ValueError
     except ValueError:
-        raise ValueError(f"URL 端口无效: {raw}") from None
+        # 报错里回显地址时遮掉口令：这条消息会进隧道状态、也进界面
+        raise ValueError(f"URL 端口无效: {mask_url_credentials(raw)}") from None
+    # hostname 已经剥掉 userinfo 并转小写（主机名大小写不敏感，去重更稳）
+    host = parsed.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"                      # IPv6 字面量补回方括号
+    netloc = f"{host}:{parsed.port}" if parsed.port else host
+    if not netloc:
+        raise ValueError(f"URL 缺少主机名: {mask_url_credentials(raw)}")
+    username = urllib.parse.unquote(parsed.username or "")
+    password = urllib.parse.unquote(parsed.password or "")
     if "/v1/setup" in parsed.path:
         path = parsed.path[: parsed.path.index("/v1/setup") + len("/v1/setup")]
     else:
@@ -89,18 +112,135 @@ def normalize_setup_url(url: str) -> dict:
         if key not in MANAGED_SETUP_QUERY_KEYS
     ]
     return {
-        "id": f"{parsed.scheme}://{parsed.netloc}",
+        "id": f"{parsed.scheme}://{netloc}",
         "scheme": parsed.scheme,
-        "netloc": parsed.netloc,
+        "netloc": netloc,
         "path": path,
         "query": query,
+        "username": username,
+        "password": password,
+        "userinfo": _encode_userinfo(username, password),
     }
 
 
+def _encode_userinfo(username: str, password: str) -> str:
+    """``user:pass@``（百分号编码，无凭据时为空串）。"""
+    if not username and not password:
+        return ""
+    userinfo = urllib.parse.quote(str(username), safe="")
+    if password:
+        userinfo += ":" + urllib.parse.quote(str(password), safe="")
+    return userinfo + "@"
+
+
+def basic_auth_header(username: str, password: str) -> str:
+    """``Authorization`` 头的 ``Basic`` 值；无凭据时为空串。"""
+    if not username and not password:
+        return ""
+    raw = f"{username}:{password}".encode("utf-8")
+    return "Basic " + base64.b64encode(raw).decode("ascii")
+
+
+# 一次请求只有一个 ``Authorization`` 头。环境 URL 里同时写了凭据（环境前面那道
+# 要密码的网关）与 ``?token=``（环境自身的授权）时，凭据占 Authorization，token
+# 走这个头 —— 母/子两端都在我们手里，加一个专用头比把 token 塞进 URL 干净
+# （URL 会被中间代理的访问日志记下来）。
+SECONDARY_TOKEN_HEADER = "X-Agent-Service-Token"
+
+
+def auth_headers(token: str = "", basic: str = "") -> dict:
+    """一份 URL 里可能带着两种凭据：返回要发的鉴权头。
+
+    * 只有 token → ``Authorization: Bearer <token>``；
+    * 只有凭据 → ``Authorization: Basic …``；
+    * 两者都有 → 凭据占 ``Authorization``（它是过网关的那一把），token 放
+      ``X-Agent-Service-Token``（对端在接受 Bearer 的地方同样接受它，见
+      ``runtime.handler_base``）。
+    """
+    token = str(token or "").strip()
+    basic = str(basic or "").strip()
+    if basic:
+        headers = {"Authorization": basic}
+        if token:
+            headers[SECONDARY_TOKEN_HEADER] = token
+        return headers
+    if token:
+        return {"Authorization": f"Bearer {token}"}
+    return {}
+
+
+def url_credentials(url: str) -> tuple[str, str, str]:
+    """环境 URL 里的凭据 → ``(username, password, Basic header)``。
+
+    URL 非法或不含凭据时返回 ``("", "", "")``：调用方大多只是「有就带上」，
+    不值得为解析失败再处理一次异常（合法性已在登记处校验）。
+    """
+    try:
+        normalized = normalize_setup_url(url)
+    except ValueError:
+        return "", "", ""
+    username, password = normalized["username"], normalized["password"]
+    return username, password, basic_auth_header(username, password)
+
+
+def strip_url_credentials(url: str) -> str:
+    """去掉 URL 的 ``user:pass@`` 段（剩下的部分才能直接建连）。"""
+    raw = str(url or "").strip()
+    parsed = urllib.parse.urlsplit(raw)
+    if "@" not in parsed.netloc:
+        return raw
+    return urllib.parse.urlunsplit((
+        parsed.scheme,
+        parsed.netloc.rsplit("@", 1)[-1],
+        parsed.path,
+        parsed.query,
+        parsed.fragment,
+    ))
+
+
+def attach_url_credentials(url: str, headers: dict | None = None) -> tuple[str, dict]:
+    """把 URL 里的凭据搬进 ``Authorization: Basic``：``(可建连 URL, headers)``。
+
+    每个直连环境 / 更新源的出口都应先过一遍这个函数：带 userinfo 的 netloc
+    会直接被当成主机名去 DNS 解析（连不上，报错还看不出原因）。已带有
+    ``Authorization`` 的 *headers* 原样保留（调用方明确挑好的凭据优先）。
+    """
+    merged = dict(headers or {})
+    _user, _password, auth = url_credentials(url)
+    if auth and not any(str(k).lower() == "authorization" for k in merged):
+        merged["Authorization"] = auth
+    return strip_url_credentials(url), merged
+
+
+def mask_url_credentials(url: str) -> str:
+    """把 URL 里的密码换成 ``***``（日志 / 界面展示用）。"""
+    raw = str(url or "").strip()
+    parsed = urllib.parse.urlsplit(raw)
+    if "@" not in parsed.netloc:
+        return raw
+    userinfo = parsed.netloc.rsplit("@", 1)[0]
+    head, _sep, password = userinfo.partition(":")
+    shown = f"{head}:***" if password else userinfo
+    return urllib.parse.urlunsplit((
+        parsed.scheme,
+        f"{shown}@{parsed.netloc.rsplit('@', 1)[-1]}",
+        parsed.path,
+        parsed.query,
+        parsed.fragment,
+    ))
+
+
 def canonical_setup_url(url: str) -> str:
-    """返回归一化后的环境地址（base + 保留的查询参数，不含 op 等受管理参数）。"""
+    """返回归一化后的环境地址（base + 保留的查询参数，不含 op 等受管理参数）。
+
+    userinfo 凭据保留在 URL 里：remote_envs.json 的记录要能重新拨号，
+    实际建连时由 :func:`attach_url_credentials` 搬进 header。
+    """
     normalized = normalize_setup_url(url)
-    url_str = f"{normalized['scheme']}://{normalized['netloc']}{normalized['path']}"
+    url_str = (
+        f"{normalized['scheme']}://{normalized['userinfo']}{normalized['netloc']}"
+        f"{normalized['path']}"
+    )
     if normalized["query"]:
         url_str += "?" + urllib.parse.urlencode(normalized["query"])
     return url_str
@@ -109,16 +249,17 @@ def canonical_setup_url(url: str) -> str:
 def build_setup_request_url(url: str, params: dict) -> str:
     """基于环境 URL 构造带指定查询参数的 /v1/setup 请求 URL。
 
-    保留原 URL 中的鉴权类查询参数（如 token），剔除由 *params* 重新决定的
-    受管理参数（op / source / 三个版本基线），与后端 op=update 组装远端
-    delta 地址的规则一致。
+    保留原 URL 中的鉴权类查询参数（如 token）与 userinfo 凭据（凭据由
+    :func:`attach_url_credentials` 在拨号前搬进 header），剔除由 *params*
+    重新决定的受管理参数（op / source / 三个版本基线），与后端 op=update
+    组装远端 delta 地址的规则一致。
     """
     normalized = normalize_setup_url(url)
     query = list(normalized["query"])
     query.extend((key, str(value)) for key, value in params.items())
     return urllib.parse.urlunsplit((
         normalized["scheme"],
-        normalized["netloc"],
+        normalized["userinfo"] + normalized["netloc"],
         normalized["path"],
         urllib.parse.urlencode(query),
         "",

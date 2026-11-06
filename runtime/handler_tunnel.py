@@ -27,7 +27,7 @@ import urllib.parse
 import urllib.request
 from typing import Iterator, Optional
 
-from runtime.remote_env_manager import snapshot_from_hello
+from runtime.remote_env_manager import auth_headers, snapshot_from_hello
 from runtime.tunnel_protocol import (
     OP_HELLO,
     OP_REJECT,
@@ -509,14 +509,19 @@ class HandlerTunnelMixin:
         the parent, and the browser no longer holds the child's credential.
         """
         from runtime.remote_tool_proxy import child_endpoint
-        base, token = child_endpoint(record)
+        base, token, basic = child_endpoint(record)
         if not base:
             raise RuntimeError(f"remote environment has no direct URL: {record.get('id')}")
         url = base + child_path
         req_headers = {"User-Agent": "agent-service-env-proxy/1.0"}
         req_headers.update(headers)
-        if token and "Authorization" not in req_headers:
-            req_headers["Authorization"] = f"Bearer {token}"
+        if "Authorization" not in req_headers:
+            # A credential written inline in the registered URL
+            # (``https://user:pass@host:port/``) takes the single Authorization
+            # header ahead of the setup token: it is what gets the request
+            # through a password gateway in front of the child. The token then
+            # rides in its own header, so POSTs are authorized too.
+            req_headers.update(auth_headers(token, basic))
         req = urllib.request.Request(url, data=body, headers=req_headers,
                                      method=self.command)
 
@@ -638,7 +643,7 @@ class HandlerTunnelMixin:
                 raise EnvBridgeError(f"child tunnel handshake failed: {exc}") from exc
             return TunnelTransport(stream)
 
-        base, token = child_endpoint(record)
+        base, token, basic = child_endpoint(record)
         if base.startswith("https://"):
             ws_base = "wss://" + base[len("https://"):]
         elif base.startswith("http://"):
@@ -646,10 +651,12 @@ class HandlerTunnelMixin:
         else:
             raise EnvBridgeError(f"environment has no direct URL: {env_id}")
         headers = {"User-Agent": "agent-service-terminal/1.0"}
-        if token:
-            # Bearer rather than ?token=: the child accepts it on the upgrade
-            # and, unlike a query parameter, it never lands in an access log.
-            headers["Authorization"] = f"Bearer {token}"
+        # Bearer rather than ?token=: the child accepts it on the upgrade and,
+        # unlike a query parameter, it never lands in an access log. When the
+        # registered URL also carries a credential (a gateway in front of the
+        # child) that one takes the header and the token moves to its own
+        # header -- see remote_env_manager.auth_headers.
+        headers.update(auth_headers(token, basic))
         try:
             child = WSClient.connect(ws_base + "/v1/terminals/ws",
                                      timeout=self._MUX_ENV_DIAL_TIMEOUT,

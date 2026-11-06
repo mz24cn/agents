@@ -40,6 +40,7 @@ import urllib.request
 from typing import Optional
 
 from runtime.models import ToolConfig
+from runtime.remote_env_manager import auth_headers, strip_url_credentials, url_credentials
 
 logger = logging.getLogger("runtime.remote_tool_proxy")
 
@@ -66,18 +67,24 @@ _TOOL_CALL_FALLBACK_TIMEOUT = 3600.0
 PARENT_SIDE_TOOLS = frozenset({"talk_to", "delegate"})
 
 
-def child_endpoint(env_record: dict) -> tuple[str, str]:
-    """直连子环境的 ``(base URL, setup token)``。
+def child_endpoint(env_record: dict) -> tuple[str, str, str]:
+    """直连子环境的 ``(base URL, setup token, basic auth)``.
 
     登记在 remote_envs.json 里的 ``url`` 是 setup URL
     （``http://host:7988/deploy/v1/setup?token=as_xxx``）：服务 base 取
     ``/v1/setup`` 之前的部分（保留部署前缀），token 保留在查询参数里
-    （``st_`` / ``as_``）。隧道记录没有直连地址，返回 ``("", "")``。
+    （``st_`` / ``as_``）。
+
+    URL 里内联的凭据（``https://user:pass@host:port/`` 这种写法）**不进
+    base** —— ``http.client`` 会把带 userinfo 的 netloc 当主机名去解析，
+    根本连不上 —— 而是作为 ``Authorization: Basic`` 的值返回，由拨号方放进
+    请求头。隧道记录没有直连地址，返回 ``("", "", "")``。
     """
     env_url = str(env_record.get("url") or env_record.get("id") or "")
-    parsed = urllib.parse.urlsplit(env_url)
+    _user, _password, basic = url_credentials(env_url)
+    parsed = urllib.parse.urlsplit(strip_url_credentials(env_url))
     if not parsed.scheme or not parsed.netloc:
-        return "", ""
+        return "", "", ""
     # base = scheme://netloc + 部署前缀（/v1/setup 之前的路径）
     path = parsed.path or ""
     marker = "/v1/setup"
@@ -91,7 +98,7 @@ def child_endpoint(env_record: dict) -> tuple[str, str]:
         if key == "token":
             token = value
             break
-    return base, token
+    return base, token, basic
 
 
 class RemoteToolProxy:
@@ -118,8 +125,9 @@ class RemoteToolProxy:
             # No direct URL is used; _build_url returns the bare child path.
             self.base = ""
             self.token = ""
+            self.basic = ""
         else:
-            self.base, self.token = child_endpoint(env_record)
+            self.base, self.token, self.basic = child_endpoint(env_record)
 
         self._lock = threading.Lock()
         self._tools_cache: Optional[list[dict]] = None
@@ -162,8 +170,14 @@ class RemoteToolProxy:
         headers = {
             "User-Agent": "agent-service-remote-proxy/1.0",
         }
-        if bearer and self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
+        if bearer or self.basic:
+            # A GET already carries the setup token in its query string (see
+            # _build_url); POSTs need it as a credential. When the registered
+            # URL also carries an inline credential (written as
+            # ``https://user:pass@host:port/``) that one takes Authorization --
+            # it is what passes a password gateway in front of the child -- and
+            # the token rides in its own header (auth_headers).
+            headers.update(auth_headers(self.token if bearer else "", self.basic))
         if body is not None:
             headers["Content-Type"] = "application/json"
         if extra_headers:
