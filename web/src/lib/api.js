@@ -585,6 +585,11 @@ const FRAMES_CONN_KEY = 'agents_frames_conn'
 // pinning the POST connection forever.
 const FRAMES_HANDOFF_WAIT_MS = 2_000
 const FRAMES_SUBSCRIBE_RETRY_MS = 400
+// Upper bound on frames handed to the page but not yet acknowledged by it. A
+// page that cannot acknowledge (a batcher waiting for a paint a hidden tab will
+// never serve, a detached component) must not pin the resume cursor: every
+// reconnect would otherwise replay the whole generation from the stale cursor.
+const FRAMES_MAX_PENDING_APPLIES = 512
 
 /** Per-tab channel id: stable across reloads of the same tab. */
 function framesConnId() {
@@ -732,6 +737,17 @@ function framesApply(entry, seq, eventName, frame) {
   if (seq == null) return
   if (entry.onApplied) {
     entry.pendingApplications += 1
+    // The frames are already handed to the UI; only the cursor advance is
+    // outstanding. Release it on our own once too many pile up.
+    if (entry.pendingApplications >= FRAMES_MAX_PENDING_APPLIES) {
+      streamDebug('frames_cursor_released_unacknowledged', {
+        sessionId: entry.sessionId, seq, pending: entry.pendingApplications,
+      })
+      entry.reconnectAfterApplications = false
+      entry.pendingApplications = 0
+      entry.lastSeq = Math.max(entry.lastSeq, seq)
+      return
+    }
     let acknowledged = false
     entry.onApplied(() => {
       if (acknowledged) return

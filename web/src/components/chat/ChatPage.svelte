@@ -17,6 +17,7 @@
   import { buildFileJournalTurnKeyMap } from '../../lib/file-journals.js'
   import { restoreFileRefTags } from '../../lib/file-ref.js'
   import { mergeToolCallDeltas, startsNewToolCallRound } from '../../lib/stream-messages.js'
+  import { createStreamFrameBatcher as createSharedFrameBatcher } from '../../lib/stream-batcher.js'
   import AskUserDialog from './AskUserDialog.svelte'
   import {
     askUserRequest,
@@ -248,76 +249,14 @@
     } catch { /* diagnostics must never affect rendering */ }
   }
 
-  function canMergeStreamFrames(previous, next) {
-    if (!previous || !next || previous.role !== next.role) return false
-    // Sequence IDs are transport acknowledgements. Keep frames carrying them
-    // separate so the retained cursor can advance only after each frame has
-    // actually been applied to the UI.
-    if (previous.__streamSeq != null || next.__streamSeq != null) return false
-    if (next.role === 'assistant') {
-      return !previous.tool_calls && !next.tool_calls
-        && (previous.agent_id || previous.assistant_id || '') === (next.agent_id || next.assistant_id || '')
-    }
-    if (next.role === 'tool' && previous.streaming === true && next.streaming === true) {
-      return previous.name === next.name
-        && getToolUseId(previous) === getToolUseId(next)
-        && (previous.agent_id || '') === (next.agent_id || '')
-        && (previous.target_agent_id || '') === (next.target_agent_id || '')
-    }
-    return false
-  }
-
-  function mergeStreamFrame(previous, next) {
-    if (next.role === 'assistant') {
-      return {
-        ...previous,
-        ...next,
-        content: (previous.content || '') + (next.content || ''),
-        thinking: (previous.thinking || '') + (next.thinking || ''),
-      }
-    }
-    return {
-      ...previous,
-      ...next,
-      delta: (previous.delta || '') + (next.delta || ''),
-    }
-  }
-
   // Network readers can deliver thousands of one-character frames faster than
-  // Svelte/Markdown can render them. Apply at most once per animation frame so
-  // the browser remains responsive and commits one DOM update for each batch.
+  // Svelte/Markdown can render them, so frames are applied once per animation
+  // frame. The batching policy lives in lib/stream-batcher.js, including the
+  // hidden-tab case: requestAnimationFrame never fires in a background tab, and
+  // a rAF-only drain would freeze a conversation that is not on screen and then
+  // dump the whole generation at once when the user comes back to it.
   function createStreamFrameBatcher(onFrame) {
-    let queue = []
-    let scheduled = false
-    let afterDrain = []
-    const schedule = () => {
-      if (scheduled) return
-      scheduled = true
-      if (typeof requestAnimationFrame === 'function') requestAnimationFrame(flush)
-      else setTimeout(flush, 0)
-    }
-    const flush = () => {
-      scheduled = false
-      const pending = queue
-      queue = []
-      const merged = []
-      for (const frame of pending) {
-        const last = merged.at(-1)
-        if (canMergeStreamFrames(last, frame)) merged[merged.length - 1] = mergeStreamFrame(last, frame)
-        else merged.push(frame)
-      }
-      for (const frame of merged) onFrame(frame)
-      if (queue.length) schedule()
-      else {
-        const callbacks = afterDrain
-        afterDrain = []
-        for (const callback of callbacks) callback()
-      }
-    }
-    return {
-      push(frame) { queue.push(frame); schedule() },
-      then(callback) { afterDrain.push(callback); schedule() },
-    }
+    return createSharedFrameBatcher(onFrame, { toolUseId: (msg) => msg?.tool_use_id || null })
   }
 
   function markSessionDirectlyConsumed(sid) {

@@ -197,6 +197,33 @@ B 之后 starter POST 早已交接并释放，这一退订让 generation 的观�
 
 "活跃会话数增加而连接不增加"已成立；B 之后剩下的瓶颈是终端 WS（T）。
 
+### 第三个回归：后台会话看不到输出，切回来才"唰"地一大片
+
+症状：发完消息后推理确实在跑，但屏幕上什么都没有；切到别的会话（或抛出
+`Error: user interrupted.`）之后，忽然一次涌出大量输出。与连接数无关——帧确实到了
+浏览器，只是没有落地。
+
+链路：ChatPage 把流式帧合帧后再渲染，而调度只挂了 `requestAnimationFrame`。浏览器对
+**隐藏 tab 不执行 rAF 回调**，于是这条会话不在前台时：帧既不写进 store，`then()` 里的
+排空回调也不跑（那里才是在推进续传游标、结束流、`onStreamDone`），游标冻结在旧值 →
+每次重连/重新订阅都按旧游标把整代帧重放一遍 → 用户看到的就是一次性的"文字墙"。
+
+修法（都在前端）：
+
+- 合帧策略搬到 `web/src/lib/stream-batcher.js`：可见时按 rAF 合帧（每帧一次 DOM 提交），
+  不可见时退回 10Hz 定时排空 —— 合帧是为了别把 DOM 打爆，不是为了等一次 painting。
+  ChatPage 只留一个带 `tool_use_id` 访问器的薄封装。
+- `web/src/lib/api.js` 加 `FRAMES_MAX_PENDING_APPLIES = 512` 兜底：帧已经交给页面了，
+  只是页面没 ack；超过上限就自行推进游标，否则一次重连就要整段重放（实测去掉兜底后
+  重订阅的 `after` 退回 0，即从头重放整代）。
+
+回归：`web/src/lib/stream-batcher.test.js`（把旧的 rAF-only 调度塞回去会红 3 条）、
+`web/src/lib/api.test.js::releases the resume cursor when the page never acknowledges frames`。
+
+结论性提醒：§7.1 设想的"隐藏 tab 主动释放通道"**不要做**。它把一条还在推理的会话主动
+变成"无人观看"，正是前两个回归的形状；即便母端现在只在该 conn 的通道真消失时才取消
+（`tab_left`），隐藏期间的实时输出也照样丢了。
+
 ## 5. C 阶段（终端 WS 多路复用）—— 已落地
 
 `WS /v1/terminals/ws`：一个 tab 一条 socket 承载它打开的全部终端。

@@ -286,6 +286,33 @@ describe('subscribeSessionStream (shared frame channel)', () => {
     expect(resumed.at(-1).body.after).toBe(9)
   })
 
+  it('releases the resume cursor when the page never acknowledges frames', async () => {
+    vi.useFakeTimers()
+    const first = makeChannel()
+    const second = makeChannel()
+    const transport = framesTransport([first, second])
+    vi.stubGlobal('fetch', transport.fetch)
+
+    // A page that cannot flush its batcher (a hidden tab whose animation frames
+    // are frozen, or a detached component) never invokes the acknowledge
+    // callback. The frames were still delivered, so the cursor must not stay
+    // pinned at the old value: every reconnect would replay the whole
+    // generation, which is what made a backgrounded conversation look frozen.
+    subscribeSessionStream('session-a', vi.fn(), vi.fn(), vi.fn(), vi.fn(), -1, () => {})
+    await settle()
+    first.push(chanInit('t'))
+    first.push(subInit('session-a', 0))
+    for (let seq = 1; seq <= 600; seq++) first.push(chanFrame('session-a', seq, `x${seq}`))
+    for (let i = 0; i < 40; i++) await settle()
+    first.end()
+
+    await vi.advanceTimersByTimeAsync(1000)
+    await settle()
+
+    const resumed = transport.calls.commands.filter((c) => c.url === '/v1/sessions/frames/subscribe')
+    expect(resumed.at(-1).body.after).toBeGreaterThanOrEqual(512)
+  })
+
   it('closes the channel when the last watched session goes away', async () => {
     vi.useFakeTimers()
     const channel = makeChannel()
