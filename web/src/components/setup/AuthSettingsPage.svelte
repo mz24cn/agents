@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte'
-  import { auth, build, env, remoteEnv, tunnel, subscribeSessionEvents, remoteEnvHomeUrl, isRemoteLogoImage, resolveRemoteEnvLogo } from '../../lib/api.js'
+  import { auth, build, env, remoteEnv, tunnel, subscribeSessionEvents, remoteEnvHomeUrl, maskRemoteEnvUrl, isRemoteLogoImage, resolveRemoteEnvLogo } from '../../lib/api.js'
   import { copyToClipboard } from '../../lib/clipboard.js'
   import { t } from '../../lib/i18n.svelte.js'
 
@@ -979,7 +979,7 @@
                       {#if entry.id.startsWith('tunnel:') && !entry.url}
                         <span class="remote-env-address tunnel-address" title={t('tunnelEnvHint')}>🛰️ {entry.id}</span>
                       {:else}
-                        <a class="remote-env-address" href={remoteEnvHomeUrl(entry.url)} target="_blank" rel="noopener noreferrer" title={entry.url}>{entry.id}</a>
+                        <a class="remote-env-address" href={remoteEnvHomeUrl(entry.url)} target="_blank" rel="noopener noreferrer" title={maskRemoteEnvUrl(entry.url)}>{entry.id}</a>
                       {/if}
                       <span class="remote-env-app">
                         {#if isRemoteLogoImage(entry.app_logo)}
@@ -1041,6 +1041,7 @@
             </div>
           </div>
           <p>{t('tunnelConnDesc')}</p>
+          <p class="hint">{t('tunnelSourceHint')}</p>
           <div class="tunnel-conn-row">
             <input
               class="tunnel-conn-input"

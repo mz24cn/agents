@@ -1347,6 +1347,11 @@ export const remoteEnv = {
  */
 export function remoteEnvHomeUrl(url) {
   const u = new URL(String(url).trim())
+  // 凭据不进地址栏：登记的 URL 可能写成 https://user:password@host:27988/，
+  // 但打开首页是浏览器的事，把密码留在链接上只会让它出现在地址栏与历史里。
+  // 后端拨号时才需要这份凭据（作为 Basic 认证发送）。
+  u.username = ''
+  u.password = ''
   const marker = '/v1/setup'
   const idx = u.pathname.indexOf(marker)
   let base = idx === -1 ? '' : u.pathname.slice(0, idx)
@@ -1354,6 +1359,26 @@ export function remoteEnvHomeUrl(url) {
   u.pathname = base || '/'
   u.search = ''
   u.hash = ''
+  return u.toString()
+}
+
+/**
+ * 把环境 URL 里的密码遮成 ``***``（界面展示用；后端 ``mask_url_credentials``
+ * 的同款行为）。URL 不含凭据时原样返回，无法解析时同样原样返回。
+ *
+ * @param {string} url 登记的环境 URL（canonical_setup_url 形态）
+ */
+export function maskRemoteEnvUrl(url) {
+  const raw = String(url ?? '').trim()
+  if (!raw) return ''
+  let u
+  try {
+    u = new URL(raw)
+  } catch {
+    return raw
+  }
+  if (!u.username && !u.password) return raw
+  if (u.password) u.password = '***'
   return u.toString()
 }
 

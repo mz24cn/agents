@@ -3,7 +3,7 @@
  * Validates: Requirements 6.1–6.6, 4.1, 5.5, 5.6
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { env, sessions, inferStream, subscribeSessionStream, isSessionStreamWatched, subscribeSessionEvents, __resetSessionEventsHubForTests, __resetSessionFramesHubForTests, remoteEnv, remoteEnvHomeUrl, isRemoteLogoImage, resolveRemoteEnvLogo, tools, build } from './api.js'
+import { env, sessions, inferStream, subscribeSessionStream, isSessionStreamWatched, subscribeSessionEvents, __resetSessionEventsHubForTests, __resetSessionFramesHubForTests, remoteEnv, remoteEnvHomeUrl, maskRemoteEnvUrl, isRemoteLogoImage, resolveRemoteEnvLogo, tools, build } from './api.js'
 
 // ---------------------------------------------------------------------------
 // Helper: create a mock fetch that returns the given data with the given status
@@ -1004,6 +1004,31 @@ describe('remoteEnvHomeUrl', () => {
 
   it('rejects non-URL input', () => {
     expect(() => remoteEnvHomeUrl('not a url')).toThrow()
+  })
+
+  it('drops the credential: the password never reaches the address bar', () => {
+    // 登记的地址可以写成 https://user:password@host:27988/（凭据给后端拨号用），
+    // 但打开首页是浏览器的事 —— 链接里不能留密码（地址栏、历史、referer 都会泄露）
+    expect(remoteEnvHomeUrl('https://gw:secret@proxy.example.com:27988/v1/setup'))
+      .toBe('https://proxy.example.com:27988/')
+  })
+})
+
+describe('maskRemoteEnvUrl', () => {
+  it('masks the password, keeps the user for context', () => {
+    expect(maskRemoteEnvUrl('https://gw:secret@proxy.example.com:27988/v1/setup'))
+      .toBe('https://gw:***@proxy.example.com:27988/v1/setup')
+  })
+
+  it('returns credential-free URLs unchanged', () => {
+    expect(maskRemoteEnvUrl('http://172.28.70.13:7988/v1/setup?token=tok'))
+      .toBe('http://172.28.70.13:7988/v1/setup?token=tok')
+  })
+
+  it('tolerates empty and unparseable input', () => {
+    expect(maskRemoteEnvUrl('')).toBe('')
+    expect(maskRemoteEnvUrl(null)).toBe('')
+    expect(maskRemoteEnvUrl('not a url')).toBe('not a url')
   })
 })
 

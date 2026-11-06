@@ -136,7 +136,7 @@ const translations = {
     // 远程环境管理
     remoteEnvsTitle: '远程环境管理',
     remoteEnvsHint: '以当前环境为母环境管理其子环境：添加环境后，可并行检查各环境状态，或一键更新（由当前环境把增量直接推送到子环境，子环境无需能访问本环境地址）',
-    remoteEnvUrlPlaceholder: 'http://host:7988/ 或 http://host:7988/v1/setup?token=...',
+    remoteEnvUrlPlaceholder: 'http://host:7988/ 或 http://host:7988/v1/setup?token=... 或 https://user:password@host:7988/',
     remoteEnvAdd: '添加环境',
     remoteEnvAdding: '添加中...',
     remoteEnvCheckAll: '状态检查',
@@ -660,6 +660,7 @@ const translations = {
     // Tunnel（子端 → 母环境反向隧道）
     tunnelTitle: '隧道连接',
     tunnelConnDesc: '当前环境将作为子环境，主动向母环境建立隧道，并把自己注册进母环境的远程环境列表。适用于子环境无法被母环境直接访问（如处于内网、NAT 之后），但能访问到母环境地址的场景。',
+    tunnelSourceHint: '母环境地址支持四种写法：http://host:7988/、http://host:7988/v1/setup、http://host:7988/v1/setup?token=...，以及带凭据的 https://user:password@host:27988/（凭据作为 Basic 认证随每次请求发送，用于母环境前面那道需要密码的网关）',
     tunnelParent: '母环境',
     tunnelRegister: '注册到母环境',
     tunnelRegisterHint: '把本环境注册到母环境，地址保存为 SETUP_SOURCE 变量',
@@ -907,7 +908,7 @@ const translations = {
     // Remote environment management
     remoteEnvsTitle: 'Remote environment management',
     remoteEnvsHint: 'Manage child environments from this parent environment: after adding an environment, check their statuses in parallel, or update them in one click (the delta is pushed directly to each child — children do not need to reach this environment)',
-    remoteEnvUrlPlaceholder: 'http://host:7988/ or http://host:7988/v1/setup?token=...',
+    remoteEnvUrlPlaceholder: 'http://host:7988/ or http://host:7988/v1/setup?token=... or https://user:password@host:7988/',
     remoteEnvAdd: 'Add environment',
     remoteEnvAdding: 'Adding...',
     remoteEnvCheckAll: 'Status check',
@@ -1432,6 +1433,7 @@ const translations = {
     // Tunnel (child -> parent reverse tunnel)
     tunnelTitle: 'Tunnel Connection',
     tunnelConnDesc: 'This environment acts as the child: it dials out to the parent and registers itself in the parent\'s remote environment list. Useful when the parent cannot reach this environment directly (e.g. it is behind a NAT or firewall) but can reach the parent\'s address.',
+    tunnelSourceHint: 'The parent address accepts four forms: http://host:7988/, http://host:7988/v1/setup, http://host:7988/v1/setup?token=..., or one with credentials such as https://user:password@host:27988/ (the credential travels as Basic authentication on every request, for a password gateway in front of the parent)',
     tunnelParent: 'Parent',
     tunnelRegister: 'Register to parent',
     tunnelRegisterHint: 'Register this environment to its parent; the address is stored as the SETUP_SOURCE variable',
