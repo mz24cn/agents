@@ -56,6 +56,7 @@ from runtime.server_state import (
     publish_session_stream_frame,
     queue_infer_interjection,
     request_pause_infer,
+    seed_paused_status,
     set_session_stream_agents,
     stream_batch_is_protocol_complete,
     StreamUsageEstimator,
@@ -587,6 +588,7 @@ class HandlerInferMixin:
 
         # === Retry / resume validation ===
         continued_user_message_timestamp = None
+        resume_context: Optional[list] = None
         if is_continue or is_resume:
             if raw_session_id in (None, "new"):
                 self._send_json_error(400, "continue/resume requires an existing session_id")
@@ -614,7 +616,31 @@ class HandlerInferMixin:
                         "or the session was already resumed",
                     )
                     return None
-            if len(agent_ids) > 1 and not retry_agent_id:
+                # M3: consume the pause sidecar. Its context snapshot carries
+                # the transient loop state that was never persisted as such
+                # (skill-disclosure frames, the in-loop compression rebuild,
+                # boundary-injected turns); the resume continues from exactly
+                # that list. The file is deleted on consumption, so a later
+                # restart cannot resurrect a stale paused marker.
+                pause_state = context_manager.read_pause_state(session_id)
+                if pause_state is not None:
+                    context_manager.clear_pause_state(session_id)
+                    snapshot = pause_state.get("context") or []
+                    if snapshot:
+                        resume_context = snapshot
+                        body["_resume_sidecar_used"] = True
+                    pending_ids = pause_state.get("pending_agent_ids")
+                    if isinstance(pending_ids, list) and pending_ids:
+                        body["_resume_pending_agent_ids"] = [
+                            str(a) for a in pending_ids
+                            if isinstance(a, str) and a
+                        ]
+                    logger.info(
+                        "resume: consumed pause sidecar for session %s "
+                        "(paused_at=%s, context_turns=%d)",
+                        session_id, pause_state.get("paused_at"), len(snapshot),
+                    )
+            if not is_resume and len(agent_ids) > 1 and not retry_agent_id:
                 self._send_json_error(400, "group-chat retry requires retry_agent_id")
                 return None
             if not retry_agent_id and not body.get("model_id"):
@@ -677,6 +703,17 @@ class HandlerInferMixin:
                     session_id, agent_ids,
                     body.get("model_id"), body.get("tool_ids"),
                 )
+            if is_resume and is_group_chat:
+                # Group resume: replay exactly the wave the pause cut off.
+                # The pause sidecar recorded which agents were about to be
+                # dispatched; without it (or if the roster changed) the
+                # regular mention routing of this request decides instead.
+                replay = [
+                    a for a in (body.get("_resume_pending_agent_ids") or [])
+                    if a in agent_ids
+                ]
+                if replay:
+                    mentioned_agent_ids = replay
 
         # 载入的文件实体（<file>）一律展开：本地会话按本地工作区解析；远程会话的
         # 文件在子端（粘贴上传写的是子端 /tmp 或子端工作区），母端本地没有这些
@@ -728,13 +765,21 @@ class HandlerInferMixin:
 
         assembled_messages = original_messages
         if use_session and session_id is not None:
-            try:
-                new_msgs_dicts = [m.to_dict() for m in original_messages] if original_messages else []
-                assembled_dicts = context_manager.assemble_context(session_id, new_msgs_dicts)
-                assembled_messages = [Message.from_dict(m) for m in assembled_dicts]
-            except OSError as exc:
-                self._send_json_error(500, f"Failed to assemble context: {exc}")
-                return None
+            if is_resume and resume_context:
+                # The paused generation continues from its exact in-flight
+                # context; re-assembling from disk would drop the transient
+                # frames the sidecar exists to preserve.
+                assembled_messages = [
+                    Message.from_dict(m) for m in resume_context if isinstance(m, dict)
+                ]
+            else:
+                try:
+                    new_msgs_dicts = [m.to_dict() for m in original_messages] if original_messages else []
+                    assembled_dicts = context_manager.assemble_context(session_id, new_msgs_dicts)
+                    assembled_messages = [Message.from_dict(m) for m in assembled_dicts]
+                except OSError as exc:
+                    self._send_json_error(500, f"Failed to assemble context: {exc}")
+                    return None
 
         # Render request-scoped AGENTS/TOOLS values on an inference-only copy.
         # The unmodified messages remain suitable for conversation persistence.
@@ -1222,6 +1267,11 @@ class HandlerInferMixin:
         }
         if session_id is not None:
             begin_session_stream(session_id, cancel_event)
+            if _body.get("resume") is not True:
+                # Any generation other than a resume supersedes the paused
+                # resting state; its sidecar would be stale context (and a
+                # stale durable paused-marker) for any later resume.
+                context_manager.clear_pause_state(session_id)
             set_session_stream_agents(session_id, cancel_event, agent_ids)
             # Continue has already removed the persisted final assistant turn.
             # Retain a control frame before status broadcast so every other
@@ -1427,13 +1477,13 @@ class HandlerInferMixin:
                         session_id, exc,
                     )
 
-            # === Soft-pause gate (single-agent only in phase 1) ===
+            # === Soft-pause gate ===
             # Checked by the tool loop at round boundaries: after a pause is
             # requested (POST /v1/infer/abort {action: "pause"}), the generator
             # stops before the next model API call. The conversation persisted
             # so far is complete, so a later resume continues from it exactly
-            # like a normal next round. Group chat has its own thread model and
-            # is intentionally not pauseable yet.
+            # like a normal next round. Group chat answers the same contract at
+            # its wave boundary instead (see _group_boundary_gate below).
             def _pause_gate() -> Optional[dict]:
                 if session_id is None:
                     return None
@@ -1453,11 +1503,20 @@ class HandlerInferMixin:
                     return True
                 return try_close_infer_loop(session_id, cancel_event)
 
-            # Group-chat interjection gate: consumed at every wave boundary
+            # Group-chat boundary gates, both consumed at every wave boundary
             # (previous wave fully settled, next wave not yet dispatched).
-            # Interjections only join the shared transcript; group pause is
-            # intentionally not implemented, so this gate never touches the
-            # pause flag (take_infer_interjections is interjection-only).
+            # boundary_gate implements the single-agent round-boundary
+            # contract: interjections join the shared transcript AND a soft
+            # pause ends the generation before the next wave is dispatched
+            # (coarse group semantics — the running wave always finishes
+            # first). interject_gate stays interjection-only and drives the
+            # trailing acceptance after the wave loop, where a pause must
+            # never be honoured (natural completion wins the race).
+            def _group_boundary_gate() -> Optional[dict]:
+                if session_id is None:
+                    return None
+                return take_infer_boundary_action(session_id, cancel_event)
+
             def _group_interject_gate() -> list:
                 if session_id is None:
                     return []
@@ -1476,8 +1535,21 @@ class HandlerInferMixin:
                 return True
 
             # === 统一消息源 ===
+            # Transient snapshot captured by the tool loop when it ends at a
+            # pause boundary (see Runtime.infer_stream.exit_state); persisted
+            # as the session's resume_state.json sidecar at finalization.
+            pause_exit_state: dict = {}
             if is_group_chat:
                 from runtime.group_chat import run_group_chat_stream_gen
+                # Resume of a soft-paused group generation: the sidecar
+                # snapshot already IS the shared transcript (request.messages
+                # was built from it), and the wave the pause cut off is
+                # replayed via mentioned_agent_ids (set in _prepare).
+                _group_initial_turns = (
+                    list(request.messages or [])
+                    if _body.get("resume") is True and _body.get("_resume_sidecar_used")
+                    else None
+                )
                 msg_gen = run_group_chat_stream_gen(
                     runtime=runtime,
                     mentioned_agent_ids=mentioned_agent_ids,
@@ -1503,7 +1575,10 @@ class HandlerInferMixin:
                         ) if session_id is not None else None
                     ),
                     interject_gate=_group_interject_gate,
+                    boundary_gate=_group_boundary_gate,
                     close_gate=_group_close_gate,
+                    exit_state=pause_exit_state,
+                    initial_turns=_group_initial_turns,
                 )
             else:
                 msg_gen = runtime.infer_stream(
@@ -1516,6 +1591,7 @@ class HandlerInferMixin:
                         context_compressor.ensure_within_budget
                         if context_compressor is not None else None
                     ),
+                    exit_state=pause_exit_state,
                 )
 
             for msg in msg_gen:
@@ -1646,6 +1722,39 @@ class HandlerInferMixin:
                 if persist_exc is not None:
                     logger.error("infer_stream: failed to save conversation for session %s: %s", session_id, persist_exc)
 
+            if (
+                paused_exit
+                and use_session
+                and session_id is not None
+                and self._is_active_stream(session_id, cancel_event)
+            ):
+                # M3: make the resting pause durable. The sidecar is both the
+                # marker the server re-seeds into the status registry after a
+                # restart and the transient-context snapshot a resume keeps.
+                try:
+                    from runtime.common import now_iso as _pause_now_iso
+                    context_manager.write_pause_state(session_id, {
+                        "version": context_manager.PAUSE_STATE_VERSION,
+                        "kind": "infer_pause",
+                        "session_id": session_id,
+                        "paused_at": _pause_now_iso(),
+                        "model_id": model_id or "",
+                        "agent_ids": list(agent_ids or []),
+                        "tool_ids": list(tool_ids or []),
+                        # Group pause only: the wave that was about to be
+                        # dispatched. A resume replays it verbatim instead of
+                        # re-routing mentions it has no way to reconstruct.
+                        "pending_agent_ids": list(
+                            pause_exit_state.get("pending_agent_ids") or []
+                        ),
+                        "context": pause_exit_state.get("messages") or [],
+                    })
+                except OSError as exc:
+                    logger.error(
+                        "infer_stream: failed to write pause sidecar for session %s: %s",
+                        session_id, exc,
+                    )
+
             # --- Session Status Stream: broadcast the terminal outcome ---
             if session_id is not None:
                 if paused_exit:
@@ -1723,6 +1832,43 @@ class HandlerInferMixin:
             return True
         return active_infers.get(session_id) is cancel_event
 
+    def _recognize_pause_from_disk(self, session_id: str) -> bool:
+        """惰性识别跨重启的暂停（替代启动全量扫描）。
+
+        resume_state.json sidecar 只在会话**被使用时**逐点检查：UI 打开会话
+        （pause-status）、end 收敛（abort action=end）、恢复（resume 直接读
+        sidecar）。发现有效 sidecar 就把内存中的 paused 状态种回来，▶ 按钮 /
+        侧边栏标记 / end 收敛在升级 agentsvc 后行为不变。
+        """
+        if not session_id:
+            return False
+        cm = getattr(self.server, "context_manager", None)
+        if cm is None:
+            return False
+        try:
+            sidecar = cm.read_pause_state(session_id)
+        except Exception:
+            return False
+        if not sidecar:
+            return False
+        return seed_paused_status(session_id, sidecar.get("agent_ids") or [])
+
+    def _handle_infer_pause_status(self) -> None:
+        """GET /v1/infer/pause-status?session_id=... — 单会话 paused 检查。
+
+        浏览器打开会话时调用，用于识别跨越 agentsvc 重启的暂停；代价是每
+        次 O(1) 的单文件读取，与服务里有多少会话无关。副作用：把内存 paused
+        状态种回并广播（与天然暂停收尾同一条事件通道）。
+        """
+        qs = urllib.parse.urlparse(self.path).query
+        params = urllib.parse.parse_qs(qs)
+        session_id = (params.get("session_id") or [""])[0]
+        if not session_id:
+            self._send_json_error(400, "Missing required query param: session_id")
+            return
+        paused = self._recognize_pause_from_disk(session_id)
+        self._send_json_response(200, {"session_id": session_id, "paused": paused})
+
     def _handle_infer_abort(self) -> None:
         """POST /v1/infer/abort — 主动中止/暂停指定会话的流式推理。
 
@@ -1760,7 +1906,15 @@ class HandlerInferMixin:
             # 结束被暂停的会话：不恢复、不新增任何轮次，把 resting 的 paused 状态
             # 正式收敛为 done_success_unread（历史在暂停点已完整落盘）。会话正在
             # 推理或状态并非 paused 时是 no-op（幂等）。
+            # 重启后内存状态为空：先用 sidecar 惰性识别（O(1) 单文件），再收敛。
+            self._recognize_pause_from_disk(session_id)
             ended = end_paused_session_status(session_id)
+            # Abandoning the pause also discards the durable sidecar; keeping
+            # it would let a later restart resurrect the paused marker.
+            try:
+                self.server.context_manager.clear_pause_state(session_id)  # type: ignore[attr-defined]
+            except Exception:
+                pass
             self._send_json_response(200, {"ok": True, "action": "end", "ended": ended})
             return
 

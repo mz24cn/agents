@@ -1625,6 +1625,75 @@ class ContextManager:
         return existed
 
     # ------------------------------------------------------------------
+    # Pause sidecar (resume_state.json)
+    # ------------------------------------------------------------------
+    # A soft pause ends the inference generation at a completed round
+    # boundary. conversation.json is already complete at that point, but the
+    # loop also carries transient context that is never persisted as such:
+    # skill-disclosure frames, the in-flight list rebuilt by in-loop context
+    # compression, user messages injected at a boundary. The sidecar snapshots
+    # that list so a paused session survives an agentsvc restart with full
+    # fidelity: its mere existence is also the durable "paused" marker the
+    # server re-seeds into _session_statuses at startup. A resume restores the
+    # snapshot and deletes the file immediately; any other new generation (or
+    # ending the pause) discards it as stale.
+
+    PAUSE_STATE_FILENAME = "resume_state.json"
+    PAUSE_STATE_VERSION = 1
+
+    def pause_state_path(self, session_id: str) -> str:
+        return os.path.join(self._chats_dir, session_id, self.PAUSE_STATE_FILENAME)
+
+    def write_pause_state(self, session_id: str, state: dict) -> None:
+        """Atomically persist the pause sidecar for *session_id*."""
+        path = self.pause_state_path(session_id)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+            f.flush()
+        os.replace(tmp, path)
+
+    def read_pause_state(self, session_id: str) -> Optional[dict]:
+        """Return the validated pause sidecar, or None when absent/corrupt.
+
+        A corrupt or mismatched file is removed: it can only come from a
+        crashed write or a session-id mix-up, and keeping it would pin the
+        session to a "paused" marker whose snapshot cannot be trusted.
+        """
+        path = self.pause_state_path(session_id)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                state = json.load(f)
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError):
+            self.clear_pause_state(session_id)
+            return None
+        if (
+            not isinstance(state, dict)
+            or state.get("version") != self.PAUSE_STATE_VERSION
+            or state.get("session_id") != session_id
+            or not isinstance(state.get("context"), list)
+        ):
+            logging.getLogger(__name__).warning(
+                "discarding invalid pause sidecar for session %s", session_id,
+            )
+            self.clear_pause_state(session_id)
+            return None
+        return state
+
+    def clear_pause_state(self, session_id: str) -> bool:
+        """Delete the pause sidecar if present. Returns True when one was removed."""
+        try:
+            os.remove(self.pause_state_path(session_id))
+            return True
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return False
+
+    # ------------------------------------------------------------------
     # Conversation file I/O
     # ------------------------------------------------------------------
 

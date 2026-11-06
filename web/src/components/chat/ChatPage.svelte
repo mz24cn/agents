@@ -1,7 +1,7 @@
 <script>
   import { onMount, onDestroy, setContext, untrack } from 'svelte'
   import { writable } from 'svelte/store'
-  import { inferStream, abortInferStream, interjectInfer, subscribeSessionEvents, subscribeSessionStream, isSessionStreamWatched, agents as agentsApi, sessions as sessionsApi, remoteEnv as remoteEnvApi } from '../../lib/api.js'
+  import { inferStream, abortInferStream, interjectInfer, getPauseStatus, subscribeSessionEvents, subscribeSessionStream, isSessionStreamWatched, agents as agentsApi, sessions as sessionsApi, remoteEnv as remoteEnvApi } from '../../lib/api.js'
   import { catalog, loadAgents, loadTools, loadEnvVars, refreshAgents } from '../../lib/catalog-state.svelte.js'
   import ModelSelector from './ModelSelector.svelte'
   import ToolSelector from './ToolSelector.svelte'
@@ -451,6 +451,21 @@
   let isStreaming = $derived(sessionStore[storeKey(sessionId)]?.isStreaming ?? false)
   let isPaused = $derived(!!sessionId && backendPausedSessions.has(sessionId))
   let pauseRequested = $derived(!!sessionId && pauseRequestedSessions.has(sessionId))
+
+  // 跨重启的暂停惰性识别：打开会话且本地没有流式进行中时，向后端查一次这
+  // 个会话的 resume_state.json sidecar（O(1) 单文件，与服务里的会话总数无
+  // 关）。升级 agentsvc 后，暂停在重启前的会话被打开时依旧显示 ▶ 可恢复；
+  // 后端同时会把 paused 状态种回内存并广播，侧边栏标记随事件补齐。
+  $effect(() => {
+    const sid = sessionId
+    if (!sid || isStreaming) return
+    if (backendPausedSessions.has(sid) || pauseRequestedSessions.has(sid)) return
+    void (async () => {
+      try {
+        if (await getPauseStatus(sid)) markPaused(sid, true)
+      } catch { /* 旧后端/网络异常：按空闲会话处理 */ }
+    })()
+  })
   let collapsedGroups = $derived(sessionStore[storeKey(sessionId)]?.collapsedGroups ?? new Set())
 
   let isGroupChat = $derived(selectedAgentIds.length > 1)
@@ -2789,7 +2804,7 @@
     onInterject={handleInterject}
     {isPaused}
     {pauseRequested}
-    canPause={selectedAgentIds.length <= 1}
+    canPause={true}
     onToggleTemplatePanel={toggleTemplatePanel}
     onToggleWorkspacePanel={toggleWorkspacePanel}
     bind:workspacePanelOpen

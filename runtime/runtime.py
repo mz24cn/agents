@@ -3115,6 +3115,7 @@ class Runtime:
         pause_gate: Optional[Callable[[], Optional[dict]]] = None,
         close_gate: Optional[Callable[[], bool]] = None,
         on_context_overflow: Optional[Callable] = None,
+        exit_state: Optional[dict] = None,
     ) -> Iterator[Message]:
         """Streaming inference with full tool call loop and Skill progressive disclosure.
 
@@ -3175,6 +3176,14 @@ class Runtime:
                 a later one is refused by the endpoint (and re-sent as a normal
                 turn) instead of being buffered past the last boundary.  ``None``
                 (no session-scoped control) ends the loop as before.
+            exit_state: Optional caller-owned dict.  When the loop ends at a
+                *pause* boundary (``pause_gate`` returned ``stop``), it records
+                ``"messages"``: the loop's in-flight message list as plain
+                dicts — the exact context the next model round would have been
+                sent, including skill-disclosure frames, the list rebuilt by
+                in-loop context compression, and boundary-injected user
+                messages.  The handler persists it as the session's pause
+                sidecar so a soft pause survives a server restart (M3).
 
         Yields:
             Message objects incrementally.
@@ -3270,6 +3279,18 @@ class Runtime:
                         messages.append(injected)
                         yield injected
                     if boundary.get("stop"):
+                        if exit_state is not None:
+                            # Snapshot the exact context the *next* round would
+                            # have sent, so a later resume (possibly after a
+                            # server restart) continues from the same in-flight
+                            # list instead of re-deriving it.
+                            try:
+                                exit_state["messages"] = [
+                                    m.to_dict() if hasattr(m, "to_dict") else m
+                                    for m in messages
+                                ]
+                            except Exception:
+                                exit_state["messages"] = []
                         return
 
             # Dynamically throttle very long/fast tool-call loops before the

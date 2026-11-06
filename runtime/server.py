@@ -605,6 +605,9 @@ class RuntimeHTTPServer:
         # 恢复持久化的飞行模式设定：重启后老的飞行模式会话继续对话时
         # 仍保持飞行模式（无浏览器连接也允许推理继续）。
         load_flight_sessions(self._session_manager.flight_sessions())
+        # 软暂停的跨重启识别是**惰性**的：不在启动时扫描全部会话目录，
+        # 而是在会话被打开/使用时逐点检查 resume_state.json sidecar
+        # （见 handler_infer._recognize_pause_from_disk）。
 
     def _prepare_server(
         self,

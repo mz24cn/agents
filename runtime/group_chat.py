@@ -828,7 +828,10 @@ def run_group_chat_stream_gen(
     session_ready: Optional[Callable[[], bool]] = None,
     max_rounds: int = 5,
     interject_gate=None,
+    boundary_gate=None,
     close_gate=None,
+    exit_state: Optional[dict] = None,
+    initial_turns: Optional[list] = None,
 ) -> Generator[Message, None, None]:
     """Group-chat inference as a generator of Messages.
 
@@ -846,6 +849,25 @@ def run_group_chat_stream_gen(
             caller, so they are not duplicated through this callback.
         sse_heartbeat: Optional zero-argument callback emitting an SSE
             keep-alive comment frame while waiting on slow agents.
+        interject_gate: Optional zero-argument callback returning a list of
+            queued user-message dicts. Consumed at every wave boundary and
+            once more after the wave loop ends (trailing acceptance).
+        boundary_gate: Optional zero-argument callback implementing the full
+            round-boundary contract of the single-agent pause gate: returns
+            ``None`` or ``{"append": [message dicts], "stop": bool}``. Used
+            at the top of the wave loop in place of ``interject_gate`` when
+            present; a ``stop`` ends this generation cleanly at the wave
+            boundary (soft pause, coarse-grained by design: the wave already
+            running completes first because group agents share no single
+            round boundary).
+        exit_state: Optional dict filled when the generation ends at a pause
+            boundary: ``messages`` carries the shared-transcript snapshot and
+            ``pending_agent_ids`` the wave that was about to be dispatched —
+            exactly what a resume must replay.
+        initial_turns: Optional pre-built shared transcript (the sidecar
+            snapshot of a soft-paused group generation). When present it
+            replaces the conversation.json load; disk windowing must not
+            rewrite history that the pause already froze.
 
     Yields:
         Message objects tagged with ``agent_id`` and ``name``.
@@ -867,7 +889,10 @@ def run_group_chat_stream_gen(
         session_ready=session_ready,
         max_rounds=max_rounds,
         interject_gate=interject_gate,
+        boundary_gate=boundary_gate,
         close_gate=close_gate,
+        exit_state=exit_state,
+        initial_turns=initial_turns,
     )
 
 
@@ -894,7 +919,10 @@ def _run_group_chat_stream_gen(
     session_ready: Optional[Callable[[], bool]] = None,
     max_rounds: int = 5,
     interject_gate=None,
+    boundary_gate=None,
     close_gate=None,
+    exit_state: Optional[dict] = None,
+    initial_turns: Optional[list] = None,
 ) -> Generator[Message, None, None]:
     """Execute group chat inference as a generator of Messages.
 
@@ -917,11 +945,19 @@ def _run_group_chat_stream_gen(
     existing_turns = []
     summary_text: str = ""
     memory_entries: list = []
+    if initial_turns is not None:
+        # Resume of a soft-paused group generation: the sidecar snapshot
+        # IS this generator's frozen working transcript (boundary
+        # injections and other transient frames may never have been
+        # persisted separately). Take it verbatim — windowing a fresh
+        # disk load would rewrite history the pause already committed to.
+        existing_turns = list(initial_turns)
     if session_id:
-        try:
-            existing_turns = context_manager.load_conversation(session_id)
-        except (FileNotFoundError, ValueError):
-            pass
+        if initial_turns is None:
+            try:
+                existing_turns = context_manager.load_conversation(session_id)
+            except (FileNotFoundError, ValueError):
+                pass
 
         # Rolling summary & structured memory (context compression)
         summary_text, summary_fm = context_manager.get_summary(session_id)
@@ -935,9 +971,10 @@ def _run_group_chat_stream_gen(
             # "K = 10" back to the previous user message and re-sent 96 turns /
             # 711 996 characters -- 84 of them already inside the summary it was
             # also sending -- to a model with a 196 608-token window.
-            existing_turns = context_manager.select_unsummarized_turns(
-                existing_turns, summary_fm,
-            )
+            if initial_turns is None:
+                existing_turns = context_manager.select_unsummarized_turns(
+                    existing_turns, summary_fm,
+                )
 
     # Frames handed to the round queue are only persisted after the drain
     # loop has yielded them, so a context rebuild from disk has to wait for
@@ -973,7 +1010,10 @@ def _run_group_chat_stream_gen(
     # completed round builds a fresh dict for the following round.
     trigger_msgs: dict[str, list[Message]] = {}
 
-    def _drain_interjections():
+    # Soft-pause latch, refreshed by every top-of-loop boundary drain.
+    boundary_stop = False
+
+    def _drain_interjections(gate=None):
         """Buffered user interjections, as Messages, at a wave boundary.
 
         Coarse-grained by design: an interjection queued while this generation
@@ -983,10 +1023,26 @@ def _run_group_chat_stream_gen(
         observe it; every later turn sees it via assemble_agent_context.
         Interjections only change context, they never schedule agents: wave
         membership stays driven by @-mentions alone.
+
+        The gate may return a plain list of queued message dicts (interjection
+        only — the trailing drain after the wave loop must never honour a
+        pause: the generation already finished on its own) or the full
+        boundary-action dict ``{"append": [...], "stop": bool}`` (soft pause
+        honoured at the wave boundary, the coarse group analogue of the
+        single-agent round boundary).
         """
-        if interject_gate is None:
+        nonlocal boundary_stop
+        if gate is None:
             return
-        for item in interject_gate():
+        action = gate()
+        if action is None:
+            return
+        if isinstance(action, dict):
+            items = action.get("append") or []
+            boundary_stop = bool(action.get("stop"))
+        else:
+            items = action
+        for item in items:
             if not isinstance(item, dict):
                 continue
             interjection = Message.from_dict(dict(item))
@@ -998,8 +1054,33 @@ def _run_group_chat_stream_gen(
             yield interjection
 
     while pending_mentioned and round_num < max_rounds:
-        # --- User interjections (wave boundary) ---
-        yield from _drain_interjections()
+        # --- User interjections / soft pause (wave boundary) ---
+        boundary_stop = False
+        yield from _drain_interjections(boundary_gate or interject_gate)
+        if boundary_stop:
+            # Soft pause at a wave boundary: the previous wave fully settled
+            # and was incrementally persisted, the next one is not dispatched,
+            # no "Error: user interrupted" turn is written. Export exactly
+            # what a resume must restore: the frozen shared transcript and
+            # the wave that was about to run. Every worker has settled at
+            # this point, so reading existing_turns is race-free here. Turns
+            # arrive in three shapes (disk-loaded ConversationTurn, merged
+            # round dicts, injected Messages) — normalize through
+            # _message_from_turn, the same helper the per-agent replay uses;
+            # ``dict(turn)`` would choke on ConversationTurn (no to_dict).
+            # (The handler persists this as the session's resume_state.json
+            # sidecar and broadcasts the resting "paused" status; no title
+            # update on this path.)
+            if exit_state is not None:
+                try:
+                    exit_state["messages"] = [
+                        _message_from_turn(m).to_dict()
+                        for m in existing_turns
+                    ]
+                except Exception:
+                    exit_state["messages"] = []
+                exit_state["pending_agent_ids"] = list(pending_mentioned)
+            return
         round_num += 1
         current_trigger_msgs = trigger_msgs
         next_trigger_msgs: dict[str, list[Message]] = {}
@@ -1444,6 +1525,11 @@ def _run_group_chat_stream_gen(
     # becomes a real user turn that every later turn sees — never dropped.
     if close_gate is not None:
         close_gate()
-    yield from _drain_interjections()
+    # Trailing acceptance: interjections only. A pause requested from here on
+    # must not be honoured — the wave loop already ended on its own, so the
+    # generation is a natural completion, not a resting pause (same race
+    # decision as the single-agent path). The handler gate (interject_gate) is
+    # interjection-only; the boundary gate is never called here.
+    yield from _drain_interjections(interject_gate)
 
     # No additional yield needed; the queue already yielded everything.

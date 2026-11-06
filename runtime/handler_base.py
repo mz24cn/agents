@@ -214,6 +214,9 @@ _ROUTES: dict[str, list] = {
         # *background* session's bindings before it opens that session's terminal.
         (re.compile(r"^/v1/sessions/([^/]+)/meta$"), "_handle_session_meta", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/sessions/([^/]+)$"), "_handle_get_session", ()),
+        # Lazy paused recognition for a single session (survives an agentsvc
+        # restart without any startup scan of all session directories).
+        (re.compile(r"^/v1/infer/pause-status$"), "_handle_infer_pause_status", ()),
         (re.compile(r"^/v1/agents$"), "_handle_list_agents", ()),
         (re.compile(r"^/v1/agents/([^/]+)$"), "_handle_get_agent", ()),
         (re.compile(r"^/v1/workspace/list$"), "_handle_workspace_list", ()),

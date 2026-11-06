@@ -471,6 +471,24 @@ export async function pauseInferStream(sessionId) {
 }
 
 /**
+ * Lazily check whether a session rests in a soft pause that survived an
+ * agentsvc restart (GET /v1/infer/pause-status). The backend inspects only
+ * this session's resume_state.json sidecar — O(1), independent of how many
+ * sessions exist — and re-arms the in-memory "paused" status (broadcasting
+ * it) when found. Call when opening a session with no active local stream.
+ * @returns {Promise<boolean>}
+ */
+export async function getPauseStatus(sessionId) {
+  try {
+    const res = await apiFetch(`/v1/infer/pause-status?session_id=${encodeURIComponent(sessionId)}`)
+    const data = await res.json()
+    return data?.paused === true
+  } catch {
+    return false
+  }
+}
+
+/**
  * Queue a user message into the currently running inference generation
  * (POST /v1/infer/interject). The backend appends it at the next round
  * boundary (after all tool calls of the current round completed) and the

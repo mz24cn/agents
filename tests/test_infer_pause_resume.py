@@ -16,6 +16,7 @@ Covers the three layers introduced together:
 
 import io
 import json
+import os
 import threading
 import urllib.request
 from types import SimpleNamespace
@@ -702,8 +703,10 @@ def test_group_chat_gate_consumes_interjections_only():
 
     taken = server_state.take_infer_interjections("s2", cancel_event)
     assert [m["content"] for m in taken] == ["q"]
-    # Pause flag untouched: the group path never honours it, but taking
-    # interjections must not silently clear it either.
+    # Pause flag untouched: the interjection-only trailing drain never
+    # honours it (the wave loop already ended on its own), but consuming
+    # interjections must not silently clear it either — the boundary gate
+    # (take_infer_boundary_action) is what honours group pause mid-run.
     action = server_state.take_infer_boundary_action("s2", cancel_event)
     assert action is not None and action["stop"] is True and action["append"] == []
     # Nothing buffered a second time.
@@ -826,6 +829,212 @@ def test_group_chat_interjection_injected_at_wave_boundary():
         m.get("role") == "user" and "插一句" in (m.get("content") or "")
         for m in second_dicts
     )
+
+
+def test_group_chat_pause_stops_at_wave_boundary():
+    """Coarse group pause: a boundary action with stop=True ends the
+    generation after the settled wave, WITHOUT dispatching the next wave —
+    and exports exactly what a resume needs (transcript + pending wave)."""
+    manager = _GroupStubAgentManager(_GROUP_AGENTS)
+    runtime = _GroupScriptRuntime(["@ShaWuJing 你怎么看", "绝不该被执行"])
+
+    calls = {"n": 0}
+
+    def boundary_gate():
+        calls["n"] += 1
+        if calls["n"] == 2:  # wave 1 settled, wave 2 not dispatched yet
+            return {
+                "append": [{
+                    "role": "user", "content": "暂停前的插话",
+                    "timestamp": "2026-01-01T00:00:01",
+                }],
+                "stop": True,
+            }
+        return None
+
+    exit_state: dict = {}
+    set_request_context(
+        agent_manager=manager,
+        all_agent_ids=[a["agent_id"] for a in _GROUP_AGENTS],
+    )
+    try:
+        out = list(run_group_chat_stream_gen(
+            runtime=runtime,
+            mentioned_agent_ids=["SunWuKong"],
+            all_agent_ids=[a["agent_id"] for a in _GROUP_AGENTS],
+            original_messages=[Message(role="user", content="@SunWuKong 开始")],
+            base_request=InferenceRequest(model_id="m1", messages=[]),
+            cancel_event=None,
+            context_manager=None,
+            session_id=None,
+            agent_manager=manager,
+            model_id="m1",
+            tool_ids=[],
+            max_rounds=5,
+            boundary_gate=boundary_gate,
+            exit_state=exit_state,
+        ))
+    finally:
+        clear_request_context(list(_thread_local.__dict__.keys()))
+
+    # Wave 1's reply and the queued interjection made it out; wave 2 never ran.
+    assert any(m.role == "assistant" and "你怎么看" in (m.content or "") for m in out)
+    assert any(m.role == "user" and "暂停前的插话" in (m.content or "") for m in out)
+    assert not any("绝不该被执行" in (m.content or "") for m in out)
+    assert len(runtime.requests) == 1
+    # The pause snapshot: transcript includes wave 1 + the interjection, and
+    # the cut-off wave is recorded for the resume to replay.
+    snapshot = exit_state.get("messages") or []
+    assert any(
+        (m.get("content") or "") == "暂停前的插话" and m.get("role") == "user"
+        for m in snapshot
+    )
+    assert any("你怎么看" in (m.get("content") or "") for m in snapshot)
+    assert exit_state.get("pending_agent_ids") == ["ShaWuJing"]
+
+
+def test_group_chat_resume_replays_wave_from_initial_turns():
+    """Resume replays the cut-off wave against the sidecar transcript: the
+    pending agent sees the paused history (including the interjection) and is
+    the only agent dispatched — no disk load, no windowed re-selection."""
+    manager = _GroupStubAgentManager(_GROUP_AGENTS)
+    runtime = _GroupScriptRuntime(["收到，结束"])
+
+    transcript = [
+        Message(role="user", content="@SunWuKong 开始", timestamp="2026-01-01 00:00:00"),
+        Message(role="assistant", content="@ShaWuJing 你怎么看",
+                agent_id="SunWuKong", timestamp="2026-01-01 00:00:01"),
+        Message(role="user", content="暂停前的插话", timestamp="2026-01-01 00:00:02"),
+    ]
+    set_request_context(
+        agent_manager=manager,
+        all_agent_ids=[a["agent_id"] for a in _GROUP_AGENTS],
+    )
+    try:
+        out = list(run_group_chat_stream_gen(
+            runtime=runtime,
+            mentioned_agent_ids=["ShaWuJing"],
+            all_agent_ids=[a["agent_id"] for a in _GROUP_AGENTS],
+            original_messages=[],
+            base_request=InferenceRequest(model_id="m1", messages=[]),
+            cancel_event=None,
+            context_manager=None,
+            session_id=None,
+            agent_manager=manager,
+            model_id="m1",
+            tool_ids=[],
+            max_rounds=5,
+            initial_turns=list(transcript),
+        ))
+    finally:
+        clear_request_context(list(_thread_local.__dict__.keys()))
+
+    assert any(m.role == "assistant" and "收到" in (m.content or "") for m in out)
+    # Exactly one dispatch: the replayed wave; only ShaWuJing ran.
+    assert len(runtime.requests) == 1
+    sent = [
+        m.to_dict() if hasattr(m, "to_dict") else m
+        for m in runtime.requests[0].messages
+    ]
+    # The model call must NOT contain the injected instruction; the caller
+    # replays the recorded turn instead.
+    assert not any(
+        "group-chat resume: continue the pending wave" in (m.get("content") or "")
+        for m in sent
+    )
+    assert any(
+        m.get("role") == "user" and "暂停前的插话" in (m.get("content") or "")
+        for m in sent
+    )
+    assert any(
+        "你怎么看" in (m.get("content") or "") for m in sent
+    )
+
+
+def test_group_chat_pause_resume_end_to_end(continue_server):
+    """Full cycle over HTTP: a group generation pauses at a wave boundary
+    (the wave already settled, the triggered wave never dispatched), the
+    sidecar records the cut-off wave, and a resume replays exactly that
+    wave against the snapshot transcript — and never re-runs the settled
+    agent."""
+    srv = continue_server
+    cm = srv._context_manager
+    srv._agent_manager.create(
+        agent_id="SunWuKong", model_id="test-model", nickname="孙悟空", tool_ids=[])
+    srv._agent_manager.create(
+        agent_id="ShaWuJing", model_id="test-model", nickname="沙悟净", tool_ids=[])
+    session_id = cm.create_session()
+
+    r1 = _openai_sse_text("@ShaWuJing 你怎么看")   # Sun's wave-1 reply
+    r2 = _openai_sse_text("绝不该出现在第一段流")   # would-be Sha wave-2 reply
+    r3 = _openai_sse_text("恢复后完成")            # resume: Sha's replayed wave
+    bodies: list = []
+    pause_result: dict = {}
+
+    def side_effect(request, **kwargs):
+        body = json.loads(request.data.decode("utf-8"))
+        bodies.append(body)
+        if len(bodies) == 1:
+            # Strictly inside wave 1: the pause cannot be consumed before
+            # the very next wave boundary.
+            status, res = _post_json(
+                srv, "/v1/infer/abort",
+                {"session_id": session_id, "action": "pause"},
+            )
+            pause_result.update(status=status, body=res)
+            return _make_resp(r1)
+        if len(bodies) == 2:
+            return _make_resp(r3)
+        return _make_resp(r2)  # never reached
+
+    _st1, text1 = _post_stream(srv, {
+        "session_id": session_id,
+        "model_id": "test-model",
+        "tool_ids": [],
+        "messages": [{"role": "user", "content": "@SunWuKong 开始"}],
+        "agent_ids": ["SunWuKong", "ShaWuJing"],
+        "stream": True,
+    }, side_effect)
+
+    assert pause_result.get("status") == 200
+    assert pause_result.get("body", {}).get("effective") is True
+    assert "你怎么看" in text1
+    assert "绝不该出现在第一段流" not in text1
+    # Resting status is a session-event broadcast, not a frame in the
+    # inference body: check the status registry directly (same as the
+    # single-agent pause tests).
+    assert server_state._session_statuses.get(session_id) == "paused"
+    assert len(bodies) == 1             # wave 2 was never dispatched
+
+    # The sidecar recorded the cut-off wave for a deterministic replay.
+    state = cm.read_pause_state(session_id)
+    assert state is not None
+    assert state.get("pending_agent_ids") == ["ShaWuJing"]
+    assert any(
+        "开始" in (m.get("content") or "") for m in state["context"]
+    )
+
+    _st2, text2 = _post_stream(srv, {
+        "session_id": session_id,
+        "model_id": "test-model",
+        "tool_ids": [],
+        "messages": [],
+        "agent_ids": ["SunWuKong", "ShaWuJing"],
+        "resume": True,
+        "stream": True,
+    }, side_effect)
+
+    assert "恢复后完成" in text2
+    assert server_state._session_statuses.get(session_id) == "done_success_unread"
+    # Only the pending agent ran: exactly one model call for the replay.
+    assert len(bodies) == 2
+    replay_msgs = bodies[-1]["messages"]
+    # The replayed request is built from the snapshot transcript: it already
+    # carries Sun's settled reply and the original user turn.
+    assert any("你怎么看" in (m.get("content") or "") for m in replay_msgs)
+    assert any("开始" in (m.get("content") or "") for m in replay_msgs)
+    # Sidecar consumed exactly once.
+    assert cm.read_pause_state(session_id) is None
 
 
 def test_interject_end_to_end_continues_same_generation(continue_server):
@@ -959,6 +1168,15 @@ def _post_json_delete(srv, session_id):
         return exc.code, json.loads(exc.read().decode("utf-8") or "{}")
 
 
+def _get_json(srv, path):
+    req = urllib.request.Request(_url(srv, path), method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8") or "{}")
+
+
 # ---------------------------------------------------------------------------
 # 5. Resume re-binds inference parameters from the resume request itself
 # ---------------------------------------------------------------------------
@@ -1063,3 +1281,313 @@ def test_resume_agent_switch_rebinds_model_and_tools(continue_server):
     sent = captured[-1]
     assert sent.get("model") == "model-B-label"
     assert _tool_names(sent) == {"alpha"}
+
+
+# ---------------------------------------------------------------------------
+# 6. M3: the paused resting state survives an agentsvc restart
+# ---------------------------------------------------------------------------
+
+
+def test_pause_sidecar_roundtrip_and_validation(tmp_path):
+    """write/read/clear plus self-healing on corrupt or mismatched files."""
+    from runtime.context_manager import ContextManager
+
+    cm = ContextManager(infer_fn=lambda *a, **k: "", chats_dir=str(tmp_path))
+    sid = cm.create_session()
+    assert cm.read_pause_state(sid) is None
+
+    cm.write_pause_state(sid, {
+        "version": ContextManager.PAUSE_STATE_VERSION,
+        "kind": "infer_pause",
+        "session_id": sid,
+        "paused_at": "2026-08-12T15:00:03",
+        "context": [{"role": "user", "content": "go"}],
+    })
+    state = cm.read_pause_state(sid)
+    assert state is not None and state["kind"] == "infer_pause"
+    assert cm.clear_pause_state(sid) is True
+    assert cm.clear_pause_state(sid) is False
+
+    # Corrupt JSON is discarded (and the file removed, so the session is
+    # never pinned to a paused marker whose snapshot cannot load).
+    with open(cm.pause_state_path(sid), "w", encoding="utf-8") as f:
+        f.write("{not json")
+    assert cm.read_pause_state(sid) is None
+    assert not os.path.isfile(cm.pause_state_path(sid))
+
+    # A sidecar written for another session id, or with a foreign version,
+    # is likewise discarded.
+    cm.write_pause_state(sid, {"version": 1, "session_id": "other", "context": []})
+    assert cm.read_pause_state(sid) is None
+    cm.write_pause_state(sid, {"version": 99, "session_id": sid, "context": []})
+    assert cm.read_pause_state(sid) is None
+    assert not os.path.isfile(cm.pause_state_path(sid))
+
+
+def test_pause_status_endpoint_recognizes_pause_lazily(continue_server):
+    """No startup scan: the UI's per-session check re-arms "paused" on open.
+
+    Cost is O(1) per opened session (one small file), independent of how many
+    sessions the service has on disk. A live generation still wins.
+    """
+    from runtime.context_manager import ContextManager
+
+    srv = continue_server
+    cm = srv._context_manager
+    paused_sid = cm.create_session()
+    # Session ids are second-precise; a second create_session() in the same
+    # second would collide. An id that was never created is a perfectly good
+    # idle session for this check (no directory, no sidecar).
+    idle_sid = "000000_000000"
+    cm.write_pause_state(paused_sid, {
+        "version": ContextManager.PAUSE_STATE_VERSION,
+        "kind": "infer_pause", "session_id": paused_sid,
+        "paused_at": "x", "context": [],
+    })
+
+    status, res = _get_json(srv, f"/v1/infer/pause-status?session_id={paused_sid}")
+    assert status == 200 and res.get("paused") is True
+    assert server_state._session_statuses.get(paused_sid) == "paused"
+
+    status, res = _get_json(srv, f"/v1/infer/pause-status?session_id={idle_sid}")
+    assert status == 200 and res.get("paused") is False
+    assert idle_sid not in server_state._session_statuses
+
+    # An active generation owns the status: the stale sidecar never wins.
+    owner = threading.Event()
+    begin_session_stream(paused_sid, owner)
+    status, res = _get_json(srv, f"/v1/infer/pause-status?session_id={paused_sid}")
+    assert status == 200 and res.get("paused") is False
+    server_state.clear_session_stream_state(paused_sid)
+
+    # Missing session_id is a client error.
+    status, _res = _get_json(srv, "/v1/infer/pause-status")
+    assert status == 400
+
+
+def test_exit_state_snapshots_inflight_context_at_pause_boundary():
+    """The generator hands the loop's exact in-flight list to the handler."""
+    runtime = _stream_runtime()
+    seen = {"n": 0}
+
+    def gate():
+        seen["n"] += 1
+        if seen["n"] == 1:
+            return None
+        return {"append": [], "stop": True}
+
+    rounds = [_openai_sse_text("", tool_calls=[("echo", "{}")])]
+
+    def urlopen(request, **kwargs):
+        # Second boundary stop: the model must never be called again.
+        return _make_resp(rounds.pop(0) if rounds else _openai_sse_text("never"))
+
+    exit_state: dict = {}
+    with patch("urllib.request.urlopen", side_effect=urlopen):
+        list(runtime.infer_stream(
+            InferenceRequest(
+                model_id="test-model",
+                messages=[Message(role="user", content="go")],
+                stream=True,
+            ),
+            pause_gate=gate,
+            exit_state=exit_state,
+        ))
+
+    snapshot = exit_state.get("messages")
+    assert snapshot, "pause exit must snapshot the in-flight context"
+    roles = [m.get("role") for m in snapshot]
+    assert roles[0] == "user"
+    assert any(m.get("tool_calls") for m in snapshot)
+    # The snapshot ends on the fully executed round (function == the loop's
+    # role for a tool result; it is persisted/published as "tool").
+    assert roles[-1] in ("function", "tool")
+
+
+def test_pause_writes_sidecar_and_resume_survives_simulated_restart(continue_server):
+    """Full cycle: pause persists a sidecar, a simulated restart re-seeds
+    "paused", and resume then consumes the sidecar and continues the session."""
+    srv = continue_server
+    cm = srv._context_manager
+    session_id = cm.create_session()
+
+    r2_gate = threading.Event()
+    r1 = _openai_sse_text("", tool_calls=[("echo", "{}")])
+    r2 = _openai_sse_text("", tool_calls=[("echo", "{}")])
+
+    def side_effect(request, **kwargs):
+        body = json.loads(request.data.decode("utf-8"))
+        if "tool" in json.dumps(body.get("messages", [])):
+            r2_gate.wait(timeout=10)
+            return _make_resp(r2)
+        return _make_resp(r1)
+
+    payload = json.dumps({
+        "session_id": session_id,
+        "model_id": "test-model",
+        "tool_ids": ["echo"],
+        "messages": [{"role": "user", "content": "go"}],
+        "stream": True,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        _url(srv, "/v1/infer/stream"), data=payload,
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    with _patch_model_urlopen(srv, side_effect):
+        resp = urllib.request.urlopen(req, timeout=15)
+        paused = False
+        for raw in resp:
+            text = raw.decode("utf-8", "replace")
+            if '"role": "tool"' in text and not paused:
+                _status, res = _post_json(
+                    srv, "/v1/infer/abort",
+                    {"session_id": session_id, "action": "pause"},
+                )
+                assert res.get("effective") is True
+                r2_gate.set()
+                paused = True
+    r2_gate.set()
+
+    # The pause wrote a durable snapshot of the in-flight context.
+    sidecar = cm.read_pause_state(session_id)
+    assert sidecar is not None, "pause must persist a resume_state.json sidecar"
+    assert sidecar["kind"] == "infer_pause"
+    assert sidecar["session_id"] == session_id
+    assert os.path.isfile(cm.pause_state_path(session_id))
+    roles = [m.get("role") for m in sidecar["context"]]
+    assert roles[0] == "user"
+    assert any(m.get("tool_calls") for m in sidecar["context"])
+    assert roles[-1] in ("function", "tool")
+
+    # Simulate the restart: every in-memory registry is empty, then the
+    # startup scan re-seeds the resting status from disk.
+    with server_state._session_state_lock:
+        server_state._session_statuses.clear()
+        server_state._unread_sessions.clear()
+    with server_state._session_stream_lock:
+        server_state._session_streams.clear()
+    # The UI opening the session performs the O(1) per-session check that
+    # re-arms the resting status from disk (no startup scan anywhere).
+    _status, res = _get_json(srv, f"/v1/infer/pause-status?session_id={session_id}")
+    assert res.get("paused") is True
+    assert server_state._session_statuses.get(session_id) == "paused"
+
+    # Resume after the "restart" completes the session and consumes the file.
+    status, body = _post_stream(
+        srv,
+        {
+            "session_id": session_id,
+            "model_id": "test-model",
+            "tool_ids": ["echo"],
+            "resume": True,
+            "messages": [],
+        },
+        _scripted_urlopen([_openai_sse_text("Resumed after restart.")]),
+    )
+    assert status == 200, f"resume after restart failed: {body[:500]}"
+    assert "Resumed after restart." in body
+    assert cm.read_pause_state(session_id) is None
+    assert not os.path.isfile(cm.pause_state_path(session_id))
+
+
+def test_resume_uses_sidecar_context_verbatim_and_deletes_it(continue_server):
+    """A resume continues from the snapshot, not from re-assembled history.
+
+    The snapshot carries one frame that was never persisted (a skill
+    disclosure marker); seeing it in the outgoing model request proves the
+    in-flight context -- not the disk history -- fed the resumed round.
+    """
+    from runtime.context_manager import ContextManager
+
+    srv = continue_server
+    cm = srv._context_manager
+    session_id = _seed_paused_history(cm)
+    cm.write_pause_state(session_id, {
+        "version": ContextManager.PAUSE_STATE_VERSION,
+        "kind": "infer_pause",
+        "session_id": session_id,
+        "paused_at": "2026-08-12T15:00:03",
+        "context": [
+            {"role": "user", "content": "go", "timestamp": "2026-08-12T15:00:00"},
+            {"role": "assistant", "content": "", "timestamp": "2026-08-12T15:00:01",
+             "tool_calls": [{"id": "call_1", "name": "echo", "arguments": "{}"}]},
+            {"role": "tool", "content": "echo result", "timestamp": "2026-08-12T15:00:02",
+             "name": "echo", "tool_use_id": "call_1"},
+            {"role": "system", "content": "SKILL-DISCLOSURE-MARKER",
+             "timestamp": "2026-08-12T15:00:03"},
+        ],
+    })
+
+    captured, wrapper = _capture_model_calls(
+        _scripted_urlopen([_openai_sse_text("Resumed from snapshot.")])
+    )
+    status, body = _post_stream(srv, {
+        "session_id": session_id,
+        "model_id": "test-model",
+        "tool_ids": ["echo"],
+        "resume": True,
+        "messages": [],
+    }, wrapper)
+    assert status == 200, f"resume failed: {body[:500]}"
+    assert "Resumed from snapshot." in body
+
+    assert captured, "model API was not called"
+    sent = json.dumps(captured[-1], ensure_ascii=False)
+    assert "SKILL-DISCLOSURE-MARKER" in sent, (
+        "resumed round must carry the sidecar's transient context"
+    )
+    # Restored, then deleted immediately -- no stale paused marker survives.
+    assert cm.read_pause_state(session_id) is None
+    assert not os.path.isfile(cm.pause_state_path(session_id))
+
+
+def test_fresh_generation_discards_stale_pause_sidecar(continue_server):
+    """A normal send on a paused session supersedes the resting state."""
+    from runtime.context_manager import ContextManager
+
+    srv = continue_server
+    cm = srv._context_manager
+    session_id = _seed_paused_history(cm)
+    cm.write_pause_state(session_id, {
+        "version": ContextManager.PAUSE_STATE_VERSION,
+        "kind": "infer_pause", "session_id": session_id,
+        "paused_at": "2026-08-12T15:00:03",
+        "context": [{"role": "user", "content": "stale snapshot"}],
+    })
+    server_state._session_statuses[session_id] = "paused"
+
+    status, body = _post_stream(srv, {
+        "session_id": session_id,
+        "model_id": "test-model",
+        "tool_ids": ["echo"],
+        "messages": [{"role": "user", "content": "next question"}],
+    }, _scripted_urlopen([_openai_sse_text("answered fresh")]))
+    assert status == 200, f"send failed: {body[:500]}"
+
+    assert cm.read_pause_state(session_id) is None
+    assert not os.path.isfile(cm.pause_state_path(session_id))
+    assert server_state._session_statuses.get(session_id) != "paused"
+
+
+def test_end_action_discards_pause_sidecar(continue_server):
+    """Ending the pause also discards the durable sidecar."""
+    from runtime.context_manager import ContextManager
+
+    srv = continue_server
+    cm = srv._context_manager
+    session_id = _seed_paused_history(cm)
+    cm.write_pause_state(session_id, {
+        "version": ContextManager.PAUSE_STATE_VERSION,
+        "kind": "infer_pause", "session_id": session_id,
+        "paused_at": "2026-08-12T15:00:03", "context": [],
+    })
+    server_state._session_statuses[session_id] = "paused"
+
+    status, res = _post_json(
+        srv, "/v1/infer/abort", {"session_id": session_id, "action": "end"},
+    )
+    assert status == 200
+    assert res.get("ended") is True
+    assert cm.read_pause_state(session_id) is None
+    assert not os.path.isfile(cm.pause_state_path(session_id))
+    assert server_state._session_statuses.get(session_id) == "done_success_unread"

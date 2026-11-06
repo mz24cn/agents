@@ -1762,6 +1762,36 @@ def transition_session_stream_status(
         return True
 
 
+def seed_paused_status(session_id: str, agent_ids=None) -> bool:
+    """Re-arm the resting ``paused`` status from a persisted pause sidecar.
+
+    A soft pause persists ``resume_state.json`` in the session directory, so
+    the resting state survives an agentsvc restart without any startup scan:
+    the status is recognised LAZILY, one session at a time, when that session
+    is actually used (opened in the UI via /v1/infer/pause-status, ended via
+    abort action=end; resume reads the sidecar directly).
+
+    No generation can own the session in these paths' resting assumption, but
+    a live stream or a ``streaming`` status still wins (return False) so this
+    can never resurrect a paused marker over an active generation. On success
+    the standard status event is broadcast like a natural pause exit.
+    """
+    frame = _build_session_status_frame(session_id, "paused")
+    with _session_stream_lock:
+        stream = _session_streams.get(session_id)
+        if stream is not None and not stream.get("done"):
+            return False
+        with _session_state_lock:
+            if _session_statuses.get(session_id) == "streaming":
+                return False
+            already = _session_statuses.get(session_id) == "paused"
+            _session_statuses[session_id] = "paused"
+            _unread_sessions.pop(session_id, None)
+        if not already:
+            _enqueue_session_event_frame(frame)
+    return True
+
+
 def end_paused_session_status(session_id: str) -> bool:
     """Formally finish a paused session without resuming it.
 
@@ -1913,10 +1943,13 @@ def take_infer_boundary_action(session_id: str, owner_event) -> Optional[dict]:
 def take_infer_interjections(session_id: str, owner_event) -> list:
     """Consume buffered interjections only (never the soft-pause flag).
 
-    Used by the group-chat wave boundary: interjections join the shared
-    transcript between waves, but group pause is not implemented, so a stray
-    ``pause_requested`` flag must not be consumed or honoured here. Returns
-    an empty list when there is nothing buffered for this generation.
+    Used by the group-chat *trailing* drain after its wave loop has ended:
+    interjections still join the shared transcript, but a generation that
+    already finished on its own must not be flipped into "paused" this late
+    (natural completion wins the race, same decision as the single-agent
+    path). Wave-boundary consumption inside the loop uses
+    ``take_infer_boundary_action`` instead, which honours pause as well.
+    Returns an empty list when there is nothing buffered for this generation.
     """
     with _session_stream_lock:
         stream = _session_streams.get(session_id)
