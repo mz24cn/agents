@@ -6,6 +6,7 @@
   import {
     isMissingChunksError,
     isTransientUploadError,
+    mapWithConcurrency,
     missingChunkIds,
     fileLanded,
     chunkRequestPromise,
@@ -2018,7 +2019,10 @@
     refreshUploads()
     const pending = task.chunks.filter((chunk) => chunk.status !== 'completed')
     try {
-      await Promise.all(pending.map((chunk) => uploadChunk(task, chunk)))
+      // The plan is size-driven (one chunk per parallel_size bytes), so a big
+      // file can hold dozens of chunks; upload/init's parallel_max_threads is
+      // the concurrency ceiling to respect.
+      await mapWithConcurrency(pending, (chunk) => uploadChunk(task, chunk), task.parallel_max_threads || 1)
       return true
     } catch (err) {
       if (err?.name === 'AbortError' || task.status === 'paused' || task.status === 'cancelled') {

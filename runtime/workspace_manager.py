@@ -27,6 +27,17 @@ DEFAULT_UPLOAD_PARALLEL_SIZE = 100 * 1024 * 1024
 DEFAULT_UPLOAD_PARALLEL_MAX_THREADS = 5
 UPLOAD_READ_BUFFER_SIZE = 1024 * 1024
 
+# Hard ceiling for a single chunk PUT body.
+#
+# ``handler_base._MAX_PUSH_BODY_BYTES`` (512 MB) is the largest request body the
+# parent will forward to a child environment over ``/v1/env-proxy``; anything
+# bigger is refused with 413 and the connection is dropped while the browser is
+# still writing the body, which the browser reports as an opaque network error.
+# A chunk plan must therefore never hand out a chunk above that ceiling,
+# whatever UPLOAD_PARALLEL_SIZE is set to (kept in sync by
+# tests/test_upload_chunk_plan.py).
+MAX_UPLOAD_CHUNK_BYTES = 512 * 1024 * 1024
+
 # ---------------------------------------------------------------------------
 # Shared file-type constants & helpers (used by listing, search, and refs)
 # ---------------------------------------------------------------------------
@@ -795,19 +806,34 @@ class WorkspaceManager:
         if os.path.isdir(target_abs):
             raise ValueError("INVALID_TARGET_PATH: target is a directory")
 
+        # The plan is size-driven, never thread-count driven: one chunk per
+        # ``chunk_size`` bytes, however many chunks that takes.  Bounding the
+        # *count* instead (the old ``min(parallel_max_threads, ...)``) made the
+        # chunk *size* grow with the file: a 2.7 GB file became 5 PUTs of 553 MB,
+        # and the parent's /v1/env-proxy bridge refuses any body above
+        # _MAX_PUSH_BODY_BYTES -- every file above parallel_max_threads * 512 MB
+        # was un-uploadable into a child environment (browser-side symptom:
+        # "upload network error" at 0%).  ``parallel_max_threads`` is now purely
+        # a concurrency hint, which the web client honours (it used to upload
+        # every chunk at once).
+        chunk_size = min(parallel_size, MAX_UPLOAD_CHUNK_BYTES)
+
         if file_size == 0:
             chunk_count = 0
             chunks: List[Dict[str, Any]] = []
-        elif file_size <= parallel_size:
+        elif file_size <= chunk_size:
             chunk_count = 1
             chunks = [{"parallel_id": 0, "offset": 0, "size": file_size, "status": "pending"}]
         else:
-            chunk_count = min(parallel_max_threads, math.ceil(file_size / parallel_size))
-            chunk_size = math.ceil(file_size / chunk_count)
+            # Enough chunks that one never exceeds the ceiling, then balance
+            # them (``unit`` <= chunk_size by construction, so the ceiling and
+            # UPLOAD_PARALLEL_SIZE both keep holding).
+            chunk_count = math.ceil(file_size / chunk_size)
+            unit = math.ceil(file_size / chunk_count)
             chunks = []
             for parallel_id in range(chunk_count):
-                offset = parallel_id * chunk_size
-                size = min(chunk_size, file_size - offset)
+                offset = parallel_id * unit
+                size = min(unit, file_size - offset)
                 if size > 0:
                     chunks.append({"parallel_id": parallel_id, "offset": offset, "size": size, "status": "pending"})
             chunk_count = len(chunks)

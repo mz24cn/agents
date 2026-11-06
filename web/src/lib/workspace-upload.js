@@ -110,6 +110,50 @@ export function joinPath(dir, name) {
 }
 
 /**
+ * Run one async task per item with at most `limit` in flight.
+ *
+ * The backend's upload plan is size-driven (one chunk per `parallel_size`
+ * bytes), so a multi-gigabyte file legitimately yields dozens or hundreds of
+ * chunks; `upload/init` answers with `parallel_max_threads` as the concurrency
+ * hint the client is expected to honour.  `Promise.all(chunks.map(...))` used
+ * to be safe only because the plan itself was capped at that many chunks --
+ * with a size-driven plan it would open hundreds of simultaneous PUTs.
+ *
+ * Error semantics match `Promise.all` closely enough for the upload pipeline:
+ * the first failure wins, but the tasks already in flight are awaited before
+ * rejecting, so a chunk-PUT never outlives its caller (and a rejected one
+ * never becomes an unhandled rejection).
+ *
+ * @template T
+ * @param {T[]} items
+ * @param {(item: T, index: number) => Promise<any>} worker
+ * @param {number} [limit=1] maximum number of tasks running at once
+ * @returns {Promise<void>}
+ */
+export async function mapWithConcurrency(items, worker, limit = 1) {
+  const list = Array.isArray(items) ? items : []
+  if (!list.length) return
+  const width = Math.max(1, Math.min(Number(limit) || 1, list.length))
+  let cursor = 0
+  let firstError = null
+  const runners = Array.from({ length: width }, async () => {
+    while (cursor < list.length && firstError === null) {
+      const index = cursor++
+      try {
+        await worker(list[index], index)
+      } catch (err) {
+        // Stop scheduling new items; keep the first verdict, and let the
+        // other workers drain what they already started.
+        if (firstError === null) firstError = err
+        return
+      }
+    }
+  })
+  await Promise.all(runners.map((p) => p.catch(() => undefined)))
+  if (firstError !== null) throw firstError
+}
+
+/**
  * Upload a single File into targetDirPath using the chunked workspace upload API.
  *
  * The API client is an explicit parameter so callers never have to guess where
@@ -140,14 +184,18 @@ export async function uploadFileToDir(file, targetDirPath, { onProgress, api = d
   // sending X-File-Size, so we must do the same here (otherwise the header
   // becomes "undefined" and the backend rejects it).
   const sizedChunks = chunks.map((chunk) => ({ ...chunk, file_size: file.size }))
+  // A size-driven plan can hold many chunks for one big file; upload them with
+  // the backend's own concurrency hint instead of one-at-a-time.
+  const maxThreads = init.parallel_max_threads || 1
+  const sendChunk = (chunk) => {
+    const body = file.slice(chunk.offset, chunk.offset + chunk.size)
+    const request = api.uploadChunk(upload_id, chunk, body, (uploaded) => {
+      onProgress?.({ name: file.name, uploaded, size: chunk.size })
+    })
+    return chunkRequestPromise(request)
+  }
   try {
-    for (const chunk of sizedChunks) {
-      const body = file.slice(chunk.offset, chunk.offset + chunk.size)
-      const request = api.uploadChunk(upload_id, chunk, body, (uploaded) => {
-        onProgress?.({ name: file.name, uploaded, size: chunk.size })
-      })
-      await chunkRequestPromise(request)
-    }
+    await mapWithConcurrency(sizedChunks, sendChunk, maxThreads)
     try {
       await api.uploadComplete(upload_id)
     } catch (err) {
@@ -159,10 +207,10 @@ export async function uploadFileToDir(file, targetDirPath, { onProgress, api = d
       const retry = ids
         ? sizedChunks.filter((chunk) => ids.includes(chunk.parallel_id))
         : sizedChunks
-      for (const chunk of retry) {
+      await mapWithConcurrency(retry, (chunk) => {
         const body = file.slice(chunk.offset, chunk.offset + chunk.size)
-        await chunkRequestPromise(api.uploadChunk(upload_id, chunk, body))
-      }
+        return chunkRequestPromise(api.uploadChunk(upload_id, chunk, body))
+      }, maxThreads)
       await api.uploadComplete(upload_id)
     }
     return joinPath(targetDirPath, file.name)

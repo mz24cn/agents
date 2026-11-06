@@ -956,10 +956,11 @@ def test_tunnel_envs_hello_endpoint(tmp_path):
 # Large / chunked request bodies over the browser bridge
 # ---------------------------------------------------------------------------
 
-def _bridge_upload(parent_srv, env_id, name, payload, tag=""):
+def _bridge_upload(parent_srv, env_id, name, payload, tag="", plan_out=None):
     """Browser-style workspace upload through the parent tunnel bridge:
     init -> chunk PUTs (Content-Length framing) -> complete.  Returns the
-    (status, body) of the final complete call."""
+    (status, body) of the final complete call.  ``plan_out`` (a dict) receives
+    the init response, so a test can assert on the chunk plan as well."""
     base = f"http://127.0.0.1:{parent_srv.port}/v1/env-proxy/{env_id}"
 
     def _raw(method, path, data=None, headers=None):
@@ -985,6 +986,8 @@ def _bridge_upload(parent_srv, env_id, name, payload, tag=""):
                                 "target_path": name}).encode(),
                     {"Content-Type": "application/json"})
     assert st == 200, (st, init)
+    if plan_out is not None:
+        plan_out.update(init)
     for chunk in init["chunks"]:
         st, body = _raw(
             "PUT", f"/v1/workspace/upload/{init['upload_id']}/chunk/{chunk['parallel_id']}",
@@ -1103,6 +1106,167 @@ def test_tunnel_proxy_browser_chunked_body(tmp_path):
         assert st == 200, (st, comp)
         on_disk = (tmp_path / "child_ws" / "chunked.bin").read_bytes()
         assert on_disk == payload
+
+
+def test_env_proxy_multi_chunk_upload_lands_intact(tmp_path, monkeypatch):
+    """A size-driven plan (UPLOAD_PARALLEL_SIZE well below the file size)
+    really moves the bytes: 12 MB through the tunnel as 3 chunks of 4 MB,
+    assembled on the child and verified by hash."""
+    monkeypatch.setenv("UPLOAD_PARALLEL_SIZE", "5MB")
+    with _real_server(tmp_path, "parent_data") as parent, \
+         _real_server(tmp_path, "child_data", workspace=tmp_path / "child_ws") as child:
+        parent_srv, _ = parent
+        child_srv, child_data = child
+        _set_child_source(child_srv, child_data, f"http://127.0.0.1:{parent_srv.port}/")
+        status, body = _request(child_srv, "POST", "/v1/tunnel/parent/register")
+        assert status == 200, body
+        env_id = body["env_id"]
+
+        def _online():
+            e = next((e for e in _parent_tunnel_envs(parent_srv) if e["id"] == env_id), None)
+            return e if e and e.get("online") is True else None
+        _wait_until(_online, message="tunnel env online")
+
+        import hashlib
+        payload = os.urandom(12 * 1024 * 1024)
+        plan = {}
+        st, comp = _bridge_upload(parent_srv, env_id, "multi.bin", payload, tag="multi", plan_out=plan)
+        assert st == 200, (st, comp)
+        assert [c["size"] for c in plan["chunks"]] == [4 * 1024 * 1024] * 3
+        on_disk = (tmp_path / "child_ws" / "multi.bin").read_bytes()
+        assert len(on_disk) == len(payload)
+        assert hashlib.sha256(on_disk).hexdigest() == hashlib.sha256(payload).hexdigest()
+
+
+def test_env_proxy_upload_plan_keeps_chunks_under_the_proxy_cap(tmp_path):
+    """Regression (multi-GB upload into a tunnel child): the child's chunk
+    plan used to be capped at ``parallel_max_threads`` chunks, so the chunk
+    *size* grew with the file -- a 2.7 GB file was planned as 5 PUTs of 553 MB.
+    The parent's /v1/env-proxy bridge refuses any request body above
+    ``_MAX_PUSH_BODY_BYTES`` (512 MB), and it says so while the browser is
+    still writing, which the browser reports as an opaque "upload network
+    error" at 0%: every file above ``parallel_max_threads * 512 MB`` was
+    un-uploadable through a child environment.  The plan is size-driven now, so
+    no chunk may ever cross that line -- which is exactly what the bridge hands
+    back to the browser here (no bytes uploaded, the plan alone is the test)."""
+    from runtime.handler_base import _MAX_PUSH_BODY_BYTES
+
+    with _real_server(tmp_path, "parent_data") as parent, \
+         _real_server(tmp_path, "child_data", workspace=tmp_path / "child_ws") as child:
+        parent_srv, _ = parent
+        child_srv, child_data = child
+        _set_child_source(child_srv, child_data, f"http://127.0.0.1:{parent_srv.port}/")
+        status, body = _request(child_srv, "POST", "/v1/tunnel/parent/register")
+        assert status == 200, body
+        env_id = body["env_id"]
+
+        def _online():
+            e = next((e for e in _parent_tunnel_envs(parent_srv) if e["id"] == env_id), None)
+            return e if e and e.get("online") is True else None
+        _wait_until(_online, message="tunnel env online")
+
+        base = f"http://127.0.0.1:{parent_srv.port}/v1/env-proxy/{env_id}"
+        req = urllib.request.Request(base + "/v1/env")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            ws_root = json.loads(resp.read()).get("env", {}).get("AGENTS_WORKSPACE", "")
+
+        file_size = int(2.7 * 1024 ** 3)  # the size from the report
+        st, init = _request(
+            parent_srv, "POST", f"/v1/env-proxy/{env_id}/v1/workspace/upload/init",
+            {"workspace_id": "default", "file_name": "big.zip",
+             "file_size": file_size, "target_dir_path": ws_root,
+             "target_path": "big.zip"})
+        assert st == 200, (st, init)
+        assert init["chunk_count"] > 1
+        for chunk in init["chunks"]:
+            assert chunk["size"] <= _MAX_PUSH_BODY_BYTES, (
+                f"chunk {chunk['parallel_id']} ({chunk['size']} B) is bigger than "
+                f"what the parent forwards ({_MAX_PUSH_BODY_BYTES} B)")
+        assert sum(c["size"] for c in init["chunks"]) == file_size
+
+        st, done = _request(
+            parent_srv, "DELETE", f"/v1/env-proxy/{env_id}/v1/workspace/upload/{init['upload_id']}")
+        assert st == 200, (st, done)
+
+
+def test_env_proxy_rejects_chunk_body_over_the_push_cap(tmp_path):
+    """What the over-cap body looks like from the browser's side: the parent
+    answers 413 and drops the connection while the body is still being
+    written, so the XHR dies in ``onerror`` ("upload network error") rather
+    than showing the child's verdict.  Kept as documentation of the failure
+    the chunk plan must never provoke."""
+    with _real_server(tmp_path, "parent_data") as parent, \
+         _real_server(tmp_path, "child_data", workspace=tmp_path / "child_ws") as child:
+        parent_srv, _ = parent
+        child_srv, child_data = child
+        _set_child_source(child_srv, child_data, f"http://127.0.0.1:{parent_srv.port}/")
+        status, body = _request(child_srv, "POST", "/v1/tunnel/parent/register")
+        assert status == 200, body
+        env_id = body["env_id"]
+
+        def _online():
+            e = next((e for e in _parent_tunnel_envs(parent_srv) if e["id"] == env_id), None)
+            return e if e and e.get("online") is True else None
+        _wait_until(_online, message="tunnel env online")
+
+        base = f"http://127.0.0.1:{parent_srv.port}/v1/env-proxy/{env_id}"
+        req = urllib.request.Request(base + "/v1/env")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            ws_root = json.loads(resp.read()).get("env", {}).get("AGENTS_WORKSPACE", "")
+
+        payload = os.urandom(100_000)
+        st, init = _request(
+            parent_srv, "POST", f"/v1/env-proxy/{env_id}/v1/workspace/upload/init",
+            {"workspace_id": "default", "file_name": "oversize.bin",
+             "file_size": len(payload), "target_dir_path": ws_root,
+             "target_path": "oversize.bin"})
+        assert st == 200, (st, init)
+        chunk = init["chunks"][0]
+
+        # Shrink the bridge's body cap: the 100 KB PUT above is then the
+        # 553 MB chunk of the report, without moving gigabytes in a test.
+        import runtime.handler_base as handler_base
+        original_cap = handler_base._MAX_PUSH_BODY_BYTES
+        handler_base._MAX_PUSH_BODY_BYTES = 1_000
+        try:
+            raw = socket.create_connection(("127.0.0.1", parent_srv.port), timeout=30)
+            raw.sendall((
+                f"PUT {base}/v1/workspace/upload/{init['upload_id']}/chunk/0 HTTP/1.1\r\n"
+                "Host: 127.0.0.1\r\n"
+                "Content-Type: application/octet-stream\r\n"
+                f"Content-Length: {chunk['size']}\r\n"
+                f"X-Upload-Offset: {chunk['offset']}\r\n"
+                f"X-Upload-Size: {chunk['size']}\r\n"
+                f"X-File-Size: {len(payload)}\r\n"
+                "\r\n"
+            ).encode("ascii"))
+            # Send a slice and stall: exactly the mid-upload state in which a
+            # browser learns the connection is gone.
+            raw.sendall(payload[:2000])
+            raw.settimeout(30)
+            response = b""
+            while True:
+                piece = raw.recv(65536)
+                if not piece:
+                    break
+                response += piece
+                head, sep, rest = response.partition(b"\r\n\r\n")
+                if not sep:
+                    continue
+                declared = 0
+                for line in head.split(b"\r\n")[1:]:
+                    name, _, value = line.partition(b":")
+                    if name.strip().lower() == b"content-length":
+                        declared = int(value.strip() or 0)
+                if len(rest) >= declared:
+                    break
+            raw.close()
+        finally:
+            handler_base._MAX_PUSH_BODY_BYTES = original_cap
+
+        status_line = response.split(b"\r\n", 1)[0].decode("ascii", errors="replace")
+        assert " 413 " in status_line, (status_line, response[:300])
+        assert b"Request body too large" in response
 
 
 def test_read_chunked_body_unit():

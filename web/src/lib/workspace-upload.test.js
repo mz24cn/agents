@@ -15,6 +15,7 @@ import {
   resetPasteStamp,
   isMissingChunksError,
   isTransientUploadError,
+  mapWithConcurrency,
   fileLanded,
   missingChunkIds,
   chunkRequestPromise,
@@ -83,6 +84,52 @@ describe('joinPath', () => {
   })
 })
 
+describe('mapWithConcurrency', () => {
+  it('runs every item, never more than `limit` at a time', async () => {
+    let inFlight = 0
+    let peak = 0
+    const seen = []
+    await mapWithConcurrency(Array.from({ length: 11 }, (_, i) => i), async (item) => {
+      inFlight += 1
+      peak = Math.max(peak, inFlight)
+      await new Promise((resolve) => setTimeout(resolve, 1))
+      seen.push(item)
+      inFlight -= 1
+    }, 4)
+    expect(peak).toBeLessThanOrEqual(4)
+    expect(seen).toHaveLength(11)
+    expect([...seen].sort((a, b) => a - b)).toEqual(Array.from({ length: 11 }, (_, i) => i))
+  })
+
+  it('stops scheduling after the first failure and reports that error', async () => {
+    const started = []
+    await expect(mapWithConcurrency([1, 2, 3, 4, 5, 6], async (item) => {
+      started.push(item)
+      if (item === 2) throw new Error('chunk failed')
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }, 2)).rejects.toThrow('chunk failed')
+    // Item 1 was still in flight and was awaited; nothing new was scheduled.
+    expect(started).toEqual([1, 2])
+  })
+
+  it('defaults to one at a time and accepts a junk limit', async () => {
+    let inFlight = 0
+    let peak = 0
+    const worker = async () => {
+      inFlight += 1
+      peak = Math.max(peak, inFlight)
+      await new Promise((resolve) => setTimeout(resolve, 1))
+      inFlight -= 1
+    }
+    await mapWithConcurrency([1, 2, 3], worker)
+    expect(peak).toBe(1)
+    await mapWithConcurrency([1, 2, 3], worker, 0)
+    await mapWithConcurrency([1, 2, 3], worker, 'nonsense')
+    expect(peak).toBe(1)
+    await mapWithConcurrency([], worker, 3)
+  })
+})
+
 describe('uploadFileToDir', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -115,6 +162,37 @@ describe('uploadFileToDir', () => {
     expect(workspace.uploadChunk.mock.calls[1][1]).toMatchObject({ parallel_id: 1, offset: 5, size: 5, file_size: 10 })
     expect(workspace.uploadComplete).toHaveBeenCalledWith('upload-1')
     expect(path).toBe('/tmp/report.pdf')
+  })
+
+  it('uploads a many-chunk file within the backend concurrency hint', async () => {
+    // A size-driven plan (one chunk per parallel_size bytes) yields dozens of
+    // chunks for a multi-GB file. uploadFileToDir must fan them out no wider
+    // than upload/init's parallel_max_threads, and still send every one.
+    const chunks = Array.from({ length: 28 }, (_, i) => ({
+      parallel_id: i, offset: i * 1024, size: 1024,
+    }))
+    workspace.uploadInit.mockResolvedValue({
+      upload_id: 'big-1', chunks, parallel_size: 1024, parallel_max_threads: 5,
+    })
+    let inFlight = 0
+    let peak = 0
+    workspace.uploadChunk.mockImplementation(() => {
+      inFlight += 1
+      peak = Math.max(peak, inFlight)
+      return { promise: new Promise((resolve) => setTimeout(() => {
+        inFlight -= 1
+        resolve({ status: 'uploaded' })
+      }, 2)) }
+    })
+    workspace.uploadComplete.mockResolvedValue({ status: 'completed' })
+
+    const file = makeFile('bundle.zip', 'application/zip', 28 * 1024)
+    const path = await uploadFileToDir(file, '/tmp')
+
+    expect(workspace.uploadChunk).toHaveBeenCalledTimes(28)
+    expect(peak).toBeGreaterThan(1)
+    expect(peak).toBeLessThanOrEqual(5)
+    expect(path).toBe('/tmp/bundle.zip')
   })
 
   it('handles a zero-size file (no chunks) and completes immediately', async () => {

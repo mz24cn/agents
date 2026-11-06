@@ -401,6 +401,12 @@ class HandlerTunnelMixin:
                 else:
                     body = self._read_raw_body(_MAX_PUSH_BODY_BYTES)
                     if body is None:
+                        # Either over the limit (413) or a short read; the
+                        # browser will only report "network error", so say what
+                        # this side did while it still has the numbers.
+                        logger.warning(
+                            "Env proxy %s %s: request body of %dB not accepted (limit %dB)",
+                            self.command, child_path, content_length, _MAX_PUSH_BODY_BYTES)
                         return
 
         proxy_t0 = time.monotonic()
@@ -563,6 +569,9 @@ class HandlerTunnelMixin:
             # The browser may already be gone (it is exactly the mid-upload
             # disconnect case that lands here), so the error write is
             # best-effort; either way the connection must not be reused.
+            logger.warning(
+                "Env proxy %s %s: refusing body of %dB (chunked=%s) -> %d %s",
+                self.command, child_path, content_length, chunked, status, message)
             self.close_connection = True
             try:
                 self._send_json_error(status, message)
