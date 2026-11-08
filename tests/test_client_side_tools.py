@@ -613,3 +613,58 @@ def test_server_only_rounds_still_loop_as_before() -> None:
     assert len(seen) == 2
     assert [m.name for m in collected if m.role == "tool"] == ["server_echo"]
     assert any(m.content == "done" for m in collected if m.role == "assistant")
+
+# ---------------------------------------------------------------------------
+# What max_tool_rounds actually budgets (matters for handoff-driven callers)
+# ---------------------------------------------------------------------------
+
+def test_pure_client_side_round_does_not_consume_max_tool_rounds() -> None:
+    """``max_tool_rounds`` counts server-side rounds of *one* request.
+
+    A round that only declares client-side calls leaves nothing for the server
+    to execute, so the loop breaks *before* the round counter is checked, and a
+    continuation request starts from 0 again.  A caller that drives a session
+    through client tools (the online debugger does) is therefore bounded by its
+    own handoff limit, not by the service's per-request cap.
+    """
+    streams = [_sse_tool_calls([("probe", "call_c1", '{"target": "app"}')])]
+    with _fake_model_server(streams) as (api_base, _seen):
+        runtime = _make_runtime(api_base)
+        request = InferenceRequest(
+            model_id="test-model",
+            tool_ids=[f"{CLIENT_SIDE_TOOL_TYPE}-probe"],
+            text="probe the target",
+            stream=True,
+            max_tool_rounds=1,          # one *server-side* round allowed
+        )
+        collected = list(runtime.infer_stream(request))
+
+    text = "".join(m.content or "" for m in collected if m.role == "assistant")
+    assert "maximum tool-call rounds" not in text, text
+    declared = [
+        call for m in collected if m.role == "assistant" and m.tool_calls
+        for call in m.tool_calls
+    ]
+    assert [c["name"] for c in declared] == ["probe"]
+
+
+def test_server_side_round_does_consume_max_tool_rounds() -> None:
+    """Contrast: the same cap does bite as soon as a server-side round runs."""
+    streams = [
+        _sse_tool_calls([("server_echo", "call_s1", "{}")]),
+        _sse_tool_calls([("server_echo", "call_s2", "{}")]),
+    ]
+    with _fake_model_server(streams) as (api_base, seen):
+        runtime = _make_runtime(api_base)
+        request = InferenceRequest(
+            model_id="test-model",
+            tool_ids=["function-server_echo"],
+            text="echo twice",
+            stream=True,
+            max_tool_rounds=1,
+        )
+        collected = list(runtime.infer_stream(request))
+
+    text = "".join(m.content or "" for m in collected if m.role == "assistant")
+    assert "maximum tool-call rounds (1) reached" in text, text
+    assert len(seen) == 2

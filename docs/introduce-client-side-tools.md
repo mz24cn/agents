@@ -185,8 +185,14 @@ Setup / Tools 页面里客户端工具带紫色 `CLIENT` 徽标，表单不再�
 
 - 交回是**成功**结局：`success=true`、无 `error`，会话停在 assistant 的工具调用那一轮；
   如果客户端再也不回来，这条会话就停在「中断的会话」状态，Web UI 的「继续推理」或 `"continue": true` 可清掉重发。
-- 交回轮数由客户端自己封顶（调试器默认 30 轮，Python 与 JS 版都有），服务端不额外限制：
-  每一轮都还受服务端自身的 `max_tool_rounds` 约束。
+- 交回轮数由客户端自己封顶（调试器默认 **80** 轮，Python 与 JS 版都有）。服务端预算**不覆盖交回**：
+  `max_tool_rounds`（默认 200）是**每个请求**的服务端轮次预算，只声明客户端工具的那一轮在
+  `tool_round += 1` 之前就正常收尾（不计数），而每次续跑请求都重新计数——所以交回驱动的会话
+  总轮数实际上只由调用方的 `handoff_rounds` 决定。真机上曾出现会话恰好跑满 30 个交回轮被截断、
+  Web 侧只看到一个停在 🛠️ `debugger_eval` ⏳ 的现场，上限因此从 30 提到 80，把「次数」交回服务端
+  `max_tool_rounds` 兜底（单请求内），客户端只防真正的死循环。该语义由
+  `test_pure_client_side_round_does_not_consume_max_tool_rounds` 与
+  `test_server_side_round_does_consume_max_tool_rounds` 两条对比测试固定。
 - `debugger_eval` 会在事发进程里求值——这是客户端的明确授权行为，默认禁用语句执行、
   默认跳过 `self / conn / session` 一类对象；不需要就把这个工具从清单里去掉。
 - 工具名冲突时会话内声明优先（同名注册表工具本轮会被它替换）；不同名则两组工具都在清单里。
