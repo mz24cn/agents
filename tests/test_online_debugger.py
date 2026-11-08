@@ -11,9 +11,12 @@ event snapshot and evaluates an expression in the target process, the debugger
 answers locally, and the session completes with a diagnosis report.
 """
 
+import contextlib
+import http.server
 import json
 import pathlib
 import sys
+import threading
 
 import pytest
 
@@ -186,3 +189,210 @@ def test_handoff_rounds_are_bounded(dbg, tmp_path, capsys) -> None:
     assert "交回轮次超过 2 次" in box["text"]
     assert len(seen) == 3, "the initial request plus the 2 allowed handoffs"
 
+
+
+# ---------------------------------------------------------------------------
+# The handoff list must be reported-union-unanswered, not reported-only
+# ---------------------------------------------------------------------------
+
+class _RawSSEHandler(http.server.BaseHTTPRequestHandler):
+    """Replays one fixed SSE body as *the agent service* would have sent it."""
+
+    def do_POST(self) -> None:  # noqa: N802
+        length = int(self.headers.get("Content-Length") or 0)
+        if length:
+            self.rfile.read(length)
+        self.server.hits.append(dict(self.headers))
+        body = self.server.body
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args) -> None:
+        return
+
+
+@contextlib.contextmanager
+def _raw_sse_server(body: bytes):
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _RawSSEHandler)
+    srv.body = body
+    srv.hits = []
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield srv
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        thread.join(timeout=5)
+
+
+def _dbg_sse(frames) -> bytes:
+    lines = [f"data: {json.dumps(f)}\n\n" for f in frames]
+    return ("".join(lines) + "data: [DONE]\n\n").encode("utf-8")
+
+
+def _post(dbg, frames):
+    with _raw_sse_server(_dbg_sse(frames)) as srv2:
+        dbg._CFG["agents_url"] = f"http://127.0.0.1:{srv2.server_address[1]}"
+        return dbg._post_stream("/v1/infer/stream", {"messages": []})
+
+
+def test_stream_handoff_unions_status_frame_with_unanswered_calls(dbg) -> None:
+    """A parallel batch whose status frame names only part must not drop the rest.
+
+    ``reported or [fallback]`` used to discard the fallback the moment the
+    service named *anything*, so the calls the frame did not name were never
+    executed: the session shows a client-tool call stuck pending mid-conversation
+    while inference keeps running.  The handoff list is now reported ∪
+    announced-but-unanswered, de-duplicated by id.
+    """
+    dbg.start(project="demo", agent_enabled=False,
+              cooldown_file="/tmp/unused-cooldown.json")
+    frames = [
+        {"session_id": "s1", "role": "assistant", "tool_calls": [
+            {"id": "a", "name": "debugger_eval", "arguments": '{"expr": "1"}'},
+            {"id": "b", "name": "debugger_eval", "arguments": '{"expr": "2"}'},
+        ]},
+        # the service names only one of the two declared calls
+        {"role": "status", "status": "client_tool_calls", "client_tool_calls": [
+            {"id": "a", "name": "debugger_eval", "arguments": '{"expr": "1"}'},
+        ]},
+        {"role": "assistant", "content": "ok"},
+    ]
+    status, envelope = _post(dbg, frames)
+    assert status == 200
+    assert {c["id"] for c in envelope["client_tool_calls"]} == {"a", "b"}
+
+
+def test_stream_handoff_dedups_by_id_and_keeps_arguments(dbg) -> None:
+    dbg.start(project="demo", agent_enabled=False,
+              cooldown_file="/tmp/unused-cooldown.json")
+    frames = [
+        {"session_id": "s1", "role": "assistant", "tool_calls": [
+            {"id": "a", "name": "debugger_eval", "arguments": '{"expr": "2+2"}'},
+        ]},
+        # same id again, arguments-less: the richer copy must win
+        {"role": "status", "status": "client_tool_calls", "client_tool_calls": [
+            {"id": "a", "name": "debugger_eval", "arguments": ""},
+        ]},
+        {"role": "assistant", "content": "ok"},
+    ]
+    _status, envelope = _post(dbg, frames)
+    calls = envelope["client_tool_calls"]
+    assert len(calls) == 1 and calls[0]["arguments"] == '{"expr": "2+2"}'
+
+
+def test_stream_handoff_skips_calls_already_answered(dbg) -> None:
+    dbg.start(project="demo", agent_enabled=False,
+              cooldown_file="/tmp/unused-cooldown.json")
+    frames = [
+        {"session_id": "s1", "role": "assistant", "tool_calls": [
+            {"id": "a", "name": "debugger_status", "arguments": "{}"},
+            {"id": "b", "name": "debugger_threads", "arguments": "{}"},
+        ]},
+        {"role": "tool", "tool_use_id": "b", "content": "{}"},
+        {"role": "assistant", "content": "ok"},
+    ]
+    _status, envelope = _post(dbg, frames)
+    assert [c["id"] for c in envelope["client_tool_calls"]] == ["a"]
+
+
+# ---------------------------------------------------------------------------
+# Contract details that the packaged device build taught us
+# ---------------------------------------------------------------------------
+
+def test_fingerprint_carries_line_numbers(dbg) -> None:
+    """Same call chain, different raise site -> different fingerprint.
+
+    With only ``func@file`` the five breakpoints of one chain collapsed into a
+    single fingerprint, so the later (genuinely new) variant only bumped a
+    counter: no jsonl line, no dispatch.
+    """
+    same_a = [{"func": "run", "file": "/x/a.py", "line": 10}]
+    same_b = [{"func": "run", "file": "/x/a.py", "line": 42}]
+    assert dbg._make_fingerprint("ValueError", same_a) == \
+        dbg._make_fingerprint("ValueError", list(same_a))
+    assert dbg._make_fingerprint("ValueError", same_a) != \
+        dbg._make_fingerprint("ValueError", same_b)
+
+
+def test_api_key_rides_only_in_the_request_header(dbg) -> None:
+    dbg.start(project="demo", agent_enabled=False, api_key="sekret",
+              cooldown_file="/tmp/unused-cooldown.json")
+    headers = dbg._headers()
+    assert headers["Authorization"] == "Bearer sekret"
+    status = json.loads(dbg._execute_client_tool("debugger_status", {}))
+    assert status["auth"] == "Bearer"
+    assert "sekret" not in json.dumps(status)   # this blob is fed to the model
+    dbg._CFG["api_key"] = ""
+    assert "Authorization" not in dbg._headers()
+
+
+def test_explicit_workspace_overrides_the_derived_one(dbg) -> None:
+    dbg.start(project="demo", agent_enabled=False, workspace="/srv/app",
+              cooldown_file="/tmp/unused-cooldown.json")
+    event = _raise_and_capture()
+    assert event["workspace"] == "/srv/app"
+
+
+def test_handoff_budget_is_the_clients_own_limit(dbg) -> None:
+    """The service caps *server-side* rounds per request; the caller owns handoffs.
+
+    A round that only declares client tools ends the loop before the round
+    counter, and every continuation request restarts that counter -- so a small
+    handoff_rounds silently truncates long field-debugging sessions (observed on
+    device at exactly 30).
+    """
+    assert online_debugger._DEFAULTS["handoff_rounds"] >= 80
+
+
+# ---------------------------------------------------------------------------
+# The verification step is now part of the contract (L4)
+# ---------------------------------------------------------------------------
+
+def test_diagnosis_prompt_requires_red_then_green_evidence(dbg) -> None:
+    dbg.start(project="demo", agent_enabled=False,
+              cooldown_file="/tmp/unused-cooldown.json")
+    event = _raise_and_capture()
+    prompt = dbg._build_prompt(event)
+    assert "红→绿" in prompt and "改动前" in prompt
+    assert "未验证：" in prompt                      # explicit "not verified" marker
+    assert "{workspace}" not in prompt              # slots must resolve
+    assert "reload" in prompt                       # no fake "it took effect"
+
+    dbg._CFG["verify_fix"] = False
+    off = dbg._build_prompt(event)
+    assert "未执行验证" in off and "红→绿" not in off
+
+
+# ---------------------------------------------------------------------------
+# One portable file: no host-specific special cases, no non-stdlib imports
+# ---------------------------------------------------------------------------
+
+def test_the_client_imports_nothing_outside_the_standard_library() -> None:
+    """The Android logcat mirror (tag ``HH_DEBUGGER``) used to live in ``_print``.
+
+    A host whose stdout never reaches a log is a property of *that host*, not of
+    this client.  Carrying that branch here means a portable single file grows a
+    non-stdlib import plus a per-host special case; the host's integration layer
+    should own its own log instead.
+    """
+    import ast
+
+    src = pathlib.Path(online_debugger.__file__).read_text(encoding="utf-8")
+    imported = set()
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.Import):
+            imported.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            imported.add(node.module.split(".")[0])
+    assert "android" not in imported
+    assert sorted(imported - set(sys.stdlib_module_names)) == []
+
+
+def test_debugger_own_voice_has_exactly_one_outlet(capsys) -> None:
+    online_debugger._print("交回中止: 撞 handoff 上限")
+    assert capsys.readouterr().out.strip() == "[debugger] 交回中止: 撞 handoff 上限"

@@ -175,8 +175,11 @@ Setup / Tools 页面里客户端工具带紫色 `CLIENT` 徽标，表单不再�
 三次请求都带同一个 `session_id`、最终报告交回宿主。
 
 同一份实现另有 JavaScript 版 [`accessories/online_debugger.js`](../accessories/online_debugger.js)：
-零依赖（Node 内置 `http` / `vm`），`node accessories/online_debugger.js --selftest` 跑 21 项自检，
-覆盖快照采集、本地执行交回、SSE 帧重建（并行调用分帧拼接、按工具名识别交回）、交回轮数上限。
+零依赖（Node 内置 `http` / `vm` / `crypto`），`node accessories/online_debugger.js --selftest` 跑 31 项自检，
+覆盖快照采集、本地执行交回、SSE 帧重建（并行调用分帧拼接、按工具名识别交回、交回清单取
+「服务端点名的 ∪ 宣布过但无回执的」并按 id 去重）、交回轮数上限、指纹带行号、Bearer 鉴权头、
+`workspace` 显式覆盖、诊断契约里的红→绿验证步骤、纯传输故障的一次重试。
+两版的配置项与默认值逐一对齐（同名环境变量，18 项一致），改动同步维护。
 
 ## 八、边界
 

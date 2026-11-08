@@ -40,12 +40,24 @@
     DEBUGGER_ENABLED=0                   整套关闭
     DEBUGGER_AGENT_ENABLED=0             观察模式：只做快照，不派发 Coder
     DEBUGGER_AGENTS_URL=http://localhost:7988
+    DEBUGGER_API_KEY=<bearer>             可选：上游要 Bearer 时给（hh 那套
+                                          HH_AGENTSVC_TOKEN 就是这种令牌）。不设=不带
+                                          Authorization 头，直连裸 Agent Service 够用。
     DEBUGGER_AGENT_ID=Coder
     DEBUGGER_AGENT_ID= + DEBUGGER_MODEL_ID=xxx   不用 agent，直接指定服务端模型
+    DEBUGGER_WORKSPACE=/path/to/repo       可选：服务端 workspace（它读文件/跑命令的根）。
+                                          不设=按事发源码路径推导；在移动端/容器里跑时
+                                          那个路径是宿主沙箱内的，服务端读不到，跨端诊断要显式给。
     DEBUGGER_MAX_ROUNDS=30               可选：agent 工具轮数上限；默认不设(null)，由 agent service 自身控制
-    DEBUGGER_HANDOFF_ROUNDS=30           客户端工具交回轮次上限（防会话无限往返）
+    DEBUGGER_HANDOFF_ROUNDS=80           客户端工具交回轮次上限（防会话无限往返）。
+                                         服务端 max_tool_rounds 只数单个请求内的服务端
+                                         轮次：纯交回轮不计数、续跑请求重新计数，所以
+                                         这条上限实际由调用方掌握（真机 2026-11-08：
+                                         30 曾被正好跑满，会话停在 ⏳ 那一帧）。
     DEBUGGER_STREAM=1                    用 /v1/infer/stream（SSE）跑诊断，默认关（用 /v1/infer）
     DEBUGGER_EVAL=0                      禁用 debugger_eval（默认允许在本地进程求值表达式）
+    DEBUGGER_VERIFY=0                    不要求红→绿复现验证（默认要求：改了代码就得
+                                         先复现失败、改后复现通过，并把命令与退出码写进报告）
     DEBUGGER_SYNC=1                      子进程模式：report 就地同步诊断（默认关）
     DEBUGGER_SYNC_TIMEOUT=900            sync 诊断最长等待（秒）
     DEBUGGER_COOLDOWN_SEC=1800           sync 模式同指纹跨进程冷却窗口（秒）
@@ -80,12 +92,24 @@ _DEFAULTS = {
     "agent_id": "Coder",
     # agent_id 设为空串时改用这个 model_id（服务端没有配 Coder agent 时也能跑）
     "model_id": "",
+    # 上游要 Bearer 时用（例如 hh 那套 Agent Service：HH_AGENTSVC_TOKEN）。
+    # 空 = 不带 Authorization 头 = 直连裸 Agent Service。令牌只进请求头，不进日志/产物。
+    "api_key": "",
+    # 服务端 workspace（agent 在它自己的机器上读文件/跑命令的根目录）。
+    # 空 = 按事发源码路径推导；在移动端/容器里跑时那个路径服务端读不到，需显式给仓库路径。
+    "workspace": "",
     # 默认不设（null）：不自行指定工具轮数，交由 agent service 自身的次数控制
     "max_rounds": None,
-    "handoff_rounds": 30,
+    # 30 太小: 真机 2026-11-08 有会话正好跑满 30 个交回轮次后被"轮次上限"掐断,
+    # Web 侧看到的就是推理停在 🛠️ debugger_eval ⏳。给到 80, 让"次数"这件事由
+    # 服务端 max_tool_rounds 兜底, 客户端这侧只防真正的死循环。
+    "handoff_rounds": 80,
     "agent_timeout": 1200,
     "agent_enabled": True,
     "eval_enabled": True,
+    # 改了代码就要求做一次红→绿复现（红=改动前能复现同一异常，绿=改动后通过）。
+    # 关掉它只是回到"报告里描述打算怎么验"，不改变任何现场捕获行为。
+    "verify_fix": True,
     "stream": False,
     "max_events": 32,
     "sync": False,          # True：report() 就地同步诊断（短命子进程用）
@@ -128,6 +152,13 @@ def _now():
 
 
 def _print(msg):
+    """调试器自身的声音: 一律进 stdout, 前缀 `[debugger]`。
+
+    为什么这些 print 不能省: 交回中止原因(撞 handoff 上限 / 没有最终文本 / 调用失败)
+    只有这一处出口; 没有它, Web 侧看到的就是推理停在 🛠️ ⏳ 那一帧, 这边一行解释都没有,
+    只能靠猜。宿主若没有 stdout(嵌进 GUI 进程、移动端宿主之类), 由宿主自己的集成层接管
+    这一层 —— 本文件不为某个具体宿主开特例, 也不为此引入任何非标准库依赖。
+    """
     try:
         print(f"[debugger] {msg}")
     except Exception:
@@ -203,8 +234,15 @@ def _exc_chain(exc):
 
 
 def _make_fingerprint(exc_type_name, frames):
+    # basis 必须带**行号**: 只按 func@file 拼, 同一条调用链里同一函数的不同落点会撞成同一指纹。
+    # 真机 2026-11-08 16:06:22 / 16:07:12(fp=abe501a9456d, eid=b3bd5bc6)实测: probe_one_dept_unit
+    # 里 6170/6199/6235/6250/6259 五个断点的 func 序列(run→...→probe_one_dept_unit→_nav_assert→
+    # _synexc)完全一样 => 全归一个指纹: 第二条(SH-198 dept_intro_card)只 count++, 既不落
+    # debugger_events.jsonl(_dbg_sink 只写 count==1)也不派 agent —— 后到的**真·未知变体**现场会被
+    # 前一条 report 吞掉(这正是 fetch_slots._attach_caller_tb 注释里"指纹按调用链彼此区分"想要的
+    # 效果缺的那一半)。带上行号后: 同一落点跨医院仍去重, 不同落点各自留现场。
     basis = exc_type_name + "|" + "|".join(
-        f"{f['func']}@{os.path.basename(f['file'])}" for f in frames)
+        f"{f['func']}@{os.path.basename(f['file'])}:{f.get('line')}" for f in frames)
     return hashlib.md5(basis.encode("utf-8")).hexdigest()[:12]
 
 
@@ -250,7 +288,9 @@ def report(step, exc):
                  "chain": chain, "frames": frames, "ts": ts,
                  "pid": os.getpid(), "count": 1,
                  "project": _CFG["project"] or os.path.basename(os.getcwd()),
-                 "workspace": _derive_workspace(frames)}
+                 # 显式配了 DEBUGGER_WORKSPACE / start(workspace=) 就用它（跨端诊断必须有：
+                 # 移动端/容器里推导出来的是那台机器上的路径，服务端读不到）；没配才按事发帧推导。
+                 "workspace": _CFG.get("workspace") or _derive_workspace(frames)}
         dispatch = False
         with _LOCK:
             rec = _FINGERPRINTS.get(fp)
@@ -303,9 +343,13 @@ def _status():
             "dispatch_fail": _STATE["dispatch_fail"],
             "client_tool_handoffs": _STATE["handoffs"],
             "agent": f"{_CFG['agent_id']}@{_CFG['agents_url']}",
+            # 只报「有没有带令牌」，绝不回显令牌本身（这份 status 会进 prompt 给模型）
+            "auth": "Bearer" if _CFG.get("api_key") else "none",
+            "workspace": _CFG.get("workspace") or "",   # 空 = 按事发帧推导
             "max_rounds": _CFG["max_rounds"],      # null = 由 agent service 自身的次数控制
             "agent_enabled": _CFG["agent_enabled"],
             "eval_enabled": _CFG["eval_enabled"],
+            "verify_fix": _CFG["verify_fix"],   # 报告里的「验证/风险」是否要求证据
             "sync": _CFG["sync"]}
 
 
@@ -474,7 +518,7 @@ read_file/search_code/edit_file）都在该目录下工作，源码请直接读�
    - 代码缺陷且有把握修复：用 edit_file 直接做最小化修改（改动文件即可，勿重启进程）。
    - 网络抖动/限流/对端瞬时错误：不要改代码，给出重试/退避/降级建议。
    - 涉及数据库写入、外部系统配置的动作：只写建议，不要执行。
-4) 最后一条消息严格按以下格式输出（本次会话由 agentsvc 按 session_id 全程存档）：
+{verify_step}5) 最后一条消息严格按以下格式输出（本次会话由 agentsvc 按 session_id 全程存档）：
 ## 问题
 （一句话现象 + 触发条件）
 ## 根因
@@ -482,9 +526,9 @@ read_file/search_code/edit_file）都在该目录下工作，源码请直接读�
 ## 修改
 （文件路径 + 改动摘要；未改代码则写"未修改"并说明理由）
 ## 验证/风险
-（如何确认修复有效；可能的副作用）
+{verify_hint}
 ## 后续动作
-（如：需重启进程生效 / 建议重跑哪些任务 / 无需动作）
+（如：需重启进程生效 / 建议重跑哪些任务 / 无需动作；改动尚未进入运行态时必须点明）
 
 本次异常快照（eid={eid}，step={step!r}）：
 ```json
@@ -496,7 +540,33 @@ read_file/search_code/edit_file）都在该目录下工作，源码请直接读�
 def _build_prompt(event):
     slim = {k: v for k, v in event.items() if k != "frames"}
     slim["frames"] = event["frames"]
+    if _CFG["verify_fix"]:
+        verify_step = (
+            "4) 改了代码就把它验成红→绿：先写/找到能在**改动前**复现同一异常（同一异常类型与\n"
+            "   栈顶位置）的最小复现，确认它失败（红）；打上改动后再跑一遍，确认通过（绿）。\n"
+            "   复现命令与退出码留在报告里当证据；复现不出来就写「未验证：<原因>」，\n"
+            "   不要用「打算怎么验」顶替。边界：只跑不写真实数据、不外呼的复现，\n"
+            "   拿不准就把涉事文件复制到 /tmp 的一次性副本里跑。验证跑在服务端工作区\n"
+            "   （{workspace}），它覆盖源码层，不覆盖事发进程的运行态——\n"
+            "   补丁是否已进入正在运行的进程，按 5) 的「后续动作」如实说明，\n"
+            "   也不要在事发进程里 reload/hook 制造「看起来生效」。\n"
+        )
+        verify_hint = (
+            "（先给证据：复现命令、退出码、改动前失败与改动后通过的关键输出；"
+            "无证据则写「未验证：<原因>」；再写可能的副作用）"
+        )
+    else:
+        verify_step = (
+            "4) 本次不要求执行验证（DEBUGGER_VERIFY=0）：在「验证/风险」里写清该怎样验，"
+            "并注明「未执行验证」。\n"
+        )
+        verify_hint = "（打算如何确认修复有效，并注明「未执行验证」；可能的副作用）"
+    # verify_step 是在 _SKILL_TMPL.format 之前构造的普通字符串，所以它里面的
+    # {workspace} 不会被模板替换——这里显式补上，免得报告里出现占位符。
+    verify_step = verify_step.replace("{workspace}", event.get("workspace") or os.getcwd())
     return _SKILL_TMPL.format(
+        verify_step=verify_step,
+        verify_hint=verify_hint,
         agent_id=_CFG["agent_id"],
         project=event.get("project") or "?",
         pid=event.get("pid"),
@@ -509,12 +579,22 @@ def _build_prompt(event):
     )
 
 
+def _headers():
+    """请求头。配了 api_key 才带 Authorization —— 裸 Agent Service 不需要，
+    而带 Bearer 的上游（如 hh 那套）不带会直接 401，两种都只能靠这个函数支持。
+    令牌只出现在请求头里：不打印、不进事件、不进日志。"""
+    h = {"Content-Type": "application/json"}
+    if _CFG.get("api_key"):
+        h["Authorization"] = "Bearer %s" % _CFG["api_key"]
+    return h
+
+
 def _post_json(path, payload):
     """POST {agents_url}{path} 非流式，返回 (status, dict)。"""
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         url=f"{_CFG['agents_url']}{path}", data=body,
-        headers={"Content-Type": "application/json"}, method="POST")
+        headers=_headers(), method="POST")
     try:
         with urllib.request.urlopen(req, timeout=_CFG["agent_timeout"]) as r:
             return r.status, json.loads(r.read().decode("utf-8", "replace"))
@@ -543,7 +623,7 @@ def _post_stream(path, payload):
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         url=f"{_CFG['agents_url']}{path}", data=body,
-        headers={"Content-Type": "application/json"}, method="POST")
+        headers=_headers(), method="POST")
     envelope = {"messages": [], "client_tool_calls": []}
     client_tool_names = {t["name"] for t in _client_tools_payload()}
     announced, answered, reported = [], set(), []
@@ -592,9 +672,20 @@ def _post_stream(path, payload):
     except Exception as e:
         return 0, {"error": f"调用 {_CFG['agents_url']}{path} 失败: {e!r}"}
     envelope["success"] = True
-    envelope["client_tool_calls"] = reported or [
-        c for c in announced if c["name"] in client_tool_names and c["id"] not in answered
-    ]
+    # 交回清单 = 服务端点名的(reported) ∪ 流里宣布过但没有回执的(fallback)，按 id 去重。
+    # 只取 reported 会漏答: 并行批次里服务端没点名的那几条客户端调用永远不会被执行,
+    # 会话中间就留下一枚 ⏳(真机 2026-11-08 有 4 个会话是这个形态, 全是 debugger_eval)。
+    fallback = [c for c in announced
+                if c["name"] in client_tool_names and c["id"] not in answered]
+    merged_pending = OrderedDict()
+    for call in list(reported) + fallback:
+        cid = call.get("id")
+        if cid is None or cid in answered:
+            continue
+        prev = merged_pending.get(cid)
+        if prev is None or (not (prev.get("arguments") or "") and (call.get("arguments") or "")):
+            merged_pending[cid] = call
+    envelope["client_tool_calls"] = list(merged_pending.values())
     return 200, envelope
 
 
@@ -665,6 +756,13 @@ def _call_agent(prompt, workspace):
     while True:
         status, data = (_post_stream(path, payload) if _CFG["stream"]
                         else _post_json(path, payload))
+        # status==0 且 error 是我们自己拼的"调用 … 失败:"= 纯传输故障(连接被重置/读超时)。
+        # 这一步断了但服务端会话还在: 重试一次, 否则这条会话就永远停在 🛠️ ⏳ 那一帧。
+        if status == 0 and str(data.get("error") or "").startswith("调用 "):
+            _print(f"续跑请求传输失败 => 重试 1 次: {str(data.get('error'))[:160]}")
+            time.sleep(2.0)
+            status, data = (_post_stream(path, payload) if _CFG["stream"]
+                            else _post_json(path, payload))
         session_id = data.get("session_id") or session_id
         if status != 200:
             return False, str(data.get("error") or f"HTTP {status}")[:2000], session_id
@@ -814,12 +912,16 @@ def _start_worker():
 
 def start(project=None, agents_url=None, agent_id=None, model_id=None,
           agent_enabled=None, sync=None, max_rounds=None, stream=None,
-          eval_enabled=None, handoff_rounds=None, **kwargs):
+          eval_enabled=None, handoff_rounds=None, api_key=None, workspace=None,
+          verify_fix=None, **kwargs):
     """启动诊断通道（幂等）。sync=True 时 report() 就地同步诊断（短命子进程用，
     不常驻 worker），否则后台 worker 异步派发。
     max_rounds=None（默认）不自行指定工具轮数，由 agent service 自身的次数控制决定；
     stream=True 用 /v1/infer/stream 跑诊断；eval_enabled=False 连 debugger_eval 的
-    注册 JSON 都不下发（现场工具只剩只读那几个）。"""
+    注册 JSON 都不下发（现场工具只剩只读那几个）。
+    api_key：上游要求 Bearer 时给（如 hh 那套 Agent Service 的 HH_AGENTSVC_TOKEN）；
+    只进请求头，不进日志/事件/产物。workspace：服务端 workspace 根目录，跨端诊断
+    （事发在手机上、agent 在服务器上看仓库源码）必须显式给仓库路径。"""
     if _STATE["started"]:
         return True
     with _LOCK:
@@ -837,6 +939,10 @@ def start(project=None, agents_url=None, agent_id=None, model_id=None,
             "DEBUGGER_MODEL_ID", _DEFAULTS["model_id"])
         if not _CFG["agent_id"] and not _CFG["model_id"]:
             _CFG["agent_id"] = _DEFAULTS["agent_id"]  # 两者都没给，回到默认 agent
+        # 令牌 / 服务端工作区：start 参数 > 环境变量 > 默认(空)。
+        # api_key 只用于请求头，不参与指纹/事件/日志（日志里只出现「Bearer/无」）。
+        _CFG["api_key"] = str(api_key or os.environ.get("DEBUGGER_API_KEY", "") or "")
+        _CFG["workspace"] = str(workspace or os.environ.get("DEBUGGER_WORKSPACE", "") or "")
         # max_rounds：start 参数 > 环境变量 > 默认(null)；null 或非法值都不带 max_tool_rounds，
         # 推理循环次数交给 agent service 自身的次数控制（它有自己的默认/环境变量）。
         _rounds = max_rounds if max_rounds is not None else os.environ.get("DEBUGGER_MAX_ROUNDS", "")
@@ -848,6 +954,10 @@ def start(project=None, agents_url=None, agent_id=None, model_id=None,
         _CFG["stream"] = bool(stream) or os.environ.get("DEBUGGER_STREAM", "") == "1"
         _CFG["eval_enabled"] = not (
             eval_enabled is False or os.environ.get("DEBUGGER_EVAL", "") == "0")
+        # 红→绿复现验证：start 参数 > 环境变量 > 默认(要求)。
+        _verify = (verify_fix if verify_fix is not None
+                   else os.environ.get("DEBUGGER_VERIFY", "1") != "0")
+        _CFG["verify_fix"] = bool(_verify)
         _CFG["sync"] = bool(sync) or os.environ.get("DEBUGGER_SYNC", "") == "1"
         _CFG["sync_timeout"] = int(os.environ.get(
             "DEBUGGER_SYNC_TIMEOUT", _DEFAULTS["sync_timeout"]))
@@ -864,8 +974,11 @@ def start(project=None, agents_url=None, agent_id=None, model_id=None,
         if _CFG["agent_enabled"] and not _CFG["sync"]:
             _start_worker()
     _print(f"已启动：agent={_CFG['agent_id']}@{_CFG['agents_url']} "
+           f"鉴权={'Bearer' if _CFG['api_key'] else '无'} "
            f"现场接口=client side tool calls（{len(_client_tools_payload())} 个，无监听端口） "
+           f"工作区={_CFG['workspace'] or '(按事发帧推导)'} "
            f"轮数上限={_CFG['max_rounds'] or 'agent service 自身默认'} "
+           f"复现验证={'红→绿' if _CFG['verify_fix'] else '不要求'} "
            f"交回轮数上限={_CFG['handoff_rounds']} "
            f"通道={'流式' if _CFG['stream'] else '非流式'} "
            f"模式={'同步' if _CFG['sync'] else '异步'} "

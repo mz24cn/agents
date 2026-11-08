@@ -44,7 +44,15 @@
  *     DEBUGGER_AGENT_ID=Coder      （设成空串则改用 DEBUGGER_MODEL_ID）
  *     DEBUGGER_MODEL_ID=xxx
  *     DEBUGGER_MAX_ROUNDS=30       可选：工具轮数上限；默认不设，交给 agent service 自身
- *     DEBUGGER_HANDOFF_ROUNDS=30   客户端工具交回轮次上限（防会话无限往返）
+ *     DEBUGGER_HANDOFF_ROUNDS=80   客户端工具交回轮次上限（防会话无限往返）。
+ *                                  服务端 max_tool_rounds 只数单个请求内的服务端轮次：
+ *                                  纯交回轮不计数、续跑请求重新计数，所以这条上限实际
+ *                                  由调用方掌握（真机 2026-11-08：30 曾被正好跑满）。
+ *     DEBUGGER_VERIFY=0            不要求红→绿复现验证（默认要求：改了代码就得先写能在
+ *                                  改动前失败的复现，改后跑通，命令与退出码进报告）
+ *     DEBUGGER_API_KEY=...         服务侧需要 Authorization: Bearer 时填（只进请求头）
+ *     DEBUGGER_WORKSPACE=/repo     会话 workspace；跨端诊断必须显式给仓库路径，否则
+ *                                  用的是端上推导出的目录，服务端 read_file 读不到
  *     DEBUGGER_STREAM=1            用 /v1/infer/stream（SSE）跑诊断（仅 async 模式）
  *     DEBUGGER_EVAL=0              禁用 debugger_eval
  *     DEBUGGER_SYNC=1              report() 就地同步诊断（默认关）
@@ -75,7 +83,7 @@ const DEFAULTS = {
   agent_id: 'Coder',
   model_id: '',            // agent_id 为空串时用这个
   max_rounds: null,
-  handoff_rounds: 30,
+  handoff_rounds: 80,
   agent_timeout: 1200,
   agent_enabled: true,
   eval_enabled: true,
@@ -85,6 +93,9 @@ const DEFAULTS = {
   sync_timeout: 900,
   cooldown_sec: 1800,
   cooldown_file: '~/.debugger_cooldown.json',
+  api_key: '',
+  workspace: '',
+  verify_fix: true,
 };
 
 const CFG = Object.assign({}, DEFAULTS);
@@ -103,6 +114,25 @@ const SINK = [];                   // 观察模式（agent_enabled=false）下�
 const now = () => new Date().toISOString().replace('T', ' ').slice(0, 19);
 const md5 = (s) => crypto.createHash('md5').update(String(s)).digest('hex');
 const print = (msg) => { try { process.stdout.write(`[debugger] ${msg}\n`); } catch (_) { /* ignore */ } };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function sleepSync(ms) {
+  /** sync 模式（curl 子进程那条路）里的阻塞等待；Atomics.wait 是 Node 的同步睡法。 */
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch (_) {
+    const until = Date.now() + ms;
+    execFileSync('sleep', [String(Math.ceil(ms / 1000))]);
+    while (Date.now() < until) { /* 兜底 */ }
+  }
+}
+
+function headers() {
+  /** 令牌只进请求头：不进日志、不进事件、不进自检输出（与 Python 版 _headers 一致）。 */
+  const h = { 'Content-Type': 'application/json' };
+  if (CFG.api_key) h.Authorization = `Bearer ${CFG.api_key}`;
+  return h;
+}
 
 function safeRepr(value, limit = 200) {
   let text;
@@ -197,7 +227,12 @@ function errorOwnProps(err) {
 }
 
 function makeFingerprint(name, frames) {
-  const basis = name + '|' + frames.map((f) => `${f.func}@${path.basename(f.file)}`).join('|');
+  // 行号必须在指纹里：同一条调用链里同一个函数的不同落点（例如某个大函数里有五处会走
+  // 到同一个下游调用）过去会撞成同一个指纹，于是后到的未知变体被第一条 report 吞掉，
+  // 连现场快照都不留。带上行号会让去重变弱（同一逻辑分支改动行号后算新错误），这是取舍。
+  const basis = name + '|' + frames
+    .map((f) => `${f.func}@${path.basename(f.file)}:${f.line || 0}`)
+    .join('|');
   return md5(basis).slice(0, 12);
 }
 
@@ -239,7 +274,7 @@ function report(step, err, context) {
       pid: process.pid,
       count: 1,
       project: CFG.project || path.basename(process.cwd()),
-      workspace: deriveWorkspace(frames),
+      workspace: CFG.workspace || deriveWorkspace(frames),
       stack: String((err && err.stack) || '').slice(0, 4000),
     };
     let dispatch = false;
@@ -303,6 +338,9 @@ function statusInfo() {
     agent_enabled: CFG.agent_enabled,
     eval_enabled: CFG.eval_enabled,
     sync: CFG.sync,
+    workspace: CFG.workspace || null,
+    auth: CFG.api_key ? 'Bearer' : 'none',   // 只回显形态，不回显令牌
+    verify_fix: CFG.verify_fix,
   };
 }
 
@@ -468,7 +506,7 @@ read_file/search_code/edit_file）都在该目录下工作，源码请直接读�
    - 代码缺陷且有把握修复：用 edit_file 直接做最小化修改（改动文件即可，勿重启进程）。
    - 网络抖动/限流/对端瞬时错误：不要改代码，给出重试/退避/降级建议。
    - 涉及数据库写入、外部系统配置的动作：只写建议，不要执行。
-4) 最后一条消息严格按以下格式输出（本次会话由 agentsvc 按 session_id 全程存档）：
+${p.verify_step}5) 最后一条消息严格按以下格式输出（本次会话由 agentsvc 按 session_id 全程存档）：
 ## 问题
 （一句话现象 + 触发条件）
 ## 根因
@@ -476,9 +514,10 @@ read_file/search_code/edit_file）都在该目录下工作，源码请直接读�
 ## 修改
 （文件路径 + 改动摘要；未改代码则写"未修改"并说明理由）
 ## 验证/风险
-（如何确认修复有效；可能的副作用）
+${p.verify_hint}
 ## 后续动作
-（如：需重启进程生效 / 建议重跑哪些任务 / 无需动作）
+（如：需重启进程生效 / 建议重跑哪些任务 / 无需动作；**若改了代码，必须点明「改动尚未进入运行态，
+需重启或热重载才对当前流量生效」**，以及建议重跑哪些任务来确认）
 
 本次异常快照（eid=${p.eid}，step=${p.step}）：
 \`\`\`json
@@ -490,6 +529,21 @@ function buildPrompt(event) {
   const slim = Object.assign({}, event);
   delete slim.stack;
   delete slim.context_object;
+  const workspace = event.workspace || process.cwd();
+  // 红→绿这一步过去不在任务列表里，只出现在报告格式里：那一段本来就有，但它只被要求
+  // *描述*怎么验，于是模型改完 edit_file 就交报告、把这段写成计划，自愈链停在「补丁落在磁盘」。
+  // 现在把它做成一条有终态的动作：改动前失败、改动后通过，命令与退出码作为证据。
+  const verifyStep = CFG.verify_fix
+    ? `4) 改了代码就必须做红→绿验证：先用 exec_shell 写一条能复现本次故障的最小复现
+   （在 ${workspace} 下，用同一输入跑出快照里那个异常类型与栈顶位置），确认它在改动**前**失败；
+   打上改动，重跑同一条命令确认通过。复现命令与两次退出码写进「## 验证/风险」作为证据。
+   复现不出来就写「未验证：<原因>」，不要把「打算怎么验」写成「已经验过」。
+   只给建议、没有改代码的（瞬时错误、数据库、外部配置）跳过这一步，直接说明依据。
+`
+    : `4) 本次不要求执行验证（DEBUGGER_VERIFY=0）：在「验证/风险」里写清该怎样验，并注明「未执行验证」。\n`;
+  const verifyHint = CFG.verify_fix
+    ? `先给证据：复现命令、改动前失败（异常类型 / 退出码）、改动后通过（退出码）；没有证据就写「未验证：<原因>」。另注可能的副作用`
+    : `（打算如何确认修复有效，并注明「未执行验证」；可能的副作用）`;
   return SKILL_TMPL({
     agent_id: CFG.agent_id || CFG.model_id,
     project: event.project || '?',
@@ -497,8 +551,10 @@ function buildPrompt(event) {
     started: CFG.started ? new Date(CFG.started * 1000).toISOString() : now(),
     eid: event.eid,
     step: JSON.stringify(event.step),
-    workspace: event.workspace || process.cwd(),
+    workspace,
     snapshot: JSON.stringify(slim, null, 1),
+    verify_step: verifyStep,
+    verify_hint: verifyHint,
   });
 }
 
@@ -568,7 +624,7 @@ async function postAsync(payload) {
   try {
     const res = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: headers(),
       body: JSON.stringify(payload),
       signal: controller.signal,
     });
@@ -589,8 +645,9 @@ function postSync(payload) {
   try {
     const raw = execFileSync(
       'curl',
-      ['-sS', '-X', 'POST', url, '-H', 'Content-Type: application/json',
-        '--max-time', String(CFG.agent_timeout), '--data-binary', '@-'],
+      ['-sS', '-X', 'POST', url, '-H', 'Content-Type: application/json']
+        .concat(CFG.api_key ? ['-H', `Authorization: Bearer ${CFG.api_key}`] : [])
+        .concat(['--max-time', String(CFG.agent_timeout), '--data-binary', '@-']),
       { input: JSON.stringify(payload), maxBuffer: 32 * 1024 * 1024, encoding: 'utf8' },
     );
     const parsed = safeParse(raw);
@@ -638,9 +695,19 @@ function collectStream(raw) {
     envelope.messages.push(Object.assign({}, frame));
   }
   envelope.success = true;
-  envelope.client_tool_calls = reported.length
-    ? reported
-    : announced.filter((c) => names.has(c.name) && !answered.has(c.id));
+  // 交回清单必须是「服务端点名的 ∪ 宣布过但没有回执的」，不能二选一：只取 status 帧的话，
+  // 同一轮里服务端没点名的那几条客户端调用永远不会被执行——真机上四条会话在中段各缺一枚
+  // debugger_eval，而推理照常收尾，现场缺一块数据模型却已经下了结论。
+  const fallback = announced.filter((c) => names.has(c.name) && !answered.has(c.id));
+  const byId = new Map();
+  for (const call of reported.concat(fallback)) {
+    if (!call || !(call.name || call.id)) continue;
+    const key = call.id || `anon:${call.name}`;
+    const prev = byId.get(key);
+    // 同一个 id 只执行一次；两处来源里缺参数的那份让位给带参数的那份。
+    byId.set(key, prev && !prev.arguments && call.arguments ? call : (prev || call));
+  }
+  envelope.client_tool_calls = Array.from(byId.values());
   return envelope;
 }
 
@@ -664,7 +731,15 @@ async function callAgent(prompt, workspace, post = postAsync) {
   let final = null;
   let handoffRound = 0;
   for (;;) {
-    const { status, envelope } = await post(payload);
+    let { status, envelope } = await post(payload);
+    // 只重试一次，且只重试「我们自己的传输层失败」（status=0 + 自己拼的「调用 … 失败:」），
+    // 不重试 HTTP 4xx/5xx——那通常是参数或路由问题，重试只会把现场埋得更深。不重试的话
+    // 会话就永远停在 ⏳ 那一帧，端上连一条失败原因都留不下。
+    if (status === 0 && String(envelope.error || '').startsWith('调用 ')) {
+      print('推理调用传输故障，2s 后重试一次');
+      await sleep(2000);
+      ({ status, envelope } = await post(payload));
+    }
     sessionId = envelope.session_id || sessionId;
     if (status !== 200) {
       return { ok: false, text: String(envelope.error || `HTTP ${status}`).slice(0, 2000), session_id: sessionId };
@@ -696,7 +771,14 @@ function callAgentSync(prompt, workspace) {
   let final = null;
   let handoffRound = 0;
   for (;;) {
-    const { status, envelope } = postSync(payload);
+    let { status, envelope } = postSync(payload);
+    if (status === 0 && String(envelope.error || '').startsWith('调用 ')) {
+      // 同 async 分支：只重试一次纯传输故障。sync 模式下这次等待是阻塞的，
+      // 最坏情况再多等一个 agent_timeout——sync 本来就是「把事件循环冻在案发点」的模式。
+      print('同步推理调用传输故障，2s 后重试一次');
+      sleepSync(2000);
+      ({ status, envelope } = postSync(payload));
+    }
     sessionId = envelope.session_id || sessionId;
     if (status !== 200) {
       return { ok: false, text: String(envelope.error || `HTTP ${status}`).slice(0, 2000), session_id: sessionId };
@@ -862,6 +944,12 @@ function start(opts) {
   CFG.sync_timeout = Number(process.env.DEBUGGER_SYNC_TIMEOUT || DEFAULTS.sync_timeout);
   CFG.cooldown_sec = Number(process.env.DEBUGGER_COOLDOWN_SEC || DEFAULTS.cooldown_sec);
   CFG.cooldown_file = process.env.DEBUGGER_COOLDOWN_FILE || DEFAULTS.cooldown_file;
+  CFG.api_key = String(opts.apiKey || process.env.DEBUGGER_API_KEY || DEFAULTS.api_key || '');
+  // workspace 只在**跨端**诊断时必须显式给：端上从栈帧推导出来的是端上的目录，服务端
+  // 在那条路径下 read_file / edit_file 全都落空，补丁会落到不存在（或更糟：另一棵树）的位置。
+  CFG.workspace = String(opts.workspace || process.env.DEBUGGER_WORKSPACE
+    || DEFAULTS.workspace || '');
+  CFG.verify_fix = !(opts.verifyFix === false || process.env.DEBUGGER_VERIFY === '0');
   if (opts.agentEnabled !== undefined) CFG.agent_enabled = !!opts.agentEnabled;
   if (process.env.DEBUGGER_AGENT_ENABLED === '0') CFG.agent_enabled = false;
   CFG.started = Date.now() / 1000;
@@ -869,7 +957,9 @@ function start(opts) {
   print(`已启动：agent=${CFG.agent_id || CFG.model_id}@${CFG.agents_url} `
     + `现场接口=client side tool calls（${clientToolsPayload().length} 个，无监听端口） `
     + `轮数上限=${CFG.max_rounds || 'agent service 自身默认'} `
+    + `复现验证=${CFG.verify_fix ? '红→绿' : '不要求'} `
     + `交回轮数上限=${CFG.handoff_rounds} `
+    + (CFG.workspace ? `workspace=${CFG.workspace} ` : '')
     + `通道=${CFG.stream && !CFG.sync ? '流式' : '非流式'} `
     + `模式=${CFG.sync ? '同步' : '异步'} `
     + `诊断=${CFG.agent_enabled ? '开' : '关(仅现场快照)'}`);
@@ -1009,6 +1099,79 @@ async function selftest() {
     async () => { loopCalls += 1; return looping; });
   check('交回轮数有上限', loopResult.ok === false
     && String(loopResult.text).includes('交回轮次超过 2 次') && loopCalls === 3);
+
+  // 交回清单：服务端 status 帧只点名 a，b 也宣布了但没有回执 —— 两条都必须执行（真机缺陷）
+  const unionFrames = [
+    { session_id: 's3' },
+    { role: 'assistant', tool_calls: [
+      { _index: 0, id: 'x1', name: 'debugger_event', arguments: '{"eid":"q"}' },
+      { _index: 1, id: 'x2', name: 'debugger_status', arguments: '{}' }] },
+    { role: 'status', status: 'client_tool_calls', client_tool_calls: [
+      { id: 'x1', name: 'debugger_event', arguments: '{"eid":"q"}' }] },
+  ];
+  const unionEnv = collectStream(unionFrames.map((f) => `data: ${JSON.stringify(f)}`).join('\n\n')
+    + '\n\ndata: [DONE]\n');
+  check('交回清单取「点名的 ∪ 无回执的」', unionEnv.client_tool_calls.length === 2
+    && unionEnv.client_tool_calls.map((c) => c.id).sort().join(',') === 'x1,x2');
+  const dupEnv = collectStream((unionFrames.slice(0, 2).concat([
+    { role: 'status', status: 'client_tool_calls', client_tool_calls: [
+      { id: 'x2', name: 'debugger_status' },                       // 同一 id 两份，这份缺参数
+      { id: 'x2', name: 'debugger_status', arguments: '{}' }] },   // 流里宣布的那份带参数
+  ])).map((f) => `data: ${JSON.stringify(f)}`).join('\n\n') + '\n\ndata: [DONE]\n');
+  check('同一 id 只交回一次且保留参数', dupEnv.client_tool_calls.filter((c) => c.id === 'x2').length === 1
+    && dupEnv.client_tool_calls.find((c) => c.id === 'x2').arguments === '{}');
+
+  // 指纹带行号：同一个函数里的两个不同落点必须是两个指纹
+  const twoCase = path.join(caseDir, 'two_throws.js');
+  fs.writeFileSync(twoCase, [
+    "'use strict';",
+    "module.exports = function probe(which) {",
+    "  if (which === 'a') throw new RangeError('branch a');",
+    "  if (which === 'b') throw new RangeError('branch b');",
+    "};",
+  ].join('\n'));
+  const probe = require(twoCase);
+  const fps = [];
+  for (const which of ['a', 'b']) {
+    try { probe(which); } catch (e) { const ev2 = report('分支' + which, e); fps.push(ev2.fingerprint); }
+  }
+  check('指纹含行号：同一函数不同落点不再撞车', fps[0] !== fps[1]);
+
+  // 鉴权头与 workspace 覆盖
+  CFG.api_key = 'secret-token';
+  check('Bearer 只进请求头', headers().Authorization === 'Bearer secret-token'
+    && !JSON.stringify(statusInfo()).includes('secret-token')
+    && statusInfo().auth === 'Bearer');
+  CFG.api_key = '';
+  check('未配令牌时不带鉴权头', !headers().Authorization && statusInfo().auth === 'none');
+  CFG.workspace = '/repo/on/server';
+  try { throw new Error('ws override probe'); } catch (e) {
+    check('workspace 可显式覆盖（跨端诊断）', report('ws', e).workspace === '/repo/on/server');
+  }
+  CFG.workspace = '';
+
+  // 验证契约：默认要求红→绿并要证据；关掉时明确要求写「未执行验证」
+  const promptOn = buildPrompt(ev);
+  CFG.verify_fix = false;
+  const promptOff = buildPrompt(ev);
+  CFG.verify_fix = true;
+  check('诊断契约含红→绿验证步骤', promptOn.includes('红→绿')
+    && promptOn.includes('改动**前**失败') && promptOn.includes('未验证：'));
+  check('关掉验证时仍要求注明未执行', !promptOff.includes('红→绿')
+    && promptOff.includes('未执行验证'));
+  check('报告要求点明补丁未进入运行态', promptOn.includes('尚未进入运行态'));
+
+  // 传输故障只重试一次：第一次纯传输失败、第二次成功，闭环仍应拿到最终报告
+  let tries = 0;
+  const flaky = async (payload) => {
+    tries += 1;
+    if (tries === 1) return { status: 0, envelope: { error: `调用 http://127.0.0.1:1/v1/infer 失败: ECONNRESET` } };
+    return { status: 200, envelope: { session_id: 'flaky-1', messages: [{ role: 'assistant', content: '## 问题\nx' }] } };
+  };
+  const retryStart = Date.now();
+  const retryResult = await callAgent('retry probe', process.cwd(), flaky);
+  check('纯传输故障重试一次后闭环', retryResult.ok === true && tries === 2
+    && Date.now() - retryStart >= 2000);
 
   let failed = 0;
   for (const [label, ok] of checks) {
