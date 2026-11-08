@@ -28,11 +28,11 @@ RUNTIME_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "runtime"
 STDLIB_MODULES: frozenset[str] = frozenset(sys.stdlib_module_names)
 
 # Optional third-party dependencies: each is imported only inside a
-# try/except ImportError block and used purely as a best-effort feature
-# (winpty: Windows PTY support; cryptography: generating a self-signed
-# fallback certificate for https when no certificate files are provided).
-# The service keeps working without any of them installed.
-_OPTIONAL_DEPENDENCIES: frozenset[str] = frozenset({"winpty", "cryptography"})
+# try/except ImportError block and used purely as a best-effort feature.
+# winpty: Windows PTY support (the terminal endpoint reports it is unavailable
+# when the package is missing). The service keeps running without it --
+# everything else, the TLS fallback certificate included, is stdlib only.
+_OPTIONAL_DEPENDENCIES: frozenset[str] = frozenset({"winpty"})
 
 
 def _collect_py_files() -> list[str]:

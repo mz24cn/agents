@@ -65,6 +65,7 @@ runtime/
 ├── env_manager.py           # Environment variable manager
 ├── session_manager.py       # Session index manager
 ├── workspace_manager.py     # Workspace file manager: listing, search, upload, file refs
+├── selfsigned.py            # Self-signed certificates: DER/RSA on the standard library only (https fallback cert)
 └── server.py                # HTTP API server
 
 web/                         # Svelte 5 management console SPA
@@ -272,9 +273,15 @@ when the server starts:
 - an `https` protocol enables TLS. Certificates live in `DATA_DIR/certs`
   and are loaded per SNI domain as `{domain}.pem` / `{domain}.key`, so one
   server can serve multiple domain certificates. Unmatched SNI names fall
-  back to a default certificate (`default.pem` or a generated
-  self-signed one) — browsers show a certificate warning, but the site
-  stays reachable;
+  back to a default certificate (`default.pem` or a generated self-signed
+  one, produced by `runtime/selfsigned.py` with the standard library alone) —
+  browsers show a certificate warning, but the site stays reachable;
+- an IP URL (`https://192.168.1.20:7988/`) never carries SNI (RFC 6066
+  forbids IP literals), so the fallback certificate always answers. It puts
+  the address in an iPAddress subjectAltName, so importing that self-signed
+  certificate into the trust store is enough to pass verification. A
+  `{ip}.pem` file is never picked by name — a real certificate for an IP
+  address has to be named `default.pem` / `default.key`;
 - with no `AGENTS_URL` and no command-line argument, the defaults are
  `http` + `0.0.0.0` + `7988` (listening on all interfaces so the service
   is reachable from other machines right after installation; set

@@ -12,7 +12,6 @@ Covers:
 
 from __future__ import annotations
 
-import datetime
 import json
 import os
 import re
@@ -26,55 +25,37 @@ import pytest
 
 from runtime.registry import ModelRegistry, ToolRegistry
 from runtime.runtime import Runtime
+from runtime.selfsigned import common_name_of, generate_self_signed_cert
 from runtime.server import RuntimeHTTPServer, _resolve_bind_config
-
-try:
-    from cryptography import x509
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import rsa
-    from cryptography.x509.oid import NameOID
-    _HAVE_CRYPTOGRAPHY = True
-except ImportError:  # pragma: no cover
-    _HAVE_CRYPTOGRAPHY = False
-
-needs_cryptography = pytest.mark.skipif(
-    not _HAVE_CRYPTOGRAPHY,
-    reason="the 'cryptography' package is required to generate test certificates",
-)
-
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
+# A certificate is throwaway here, but generating one costs ~0.5 s (RSA-2048
+# key generation, standard library only), so reuse one per (domain, cn): the
+# assertions below are about *which* certificate the server picked, not about
+# key freshness.
+_TEST_CERT_CACHE: dict = {}
+
+
 def _write_cert(certs_dir: str, domain: str, cn: str | None = None) -> None:
-    """Write a self-signed {domain}.pem / {domain}.key pair to certs_dir."""
+    """Write a self-signed {domain}.pem / {domain}.key pair to certs_dir.
+
+    Uses ``runtime.selfsigned`` -- the same stdlib-only generator that serves
+    the server's fallback certificate -- so these tests need neither the
+    ``cryptography`` package nor an ``openssl`` binary.
+    """
     os.makedirs(certs_dir, exist_ok=True)
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn or domain)])
-    now = datetime.datetime.now(datetime.timezone.utc)
-    cert = (
-        x509.CertificateBuilder()
-        .subject_name(name)
-        .issuer_name(name)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(now - datetime.timedelta(days=1))
-        .not_valid_after(now + datetime.timedelta(days=365))
-        .add_extension(x509.SubjectAlternativeName([x509.DNSName(domain)]), critical=False)
-        .sign(key, hashes.SHA256())
-    )
+    cache_key = (domain, cn)
+    if cache_key not in _TEST_CERT_CACHE:
+        _TEST_CERT_CACHE[cache_key] = generate_self_signed_cert(cn or domain)
+    cert_pem, key_pem = _TEST_CERT_CACHE[cache_key]
     with open(os.path.join(certs_dir, f"{domain}.pem"), "wb") as fh:
-        fh.write(cert.public_bytes(serialization.Encoding.PEM))
+        fh.write(cert_pem)
     with open(os.path.join(certs_dir, f"{domain}.key"), "wb") as fh:
-        fh.write(
-            key.private_bytes(
-                serialization.Encoding.PEM,
-                serialization.PrivateFormat.TraditionalOpenSSL,
-                serialization.NoEncryption(),
-            )
-        )
+        fh.write(key_pem)
 
 
 def _cert_cn(ssl_sock: ssl.SSLSocket) -> str:
@@ -89,9 +70,7 @@ def _cert_cn(ssl_sock: ssl.SSLSocket) -> str:
     except ValueError:
         ssl_sock.do_handshake()
         der = ssl_sock.getpeercert(binary_form=True)
-    cert = x509.load_der_x509_certificate(der)
-    attrs = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
-    return attrs[0].value if attrs else ""
+    return common_name_of(der)
 
 
 def _tls_probe(port: int, sni: str | None, request: bytes = b"GET /v1/models HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"):
@@ -292,7 +271,6 @@ class TestStartResolvesBindConfig:
 # ---------------------------------------------------------------------------
 
 
-@needs_cryptography
 class TestSniMultiCert:
     def test_per_domain_certificates_selected_by_sni(self, patched_paths):
         certs_dir = str(patched_paths / "certs")
@@ -360,6 +338,49 @@ class TestSniMultiCert:
             assert status == b"HTTP/1.1 200 OK"
             assert json.loads(body) == {"models": []}
             assert cn  # some (self-signed) certificate was presented
+        finally:
+            srv.stop()
+
+    def test_ip_access_fallback_carries_an_ipaddress_san(self, monkeypatch, patched_paths):
+        """https on an IP address: reachable *and* verifiable.
+
+        A client using an IP URL sends no SNI (RFC 6066 forbids IP literals
+        there), so the base context -- the generated fallback -- answers. For
+        that certificate to be usable by a client that chooses to trust it, the
+        address has to be an iPAddress subjectAltName: a dNSName holding
+        "127.0.0.1" is ignored, and OpenSSL fails with "IP address mismatch".
+        """
+        import runtime.server as server_module
+
+        os.makedirs(patched_paths / "certs", exist_ok=True)
+        generated: dict = {}
+        real = server_module._generate_self_signed_cert_bytes
+
+        def generate_and_remember(cn: str) -> tuple:
+            pair = real(cn)
+            generated["cert_pem"] = pair[0]
+            return pair
+
+        monkeypatch.setattr(
+            server_module, "_generate_self_signed_cert_bytes", generate_and_remember
+        )
+        srv = _make_server(patched_paths, protocol="https")
+        try:
+            assert srv.protocol == "https"
+            cn, status, _ = _tls_probe(srv.port, None)
+            assert cn == "127.0.0.1"
+            assert status == b"HTTP/1.1 200 OK"
+
+            # The very fallback the server is serving, now as a trust anchor and
+            # with hostname checking left enabled.
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.load_verify_locations(cadata=generated["cert_pem"].decode("ascii"))
+            raw = socket.create_connection(("127.0.0.1", srv.port), timeout=15)
+            with ctx.wrap_socket(raw, server_hostname="127.0.0.1") as sock:
+                sock.sendall(
+                    b"GET /v1/models HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+                )
+                assert sock.recv(64).startswith(b"HTTP/1.1 200")
         finally:
             srv.stop()
 
@@ -541,7 +562,6 @@ class TestWebSocketEndpointAuth:
         finally:
             srv.stop()
 
-    @needs_cryptography
     def test_session_cookie_has_secure_flag_over_https(self, patched_paths):
         os.makedirs(patched_paths / "certs", exist_ok=True)
         srv = _make_server(patched_paths, protocol="https")

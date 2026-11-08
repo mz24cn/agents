@@ -7,7 +7,6 @@ tool calling, and registry management.
 Zero third-party dependencies — only Python standard library.
 """
 
-import datetime
 import ipaddress
 import json
 import logging
@@ -41,6 +40,7 @@ from runtime.agent_manager import AgentManager
 from runtime.registry import ModelRegistry, ToolRegistry
 from runtime.runtime import Runtime
 from runtime.context_manager import ContextManager, ConversationTurn, JournalConflictError
+from runtime.selfsigned import generate_self_signed_cert
 
 
 from runtime.common import DATA_DIR as _DATA_DIR, set_request_context, get_request_context, clear_request_context, now_iso as _now_iso, session_timestamp
@@ -227,43 +227,15 @@ def _resolve_bind_config(
 
 
 def _generate_self_signed_cert_bytes(common_name: str) -> tuple:
-    """Generate an in-memory self-signed certificate.
+    """Generate an in-memory self-signed certificate (stdlib only).
 
     Returns ``(cert_pem, key_pem)``. Used only as a last-resort fallback so
     that https keeps working (the browser will warn about the certificate,
     but the site stays reachable) when no certificate files are available.
-    Requires the optional ``cryptography`` package; raises ``ImportError``
-    when it is not installed.
+    The certificate and RSA key are built by ``runtime.selfsigned`` -- no
+    third-party package is involved, see the module docstring for the trade-off.
     """
-    from cryptography import x509
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import rsa
-    from cryptography.x509.oid import NameOID
-
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
-    now = datetime.datetime.now(datetime.timezone.utc)
-    cert = (
-        x509.CertificateBuilder()
-        .subject_name(name)
-        .issuer_name(name)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(now - datetime.timedelta(days=1))
-        .not_valid_after(now + datetime.timedelta(days=3650))
-        .add_extension(
-            x509.SubjectAlternativeName([x509.DNSName(common_name)]),
-            critical=False,
-        )
-        .sign(key, hashes.SHA256())
-    )
-    cert_pem = cert.public_bytes(serialization.Encoding.PEM)
-    key_pem = key.private_bytes(
-        serialization.Encoding.PEM,
-        serialization.PrivateFormat.TraditionalOpenSSL,
-        serialization.NoEncryption(),
-    )
-    return cert_pem, key_pem
+    return generate_self_signed_cert(common_name)
 
 
 def _load_cert_chain_from_pem(ctx: ssl.SSLContext, cert_pem: bytes, key_pem: bytes) -> None:
@@ -386,8 +358,8 @@ def _build_ssl_context(domain: str) -> Optional[ssl.SSLContext]:
 
     Fallback certificate preference:
       1. ``default.pem`` / ``default.key`` in the cert directory;
-      2. an in-memory self-signed certificate (requires the optional
-         ``cryptography`` package);
+      2. an in-memory self-signed certificate, generated on the fly by
+         ``runtime.selfsigned`` (standard library only);
       3. the first certificate pair found in the directory.
 
     Returns None when no certificate can be provided at all.
@@ -403,12 +375,6 @@ def _build_ssl_context(domain: str) -> Optional[ssl.SSLContext]:
             cert_pem, key_pem = _generate_self_signed_cert_bytes(domain or "localhost")
             _load_cert_chain_from_pem(base, cert_pem, key_pem)
             source = "generated self-signed certificate"
-        except ImportError:
-            logger.warning(
-                "The optional 'cryptography' package is not installed; "
-                "cannot generate a fallback self-signed certificate"
-            )
-            base = None
         except Exception:
             logger.exception("Failed to generate fallback self-signed certificate")
             base = None
@@ -633,8 +599,8 @@ class RuntimeHTTPServer:
             if ssl_context is None:
                 logger.error(
                     "https is configured but no certificate could be loaded from %s "
-                    "(no {domain}.pem/{domain}.key pair, no 'default' pair, and no "
-                    "'cryptography' package available to self-sign one). Falling back "
+                    "(no {domain}.pem/{domain}.key pair, no 'default' pair, and the "
+                    "generated self-signed fallback could not be loaded either). Falling back "
                     "to http so the service stays reachable.",
                     _CERTS_DIR,
                 )
