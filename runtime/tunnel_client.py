@@ -80,6 +80,18 @@ _HOP_BY_HOP = {
 }
 
 
+def ws_authority(host: str) -> str:
+    """*host* as it may appear in a URL authority.
+
+    An IPv6 literal has to be bracketed (``ws://[::1]:7988/…``).  Unbracketed,
+    ``urlsplit`` reads the colons as part of the port -- ``WSClient.connect``
+    then refuses the URL as ``Invalid port in WebSocket URL`` before any
+    handshake, so a child bound to ``::`` would lose its stream bridge for a
+    reason that has nothing to do with the tunnel.
+    """
+    return f"[{host}]" if ":" in host else host
+
+
 class _IncomingBody:
     """One routed request body, assembled incrementally by the reader thread.
 
@@ -138,6 +150,14 @@ class TunnelClient:
     # Concurrent local-call workers (the parent's own fan-out is 8:
     # talk_to max_workers / group-chat sub-agents).
     _WORKERS = 8
+
+    # Bound only the *connect* phase of a loopback call.  A hung local service
+    # would otherwise park a worker forever (_req_queue is unbounded), so after
+    # _WORKERS hangs the child's loopback executor is saturated and every later
+    # tool call has to wait out the parent's forward timeout (600 s).  The
+    # timeout is lifted again once the socket is connected, so large uploads and
+    # streamed bodies keep the semantics they always had.
+    _LOCAL_CONNECT_TIMEOUT = 10.0
 
     def __init__(self, server, data_dir: str) -> None:
         self._server = server
@@ -664,7 +684,9 @@ class TunnelClient:
         self._body_cursor = None
 
     # ------------------------------------------------------------------
-    # HTTP request dispatch (serial — one local call in flight at a time)
+    # HTTP request dispatch (_WORKERS threads, so up to _WORKERS local calls
+    # are in flight at once; the queue is unbounded, which is precisely why the
+    # connect phase carries a timeout instead of being allowed to hang)
     # ------------------------------------------------------------------
 
     def _req_worker(self) -> None:
@@ -690,8 +712,31 @@ class TunnelClient:
                 job["method"], job["path"], job["headers"], job["body"]
             )
         except OSError as exc:
-            self._send_resp(ws, rid, 502, {"Content-Type": "application/json"},
-                            json.dumps({"error": f"local call failed: {exc}"}).encode())
+            # Shapes seen in practice: ConnectionResetError(104) when this child
+            # listens with TLS while the self-call was still plaintext, and
+            # ConnectionRefusedError(111) when it is bound to a non-loopback
+            # address.  Both are address/protocol faults, so name the target --
+            # a bare errno otherwise reads as "the local service is down".
+            _h, _p, _tls = self._loopback_target()
+            self._send_resp(
+                ws, rid, 502, {"Content-Type": "application/json"},
+                json.dumps({
+                    "error": f"local call failed: {exc}",
+                    "hint": f"child loopback target {'https' if _tls else 'http'}"
+                            f"://{_h}:{_p} unreachable",
+                }).encode(),
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 - never leave the parent waiting
+            # _req_worker used to swallow this: no resp frame at all, so the
+            # parent only found out after its full forward timeout (600 s) for
+            # an error that had already happened.
+            logger.exception("Tunnel: unhandled local call error for %s", rid)
+            try:
+                self._send_resp(ws, rid, 500, {"Content-Type": "application/json"},
+                                json.dumps({"error": f"local call error: {exc!r}"}).encode())
+            except (OSError, WSClientError):
+                pass
             return
         self._send_response(ws, rid, status, headers_out, resp)
 
@@ -877,10 +922,89 @@ class TunnelClient:
             return ""
         return token
 
+    def _loopback_target(self) -> tuple:
+        """Where this child dials *itself* for tunnel traffic: (host, port, https).
+
+        The address used to be hardcoded as ``127.0.0.1`` with plaintext HTTP,
+        which turned two premises of the loopback data plane into settings the
+        child could ignore.  They are not settings:
+
+        * A child started as ``AGENTS_URL=https://...`` speaks TLS on that port.
+          A plaintext request to it is refused at the *protocol* layer, so it
+          never becomes an HTTP status at all: the measured symptom is
+          ``ConnectionResetError(104)``, which lands in the OSError branch and is
+          handed back as a 502.
+        * A child bound to a concrete interface address (a LAN IP rather than
+          0.0.0.0) is not reachable on 127.0.0.1 in the first place:
+          ``ConnectionRefusedError(111)``.
+
+        Registration, the hello snapshot and the online flag all live on the
+        control plane, which is why both breakages present as a healthy-looking
+        environment whose tool calls nevertheless never work.
+        """
+        port = self._server.port
+        scheme = (getattr(self._server, "protocol", "") or "http").lower()
+        # ``bind_host`` is what RuntimeHTTPServer exposes (it mirrors the port
+        # and protocol properties); ``server_address`` is kept as the secondary
+        # source for anything duck-typed that only has the socket tuple.
+        bound = getattr(self._server, "bind_host", None)
+        if bound is None:
+            addr = getattr(self._server, "server_address", None)
+            bound = addr[0] if isinstance(addr, tuple) and addr else None
+        if bound is None:
+            # Used to fall back silently, which is how "the derived target is
+            # always 127.0.0.1" survived a server object that never exposed its
+            # bind address: the real failure reappeared much later as a bare
+            # ConnectionRefusedError(111) far from its cause.
+            logger.debug(
+                "Tunnel: server object exposes no bind address; assuming "
+                "loopback for the self-call")
+            bound = ""
+        host = "127.0.0.1"
+        if bound == "::":
+            host = "::1"
+        elif bound and bound != "0.0.0.0" and not str(bound).startswith("/"):
+            host = str(bound)
+        return (host, port, scheme == "https")
+
+    @staticmethod
+    def _loopback_tls_context():
+        """TLS context for the self-call; verification is off by default.
+
+        Loopback TLS cannot be authenticated the usual way (the child normally
+        self-signs, and a hostname check against 127.0.0.1 is meaningless), so
+        the tunnel's trust anchor stays what it always was: the child proved it
+        holds a token the parent accepts.  Operators who want the check set
+        ``AGENTS_TUNNEL_LOOPBACK_VERIFY=1``.
+        """
+        import ssl
+
+        if os.environ.get("AGENTS_TUNNEL_LOOPBACK_VERIFY", "").strip().lower() in (
+            "1", "true", "yes",
+        ):
+            return ssl.create_default_context()
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+
     def _local_call(self, method: str, path: str, headers_in: dict, body):
         """Execute the request against this environment's own HTTP service."""
-        port = self._server.port
-        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=None)
+        host, port, use_tls = self._loopback_target()
+        if use_tls:
+            conn = http.client.HTTPSConnection(
+                host, port,
+                timeout=self._LOCAL_CONNECT_TIMEOUT,
+                context=self._loopback_tls_context(),
+            )
+        else:
+            conn = http.client.HTTPConnection(host, port,
+                                              timeout=self._LOCAL_CONNECT_TIMEOUT)
+        conn.connect()
+        # Only the connect phase is bounded (see _LOCAL_CONNECT_TIMEOUT): a big
+        # upload or a streamed response must not be cut off mid-body.
+        if getattr(conn, "sock", None) is not None:
+            conn.sock.settimeout(None)
         headers = {
             str(k): str(v)
             for k, v in (headers_in or {}).items()
@@ -948,7 +1072,13 @@ class TunnelClient:
         if token:
             sep = "&" if "?" in path else "?"
             path = f"{path}{sep}token={urllib.parse.quote(token, safe='')}"
-        local_url = f"ws://127.0.0.1:{self._server.port}{path}"
+        _host, _port, _tls = self._loopback_target()
+        # Same rule as _local_call: the scheme and the host have to follow how
+        # this child actually listens.  WSClient.connect already tolerates a
+        # self-signed child for wss (it retries once without verification), so
+        # only the scheme/host are derived here.
+        local_url = (f"{'wss' if _tls else 'ws'}://"
+                     f"{ws_authority(_host)}:{_port}{path}")
         try:
             local = WSClient.connect(local_url, timeout=10.0)
             # The local endpoint (e.g. an idle terminal) may be silent for a

@@ -17,11 +17,14 @@ from __future__ import annotations
 import contextlib
 import base64
 import hashlib
+import http.client
 import json
 import os
 import socket
+import ssl
 import struct
 import threading
+import types
 import time
 import urllib.error
 import urllib.parse
@@ -2289,3 +2292,178 @@ def test_streaming_body_readers_unit():
         list(iter_chunked_body(io.BytesIO(b"5\r\nhello"), 1 << 20))    # no CRLF
     with pytest.raises(_BodyReaderError):
         list(iter_chunked_body(io.BytesIO(b"xyz\r\n"), 1 << 20))       # bad size
+
+
+# ---------------------------------------------------------------------------
+# Loopback target resolution: the two premises the data plane used to hardcode
+# ---------------------------------------------------------------------------
+
+def _loopback_client(port, protocol="http", server_address=None, bind_host="0.0.0.0"):
+    """A stand-in for the object handed to ``TunnelClient``.
+
+    In production that object is the ``RuntimeHTTPServer`` *wrapper*, and it
+    exposes ``port`` / ``protocol`` / ``bind_host`` -- not the socket-level
+    ``server_address``.  The stand-in follows that shape; the ``bind_host=None``
+    case is the only one that falls back to ``server_address``.
+    """
+    from runtime.tunnel_client import TunnelClient
+    kwargs = {"port": port, "protocol": protocol}
+    if bind_host is not None:
+        kwargs["bind_host"] = bind_host
+    if server_address is not None:
+        kwargs["server_address"] = server_address
+    tc = TunnelClient.__new__(TunnelClient)
+    tc._server = types.SimpleNamespace(**kwargs)
+    return tc
+
+
+def test_loopback_target_follows_bind_and_protocol():
+    assert _loopback_client(7988)._loopback_target() == ("127.0.0.1", 7988, False)
+    assert _loopback_client(
+        7988, "https", bind_host="192.168.1.7")._loopback_target() == ("192.168.1.7", 7988, True)
+    assert _loopback_client(7988, "https")._loopback_target() == ("127.0.0.1", 7988, True)
+    assert _loopback_client(7988, "http", bind_host="::")._loopback_target() == ("::1", 7988, False)
+    # Duck-typed callers that only carry the socket tuple still resolve.
+    assert _loopback_client(7988, bind_host=None, server_address=("10.0.0.5", 7988)
+                            )._loopback_target() == ("10.0.0.5", 7988, False)
+    # Neither: the loopback default, but no longer silently (a missing bind
+    # address used to be swallowed and looked like an unreachable child).
+    assert _loopback_client(7988, bind_host=None)._loopback_target() == ("127.0.0.1", 7988, False)
+    assert hasattr(RuntimeHTTPServer, "bind_host"), (
+        "RuntimeHTTPServer must expose its bind address: the tunnel self-call "
+        "derives its target from the wrapper, and without this it is pinned to "
+        "127.0.0.1 for every child -- including one bound to an interface IP")
+
+
+def test_loopback_target_reads_the_real_wrapper(tmp_path):
+    """Contract lock against the production object, not a stand-in.
+
+    The self-call target is read off whatever is passed to ``TunnelClient``, so
+    the unit tests above can stay green on a stand-in that happens to define an
+    attribute the real server object does not have.  That is exactly how the
+    bind-derived half of the fix stayed inert: a child bound to a concrete
+    address answered every forwarded call with ``ConnectionRefusedError(111)``.
+    """
+    with _real_server(tmp_path, name="loopback-contract") as (srv, data_dir):
+        from runtime.tunnel_client import TunnelClient
+        assert srv.bind_host == "127.0.0.1" and srv.protocol == "http"
+        tc = TunnelClient(srv, data_dir=str(data_dir))
+        assert tc._loopback_target() == ("127.0.0.1", srv.port, False)
+
+
+def test_ipv6_loopback_host_stays_dialable_in_a_ws_url():
+    """A ``::`` bind resolves to ``::1``, and that has to survive URL parsing.
+
+    The stream bridge dials ``ws://<host>:<port><path>``; an unbracketed IPv6
+    literal makes urlsplit read ``::1:7988`` as the port, and the dial dies as
+    ``Invalid port in WebSocket URL`` -- a broken terminal bridge with no TLS
+    or tunnel fault behind it.
+    """
+    from runtime.tunnel_client import ws_authority
+    for host in ("127.0.0.1", "192.168.1.7", "10.0.0.5", "::1", "fe80::1"):
+        url = f"wss://{ws_authority(host)}:7988/v1/terminals/ws?token=x"
+        parsed = urllib.parse.urlsplit(url)
+        assert parsed.hostname == host, url
+        assert parsed.port == 7988, url
+
+
+def test_loopback_call_uses_tls_when_the_child_listens_with_tls():
+    """A TLS-only child used to get a plaintext request: ConnectionResetError(104).
+
+    The child's own ``protocol`` is now the authority, and the loopback context
+    does not verify certificates by default (a self-signed cert against
+    127.0.0.1 cannot be validated meaningfully).
+    """
+    from runtime import tunnel_client as tcmod
+    chosen = {}
+
+    class _Spy:
+        def __init__(self, host, port, timeout=None, context=None):
+            chosen.update(host=host, port=port, timeout=timeout, context=context)
+
+        def connect(self):
+            raise OSError("stop here: the address/protocol choice is what matters")
+
+    plain_used = {}
+
+    class _SpyPlain:
+        def __init__(self, host, port, timeout=None):
+            plain_used.update(host=host, port=port, timeout=timeout)
+
+        def connect(self):
+            raise OSError("stop here")
+
+    real_https, real_http = http.client.HTTPSConnection, http.client.HTTPConnection
+    http.client.HTTPSConnection = _Spy
+    http.client.HTTPConnection = _SpyPlain
+    try:
+        try:
+            _loopback_client(8399, "https")._local_call("GET", "/v1/models", {}, None)
+        except OSError:
+            pass
+        assert chosen.get("host") == "127.0.0.1" and chosen.get("port") == 8399
+        assert chosen.get("context") is not None
+        assert chosen["context"].verify_mode == ssl.CERT_NONE
+        assert plain_used == {}, "plaintext must not be used for a TLS child"
+
+        try:
+            _loopback_client(8400, "http", bind_host="10.0.0.5")._local_call(
+                "GET", "/v1/models", {}, None)
+        except OSError:
+            pass
+        assert plain_used.get("host") == "10.0.0.5", plain_used
+        assert plain_used.get("timeout") == tcmod.TunnelClient._LOCAL_CONNECT_TIMEOUT
+    finally:
+        http.client.HTTPSConnection, http.client.HTTPConnection = real_https, real_http
+
+
+def test_unhandled_local_call_error_answers_instead_of_timing_out():
+    """A non-OSError used to leave the parent waiting out its 600 s timeout.
+
+    ``_req_worker`` swallowed it with only a log line, so the parent had no resp
+    frame and learned about an instant failure after the full forward timeout.
+    """
+    from runtime.tunnel_client import TunnelClient
+    sent = []
+
+    class _Ws:
+        def send(self, *a, **k):
+            return None
+
+    tc = TunnelClient.__new__(TunnelClient)
+    tc._server = types.SimpleNamespace(port=1, protocol="http",
+                                       server_address=("0.0.0.0", 1))
+
+    def _send_resp(ws, rid, status, headers, body):
+        sent.append((rid, status, json.loads(body.decode())))
+
+    def _boom(*a, **k):
+        raise ValueError("bug that is not an OSError")
+
+    tc._send_resp = _send_resp
+    tc._local_call = _boom
+    tc._execute_req(_Ws(), {"id": "r1", "method": "GET", "path": "/", "headers": {},
+                            "body": None})
+    assert sent and sent[0][0] == "r1" and sent[0][1] == 500
+    assert "not an OSError" in sent[0][2]["error"]
+
+
+def test_oserror_answer_names_the_loopback_target():
+    from runtime.tunnel_client import TunnelClient
+    sent = []
+    tc = TunnelClient.__new__(TunnelClient)
+    tc._server = types.SimpleNamespace(port=8391, protocol="https",
+                                       server_address=("172.30.1.9", 8391))
+
+    def _send_resp(ws, rid, status, headers, body):
+        sent.append((status, json.loads(body.decode())))
+
+    def _boom(*a, **k):
+        raise ConnectionRefusedError(111, "Connection refused")
+
+    tc._send_resp = _send_resp
+    tc._local_call = _boom
+    tc._execute_req(object(), {"id": "r2", "method": "GET", "path": "/", "headers": {},
+                               "body": None})
+    assert sent and sent[0][0] == 502
+    assert "https://172.30.1.9:8391" in sent[0][1]["hint"]

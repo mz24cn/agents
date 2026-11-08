@@ -694,3 +694,34 @@ class TestSlowClientTimeouts:
                 raw.close()
         finally:
             srv.stop()
+
+
+def test_tunnel_loopback_self_call_reaches_a_tls_only_child(patched_paths):
+    """The tunnel's self-call completes a real TLS handshake with this process.
+
+    ``runtime/tunnel_client._loopback_target()`` reads protocol/host/port off the
+    object handed to ``TunnelClient`` -- in production the ``RuntimeHTTPServer``
+    wrapper, which has to expose its bind address the same way it exposes
+    ``port`` and ``protocol``.  Unit tests in ``tests/test_tunnel.py`` inject a
+    stand-in for that object, so this is the one place where the whole path is
+    exercised: https child, the stdlib-generated fallback certificate, the
+    unverified loopback context, and an actual request that comes back 200.
+    """
+    from runtime.tunnel_client import TunnelClient
+
+    srv = _make_server(patched_paths, protocol="https")
+    try:
+        assert srv.protocol == "https"
+        assert srv.bind_host == "127.0.0.1"
+
+        client = TunnelClient(srv, data_dir=str(patched_paths))
+        assert client._loopback_target() == ("127.0.0.1", srv.port, True)
+
+        status, headers, resp = client._local_call("GET", "/v1/models", {}, None)
+        body = resp.read()
+        resp.close()
+        assert status == 200, (status, body[:200])
+        assert json.loads(body) == {"models": []}
+        assert any(k.lower() == "content-type" for k in headers)
+    finally:
+        srv.stop()

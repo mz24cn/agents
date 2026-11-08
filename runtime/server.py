@@ -724,3 +724,20 @@ class RuntimeHTTPServer:
     def protocol(self) -> str:
         """Return the protocol the server is serving ("http" or "https")."""
         return self._protocol
+
+    @property
+    def bind_host(self) -> str:
+        """The address this server actually listens on, as a string.
+
+        ``port`` and ``protocol`` already follow the running socket, and the
+        host has to as well: callers that dial *this* service -- above all the
+        tunnel's loopback self-call in ``runtime/tunnel_client.py`` -- cannot
+        assume ``127.0.0.1``.  A service bound to a concrete interface address
+        is not reachable there at all, and one bound to ``::`` is only reachable
+        on ``::1``.  Falls back to the configured bind host before start().
+        """
+        if self._server is not None:
+            addr = getattr(self._server, "server_address", None)
+            if isinstance(addr, tuple) and addr:
+                return str(addr[0])
+        return self._bind_host

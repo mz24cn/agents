@@ -194,7 +194,7 @@ https://user:password@host:7988/
 - 子端断线后按 **1–30s 指数退避**重拨；子端自身的 WS 读超时为 95s（90+5），因此**母端整体静默时，子端也会自己判定通道死亡并重拨**——两侧都能独立自愈；
 - `tunnel_id` 持久化在磁盘，子端重启后自动重拨，隧道自动恢复。
 
-**自我授权（安全核心）**：母端下发的 req 帧由子端在**本地回环 HTTP**（`127.0.0.1:port`）上执行，子端的正常 handler 与授权机制**原样生效**——子端启用授权时，会为自己签发一个会话凭证并附在回环请求上（stream 桥接的握手则附一个短时效 setup token）。结果是：**母端永远不需要存储任何子端凭据**，隧道鉴权只依赖"子端能出示母端认可的 token 来建立这条 WS"这一件事。
+**自我授权（安全核心）**：母端下发的 req 帧由子端在**自己的监听端口上**重放（回环目标按监听方式解析：明文子端 `http://127.0.0.1:port`，https 子端走 `https://` 并按实际绑定地址连接，见 §8），子端的正常 handler 与授权机制**原样生效**——子端启用授权时，会为自己签发一个会话凭证并附在回环请求上（stream 桥接的握手则附一个短时效 setup token）。结果是：**母端永远不需要存储任何子端凭据**，隧道鉴权只依赖"子端能出示母端认可的 token 来建立这条 WS"这一件事。
 
 **参数速查表**：
 
@@ -232,7 +232,7 @@ https://user:password@host:7988/
 
 - 会话绑定子端后，该会话的**全部工具**来自子端：工具 ID / 名称保留子端原名（`exec_shell`、`write_file`、`exec_cli`……），**与本地执行观感完全一致**；远程工具不注册进母端全局工具注册表，同一会话内远程与本地工具绝不混用；
 - **推理留在母端**：模型调用、会话历史、上下文管理全部发生在母端；
-- 每次工具调用被转发到子端 `POST /v1/tools/call`，并携带母端请求上下文中**可移植的部分**（`workspace` / `session_id` / `user_message_timestamp` / `depth` / `agent_id` / `agent_ids` / `all_agent_ids` / `model_id` / `available_tool_ids`），统一编码为 `X-Agents-Request-Context` header 里的**一个 base64url JSON 值**（与 Bearer 认证头同级的传输层上下文；`/v1/tools/call` 的 payload 保持 `tool_id` + `arguments` 的纯工具调用契约）——**子端的文件 journal、终端、delegate 子会话与母端会话同 id**：在子端发生的文件变更，能在母端 UI 里以同一会话追溯。host 相关的 `session_dir`、文件 journal holder 与各服务器单例**由子端按自身重建**，不转发。
+- 每次工具调用被转发到子端 `POST /v1/tools/call`，并携带母端请求上下文中**可移植的部分**（`workspace` / `session_id` / `user_message_timestamp` / `depth` / `agent_id` / `agent_ids` / `all_agent_ids` / `model_id` / `available_tool_ids`），统一编码为 `X-Agents-Request-Context` header 里的**一个 base64url JSON 值**（与 Bearer 认证头同级的传输层上下文；`/v1/tools/call` 的 payload 保持 `tool_id` + `arguments` 的纯工具调用契约）——**子端的文件 journal 与终端和母端会话同 id**（`delegate` / `talk_to` 的子会话本身在母端，见 6.6；它们落到子端的叶子调用仍带着同一个 `session_id`）：在子端发生的文件变更，能在母端 UI 里以同一会话追溯。host 相关的 `session_dir`、文件 journal holder 与各服务器单例**由子端按自身重建**，不转发。
 
 - **会话上下文只走 header、绝不放 body**：`X-Agents-Request-Context` 是唯一的传输通道，`POST /v1/tools/call` 的 JSON body 只承载 `tool_id` + `arguments`（直连调用方也一样——把 `workspace` / `session_id` / `user_message_timestamp` 塞进 body 会被忽略，工具只在子端默认工作区里执行）。
 
@@ -267,7 +267,7 @@ https://user:password@host:7988/
 
 远程执行不是"只能跑 shell"的简化形态，会话级能力完整随迁到子端：
 
-- **talk_to / delegate / 群聊**：子代理与子会话在子端执行，子会话 id 同样挂在母端会话下；请求上下文里的 `depth` / `agent_id` / `agent_ids` / `all_agent_ids` 会一并转发，`tool_scope` 由子端按转发的 `available_tool_ids` 在**自身 registry** 上重建（子工具在子端解析）。注意：**agent 名册本身不跨主机同步**，子端需具备与母端一致的 agent 定义，否则 talk_to 在子端解析目标会失败；
+- **talk_to / delegate / 群聊（编排留在母端，落到子端的是叶子工具）**：`talk_to` 与 `delegate` 列在 `remote_tool_proxy.PARENT_SIDE_TOOLS`，会话绑定子端时**不转发**——`wrap_parent_configs` 对这两项原样保留母端配置（回归测试断言它们是同一对象、`is_remote_proxy is False`、`callable_fn is None`），目标 agent 仍由**母端**的 AgentManager 解析，子会话（`{父会话}-talk_{ts}_{agent_id}` / `{父会话}-sub_{ts}`）也在母端创建与持久化。理由是 agent 名册与群聊编排上下文只存在于母端进程：子端是独立环境，没有本次会话/群聊的 agent 信息，转过去既解析不出目标，也会把编排逻辑劈到两端。**落到子端的是执行类叶子工具**：目标 agent 的工具清单按**母端 registry** 按其自身 `tool_ids` 构建（与本地模式一致；早期取「顶层选中工具 ∩ agent 自己的 `tool_ids`」会让清单里写了 `talk_to`、而本次会话没选它的 agent 静默丢工具，该回归由 `tests/test_remote_group_chat_talk_to.py` 锁住），其中文件 / 终端 / MCP 条目再包成代理转发——即**子 agent 的推理在母端、它的工具调用在子端**；`delegate` 把继承来的 `tool_scope` 里的代理条目直接交给子请求（`runtime/builtin_tools_agent.py` 的 `scope_by_id`），所以委托出去的子 agent 的工具同样打在子端。`depth` / `agent_id` / `agent_ids` / `all_agent_ids` / `available_tool_ids` 仍随每次叶子调用转发，子端据此在自己的 registry 上重建 `tool_scope`、把文件变更挂到母端可见的同一会话与用户轮次上。**因此 agent 名册不需要跨主机同步**（这正是把编排留在母端的原因）；需要跨主机对齐的是**工具**——母端给 schema、子端按 `tool_id` 执行，见八。
 - **Skill 渐进披露**：披露由**母端**推理循环触发（子端 `/v1/tools/call` 不执行 skill 条目），`SKILL.md` 正文从子端 `GET /v1/tools/skill/{id}` 拉取并**缓存 300s**；
 - **MCP 工具**：以 function 条目形式代理，由子端执行；base64 前后置（把 `base64` 参数里的文件路径读成内容、把过长的 base64 结果落盘换成本机路径）由**母端**负责——子端 `/v1/tools/call` 始终原样执行，其直接 API 调用方拿到的仍是真实 base64，而不是服务器上的文件路径。**路径型 `base64` 参数若只存在于子端**（母端读不到），母端会把 `{"base64": "auto"}` 随 `X-Agents-Request-Context` 转发给子端，由子端用自己的文件系统把该路径读成 base64 后再交给（子端本地）MCP 工具；过长 base64 结果的落盘仍由母端完成；
 - **工具列表缓存 TTL 30s**：子端工具集变化（如隧道重连、推送更新后）会在 TTL 过期时自动失效刷新；
@@ -393,7 +393,10 @@ server {
 
 > ⚠️ **匿名母端风险**：母端未设密码时，**任何能到达其端口的客户端都可以注册隧道，并借母端代理到子端的本地端点**——对已注册的子端，隧道数据面等价于对该子端本地服务的直调。**不要把匿名母端暴露到不受信网络**：要么为母端启用授权（token），要么确保母端端口不可从公网 / 不受信网段到达。场景三（7.3）是后一种做法的正规形态：公网面收敛到一座带口令的 HTTPS 反向代理上，风险由代理承担——前提是确实没有别的路径能直达母端端口。
 
-- **已知限制（实测发现）**：子端本地回环调用使用**明文 HTTP**（`127.0.0.1:port`），因此**仅以 TLS 监听（纯 https 部署）的子端无法承载隧道数据流量**——控制链路仍可建立（注册成功、hello 成功、状态显示在线），但 req / stream 转发会失败。此类子端应使用**直连模式**，或让本地回环同时接受明文 HTTP。**直连模式不受此限制影响。**
+- **回环目标按监听方式解析（曾经的限制，现已修复）**：子端把母端下发的 req 帧在自己进程上重放，回环目标由 `_loopback_target()` 决定——协议取 `server.protocol`（https 子端走 `HTTPSConnection` / `wss://`），地址取实际绑定地址（绑 `0.0.0.0` → `127.0.0.1`、绑 `::` → `::1`、`AGENTS_URL` 写具体网卡 IP 就连那个 IP）。早期版本把回环写死为明文 `127.0.0.1`，纯 https 监听或绑定非回环 IP 的子端因此出现「控制链路全绿（注册、hello、在线状态都不经过回环）而每次 req / stream 都失败」的假在线；现在两类部署都能直接走隧道。
+  - 回环 TLS **默认不校验证书**：回环上的 TLS 无法用常规方式认证（子端通常自签，而对 `127.0.0.1` 做主机名校验没有意义），隧道真正的信任锚仍然是「子端出示了母端认可的 token」。想收回这份宽松：设 `AGENTS_TUNNEL_LOOPBACK_VERIFY=1` 走默认证书校验上下文。
+  - 回环调用只在 connect 阶段有超时（10 s），连上之后不设超时，以免截断大 body 与流式响应；未捕获的本地错误会回 `resp 500`，`OSError` 回 `resp 502` 并在错误文本里带出解析出的回环目标，便于判断「环境不健康」。
+  - 绑定 `::` 时回环地址是 `::1`，它在 URL 里必须带方括号（`ws://[::1]:7988/…`）：不带括号时 `urlsplit` 会把 `::1:7988` 读成端口，stream 桥接在握手之前就死在 `Invalid port in WebSocket URL`——一个与隧道本身毫无关系的终端桥接故障。
 
 ---
 
