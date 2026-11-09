@@ -386,11 +386,39 @@
   // 推理途中的“附加新的消息”：草稿排队到当前推理的下一个轮边界。
   // 不清空输入框 —— 由 ChatPage 在收到 queued 确认后清空（请求失败时
   // 草稿保留，可直接重试）。
+  // 与 stop-menu 其它动作不同，插话是同 generation 的续跑，不会翻转
+  // isStreaming/isPaused/pauseRequested 中任何一个 —— 状态驱动的解锁
+  // 永远不会触发。所以这里只上“请求在途”的瞬时锁，请求一落地就释放，
+  // 让用户能立刻插下一条；幂等保护由在途锁本身承担。
+  // 两个入口（推理中回车、菜单里的 💬）都必须走 submitInterject：漏掉
+  // 解锁的那条路会把这一代推理的 暂停/停止/强制停止 全部禁用掉。
   function handleInterjectText() {
     syncTextFromEditor()
     const trimmed = text.trim()
-    if (!trimmed || disabled) return
-    onInterject?.(trimmed)
+    if (!trimmed || disabled) return null
+    return onInterject?.(trimmed) ?? null
+  }
+
+  function submitInterject() {
+    if (actionPending) return
+    closeStopMenu()
+    actionPending = true
+    const release = () => { actionPending = false }
+    let done = null
+    try {
+      done = handleInterjectText()
+    } catch (err) {
+      // A failure before the request even starts must not cost the user the
+      // stop controls for the rest of the generation either.
+      release()
+      onError?.(String(err?.message || err))
+      return
+    }
+    if (done && typeof done.then === 'function') {
+      done.then(release, release)
+    } else {
+      release()
+    }
   }
 
   /**
@@ -454,10 +482,8 @@
       if (isStreaming) {
         // 推理中回车 = “附加新的消息”（与下拉菜单项同一动作）：不打断当前
         // 模型轮，草稿排队到下一个轮边界。输入框为空则不动作。
-        if (onInterject && !actionPending) {
-          closeStopMenu()
-          actionPending = true
-          handleInterjectText()
+        if (onInterject) {
+          submitInterject()
         }
         return
       }
@@ -568,7 +594,7 @@
             <button class="stop-menu-item" onclick={() => pickStopAction(onStop)}><span class="stop-menu-icon">⏹️</span>{t('stopInference')}</button>
             <button class="stop-menu-item danger" onclick={() => pickStopAction(onStopForce)}><span class="stop-menu-icon">⛔</span>{t('forceStopInference')}</button>
             {#if onInterject && text.trim()}
-              <button class="stop-menu-item" onclick={() => pickStopAction(handleInterjectText)}><span class="stop-menu-icon">💬</span>{t('attachNewMessage')}</button>
+              <button class="stop-menu-item" onclick={() => submitInterject()}><span class="stop-menu-icon">💬</span>{t('attachNewMessage')}</button>
             {/if}
           </div>
         {/if}
