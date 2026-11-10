@@ -1109,8 +1109,9 @@
       const message = clientToolResultMessage(call, content)
       answers.push(message)
       answeredNames.push(call.name)
-      // The service persists submitted messages but does not rebroadcast them as
-      // frames, so the answer only shows up here if we show it ourselves.
+      // The service brokers what this client submitted to the session's other
+      // clients, but never echoes it back to the one that posted it (one call,
+      // one result), so this tab has to render its own answer.
       shown.push({ ...message, timestamp: new Date().toISOString() })
     }
     if (!answers.length) return
@@ -1633,6 +1634,17 @@
         store.messages = u
       }
     } else if (msg.role === 'tool') {
+      // Another client of this session answered a client-side call (the result
+      // frame is brokered to everyone, including the clients that cannot run
+      // the tool). A question still queued here is stale: it asks the user for
+      // a decision that is already made, and answering it would put a second
+      // result on a call that has one.
+      const answeredCallId = getToolUseId(msg) || msg.tool_call_id
+      if (answeredCallId) {
+        const sid = keyRef.key === '__new__' ? sessionId : keyRef.key
+        if (questionLedger.settleExternallyAnswered(sid, answeredCallId)) askUserBump()
+      }
+
       // Formal/streaming tool frames should already carry the caller's
       // agent_id. Recover it from the declaring assistant call for older or
       // partially replayed streams, so concurrent agents cannot steal each
@@ -1911,7 +1923,15 @@
         store.isStreaming = true
         store.streamConnection = 'reconnecting'
       }
-      errorMsg = ''
+      // A refused submission is not a dropped connection. One client-side call
+      // has exactly one result, so when another client answered the same call
+      // first this tab's answer is refused on purpose and never becomes part of
+      // the conversation. Re-attaching the session stream below replaces the
+      // locally shown copy of that answer with the result the session kept --
+      // but the user is owed the reason their own answer disappeared.
+      errorMsg = err?.payload?.code === 'client_tool_already_answered'
+        ? (err?.message || '')
+        : ''
       subscribeToExistingSession(sid, { handoff: true })
       return
     }

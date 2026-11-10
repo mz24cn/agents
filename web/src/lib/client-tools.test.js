@@ -347,4 +347,26 @@ describe('the question ledger', () => {
     expect(ledger.settle(handle.key, { value: 'b' })).toBe(false)
     await expect(handle.promise).resolves.toEqual({ value: 'a' })
   })
+
+  it('drops a question another client of the session answered', async () => {
+    // The result frame of a client-side call is brokered to every client of the
+    // session, so a browser that did not run the tool sees it being answered.
+    // Its own question is stale from that moment: the decision is already made,
+    // and answering would put a second result on a call that has exactly one.
+    const ledger = createQuestionLedger()
+    const answered = ledger.ask('s1', 'call_1', req('别人已经答过了'))
+    const waiting = ledger.ask('s1', 'call_2', req('这个还没人答'))
+    expect(ledger.settleExternallyAnswered('s1', 'call_1')).toBe(1)
+    // abandoned: the caller must not post a result for it
+    expect(answered.abandoned).toBe(true)
+    await expect(answered.promise).resolves.toEqual({
+      value: null, dismissed: true, abandoned: true,
+    })
+    // Only that call was settled - the other question of the same session waits.
+    expect(ledger.visibleFor('s1').call_id).toBe('call_2')
+    // A result frame nobody here is waiting for changes nothing.
+    expect(ledger.settleExternallyAnswered('s1', 'call_server_side')).toBe(0)
+    expect(ledger.settleExternallyAnswered(null, 'call_2')).toBe(0)
+    ledger.settle(waiting.key, { value: 'a' })
+  })
 })

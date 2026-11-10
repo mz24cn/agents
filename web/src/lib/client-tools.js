@@ -346,6 +346,27 @@ export function createQuestionLedger() {
       return items.some((item) => item.session_id === sessionId && item.call_id === callId)
     },
 
+    /**
+     * This call was answered by someone else: end the queued question here and
+     * tell the caller not to post a result for it.  Returns how many settled.
+     *
+     * A session can have several clients and one client-side call has exactly
+     * one result, so a question still open here after the result reached the
+     * session is stale on two counts: it asks the user for a decision that is
+     * already made, and answering it would put a second result on a call that
+     * already has one.  The result frame is what makes this observable -- it is
+     * brokered to every client of the session, including the ones that cannot
+     * run the tool themselves.
+     */
+    settleExternallyAnswered(sessionId, callId) {
+      if (!sessionId || !callId) return 0
+      const matches = items.filter(
+        (item) => item.session_id === sessionId && item.call_id === callId,
+      )
+      for (const item of matches) this.settle(item.key, { value: null, dismissed: true, abandoned: true })
+      return matches.length
+    },
+
     /** End every question of one session as "no answer"; returns how many. */
     dropSession(sessionId) {
       if (!sessionId) return 0

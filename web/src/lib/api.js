@@ -269,9 +269,24 @@ export function inferStream(body, onMessage, onDone, onError, onInit = null, onS
   })
     .then((res) => {
       if (!res.ok) {
-        return res.json().then((d) => {
-          throw new Error(d.error || `Stream request failed: ${res.status}`)
-        })
+        // A rejected inference carries a structured body. Keep the status and
+        // that payload on the Error: the page has to tell *why* the request was
+        // refused from the way a connection dropped. A duplicate answer of a
+        // client-side call, for instance, is not a transport failure, and the
+        // answer the user gave is deliberately not part of the conversation.
+        return res.json().then(
+          (d) => {
+            const err = new Error(d?.error || `Stream request failed: ${res.status}`)
+            err.status = res.status
+            if (d && typeof d === 'object') err.payload = d
+            throw err
+          },
+          () => {
+            const err = new Error(`Stream request failed: ${res.status}`)
+            err.status = res.status
+            throw err
+          },
+        )
       }
       const reader = res.body.getReader()
       const decoder = new TextDecoder()

@@ -39,8 +39,10 @@ from runtime.models import (
 from runtime.server_state import (
     _session_stream_lock,
     _session_streams,
+    answered_client_tool_call_ids,
     begin_session_stream,
     clear_infer_control,
+    claim_client_tool_answers,
     close_infer_loop,
     disconnect_session_stream_starter,
     end_paused_session_status,
@@ -55,6 +57,7 @@ from runtime.server_state import (
     pending_client_tool_calls,
     publish_session_stream_frame,
     queue_infer_interjection,
+    release_client_tool_answers,
     request_pause_infer,
     seed_paused_status,
     set_session_stream_agents,
@@ -940,6 +943,32 @@ class HandlerInferMixin:
             image_resolver=remote_image_resolver,
         )
 
+        # One client-side call has exactly one result, whichever client ran the
+        # tool.  Arbitrate before this request can start a generation of its
+        # own: a session can have several clients that all have the tool, and
+        # the first answer back is the one the conversation continues with.
+        claimed_answers: list[str] = []
+        if use_session and session_id is not None:
+            conflicts, claimed_answers = self._claim_client_tool_answers(
+                body, request, context_manager, session_id,
+            )
+            if conflicts:
+                logger.info(
+                    "infer: refused duplicate client-side answer(s) %s for session %s",
+                    ", ".join(conflicts), session_id,
+                )
+                self._send_json_response(409, {
+                    "error": (
+                        "Client-side tool call(s) already answered in this session: "
+                        f"{', '.join(conflicts)}. A call has exactly one result and "
+                        "the first answer back is the one that counts; this session "
+                        "has continued with it."
+                    ),
+                    "code": "client_tool_already_answered",
+                    "answered_call_ids": conflicts,
+                })
+                return None
+
         session_dir = None
         if use_session and session_id is not None:
             session_dir = os.path.dirname(context_manager._conversation_path(session_id))
@@ -964,6 +993,7 @@ class HandlerInferMixin:
             model_id=body["model_id"],
             remote_env=remote_env_id,
             remote_tool_proxy=remote_proxy,
+            client_answer_claims=claimed_answers,
         )
 
         agent_nickname = agent.get("nickname") if agent else None
@@ -1031,6 +1061,65 @@ class HandlerInferMixin:
         names.discard("")
         return names
 
+    def _claim_client_tool_answers(
+        self, body: dict, request: InferenceRequest, context_manager, session_id: str,
+    ) -> tuple[list, list]:
+        """Take this request's claim on the client-side calls it is answering.
+
+        Returns ``(conflicts, claimed)``: the call ids this request may not
+        answer, and - when there are none - the ids it now holds a claim on.
+        Exactly one of the two is ever non-empty: a refusal claims nothing, and
+        the caller must not release the ids another request is still holding.
+
+        ``tool_type='client_side'`` means this service cannot run the tool, so
+        every client of the session that has the tool can answer the same call,
+        and exactly one of those answers becomes the conversation's result.  Two
+        sources say who was first:
+
+        * ``conversation.json`` - the call already has a ``role=tool`` result, so
+          this submission is a late duplicate (another client answered it, or
+          this client is retrying a POST that did in fact land);
+        * the in-memory claim table - another request of this session is still
+          carrying its answer, which the history cannot show until it persists.
+
+        Only answers to calls of this session's client-side tools are considered:
+        the service executes every other tool itself, and a caller that resends
+        its own history is not answering anything.
+        """
+        submitted_ids: list[str] = []
+        for raw in (body.get("messages") or []):
+            if not isinstance(raw, dict) or raw.get("role") != "tool":
+                continue
+            call_id = raw.get("tool_use_id") or raw.get("tool_call_id")
+            if call_id:
+                submitted_ids.append(str(call_id))
+        if not submitted_ids:
+            return [], []
+        client_names = self._client_side_tool_names(request)
+        if not client_names:
+            return [], []
+        try:
+            history = context_manager.load_conversation(session_id)
+        except (OSError, ValueError) as exc:
+            # Without the history this request cannot prove it is a duplicate;
+            # the claim table below still arbitrates the in-flight case.
+            logger.warning(
+                "infer: cannot read conversation of session %s to arbitrate "
+                "client-side answers: %s", session_id, exc,
+            )
+            history = []
+        settled = answered_client_tool_call_ids(history, client_names)
+        conflicts = [call_id for call_id in submitted_ids if call_id in settled]
+        if conflicts:
+            return conflicts, []
+        # The claim table answers with the ids it refused, not with the ids it
+        # took -- conflating the two both hides this refusal from the caller and
+        # makes the loser's cleanup hand back the *winner's* claim.
+        refused = claim_client_tool_answers(session_id, submitted_ids)
+        if refused:
+            return refused, []
+        return [], submitted_ids
+
     def _finalize_file_journal(self) -> None:
         """Best-effort turn-level reconciliation of registered file changes."""
         journal_holder = get_request_context("file_journal_holder")
@@ -1047,12 +1136,21 @@ class HandlerInferMixin:
         self._finalize_file_journal()
         set_request_context(file_journal_manager=None)
 
+        # Whatever became of this run, the client-side answers it submitted are
+        # no longer this request's to give: give the calls back so they can be
+        # answered again.  The conversation itself is what keeps an already
+        # answered call answered.
+        claims = get_request_context("client_answer_claims")
+        if claims:
+            release_client_tool_answers(get_request_context("session_id"), claims)
+
         clear_request_context([
             "sse_callback", "cancel_event", "session_id", "session_dir",
             "user_message_timestamp", "user_message_timestamp_fallback_used",
             "depth", "tool_scope", "available_tool_ids",
             "context_manager", "session_manager", "agent_manager", "workspace",
             "agent_id", "agent_ids", "all_agent_ids", "mentioned_agent_ids",
+            "client_answer_claims",
             "file_journal_holder", "file_journal_session_id",
             "file_journal_session_dir", "file_journal_user_message_timestamp",
             "file_journal_timestamp_fallback_used",
@@ -1287,26 +1385,39 @@ class HandlerInferMixin:
                 )
                 if published_seq is not None:
                     latest_stream_seq = published_seq
-            # The initiating browser renders the submitted user turn from the
-            # POST stream's init event, but other browsers only consume the
-            # retained session stream. Publish the user turn into that broker
-            # before announcing "streaming" so a newly attached browser sees
-            # the prompt before any assistant/tool frames. Use the request body
-            # rather than expanded workspace content to preserve exactly what
-            # the user submitted in the UI.
-            raw_user_messages = [
+            # Whatever this request *submitted* is invisible to the session's
+            # other clients unless it is brokered here: the loop only replays
+            # what the inference produced.  Both kinds are published before the
+            # "streaming" broadcast, so a browser that attaches mid-run sees
+            # them before any assistant/tool frame, in the order
+            # conversation.json keeps them.  Use the request body rather than
+            # expanded workspace content to preserve exactly what was submitted.
+            #   * the user turn: the initiating browser renders it from its own
+            #     POST, every other browser only consumes the retained stream;
+            #   * a ``role=tool`` answer to a handed-back client-side call
+            #     (``tool_type='client_side'``).  The caller ran that tool; this
+            #     service never does and has no result frame of its own to
+            #     emit, so without this every OTHER client of the session keeps
+            #     showing that call as still running -- until its page is
+            #     reloaded and conversation.json fills the gap in.  The web UI
+            #     is frequently the bystander here while the process driving
+            #     the session (e.g. the online debugger) is the one executing.
+            # Published to the broker only, never mirrored back to the
+            # submitting connection: a client renders what it posted, and one
+            # client-side call has exactly one result to display.
+            raw_submitted_messages = [
                 raw for raw in (_body.get("messages") or [])
-                if isinstance(raw, dict) and raw.get("role") == "user"
+                if isinstance(raw, dict) and raw.get("role") in ("user", "tool")
             ]
-            for raw_user in raw_user_messages:
-                user_frame = dict(raw_user)
-                user_frame["role"] = "user"
-                if not user_frame.get("timestamp") and user_message_ts:
-                    user_frame["timestamp"] = user_message_ts
-                if mentioned_for_init and not user_frame.get("mentions"):
-                    user_frame["mentions"] = mentioned_for_init
+            for raw_submitted in raw_submitted_messages:
+                submitted_frame = dict(raw_submitted)
+                if submitted_frame["role"] == "user":
+                    if not submitted_frame.get("timestamp") and user_message_ts:
+                        submitted_frame["timestamp"] = user_message_ts
+                    if mentioned_for_init and not submitted_frame.get("mentions"):
+                        submitted_frame["mentions"] = mentioned_for_init
                 published_seq = publish_session_stream_frame(
-                    session_id, user_frame, owner_event=cancel_event,
+                    session_id, submitted_frame, owner_event=cancel_event,
                 )
                 if published_seq is not None:
                     latest_stream_seq = published_seq

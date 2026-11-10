@@ -508,6 +508,133 @@ def pending_client_tool_calls(merged_turns: list, client_tool_names) -> list:
     return pending
 
 
+def answered_client_tool_call_ids(merged_turns: list, client_tool_names) -> set:
+    """Client-side calls this conversation already has a result for.
+
+    The mirror image of :func:`pending_client_tool_calls`: of the calls that
+    belong to the session's client-side tools, these are the ones a
+    ``role="tool"`` turn already answers.
+
+    A session can have several clients and one client-side call has exactly one
+    result, so this is the durable half of the arbitration: whoever answered
+    first is in the conversation, and any later answer for the same call is a
+    duplicate.  Position decides it, not mere presence: a call id that was
+    answered and then **declared again** (models are not always disciplined about
+    id uniqueness across rounds) is a new call waiting for its first result, so
+    an id counts as answered only when its last appearance in the history is the
+    result.  Takes the same turn shapes as :func:`pending_client_tool_calls`
+    (dicts or objects), so a persisted conversation can be passed straight in.
+    """
+    names = set(client_tool_names or ())
+    if not names:
+        return set()
+
+    def _field(obj, key):
+        return obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
+
+    # id -> (state, position of that state)
+    last_seen: dict = {}
+    for position, turn in enumerate(merged_turns):
+        role = _field(turn, "role")
+        if role == "assistant":
+            for call in _field(turn, "tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                if call.get("name", "") not in names:
+                    continue
+                call_id = call.get("id") or call.get("tool_use_id")
+                if call_id:
+                    last_seen[str(call_id)] = ("declared", position)
+        elif role == "tool":
+            call_id = _field(turn, "tool_use_id")
+            if call_id is not None and str(call_id) in last_seen:
+                last_seen[str(call_id)] = ("answered", position)
+
+    return {
+        call_id for call_id, (state, _) in last_seen.items() if state == "answered"
+    }
+
+
+# One client-side call has exactly one result, whichever client produced it.
+# ``answered_client_tool_call_ids`` reads that back out of conversation.json, but
+# two clients can post their answer for the same call at the same moment --
+# before either answer has reached disk, where the history can arbitrate.  A
+# request that submits answers therefore also *claims* the call ids it answers
+# for as long as its own generation runs: the client that claimed first is the
+# one whose result counts, and the other is told so instead of starting a
+# competing turn.
+_client_answer_claims: dict[str, dict[str, float]] = {}
+_client_answer_claims_lock = threading.Lock()
+
+# A claim only has to outlive the request that took it.  The TTL is the safety
+# net for a handler that dies before releasing: an id nobody could ever answer
+# again would be worse than a duplicate, which the persisted history now
+# rejects on its own.  Overridable for tests.
+CLIENT_ANSWER_CLAIM_TTL_S = 900.0
+
+
+def _client_answer_claim_ttl_s() -> float:
+    raw = os.environ.get("CLIENT_ANSWER_CLAIM_TTL_S", "")
+    if not raw.strip():
+        return CLIENT_ANSWER_CLAIM_TTL_S
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return CLIENT_ANSWER_CLAIM_TTL_S
+
+
+def claim_client_tool_answers(
+    session_id, call_ids, ttl_s: Optional[float] = None,
+) -> list:
+    """Claim the right to answer these client-side calls of one session.
+
+    Returns the ids that are already claimed -- answered and persisted, or
+    answered by another request that is still in flight -- and claims nothing in
+    that case.  All-or-nothing on purpose: a handoff batch belongs to one model
+    round, so silently answering part of it would leave the session waiting for
+    results that were thrown away.  The calls that stayed unanswered remain
+    pending in the conversation, where any client can still answer them.
+    """
+    ids = [str(call_id) for call_id in (call_ids or []) if call_id]
+    if not session_id or not ids:
+        return []
+    ttl = _client_answer_claim_ttl_s() if ttl_s is None else ttl_s
+    now = time.monotonic()
+    with _client_answer_claims_lock:
+        claims = _client_answer_claims.setdefault(session_id, {})
+        for call_id, deadline in list(claims.items()):
+            if deadline <= now:
+                claims.pop(call_id, None)      # the holder is gone; free the id
+        conflicts = [call_id for call_id in ids if call_id in claims]
+        if conflicts:
+            return conflicts
+        for call_id in ids:
+            claims[call_id] = now + ttl
+    return []
+
+
+def release_client_tool_answers(session_id, call_ids=None) -> None:
+    """Give back the claim on these calls: the generation that took it is over.
+
+    Releasing is not what allows a second result -- once the first answer is in
+    conversation.json the history check rejects later ones.  It only keeps the
+    in-memory table from holding calls no client can answer any more.
+    """
+    if not session_id:
+        return
+    with _client_answer_claims_lock:
+        claims = _client_answer_claims.get(session_id)
+        if not claims:
+            return
+        if call_ids is None:
+            _client_answer_claims.pop(session_id, None)
+            return
+        for call_id in call_ids:
+            claims.pop(str(call_id), None)
+        if not claims:
+            _client_answer_claims.pop(session_id, None)
+
+
 def merge_stream_messages(stream_messages: list) -> tuple[list, Optional[dict]]:
     """Merge streamed messages without mixing concurrent agent buffers.
 

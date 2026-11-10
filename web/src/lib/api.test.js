@@ -451,6 +451,33 @@ describe('inferStream (post-init handoff)', () => {
     await settle()
     expect(done).toHaveBeenCalledOnce()
   })
+
+  it("hands a refusal's reason to onError, not just its text", async () => {
+    // A second answer for one client-side call is refused with a structured
+    // body. The page must be able to tell that deliberate refusal from a
+    // dropped connection: one call has exactly one result, so the answer this
+    // tab posted is not part of the conversation and its row has to give way.
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: false,
+      status: 409,
+      json: () => Promise.resolve({
+        error: 'Client-side tool call(s) already answered in this session: call_c1',
+        code: 'client_tool_already_answered',
+        answered_call_ids: ['call_c1'],
+      }),
+    }))
+
+    const error = vi.fn()
+    inferStream({ messages: [] }, vi.fn(), vi.fn(), error)
+    await settle()
+
+    expect(error).toHaveBeenCalledOnce()
+    const [err] = error.mock.calls[0]
+    expect(err.status).toBe(409)
+    expect(err.name).not.toBe('AbortError')
+    expect(err.payload.code).toBe('client_tool_already_answered')
+    expect(err.payload.answered_call_ids).toEqual(['call_c1'])
+  })
 })
 
 // ---------------------------------------------------------------------------

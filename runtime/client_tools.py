@@ -14,6 +14,25 @@ exists three times on purpose:
 ``tui/client_tools.py``       terminal implementation (question modal + shell)
 ======================  ==========================================================
 
+Where the result goes is part of the contract too: the client that ran the call
+posts it back on the same session as a ``role='tool'`` message, and the service
+brokers that message into the session's retained inference stream -- the frames
+every other client of the session consumes -- so a client that is merely
+watching (a web page looking at a session a script is driving) stops showing the
+call as still running.  It is never echoed back to the connection that posted it
+(like a submitted user turn: a client renders what it submitted itself), and one
+call has exactly one result -- enforced, not merely expected: several clients of a
+session can all have the same tool, and the service takes the first answer back
+for a call and refuses a later one (``409`` with
+``code='client_tool_already_answered'`` and the offending ``answered_call_ids``)
+instead of running a competing turn.  A front end therefore has to be able to tell
+its own answer disappearing from a connection dropping.
+
+A handoff is not addressed to one client and nothing about it is claimable: every
+client that has the tool is expected to show the question, since the user may well
+walk away from the machine that saw it first and answer from another device.  The
+client that answered first simply wins.
+
 AskUser is registered as a built-in tool at start-up
 (``runtime.builtin_tools.register_builtin_tools``), so it is available without
 anyone registering it by hand, and being built in keeps it out of
