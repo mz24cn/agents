@@ -153,7 +153,15 @@ def _blob_ref(session_dir: str, turn_key: str, rel_path: str, role: str, raw: by
     }
 
 
-def _write_manifest(session_dir: str, workspace: str, session_id: str, turn_key: str, timestamp: str, files: dict) -> str:
+def _write_manifest(
+    session_dir: str,
+    workspace: str,
+    session_id: str,
+    turn_key: str,
+    timestamp: str,
+    files: dict,
+    omit_workspace: bool = False,
+) -> str:
     manifest_dir = os.path.join(session_dir, "file_journals", turn_key)
     os.makedirs(manifest_dir, exist_ok=True)
     manifest_path = os.path.join(manifest_dir, "manifest.json")
@@ -162,11 +170,14 @@ def _write_manifest(session_dir: str, workspace: str, session_id: str, turn_key:
         "session_id": session_id,
         "timestamp": timestamp,
         "turn_key": turn_key,
-        "workspace": workspace,
         "created_at": timestamp,
         "updated_at": timestamp,
         "files": files,
     }
+    if not omit_workspace:
+        # The workspace the turn was journaled in, exactly as the writer
+        # records it (runtime/builtin_tools_coding._FileJournalManager).
+        manifest["workspace"] = workspace
     with open(manifest_path, "w", encoding="utf-8") as fh:
         json.dump(manifest, fh)
     return manifest_path
@@ -323,6 +334,211 @@ def test_revoke_session_file_changes_detects_conflict_before_restoring(tmp_path)
 
     assert result["error"] == "JournalConflict"
     assert open(target, encoding="utf-8").read() == "user change\n"
+
+
+# ---------------------------------------------------------------------------
+# Unit tests — the workspace a revoke restores into
+#
+# A session's workspace is per-session state; a revoke request does not carry
+# it and nothing on that path binds it to the request thread, so the only
+# trustworthy answer is the workspace each journal turn recorded.  Everything
+# below pins that against the process default (AGENTS_WORKSPACE), which is the
+# production failure: an HQD session's revoke restoring into an unrelated TDS
+# checkout -- and "force" writing 24 files there while HQD stayed untouched.
+# ---------------------------------------------------------------------------
+
+def _journal_file(session_dir: str, turn_key: str, rel: str, baseline: bytes, after: bytes) -> dict:
+    return {
+        rel: {
+            "path": rel,
+            "tools": ["edit_file"],
+            "baseline": _blob_ref(session_dir, turn_key, rel, "baseline", baseline),
+            "after": _blob_ref(session_dir, turn_key, rel, "after", after),
+        }
+    }
+
+
+def test_revoke_restores_the_workspace_the_journal_was_taken_in(tmp_path, monkeypatch):
+    """The manifest's workspace wins over the caller's (process default)."""
+    session_ws = str(tmp_path / "HQD")
+    process_ws = str(tmp_path / "TDS")
+    session_dir = str(tmp_path / "chat_data" / "session1")
+    for d in (session_ws, process_ws, session_dir):
+        os.makedirs(d)
+    rel = os.path.join("frontend", "src", "router", "index.ts")
+    session_target = os.path.join(session_ws, rel)
+    process_target = os.path.join(process_ws, rel)
+    for path in (session_target, process_target):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("after\n")
+    files = _journal_file(
+        session_dir, "260511_102030", "frontend/src/router/index.ts",
+        b"before\n", b"after\n",
+    )
+    _write_manifest(
+        session_dir, session_ws, "session1", "260511_102030",
+        "2026-05-11T10:20:30", files,
+    )
+    # The server process runs in a different workspace than the session did.
+    monkeypatch.setenv("AGENTS_WORKSPACE", process_ws)
+
+    result = revoke_session_file_changes(
+        process_ws, session_dir, "session1", "2026-05-11T10:20:30",
+    )
+
+    assert "error" not in result, result
+    assert open(session_target, encoding="utf-8").read() == "before\n"
+    # The unrelated checkout must not gain (or lose) a single file.
+    assert open(process_target, encoding="utf-8").read() == "after\n"
+
+
+def test_revoke_conflict_reports_the_workspaces_it_checked(tmp_path):
+    """The 409 payload must name the root it probed, or the report is guesswork."""
+    session_ws = str(tmp_path / "HQD")
+    session_dir = str(tmp_path / "chat_data" / "session1")
+    os.makedirs(session_ws)
+    os.makedirs(session_dir)
+    with open(os.path.join(session_ws, "foo.txt"), "w", encoding="utf-8") as fh:
+        fh.write("drifted\n")
+    files = _journal_file(session_dir, "260511_102030", "foo.txt", b"before\n", b"after\n")
+    _write_manifest(session_dir, session_ws, "session1", "260511_102030", "2026-05-11T10:20:30", files)
+
+    result = revoke_session_file_changes(
+        str(tmp_path / "TDS"), session_dir, "session1", "2026-05-11T10:20:30",
+    )
+
+    assert result["error"] == "JournalConflict"
+    assert os.path.realpath(session_ws) in result["checked_workspaces"]
+
+
+def test_revoke_refuses_a_missing_journal_root_even_when_forced(tmp_path):
+    """A root that is not here cannot be restored into -- and force would invent it."""
+    gone_ws = str(tmp_path / "moved-or-unmounted")
+    process_ws = str(tmp_path / "TDS")
+    session_dir = str(tmp_path / "chat_data" / "session1")
+    os.makedirs(process_ws)
+    os.makedirs(session_dir)
+    files = _journal_file(session_dir, "260511_102030", "foo.txt", b"before\n", b"after\n")
+    _write_manifest(session_dir, gone_ws, "session1", "260511_102030", "2026-05-11T10:20:30", files)
+
+    result = revoke_session_file_changes(
+        process_ws, session_dir, "session1", "2026-05-11T10:20:30", force=True,
+    )
+
+    assert result["error"] == "JournalWorkspaceMismatch"
+    assert result["can_force"] is False
+    assert os.path.realpath(gone_ws) in result["workspaces"]
+    # Nothing was written anywhere: the wrong tree must not be created.
+    assert os.listdir(process_ws) == []
+    # ...and the journal was left intact, so a later revoke can still succeed.
+    manifest = json.load(open(
+        os.path.join(session_dir, "file_journals", "260511_102030", "manifest.json"),
+        encoding="utf-8",
+    ))
+    assert not manifest.get("revoked")
+    assert "foo.txt" in manifest["files"]
+
+
+def test_undo_latest_file_journal_turn_uses_the_manifest_workspace(tmp_path):
+    session_ws = str(tmp_path / "HQD")
+    process_ws = str(tmp_path / "TDS")
+    session_dir = str(tmp_path / "chat_data" / "session1")
+    for d in (session_ws, process_ws, session_dir):
+        os.makedirs(d)
+    with open(os.path.join(session_ws, "foo.txt"), "w", encoding="utf-8") as fh:
+        fh.write("after\n")
+    files = _journal_file(session_dir, "260511_102030", "foo.txt", b"before\n", b"after\n")
+    _write_manifest(session_dir, session_ws, "session1", "260511_102030", "2026-05-11T10:20:30", files)
+
+    result = undo_latest_file_journal_turn(process_ws, session_dir, "session1")
+
+    assert "error" not in result, result
+    assert open(os.path.join(session_ws, "foo.txt"), encoding="utf-8").read() == "before\n"
+    assert not os.path.exists(os.path.join(process_ws, "foo.txt"))
+
+
+def test_revoke_restores_each_turn_in_its_own_workspace(tmp_path):
+    """A session may switch workspace mid-session; one revoke spans both roots.
+
+    The same path label under two roots names two different files, so the
+    restore plan must not merge them into one entry.
+    """
+    ws_a = str(tmp_path / "ws_a")
+    ws_b = str(tmp_path / "ws_b")
+    session_dir = str(tmp_path / "chat_data" / "session1")
+    for d in (ws_a, ws_b, session_dir):
+        os.makedirs(d)
+    for root in (ws_a, ws_b):
+        with open(os.path.join(root, "shared.txt"), "w", encoding="utf-8") as fh:
+            fh.write("after\n")
+    files_a = _journal_file(session_dir, "260511_102030", "shared.txt", b"a-before\n", b"after\n")
+    files_b = _journal_file(session_dir, "260511_102100", "shared.txt", b"b-before\n", b"after\n")
+    _write_manifest(session_dir, ws_a, "session1", "260511_102030", "2026-05-11T10:20:30", files_a)
+    _write_manifest(session_dir, ws_b, "session1", "260511_102100", "2026-05-11T10:21:00", files_b)
+
+    result = revoke_session_file_changes(
+        str(tmp_path / "TDS"), session_dir, "session1", "2026-05-11T10:20:00",
+    )
+
+    assert "error" not in result, result
+    assert open(os.path.join(ws_a, "shared.txt"), encoding="utf-8").read() == "a-before\n"
+    assert open(os.path.join(ws_b, "shared.txt"), encoding="utf-8").read() == "b-before\n"
+
+
+def test_revoke_falls_back_to_the_session_record_for_legacy_journals(tmp_path, monkeypatch):
+    """Without a manifest workspace, use the session's own record, not AGENTS_WORKSPACE."""
+    session_ws = str(tmp_path / "HQD")
+    process_ws = str(tmp_path / "TDS")
+    chats_dir = str(tmp_path / "chat_data")
+    session_dir = os.path.join(chats_dir, "session1")
+    for d in (session_ws, process_ws, session_dir):
+        os.makedirs(d)
+    with open(os.path.join(session_ws, "foo.txt"), "w", encoding="utf-8") as fh:
+        fh.write("after\n")
+    files = _journal_file(session_dir, "260511_102030", "foo.txt", b"before\n", b"after\n")
+    _write_manifest(
+        session_dir, session_ws, "session1", "260511_102030",
+        "2026-05-11T10:20:30", files, omit_workspace=True,
+    )
+
+    cm = ContextManager(infer_fn=lambda req: None, chats_dir=chats_dir)
+    cm.save_conversation(
+        "session1",
+        [_make_turn("user", "do it", "2026-05-11T10:20:30"),
+         _make_turn("assistant", "done", "2026-05-11T10:20:40")],
+        extra_meta={"workspace": session_ws},
+    )
+    monkeypatch.setenv("AGENTS_WORKSPACE", process_ws)
+
+    result = cm.revoke_conversation("session1", "2026-05-11T10:20:30")
+
+    assert result["journal"]["revoked"] is True
+    assert open(os.path.join(session_ws, "foo.txt"), encoding="utf-8").read() == "before\n"
+    assert not os.path.exists(os.path.join(process_ws, "foo.txt"))
+
+
+def test_session_recorded_workspace_prefers_the_turn_snapshot(tmp_path):
+    """A turn's own context snapshot beats the session-level (latest) value."""
+    from runtime.context_manager import session_recorded_workspace
+
+    session_dir = str(tmp_path / "chat_data" / "session1")
+    os.makedirs(session_dir)
+    with open(os.path.join(session_dir, "conversation.json"), "w", encoding="utf-8") as fh:
+        json.dump({
+            "meta": {"workspace": "/ws/latest"},
+            "messages": [
+                {"role": "user", "content": "a", "timestamp": "2026-05-11T10:20:30",
+                 "meta": {"workspace": "/ws/then"}},
+                {"role": "user", "content": "b", "timestamp": "2026-05-11T10:30:00"},
+            ],
+        }, fh)
+
+    assert session_recorded_workspace(session_dir, "2026-05-11T10:20:30") == "/ws/then"
+    # A turn with no snapshot falls back to the session-level record.
+    assert session_recorded_workspace(session_dir, "2026-05-11T10:30:00") == "/ws/latest"
+    # Unknown session: nothing recorded, so the caller decides.
+    assert session_recorded_workspace(str(tmp_path / "nope")) == ""
 
 
 # ---------------------------------------------------------------------------

@@ -787,6 +787,164 @@ class TestJournalOnlyRevoke:
         assert status == 200, body
         assert not (child_ws / "ro4.txt").exists()
 
+    # --- the workspace the journal was taken in (not the process default) ---
+
+    def _manifest(self, child, session_id):
+        session_dir = child[1] / "chat_data" / session_id
+        manifests = list(session_dir.glob("file_journals/*/manifest.json"))
+        assert manifests, "no file journal manifest created"
+        return manifests[0]
+
+    def test_restores_the_workspace_recorded_in_the_manifest(self, child, tmp_path):
+        """A journal taken in another root restores there, not into the child's
+        own AGENTS_WORKSPACE (the production failure: HQD's revoke writing
+        into TDS)."""
+        child_ws = tmp_path / "child_ws"
+        session_ws = tmp_path / "session_ws"
+        session_ws.mkdir()
+        _child_write_file(child, "sess-ro-5", "ro5.txt", "created")
+        # Move the journaled file out to the workspace the session really used
+        # and stamp the manifest as if that root had been recorded at write time.
+        (session_ws / "ro5.txt").write_text("created", encoding="utf-8")
+        (child_ws / "ro5.txt").unlink()
+        manifest_path = self._manifest(child, "sess-ro-5")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["workspace"] = str(session_ws)
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        status, body = _request(
+            child[0], "POST", "/v1/sessions/sess-ro-5/revoke?journal_only=true",
+            {"timestamp": TURN_TS},
+        )
+
+        assert status == 200, body
+        assert not (session_ws / "ro5.txt").exists()
+        # The child's default workspace stayed untouched.
+        assert not (child_ws / "ro5.txt").exists()
+
+    def test_legacy_manifest_uses_the_workspace_the_parent_names(self, child, tmp_path):
+        """Journals written before the manifest recorded a workspace still get
+        the parent's session workspace instead of the child's process default."""
+        child_ws = tmp_path / "child_ws"
+        session_ws = tmp_path / "session_ws"
+        session_ws.mkdir()
+        _child_write_file(child, "sess-ro-6", "ro6.txt", "created")
+        (session_ws / "ro6.txt").write_text("created", encoding="utf-8")
+        (child_ws / "ro6.txt").unlink()
+        manifest_path = self._manifest(child, "sess-ro-6")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest.pop("workspace", None)
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        status, body = _request(
+            child[0], "POST", "/v1/sessions/sess-ro-6/revoke?journal_only=true",
+            {"timestamp": TURN_TS, "workspace": str(session_ws)},
+        )
+
+        assert status == 200, body
+        assert not (session_ws / "ro6.txt").exists()
+        assert not (child_ws / "ro6.txt").exists()
+
+    def test_unusable_journal_root_is_409_and_cannot_be_forced(self, child, tmp_path):
+        """A root that is not mounted here must never be invented by force."""
+        child_ws = tmp_path / "child_ws"
+        _child_write_file(child, "sess-ro-7", "ro7.txt", "created")
+        gone = tmp_path / "unmounted-workspace"
+        manifest_path = self._manifest(child, "sess-ro-7")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["workspace"] = str(gone)
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        status, body = _request(
+            child[0], "POST", "/v1/sessions/sess-ro-7/revoke?journal_only=true",
+            {"timestamp": TURN_TS},
+        )
+        assert status == 409, body
+        assert body.get("error") == "JournalWorkspaceMismatch"
+        assert body.get("can_force") is False
+        assert os.path.realpath(str(gone)) in body.get("workspaces", [])
+        # force must not create the missing tree, nor drop the file elsewhere
+        status, body = _request(
+            child[0], "POST", "/v1/sessions/sess-ro-7/revoke?journal_only=true",
+            {"timestamp": TURN_TS, "forced": True},
+        )
+        assert status == 409, body
+        assert not gone.exists()
+        assert (child_ws / "ro7.txt").read_text(encoding="utf-8") == "created"
+
+
+# ---------------------------------------------------------------------------
+# Revoke workspace anchoring (local sessions, no remote env)
+# ---------------------------------------------------------------------------
+
+class TestRevokeWorkspaceAnchor:
+    """A session's file changes belong to the workspace they were taken in.
+
+    In production ``AGENTS_WORKSPACE`` was one project (TDS) while the session
+    ran against another (HQD).  The revoke path never read the session's own
+    record, so it restored against the process default: the default tree was
+    created out of nothing, the session's files stayed as they were, and the
+    message history plus the journal had already been revoked.
+    """
+
+    def _write_conversation(self, data_dir, session_id, workspace, timestamp=TURN_TS):
+        session_dir = data_dir / "chat_data" / session_id
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / "conversation.json").write_text(
+            json.dumps({
+                "meta": {"workspace": str(workspace), "turn_count": 1},
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "write it",
+                        "timestamp": timestamp,
+                        "meta": {"workspace": str(workspace)},
+                    },
+                ],
+            }, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    def test_revoke_ignores_the_process_default_workspace(self, child, tmp_path, monkeypatch):
+        child_ws = tmp_path / "child_ws"
+        _child_write_file(child, "sess-ws-1", "ws.txt", "created by the journaled turn")
+        self._write_conversation(child[1], "sess-ws-1", child_ws)
+
+        # Some other project is the process default -- what the revoke used to
+        # resolve through get_workspace(), since no workspace is bound to a
+        # request that carries none.
+        monkeypatch.setenv("AGENTS_WORKSPACE", str(tmp_path / "other_project"))
+
+        status, body = _request(
+            child[0], "POST", "/v1/sessions/sess-ws-1/revoke", {"timestamp": TURN_TS},
+        )
+        assert status == 200, body
+        assert not (child_ws / "ws.txt").exists(), \
+            "the journaled change must be restored in the workspace it was taken in"
+        assert not (tmp_path / "other_project" / "ws.txt").exists()
+
+    def test_force_cannot_retarget_a_journal_root_that_is_gone(self, child, tmp_path, monkeypatch):
+        child_ws = tmp_path / "child_ws"
+        _child_write_file(child, "sess-ws-2", "ws2.txt", "still here")
+        self._write_conversation(child[1], "sess-ws-2", child_ws)
+        manifest_path = next(
+            (child[1] / "chat_data" / "sess-ws-2").glob("file_journals/*/manifest.json")
+        )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["workspace"] = str(tmp_path / "unmounted_workspace")
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        monkeypatch.setenv("AGENTS_WORKSPACE", str(tmp_path / "other_project"))
+
+        status, body = _request(
+            child[0], "POST", "/v1/sessions/sess-ws-2/revoke",
+            {"timestamp": TURN_TS, "forced": True},
+        )
+        assert status == 409, body
+        assert body.get("error") == "JournalWorkspaceMismatch"
+        assert body.get("can_force") is False, "forcing would create a tree and fill another project"
+        assert (child_ws / "ws2.txt").read_text(encoding="utf-8") == "still here"
+        assert not (tmp_path / "other_project" / "ws2.txt").exists()
+
 
 # ---------------------------------------------------------------------------
 # Parent-side routing (A2/A3/A6/A7)
@@ -844,6 +1002,41 @@ class TestParentRemoteRouting:
         assert status == 409
         assert body.get("error") == "JournalConflict"
         # local messages must NOT be deleted while the child journal conflicts
+        conv = json.loads(
+            (parent[1] / "chat_data" / sid / "conversation.json").read_text(encoding="utf-8")
+        )
+        assert len(conv["messages"]) == 1
+
+    def test_revoke_child_workspace_mismatch_is_not_offered_as_forced(self, parent, child, tmp_path):
+        """A child's JournalWorkspaceMismatch must arrive with can_force=false.
+
+        The parent's conflict pass-through defaults ``can_force`` to true, which
+        is right for "the file was changed afterwards" and wrong here: forcing a
+        root the child does not have would create the directory and write the
+        session's files into an unrelated tree, while the parent then deletes the
+        history.  The refusal has to stay a refusal across the hop.
+        """
+        env_id = _add_env(parent, f"http://127.0.0.1:{child[0].port}/v1/setup")
+        sid = self._make_parent_session(parent, env_id)
+        child_ws = tmp_path / "child_ws"
+        _child_write_file(child, sid, "gone_root.txt", "owned")
+        manifest_path = next(
+            (child[1] / "chat_data" / sid).glob("file_journals/*/manifest.json")
+        )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["workspace"] = str(tmp_path / "unmounted_on_the_child")
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        status, body = _request(
+            parent[0], "POST", f"/v1/sessions/{sid}/revoke", {"timestamp": TURN_TS},
+        )
+
+        assert status == 409, body
+        assert body.get("error") == "JournalWorkspaceMismatch"
+        assert body.get("can_force") is False, "the parent must not offer to force a missing root"
+        assert os.path.realpath(str(tmp_path / "unmounted_on_the_child")) in body.get("workspaces", [])
+        # Nothing moved on the child, and the parent kept its messages.
+        assert (child_ws / "gone_root.txt").read_text(encoding="utf-8") == "owned"
         conv = json.loads(
             (parent[1] / "chat_data" / sid / "conversation.json").read_text(encoding="utf-8")
         )

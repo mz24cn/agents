@@ -20,16 +20,72 @@ logger = logging.getLogger(__name__)
 
 
 class JournalConflictError(RuntimeError):
-    def __init__(self, message: str, files: list[str]):
+    """The current files do not match what the journal says they should be.
+
+    ``checked_workspaces`` names the root(s) the restore was about to write
+    to, so a conflict report says *where* it looked -- without it a
+    wrong-workspace session's conflict is indistinguishable from a file the
+    user edited by hand.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        files: list[str],
+        checked_workspaces: Optional[list[str]] = None,
+    ):
         super().__init__(message)
         self.files = files
+        self.checked_workspaces = checked_workspaces or []
 
     def to_dict(self) -> dict:
-        return {
+        payload = {
             "error": "JournalConflict",
             "message": str(self),
             "files": self.files,
             "can_force": True,
+        }
+        if self.checked_workspaces:
+            payload["checked_workspaces"] = self.checked_workspaces
+        return payload
+
+
+class JournalWorkspaceMismatchError(RuntimeError):
+    """A file journal was taken in a workspace root this machine cannot use.
+
+    Raised instead of :class:`JournalConflictError` when the root recorded in
+    a journal manifest does not exist here (or is not a directory).  Unlike a
+    conflict, forcing this restore would *create* the missing tree and write
+    the session's files into an unrelated directory -- the failure mode that
+    turned a wrong-workspace revoke into an irreversible mess -- so the client
+    is told ``can_force: false``.
+
+    Attributes:
+        workspaces: Roots the journal recorded that are unusable here.
+        checked_workspaces: Every root this restore would have written to.
+        files: Path labels that could not be restored.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        workspaces: list[str],
+        files: Optional[list[str]] = None,
+        checked_workspaces: Optional[list[str]] = None,
+    ):
+        super().__init__(message)
+        self.workspaces = workspaces
+        self.checked_workspaces = checked_workspaces or list(workspaces)
+        self.files = files or []
+
+    def to_dict(self) -> dict:
+        return {
+            "error": "JournalWorkspaceMismatch",
+            "message": str(self),
+            "workspaces": self.workspaces,
+            "checked_workspaces": self.checked_workspaces,
+            "files": self.files,
+            "can_force": False,
         }
 
 
@@ -1017,23 +1073,126 @@ def _manifest_has_file_changes(manifest: dict) -> bool:
     return any(isinstance(entry, dict) and "baseline" in entry and "after" in entry for entry in files.values())
 
 
-def _restore_file_plan(workspace: str, restore_plan: dict[str, dict], force: bool = False) -> dict:
+def _manifest_workspace(manifest: dict, fallback: str) -> str:
+    """Workspace root a journal turn was taken in.
+
+    The manifest is authoritative: it was written by the process that made the
+    change, bound to the workspace that request was running in.  *fallback*
+    (session meta, or the process default) is only consulted for manifests
+    written before the field existed -- reading it first is what sent an
+    unrelated-workspace session's revoke into the process default root.
+    """
+    recorded = str((manifest or {}).get("workspace") or "").strip()
+    if not recorded:
+        return str(fallback or "")
+    return os.path.realpath(recorded)
+
+
+def _recorded_workspace_in_data(data: dict, timestamp: Optional[str] = None) -> str:
+    """Workspace recorded inside a parsed ``conversation.json`` payload.
+
+    Prefers the request-context snapshot on the user turn *timestamp* (a
+    session can switch workspace between turns), then the session-level
+    ``meta.workspace``.  Returns "" when neither records one.
+    """
+    if not isinstance(data, dict):
+        return ""
+    if timestamp:
+        for msg in data.get("messages") or []:
+            if not isinstance(msg, dict) or msg.get("role") != "user":
+                continue
+            if msg.get("timestamp") != timestamp:
+                continue
+            turn_meta = msg.get("meta")
+            if isinstance(turn_meta, dict) and turn_meta.get("workspace"):
+                return str(turn_meta["workspace"])
+    meta = data.get("meta")
+    if isinstance(meta, dict) and meta.get("workspace"):
+        return str(meta["workspace"])
+    return ""
+
+
+def session_recorded_workspace(session_dir: str, timestamp: Optional[str] = None) -> str:
+    """Workspace a session recorded for itself, read from its own session dir.
+
+    Used by API paths that never bind a workspace to the request thread (a
+    revoke carries no workspace of its own), so the session's on-disk record
+    beats the process default.  Returns "" when the session records none.
+    """
+    conv_path = os.path.join(session_dir, "conversation.json")
+    try:
+        with open(conv_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return ""
+    return _recorded_workspace_in_data(data, timestamp)
+
+
+def _restore_file_plan(
+    workspace: str,
+    restore_plan: "dict[tuple[str, str], dict]",
+    force: bool = False,
+) -> dict:
+    """Restore every entry of *restore_plan*, which may span several roots.
+
+    *restore_plan* is keyed by ``(workspace_root, path_label)``: one revoke can
+    cover turns taken in different workspaces (a session may switch workspace
+    mid-session), and the same label under two roots names two different files.
+    Each entry's ``"workspace"`` is the root to write to; *workspace* is only
+    the fallback for entries built from legacy manifests without one.
+
+    Refuses with ``JournalWorkspaceMismatch`` -- regardless of *force* -- when a
+    root the plan needs is not a directory here.  Forcing that would create the
+    missing tree and drop the session's files into an unrelated location, and
+    the very next revoke would no longer find them.
+    """
+    needed_roots: list[str] = []
+    for (root, rel_path), item in restore_plan.items():
+        item_root = str(item.get("workspace") or root or workspace or "")
+        if os.path.isabs(_journal_normalize_label(rel_path)):
+            # Absolute labels point at the /tmp scratch area, not the root.
+            continue
+        if item_root and item_root not in needed_roots:
+            needed_roots.append(item_root)
+    missing_roots = [root for root in needed_roots if not os.path.isdir(root)]
+    if missing_roots:
+        unreadable = [
+            rel_path
+            for (root, rel_path), item in restore_plan.items()
+            if str(item.get("workspace") or root or workspace or "") in missing_roots
+        ]
+        return {
+            "error": "JournalWorkspaceMismatch",
+            "message": (
+                "Journal workspace is not available on this server: "
+                + ", ".join(missing_roots)
+            ),
+            "workspaces": missing_roots,
+            "checked_workspaces": needed_roots,
+            "files": unreadable,
+            "can_force": False,
+        }
+
     conflicts: list[str] = []
-    for rel_path, item in restore_plan.items():
-        target_path = _journal_resolve_workspace_path(workspace, rel_path)
+    for (root, rel_path), item in restore_plan.items():
+        item_root = str(item.get("workspace") or root or workspace or "")
+        target_path = _journal_resolve_workspace_path(item_root, rel_path)
         if not _current_file_matches(target_path, item["expected_current"]):
-            conflicts.append(rel_path)
+            if rel_path not in conflicts:
+                conflicts.append(rel_path)
     if conflicts and not force:
         return {
             "error": "JournalConflict",
             "message": "Current files do not match journal after-state",
             "files": conflicts,
+            "checked_workspaces": needed_roots,
         }
 
     restored_files: list[str] = []
-    for rel_path, item in restore_plan.items():
-        target_path = _journal_resolve_workspace_path(workspace, rel_path)
-        _restore_journal_baseline(target_path, item["baseline"], workspace, item["journal_dir"])
+    for (root, rel_path), item in restore_plan.items():
+        item_root = str(item.get("workspace") or root or workspace or "")
+        target_path = _journal_resolve_workspace_path(item_root, rel_path)
+        _restore_journal_baseline(target_path, item["baseline"], item_root, item["journal_dir"])
         restored_files.append(rel_path)
     return {"restored_files": restored_files}
 
@@ -1117,15 +1276,24 @@ def undo_latest_file_journal_turn(
 
     manifest_path, manifest = manifests[-1]
     journal_dir = os.path.dirname(manifest_path)
-    restore_plan: dict[str, dict] = {}
+    # Anchor to the workspace this turn was journaled in; the caller's
+    # *workspace* only backs up manifests that predate the manifest field.
+    manifest_ws = _manifest_workspace(manifest, workspace)
+    if manifest_ws and workspace and manifest_ws != os.path.realpath(workspace or ""):
+        logger.info(
+            "undo: journal turn %s was taken in %s, not the caller's %s -- restoring there",
+            manifest.get("turn_key"), manifest_ws, workspace,
+        )
+    restore_plan: "dict[tuple[str, str], dict]" = {}
     for rel_path, entry in manifest.get("files", {}).items():
         if not isinstance(entry, dict) or "baseline" not in entry or "after" not in entry:
             continue
         safe_rel = _journal_normalize_label(entry.get("path") or rel_path)
-        restore_plan[safe_rel] = {
+        restore_plan[(manifest_ws, safe_rel)] = {
             "baseline": entry["baseline"],
             "expected_current": entry["after"],
             "journal_dir": journal_dir,
+            "workspace": manifest_ws,
         }
     if not restore_plan:
         return {"error": "NoJournalToUndo", "message": "No file changes were found in the latest journal turn"}
@@ -1172,21 +1340,32 @@ def revoke_session_file_changes(
     if not selected:
         return {"skipped": True, "reason": "no_matching_file_journals", "restored_files": []}
 
-    restore_plan: dict[str, dict] = {}
+    restore_plan: "dict[tuple[str, str], dict]" = {}
     for manifest_path, manifest in selected:
         journal_dir = os.path.dirname(manifest_path)
+        # Each turn restores to the workspace it was taken in.  A session can
+        # switch workspace mid-session, so one revoke legitimately spans
+        # several roots -- and the process default is none of them.
+        manifest_ws = _manifest_workspace(manifest, workspace)
+        if manifest_ws and workspace and manifest_ws != os.path.realpath(workspace or ""):
+            logger.info(
+                "revoke: journal turn %s was taken in %s, not the caller's %s -- restoring there",
+                manifest.get("turn_key"), manifest_ws, workspace,
+            )
         for rel_path, entry in manifest.get("files", {}).items():
             if not isinstance(entry, dict) or "baseline" not in entry or "after" not in entry:
                 continue
             safe_rel = _journal_normalize_label(entry.get("path") or rel_path)
-            if safe_rel not in restore_plan:
-                restore_plan[safe_rel] = {
+            key = (manifest_ws, safe_rel)
+            if key not in restore_plan:
+                restore_plan[key] = {
                     "baseline": entry["baseline"],
                     "expected_current": entry["after"],
                     "journal_dir": journal_dir,
+                    "workspace": manifest_ws,
                 }
             else:
-                restore_plan[safe_rel]["expected_current"] = entry["after"]
+                restore_plan[key]["expected_current"] = entry["after"]
 
     if not restore_plan:
         return {"skipped": True, "reason": "no_file_changes", "restored_files": []}
@@ -1901,12 +2080,20 @@ class ContextManager:
         timestamp: str,
         force: bool = False,
         keep_files: bool = False,
+        workspace_hint: str = "",
     ) -> dict:
         """Revoke messages from the conversation starting from the message with the given timestamp.
 
         Args:
             session_id: Target session.
             timestamp: The timestamp of the user message to revoke from.
+            force: Restore even when the current files no longer match the
+                journal's after-state (a conflict).  Never overrides a
+                workspace that is unavailable here.
+            keep_files: Revoke the history without restoring file changes.
+            workspace_hint: Optional workspace the client believes the session
+                ran in.  Only a fallback: the journal manifest decides, and the
+                session's own record outranks a client-supplied value.
 
         Returns:
             A result dict containing the number of removed messages and the
@@ -1916,6 +2103,9 @@ class ContextManager:
         Raises:
             FileNotFoundError: When the conversation file does not exist.
             ValueError: When the file content is malformed JSON or no message found with the given timestamp.
+            JournalConflictError: When files conflict with the journal after-state.
+            JournalWorkspaceMismatchError: When a journal's workspace root is
+                not usable on this server (see :class:`_restore_file_plan`).
             RuntimeError: When git history rewriting fails.
         """
         conv_path = self._conversation_path(session_id)
@@ -1941,8 +2131,19 @@ class ContextManager:
         removed_count = len(messages) - revoke_index
         new_messages = messages[:revoke_index]
 
-        workspace = get_workspace()
+        # A revoke request carries no workspace and nothing on this path binds
+        # one to the thread, so get_workspace() resolves to the *process*
+        # default -- which for a session created against another workspace is a
+        # different tree, and restoring there writes the session's files into
+        # an unrelated project.  Resolve the session's own record first; the
+        # journal manifests still win per turn (see revoke_session_file_changes),
+        # so this only backs up journals that predate the manifest field.
         session_dir = os.path.dirname(conv_path)
+        workspace = (
+            _recorded_workspace_in_data(data, timestamp)
+            or str(workspace_hint or "").strip()
+            or get_workspace()
+        )
         journal_result = revoke_session_file_changes(
             workspace,
             session_dir,
@@ -1956,6 +2157,14 @@ class ContextManager:
                 raise JournalConflictError(
                     journal_result.get("message") or "Current files do not match journal after-state",
                     list(journal_result.get("files") or []),
+                    checked_workspaces=list(journal_result.get("checked_workspaces") or []),
+                )
+            if journal_result.get("error") == "JournalWorkspaceMismatch":
+                raise JournalWorkspaceMismatchError(
+                    journal_result.get("message") or "Journal workspace is not available on this server",
+                    list(journal_result.get("workspaces") or []),
+                    files=list(journal_result.get("files") or []),
+                    checked_workspaces=list(journal_result.get("checked_workspaces") or []),
                 )
             if journal_result.get("error") == "InvalidTimestamp":
                 raise ValueError(journal_result.get("message") or journal_result["error"])

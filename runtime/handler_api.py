@@ -31,7 +31,11 @@ import uuid
 
 from runtime.agent_manager import validate_agent_id
 from runtime.common import get_workspace, session_timestamp
-from runtime.context_manager import JournalConflictError
+from runtime.context_manager import (
+    JournalConflictError,
+    JournalWorkspaceMismatchError,
+    session_recorded_workspace,
+)
 from runtime.handler_base import (
     _MAX_PUSH_BODY_BYTES,
     _SESSION_GZIP_CACHE,
@@ -3059,8 +3063,16 @@ class HandlerApiMixin:
     def _revoke_remote_journal(
         self, session_id: str, env_id: str,
         timestamp: str, forced: bool, keep_files: bool,
+        workspace: str = "",
     ) -> bool:
         """Call the child environment's ``revoke?journal_only=true``.
+
+        *workspace* is the workspace this session records (for a remote-bound
+        session that is the **child's** path).  It is only a fallback for the
+        child -- the child's journal manifests carry the authoritative root --
+        but it keeps a revoke correct against journals written before the
+        manifest recorded one, and it stops the child from falling back to its
+        own process default.
 
         Returns True on success. On failure the appropriate error response
         (409 conflict / 400 / 404 / 502) has already been sent and False is
@@ -3086,6 +3098,7 @@ class HandlerApiMixin:
                     "timestamp": timestamp,
                     "forced": forced,
                     "keep_files": keep_files,
+                    "workspace": workspace,
                 },
             )
         except (urllib.error.URLError, OSError, RemoteToolCallError) as exc:
@@ -3102,7 +3115,11 @@ class HandlerApiMixin:
             # 与本地 JournalConflictError.to_dict() 同构，前端冲突对话框可直接复用
             conflict = dict(data)
             conflict.setdefault("error", "JournalConflict")
-            conflict.setdefault("can_force", True)
+            # 只有“文件与 journal 不符”这类冲突可以 force。工作区在这台机器上
+            # 不存在（JournalWorkspaceMismatch）时 force 会凭空建出目录、把文件
+            # 写进无关的树，必须保留子端给出的 can_force=false。
+            if conflict.get("error") != "JournalWorkspaceMismatch":
+                conflict.setdefault("can_force", True)
             self._send_json_response(409, conflict)
             return False
         if status in (400, 404):
@@ -3130,6 +3147,16 @@ class HandlerApiMixin:
 
         forced = bool(body.get("forced", False))
         keep_files = bool(body.get("keep_files", False))
+        # The client may name the workspace it believes the session runs in.
+        # It is only a fallback: the journal manifest decides per turn, and the
+        # session's own on-disk record outranks the request.
+        workspace_hint = str(body.get("workspace") or "").strip()
+        context_manager = self.server.context_manager  # type: ignore[attr-defined]
+        session_dir = os.path.dirname(context_manager._conversation_path(session_id))
+        if not workspace_hint:
+            # 不带 workspace 的请求（旧前端、脚本调用）也要落到会话自己的根目录：
+            # 会话在磁盘上记住的工作区远比进程默认可信，远程分支还要把它转发给子端。
+            workspace_hint = session_recorded_workspace(session_dir, str(timestamp))
 
         # journal_only=true：由母环境远程会话调用，只还原本端（子端）文件
         # 变更，不触碰会话历史（历史在母端）。冲突时返回与本地 revoke 同构
@@ -3137,11 +3164,14 @@ class HandlerApiMixin:
         if self._get_query_param("journal_only") == "true":
             from runtime.common import get_workspace
             from runtime.context_manager import revoke_session_file_changes
-            context_manager = self.server.context_manager  # type: ignore[attr-defined]
-            session_dir = os.path.dirname(context_manager._conversation_path(session_id))
+            # 子端的 journal 目录里可能没有 conversation.json（历史在母端），此时
+            # workspace_hint 就是母端传来的会话工作区（那正是子端自己的路径），最后
+            # 才退回本端进程默认——退回进程默认正是“会话工作区 ≠ AGENTS_WORKSPACE 时
+            # 撤销写错目录”的根因。真正的权威仍是各 turn manifest 里记录的 workspace。
+            journal_workspace = workspace_hint or get_workspace()
             try:
                 journal_result = revoke_session_file_changes(
-                    get_workspace(),
+                    journal_workspace,
                     session_dir,
                     session_id,
                     timestamp,
@@ -3157,7 +3187,20 @@ class HandlerApiMixin:
                         "error": "JournalConflict",
                         "message": journal_result.get("message") or "Current files do not match journal after-state",
                         "files": list(journal_result.get("files") or []),
+                        "checked_workspaces": list(journal_result.get("checked_workspaces") or []),
                         "can_force": True,
+                    })
+                    return
+                if journal_result.get("error") == "JournalWorkspaceMismatch":
+                    # 工作区在本机不存在：force 会凭空建目录并把文件写进无关的树，
+                    # 所以 can_force=false，让母端/前端把它当错误而不是冲突来引导。
+                    self._send_json_response(409, {
+                        "error": "JournalWorkspaceMismatch",
+                        "message": journal_result.get("message") or "Journal workspace is not available on this server",
+                        "workspaces": list(journal_result.get("workspaces") or []),
+                        "checked_workspaces": list(journal_result.get("checked_workspaces") or []),
+                        "files": list(journal_result.get("files") or []),
+                        "can_force": False,
                     })
                     return
                 self._send_json_error(
@@ -3181,16 +3224,17 @@ class HandlerApiMixin:
         if remote_env_id:
             if not self._revoke_remote_journal(
                 session_id, remote_env_id, timestamp, forced, keep_files,
+                workspace=workspace_hint,
             ):
                 return
 
-        context_manager = self.server.context_manager  # type: ignore[attr-defined]
         try:
             revoke_result = context_manager.revoke_conversation(
                 session_id,
                 timestamp,
                 force=forced,
                 keep_files=keep_files,
+                workspace_hint=workspace_hint,
             )
 
             self._send_json_response(200, {
@@ -3201,6 +3245,11 @@ class HandlerApiMixin:
                 "journal": revoke_result.get("journal", {}),
             })
         except JournalConflictError as exc:
+            self._send_json_response(409, exc.to_dict())
+            return
+        except JournalWorkspaceMismatchError as exc:
+            # 不是“文件被改过”，而是“journal 记录的根目录在这台机器上用不了”。
+            # 让用户先把工作区挂回来（或换环境），而不是诱导其 force。
             self._send_json_response(409, exc.to_dict())
             return
         except FileNotFoundError:

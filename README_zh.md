@@ -295,7 +295,7 @@ python app.py 0.0.0.0:9000 # 自定义主机和端口（重载 AGENTS_URL）
 | GET | `/v1/mcp-servers` | 列出已注册的 MCP servers |
 | DELETE | `/v1/mcp-servers/{server_name}` | 删除一个 MCP server |
 | POST | `/v1/sessions/{session_id}/generate-title` | 设定或生成会话标题（body 带非空 title 为人工设定，空则模型生成） |
-| POST | `/v1/sessions/{session_id}/revoke` | 撤销/取消一个会话 |
+| POST | `/v1/sessions/{session_id}/revoke` | 撤销/取消一个会话（文件按 journal manifest 记录的**工作区**还原，一个会话中途换过工作区就分别还原到各自根目录；body `workspace` 只为没记工作区的旧 journal 兜底。journal 的根目录在本机不可用时返回 409 `JournalWorkspaceMismatch`（`can_force: false`，强制撤销会凭空建目录写进无关项目） |
 | POST | `/v1/sessions/{session_id}/fork` | 从一条无工具调用的 assistant 回复衍生新会话（body：`message_index` + `timestamp`；截取该消息及之前所有轮次，附带对齐后的 summary/memory） |
 | DELETE | `/v1/tools/batch` | 批量删除工具 |
 | GET | `/v1/prompt-templates` | 获取提示词模板列表 |

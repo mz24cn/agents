@@ -316,7 +316,7 @@ change takes effect after a restart.
 | GET | `/v1/mcp-servers` | List registered MCP servers |
 | DELETE | `/v1/mcp-servers/{server_name}` | Delete an MCP server |
 | POST | `/v1/sessions/{session_id}/generate-title` | Set or generate session title (body `title` = manual, empty = model-generated) |
-| POST | `/v1/sessions/{session_id}/revoke` | Revoke a session |
+| POST | `/v1/sessions/{session_id}/revoke` | Revoke a session (file restore is anchored to the workspace recorded in each journal manifest, so a session that switched workspace mid-session is restored root by root; the body's `workspace` only backs up journals that recorded none. A journal root that is unusable here returns 409 `JournalWorkspaceMismatch` with `can_force: false`) |
 | POST | `/v1/sessions/{session_id}/fork` | Fork a new session from a tool-call-free assistant reply (body: `message_index` + `timestamp`; keeps that message and every earlier turn, with aligned summary/memory) |
 | DELETE | `/v1/tools/batch` | Batch delete tools |
 | GET | `/v1/prompt-templates` | List prompt templates |
