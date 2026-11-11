@@ -881,6 +881,39 @@ describe('sessions.revoke', () => {
     })
   })
 
+  it('names the session workspace when the caller knows it', async () => {
+    // A revoke carries no workspace of its own, so without this the backend
+    // falls back to the process default and restores another project's files.
+    vi.stubGlobal('fetch', mockFetch({ status: 'success' }))
+
+    await sessions.revoke('session-1', '2026-05-13T10:00:00', { workspace: '/mnt/d/Sources/HQD' })
+
+    const [, opts] = fetch.mock.calls[0]
+    expect(JSON.parse(opts.body).workspace).toBe('/mnt/d/Sources/HQD')
+  })
+
+  it('keeps a workspace mismatch non-forced', async () => {
+    // Not "the file changed" but "the journal's root is not on this machine":
+    // force would invent the directory and write the session into it.
+    const errorData = {
+      error: 'JournalWorkspaceMismatch',
+      message: 'Journal workspace is not available on this server: /mnt/d/Sources/HQD',
+      workspaces: ['/mnt/d/Sources/HQD'],
+      files: ['frontend/src/router/index.ts'],
+      can_force: false,
+    }
+    vi.stubGlobal('fetch', mockFetch(errorData, 409))
+
+    try {
+      await sessions.revoke('session-1', '2026-05-13T10:00:00')
+      throw new Error('Expected revoke to fail')
+    } catch (err) {
+      expect(err.status).toBe(409)
+      expect(err.code).toBe('JournalWorkspaceMismatch')
+      expect(err.data.can_force).toBe(false)
+    }
+  })
+
   it('preserves structured error metadata', async () => {
     const errorData = {
       error: 'JournalConflict',
