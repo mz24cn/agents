@@ -564,7 +564,10 @@ export const sessions = {
   // title 非空 = 人工设定标题；空 = 模型生成标题
   generateTitle: (sessionId, title = '') => request('POST', `/v1/sessions/${encodeURIComponent(sessionId)}/generate-title`, { title }),
   regenerateSummary: (sessionId) => request('POST',   `/v1/sessions/${encodeURIComponent(sessionId)}/regenerate-summary`),
-  revoke:        (sessionId, timestamp, { forced = false, keepFiles = false } = {}) => request('POST', `/v1/sessions/${encodeURIComponent(sessionId)}/revoke`, { session_id: sessionId, timestamp, forced, keep_files: keepFiles }),
+  // workspace：会话当前认定的工作区。服务端以 journal manifest 记录的工作区为准，
+  // 这个值只作兜底（manifest 没记 workspace 的老会话）——不传的话服务端会退回
+  // 进程级 AGENTS_WORKSPACE，会话工作区非默认值时就把文件还原到了别的目录。
+  revoke:        (sessionId, timestamp, { forced = false, keepFiles = false, workspace = '' } = {}) => request('POST', `/v1/sessions/${encodeURIComponent(sessionId)}/revoke`, { session_id: sessionId, timestamp, forced, keep_files: keepFiles, ...(workspace ? { workspace } : {}) }),
   // 衍生新会话：把该消息及之前的轮次复制成一条新会话（新会话 ID 由后端生成）。
   // timestamp 是 message_index 的交叉校验，也是下标错位时的兜底定位依据。
   fork:          (sessionId, { messageIndex = null, timestamp = '' } = {}) => request('POST', `/v1/sessions/${encodeURIComponent(sessionId)}/fork`, { message_index: messageIndex, timestamp }),

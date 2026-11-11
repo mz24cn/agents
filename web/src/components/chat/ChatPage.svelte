@@ -893,7 +893,11 @@
         // 守卫：当前会话已绑定远程环境时，workspacePath 是子端工作区路径，
         // 不能被母端 AGENTS_WORKSPACE 覆盖——否则下一轮消息会把母端路径
         // 写进 meta.workspace（曾导致远程会话工作区落盘/显示丢失）。
-        if (!resolvePanelRemoteEnv(sessionId)) {
+        // 本地会话同理：会话自己记住的工作区不能被“默认工作区”覆盖，否则
+        // 指示器显示的是默认值、journal 里记录的却是会话的工作区，两个数据源
+        // 一旦分叉，撤销时就会拿默认目录去解析会话的文件。
+        const remembered = sessionId ? sessionWorkspace(sessionId) : ''
+        if (!resolvePanelRemoteEnv(sessionId) && !remembered) {
           workspacePath = envMap.AGENTS_WORKSPACE
         }
       }
@@ -904,6 +908,9 @@
 
   function handleWorkspaceChange(path) {
     workspacePath = path
+    // 用户手选的工作区也要记进会话：否则 env 刷新（fetchWorkspacePath）会把它
+    // 冲回默认工作区，下一轮消息的 meta.workspace 就不是用户选的那个了。
+    if (sessionId) rememberSessionWorkspace(sessionId, path)
   }
 
   function handleSelectFiles(files) {
@@ -2009,13 +2016,37 @@
     revokeConfirm = { timestamp, hasFileChanges }
   }
 
+  // 撤销时把会话的工作区一并上报。服务端以 journal manifest 记录的工作区为准，
+  // 这个值只给“manifest 没记 workspace”的老会话兜底：不带的话服务端会退回进程
+  // 级 AGENTS_WORKSPACE，特定工作区的会话就被还原到别的目录去了（曾把 HQD 会话
+  // 的文件写进 TDS）。
+  function revokeWorkspaceHint() {
+    return workspacePath || sessionWorkspace(sessionId) || ''
+  }
+
+  function formatRevokeWorkspaceMismatch(data) {
+    const roots = Array.isArray(data?.workspaces) ? data.workspaces : []
+    const list = roots.length
+      ? `\n\n${t('revokeMismatchWorkspaces')}\n${roots.map(r => `- ${r}`).join('\n')}`
+      : ''
+    return `${t('revokeWorkspaceMismatch')}${list}`
+  }
+
+  // JournalWorkspaceMismatch 不是“文件被改过”，而是 journal 记录的根目录在这台
+  // 机器上用不了（未挂载 / 已移动 / 属于另一台环境）。服务端对此给 can_force=false：
+  // force 会凭空建出目录、把会话文件写进一棵无关的树，且消息历史已删、journal 已标
+  // revoked，事后无法挽回。所以这里只报错，不弹“强制撤销”。
+  function isWorkspaceMismatch(err) {
+    return err?.status === 409 && err?.code === 'JournalWorkspaceMismatch'
+  }
+
   async function confirmRevoke() {
     if (!sessionId || !revokeConfirm) return
     const timestamp = revokeConfirm.timestamp
     revokeConfirm = null
     errorMsg = ''
     try {
-      await sessionsApi.revoke(sessionId, timestamp)
+      await sessionsApi.revoke(sessionId, timestamp, { workspace: revokeWorkspaceHint() })
       applyRevokeSuccess(timestamp)
     } catch (err) {
       if (err?.status === 409 && err?.code === 'JournalConflict') {
@@ -2023,6 +2054,10 @@
           timestamp,
           files: err.data?.files ?? [],
         }
+        return
+      }
+      if (isWorkspaceMismatch(err)) {
+        errorMsg = formatRevokeWorkspaceMismatch(err.data)
         return
       }
       errorMsg = err?.message || t('revokeFailed')
@@ -2035,9 +2070,16 @@
     revokeConfirm = null
     errorMsg = ''
     try {
-      await sessionsApi.revoke(sessionId, timestamp, { keepFiles: true })
+      await sessionsApi.revoke(sessionId, timestamp, {
+        keepFiles: true,
+        workspace: revokeWorkspaceHint(),
+      })
       applyRevokeSuccess(timestamp)
     } catch (err) {
+      if (isWorkspaceMismatch(err)) {
+        errorMsg = formatRevokeWorkspaceMismatch(err.data)
+        return
+      }
       errorMsg = err?.message || t('revokeFailed')
     }
   }
@@ -2052,9 +2094,16 @@
     revokeConflict = null
     errorMsg = ''
     try {
-      await sessionsApi.revoke(sessionId, timestamp, { forced: true })
+      await sessionsApi.revoke(sessionId, timestamp, {
+        forced: true,
+        workspace: revokeWorkspaceHint(),
+      })
       applyRevokeSuccess(timestamp)
     } catch (err) {
+      if (isWorkspaceMismatch(err)) {
+        errorMsg = formatRevokeWorkspaceMismatch(err.data)
+        return
+      }
       errorMsg = err?.message || t('revokeFailed')
     }
   }
@@ -2065,9 +2114,16 @@
     revokeConflict = null
     errorMsg = ''
     try {
-      await sessionsApi.revoke(sessionId, timestamp, { keepFiles: true })
+      await sessionsApi.revoke(sessionId, timestamp, {
+        keepFiles: true,
+        workspace: revokeWorkspaceHint(),
+      })
       applyRevokeSuccess(timestamp)
     } catch (err) {
+      if (isWorkspaceMismatch(err)) {
+        errorMsg = formatRevokeWorkspaceMismatch(err.data)
+        return
+      }
       errorMsg = err?.message || t('revokeFailed')
     }
   }
