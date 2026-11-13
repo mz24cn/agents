@@ -41,6 +41,9 @@ from runtime.context_manager import (
     ConversationTurn,
     MemoryEntry,
     _estimate_tokens_fast,
+    _memory_char_limit,
+    _memory_entry_char_limit,
+    _memory_entry_cost,
     serialize_memory,
     serialize_summary,
 )
@@ -891,3 +894,387 @@ def test_disabled_when_no_compression_model_available() -> None:
             model_registry=ModelRegistry(),  # empty registry
         )
         assert cm._select_compression_model("", 0) == ("", 0)
+
+
+
+# ---------------------------------------------------------------------------
+# A compression request the provider rejects as oversized
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _calibration_table_isolated():
+    """The estimate->actual factors are process-wide: keep them out of tests."""
+    from runtime.common import clear_prompt_token_calibration
+
+    clear_prompt_token_calibration()
+    yield
+    clear_prompt_token_calibration()
+
+
+def _windowed_cm(
+    tmp_dir: str, infer_fn: Callable, *, model_id: str = "test-model",
+    max_context: int = 196608,
+) -> ContextManager:
+    """A ContextManager whose compression model has a KNOWN window.
+
+    The window is what the compression prompt is bounded by, so every test
+    about that bound needs a registry entry carrying it.
+    """
+    registry = ModelRegistry()
+    registry.register(_cfg(model_id, max_context))
+    return ContextManager(
+        infer_fn=infer_fn,
+        chats_dir=tmp_dir,
+        recent_turns_k=2,
+        summary_model_id=model_id,
+        max_tokens_in_context=1000,
+        model_registry=registry,
+    )
+
+
+def test_compression_budget_honours_the_measured_factor() -> None:
+    """A model measured at 1.5x our estimate gets its budget divided by 1.5.
+
+    The prompt builder spends its budget in ESTIMATED tokens (it drops the
+    oldest delta turns until ``estimate_llm_tokens`` says the prompt fits), so a
+    bound expressed as the raw window is not a bound on what the provider
+    counts.  Reproduced from a real 196 608-token session: the builder measured
+    its own prompt at 179 454 tokens, the provider counted 242 845 and answered
+    ``request exceeds the context window`` -- on every attempt, because a
+    compression that never succeeds is a session that can never stop growing.
+    """
+    from runtime.common import estimate_llm_tokens, set_prompt_token_calibration
+
+    store: dict = {}
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cm = _windowed_cm(tmp_dir, _capturing_infer(store))
+        sid = cm.create_session()
+        # ~200k estimated tokens: over the raw budget (180 224) AND over the
+        # calibrated one (120 149), so both runs drop turns -- what is under
+        # test is WHICH of the two budgets they drop down to.
+        turns = [_make_turn(content=f"turn {i}: " + "字" * 400) for i in range(500)]
+        set_prompt_token_calibration("test-model", 1.5)
+
+        cm.compress_context(sid, turns, last_total_tokens=2000)
+
+        prompt = store["prompts"][0]
+        assert "older turn(s) omitted" in prompt
+        calibrated = (196608 - 16384) / 1.5
+        assert estimate_llm_tokens(prompt) <= calibrated + 512, (
+            "the prompt was bounded by the raw window, not by the window as "
+            f"this model counts it: {estimate_llm_tokens(prompt)} > {calibrated}"
+        )
+        assert estimate_llm_tokens(prompt) > calibrated / 2, (
+            "the budget must be spent, not collapsed"
+        )
+
+
+def test_an_oversized_rejection_teaches_the_next_attempt() -> None:
+    """A rejected compression is a measurement: fold the provider's count in.
+
+    The rejection names the prompt size the provider counted, which is the only
+    trustworthy number available for a model this service has never had accepted.
+    Without it, every later attempt rebuilds the same doomed request and the
+    pre-send guard -- measuring with the same naive estimate, and so measuring
+    ~1.35x too small -- keeps letting the session grow until nothing fits.
+    """
+    from runtime.common import estimate_llm_tokens, get_prompt_token_calibration
+
+    store: dict = {"n": 0, "prompts": []}
+
+    def reject_once(req: Any) -> SimpleNamespace:
+        store["n"] += 1
+        store["prompts"].append(req.messages[0].content)
+        if store["n"] == 1:
+            return _failed_result(
+                req,
+                'HTTP 400: Bad Request. {"error": {"type": "invalid_request_error", '
+                '"message": "request exceeds the context window: prompt (242845 '
+                'tokens) leaves no room to answer in the context (196608); '
+                'requests are never truncated"}}',
+            )
+        return SimpleNamespace(
+            content="<summary>\nsummary text\n</summary>\n<memory>\n[]\n</memory>"
+        )
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cm = _windowed_cm(tmp_dir, reject_once)
+        sid = cm.create_session()
+        turns = [_make_turn(content=f"turn {i}: " + "字" * 400) for i in range(500)]
+
+        cm.compress_context(sid, turns, last_total_tokens=2000)
+        assert cm.get_summary(sid)[0] == "", "a rejected attempt persists nothing"
+
+        first = store["prompts"][0]
+        ratio = 242845 / estimate_llm_tokens(first)
+        assert 0.5 <= ratio <= 8.0, "the sample must be credible to be folded in"
+        factor = get_prompt_token_calibration("test-model")
+        assert factor > 1.0, "the rejection was thrown away instead of measured"
+
+        cm.compress_context(
+            sid, turns + [_make_turn(content="newest turn")],
+            last_total_tokens=4000,
+        )
+        second = store["prompts"][-1]
+        assert estimate_llm_tokens(second) <= int((196608 - 16384) / factor) + 512
+        assert cm.get_summary(sid)[0] == "summary text", (
+            "the attempt that learned the factor is the one that fits"
+        )
+
+
+def test_a_non_overflow_failure_teaches_nothing() -> None:
+    """``Insufficient Balance`` says nothing about how a model tokenises text."""
+    from runtime.common import get_prompt_token_calibration
+
+    def payment_required(req: Any) -> SimpleNamespace:
+        return _failed_result(
+            req,
+            'HTTP 402: Payment Required. {"error":{"message":"Insufficient '
+            'Balance","type":"insufficient_balance_error"}}',
+        )
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cm = _windowed_cm(tmp_dir, payment_required)
+        sid = cm.create_session()
+        cm.compress_context(
+            sid, [_make_turn(content=f"turn {i}") for i in range(6)],
+            last_total_tokens=2000,
+        )
+        assert get_prompt_token_calibration("test-model") == 1.0
+
+
+def test_a_failure_about_something_else_teaches_nothing_even_when_it_quotes_tokens() -> None:
+    """Only a context-window rejection measures our own estimate.
+
+    Providers also quote token counts in rate-limit and parameter errors, and a
+    throughput figure says nothing about how a prompt tokenises: folding one in
+    would start truncating later requests to that model for no reason.  The
+    quoted share is deliberately inside the credible band, so the only thing
+    that can turn it down here is the overflow check itself.
+    """
+    from runtime.common import estimate_llm_tokens, get_prompt_token_calibration
+
+    prompt = "the quick brown fox jumps over the lazy dog. " * 60
+    quoted = int(estimate_llm_tokens(prompt) * 2.5)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cm = _windowed_cm(tmp_dir, lambda req: None)  # no call happens here
+        sid = cm.create_session()
+        learned = cm._learn_compression_overflow(
+            sid, "test-model", 8000, prompt,
+            f"HTTP 429: Too Many Requests. you requested {quoted} tokens "
+            f"per minute; limit reached",
+        )
+        assert learned is False
+        assert get_prompt_token_calibration("test-model") == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Memory budget: entries accumulate, and the block rides on EVERY request
+# ---------------------------------------------------------------------------
+
+
+def _memory_store(count: int, size: int) -> list:
+    """*count* distinct entries of ~*size* characters, oldest first."""
+    return [
+        MemoryEntry(
+            "fact",
+            f"mem{i:04d} " + ("x" * size),
+            i,
+            0.9,
+            f"2026-01-01T{i // 3600:02d}:{(i // 60) % 60:02d}:{i % 60:02d}",
+        )
+        for i in range(count)
+    ]
+
+
+def test_memory_file_is_capped_by_characters() -> None:
+    """Entries accumulate on every compression round, and the WHOLE block is
+    merged into the system message of every later request.
+
+    One real session carried 200 entries / 30 344 content characters, injected as
+    32 743 characters (~10 600 estimated tokens) on every request while the turns
+    themselves were the thing being squeezed into the window.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cm = _make_cm(tmp_dir)
+        sid = cm.create_session()
+        entries = _memory_store(200, 300)
+        cm.save_memory(sid, entries)
+
+        kept = cm.get_memory_entries(sid)
+        assert len(kept) < len(entries), "a 200 x 300-character store must shrink"
+        assert sum(_memory_entry_cost(e) for e in kept) <= _memory_char_limit()
+        assert kept[-1].content == entries[-1].content, (
+            "the newest fact is the one that must survive"
+        )
+        assert entries[0].content not in {e.content for e in kept}
+
+
+def test_the_memory_caps_are_configurable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``MEMORY_MAX_CHARS`` / ``MEMORY_MAX_ENTRIES`` are operator-tunable."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cm = _make_cm(tmp_dir)
+
+        sid = cm.create_session()
+        monkeypatch.setenv("MEMORY_MAX_CHARS", "3000")
+        cm.save_memory(sid, _memory_store(60, 200))
+        kept = cm.get_memory_entries(sid)
+        assert sum(_memory_entry_cost(e) for e in kept) <= 3000
+
+        other = "cap-by-entries"
+        os.makedirs(os.path.join(cm._chats_dir, other))
+        monkeypatch.setenv("MEMORY_MAX_CHARS", "1000000")
+        monkeypatch.setenv("MEMORY_MAX_ENTRIES", "7")
+        cm.save_memory(other, _memory_store(60, 200))
+        kept = cm.get_memory_entries(other)
+        assert [e.content[:7] for e in kept] == [
+            f"mem{i:04d}" for i in range(53, 60)
+        ]
+
+
+def test_one_runaway_entry_does_not_eat_the_budget() -> None:
+    """A pasted tool output is not a memory; clamping it keeps it from evicting
+    every real fact stored alongside it."""
+    payload = [
+        {
+            "entry_type": "fact",
+            "content": "y" * 30_000,
+            "source_turn_index": 1,
+            "confidence": 0.9,
+            "created_at": "2026-01-02T00:00:00",
+        },
+        {
+            "entry_type": "fact",
+            "content": "the release build cannot be read with run-as",
+            "source_turn_index": 2,
+            "confidence": 0.9,
+            "created_at": "2026-01-02T00:00:01",
+        },
+    ]
+    output = (
+        "<summary>\ns\n</summary>\n<memory>\n" + json.dumps(payload) + "\n</memory>"
+    )
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cm = _make_cm(tmp_dir, infer_fn=lambda req: SimpleNamespace(content=output))
+        sid = cm.create_session()
+        cm.compress_context(
+            sid, [_make_turn(content=f"turn {i}") for i in range(4)],
+            last_total_tokens=2000,
+        )
+
+        contents = [e.content for e in cm.get_memory_entries(sid)]
+        assert "the release build cannot be read with run-as" in contents, (
+            "the small real fact must not be evicted by the runaway one"
+        )
+        runaway = [c for c in contents if c.startswith("yyyy")]
+        assert len(runaway) == 1
+        assert len(runaway[0]) <= _memory_entry_char_limit()
+        assert runaway[0].endswith("[entry truncated]"), (
+            "the entry must say it was cut, not pretend to be complete"
+        )
+
+
+def test_compression_prompt_shows_the_existing_memory() -> None:
+    """The model has to see what is ALREADY stored.
+
+    Without the echo it re-emits the same fact in other words every round, and
+    the exact de-duplication on ``(entry_type, content)`` cannot catch that --
+    which is how the 200-entry / 60 000-character file was produced.
+    """
+    seen: dict = {}
+
+    def llm_fn(req: Any) -> SimpleNamespace:
+        seen["prompt"] = req.messages[-1].content
+        return SimpleNamespace(
+            content="<summary>\ns2\n</summary>\n<memory>\n[]\n</memory>"
+        )
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cm = _make_cm(tmp_dir, infer_fn=llm_fn)
+        sid = cm.create_session()
+        cm.save_memory(sid, [
+            MemoryEntry(
+                "fact", "全局有450家医院，其中81家三甲", 0, 0.9,
+                "2026-01-01T00:00:01",
+            ),
+        ])
+        cm.compress_context(
+            sid, [_make_turn(content=f"turn {i}") for i in range(4)],
+            last_total_tokens=2000,
+        )
+
+        prompt = seen["prompt"]
+        assert "## Existing memory" in prompt
+        assert "全局有450家医院，其中81家三甲" in prompt
+        assert "Already recorded" in prompt, (
+            "the memory instructions must tell the model not to restate them"
+        )
+
+
+def test_the_memory_echo_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The echo must not turn the compression prompt into a memory dump."""
+    monkeypatch.setenv("MEMORY_CONTEXT_MAX_CHARS", "600")
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cm = _make_cm(tmp_dir)
+        sid = cm.create_session()
+        entries = _memory_store(50, 60)
+        cm.save_memory(sid, entries)
+
+        block = cm._existing_memory_block(sid)
+        assert len(block) <= 800
+        assert entries[-1].content in block
+        assert "older entr" in block, "the truncation must be visible"
+
+
+def test_a_legacy_oversized_memory_file_is_capped_when_injected() -> None:
+    """Sessions already on disk carry more than the cap.
+
+    Injection pays the cap, not the file size -- otherwise the fix only helps
+    sessions created after it.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cm = _make_cm(tmp_dir)
+        sid = cm.create_session()
+        cm.save_conversation(
+            sid, [_make_turn(content=f"turn {i}") for i in range(20)]
+        )
+        cm._atomic_write(
+            cm._summary_path(sid),
+            serialize_summary(
+                {
+                    "session_id": sid,
+                    "summary_version": 1,
+                    "summarized_up_to_turn": 15,
+                    "updated_at": "2026-01-01T00:00:00",
+                },
+                "the real summary prose",
+            ),
+        )
+        # Bypass save_memory's trim: this is what an older process left behind.
+        cm._atomic_write(
+            cm._memory_path(sid),
+            serialize_memory(
+                {
+                    "session_id": sid,
+                    "entry_count": 200,
+                    "updated_at": "2026-01-01T00:00:00",
+                },
+                _memory_store(200, 300),
+            ),
+        )
+
+        assembled = cm.assemble_context(sid, [])
+        system_text = "\n".join(
+            str(m.get("content", "")) for m in assembled if m.get("role") == "system"
+        )
+        injected = [i for i in range(200) if f"mem{i:04d}" in system_text]
+        assert injected, "some memory must still be injected"
+        assert max(injected) == 199, "the newest entries are the ones kept"
+        assert len(injected) < 200, "a 60 000-character file must not all be sent"
+        unit = _memory_entry_cost(_memory_store(1, 300)[0])
+        assert len(injected) * unit <= _memory_char_limit() + unit

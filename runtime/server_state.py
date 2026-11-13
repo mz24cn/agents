@@ -1386,6 +1386,19 @@ class InLoopContextCompressor:
         Message objects of the loop are never mutated: they are also held by the
         caller's persistence list, and the transcript must keep the verbatim
         tool output.
+
+        ``system`` messages are never candidates: that message is where
+        :meth:`ContextManager.assemble_context` carries the agent prompt, the
+        rolling summary and the structured memory, so offloading it would spend
+        the very compression the guard has just asked for (a real
+        ``context guard: refusing to send`` ended with the summary/memory
+        message itself spilled to a file, leaving a request that was both
+        oversized and amnesic).
+
+        When offloading every oversized message is still not enough — the rest
+        of the overflow is spread over many medium turns, and only a handful of
+        them ever reach the offload threshold — :meth:`_drop_oldest_for_budget`
+        finishes the job instead of refusing the request.
         """
         from dataclasses import replace as dc_replace
 
@@ -1399,16 +1412,16 @@ class InLoopContextCompressor:
         for index, message in enumerate(messages):
             if getattr(message, "images", None):
                 continue
+            if self._message_role(message) == "system":
+                continue
             content = self._message_content(message)
             if not isinstance(content, str) or is_spilled_content(content):
                 continue
             size = estimate_content(content)
             if size >= _CONTEXT_SPILL_MIN_TOKENS:
                 candidates.append((size, index))
-        if not candidates:
-            return None, estimate(messages)
-
         candidates.sort(reverse=True)
+
         current = list(messages)
         current_tokens = estimate(current)
         offloaded = 0
@@ -1436,7 +1449,156 @@ class InLoopContextCompressor:
                 "message to a file (excerpt of %d chars kept inline)",
                 self.session_id, size, label, len(reference),
             )
+
+        if current_tokens > budget:
+            trimmed, trimmed_tokens = self._drop_oldest_for_budget(
+                current, budget, current_tokens, estimate
+            )
+            if trimmed is not None:
+                current, current_tokens, offloaded = trimmed, trimmed_tokens, offloaded + 1
         return (current if offloaded else None), current_tokens
+
+    def _drop_oldest_for_budget(
+        self,
+        messages: list,
+        budget: int,
+        current_tokens: int,
+        estimate: Callable[[list], int],
+    ) -> tuple[Optional[list], int]:
+        """Drop the oldest turns of the window until the request fits.
+
+        The last step of the pre-send guard, reached only after compression
+        (shallow and deep) and after every oversized message became a file
+        reference.  What is left is a long run of medium messages — typically
+        the unsummarized window of a session whose compression is unavailable or
+        keeps failing — and no amount of offloading can clear it: a real request
+        of 222 messages / ~189 000 tokens had exactly four messages above the
+        offload threshold, so the guard offloaded four and refused to send.
+
+        Dropping the oldest messages is lossy, but it is the lesser loss: the
+        rolling summary (still in the system message) describes older content,
+        ``conversation.json`` still holds the verbatim transcript, and the
+        alternative is an inference that never runs at all.  The drop is written
+        into the system message so the model is told what it is missing instead
+        of silently seeing a shorter past.
+
+        Protocol integrity is preserved: the window never starts on a ``tool``
+        result whose ``assistant(tool_calls)`` was dropped, and it keeps at
+        least one ``user`` message (providers such as Ollama reject a request
+        without one) -- the same two invariants
+        :meth:`ContextManager.select_unsummarized_turns` upholds.
+
+        Returns ``(list_or_None, tokens)``: ``None`` when nothing could be
+        dropped (a single-message request, or everything already dropped).
+        """
+        if len(messages) < 2:
+            return None, current_tokens
+
+        # A leading system message carries the prompt/summary/memory: it is
+        # never dropped, and it is where the omission note is written.
+        head = 1 if self._message_role(messages[0]) == "system" else 0
+
+        from runtime.common import (
+            estimate_chat_message_tokens,
+            get_prompt_token_calibration,
+        )
+
+        sizes = [estimate_chat_message_tokens(m) for m in messages]
+        measured = max(1, current_tokens)
+        walked = max(1, sum(sizes))
+        # ``measured`` comes from a walk that stops as soon as the budget is
+        # passed, so it can be smaller than the list really is; the model's
+        # measured estimate->factor is the other way to know the per-message
+        # walk is not yet in the model's own units.
+        scale = max(measured / walked, get_prompt_token_calibration(self.inference_model_id))
+
+        def _clean_start(cut: int) -> int:
+            """First index >= *cut* that may legally open the window."""
+            while cut < len(messages) and self._message_role(messages[cut]) == "tool":
+                cut += 1
+            return cut
+
+        limit = len(messages) - 1  # the newest message is never dropped
+        # Phase 1: walk the per-message estimates, scaled to the model's units,
+        # until the projection fits.  Cheap: no full re-estimate per step.
+        cut = _clean_start(head)
+        dropped_raw = 0.0
+        while cut < limit and (walked * scale - dropped_raw) > budget:
+            dropped_raw += sizes[cut] * scale
+            cut = _clean_start(cut + 1)
+        cut = min(cut, limit)
+
+        rebuilt = self._with_omission_note(messages, head, cut)
+        tokens = estimate(rebuilt)
+        # Phase 2: the walk above is an approximation; correct it with the
+        # caller's own estimator, which is the number the request is judged by.
+        # The step is proportional to what is still over, so a window of
+        # hundreds of messages is cleared in a handful of re-measures.
+        average = max(1, int(sum(sizes[head:]) * scale // max(1, len(messages) - head)))
+        while tokens > budget and cut < limit:
+            step = min(limit - cut, max(1, (tokens - budget) // average))
+            cut = min(_clean_start(cut + step), limit)
+            rebuilt = self._with_omission_note(messages, head, cut)
+            tokens = estimate(rebuilt)
+        if tokens > current_tokens or len(rebuilt) >= len(messages):
+            return None, current_tokens
+
+        logger.warning(
+            "pre-send context guard: session %s dropped %d of its oldest messages "
+            "(~%d tokens) to reach the %d-token budget: compression did not free "
+            "enough, and the full transcript stays in conversation.json",
+            self.session_id, len(messages) - len(rebuilt),
+            sum(sizes[head:cut]), budget,
+        )
+        return rebuilt, tokens
+
+    def _with_omission_note(self, messages: list, head: int, cut: int) -> list:
+        """Rebuild ``messages`` without its oldest *cut*, and say so.
+
+        The two protocol invariants are applied BEFORE the note is written, and
+        a rebuild that they cancel out (the whole window was user anchors, so
+        nothing actually left the context) is returned verbatim: a note costing
+        tokens for a drop that did not happen would only push the request
+        further over its budget.
+        """
+        from dataclasses import replace as dc_replace
+
+        kept = messages[0:head] + list(messages[cut:])
+
+        # Never leave a request without a user message (see the docstring):
+        # put back the newest dropped one, right after the system message.
+        if not any(self._message_role(m) == "user" for m in kept):
+            for index in range(cut - 1, head - 1, -1):
+                if self._message_role(messages[index]) == "user":
+                    kept.insert(1, messages[index])
+                    break
+
+        dropped = len(messages) - len(kept)
+        if dropped <= 0:
+            return list(messages)
+
+        note = (
+            f"\n\n[{dropped} oldest message(s) of this session were dropped from "
+            f"the context to fit the model's window; the rolling summary above "
+            f"covers them, and the verbatim transcript remains in "
+            f"conversation.json of session {self.session_id}]"
+        )
+        if head == 1:
+            first = kept[0]
+            content = self._message_content(first) or ""
+            if isinstance(first, dict):
+                kept[0] = {**first, "content": f"{content}{note}"}
+            else:
+                kept[0] = dc_replace(first, content=f"{content}{note}")
+        else:
+            kept.insert(0, {"role": "system", "content": note.strip()})
+        return kept
+
+    @staticmethod
+    def _message_role(message: object) -> str:
+        if isinstance(message, dict):
+            return str(message.get("role") or "")
+        return str(getattr(message, "role", "") or "")
 
     @staticmethod
     def _message_content(message: object) -> object:

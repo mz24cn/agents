@@ -489,6 +489,29 @@ _COMPRESSION_OUTPUT_RESERVE: int = 16384
 #: completion tokens at all (transient provider behavior).
 _MAX_EMPTY_OUTPUT_RETRIES: int = 2
 _MEMORY_MAX_ENTRIES: int = 200
+#: Hard cap on the memory block that ``memory.md`` contributes to EVERY request.
+#: Entries accumulate (each compression round adds more) and the whole block is
+#: merged into the system message, so an unbounded file silently taxes every
+#: future request of the session: one real session carried 200 entries /
+#: 30 344 content characters, injected as 32 743 characters ~= 10 600 estimated
+#: tokens on EVERY request (its memory.md itself was 60 282 characters, half of
+#: that being JSON keys).  The cap is charged
+#: in the RENDERED form (what is injected), oldest entries are dropped first, and
+#: the drop is permanent (memory.md is the only store of these entries; the raw
+#: turns stay in conversation.json), which is why the same budget is also handed
+#: to the extraction prompt (see ``_memory_context_char_limit``) so the model
+#: merges what it already has instead of accumulating near-duplicates.
+_MEMORY_MAX_CHARS: int = 32_768
+#: How much of the ALREADY STORED memory the compression prompt is shown.  Without
+#: it the model cannot know what is already recorded and re-emits near-duplicates
+#: in other words -- exact de-duplication on ``(entry_type, content)`` cannot see
+#: those.  Bounded separately from ``_MEMORY_MAX_CHARS`` because this one is paid
+#: once per compression round instead of once per request.
+_MEMORY_CONTEXT_MAX_CHARS: int = 16_384
+#: One entry longer than this is not a memory, it is a pasted tool output; the
+#: extraction prompt asks for a self-contained sentence.  Clamping keeps a single
+#: runaway entry from consuming the whole ``_MEMORY_MAX_CHARS`` budget.
+_MEMORY_ENTRY_MAX_CHARS: int = 2_000
 _COMPRESS_BACKOFF_TOKEN_GROWTH: float = 1.25
 _COMPRESS_BACKOFF_SECONDS: float = 1800.0
 _COMPRESS_BACKOFF_MIN_FAILURES: int = 3
@@ -516,6 +539,10 @@ _VALID_ENTRY_TYPES: frozenset[str] = frozenset(
 # code and its tests refer to it.
 from runtime.common import (  # noqa: E402
     estimate_llm_tokens as _estimate_tokens_fast,
+    env_int,
+    get_prompt_token_calibration,
+    record_prompt_token_calibration,
+    set_prompt_token_calibration,
     sha256_bytes,
 )
 
@@ -535,7 +562,104 @@ def _is_placeholder_memory_entry(content: str) -> bool:
     return not stripped or stripped in _PLACEHOLDER_MEMORY_CONTENTS
 
 
-def _compression_prompt_budget(max_context: int) -> Optional[int]:
+# ---------------------------------------------------------------------------
+# Memory budget (entries accumulate; the whole block rides on every request)
+# ---------------------------------------------------------------------------
+
+def _memory_entry_limit() -> int:
+    """Entries kept per session (``MEMORY_MAX_ENTRIES`` overrides the default)."""
+    return max(1, env_int("MEMORY_MAX_ENTRIES", _MEMORY_MAX_ENTRIES))
+
+
+def _memory_char_limit() -> int:
+    """Characters the memory block may cost in one request (``MEMORY_MAX_CHARS``)."""
+    return max(256, env_int("MEMORY_MAX_CHARS", _MEMORY_MAX_CHARS))
+
+
+def _memory_context_char_limit() -> int:
+    """Stored memory shown to the extraction prompt (``MEMORY_CONTEXT_MAX_CHARS``).
+
+    ``0`` disables the echo, which restores the old append-blind behaviour.
+    """
+    return max(0, env_int("MEMORY_CONTEXT_MAX_CHARS", _MEMORY_CONTEXT_MAX_CHARS))
+
+
+def _memory_entry_char_limit() -> int:
+    """Per-entry character clamp (``MEMORY_ENTRY_MAX_CHARS``)."""
+    return max(64, env_int("MEMORY_ENTRY_MAX_CHARS", _MEMORY_ENTRY_MAX_CHARS))
+
+
+def _clamp_memory_content(content: str) -> str:
+    """Cut a runaway entry down to sentence size.
+
+    One 30 000-character entry (a pasted tool output) would otherwise consume the
+    whole ``_MEMORY_MAX_CHARS`` budget and drop every real memory with it.  The
+    marker is part of the entry so the model can see the fact was cut, and the
+    full text remains in ``conversation.json`` / the spillover file.
+    """
+    text = (content or "").strip()
+    limit = _memory_entry_char_limit()
+    if len(text) <= limit:
+        return text
+    marker = " …[entry truncated]"
+    return text[: max(0, limit - len(marker))].rstrip() + marker
+
+
+def _memory_entry_cost(entry: "MemoryEntry") -> int:
+    """Characters one entry costs in the injected form.
+
+    Matches ``render_memory_entries`` (``## Memory`` header + ``type: content``),
+    because the budget has to be charged in the form that is actually sent, not
+    the JSON form stored on disk.
+    """
+    return len(entry.content or "") + len(entry.entry_type or "") + 12
+
+
+def _trim_memory_entries(entries: list) -> list:
+    """Keep the newest entries that fit both the count and the character budget.
+
+    Oldest-first matches how the block is used (recent facts bear on the current
+    turn) and how the count cap already trimmed.  The newest entry is kept even
+    when it alone exceeds the budget: a session with one memory is not a reason
+    to inject none.
+    """
+    kept = [e for e in entries if not _is_placeholder_memory_entry(e.content)]
+    kept.sort(key=lambda e: (str(e.created_at or ""), int(e.source_turn_index or 0)))
+    entry_limit = _memory_entry_limit()
+    char_limit = _memory_char_limit()
+    out: list = []
+    total = 0
+    for entry in reversed(kept):
+        cost = _memory_entry_cost(entry)
+        if out and (len(out) >= entry_limit or total + cost > char_limit):
+            break
+        out.append(entry)
+        total += cost
+    out.reverse()
+    return out
+
+
+def render_memory_entries(entries: list) -> list[str]:
+    """Render *entries* into the ``## Memory`` parts of the system message.
+
+    The injection point enforces the same budget as :func:`_trim_memory_entries`,
+    so a ``memory.md`` written before the budget existed cannot smuggle 60 000
+    characters into every request of the session.
+    """
+    return [
+        f"## Memory\n{entry.entry_type}: {entry.content}"
+        for entry in _trim_memory_entries(entries)
+    ]
+
+
+#: Public spelling for callers outside this module: group_chat injects the same
+#: memory block and must pay the same budget.
+trim_memory_entries = _trim_memory_entries
+
+
+def _compression_prompt_budget(
+    max_context: int, model_id: str = ""
+) -> Optional[int]:
     """Return the prompt token budget for a compression request, or ``None``.
 
     Compression is designed to succeed in a SINGLE call, so the prompt is
@@ -543,11 +667,73 @@ def _compression_prompt_budget(max_context: int) -> Optional[int]:
     reserving room for the summary + memory answer.  ``max_context <= 0``
     means the window is unknown, in which case the delta is sent in full
     (best effort) and the budget is ``None``.
+
+    The budget is spent in *estimated* tokens: the prompt builder drops the
+    oldest delta turns until :func:`estimate_llm_tokens` says the prompt fits.
+    That estimate is a guess, and for some tokenizers it is far too small -- a
+    196 608-token session measured 179 454 by it and 242 845 by the provider,
+    so the "already bounded" compression request was itself rejected with
+    ``request exceeds the context window`` and the session could never be
+    compressed again.  The model's MEASURED estimate->actual factor (folded in
+    by :func:`record_prompt_token_calibration` from every provider reply, and
+    by :meth:`ContextManager._learn_compression_overflow` from an overflow
+    rejection) therefore divides the budget here, exactly as
+    :func:`estimate_chat_prompt_tokens_calibrated` scales the measurement the
+    pre-send guard compares against a window.  A factor below ``1.0`` is
+    ignored: like the guard, this may only ever make the bound stricter.
     """
     if not max_context or max_context <= 0:
         return None
     budget = max_context - _COMPRESSION_OUTPUT_RESERVE
-    return budget if budget > 0 else 0
+    if budget <= 0:
+        return 0
+    factor = get_prompt_token_calibration(model_id)
+    if factor > 1.0:
+        budget = max(1, int(budget / factor))
+    return budget
+
+
+#: How providers phrase "your request is larger than my context window".  Used
+#: to tell an oversized request apart from every other compression failure: only
+#: the former carries a usable measurement of our own estimate.
+_CONTEXT_OVERFLOW_ERROR_RE = re.compile(
+    r"exceeds the (?:available )?context"
+    r"|context window"
+    r"|maximum context length"
+    r"|leaves no room"
+    r"|too many tokens",
+    re.IGNORECASE,
+)
+
+#: Where in that message the provider states the size IT counted, ordered by
+#: specificity (first match wins).  Both shapes below were seen in production:
+#: ``prompt (242845 tokens) leaves no room to answer in the context (196608)``
+#: and ``request (300000 tokens) exceeds the available context size (131072)``.
+_PROVIDER_PROMPT_TOKENS_RES: tuple[re.Pattern, ...] = (
+    re.compile(r"prompt\s*\(?\s*(\d+)\s*tokens?\)", re.IGNORECASE),
+    re.compile(r"request\s*\(\s*(\d+)\s*tokens?\)", re.IGNORECASE),
+    re.compile(r"(?:however )?you requested\s+(\d+)\s*tokens?", re.IGNORECASE),
+    re.compile(r"requested\s+(\d+)\s+tokens?", re.IGNORECASE),
+)
+
+
+def _context_overflow_tokens(error: object) -> int:
+    """Prompt tokens the provider counted for a rejected request (0 = unknown).
+
+    An overflow rejection is a free measurement: the provider just told us how
+    many tokens a request of ours really costs.  Returning ``0`` when the
+    message carries no number keeps the caller on the old path instead of
+    guessing.
+    """
+    text = error if isinstance(error, str) else str(error or "")
+    for pattern in _PROVIDER_PROMPT_TOKENS_RES:
+        match = pattern.search(text)
+        if match:
+            try:
+                return int(match.group(1))
+            except (TypeError, ValueError):  # pragma: no cover - regex-guarded
+                return 0
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -795,6 +981,14 @@ tool-call loops, tool results, and intermediate reasoning \u2014 that are useful
 reference material for future sessions. These are the raw facts deliberately \
 left out of the summary. Be thorough \u2014 err on the side of including borderline \
 items. Assign a confidence score (0.0\u20131.0).
+
+**Already recorded (de-duplicate here, not later).** When the history above
+contains an "Existing memory" list, those entries are ALREADY stored for this
+session. Do NOT emit an entry that repeats, rewords or trivially re-derives one
+of them - emit only facts that list does not cover. If a listed fact has been
+superseded by the new turns, emit the current value once and leave the outdated
+one alone. Stored memory is kept under a fixed character budget and the OLDEST
+entries are dropped first, so every duplicate costs the session a real fact.
 
 Categories (use in entry_type):
 - "fact": objective, verifiable information (e.g. "the server runs on port \
@@ -2676,11 +2870,13 @@ class ContextManager:
     def save_memory(self, session_id: str, entries: list[MemoryEntry]) -> None:
         """Persist *entries* to ``memory.md`` in the session directory.
 
-        Args:
-            session_id: Target session.
-            entries: List of :class:`MemoryEntry` objects to persist.
+        The stored list is put through :func:`_trim_memory_entries` first, so the
+        file on disk cannot outgrow the budget that is charged on every later
+        request no matter which caller writes it (compression, import, a manual
+        edit through the API).
         """
         now = now_iso()
+        entries = _trim_memory_entries(entries)
         front_matter: dict = {
             "session_id": session_id,
             "entry_count": len(entries),
@@ -2756,16 +2952,83 @@ class ContextManager:
         self._compress_failure_state.pop(session_id, None)
         self._placeholder_summary_warned.discard(session_id)
 
+    def _learn_compression_overflow(
+        self, session_id: str, model_id: str, window: int, prompt: str,
+        error: object,
+    ) -> bool:
+        """Fold an overflow rejection back into the model's estimate factor.
+
+        A compression request that the provider rejects as oversized is a
+        measurement, not just a failure: the provider names the number of prompt
+        tokens it counted for a request whose size WE measured with the same
+        estimator the prompt builder spends its budget in.  Recording that ratio
+        is what makes the NEXT compression attempt (and every pre-send guard
+        measurement of this model) bounded by the real window instead of the
+        guess -- see :meth:`_compression_prompt_budget`.
+
+        Only overflow rejections are treated this way; any other failure says
+        nothing about tokenisation, and a rejection whose message carries no
+        number is logged as such rather than guessed at.
+
+        Returns True when a factor was recorded.
+        """
+        if not model_id or not _CONTEXT_OVERFLOW_ERROR_RE.search(
+            error if isinstance(error, str) else str(error or "")
+        ):
+            return False
+        actual = _context_overflow_tokens(error)
+        measured = _estimate_tokens_fast(prompt)
+        if actual <= 0 or measured <= 0:
+            logging.warning(
+                "compress_context: session %s was rejected as oversized by model "
+                "%s, but the rejection names no token count (~%d estimated here); "
+                "the next attempt repeats the current budget",
+                session_id, model_id, measured,
+            )
+            return False
+        factor = record_prompt_token_calibration(model_id, measured, actual)
+        if factor is None:
+            logging.warning(
+                "compress_context: session %s overflow measurement for model %s "
+                "(~%d estimated here vs %d counted) is outside the credible band; "
+                "not folding it in",
+                session_id, model_id, measured, actual,
+            )
+            return False
+        # This sample is not a report about some other request: the provider
+        # counted the very prompt we just built and measured here.  Smoothing it
+        # into an EWMA would take several doomed attempts to converge (0.4 weight
+        # on a 1.35 ratio needs four), so the floor is raised to the measurement
+        # itself -- which can only ever make a later "may I send this?" answer
+        # stricter, the one direction calibration is allowed to move in.
+        ratio = actual / measured
+        if ratio > factor:
+            set_prompt_token_calibration(model_id, ratio)
+            factor = ratio
+        logging.warning(
+            "compress_context: session %s compression request rejected as "
+            "oversized (model=%s: we estimated ~%d, the provider counted %d -> "
+            "factor %.2f); its next attempt is bounded to about %d estimated "
+            "tokens",
+            session_id, model_id, measured, actual, factor,
+            _compression_prompt_budget(window, model_id) or 0,
+        )
+        return True
+
     def _merge_memory_entries(
         self, session_id: str, new_entries: list[MemoryEntry]
     ) -> list[MemoryEntry]:
         """Merge *new_entries* with the session's existing memory entries.
 
-        The compression prompt does not include the existing memory file, so
-        the model only ever emits NEW entries — persisting them alone would
-        wipe everything extracted earlier.  Entries are de-duplicated by
-        ``(entry_type, content)`` and the result is capped to the most recent
-        ``_MEMORY_MAX_ENTRIES`` entries.
+        Persisting the new entries alone would wipe everything extracted
+        earlier, so they are merged into what is on disk.  Entries are
+        de-duplicated by ``(entry_type, content)``, and the result is capped to
+        ``_memory_entry_limit()`` entries AND ``_memory_char_limit()`` rendered
+        characters (oldest first) -- see :func:`_trim_memory_entries`.
+
+        Exact de-duplication cannot catch the same fact reworded, which is why
+        the compression prompt is also shown the existing entries
+        (:meth:`_existing_memory_block`); the cap here is the backstop.
         """
         existing = [
             e for e in self.load_memory(session_id)
@@ -2777,10 +3040,63 @@ class ContextManager:
             if key not in seen:
                 seen.add(key)
                 existing.append(entry)
-        if len(existing) > _MEMORY_MAX_ENTRIES:
-            existing.sort(key=lambda e: e.created_at or "")
-            existing = existing[-_MEMORY_MAX_ENTRIES:]
-        return existing
+        merged = _trim_memory_entries(existing)
+        if len(merged) < len(existing):
+            logging.info(
+                "compress_context: session %s memory trimmed %d -> %d entries "
+                "(limits: %d entries / %d chars); the dropped facts remain in "
+                "conversation.json",
+                session_id, len(existing), len(merged),
+                _memory_entry_limit(), _memory_char_limit(),
+            )
+        return merged
+
+    def _existing_memory_block(
+        self, session_id: str, budget_tokens: Optional[int] = None
+    ) -> str:
+        """Render the session's stored memory for the extraction prompt.
+
+        Without this the model has no idea what is already in ``memory.md``, so
+        every compression round re-emits the same facts in other words -- exact
+        de-duplication in :meth:`_merge_memory_entries` cannot see those, and the
+        file (and every request that carries it) grows.  Showing it is also what
+        lets the model *supersede* instead of contradict: an entry the model can
+        see is an entry it can refine.
+
+        Compact one-line form, newest suffix: the same entries that survive into
+        a request are the ones the model is shown, so the echo stays useful even
+        when the file is longer than the echo budget.
+        """
+        limit = _memory_context_char_limit()
+        if not session_id or limit <= 0:
+            return ""
+        entries = _trim_memory_entries(self.get_memory_entries(session_id))
+        if not entries:
+            return ""
+        if budget_tokens is not None:
+            # A token share expressed in characters: 2 chars/token is the safe
+            # side for the mixed CJK/ASCII text these sessions contain, and the
+            # echo must not crowd the delta out of the compression prompt.
+            limit = min(limit, max(512, int(budget_tokens) * 2))
+        lines = [f"- [{e.entry_type}] {e.content}" for e in entries]
+        kept: list[str] = []
+        total = 0
+        omitted = 0
+        for line in reversed(lines):
+            cost = len(line) + 1
+            if kept and total + cost > limit:
+                omitted = len(lines) - len(kept)
+                break
+            kept.append(line)
+            total += cost
+        kept.reverse()
+        if omitted:
+            kept.insert(
+                0,
+                f"- [... {omitted} older entr(ies) not shown: echo budget of "
+                f"{limit} characters ...]",
+            )
+        return "\n".join(kept)
 
     def _build_compression_prompt(
         self,
@@ -2790,6 +3106,7 @@ class ContextManager:
         budget_tokens: Optional[int],
         current_ts: str,
         session_id: str = "",
+        previous_memory: str = "",
     ) -> str:
         """Build the compression prompt for the delta.
 
@@ -2817,6 +3134,11 @@ class ContextManager:
             + _estimate_tokens_fast(_COMPRESSION_PROMPT_TAIL)
             + 128  # history section headers + omission marker
         )
+        if previous_memory:
+            # The memory echo competes for the same budget as the turns.  It is
+            # bought deliberately: without it the model re-emits facts already on
+            # disk in other words, and every later request pays for both copies.
+            overhead += _estimate_tokens_fast(previous_memory) + 24
 
         prev = previous_summary
         if budget_tokens is not None:
@@ -2888,10 +3210,18 @@ class ContextManager:
                 f"[no conversation turns fit the compression prompt budget of "
                 f"{budget_tokens} tokens]"
             )
+        leads: list[str] = []
         if prev:
+            leads.append(f"## Previous summary\n{prev}")
+        if previous_memory:
+            leads.append(
+                "## Existing memory (ALREADY STORED - emit only facts that are "
+                f"NOT already covered by this list)\n{previous_memory}"
+            )
+        if leads:
             history_section = (
-                f"## Previous summary\n{prev}\n\n"
-                f"## New turns to incorporate\n{turns_text}"
+                "\n\n".join(leads)
+                + f"\n\n## New turns to incorporate\n{turns_text}"
             )
         else:
             history_section = f"## Conversation turns\n{turns_text}"
@@ -3167,16 +3497,27 @@ class ContextManager:
         # request succeeds in ONE call.  ``window == 0`` means no window is
         # known for any candidate, in which case the budget is ``None`` and the
         # delta is sent in full (best effort, as before).
-        budget = _compression_prompt_budget(window)
+        budget = _compression_prompt_budget(window, model_id)
+        # Show the model what is already recorded, so Task 2 emits facts instead
+        # of restatements.  Echoed BEFORE the turns are budgeted so its share is
+        # accounted for in the same pass (see _build_compression_prompt).
+        existing_memory = self._existing_memory_block(session_id, budget)
         prompt = self._build_compression_prompt(
             delta, delta_start, previous_summary, budget, current_ts,
             session_id=session_id,
+            previous_memory=existing_memory,
         )
         if budget is not None:
+            factor = get_prompt_token_calibration(model_id)
             logging.info(
                 "compress_context: session %s compressing with model=%s window=%d "
-                "prompt budget=%d delta turns=%d",
+                "prompt budget=%d delta turns=%d memory echo=%d chars%s",
                 session_id, model_id, window, budget, len(delta),
+                len(existing_memory),
+                (
+                    f" (prompt estimate calibrated x{factor:.2f} for this model)"
+                    if factor > 1.0 else ""
+                ),
             )
 
         error = ""
@@ -3251,6 +3592,14 @@ class ContextManager:
             break
 
         if not success:
+            # An oversized rejection is worth more than a warning: it carries
+            # the provider's own count of the request we just built, which is
+            # the only trustworthy measurement of how this model tokenises the
+            # compression prompt.  Fold it in so the NEXT attempt is bounded by
+            # the real window (see _learn_compression_overflow).
+            self._learn_compression_overflow(
+                session_id, model_id, window, prompt, error
+            )
             logging.warning(
                 "compress_context: LLM call failed for session %s (model=%s; %s); "
                 "summary.md and memory.md left unchanged",
@@ -3308,7 +3657,7 @@ class ContextManager:
                         rejected += 1
                         continue
                     entry_type = item.get("entry_type")
-                    content = str(item.get("content") or "").strip()
+                    content = _clamp_memory_content(str(item.get("content") or ""))
                     if entry_type not in _VALID_ENTRY_TYPES \
                             or _is_placeholder_memory_entry(content):
                         rejected += 1
@@ -3857,11 +4206,12 @@ class ContextManager:
                     system_parts.append(text.strip())
 
         # 2. Structured memory entries (dropped oldest-first when over budget).
+        #    The budget is charged here as well as at write time, so a memory.md
+        #    written before the budget existed cannot keep riding on every
+        #    request (one real session injected 32 743 characters ~= 10 600
+        #    estimated tokens of memory per request).
         memory_entries = self.get_memory_entries(session_id)
-        memory_parts: list[str] = [
-            f"## Memory\n{entry.entry_type}: {entry.content}"
-            for entry in memory_entries
-        ]
+        memory_parts: list[str] = render_memory_entries(memory_entries)
 
         # 3. Recent/unsummarized turns.
         recent_turns = self.select_unsummarized_turns(turns, summary_fm)

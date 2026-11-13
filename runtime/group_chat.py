@@ -42,6 +42,7 @@ from runtime.common import (
     snapshot_request_context,
 )
 from runtime.models import Message, InferenceRequest
+from runtime.context_manager import trim_memory_entries
 from runtime.server_state import InLoopContextCompressor
 
 _logger = logging.getLogger("runtime.group_chat")
@@ -691,11 +692,15 @@ def _build_agent_system_messages(
         if has_summary:
             extra_parts.append(f"## Summary\n{summary_text}")
         if has_memory:
+            # Same character budget as the single-chat assembler: the memory
+            # block rides on EVERY request, so an uncapped memory.md taxes the
+            # whole group conversation.
             memory_lines = [
                 f"{entry.entry_type}: {entry.content}"
-                for entry in memory_entries
+                for entry in trim_memory_entries(memory_entries)
             ]
-            extra_parts.append("## Memory\n" + "\n".join(memory_lines))
+            if memory_lines:
+                extra_parts.append("## Memory\n" + "\n".join(memory_lines))
         extra_block = "\n\n".join(extra_parts)
 
         if messages and messages[-1].role == "system":

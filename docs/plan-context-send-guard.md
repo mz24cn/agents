@@ -134,3 +134,72 @@ estimate, max_context)`，返回 `(replacement, tokens_after)`；`runtime` 只�
 转储幂等 + LRU + 非法 session_id、落盘对象逐字未被改写、
 `tests/test_context_manager_compress.py`：超长 turn 转储进 prompt（含文件内容断言）与
 转储失败时的截断回退。
+
+## 8. 复盘：压缩自身被拒 + 兜底无法收敛（会话 261102_160808）
+
+一个 4477 turn 的长会话反复报 `Error: context too large to send: about 188780 prompt
+tokens do not fit the 188416`，而它的 `summary.md` / `memory.md` 都在。链条是三段独立的
+故障，任何一段单独修好都不够：
+
+1. **压缩请求自己超出了窗口。** `_build_compression_prompt` 用 `estimate_llm_tokens`
+   在**估算单位**里花预算；该会话的压缩 prompt 自测 179 454 token，端点实数 242 845
+   （比值 1.35：CJK + `\uXXXX` 转义被低估）。于是号称“已被窗口约束”的压缩请求每次都被
+   400 拒绝，`summarized_up_to_turn` 永远停在 4036，摘要追不上历史。
+   现在：`_compression_prompt_budget(window, model_id)` 先除以该模型实测的
+   estimate→actual 因子（与守卫生成同一个结论，只允许更严）；被拒时
+   `_learn_compression_overflow` 从错误文本里读出端点计到的 token 数，把这一次**精确**
+   样本直接抬到因子上（EWMA 平滑需要 4 次同样注定失败的尝试才收敛）。离线拿该会话真
+   数据回放：第 1 次同样被拒 → 学到 1.35 → 第 2 次压缩成功，`summarized_up_to_turn`
+   4036 → 4466，下一次请求从 222 条 / ~189 000 token 降到 12 条 / ~4 000 token。
+2. **摘要模型坏了就等于没有压缩。** 11-12 全天 `DeepSeekOfficial` 返回 402
+   Insufficient Balance，`_select_compression_model` 因为它的窗口更大而一直选它，
+   失败只进 backoff、不切换候选，整台机器所有会话的压缩都停了。
+   未改（策略问题：用推理模型替摘要模型要烧一次很大的本地请求），留作运维决定。
+3. **兜底不收敛。** `select_unsummarized_turns` 第 4 条“回溯到本轮起点”在长工具循环里
+   会一路退到 floor（最后一次 user 轮在 4255），把 222 条 / ~190 000 token 全拉进窗口；
+   而 `ensure_within_budget` 第 3 步只转储 ≥4000 token 的消息，这批窗口里只有 4 条达阈值，
+   转储完还差 364 token → 直接拒发。它甚至把承载 summary+memory 的 system 消息也转储了。
+   现在：system 消息不再是转储候选；转储榨干后 `_drop_oldest_for_budget` 按最旧顺序丢消息直到
+   预算内（保持“窗口不得以孤儿 tool 结果开头”“至少一条 user”两条协议约束，并把丢了多少
+   写进 system 消息，全文仍在 `conversation.json`）。
+
+对应的回归测试：`test_compression_budget_honours_the_measured_factor`、
+`test_an_oversized_rejection_teaches_the_next_attempt`、
+`test_a_non_overflow_failure_teaches_nothing`、
+`test_guard_never_offloads_the_summary_and_memory_message`、
+`test_guard_drops_oldest_turns_when_offloading_cannot_help`。
+
+## 9. memory.md 的字符预算（以及"已存 memory 回填"）
+
+`## 8` 里那条会话的 memory.md 是 200 条：文件本身 60 282 字符（一半是 JSON 键名），
+真正注入 system 消息的是 32 743 字符 ≈ 10 600 估算 token，**常驻每一次请求**。
+条目只增不减，而整个 memory 块会被合进 system 消息。两个独立缺陷：
+
+1. **压缩 prompt 里没有已存 memory。** 只有 `## Previous summary`，没有 memory ——
+   模型不知道自己已经记过什么，每轮换一种说法重述同一条事实（该会话里"450 家医院 /
+   81 家三甲 / 已完成 16 家"至少出现两次），而 `_merge_memory_entries` 只能按
+   `(entry_type, content)` **精确**去重，看不见改写过的重复。
+   现在压缩 prompt 多一段 `## Existing memory`（紧凑一行、取最新后缀、
+   `MEMORY_CONTEXT_MAX_CHARS` 默认 16 384 字符），Task 2 明确要求"不得重述已有条目，
+   被新turn推翻的事实只写当前值"；echo 计入 `overhead`，所以不会挤掉 delta。
+2. **没有字符上限。** 原来只有条数上限（`_MEMORY_MAX_ENTRIES = 200`），单条长度不限。
+   现在三个上限都可配（`env.json` 里写键名即可，会同步到 os.environ）：
+
+   | 键 | 默认 | 含义 |
+   |---|---|---|
+   | `MEMORY_MAX_CHARS` | 32768 | memory 块在**一次请求里**的字符预算，按注入形态计费（`## Memory\n{type}: {content}`） |
+   | `MEMORY_MAX_ENTRIES` | 200 | 条目数 |
+   | `MEMORY_ENTRY_MAX_CHARS` | 2000 | 单条上限：一条粘贴的工具输出不该吃掉整个预算；截断带 `[entry truncated]` 标记，原文仍在 conversation.json / 转储文件里 |
+   | `MEMORY_CONTEXT_MAX_CHARS` | 16384 | 压缩 prompt 看到多少已存 memory（0 = 关闭回填） |
+
+   超限按**最旧先丢**（`_trim_memory_entries`），最新一条一定保留。裁剪发生在三处：
+   `save_memory` 写入前、`_merge_memory_entries` 合并后、以及**注入点**
+   （`assemble_context` 与群聊的 `_build_agent_system_messages`）——
+   所以已经超限的旧会话不需要迁移：下一次请求就只注入 32768 字符，下一次压缩把文件本身裁进预算。
+   丢弃是永久性的（memory.md 就是唯一存储），所以合并处会 log 一行
+   `memory trimmed N -> M entries`。
+
+实测（拿那条会话的真实 memory.md 离线跑 `_trim_memory_entries`，未写盘）：32768 的注入预算
+只会丢掉最旧的 **6 条**（省下 ~250 token/请求）—— 因为它的膨胀主因是**重复**而不是条数，
+所以真正起作用的是一致性修复（回填 echo + 提示词不许重述），上限只是兜底。
+要更硬的限制就把 `MEMORY_MAX_CHARS` 调到 16384（该会话约 5 300 token）。

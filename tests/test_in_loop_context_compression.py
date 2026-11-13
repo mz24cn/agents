@@ -1128,6 +1128,137 @@ def test_ensure_within_budget_skips_rebuild_but_still_offloads_when_not_persiste
     assert "output offloaded to file:" in replacement[-1].content
 
 
+
+
+
+def test_guard_never_offloads_the_summary_and_memory_message(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spilling the system message would spend the compression it just asked for.
+
+    The merged system message is where ``assemble_context`` carries the agent
+    prompt, the rolling summary and the structured memory.  A real run answered
+    ``context guard: refusing to send`` after offloading that very message to a
+    file: the request was still oversized, and it had also become amnesic.
+    """
+    spill_dir = str(tmp_path / "spill")
+    monkeypatch.setenv("CONTEXT_SPILL_DIR", spill_dir)
+    cm = _make_cm(str(tmp_path), recent_turns_k=2)
+    sid = cm.create_session()
+    cm.save_conversation(sid, _pending_tool_round_turns())
+
+    # Big enough to be an offload candidate (~38 000 estimated tokens), and the
+    # single biggest message in the request: offloading it would have "fixed"
+    # the budget by throwing the summary and the memory away.
+    in_flight = [Message(role="system", content="SUMMARY-AND-MEMORY " * 8_000)]
+    for index in range(20):
+        role = "user" if index % 2 == 0 else "assistant"
+        in_flight.append(Message(role=role, content=f"{role.upper()}-{index} " + "MEDIUM-TURN-" * 300))
+    in_flight.append(Message(role="assistant", content="NEWEST-ANSWER"))
+
+    compressor = InLoopContextCompressor(
+        context_manager=cm, session_id=sid, ready=lambda: False,
+    )
+    budget = 42_000
+    replacement, after = compressor.ensure_within_budget(
+        in_flight, budget, _budget_estimate(budget)
+    )
+
+    assert replacement is not None, "the guard must change something"
+    assert after <= budget, f"still {after} tokens over a {budget}-token budget"
+    assert replacement[0].role == "system"
+    assert "output offloaded to file:" not in replacement[0].content, (
+        "the summary/memory message is not an offload candidate"
+    )
+    assert replacement[0].content.startswith("SUMMARY-AND-MEMORY")
+    assert not os.path.isdir(os.path.join(spill_dir, sid)), "nothing was spilled"
+
+
+def test_guard_drops_oldest_turns_when_offloading_cannot_help(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Overflow spread over many medium turns is cleared by dropping the oldest.
+
+    Reproduced from a real refusal: 222 messages / ~189 000 tokens of
+    unsummarized window, of which only four reached the offload threshold.  The
+    guard offloaded four, could not shed the rest, and refused to send -- an
+    inference that never ran at all, for a session that still had its summary.
+    """
+    spill_dir = str(tmp_path / "spill")
+    monkeypatch.setenv("CONTEXT_SPILL_DIR", spill_dir)
+    cm = _make_cm(str(tmp_path), recent_turns_k=2)
+    sid = cm.create_session()
+    cm.save_conversation(sid, _pending_tool_round_turns())
+
+    medium = "MEDIUM-TURN-" * 400  # ~2 400 tokens: under the 4 000-token threshold
+    in_flight = [Message(role="system", content="SUMMARY-AND-MEMORY")]
+    for index in range(60):
+        role = "user" if index % 2 == 0 else "assistant"
+        in_flight.append(Message(role=role, content=f"{role.upper()}-{index} {medium}"))
+    in_flight.append(
+        Message(
+            role="assistant", content="NEWEST-ROUND",
+            tool_calls=[{"id": "call_1", "name": "dummy_tool", "arguments": "{}"}],
+        )
+    )
+    in_flight.append(
+        Message(role="tool", content="PENDING-TOOL-RESULT", name="dummy_tool",
+                tool_use_id="call_1")
+    )
+    untouched = len(in_flight)
+
+    compressor = InLoopContextCompressor(
+        context_manager=cm, session_id=sid, ready=lambda: False,
+    )
+    budget = 20_000
+    replacement, after = compressor.ensure_within_budget(
+        in_flight, budget, _budget_estimate(budget)
+    )
+
+    assert replacement is not None, "the guard must change something"
+    assert after <= budget, f"still {after} tokens over a {budget}-token budget"
+    assert len(in_flight) == untouched, "the caller's list is never mutated"
+    assert len(replacement) < untouched
+    assert replacement[0].role == "system"
+    assert "oldest message(s) of this session were dropped" in replacement[0].content, (
+        "the model is told its context was trimmed, not shown a silently "
+        "shorter past"
+    )
+    assert replacement[-1].content == "PENDING-TOOL-RESULT", (
+        "the round the model is waiting for survives"
+    )
+    assert replacement[-2].content == "NEWEST-ROUND"
+    assert not any(m.role == "tool" for m in replacement[:2]), (
+        "the window never opens on an orphaned tool result"
+    )
+    assert any(m.role == "user" for m in replacement), (
+        "a request without a user message is rejected by some providers"
+    )
+    assert not os.path.isdir(os.path.join(spill_dir, sid)), (
+        "medium messages are not written to files one by one; they are dropped"
+    )
+
+
+def test_guard_drops_nothing_when_the_request_only_needs_nothing_dropped(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The oldest-drops step is a last resort, not a routine trim."""
+    monkeypatch.setenv("CONTEXT_SPILL_DIR", str(tmp_path / "spill"))
+    cm = _make_cm(str(tmp_path), recent_turns_k=2)
+    sid = cm.create_session()
+    cm.save_conversation(sid, _pending_tool_round_turns())
+    in_flight = [
+        Message(role="system", content="SUMMARY"),
+        Message(role="user", content="OLDER-USER-TURN"),
+        Message(role="assistant", content="ANSWER"),
+    ]
+    compressor = InLoopContextCompressor(
+        context_manager=cm, session_id=sid, ready=lambda: False,
+    )
+    replacement, after = compressor.ensure_within_budget(
+        in_flight, 20_000, _budget_estimate(20_000)
+    )
+    assert replacement is None and after <= 20_000
 # ---------------------------------------------------------------------------
 # Offload helpers
 # ---------------------------------------------------------------------------

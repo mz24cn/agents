@@ -286,3 +286,41 @@ def test_group_chat_without_a_session_runs_without_a_compressor(tmp_path):
     ))
 
     assert seen == [(None, None)]
+
+
+def test_an_agent_is_not_handed_an_unbounded_memory_block() -> None:
+    """The memory block rides on EVERY request of the group conversation.
+
+    Uncapped, a session that accumulated 200 entries (~60 000 characters) makes
+    every agent of that session pay for it on every round.
+    """
+    from runtime.context_manager import (
+        MemoryEntry,
+        _memory_char_limit,
+        _memory_entry_cost,
+    )
+    from runtime.group_chat import _build_agent_system_messages
+
+    entries = [
+        MemoryEntry(
+            "fact", f"mem{i:04d} " + ("x" * 300), i, 0.9,
+            f"2026-01-01T{i // 3600:02d}:{(i // 60) % 60:02d}:{i % 60:02d}",
+        )
+        for i in range(200)
+    ]
+
+    messages = _build_agent_system_messages(
+        {"agent_id": "DevManager", "system_prompt": "你是开发经理"},
+        "DevManager", "", None, None, "the group summary", entries,
+    )
+    text = "\n".join(
+        f"{m.content or ''}\n{getattr(m, 'render_suffix', '') or ''}"
+        for m in messages
+    )
+
+    injected = [i for i in range(200) if f"mem{i:04d}" in text]
+    assert injected, "some memory must still reach the agent"
+    assert max(injected) == 199, "the newest entries are the ones kept"
+    assert len(injected) < 200, "a 60 000-character memory file must not all be sent"
+    unit = _memory_entry_cost(entries[0])
+    assert len(injected) * unit <= _memory_char_limit() + unit
