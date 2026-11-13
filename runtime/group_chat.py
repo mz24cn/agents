@@ -53,6 +53,13 @@ _logger = logging.getLogger("runtime.group_chat")
 # the browser instead of being silently lost.
 _GROUP_CHAT_HEARTBEAT_INTERVAL = 25.0
 
+# Waves that exist only because a routed user interjection demanded an answer
+# (the @-mention cascade itself has run dry) get a budget of their own, and so
+# does the keep-open retry at the exit decision. Same yardstick as the
+# single-agent loop's ``_MAX_INTERJECTED_ROUNDS`` and the interjection queue
+# cap, so an interjection can never hold the wave loop open forever.
+_MAX_INJECTION_ROUNDS = 10
+
 
 # One session, several agents: compressing it rewrites summary.md and the
 # conversation window, so the agents of a group must never compress concurrently.
@@ -431,18 +438,26 @@ _TRIGGER_TAG = "@trigger"
 
 def _trigger_to_user_message(msgs: list[Message]) -> Message:
     """Build the 'current message' for a round-2+ participant from the
-    assistant replies that @-mentioned it.
+    assistant replies that @-mentioned it, plus any user interjection routed
+    to it.
 
     Mirrors how a user message that @-mentions an agent drives round 1: the
     triggered agent sees exactly the replies that pulled it in, prefixed with
-    each author's identity (``**nickname** (agent_id): ...``). Tagged with
-    ``_TRIGGER_TAG`` so ``_normalize_for_model`` skips the user prefix.
+    each author's identity (``**nickname** (agent_id): ...``). A routed user
+    interjection IS the message to answer, so it carries no author prefix.
+    Tagged with ``_TRIGGER_TAG`` so ``_normalize_for_model`` skips the user
+    prefix.
     """
     parts = []
     for m in msgs:
+        body = (m.content or "").strip()
+        if not body:
+            continue
+        if (getattr(m, "role", "") or "") == "user":
+            parts.append(body)
+            continue
         nick = getattr(m, "name", None) or getattr(m, "agent_id", "") or ""
         aid = getattr(m, "agent_id", "") or ""
-        body = (m.content or "").strip()
         parts.append(f"**{nick}** ({aid}): {body}")
     return Message(role="user", content="\n\n".join(parts), name=_TRIGGER_TAG)
 
@@ -1025,9 +1040,11 @@ def _run_group_chat_stream_gen(
         runs joins the shared transcript exactly here — after the previous wave
         fully settled (all tool results in, next triggers computed) and before
         the next wave is dispatched. Agents already running inside a wave never
-        observe it; every later turn sees it via assemble_agent_context.
-        Interjections only change context, they never schedule agents: wave
-        membership stays driven by @-mentions alone.
+        observe it; every later turn sees it via assemble_agent_context. At the
+        boundary the drained messages are additionally routed like plain
+        group-chat user messages (see route_group_chat_user_message in the wave
+        loop), so an interjection always reaches an agent as its current
+        message instead of sitting unread in the transcript.
 
         The gate may return a plain list of queued message dicts (interjection
         only — the trailing drain after the wave loop must never honour a
@@ -1058,10 +1075,17 @@ def _run_group_chat_stream_gen(
             existing_turns.append(interjection)
             yield interjection
 
-    while pending_mentioned and round_num < max_rounds:
+    # Waves driven ONLY by a routed user interjection (the mention cascade
+    # itself has stopped) are budgeted separately from @-mention rounds.
+    injection_rounds = 0
+
+    while True:
         # --- User interjections / soft pause (wave boundary) ---
         boundary_stop = False
-        yield from _drain_interjections(boundary_gate or interject_gate)
+        injected: list[Message] = []
+        for interjection in _drain_interjections(boundary_gate or interject_gate):
+            injected.append(interjection)
+            yield interjection
         if boundary_stop:
             # Soft pause at a wave boundary: the previous wave fully settled
             # and was incrementally persisted, the next one is not dispatched,
@@ -1086,7 +1110,63 @@ def _run_group_chat_stream_gen(
                     exit_state["messages"] = []
                 exit_state["pending_agent_ids"] = list(pending_mentioned)
             return
-        round_num += 1
+        had_scheduled_wave = bool(pending_mentioned)
+        if injected:
+            # A user interjection is real user input, so it is routed exactly
+            # like a plain group-chat user message (explicit @ → last speaker
+            # → leader → everyone) and registered as the CURRENT message for
+            # the routed agents (trigger_msgs): they must answer it, not just
+            # see it pass through the shared transcript. Routing may re-use
+            # agents that already spoke this generation (the last speaker
+            # almost always did) — unlike the mention cascade, which never
+            # re-triggers a processed agent.
+            for interjection in injected:
+                explicit = resolve_mentions(
+                    parse_mentions(interjection.content or ""),
+                    agent_manager, all_agent_ids,
+                )
+                if explicit:
+                    interjection.mentions = list(explicit)
+                targets = route_group_chat_user_message(
+                    interjection.content or "", agent_manager,
+                    all_agent_ids, existing_turns,
+                )
+                if not targets:
+                    # Same compatibility fallback as the initial-turn routing:
+                    # an explicit mention that resolves to no participant
+                    # broadcasts instead of being silently un-routed.
+                    targets = list(all_agent_ids)
+                for aid in targets:
+                    if aid not in pending_mentioned:
+                        pending_mentioned.append(aid)
+                    trigger_msgs.setdefault(aid, []).append(interjection)
+        if not pending_mentioned:
+            # Exit decision, atomic against the interjection endpoint (the
+            # group analogue of the single-agent loop's close_gate): a
+            # message buffered just after the drain above keeps the
+            # generation open — the next pass takes it at this same boundary
+            # — while an empty buffer closes it, so a late interjection is
+            # refused and re-sent as a normal turn instead of landing past
+            # the last boundary.
+            if (
+                close_gate is not None
+                and injection_rounds < _MAX_INJECTION_ROUNDS
+                and close_gate() is False
+            ):
+                injection_rounds += 1
+                continue
+            break
+        if had_scheduled_wave:
+            if round_num >= max_rounds:
+                break
+            round_num += 1
+        else:
+            # Injection-driven wave: paid out of the separate budget, never
+            # out of the @-mention rounds.
+            if injection_rounds >= _MAX_INJECTION_ROUNDS:
+                break
+            injection_rounds += 1
+            round_num += 1
         current_trigger_msgs = trigger_msgs
         next_trigger_msgs: dict[str, list[Message]] = {}
         for aid in pending_mentioned:
@@ -1166,7 +1246,17 @@ def _run_group_chat_stream_gen(
             # Exclude trigger replies from replayed history
             agent_turns = existing_turns
             if trigger_list:
-                trigger_pairs = {(m.agent_id, m.content or "") for m in trigger_list}
+                trigger_pairs = {
+                    (m.agent_id, m.content or "")
+                    for m in trigger_list if m.role != "user"
+                }
+                # A routed user interjection arrives as the CURRENT message
+                # (via _trigger_to_user_message); drop it from the replayed
+                # history so the agent is not sent the same text twice.
+                user_trigger_texts = {
+                    (m.content or "").strip()
+                    for m in trigger_list if m.role == "user"
+                }
                 # ``existing_turns`` is loaded from ContextManager as
                 # ConversationTurn objects, then receives dict entries produced
                 # by earlier group-chat rounds.  Normalize both shapes before
@@ -1180,8 +1270,15 @@ def _run_group_chat_stream_gen(
                         and (turn_msg.agent_id, turn_msg.content or "")
                         in trigger_pairs
                     )
-                    if not is_trigger_reply:
-                        filtered_turns.append(turn)
+                    if is_trigger_reply:
+                        continue
+                    if (
+                        turn_msg.role == "user"
+                        and (turn_msg.content or "").strip()
+                        in user_trigger_texts
+                    ):
+                        continue
+                    filtered_turns.append(turn)
                 agent_turns = filtered_turns
 
             dispatch_agents_markdown = None
@@ -1521,20 +1618,25 @@ def _run_group_chat_stream_gen(
         trigger_msgs = next_trigger_msgs
         pending_mentioned = list(trigger_msgs.keys())
 
-    # The wave loop is over. Close the generation to interjections first, so a
-    # message arriving from here on is refused (the client re-sends it as a
-    # normal turn, which does schedule agents) instead of accepted into a queue
-    # whose last boundary has already passed. Then hand everything that was
-    # accepted in time to the shared transcript: group waves are scheduled by
-    # @-mentions alone, so a lone message has no wave to re-enter, but it
-    # becomes a real user turn that every later turn sees — never dropped.
+    # The wave loop is over: either the exit decision above already closed the
+    # generation on an empty buffer, or a round budget ran out. Finish the
+    # handshake atomically either way: try_close returns False while a message
+    # slipped in after the last boundary drain, so take it into the shared
+    # transcript and ask again until the generation is marked closing — from
+    # then on the endpoint refuses late interjections and the client re-sends
+    # them as normal turns (which schedule agents). Messages accepted in time
+    # still join the transcript even when a budget was exhausted (they may end
+    # up unanswered in this generation, but they are never dropped and never
+    # stuck in a queue no boundary will ever drain). Trailing acceptance is
+    # interjections only: a pause requested after the loop ended must not be
+    # honoured — the generation completed on its own (same race decision as the
+    # single-agent path). The handler gate (interject_gate) is interjection-
+    # only; the boundary gate is never called here.
     if close_gate is not None:
-        close_gate()
-    # Trailing acceptance: interjections only. A pause requested from here on
-    # must not be honoured — the wave loop already ended on its own, so the
-    # generation is a natural completion, not a resting pause (same race
-    # decision as the single-agent path). The handler gate (interject_gate) is
-    # interjection-only; the boundary gate is never called here.
+        for _ in range(_MAX_INJECTION_ROUNDS):
+            if close_gate() is not False:
+                break
+            yield from _drain_interjections(interject_gate)
     yield from _drain_interjections(interject_gate)
 
     # No additional yield needed; the queue already yielded everything.

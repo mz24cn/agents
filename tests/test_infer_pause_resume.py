@@ -831,6 +831,184 @@ def test_group_chat_interjection_injected_at_wave_boundary():
     )
 
 
+def test_group_chat_interjection_during_last_wave_is_answered():
+    """The reported bug: an interjection queued while the LAST wave ran used
+    to be appended to the transcript with no wave left to process it — it sat
+    at the end of conversation.json unread, answered only by the NEXT user
+    turn. Now the boundary routes it like a plain user message (no @ → last
+    speaker) and an injection-driven wave answers it inside the generation.
+    """
+    manager = _GroupStubAgentManager(_GROUP_AGENTS)
+    runtime = _GroupScriptRuntime([
+        "第一波发言完毕。",           # wave 1: mention cascade ends here
+        "收到，我会简短回答。",        # injection wave: last speaker answers
+    ])
+    boundaries = {"n": 0}
+
+    def interject_gate():
+        boundaries["n"] += 1
+        if boundaries["n"] == 2:  # queued while the last wave was running
+            return [{
+                "role": "user",
+                "content": "插一句：请简短回答",
+                "timestamp": "2026-01-01T00:00:00",
+            }]
+        return []
+
+    set_request_context(
+        agent_manager=manager,
+        all_agent_ids=[a["agent_id"] for a in _GROUP_AGENTS],
+    )
+    try:
+        out = list(run_group_chat_stream_gen(
+            runtime=runtime,
+            mentioned_agent_ids=["SunWuKong"],
+            all_agent_ids=[a["agent_id"] for a in _GROUP_AGENTS],
+            original_messages=[Message(role="user", content="@孙悟空 开始")],
+            base_request=InferenceRequest(model_id="m1", messages=[]),
+            cancel_event=None,
+            context_manager=None,
+            session_id=None,
+            agent_manager=manager,
+            model_id="m1",
+            tool_ids=[],
+            max_rounds=5,
+            interject_gate=interject_gate,
+        ))
+    finally:
+        clear_request_context(list(_thread_local.__dict__.keys()))
+
+    roles = [
+        (m.role, m.content or "")
+        for m in out
+        if m.role in ("user", "assistant") and (m.content or "")
+    ]
+    interj_idx = next(i for i, (r, c) in enumerate(roles) if r == "user" and "插一句" in c)
+    answer_idx = next(
+        i for i, (r, c) in enumerate(roles) if r == "assistant" and "简短回答" in c
+    )
+    # The interjection is answered INSIDE this generation…
+    assert interj_idx < answer_idx
+    # …and the transcript does not end with an unanswered user turn.
+    assert roles[-1][0] == "assistant"
+
+    # The routed agent sees the interjection as its CURRENT message (rendered
+    # bare, no author prefix), exactly once — not duplicated in history.
+    second = runtime.requests[-1]
+    user_turns = [
+        (m.content or "")
+        for m in second.messages
+        if (getattr(m, "role", "") or (m.get("role") if isinstance(m, dict) else "")) == "user"
+    ]
+    injections = [t for t in user_turns if "插一句" in t]
+    assert len(injections) == 1
+    assert injections[0].strip() == "插一句：请简短回答"
+
+
+def test_group_chat_boundary_refill_after_drain_keeps_generation_open():
+    """A message buffered just after a boundary's drain (the exit-decision
+    race) must keep the generation open: close_gate answers False, the next
+    pass drains and routes it, and the wave loop exits only once the queue is
+    verifiably empty."""
+    manager = _GroupStubAgentManager(_GROUP_AGENTS)
+    runtime = _GroupScriptRuntime(["第一波发言", "收到收口前的一句。"])
+    state = {"queue": [], "asked": 0}
+
+    def interject_gate():
+        if state["queue"]:
+            return [state["queue"].pop(0)]
+        return []
+
+    def close_gate():
+        state["asked"] += 1
+        if state["asked"] == 1:
+            # Message lands between the drain and the exit decision.
+            state["queue"].append({
+                "role": "user",
+                "content": "收口前最后一句",
+                "timestamp": "2026-01-01T00:00:02",
+            })
+            return False  # buffered → keep the generation open
+        return True      # empty → close
+
+    set_request_context(
+        agent_manager=manager,
+        all_agent_ids=[a["agent_id"] for a in _GROUP_AGENTS],
+    )
+    try:
+        out = list(run_group_chat_stream_gen(
+            runtime=runtime,
+            mentioned_agent_ids=["SunWuKong"],
+            all_agent_ids=[a["agent_id"] for a in _GROUP_AGENTS],
+            original_messages=[Message(role="user", content="@孙悟空 开始")],
+            base_request=InferenceRequest(model_id="m1", messages=[]),
+            cancel_event=None,
+            context_manager=None,
+            session_id=None,
+            agent_manager=manager,
+            model_id="m1",
+            tool_ids=[],
+            max_rounds=5,
+            interject_gate=interject_gate,
+            close_gate=close_gate,
+        ))
+    finally:
+        clear_request_context(list(_thread_local.__dict__.keys()))
+
+    seq = [(m.role, m.content or "") for m in out if m.role in ("user", "assistant") and m.content]
+    interj_idx = next(i for i, (r, c) in enumerate(seq) if r == "user" and "收口前" in c)
+    answer_idx = next(i for i, (r, c) in enumerate(seq) if r == "assistant" and "收口前" in c)
+    assert interj_idx < answer_idx
+    assert seq[-1][0] == "assistant"
+    assert state["asked"] >= 2  # re-asked after the refill, then closed on empty
+
+
+def test_group_chat_interjection_budget_is_bounded():
+    """Injection-driven waves cannot hold the loop open forever: even a gate
+    that never runs dry stops buying waves after the injection budget."""
+    manager = _GroupStubAgentManager(_GROUP_AGENTS)
+    runtime = _GroupScriptRuntime(["开场"])  # everything after is "(no more)"
+    counter = {"n": 0}
+
+    def interject_gate():
+        counter["n"] += 1
+        return [{
+            "role": "user",
+            "content": f"连环插话 {counter['n']}",
+            "timestamp": "2026-01-01T00:00:00",
+        }]
+
+    set_request_context(
+        agent_manager=manager,
+        all_agent_ids=[a["agent_id"] for a in _GROUP_AGENTS],
+    )
+    try:
+        out = list(run_group_chat_stream_gen(
+            runtime=runtime,
+            mentioned_agent_ids=["SunWuKong"],
+            all_agent_ids=[a["agent_id"] for a in _GROUP_AGENTS],
+            original_messages=[Message(role="user", content="@孙悟空 开始")],
+            base_request=InferenceRequest(model_id="m1", messages=[]),
+            cancel_event=None,
+            context_manager=None,
+            session_id=None,
+            agent_manager=manager,
+            model_id="m1",
+            tool_ids=[],
+            max_rounds=5,
+            interject_gate=interject_gate,
+        ))
+    finally:
+        clear_request_context(list(_thread_local.__dict__.keys()))
+
+    assert out  # terminated instead of looping forever
+    # Round 1 + at most the injection budget (same cap as the interjection
+    # queue), never more.
+    # 首波边界：尚无 assistant 发言，插话按"全员广播"路由 → 首波 2 个派发；
+    # 之后注入波最多 _MAX_INJECTION_ROUNDS 次。
+    assert len(runtime.requests) <= 2 + 10
+
+
 def test_group_chat_pause_stops_at_wave_boundary():
     """Coarse group pause: a boundary action with stop=True ends the
     generation after the settled wave, WITHOUT dispatching the next wave —

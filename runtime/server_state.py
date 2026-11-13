@@ -2296,10 +2296,12 @@ def try_close_infer_loop(session_id: str, owner_event) -> bool:
 def close_infer_loop(session_id: str, owner_event) -> None:
     """Mark a generation closed to interjections, unconditionally.
 
-    For loop shapes that cannot continue on buffered input — group chat
-    schedules agents from @-mentions alone, so a lone user message has no wave
-    to join.  Closing makes a late interjection refused (re-sent as a normal
-    turn) instead of silently buffered past the last boundary.
+    Asked once the generation's message source is fully exhausted, before
+    finalization (a context compression there can take seconds): a message
+    arriving in that window is refused and re-sent as a normal turn instead
+    of being accepted into a buffer nothing will ever drain. Loop-exit
+    decisions that CAN continue on buffered input use ``try_close_infer_loop``
+    instead — both the single-agent tool loop and the group-chat wave loop do.
     """
     with _session_stream_lock:
         stream = _session_streams.get(session_id)

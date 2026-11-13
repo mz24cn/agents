@@ -1635,17 +1635,19 @@ class HandlerInferMixin:
                     return []
                 return take_infer_interjections(session_id, cancel_event)
 
-            # Group-chat loop-exit gate. A wave loop cannot continue on a lone
-            # interjection (waves are scheduled by @-mentions alone), so the
-            # only correct answer at its end is to close the generation: what
-            # was accepted in time still joins the shared transcript, anything
-            # later is refused and re-sent as a normal turn that does schedule
-            # agents.
+            # Group-chat loop-exit gate. Asked when the wave loop has nothing
+            # left to dispatch (mention cascade dry and no interjection was
+            # drained at that boundary). Atomic against the interjection
+            # endpoint (same contract as the single-agent ``_loop_close_gate``):
+            # False means a message was buffered just after the boundary
+            # drain — the generation stays open and the next wave-loop pass
+            # routes it into a wave — while True means the buffer is empty and
+            # the generation is marked closing, so a late interjection is
+            # refused and re-sent as a normal turn.
             def _group_close_gate() -> bool:
                 if session_id is None:
                     return True
-                close_infer_loop(session_id, cancel_event)
-                return True
+                return try_close_infer_loop(session_id, cancel_event)
 
             # === 统一消息源 ===
             # Transient snapshot captured by the tool loop when it ends at a
