@@ -35,6 +35,7 @@ from runtime.common import (
     record_prompt_token_calibration,
     is_notable_prompt_token_calibration,
     estimate_message_payload_tokens,
+    get_workspace,
     env_int,
 )
 
@@ -850,6 +851,80 @@ def _strip_image_attached_lines(content: str) -> str:
     return _IMAGE_ATTACHED_RE.sub("", content).strip()
 
 
+# ---------------------------------------------------------------------------
+# Stale image payloads
+#
+# A persisted user message keeps the image *reference* (a workspace path) in
+# ``Message.images``; the bytes are read only when the request is built.  A
+# reference can therefore outlive the file it points at -- the user deleted it
+# in the file manager, ``/tmp`` was cleaned, a remote session's child removed
+# it, or the child environment is simply unreachable right now.  The protocol
+# encoders are strict by design (they raise, they do not skip), so an
+# unreadable payload must be filtered out before the request is built, or the
+# whole generation dies with "Error: system aborted. (Failed to read image:
+# [Errno 2] No such file or directory: ...)".
+# ---------------------------------------------------------------------------
+
+
+def _image_payload_is_readable(ref: object) -> bool:
+    """Whether an image reference can still be turned into bytes right now.
+
+    Mirrors what :func:`runtime.common.convert_image_to_base64` -- called by
+    every protocol encoder -- is about to do with the reference, without
+    paying for a download:
+
+    * ``data:`` URIs and raw base64 travel inside the message, so they cannot
+      go stale;
+    * a reference with **no path separator** is treated as an already-encoded
+      payload by the encoder and never touches the filesystem, so it is
+      accepted here as well (dropping it would change behaviour for callers
+      that pass opaque payload strings);
+    * URLs are left to the encoder: a URL failure is a genuine, reportable
+      network error, not a locally stale reference;
+    * a **local path** is the one reference that silently disappears between
+      turns, so it is stat'ed here.  Relative paths resolve against the
+      current session's workspace, exactly as the encoder resolves them.
+    """
+    if not isinstance(ref, str) or not ref.strip():
+        return False
+    ref = ref.strip()
+    if ref.startswith(("data:", "http://", "https://")):
+        return True
+    if "/" not in ref and "\\" not in ref:
+        return True  # the encoder treats this as an already-encoded payload
+    if is_likely_base64(ref):
+        return True
+    path = os.path.expanduser(ref)
+    if not os.path.isabs(path):
+        path = os.path.join(get_workspace(), path)
+    return os.path.isfile(path) and os.access(path, os.R_OK)
+
+
+def _mark_images_unavailable(content: Optional[str], refs: list) -> str:
+    """Annotate the attachment placeholders of images that were dropped.
+
+    The ``[Image file attached: ...]`` placeholder survives in the message
+    text, so a silently dropped payload leaves the model believing it was just
+    shown that image -- it then happily describes a file it cannot see.  The
+    note is written *inside* the brackets so the placeholder keeps matching
+    the regexes and renderers that recognise it (the web UI still draws a
+    chip, the VLM fallback still strips it from the user's query).
+
+    Idempotent per round: the annotation is applied to a copy of the message
+    on every request build, never to the persisted record.
+    """
+    text = content or ""
+    for ref in refs:
+        label = _image_attachment_label(str(ref))
+        placeholder = f"[Image file attached: {label}]"
+        note = f"[Image file attached: {label} - no longer available]"
+        if placeholder in text:
+            text = text.replace(placeholder, note, 1)
+        elif note not in text:
+            text = f"{note}\n\n{text.lstrip()}" if text else note
+    return text
+
+
 class Runtime:
     """Core runtime engine that coordinates model inference and tool execution.
 
@@ -1003,6 +1078,16 @@ class Runtime:
         expire.  It also makes ``continue`` work: the turn being continued has
         no new user message, so its persisted child reference is re-read here.
 
+        Keeping that one payload is also what makes a *deleted* image visible
+        instead of fatal: every reference that cannot be read any more (file
+        gone, child offline, oversized pull refused) is dropped here and the
+        message's placeholder is annotated with ``- no longer available``, so
+        the model knows the attachment is missing.  Passing it on instead would
+        abort the generation in the encoder -- for a history image the user has
+        long stopped looking at.  The current turn's own references are already
+        validated when the request arrives (``expand_workspace_file_refs``
+        answers 400), so this filter never swallows a fresh attachment.
+
         conversation.json is left untouched: list entries are replaced with
         copies, the persisted Message objects are not mutated.  (The one
         exception is intentional: the VLM fallback runs after this and still
@@ -1015,15 +1100,78 @@ class Runtime:
         if keep < 0:
             return messages
         out = list(messages)
+        # Resolve (and vet) the single payload that is actually sent.
+        kept = messages[keep]
+        payloads: list = []
+        lost: list = []
+        for ref in (kept.images or []):
+            payload = ref
+            if image_resolver is not None:
+                try:
+                    payload = image_resolver(ref)
+                except Exception as exc:
+                    _logger.warning(
+                        "image_resolver could not read %s (%s); sending the "
+                        "message without that attachment", ref, exc,
+                    )
+                    lost.append(ref)
+                    continue
+            if not _image_payload_is_readable(payload):
+                _logger.warning(
+                    "image payload %s is no longer readable; sending the "
+                    "message without that attachment", ref,
+                )
+                lost.append(ref)
+                continue
+            payloads.append(payload)
+        if lost:
+            # A copy: the note belongs to this request only, not to the record.
+            out[keep] = replace(
+                kept, images=payloads or None,
+                content=_mark_images_unavailable(kept.content, lost),
+            )
+        elif image_resolver is not None:
+            out[keep] = replace(kept, images=payloads)
         for index, msg in enumerate(out):
             if index == keep:
-                if image_resolver is not None and getattr(msg, "images", None):
-                    out[index] = replace(
-                        msg, images=[image_resolver(item) for item in msg.images])
                 continue
             if msg.role == "user" and getattr(msg, "images", None):
                 out[index] = replace(msg, images=None)
         return out
+
+    @staticmethod
+    def _drop_stale_image_payloads(messages: list) -> list:
+        """Prune image payloads that went unreadable while a tool loop ran.
+
+        :meth:`_drop_history_images` vets the payloads once, when the request is
+        built.  A long tool loop keeps the current turn's payload (a local path)
+        alive for every following round, and meanwhile anything can remove that
+        file -- the user, a ``/tmp`` sweep, or the agent's own ``rm``.  Re-checking
+        per round costs one ``stat`` per message that still carries an image (at
+        most one after the history strip, and never one for a remote session,
+        whose payload is already an inline ``data:`` URI), and keeps a strict
+        protocol encoder from aborting a generation that is otherwise fine.
+        """
+        out = None
+        for index, msg in enumerate(messages):
+            images = getattr(msg, "images", None)
+            if not images:
+                continue
+            lost = [ref for ref in images if not _image_payload_is_readable(ref)]
+            if not lost:
+                continue
+            _logger.warning(
+                "image payload %s went unreadable mid-loop; dropping it from the "
+                "request instead of failing the generation", ", ".join(map(str, lost)),
+            )
+            if out is None:
+                out = list(messages)
+            kept = [ref for ref in images if ref not in lost]
+            out[index] = replace(
+                msg, images=kept or None,
+                content=_mark_images_unavailable(msg.content, lost),
+            )
+        return out if out is not None else messages
 
     def _apply_vlm_image_fallback(self, model_config, messages: list) -> list:
         """Transcribe attached images into text when the model cannot see them.
@@ -1241,6 +1389,11 @@ class Runtime:
             # Dynamically throttle very long/fast tool-call loops before the
             # next model API request, if MAX_INFER_PER_MINUTE is configured.
             self._maybe_throttle_inference_loop(overall_start, tool_round)
+
+            # An attachment the agent itself may have removed during this loop
+            # (see _drop_stale_image_payloads); pruned before the request is
+            # encoded, so a vanished file never aborts the generation.
+            messages = self._drop_stale_image_payloads(messages)
 
             # Repair legacy/interrupted tool-call history before serialization.
             messages = _ensure_tool_call_results(messages)
@@ -3298,6 +3451,12 @@ class Runtime:
             if not self._maybe_throttle_inference_loop(overall_start, tool_round, cancel_event):
                 yield Message(role="assistant", timestamp=_now_iso(), content="Error: user interrupted.")
                 return
+
+            # An attachment the agent itself may have removed during this loop
+            # (see _drop_stale_image_payloads); pruned before the request is
+            # encoded -- and before the context guard measures it -- so a
+            # vanished file never aborts the generation.
+            messages = self._drop_stale_image_payloads(messages)
 
             messages = _ensure_tool_call_results(messages)
             # Last line of defence on context size.  Everything that can join

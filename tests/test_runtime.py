@@ -113,7 +113,20 @@ def test_prepare_reasoning_for_tool_rounds_requires_label_and_trailing_tool():
     assert assistant.thinking is None
 
 
-def test_normalize_messages_sends_only_the_newest_image_payload():
+def _touch_image(tmp_path, name: str) -> str:
+    """Return the path of a real image file.
+
+    ``Message.images`` carries image **paths**; a payload whose file no longer
+    exists is dropped at request-build time instead of being sent (the encoder
+    would raise).  Tests that assert a payload *survives* must therefore point
+    at a file that exists.
+    """
+    path = tmp_path / name
+    path.write_bytes(b"\x89PNG\r\n\x1a\n")
+    return str(path)
+
+
+def test_normalize_messages_sends_only_the_newest_image_payload(tmp_path):
     """历史消息里的图片不随请求重放：只保留最近一条带图 user 消息的 images。
 
     ``<file>`` 展开把图片**路径**写进 ``Message.images``，而 ``Message.to_dict``
@@ -122,44 +135,47 @@ def test_normalize_messages_sends_only_the_newest_image_payload():
     直接 ``ValueError: Failed to read image`` 打断推理。
     """
     runtime = Runtime(model_registry=ModelRegistry(), tool_registry=ToolRegistry())
+    a, b = _touch_image(tmp_path, "a.png"), _touch_image(tmp_path, "b.png")
     history = [
-        Message(role="user", content="第一张图", images=["/tmp/a.png"]),
+        Message(role="user", content="第一张图", images=[a]),
         Message(role="assistant", content="看到了"),
-        Message(role="user", content="第二张图", images=["/tmp/b.png"]),
+        Message(role="user", content="第二张图", images=[b]),
     ]
     request = InferenceRequest(model_id="test-model", messages=list(history))
 
     prepared = runtime._normalize_messages(request)
 
-    assert [m.images for m in prepared if m.role == "user"] == [None, ["/tmp/b.png"]]
+    assert [m.images for m in prepared if m.role == "user"] == [None, [b]]
     # 占位符仍在正文里：模型知道"之前发过图"，只是不再重传字节
     assert "[Image file attached" in prepared[0].content or prepared[0].content == "第一张图"
 
 
-def test_normalize_messages_image_strip_does_not_touch_the_persisted_record():
+def test_normalize_messages_image_strip_does_not_touch_the_persisted_record(tmp_path):
     """清图只发生在请求构造：conversation.json 要尽可能还原现场。"""
     runtime = Runtime(model_registry=ModelRegistry(), tool_registry=ToolRegistry())
+    a, b = _touch_image(tmp_path, "a.png"), _touch_image(tmp_path, "b.png")
     persisted = [
-        Message(role="user", content="第一张图", images=["/tmp/a.png"]),
+        Message(role="user", content="第一张图", images=[a]),
         Message(role="assistant", content="看到了"),
-        Message(role="user", content="第二张图", images=["/tmp/b.png"]),
+        Message(role="user", content="第二张图", images=[b]),
     ]
     request = InferenceRequest(model_id="test-model", messages=list(persisted))
 
     prepared = runtime._normalize_messages(request)
 
-    assert [m.images for m in persisted] == [["/tmp/a.png"], None, ["/tmp/b.png"]]
+    assert [m.images for m in persisted] == [[a], None, [b]]
     assert prepared[2] is persisted[2]  # 保留的那条不复制，VLM 兜底仍可原地改写
     # 被清的那条是副本：原对象（会写进 conversation.json）完好
     assert prepared[0] is not persisted[0]
     assert prepared[0].content == persisted[0].content
 
 
-def test_normalize_messages_keeps_images_when_only_history_has_them():
+def test_normalize_messages_keeps_images_when_only_history_has_them(tmp_path):
     """只有历史带图（本轮没图）：仍然只留最后一条，不整批清空。"""
     runtime = Runtime(model_registry=ModelRegistry(), tool_registry=ToolRegistry())
+    a = _touch_image(tmp_path, "a.png")
     messages = [
-        Message(role="user", content="图一", images=["/tmp/a.png"]),
+        Message(role="user", content="图一", images=[a]),
         Message(role="assistant", content="好"),
         Message(role="user", content="再看一眼那张图"),
     ]
@@ -167,7 +183,7 @@ def test_normalize_messages_keeps_images_when_only_history_has_them():
 
     prepared = runtime._normalize_messages(request)
 
-    assert [m.images for m in prepared if m.role == "user"] == [["/tmp/a.png"], None]
+    assert [m.images for m in prepared if m.role == "user"] == [[a], None]
 
 
 def test_normalize_messages_resolves_only_the_kept_image_payload():
@@ -202,6 +218,248 @@ def test_normalize_messages_resolves_only_the_kept_image_payload():
     # 持久化侧原样：conversation.json 里仍是用户写的子端引用
     assert [m.images for m in persisted] == [["/tmp/a.png"], None, ["/tmp/b.png"]]
     assert prepared[2] is not persisted[2]
+
+
+def test_normalize_messages_drops_a_history_image_that_was_deleted(tmp_path):
+    """历史那张图被删了：丢载荷并在正文里说明，不让协议层炸掉整轮推理。
+
+    回归场景：用户第一轮引用了工作区里的图片（``images`` 存的是**路径**），之后在
+    文件管理器里把它删了；新一轮只是普通文本。被"最新带图 user 消息"规则保留下来的
+    恰恰是这条历史载荷，编码器读盘失败 → ``ValueError: Failed to read image`` →
+    整轮变成 ``Error: system aborted. (...)``。文件没了必须降级，不能打断推理。
+    """
+    from runtime.models import ModelConfig
+    from runtime.protocols import OpenAIProtocol
+
+    runtime = Runtime(model_registry=ModelRegistry(), tool_registry=ToolRegistry())
+    image = tmp_path / "image_142617_809.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n")
+    ref = str(image)
+    persisted = [
+        Message(role="user", content=f"[Image file attached: {ref}]\n\n看下这张图",
+                images=[ref]),
+        Message(role="assistant", content="图里是一只猫"),
+        Message(role="user", content="它是什么品种？"),
+    ]
+    image.unlink()  # 用户在两轮之间删掉了文件（或 /tmp 被清理）
+
+    prepared = runtime._normalize_messages(
+        InferenceRequest(model_id="test-model", messages=list(persisted)))
+
+    assert [m.images for m in prepared if m.role == "user"] == [None, None]
+    # 占位符还在，但标明不可用：模型不会再去"描述"一张它其实看不到的图
+    assert "[Image file attached:" in prepared[0].content
+    assert "no longer available" in prepared[0].content
+    # 只改请求副本，conversation.json 侧仍是用户写下的引用
+    assert [m.images for m in persisted] == [[ref], None, None]
+    assert "no longer available" not in persisted[0].content
+    # 编码阶段不再抛异常 —— 这正是 system aborted 的出处
+    OpenAIProtocol().build_request(
+        ModelConfig(model_id="m", api_base="https://x", model_name="m"), prepared)
+
+
+def test_normalize_messages_drops_only_the_image_the_child_lost():
+    """远程会话：子端文件没了 / 子端不可达，只丢那一张，不中断整轮推理。
+
+    ``image_resolver`` 向子端回拉字节，失败会抛 ValueError。以前这个异常直接
+    冒到 handler 层（"请求构造阶段作为推理错误上报"）；现在它只让那一张附件消失，
+    同一张消息里能取到的图照常发送。
+    """
+    runtime = Runtime(model_registry=ModelRegistry(), tool_registry=ToolRegistry())
+    gone, alive = "/tmp/gone_on_child.png", "/tmp/on_child.png"
+
+    def resolver(ref):
+        if ref == gone:
+            raise ValueError(
+                f"Referenced file is not readable on the remote environment: {gone} (HTTP 404)")
+        return f"data:image/png;base64,{ref}"
+
+    persisted = [
+        Message(role="user",
+                content=f"[Image file attached: {gone}]\n[Image file attached: {alive}]\n\n对比这两张",
+                images=[gone, alive]),
+    ]
+
+    prepared = runtime._normalize_messages(
+        InferenceRequest(model_id="test-model", messages=list(persisted),
+                         image_resolver=resolver))
+
+    assert prepared[0].images == [f"data:image/png;base64,{alive}"]
+    assert f"[Image file attached: {gone} - no longer available]" in prepared[0].content
+    assert f"[Image file attached: {alive}]" in prepared[0].content
+    # 现场记录不变：两个子端引用都还在
+    assert persisted[0].images == [gone, alive]
+
+
+def test_stale_image_payloads_are_pruned_when_a_tool_loop_loses_the_file(tmp_path):
+    """工具循环跑一半文件被删（往往是 agent 自己 rm）：下一轮剪掉载荷继续，而不是中断。
+
+    入口只 vet 一次；长循环里当前这轮的载荷始终是**路径**，每轮重新读盘。期间文件
+    被删（清理脚本、/tmp 扫描、agent 删掉刚看过的截图）就必须在这里剪掉。
+    """
+    runtime = Runtime(model_registry=ModelRegistry(), tool_registry=ToolRegistry())
+    image = tmp_path / "screenshot.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n")
+    ref = str(image)
+    messages = [
+        Message(role="user", content=f"[Image file attached: {ref}]\n\n删掉这张截图",
+                images=[ref]),
+        Message(role="assistant", content="", tool_calls=[
+            {"id": "c1", "name": "exec_shell", "arguments": "{\"command\": \"rm\"}"},
+        ]),
+        Message(role="tool", content="removed", name="exec_shell", tool_use_id="c1"),
+    ]
+
+    # 文件还在：原列表原样返回，不做无谓的复制
+    assert runtime._drop_stale_image_payloads(messages) is messages
+
+    image.unlink()
+    pruned = runtime._drop_stale_image_payloads(messages)
+
+    assert pruned is not messages
+    assert pruned[0].images is None
+    assert "no longer available" in pruned[0].content
+    # 入口保留的那条不被改写（它可能是会写进 conversation.json 的对象）
+    assert messages[0].images == [ref]
+    assert "no longer available" not in messages[0].content
+
+
+def test_image_payloads_that_never_touch_the_filesystem_are_never_dropped():
+    """内联载荷（data URI / 裸 base64 / 无分隔符引用）与 URL 不因"读不到"被清。
+
+    和 ``convert_image_to_base64`` 的判定保持一致：没有路径分隔符的字符串被当作已
+    编码载荷原样交给协议层，URL 则由协议层去取（那里失败是真网络错误，该上报）。
+    """
+    from runtime.runtime import _image_payload_is_readable
+
+    for ref in ("data:image/png;base64,AAAA", "https://example.com/a.png",
+                "http://example.com/a.png", "A" * 1200, "img1"):
+        assert _image_payload_is_readable(ref), ref
+
+    assert not _image_payload_is_readable("")
+    assert not _image_payload_is_readable(None)
+    assert not _image_payload_is_readable("/tmp/there_is_no_such_image.png")
+
+
+def test_image_payload_readability_follows_the_session_workspace(tmp_path):
+    """相对路径按当前会话工作区判定，和编码器的解析方式一致。"""
+    from runtime.common import set_request_context, clear_request_context
+    from runtime.runtime import _image_payload_is_readable
+
+    (tmp_path / "shots" / "apr").mkdir(parents=True)
+    (tmp_path / "shots" / "apr" / "shot.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    try:
+        set_request_context(workspace=str(tmp_path))
+        assert _image_payload_is_readable("shots/apr/shot.png")
+        assert not _image_payload_is_readable("shots/apr/gone.png")
+        # 换个工作区，同一个相对引用就取不到了，换个写法才取得到
+        set_request_context(workspace=str(tmp_path / "shots"))
+        assert not _image_payload_is_readable("shots/apr/shot.png")
+        assert _image_payload_is_readable("apr/shot.png")
+        # 无路径分隔符的引用：编码器当它是已编码载荷，本来就不读盘
+        assert _image_payload_is_readable("shot.png")
+    finally:
+        clear_request_context(["workspace"])
+
+
+def test_a_tool_loop_that_deletes_the_attached_image_still_completes(tmp_path):
+    """An attachment the agent's own tool call removes must not kill the run.
+
+    The entry point vets the payload once, but for the rest of the loop the current
+    turn's payload stays a **path**, read from disk again on every round.  If the
+    file disappears meanwhile -- the agent's ``rm``, a ``/tmp`` sweep, the user
+    cleaning up in the file manager -- a strict protocol encoder would abort the
+    whole generation while reading it.  The per-round prune inside both loops is
+    what turns that into "this image is gone", so both entry points are driven here.
+    """
+    image = tmp_path / "screenshot.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n")
+    ref = str(image)
+
+    def run_once(entry_point: str):
+        model_registry = ModelRegistry()
+        model_registry.register(ModelConfig(
+            model_id="test-model", api_base="http://localhost:9999",
+            model_name="test", api_protocol="openai",
+        ))
+        tool_registry = ToolRegistry()
+
+        def rm_screenshot() -> str:
+            image.unlink(missing_ok=True)
+            return "removed"
+
+        tool_registry.register(ToolConfig(
+            tool_id="rm_screenshot", tool_type="function", name="rm_screenshot",
+            description="delete the screenshot",
+            parameters={"type": "object", "properties": {}, "required": []},
+        ), callable_fn=rm_screenshot)
+
+        payloads: list = []
+        state = {"n": 0}
+
+        def mock_urlopen(request, **kwargs):
+            state["n"] += 1
+            try:
+                payloads.append(json.loads(request.data))
+            except (TypeError, AttributeError, ValueError):
+                payloads.append({})
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = (
+                _make_openai_function_call_response("rm_screenshot")
+                if state["n"] == 1 else _make_openai_plain_text_response("done")
+            )
+            mock_resp.__enter__ = lambda s: s
+            mock_resp.__exit__ = MagicMock(return_value=False)
+            return mock_resp
+
+        runtime = Runtime(model_registry=model_registry, tool_registry=tool_registry)
+        request = InferenceRequest(
+            model_id="test-model", tool_ids=["rm_screenshot"],
+            messages=[Message(role="user",
+                              content=f"[Image file attached: {ref}]\n\n看看这张截图",
+                              images=[ref])],
+        )
+        # A spy on the per-round prune: each loop must re-vet what it is about to
+        # encode, not only the entry point.
+        pruned: list = []
+        original = Runtime._drop_stale_image_payloads
+
+        def spy(messages):
+            pruned.append(messages)
+            return original(messages)
+
+        with patch.object(Runtime, "_drop_stale_image_payloads",
+                          staticmethod(spy)), \
+                patch("urllib.request.urlopen", side_effect=mock_urlopen):
+            if entry_point == "infer":
+                result = runtime.infer(request)
+                assert result.success is True, f"aborted: {result.error}"
+            else:
+                # The streaming entry point is driven with the same request; the
+                # fake (non-streaming) response shape ends it early, which is
+                # enough to show the prune runs inside its round loop.  The
+                # behavioural proof -- annotation in the text, no aborted
+                # generation -- is asserted on the infer() path, where the whole
+                # round really runs.
+                for _ in runtime.infer_stream(request):
+                    pass
+
+        # The image was really deleted by the tool call, and the second round is
+        # what has to cope: the payload is gone and the text says so.
+        assert pruned, f"{entry_point}: the round loop never re-vetted its payloads"
+        if entry_point != "infer":
+            return
+        assert not image.exists()
+        assert state["n"] == 2, payloads
+        users = [m for m in payloads[1].get("messages", [])
+                 if isinstance(m, dict) and m.get("role") == "user"]
+        assert users, payloads[1]
+        assert "no longer available" in str(users[0].get("content")), users[0]
+        assert "[Image file attached: " in str(users[0].get("content"))
+
+    for entry_point in ("infer", "infer_stream"):
+        image.write_bytes(b"\x89PNG\r\n\x1a\n")
+        run_once(entry_point)
 
 
 # --- Hypothesis strategies ---

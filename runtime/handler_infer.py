@@ -93,7 +93,9 @@ def _make_remote_ref_hooks(remote_proxy):
 
     Raises:
         ValueError: 引用为空 / 子端读不到 / 超过单引用上限。展开阶段由
-            ``handler_infer`` 映射成 400；请求构造阶段作为推理错误上报。
+            ``handler_infer`` 映射成 400；请求构造阶段（``Runtime._drop_history_images``）
+            **不再中断推理**：取不到的那张图被丢掉，正文里的占位符标成
+            ``[Image file attached: ... - no longer available]``，模型知道这张图已不可用。
     """
     cache: dict[str, bytes] = {}
 
