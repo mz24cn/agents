@@ -45,6 +45,7 @@ from runtime.tunnel_protocol import (
     tunnel_id_from_env_id,
 )
 from runtime.server import RuntimeHTTPServer
+from runtime.env_manager import local_tz_offset_minutes
 
 TURN = time.time()
 
@@ -255,6 +256,10 @@ def test_register_online_call_and_stream(tmp_path):
         assert env["transport"] == "ws-tunnel"
         assert env["tunnel_id"] == tunnel_id_from_env_id(env_id)
         assert env.get("backend_build"), "hello snapshot should be populated"
+        # The hello frame carries the zone those stamps were formatted in, so a
+        # child in another zone is not read hours off by the parent (see
+        # snapshot_from_hello): the tunnel needs the field exactly like op=hello.
+        assert env.get("tz_offset") == local_tz_offset_minutes()
 
         # 3. HTTP round-trip over the tunnel
         manager = parent_srv._tunnel_manager

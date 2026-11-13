@@ -29,6 +29,20 @@ _BACKEND_MTIME_TTL = 5.0
 _BACKEND_MTIME_CACHE: dict = {}
 
 
+def invalidate_backend_mtime_cache(project_root: str | None = None) -> None:
+    """Forget cached backend build mtimes.
+
+    An applied delta rewrites project files, and the advertised ``backend_build``
+    is derived from their mtimes: while the cache lives, the very next
+    ``op=hello`` still advertises the pre-update version, which is exactly how a
+    successful update can look like "the version did not change".
+    """
+    if project_root is None:
+        _BACKEND_MTIME_CACHE.clear()
+        return
+    _BACKEND_MTIME_CACHE.pop(os.path.realpath(project_root), None)
+
+
 # Asset references emitted into web/dist/index.html by the build (script src /
 # stylesheet href).  Used to tell a complete frontend build from a partial one.
 _FRONTEND_ASSET_REF_RE = re.compile(r"""(?:src|href)\s*=\s*["'](/[^"'>\s]*)["']""")
@@ -90,6 +104,23 @@ def frontend_build_version(project_root: str) -> str:
     return datetime.datetime.fromtimestamp(latest_mtime).strftime("%y%m%d_%H%M%S")
 
 
+def local_tz_offset_minutes() -> int:
+    """Minutes east of UTC for this host (UTC+8 -> 480, UTC -> 0).
+
+    ``YYMMdd_HHmmss`` build stamps are *wall-clock* strings taken in the
+    advertising host's own timezone, so two hosts in different zones format the
+    very same mtime differently.  The offset therefore travels next to the
+    versions (``op=hello``, the tunnel hello, ``op=push``) so each side can turn
+    the other side's stamp back into the instant it was meant to name; without
+    it a UTC child is read by a UTC+8 parent as eight hours older than it is,
+    which makes every push look "needed" while the child's advertised version
+    never moves.  Peers that do not send it are treated as sharing this host's
+    zone, which is exactly the historical behaviour.
+    """
+    offset = datetime.datetime.now().astimezone().utcoffset()
+    return int(offset.total_seconds() // 60) if offset is not None else 0
+
+
 def compute_setup_versions(env_manager: "EnvManager", data_dir: str,
                            project_root: str | None = None) -> dict:
     """Compute this environment's advertised build versions.
@@ -102,6 +133,10 @@ def compute_setup_versions(env_manager: "EnvManager", data_dir: str,
 
     ``project_root`` defaults to the tree this module lives in; it is a
     parameter so tests can point at a throwaway copy.
+
+    ``tz_offset`` is not a version: it names the zone those three wall-clock
+    stamps were formatted in, so a peer in another zone can put them on its
+    own time axis before comparing.
     """
     if project_root is None:
         script_dir = os.path.dirname(os.path.abspath(__file__))  # runtime/
@@ -149,6 +184,7 @@ def compute_setup_versions(env_manager: "EnvManager", data_dir: str,
         "frontend_build": frontend,
         "backend_build": backend,
         "last_config": last_config,
+        "tz_offset": local_tz_offset_minutes(),
     }
 
 

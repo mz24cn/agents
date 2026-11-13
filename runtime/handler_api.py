@@ -1331,6 +1331,9 @@ class HandlerApiMixin:
             "frontend_build": local["frontend_build"],
             "backend_build": local["backend_build"],
             "last_config": local["last_config"],
+            # 这些版本号是本环境的挂钟时间：告诉子端它在哪个时区取的，子端据此解析
+            # 增量基线与降级保护（旧子端不读该参数，行为与历史一致）。
+            "tz_offset": self._advertised_tz_offset(),
         })
         if is_tunnel:
             try:
@@ -1368,6 +1371,8 @@ class HandlerApiMixin:
                 "frontend_build": local["frontend_build"],
                 "backend_build": local["backend_build"],
                 "last_config": local["last_config"],
+                # 同上：直连推送也带上本环境的时区。
+                "tz_offset": self._advertised_tz_offset(),
             })
             # Credentials inline in the registered URL (SETUP_SOURCE shape
             # ``https://user:pass@host:port/``) go into an Authorization header:
@@ -1407,6 +1412,19 @@ class HandlerApiMixin:
             # 推送后子端工具清单可能变化（新增 skill / MCP / 工具配置）：
             # 失效共享代理的工具缓存，下一次推理重新拉取。
             manager.invalidate_tools_cache(env_id)
+            if not payload.get("restart_backend"):
+                # 版本号也要跟上：母端手上只有**推送前**的 hello 快照，而子端不需要重启
+                # 时隧道不会重连，页面上就一直是旧版本号（“更新成功了但版本号没变”）。
+                # 这里立刻再探一次 hello：既把新版本落盘，也随响应回给前端。子端要重启
+                # 时这里探不到，等它重新拨号时隧道的 hello 帧会自行刷新快照。
+                try:
+                    fresh_hello = self._setup_hello_probe(hello_url, env_id=env_id)
+                except Exception:
+                    fresh_hello = None
+                if fresh_hello:
+                    remote = snapshot_from_hello(fresh_hello)
+                    with contextlib.suppress(KeyError, OSError):
+                        manager.update_snapshot(env_id, remote, None)
         self._send_json_response(200, {
             "ok": True,
             "updated": bool(payload.get("updated")),
@@ -1604,6 +1622,9 @@ class HandlerApiMixin:
                 "frontend_build": versions["frontend_build"],
                 "backend_build": versions["backend_build"],
                 "last_config": versions["last_config"],
+                # 上面三个时间戳是在哪个时区取的：接收方需要它才能把它们还原成时刻，
+                # 否则另一个时区的环境会把本环境误读成早/晚几个小时。
+                "tz_offset": self._advertised_tz_offset(),
                 "inference_active": inference_active,
                 # Per-source busy breakdown: web sessions carry a session_id
                 # and are tracked in active_infers; stateless API calls (no
@@ -1651,12 +1672,19 @@ class HandlerApiMixin:
                 self._send_json_error(405, "op=delta requires GET")
                 return
             try:
+                # 调用方送来的是它自己的版本戳：只有知道它所在的时区（tz_offset，
+                # 旧调用方不带 -> 按本环境时区解释）才能把这些阈值还原成可与本地
+                # mtime 比较的时刻。
+                peer_offset = self._peer_tz_offset_param()
                 frontend_since = self._parse_build_version(
-                    self._get_query_param("frontend_build", ""), allow_empty=True)
+                    self._get_query_param("frontend_build", ""), allow_empty=True,
+                    tz_offset_minutes=peer_offset)
                 backend_since = self._parse_build_version(
-                    self._get_query_param("backend_build", ""), allow_empty=True)
+                    self._get_query_param("backend_build", ""), allow_empty=True,
+                    tz_offset_minutes=peer_offset)
                 config_since = self._parse_build_version(
-                    self._get_query_param("last_config", ""), allow_empty=True)
+                    self._get_query_param("last_config", ""), allow_empty=True,
+                    tz_offset_minutes=peer_offset)
             except (ValueError, TypeError):
                 self._send_json_error(400, "Invalid or missing build version parameter")
                 return
@@ -1862,13 +1890,19 @@ class HandlerApiMixin:
         else:
             setup_path = "/v1/setup"
         query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-        managed_keys = {"op", "frontend_build", "backend_build", "last_config"}
+        managed_keys = {"op", "frontend_build", "backend_build", "last_config", "tz_offset"}
         query = [(key, value) for key, value in query if key not in managed_keys]
+        # 这份基线是本环境自己的挂钟时间，上游只有知道它的时区才能还原成时刻；
+        # 调用方若已把它们折算到别的时区（母端推送场景），会用 tz_offset 说明。
+        peer_offset = self._peer_tz_offset_param()
+        if peer_offset is None:
+            peer_offset = self._advertised_tz_offset()
         query.extend([
             ("op", "delta"),
             ("frontend_build", frontend_build),
             ("backend_build", backend_build),
             ("last_config", last_config),
+            ("tz_offset", str(peer_offset)),
         ])
         update_url = urllib.parse.urlunsplit((
             parsed.scheme,
@@ -1958,12 +1992,17 @@ class HandlerApiMixin:
             return
 
         local = self._local_setup_versions()
+        # 推送目标版本是**母环境**的挂钟时间：不知道它所在时区时，这个比较等于跨
+        # 时区抛硬币（UTC+8 的母环境在 UTC 子端眼里恒比实际新 8 小时，这道降级保护
+        # 也就形同虚设）。母端推送时会带上自己的 tz_offset。
+        parent_offset = self._peer_tz_offset_param()
         for key in ("frontend_build", "backend_build", "last_config"):
             target = str(self._get_query_param(key, "") or "").strip()
             current = local.get(key, "")
             if target and current:
                 try:
-                    if self._parse_build_version(target) < self._parse_build_version(current):
+                    if (self._parse_build_version(target, tz_offset_minutes=parent_offset)
+                            < self._parse_build_version(current)):
                         self._send_json_error(400, f"Refusing push: {key} {target} is older than local {current}")
                         return
                 except (ValueError, TypeError):
@@ -2131,6 +2170,13 @@ class HandlerApiMixin:
             self._send_json_error(500, f"Failed to apply update: {exc}")
             return
 
+        # 文件树刚刚被改写，对外的版本号也跟着变了：清掉那份短 TTL 的 mtime 缓存，
+        # 让紧接着的 op=hello（母端推送后会立刻再探一次；隧道重连时也会发 hello
+        # 帧）描述的是这些新文件，而不是几秒前的旧文件 —— 否则“更新成功了但版本号
+        # 没变”。
+        from runtime.env_manager import invalidate_backend_mtime_cache
+        invalidate_backend_mtime_cache(project_root)
+
         if config_updated:
             try:
                 runtime = self._get_runtime()
@@ -2196,15 +2242,47 @@ class HandlerApiMixin:
             timer.start()
 
     @staticmethod
-    def _parse_build_version(value: str, *, allow_empty: bool = False) -> float:
-        """Parse YYMMdd_HHmmss into local epoch seconds; empty may mean baseline 0."""
+    def _parse_build_version(value: str, *, allow_empty: bool = False,
+                             tz_offset_minutes: int | None = None) -> float:
+        """Parse YYMMdd_HHmmss into epoch seconds; empty may mean baseline 0.
+
+        The stamp is a *wall-clock* string, so it names an instant only once the
+        zone it was taken in is known.  ``tz_offset_minutes`` is that zone
+        (e.g. ``480`` for UTC+8); omit it to read the value in this
+        environment's own zone, which is correct whenever both ends agree on the
+        zone and is what older peers implicitly do.
+        """
         value = value.strip()
         if not value or value == "0":
             if allow_empty:
                 return 0.0
             raise ValueError("empty value")
         dt = datetime.datetime.strptime(value, "%y%m%d_%H%M%S")
+        if tz_offset_minutes is not None:
+            return dt.replace(tzinfo=datetime.timezone(
+                datetime.timedelta(minutes=int(tz_offset_minutes)))).timestamp()
         return dt.timestamp()
+
+    def _advertised_tz_offset(self) -> int:
+        """Minutes east of UTC of the zone *this* environment stamps in.
+
+        Asked of the host rather than read out of the computed versions dict: a
+        versions snapshot without the key must not turn into a claim of being
+        UTC, because a peer cannot tell that claim from the truth and it quietly
+        re-bases every comparison it makes against our numbers.
+        """
+        from runtime.env_manager import local_tz_offset_minutes
+        return local_tz_offset_minutes()
+
+    def _peer_tz_offset_param(self) -> int | None:
+        """``tz_offset`` query param of the current request, if the peer sent one."""
+        raw = str(self._get_query_param("tz_offset", "") or "").strip()
+        if not raw:
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            return None
 
     # ------------------------------------------------------------------
     # Session handlers

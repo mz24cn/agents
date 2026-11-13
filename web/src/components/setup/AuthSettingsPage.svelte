@@ -29,6 +29,9 @@
   let frontend = $state('')
   let backend = $state('')
   let lastConfig = $state('')
+  // 本环境（母环境）版本号所在的时区（相对 UTC 的分钟数）：远端环境跑在别的时区时，
+  // 它的版本号已由后端折算到本地时区，这里用本环境自己的时区把差异标出来。
+  let localTzOffset = $state(null)
   let setupSource = $state('')
   let remoteFrontend = $state('')
   let remoteBackend = $state('')
@@ -187,6 +190,7 @@
       frontend = data.frontend_build || ''
       backend = data.backend_build || ''
       lastConfig = data.last_config || ''
+      localTzOffset = Number.isFinite(data.tz_offset) ? data.tz_offset : null
       // Older backends do not report the per-source breakdown; fall back to
       // the overall flag and attribute the busy state to a web session.
       overallInferenceActive = !!data.inference_active
@@ -443,7 +447,11 @@
     const deadline = Date.now() + timeoutMs
     while (Date.now() < deadline) {
       try {
-        await remoteEnv.hello(entry.id)
+        const res = await remoteEnv.hello(entry.id)
+        // 恢复成功的那一刻顺手把它的版本快照落到行上：母端此时已经拿到更新后的
+        // 版本号（直连由这次 hello 取到；隧道由子端重连时的 hello 帧落盘，见
+        // handler_tunnel 握手分支）—— 否则行上还挂着推送前的旧版本号。
+        if (res?.snapshot) Object.assign(entry, res.snapshot)
         return true
       } catch {
         await new Promise((resolve) => window.setTimeout(resolve, 500))
@@ -481,12 +489,10 @@
       if (result?.restart_backend) {
         entry.status = t('remoteEnvRestarting')
         entry.statusIsError = false
-        if (isTunnel) {
-          // 隧道环境：子端重启后会自动重新拨号隧道，无法直连轮询；
-          // 在线状态由隧道 attach/detach 事件更新（刷新列表可见）。
-          return
-        }
-        const ready = await waitForRemoteReady(entry)
+        // 隧道环境同样轮询：hello 由母端经隧道转发给子端，子端重启 / 重新拨号期间
+        // 请求会失败，隧道恢复时返回的快照已是更新后的版本号。（隧道在线状态由
+        // attach/detach 事件驱动，这条路径不会把 online 回写成 false。）
+        const ready = await waitForRemoteReady(entry, isTunnel ? 60000 : 30000)
         if (!ready) {
           entry.status = t('remoteEnvRestartTimeout')
           entry.statusIsError = true
@@ -568,6 +574,23 @@
   // 在表格对应的版本格内显示 ↓ 标记（仅提示：该环境比母环境更新）
   function envSlotDowngrade(local, there) {
     return !!local && !!there && there > local
+  }
+
+  // 版本号是各环境**自己本地时区**的挂钟时间。母端拿到对方的 tz_offset 后已把它
+  // 折算成本地时区再存 / 显示（两边落在同一条时间轴上，↑ / ↓ 判断也才正确）；时区
+  // 不同时在行上标出对方原本的时区，免得“数字对不上”被误读成没更新。
+  function envTzDiffers(entry) {
+    return Number.isFinite(entry.tz_offset)
+      && Number.isFinite(localTzOffset)
+      && entry.tz_offset !== localTzOffset
+  }
+
+  function formatTzOffset(minutes) {
+    const sign = minutes < 0 ? '-' : '+'
+    const abs = Math.abs(minutes)
+    const mins = abs % 60
+    const hours = Math.floor(abs / 60)
+    return mins ? `${sign}${hours}:${String(mins).padStart(2, '0')}` : `${sign}${hours}`
   }
 
   // 在线：直连与隧道环境统一看 online 字段（见 normalizeEnvEntries）
@@ -989,7 +1012,7 @@
                         {/if}
                         <span class="remote-env-app-title" title={entry.app_title}>{entry.app_title || '-'}</span>
                       </span>
-                      <span class="remote-env-platform" title={[entry.arch, entry.os].filter(Boolean).join(' / ')}>{[entry.arch, entry.os].filter(Boolean).join(' / ') || '-'}</span>
+                      <span class="remote-env-platform" title={[entry.arch, entry.os].filter(Boolean).join(' / ')}>{[entry.arch, entry.os].filter(Boolean).join(' / ') || '-'}{#if envTzDiffers(entry)} <span class="remote-env-tz" title={t('remoteEnvTzConverted', { offset: `UTC${formatTzOffset(entry.tz_offset)}` })}>UTC{formatTzOffset(entry.tz_offset)}</span>{/if}</span>
                       <code class="build-value">{entry.frontend_build || '-'}{#if envSlotUpgrade(frontend, entry.frontend_build)}<span class="sync-up" title={t('remoteEnvUpgradeHint')}>↑</span>{:else if envSlotDowngrade(frontend, entry.frontend_build)}<span class="sync-down" title={t('remoteEnvDowngradeHint')}>↓</span>{/if}</code>
                       <code class="build-value">{entry.backend_build || '-'}{#if envSlotUpgrade(backend, entry.backend_build)}<span class="sync-up" title={t('remoteEnvUpgradeHint')}>↑</span>{:else if envSlotDowngrade(backend, entry.backend_build)}<span class="sync-down" title={t('remoteEnvDowngradeHint')}>↓</span>{/if}</code>
                       <code class="build-value">{entry.last_config || '-'}{#if envSlotUpgrade(lastConfig, entry.last_config)}<span class="sync-up" title={t('remoteEnvUpgradeHint')}>↑</span>{:else if envSlotDowngrade(lastConfig, entry.last_config)}<span class="sync-down" title={t('remoteEnvDowngradeHint')}>↓</span>{/if}</code>
@@ -1650,6 +1673,14 @@
     color: var(--text-secondary);
     font-size: 0.84rem;
     white-space: nowrap;
+  }
+  /* 该环境自身的时区标记：它的版本号已折算成本地（母环境）时区显示，
+     标出原时区避免“数字对不上”被误读成没更新 */
+  .remote-env-tz {
+    color: var(--text-secondary);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 0.74rem;
+    opacity: 0.75;
   }
   .inference-pill {
     display: inline-flex;

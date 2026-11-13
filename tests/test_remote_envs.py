@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import datetime
 import http.server
 import io
 import json
@@ -31,7 +32,11 @@ from unittest.mock import patch
 import pytest
 
 from runtime.auth_manager import AuthManager
-from runtime.env_manager import EnvManager
+from runtime.env_manager import (
+    EnvManager,
+    invalidate_backend_mtime_cache,
+    local_tz_offset_minutes,
+)
 import runtime.handler_api as handler_api_module
 from runtime.handler_api import _platform_arch, _platform_os
 from runtime.remote_env_manager import (
@@ -42,8 +47,10 @@ from runtime.remote_env_manager import (
     basic_auth_header,
     build_setup_request_url,
     canonical_setup_url,
+    hello_tz_offset_minutes,
     mask_url_credentials,
     normalize_setup_url,
+    restamp_to_local,
     snapshot_from_hello,
     strip_url_credentials,
     url_credentials,
@@ -280,6 +287,267 @@ class TestSnapshotFromHello:
         assert snap["session_inference_active"] is False
         assert snap["app_title"] == ""
         assert snap["os"] == ""
+
+
+# ---------------------------------------------------------------------------
+# Build stamps carry the timezone they were taken in
+#
+# frontend_build / backend_build / last_config are wall-clock strings
+# (YYMMdd_HHmmss) formatted in each environment's OWN zone.  Compared as text
+# across zones, a UTC child is permanently eight hours "older" to a UTC+8
+# parent: every push looks needed, the child's advertised version never moves,
+# and the child's own "refusing push: older than local" guard protects against
+# a real downgrade in name only.  tz_offset is what puts both sides on one
+# time axis; a peer that does not send one keeps the historical behaviour.
+# ---------------------------------------------------------------------------
+
+_BUILD_STAMP_FMT = "%y%m%d_%H%M%S"
+
+
+def _own_offset_minutes(stamp: str) -> int:
+    """Minutes east of UTC of this host, as it stood at *stamp*'s date."""
+    offset = datetime.datetime.strptime(stamp, _BUILD_STAMP_FMT).astimezone().utcoffset()
+    return int(offset.total_seconds() // 60)
+
+
+def _stamp_in_a_zone_away(stamp: str, delta_minutes: int) -> str:
+    """*stamp* rewritten by a host ``delta_minutes`` off this host's zone.
+
+    The instant is unchanged; only the wall clock moves.  Read back without
+    knowing the zone, that same text is ``delta_minutes`` off the instant it
+    named -- the whole cross-timezone bug in one string.
+    """
+    naive = datetime.datetime.strptime(stamp, _BUILD_STAMP_FMT)
+    instant = naive.timestamp()
+    zone = datetime.timezone(
+        datetime.timedelta(minutes=_own_offset_minutes(stamp) + delta_minutes))
+    return datetime.datetime.fromtimestamp(instant, zone).strftime(_BUILD_STAMP_FMT)
+
+
+class TestBuildStampTimezones:
+    def test_hello_advertises_the_zone_its_stamps_were_taken_in(self, server):
+        status, body = _request(server, "GET", "/v1/setup?op=hello")
+        assert status == 200
+        assert body["tz_offset"] == local_tz_offset_minutes()
+
+    def test_own_zone_never_defaults_to_utc(self, server, monkeypatch):
+        # A versions snapshot that carries no zone must not turn into a claim of
+        # being UTC: a peer cannot tell that claim from the truth, and it quietly
+        # re-bases every comparison it makes against our numbers.
+        monkeypatch.setattr("runtime.env_manager.local_tz_offset_minutes", lambda: 480)
+        with patch("runtime.env_manager.compute_setup_versions",
+                   return_value=dict(_LOCAL_PUSH_VERSIONS)):
+            status, body = _request(server, "GET", "/v1/setup?op=hello")
+        assert status == 200
+        assert body["tz_offset"] == 480
+
+    def test_restamping_moves_the_wall_clock_not_the_instant(self):
+        stamp = "260209_120000"
+        # What a host eight hours behind us writes for the instant our own
+        # 12:00 names -- and putting it back must land on 12:00 again.
+        peer_wrote = _stamp_in_a_zone_away(stamp, -480)
+        assert peer_wrote == "260209_040000"
+        assert restamp_to_local(
+            peer_wrote, _own_offset_minutes(stamp) - 480) == stamp
+
+    def test_a_foreign_peer_snapshot_is_put_on_the_local_axis(self, monkeypatch):
+        # A UTC child seen by a UTC+8 parent: the numbers shown, the upgrade/
+        # downgrade arrows and the delta mtime thresholds all speak local time.
+        monkeypatch.setattr(
+            "runtime.remote_env_manager._local_tz_offset_minutes", lambda: 480)
+        snap = snapshot_from_hello({
+            "frontend_build": "260209_120000",
+            "backend_build": "260209_120000",
+            "last_config": "260209_120000",
+            "tz_offset": 0,
+        })
+        assert snap["tz_offset"] == 0
+        assert snap["frontend_build"] == "260209_200000"
+        assert snap["backend_build"] == "260209_200000"
+        assert snap["last_config"] == "260209_200000"
+
+    def test_a_peer_that_sends_no_zone_is_left_on_the_historical_axis(self):
+        snap = snapshot_from_hello({
+            "frontend_build": "260209_120000",
+            "backend_build": "260209_120000",
+            "last_config": "260209_120000",
+        })
+        assert "tz_offset" not in snap
+        assert snap["backend_build"] == "260209_120000"
+
+    def test_a_peer_in_our_own_zone_is_recorded_but_not_rewritten(self, monkeypatch):
+        monkeypatch.setattr(
+            "runtime.remote_env_manager._local_tz_offset_minutes", lambda: 480)
+        snap = snapshot_from_hello({"backend_build": "260209_120000", "tz_offset": 480})
+        assert snap["tz_offset"] == 480
+        assert snap["backend_build"] == "260209_120000"
+
+    def test_unparsable_stamps_and_zones_are_passed_through(self):
+        assert restamp_to_local("250101", 480) == "250101"
+        assert restamp_to_local("", 480) == ""
+        assert restamp_to_local("0", 480) == "0"
+        assert hello_tz_offset_minutes({}) is None
+        assert hello_tz_offset_minutes({"tz_offset": "east-ish"}) is None
+        assert hello_tz_offset_minutes({"tz_offset": True}) is None
+
+    def test_the_record_keeps_the_zone_only_when_the_peer_reported_it(self, tmp_path):
+        # Writing 0 for a peer that never reported a zone would paint it UTC in
+        # the UI and silently re-base every comparison.
+        manager = RemoteEnvManager(str(tmp_path / "remote_envs.json"))
+        manager.upsert("http://10.0.0.5:7988/",
+                       snapshot={"backend_build": "260209_120000", "tz_offset": 0})
+        manager.upsert("http://10.0.0.9:7988/",
+                       snapshot={"backend_build": "260209_120000"})
+        envs = manager.read()
+        assert envs[0]["tz_offset"] == 0
+        assert "tz_offset" not in envs[1]
+
+    def test_a_target_stamp_from_another_zone_is_not_a_downgrade(self, server):
+        # The parent's stamp names the same instant as this environment's own
+        # version, only written in a zone eight hours behind ours: knowing the
+        # zone, the push is not a downgrade and goes through.
+        stamp = _LOCAL_PUSH_VERSIONS["backend_build"]
+        target = _stamp_in_a_zone_away(stamp, -480)
+        tar = _make_tar_bytes({"agents_runtime/models.json": "[]"})
+        with patch("runtime.env_manager.compute_setup_versions",
+                   return_value=dict(_LOCAL_PUSH_VERSIONS,
+                                     tz_offset=_own_offset_minutes(stamp))):
+            status, body = _request_raw(
+                server, "POST",
+                "/v1/setup?op=push&frontend_build={t}&backend_build={t}"
+                "&last_config={t}&tz_offset={z}".format(
+                    t=target, z=_own_offset_minutes(stamp) - 480),
+                tar,
+            )
+        assert status == 200, body
+        assert body["updated"] is True
+
+    def test_the_same_stamp_without_a_zone_is_still_read_as_older(self, server):
+        # The historical comparison, kept on purpose for peers that predate
+        # tz_offset -- and the reason the zone has to travel at all: the same
+        # instant looks eight hours older when the zone is dropped.
+        stamp = _LOCAL_PUSH_VERSIONS["backend_build"]
+        target = _stamp_in_a_zone_away(stamp, -480)
+        tar = _make_tar_bytes({"agents_runtime/models.json": "[]"})
+        with patch("runtime.env_manager.compute_setup_versions",
+                   return_value=_LOCAL_PUSH_VERSIONS):
+            status, body = _request_raw(
+                server, "POST",
+                "/v1/setup?op=push&frontend_build={t}&backend_build={t}"
+                "&last_config={t}".format(t=target),
+                tar,
+            )
+        assert status == 400
+        assert "older than local" in body["error"]
+
+    def test_an_unusable_zone_falls_back_to_local_time(self, server):
+        # A garbage tz_offset must not turn into a 400: the request is answered
+        # the way it was before zones existed (a baseline in the far future
+        # means "nothing newer" -> 304).
+        future = "291231_235900"
+        path = ("/v1/setup?op=delta&frontend_build={f}&backend_build={f}"
+                "&last_config={f}&tz_offset=east-ish".format(f=future))
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.port}{path}", method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=30) as resp:
+                status = resp.status
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+        assert status == 304
+
+    def test_a_pushed_update_forgets_the_cached_mtime(self, tmp_path):
+        # backend_build is derived from project mtimes behind a short-TTL cache.
+        # An applied delta rewrites those files; while the cache lives the very
+        # next hello still advertises the pre-update version ("updated, but the
+        # version number did not change").
+        project = tmp_path / "project"
+        (project / "agents_runtime").mkdir(parents=True)
+        source = project / "agents_runtime" / "thing.py"
+        source.write_text("print('old')\n", encoding="utf-8")
+        manager = EnvManager(env_path=str(tmp_path / "env.json"))
+
+        before = manager.get_backend_build_mtime(str(project))
+        source.write_text("print('new')\n", encoding="utf-8")
+        os.utime(source, (before + 120, before + 120))
+        assert manager.get_backend_build_mtime(str(project)) == before
+
+        invalidate_backend_mtime_cache(str(project))
+        assert manager.get_backend_build_mtime(str(project)) == before + 120
+
+    def test_invalidating_one_root_leaves_another_cached(self, tmp_path):
+        first = tmp_path / "first"
+        second = tmp_path / "second"
+        for root in (first, second):
+            root.mkdir()
+            (root / "thing.py").write_text("x\n", encoding="utf-8")
+        manager = EnvManager(env_path=str(tmp_path / "env.json"))
+        first_before = manager.get_backend_build_mtime(str(first))
+        second_before = manager.get_backend_build_mtime(str(second))
+
+        for root in (first, second):
+            source = root / "thing.py"
+            source.write_text("y\n", encoding="utf-8")
+            os.utime(source, (first_before + 120, first_before + 120))
+
+        invalidate_backend_mtime_cache(str(first))
+        assert manager.get_backend_build_mtime(str(first)) == first_before + 120
+        assert manager.get_backend_build_mtime(str(second)) == second_before
+
+        invalidate_backend_mtime_cache()  # no root: forget everything
+        assert manager.get_backend_build_mtime(str(second)) == first_before + 120
+
+
+# ---------------------------------------------------------------------------
+# A parent that has just pushed must show the child's NEW version, not the
+# hello snapshot it took before the push.
+# ---------------------------------------------------------------------------
+
+
+class TestPushRefreshesTheAdvertisedVersion:
+    def test_the_response_carries_the_childs_post_push_versions(self, server, tmp_path):
+        # A config-only delta: the child applies it and stays up, so the parent
+        # can (and now does) re-probe hello right away.  Before that, the row in
+        # the environment list kept the pre-push numbers until the next tunnel
+        # reconnect -- for a child that does not restart, never.
+        with _real_child_server(tmp_path, name="child_refresh") as (child, child_data):
+            child_hello = _wait_child_hello(child)
+            assert child_hello["last_config"] == ""
+
+            (tmp_path / "models.json").write_text("[]", encoding="utf-8")
+            env_id = _add_env(server, f"http://127.0.0.1:{child.port}/v1/setup")
+            status, result = _request(
+                server, "POST", f"/v1/remote-envs/{env_id}/push-update",
+            )
+            assert status == 200, result
+            assert result["updated"] is True
+            assert result["restart_backend"] is False
+
+            # Fresh, not the pre-push hello: the child now advertises what the
+            # parent pushed, and so does the persisted record.
+            assert result["remote"]["last_config"] == result["local"]["last_config"]
+            status, listed = _request(server, "GET", "/v1/remote-envs")
+            assert status == 200
+            assert listed["envs"][0]["last_config"] == result["local"]["last_config"]
+
+    def test_the_apply_path_drops_the_advertised_mtime_cache(self, server, tmp_path):
+        # backend_build is scanned from the project tree behind a short TTL, so
+        # applying a delta must drop that cache or the next hello describes the
+        # files as they were before the update.  Only the wiring is checked here:
+        # pushing an actual project file would rewrite the checkout the tests run
+        # from, so a config-only member stands in for "files were rewritten".
+        seen: list = []
+
+        def _fake_invalidate(project_root=None):
+            seen.append(project_root)
+
+        tar = _make_tar_bytes({"agents_runtime/models.json": "[]"})
+        with patch("runtime.env_manager.invalidate_backend_mtime_cache",
+                   _fake_invalidate):
+            status, body = _request_raw(server, "POST", "/v1/setup?op=push", tar)
+        assert status == 200, body
+        assert seen == [os.path.realpath(
+            os.path.join(os.path.dirname(handler_api_module.__file__), ".."))]
 
 
 # ---------------------------------------------------------------------------

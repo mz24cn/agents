@@ -25,6 +25,7 @@ remote_envs.json 只是本环境的本地管理元数据：与 env.json 一样�
 from __future__ import annotations
 
 import base64
+import datetime
 import json
 import logging
 import os
@@ -40,6 +41,7 @@ logger = logging.getLogger("runtime.remote_env_manager")
 # 其余查询参数（如 token=...）原样保留，供后续 hello / update 请求鉴权。
 MANAGED_SETUP_QUERY_KEYS = frozenset({
     "op", "source", "frontend_build", "backend_build", "last_config",
+    "tz_offset",
 })
 
 # 快照字段：从 /v1/setup?op=hello 响应中取值并持久化到 remote_envs.json。
@@ -49,6 +51,14 @@ SNAPSHOT_FLAG_KEYS = ("inference_active", "api_inference_active", "session_infer
 # 在远程环境列表中展示环境的应用标识与运行平台。
 # 工作区路径（workspace）：远程执行时供母端 UI 展示子端工作区。
 SNAPSHOT_TEXT_KEYS = ("app_title", "app_logo", "arch", "os", "workspace")
+# 对方版本戳所在的时区（相对 UTC 的分钟数）：三个 *_build 戳都是挂钟时间，
+# 不知道对方时区就没法判断谁更新。旧环境不上报该字段（= 视为与本地同时区）。
+SNAPSHOT_NUM_KEYS = ("tz_offset",)
+# 可比较的三个构建戳（``server_instance_id`` 也在 SNAPSHOT_VERSION_KEYS 里，
+# 但它是不透明 ID，不是时间戳，不参与时区折算）。
+_BUILD_STAMP_KEYS = ("frontend_build", "backend_build", "last_config")
+
+_BUILD_STAMP_FORMAT = "%y%m%d_%H%M%S"
 
 
 def normalize_setup_url(url: str) -> dict:
@@ -266,8 +276,56 @@ def build_setup_request_url(url: str, params: dict) -> str:
     ))
 
 
+def _local_tz_offset_minutes() -> int:
+    from runtime.env_manager import local_tz_offset_minutes
+    return local_tz_offset_minutes()
+
+
+def restamp_to_local(stamp: str, from_offset_minutes: int) -> str:
+    """Re-express a wall-clock ``YYMMdd_HHmmss`` stamp in this host's timezone.
+
+    A peer's stamp names an instant only once its own zone is known; reformatting
+    it into local time puts both environments' numbers on one axis, so the
+    parent's "is it behind me?" checks (and the delta builder's mtime
+    thresholds, which are compared against local mtimes) read correctly.
+    Unparsable / unknown-zone stamps are passed through untouched.
+    """
+    text = str(stamp or "").strip()
+    if not text or text == "0":
+        return text
+    try:
+        moment = datetime.datetime.strptime(text, _BUILD_STAMP_FORMAT)
+        zone = datetime.timezone(datetime.timedelta(minutes=int(from_offset_minutes)))
+        local = datetime.datetime.fromtimestamp(
+            moment.replace(tzinfo=zone).timestamp())
+    except (ValueError, TypeError, OverflowError):
+        return text
+    return local.strftime(_BUILD_STAMP_FORMAT)
+
+
+def hello_tz_offset_minutes(data: dict) -> int | None:
+    """The zone a peer formatted its build stamps in, or None when unknown.
+
+    ``None`` (older peer) means "assume the same zone as we are", the historical
+    assumption.
+    """
+    raw = data.get("tz_offset")
+    if isinstance(raw, bool) or raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def snapshot_from_hello(data: dict | None) -> dict:
-    """从 ``/v1/setup?op=hello`` 响应中提取可展示的快照字段。"""
+    """从 ``/v1/setup?op=hello`` 响应中提取可展示的快照字段。
+
+    对方的三个版本戳是**对方本地时区**的挂钟时间；响应带 ``tz_offset`` 时先把它们
+    折算成本地时区的同一时刻再存 —— 这样母端的“比母端旧/新”判断、delta 构造的
+    mtime 阈值（与本地 mtime 比较）以及页面上的数字都落在同一条时间轴上。
+    不带 ``tz_offset`` 的旧环境按“与本地同时区”处理，行为与历史一致。
+    """
     data = data if isinstance(data, dict) else {}
     snapshot: dict = {}
     for key in SNAPSHOT_VERSION_KEYS:
@@ -276,6 +334,14 @@ def snapshot_from_hello(data: dict | None) -> dict:
         snapshot[key] = bool(data.get(key))
     for key in SNAPSHOT_TEXT_KEYS:
         snapshot[key] = str(data.get(key, "") or "")
+    peer_offset = hello_tz_offset_minutes(data)
+    # 只在对方确实报了时区时才带上该字段：旧环境等于“与本地同时区”，
+    # 这里凭空写 0 会让页面把它标成 UTC。
+    if peer_offset is not None:
+        snapshot["tz_offset"] = peer_offset
+        if peer_offset != _local_tz_offset_minutes():
+            for key in _BUILD_STAMP_KEYS:
+                snapshot[key] = restamp_to_local(snapshot[key], peer_offset)
     return snapshot
 
 
@@ -495,6 +561,11 @@ class RemoteEnvManager:
             record[key] = bool(snapshot.get(key))
         for key in SNAPSHOT_TEXT_KEYS:
             record[key] = str(snapshot.get(key, "") or "")
+        for key in SNAPSHOT_NUM_KEYS:
+            # 只在对方确实报了时才写：没有该字段的旧环境意味着"与本地同时区"，
+            # 凭空补 0 会把它的时区标成 UTC，页面上的标记也就跟着错了。
+            if key in snapshot:
+                record[key] = int(snapshot.get(key) or 0)
         record["checked_at"] = now_iso()
 
     @staticmethod
