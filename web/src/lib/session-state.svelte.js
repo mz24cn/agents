@@ -36,8 +36,11 @@ export const sessionForked = $state({ sessionId: null, parentSessionId: null, ti
 // token: number — 每次衍生递增，重复衍生也能被响应
 
 // 终端打开请求：Sidebar 菜单触发，ChatPage 监听并显示终端
-export const terminalOpen = $state({ sessionId: null, token: 0 })
+export const terminalOpen = $state({ sessionId: null, remoteEnvId: '', commands: [], token: 0 })
 // sessionId: string | null — 要打开终端的会话 ID
+// remoteEnvId: string — 终端树节点携带的执行环境（''=本地）
+// commands: string[] — 嵌套终端层链的进入指令（双击 terminal_layer 节点时），
+//   Terminal 连接后按序注入；见 $lib/terminalChain.js
 // token: number — 每次点击递增，确保重复打开也能响应
 
 // 会话日志目录打开请求：Sidebar 菜单触发，ChatPage 监听并打开文件管理器导航到该目录。

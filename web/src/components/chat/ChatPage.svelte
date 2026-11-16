@@ -56,6 +56,7 @@
     resolveTerminalEnvId,
     sessionWorkspace,
   } from '../../lib/session-env-registry.svelte.js'
+  import { planTerminalChain } from '../../lib/terminalChain.js'
 
   const STORAGE_MODEL_KEY = 'chat_selected_model'
   const STORAGE_TOOLS_KEY = 'chat_selected_tools'
@@ -436,11 +437,14 @@
   // follow it).  Only the env **id** is needed: the tab's single terminal
   // socket routes by `env_id` (lib/terminals-mux.js).
   function terminalRemoteEnvId(termId) {
-    return resolveTerminalEnvId(termId, sessionId, selectedRemoteEnvId)
+    // 草稿终端挂在 'new' 键下：sessionId 为 null 时 'new' 就是当前会话，
+    // 应跟随环境选择器（终端树双击绑定的远程环境即由此生效）。
+    return resolveTerminalEnvId(termId, sessionId ?? 'new', selectedRemoteEnvId)
   }
 
   function terminalWorkspace(termId) {
-    return termId === sessionId ? workspacePath : sessionWorkspace(termId)
+    if (isCurrentTerminal(termId)) return workspacePath
+    return sessionWorkspace(termId)
   }
 
   // A terminal can be opened for a session this page load never visited, and
@@ -462,13 +466,46 @@
   }
 
   // Derived: current session's terminal data
-  let currentTerminalData = $derived(terminals.get(sessionId))
+  // "本地终端"目录节点打开的终端挂在全局 'new' 会话 id 下（与聊天 wire 协议
+  // reqBody.session_id = 'new' 一致）：草稿会话（sessionId 为 null）显示它。
+  let currentTerminalData = $derived(terminals.get(sessionId ?? 'new'))
   let currentTerminalStatus = $derived(currentTerminalData?.status || null)
 
-  // Listen for terminal open requests from sidebar
+  function isCurrentTerminal(termId, sid = sessionId) {
+    return termId === sid || (termId === 'new' && sid == null)
+  }
+
+  // Listen for terminal open requests from sidebar. 双击终端树节点携带 env_id：
+  // 目标是全局草稿会话（'new'），而效果顺序上 terminalOpen 可能先于
+  // newSessionRequest 的 reset（startNewSession 会清空 selectedRemoteEnvId），
+  // 直接绑定会被抹掉——因此先挂 pending，草稿就绪后再绑环境并打开。
+  let pendingDraftTerminal = $state({ token: 0, envId: '', commands: [] })
+  let appliedDraftTerminalToken = 0
   $effect(() => {
     if (terminalOpen.token > 0 && terminalOpen.sessionId) {
-      openTerminal(terminalOpen.sessionId)
+      const sid = terminalOpen.sessionId
+      if (sid === 'new' && untrack(() => sessionId) == null) {
+        pendingDraftTerminal = {
+          token: terminalOpen.token,
+          envId: terminalOpen.remoteEnvId || '',
+          commands: terminalOpen.commands || [],
+        }
+      } else {
+        openTerminal(sid, terminalOpen.commands || [])
+      }
+    }
+  })
+
+  $effect(() => {
+    const req = pendingDraftTerminal
+    if (sessionId == null && req.token && req.token !== appliedDraftTerminalToken) {
+      appliedDraftTerminalToken = req.token
+      void (async () => {
+        // 先绑定草稿会话的执行环境（含工作区默认值），再打开终端；
+        // Terminal 首次连接即按目标 env_id 路由，不会先开本地 PTY 再迁移。
+        await handleRemoteEnvChange(req.envId)
+        if (sessionId == null) openTerminal('new', req.commands)
+      })()
     }
   })
 
@@ -563,23 +600,36 @@
     fileManagerNavigateTarget = { path: rj.path, token: Date.now() }
   }
 
-  function openTerminal(sid) {
+  function openTerminal(sid, chain = []) {
     if (!sid) return
     // Background session whose binding this page never loaded: ask, don't guess.
     // The channel is re-targeted once the answer arrives (Terminal.svelte keys
     // its connection target on the env id).
-    if (sid !== sessionId && !sessionEnvRegistry.envs[sid]) void resolveSessionRemoteEnv(sid)
-    // Create terminal entry if not exists
-    if (!terminals.has(sid)) {
+    if (sid !== sessionId && sid !== 'new' && !sessionEnvRegistry.envs[sid]) void resolveSessionRemoteEnv(sid)
+    // chain: 嵌套终端层链的进入指令（见 $lib/terminalChain.js）。新建实例时记在
+    // 条目上，Terminal 首次连上时按序注入；实例已存在（先双击环境行开 PTY、再
+    // 双击其中一层是最常见的顺序）时把链换上，已连着就地注入——否则这次双击
+    // 静默无效，用户看到的还是最外层 shell。
+    const existing = terminals.get(sid)
+    const plan = planTerminalChain({
+      existing,
+      commands: chain,
+      connected: Boolean(existing?.status?.connected),
+    })
+    if (!existing) {
       terminals = new Map(terminals).set(sid, {
         ref: null,
+        chain: plan.chain || [],
         status: { connected: false, error: null, loading: true, terminalId: null }
       })
+    } else if (plan.chain) {
+      terminals = new Map(terminals).set(sid, { ...existing, chain: plan.chain })
     }
+    if (plan.runNow) existing.ref?.runChain?.(plan.runNow)
     // If opening terminal for current session, show it.
     // Use untrack() to avoid making sessionId a dependency of the caller
     // effect (line 67), which would otherwise re-fire on every session switch.
-    if (sid === untrack(() => sessionId)) {
+    if (isCurrentTerminal(sid, untrack(() => sessionId))) {
       terminalVisible = true
     }
   }
@@ -591,7 +641,7 @@
       // Double click - destroy terminal
       clearTimeout(closeClickTimer)
       closeClickTimer = null
-      destroyTerminal(sessionId)
+      destroyTerminal(sessionId ?? 'new')
     } else {
       // Single click - hide terminal (go back to messages)
       closeClickTimer = setTimeout(() => {
@@ -2724,13 +2774,14 @@
     />
     <!-- Terminals: render all instances, show only current session's if visible -->
     {#each Array.from(terminals.entries()) as [termId, termData] (termId)}
-      <div class="terminal-view" class:visible={terminalVisible && termId === sessionId}>
+      <div class="terminal-view" class:visible={terminalVisible && isCurrentTerminal(termId)}>
         <Terminal
           bind:this={termData.ref}
           sessionId={termId}
           workspace={terminalWorkspace(termId)}
           remoteEnvId={terminalRemoteEnvId(termId)}
-          visible={terminalVisible && termId === sessionId}
+          chainCommands={termData.chain || []}
+          visible={terminalVisible && isCurrentTerminal(termId)}
           onStatusChange={(status) => handleTerminalStatusChange(termId, status)}
         />
       </div>
@@ -3031,6 +3082,7 @@
 
   .terminal-view.visible {
     display: flex;
+    flex-direction: column;
   }
 
   .message-list-container {

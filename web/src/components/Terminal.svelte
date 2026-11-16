@@ -2,6 +2,8 @@
   import { onMount, onDestroy } from 'svelte';
   import { copyToClipboard } from '$lib/clipboard.js';
   import { LOCAL_ENV_ID, openTerminalChannel } from '$lib/terminals-mux.js';
+  import { createChainRunner } from '$lib/terminalChain.js';
+  import { t } from '$lib/i18n.svelte.js';
   import '@xterm/xterm/css/xterm.css';
 
   // remoteEnvId: the child environment this channel belongs to ('' = local).
@@ -9,7 +11,10 @@
   // `env_id` on the open frame and the parent dials that environment (over its
   // tunnel or directly).  The browser therefore needs nothing else about the
   // child — no URL, no credential, no extra connection.
-  let { sessionId, workspace = '', visible = true, onStatusChange = null, remoteEnvId = '' } = $props();
+  // chainCommands: 嵌套终端层链（双击 terminal_layer 树节点时传入）。连接
+  // 成功后按序注入各层进入指令；遇到密码/确认提示停手等用户，检测到 shell
+  // 提示符再继续（$lib/terminalChain.js）。
+  let { sessionId, workspace = '', visible = true, onStatusChange = null, remoteEnvId = '', chainCommands = [] } = $props();
 
   let termEl;
   let term;
@@ -22,6 +27,44 @@
   let loading = false;
   let resizeObserver;
   let destroyed = false;
+
+  // ── 嵌套终端链 ─────────────────────────────────────────────
+  // runner 在首次连接成功时创建（每终端实例只跑一次）；状态供状态条展示。
+  let chainRunner = null;
+  let chainState = $state(null);
+  let chainBarVisible = $derived(
+    visible && chainState && !['off', 'idle', 'done'].includes(chainState.state));
+  const chainHint = $derived.by(() => {
+    if (!chainState) return ''
+    if (chainState.state === 'await-input') return t('terminalChainAwaiting')
+    if (chainState.state === 'probing') return t('terminalChainProbing')
+    if (chainState.state === 'paused') return t('terminalChainPaused')
+    return t('terminalChainStep', { index: chainState.index + 1, total: chainState.total })
+  })
+
+  function makeChainRunner(commands) {
+    return createChainRunner(commands, {
+      send: (text) => chan?.send(text),
+      onState: (st) => { chainState = st },
+    })
+  }
+
+  function startChainIfNeeded() {
+    if (chainRunner || !chainCommands?.length) return
+    chainRunner = makeChainRunner(chainCommands)
+    chainRunner.begin()
+  }
+
+  // 双击终端层时，这个会话的终端可能早就连着（先双击环境行开 PTY、再双击其中
+  // 一层进得去是最常见的顺序）：就地按链逐层注入，而不是等一次可能永远不来的
+  // 重连。ChatPage 通过 bind:this 调用它（见 lib/terminalChain.js 的 planTerminalChain）。
+  export function runChain(commands) {
+    const list = (commands || []).filter((c) => typeof c === 'string' && c.trim())
+    if (!list.length) return
+    chainRunner?.cancel()
+    chainRunner = makeChainRunner(list)
+    chainRunner.begin()
+  }
 
   // ── mouse-tracking: persistently disable ──────────────────
   const MOUSE_MODES = [1000, 1002, 1003, 1006];
@@ -66,6 +109,7 @@
       cols: term?.cols ?? 80,
       rows: term?.rows ?? 24,
       onData: (chunk) => {
+        chainRunner?.onOutput(chunk);
         try {
           term?.write(chunk);
         } catch (e) {
@@ -78,6 +122,7 @@
         if (up) {
           try { fitAddon?.fit(); } catch {}
           disableMouseTracking();
+          startChainIfNeeded();
         }
         notifyStatus(error);
       },
@@ -98,6 +143,7 @@
 
   export function destroy() {
     destroyed = true;
+    chainRunner?.cancel();
     closeChannel();
   }
 
@@ -204,6 +250,7 @@
 
   onDestroy(() => {
     destroyed = true;
+    chainRunner?.cancel();
     resizeObserver?.disconnect();
     closeChannel();
     try { term?.dispose(); } catch {}
@@ -234,6 +281,14 @@
   });
 </script>
 
+{#if chainBarVisible}
+  <div class="terminal-chain-bar" data-state={chainState.state}>
+    <span class="terminal-chain-text">{chainHint}</span>
+    {#if chainState.state === 'paused' || chainState.state === 'await-input'}
+      <button class="terminal-chain-continue" onclick={() => chainRunner?.resume()}>{t('terminalChainContinue')}</button>
+    {/if}
+  </div>
+{/if}
 <div class="terminal-container" class:visible bind:this={termEl}></div>
 
 <style>
@@ -246,4 +301,27 @@
   .terminal-container:not(.visible) {
     display: none;
   }
+
+  .terminal-chain-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 5px 10px;
+    background: #233041;
+    color: #cfe3f5;
+    font-size: 0.78rem;
+  }
+  .terminal-chain-bar[data-state="await-input"] { background: #3d3324; color: #f0dcb8; }
+  .terminal-chain-bar[data-state="paused"] { background: #40282a; color: #f2c9c4; }
+  .terminal-chain-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .terminal-chain-continue {
+    padding: 3px 10px;
+    border: 1px solid rgba(255, 255, 255, 0.25);
+    border-radius: 5px;
+    background: transparent;
+    color: inherit;
+    font-size: 0.75rem;
+    cursor: pointer;
+  }
+  .terminal-chain-continue:hover { background: rgba(255, 255, 255, 0.12); }
 </style>
