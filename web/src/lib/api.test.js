@@ -835,6 +835,38 @@ describe('sessions.get', () => {
 // sessions.revoke — POST /v1/sessions/{sessionId}/revoke
 // ---------------------------------------------------------------------------
 
+describe('sessions 嵌套终端层（tree/terminal/layer）', () => {
+  it('三个端点各自命中，env_id 原样带上（本地环境就是空串）', async () => {
+    vi.stubGlobal('fetch', mockFetch({ ok: true, node: { uid: 'u1' } }))
+
+    await sessions.addTerminalLayer({ env_id: '', command: 'wsl', name: '', parent_uid: '' })
+    let [url, opts] = fetch.mock.calls[0]
+    expect(url).toBe('/v1/sessions/tree/terminal/layer')
+    expect(opts.method).toBe('POST')
+    expect(JSON.parse(opts.body)).toEqual({ env_id: '', command: 'wsl', name: '', parent_uid: '' })
+
+    await sessions.updateTerminalLayer({ env_id: 'http://win:7988', uid: 'u1', command: 'su postgres' })
+    ;[url, opts] = fetch.mock.calls[1]
+    expect(url).toBe('/v1/sessions/tree/terminal/layer/update')
+    expect(JSON.parse(opts.body).env_id).toBe('http://win:7988')
+
+    await sessions.removeTerminalLayer({ env_id: 'http://win:7988', uid: 'u1' })
+    ;[url] = fetch.mock.calls[2]
+    expect(url).toBe('/v1/sessions/tree/terminal/layer/remove')
+  })
+
+  it('被服务端拒绝时抛出 status + 服务端 message（对话框据此显示原因）', async () => {
+    const message = "terminal environment node not found: env_id='x'"
+    vi.stubGlobal('fetch', mockFetch({ error: 'bad request', message }, 400))
+
+    const err = await sessions.addTerminalLayer({ env_id: 'x', command: 'wsl' })
+      .then(() => null, (e) => e)
+    expect(err).toBeTruthy()
+    expect(err.status).toBe(400)
+    expect(err.message).toBe(message)
+  })
+})
+
 describe('sessions.revoke', () => {
   it('sends revoke request with forced false by default', async () => {
     vi.stubGlobal('fetch', mockFetch({ status: 'success' }))

@@ -575,6 +575,12 @@ export const sessions = {
   fileJournals:  (sessionId)     => request('GET',    `/v1/sessions/${encodeURIComponent(sessionId)}/file-journals`),
   fileJournalDiff: (sessionId, turnKey) => request('GET', `/v1/sessions/${encodeURIComponent(sessionId)}/file-journals/${encodeURIComponent(turnKey)}`),
   setFlightMode: (sessionId, enabled) => request('POST', `/v1/sessions/${encodeURIComponent(sessionId)}/flight`, { enabled }),
+  // 嵌套终端层：森林"终端"根下用户自建的子环境（进入指令 ssh/wsl/docker exec…，
+  // 双击时逐层注入，见 web/src/lib/terminalChain.js）。env_id='' 即"本地"——
+  // 单环境形态下终端根本身就是本地环境节点，不能省略这个键。
+  addTerminalLayer:    (payload) => request('POST', '/v1/sessions/tree/terminal/layer', payload),
+  updateTerminalLayer: (payload) => request('POST', '/v1/sessions/tree/terminal/layer/update', payload),
+  removeTerminalLayer: (payload) => request('POST', '/v1/sessions/tree/terminal/layer/remove', payload),
 }
 
 /**

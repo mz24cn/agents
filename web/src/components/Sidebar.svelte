@@ -6,6 +6,7 @@
   import { sessionRestore, sessionDownload, newSessionCreated, sessionDeleted, sessionForked, currentSession, newSessionRequest, terminalOpen, openSessionLogDir, messageScrollRequest, awaitingUserAnswer } from '../lib/session-state.svelte.js'
   import { sidebarWidth, setSidebarWidth, toggleSidebarCollapsed, collapseSidebar, SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH } from '../lib/sidebar-width.svelte.js'
   import SessionCategoryNode from './SessionCategoryNode.svelte'
+  import { locateTerminalEnvNode } from '$lib/terminalChain.js'
 
   const SESSION_PAGE_SIZE = 100
 
@@ -21,7 +22,14 @@
   let searchText = $state('')
   let activeSearchQuery = $state('')
   let searchInput = $state(null)
-  let directoryOpen = $state(false)
+  // 视图模式：'recent'（整体会话列表，无分类框）| 'category'（主题分类树）|
+  // 'workspace'（工作区目录）| 'history'（月份分组）| 'terminal'（终端列表）。
+  // 五个森林根不再作为树节点相互挤占：折叠成标题行的一组模式图标，标题行
+  // 之下只渲染当前模式根的子级。directoryOpen = 非 recent（树框可见）。
+  let viewMode = $state('recent')
+  let directoryOpen = $derived(viewMode !== 'recent')
+  // 每个分类模式各自记住选中的末级分类，模式间切换不丢选择与滚动位置。
+  let modeSelections = new Map()
   let categoryTree = $state([])
   let categoryTreeLoading = $state(false)
   let categoryTreeError = $state('')
@@ -39,9 +47,20 @@
   let directoryTreeScrollTop = 0
   let sessionLoadToken = 0
 
+  // 菜单位置可见性保护：菜单与屏幕边缘保留的安全间距
+  const MENU_EDGE_MARGIN = 8
+  const SUBMENU_PREFERRED_MAX = 620
+  const SUBMENU_MIN_HEIGHT = 160
+
   // 弹出菜单状态
   let menuOpenId = $state(null)   // 当前展开菜单的 session id
-  let menuPos = $state({ x: 0, y: 0 })  // fixed 定位坐标
+  let menuAnchor = $state({ x: 0, y: 0 })  // 触发点（··· 按钮右下角 / 触摸点）
+  let menuPos = $state({ x: 0, y: 0 })  // fixed 定位坐标（已经过 clampMenuIntoView 夹取）
+  let menuElement = $state(null)      // 弹出菜单 DOM，用于测量自身尺寸
+  let menuSize = $state({ w: 0, h: 0 })  // 弹出菜单实测尺寸（子面板锚点用）
+  let menuConstrained = $state(false) // 屏幕太矮、菜单整体放不下时启用（压缩行高 + 内部滚动）
+  // ··· 子面板的锚点（相对视口）、展开方向与可用高度：下方空间不够时向上展开
+  let submenuPlacement = $state({ left: 0, top: 0, bottom: 0, up: false, maxHeight: SUBMENU_PREFERRED_MAX })
   let userMessageMenuOpen = $state(false)
   let userMessageMenuLoading = $state(false)
   let userMessageMenuError = $state('')
@@ -55,6 +74,13 @@
   let sessionDirectoryMenuLoading = $state(false)
   let sessionDirectoryMenuError = $state('')
   let menuSessionDirectories = $state([])
+  // 会话"打开终端"子面板：按会话执行环境定位终端根下的环境节点，
+  // 面板内默认展开全部多级嵌套终端（terminal_layer），双击打开语义不变。
+  let sessionTerminalMenuOpen = $state(false)
+  let sessionTerminalLoading = $state(false)
+  let sessionTerminalError = $state('')
+  let sessionTerminalTarget = $state(null)   // {node, path}；null=环境无节点
+  let sessionTerminalCollapsed = $state(new Set())  // 默认全展开，点击可临时收起
 
   // 标题设定/生成对话框状态
   let titleDialogOpen = $state(false)
@@ -423,33 +449,77 @@
     categoryExpandedPaths = next
   }
 
-  async function showDirectoryState() {
+  // 森林根按类型定位（"最近会话"根已在 v7 移除；旧树里即使残留也不作为模式）。
+  function findRootByKind(tree, kind) {
+    for (const node of tree || []) {
+      if (!node || typeof node !== 'object') continue
+      const type = node.type || 'category'
+      if (type === kind) return node
+    }
+    return null
+  }
+
+  // 分类路径首段是根 id；据此反查该路径属于哪个模式。
+  function modeOfCategoryPath(path) {
+    const rootId = String(path || '').split('/')[0]
+    const root = (categoryTree || []).find(n => n && String(n.id) === rootId)
+    if (!root) return ''
+    const type = root.type || 'category'
+    return type === 'recent' ? 'recent' : type
+  }
+
+  let activeRoot = $derived(
+    viewMode === 'recent' ? null : findRootByKind(categoryTree, viewMode))
+
+  // 根节点本身不再渲染：把当前模式根的子级提为顶层，查询路径仍带根 id 前缀
+  // （与后端按 id 逐段解析一致）。单环境"本地终端"根没有环境子节点时，根
+  // 自身就是可双击的终端目标，作为唯一条目渲染。
+  let treeTopNodes = $derived.by(() => {
+    const root = activeRoot
+    if (!root) return []
+    const kids = (root.children || []).filter(child => child && typeof child === 'object')
+    if (viewMode === 'terminal') {
+      const envKids = kids.filter(child => (child.type || 'category') === 'terminal')
+      if (envKids.length) {
+        return envKids.map(child => ({ ...child, category: `${root.id}/${child.id}` }))
+      }
+      // 只有本地环境时，根本身就是"本地"环境节点，必须始终渲染这一行：它是
+      // 右键"新建子终端"的锚点（终端层直接挂在它下面）。若把它提成子级，用户
+      // 连第一个嵌套终端都无处创建，第二个也无从追加。
+      return [{ ...root, category: String(root.id) }]
+    }
+    return kids.map(child => ({ ...child, category: `${root.id}/${child.id}` }))
+  })
+
+  function clearSessionListState() {
+    sessionLoadToken++
+    sessionList = []
+    sessionError = ''
+    sessionPage = 1
+    sessionHasMore = false
+    sessionLoading = false
+    sessionLoadingMore = false
+  }
+
+  // 切换视图模式：记住旧模式选中的分类，恢复新模式自己的选择；recent 模式
+  // 只有整体列表，terminal 模式只有终端列表，两者都不带会话分类列表。
+  async function showModeState(mode) {
+    if (viewMode === mode) return
     saveCurrentSessionView()
-    directoryOpen = true
+    if (selectedCategory) modeSelections.set(modeOfCategoryPath(selectedCategory), selectedCategory)
+    viewMode = mode
     searchOpen = false
     activeSearchQuery = ''
     await loadCategoryTree()
-    if (selectedCategory) {
+    selectedCategory = modeSelections.get(mode) || ''
+    if (mode !== 'terminal' && selectedCategory) {
       expandCategoryAncestors(selectedCategory)
       const restored = await restoreSessionView(categorySessionViews.get(selectedCategory))
       if (!restored) await loadSessions()
     } else {
-      sessionLoadToken++
-      sessionList = []
-      sessionError = ''
-      sessionPage = 1
-      sessionHasMore = false
-      sessionLoading = false
-      sessionLoadingMore = false
+      clearSessionListState()
     }
     await restoreDirectoryScroll()
-  }
-
-  async function toggleDirectory(e) {
-    e.preventDefault()
-    e.stopPropagation()
-    if (directoryOpen) await showRecentSessions()
-    else await showDirectoryState()
   }
 
   function toggleCategoryPath(path) {
@@ -463,16 +533,18 @@
     if (selectedCategory === path && sessionList.length > 0) return
     saveCurrentSessionView()
     selectedCategory = path
+    modeSelections.set(viewMode, path)
     activeSearchQuery = ''
     const restored = await restoreSessionView(categorySessionViews.get(path))
     if (!restored) await loadSessions()
   }
 
   async function showRecentSessions() {
-    if (!directoryOpen && !activeSearchQuery) return
+    if (viewMode === 'recent' && !activeSearchQuery) return
     saveCurrentSessionView()
     if (categoryTreeElement) directoryTreeScrollTop = categoryTreeElement.scrollTop
-    directoryOpen = false
+    if (selectedCategory) modeSelections.set(modeOfCategoryPath(selectedCategory), selectedCategory)
+    viewMode = 'recent'
     searchOpen = false
     activeSearchQuery = ''
     const restored = await restoreSessionView(recentSessionView)
@@ -493,7 +565,8 @@
   function toggleSearch(e) {
     e.preventDefault()
     e.stopPropagation()
-    directoryOpen = false
+    if (selectedCategory) modeSelections.set(modeOfCategoryPath(selectedCategory), selectedCategory)
+    viewMode = 'recent'
     selectedCategory = ''
     searchOpen = !searchOpen
     if (searchOpen) {
@@ -582,8 +655,13 @@
     e.stopPropagation()
     const btn = e.currentTarget
     const rect = btn.getBoundingClientRect()
-    // 菜单出现在按钮右下角，用 fixed 定位浮于最顶层
-    menuPos = { x: rect.right + 4, y: rect.top }
+    // 菜单出现在按钮右下角，用 fixed 定位浮于最顶层；
+    // menuPos 随后由 clampMenuIntoView() 按菜单实测尺寸夹回视口内，
+    // 贴近屏幕底部 / 右边缘的条目也不会被截断（见 clampMenuIntoView）。
+    menuAnchor = { x: rect.right + 4, y: rect.top }
+    menuPos = { ...menuAnchor }
+    resetMenuPlacement()
+    void clampMenuIntoView()
     if (menuOpenId !== sid) {
       userMessageMenuOpen = false
       userMessageMenuLoading = false
@@ -609,6 +687,7 @@
 
   function closeMenu() {
     menuOpenId = null
+    closeTerminalMenu()
     userMessageMenuOpen = false
     userMessageMenuLoading = false
     userMessageMenuError = ''
@@ -622,6 +701,11 @@
     sessionDirectoryMenuLoading = false
     sessionDirectoryMenuError = ''
     menuSessionDirectories = []
+    sessionTerminalMenuOpen = false
+    sessionTerminalLoading = false
+    sessionTerminalError = ''
+    sessionTerminalTarget = null
+    sessionTerminalCollapsed = new Set()
     hoverBtnId = null
     hoverMenuId = null
     if (closeTimer) {
@@ -674,6 +758,136 @@
     }
   }
 
+  // --- 菜单位置可见性保护 ---
+  // 侧边栏靠近屏幕底部的会话条目（最近会话列表、或目录树末级分类下的列表都一样），
+  // 菜单按触发点向下展开时底部条目会跑到视口外看不见。这里按菜单实测尺寸把 fixed
+  // 坐标夹回视口内：放不下就整体上移；极端矮屏下再压缩行高并允许菜单内部滚动。
+  async function clampMenuIntoView() {
+    await tick()
+    const el = menuElement
+    if (!el || menuOpenId === null || typeof window === 'undefined') return
+
+    const vpW = window.innerWidth
+    const vpH = window.innerHeight
+    let rect = el.getBoundingClientRect()
+
+    // 整个菜单都比可视区高：切到压缩模式（更小的行高 + 内部滚动），再量一次
+    const needCompact = rect.height > vpH - MENU_EDGE_MARGIN * 2
+    if (needCompact !== menuConstrained) {
+      menuConstrained = needCompact
+      await tick()
+      if (menuElement !== el || menuOpenId === null) return
+      rect = el.getBoundingClientRect()
+    }
+
+    // 记下尺寸，供 ··· 子面板计算锚点用
+    if (Math.abs(rect.width - menuSize.w) > 0.5 || Math.abs(rect.height - menuSize.h) > 0.5) {
+      menuSize = { w: rect.width, h: rect.height }
+    }
+
+    let x = menuAnchor.x
+    let y = menuAnchor.y
+    // 右缘：放不下就左移（保持贴着触发点，除非会超出屏幕）
+    if (x + rect.width + MENU_EDGE_MARGIN > vpW) x = vpW - rect.width - MENU_EDGE_MARGIN
+    if (x < MENU_EDGE_MARGIN) x = MENU_EDGE_MARGIN
+    // 底缘：这是「底部条目看不见」的主因——把菜单整体上移，保证底部可见
+    if (y + rect.height + MENU_EDGE_MARGIN > vpH) y = vpH - rect.height - MENU_EDGE_MARGIN
+    if (y < MENU_EDGE_MARGIN) y = MENU_EDGE_MARGIN
+
+    // 只在变化明显时写入，避免与渲染来回触发造成抖动
+    if (Math.abs(x - menuPos.x) > 0.5 || Math.abs(y - menuPos.y) > 0.5) {
+      menuPos = { x, y }
+    }
+  }
+
+  function resetMenuPlacement() {
+    menuConstrained = false
+    menuSize = { w: 0, h: 0 }
+    submenuPlacement = { left: 0, top: 0, bottom: 0, up: false, maxHeight: SUBMENU_PREFERRED_MAX }
+  }
+
+  // ··· 子面板（用户消息 / 会话目录 / 执行分析）用 fixed 定位挂在菜单右侧：默认与菜单
+  // 顶部对齐向下展开；下方空间不足时改为与菜单底部对齐向上展开，并把 max-height 压到
+  // 剩余可用空间，保证面板底部不会跑到屏幕外。用 fixed 而不是 absolute，是为了在菜单
+  // 进入内部滚动（压缩模式）时不被裁剪。
+  function applySubmenuPlacement() {
+    if (menuOpenId === null || typeof window === 'undefined' || menuSize.w === 0) return
+    const vpH = window.innerHeight
+    const menuTop = menuPos.y
+    const menuBottom = menuPos.y + menuSize.h
+    const below = vpH - menuTop - MENU_EDGE_MARGIN
+    const above = menuBottom - MENU_EDGE_MARGIN
+    const preferred = Math.min(SUBMENU_PREFERRED_MAX, vpH * 0.7)
+    const up = below < SUBMENU_MIN_HEIGHT && above > below
+    const placement = {
+      left: menuPos.x + menuSize.w + 6,
+      top: menuTop,
+      bottom: vpH - menuBottom,
+      up,
+      maxHeight: Math.max(120, Math.min(preferred, up ? above : below)),
+    }
+    const prev = submenuPlacement
+    if (
+      Math.abs(placement.left - prev.left) > 0.5 ||
+      Math.abs(placement.top - prev.top) > 0.5 ||
+      Math.abs(placement.bottom - prev.bottom) > 0.5 ||
+      placement.up !== prev.up ||
+      Math.abs(placement.maxHeight - prev.maxHeight) > 0.5
+    ) {
+      submenuPlacement = placement
+    }
+  }
+
+  function submenuStyle(width) {
+    const { left, top, bottom, up, maxHeight } = submenuPlacement
+    const vertical = up ? `bottom: ${bottom}px;` : `top: ${top}px;`
+    return `left: ${left}px; width: ${width}px; ${vertical} max-height: ${maxHeight}px;`
+  }
+
+  function handleViewportResize() {
+    if (menuOpenId === null) return
+    applySubmenuPlacement()
+    void clampMenuIntoView()
+  }
+
+  // 菜单内容变化（子面板展开、异步数据返回后条目变多）都会改变整体高度，
+  // 需要重新夹取坐标。menuPos / menuConstrained 只被写出、不被读取，不会形成循环。
+  $effect(() => {
+    if (menuOpenId === null) return
+    void menuAnchor.x
+    void menuAnchor.y
+    void userMessageMenuOpen
+    void userMessageMenuLoading
+    void userMessageMenuError
+    void menuUserMessages.length
+    void sessionDirectoryMenuOpen
+    void sessionDirectoryMenuLoading
+    void sessionDirectoryMenuError
+    void menuSessionDirectories.length
+    void sessionTerminalMenuOpen
+    void sessionTerminalLoading
+    void sessionTerminalError
+    void sessionTerminalTarget
+    void executionAnalysisOpen
+    void executionAnalysisLoading
+    void executionAnalysisError
+    void executionAnalysisData
+    void clampMenuIntoView()
+  })
+
+  // 菜单位置变化（夹取 / 压缩）后，已展开子面板的可用空间要跟着重算
+  $effect(() => {
+    if (menuOpenId === null) return
+    void menuPos.x
+    void menuPos.y
+    void menuConstrained
+    void userMessageMenuOpen
+    void sessionDirectoryMenuOpen
+    void executionAnalysisOpen
+    void sessionTerminalMenuOpen
+    applySubmenuPlacement()
+  })
+
   function submenuPanelWidth(preferred = 600) {
     if (typeof window === 'undefined') return preferred
     const chatAreaWidth = Math.max(320, window.innerWidth - sidebarWidth.current)
@@ -710,8 +924,10 @@
     e.stopPropagation()
     cancelClose()
     if (executionAnalysisOpen) return
+    applySubmenuPlacement()
     userMessageMenuOpen = false
     sessionDirectoryMenuOpen = false
+    sessionTerminalMenuOpen = false
     executionAnalysisOpen = true
     executionAnalysisLoading = true
     executionAnalysisError = ''
@@ -760,8 +976,10 @@
     e.stopPropagation()
     cancelClose()
     if (sessionDirectoryMenuOpen) return
+    applySubmenuPlacement()
     userMessageMenuOpen = false
     executionAnalysisOpen = false
+    sessionTerminalMenuOpen = false
     sessionDirectoryMenuOpen = true
     sessionDirectoryMenuLoading = true
     sessionDirectoryMenuError = ''
@@ -789,7 +1007,11 @@
     closeMenu()
     saveCurrentSessionView()
     if (categoryTreeElement) directoryTreeScrollTop = categoryTreeElement.scrollTop
-    directoryOpen = true
+    // 目标路径属于哪个森林根，就切到对应模式（recent 根已取消；旧树残留时
+    // 退回主题模式）。
+    const kind = modeOfCategoryPath(targetPath)
+    viewMode = kind === 'recent' || kind === '' ? 'category' : kind
+    modeSelections.set(viewMode, targetPath)
     searchOpen = false
     activeSearchQuery = ''
     await loadCategoryTree()
@@ -806,9 +1028,11 @@
     e.stopPropagation()
     cancelClose()
     if (userMessageMenuOpen) return
+    applySubmenuPlacement()
 
     sessionDirectoryMenuOpen = false
     executionAnalysisOpen = false
+    sessionTerminalMenuOpen = false
     userMessageMenuOpen = true
     userMessageMenuLoading = true
     userMessageMenuError = ''
@@ -855,6 +1079,233 @@
     terminalOpen.token++
   }
 
+  // 按会话执行环境（meta.remote_env，缺省本地）在终端根下定位环境节点；
+  // 单环境森林只有根"本地终端"（无 env 子节点），此时根本身即本地目标。
+  function locateSessionTerminalNode(envId) {
+    return locateTerminalEnvNode(categoryTree, envId)
+  }
+
+  // 面板默认展开全部多级嵌套终端；单击可临时收起（不触碰主目录树的展开态）。
+  const sessionTerminalExpandedPaths = $derived.by(() => {
+    const target = sessionTerminalTarget
+    const all = new Set()
+    if (target) {
+      const walk = (n, p) => {
+        const kids = (n.children || []).filter(c => c && typeof c === 'object')
+        if (kids.length) {
+          all.add(p)
+          for (const c of kids) walk(c, `${p}/${c.id}`)
+        }
+      }
+      walk(target.node, target.path)
+    }
+    const collapsed = sessionTerminalCollapsed
+    return new Set([...all].filter(p => !collapsed.has(p)))
+  })
+
+  function handleSessionTerminalToggle(path) {
+    const next = new Set(sessionTerminalCollapsed)
+    if (next.has(path)) next.delete(path)
+    else next.add(path)
+    sessionTerminalCollapsed = next
+  }
+
+  async function openSessionTerminalMenu(e, sessionId) {
+    e.stopPropagation()
+    cancelClose()
+    if (sessionTerminalMenuOpen) return
+    applySubmenuPlacement()
+    userMessageMenuOpen = false
+    sessionDirectoryMenuOpen = false
+    executionAnalysisOpen = false
+    sessionTerminalMenuOpen = true
+    sessionTerminalLoading = true
+    sessionTerminalError = ''
+    sessionTerminalTarget = null
+    sessionTerminalCollapsed = new Set()
+    const requestedSessionId = sessionId
+    try {
+      await loadCategoryTree()
+      const data = await sessions.get(sessionId)
+      if (menuOpenId !== requestedSessionId || !sessionTerminalMenuOpen) return
+      const envId = typeof data?.meta?.remote_env === 'string' ? data.meta.remote_env : ''
+      sessionTerminalTarget = locateSessionTerminalNode(envId)
+    } catch (err) {
+      if (menuOpenId === requestedSessionId) sessionTerminalError = err.message || String(err)
+    } finally {
+      if (menuOpenId === requestedSessionId) sessionTerminalLoading = false
+    }
+  }
+
+  // 面板内双击：保持原"打开该会话终端"语义，并携带环境 + 嵌套命令链，
+  // ChatPage 对已有会话按 terminals-mux（env_id + session）路由并注入命令。
+  function handleOpenSessionTerminalNode(node, path) {
+    const sid = menuOpenId
+    const target = collectTerminalTarget(path)
+    const envId = target ? target.envId : ((node && node.env_id) || '')
+    const commands = target ? target.commands : []
+    closeMenu()
+    if (!sid) return
+    terminalOpen.sessionId = sid
+    terminalOpen.remoteEnvId = envId
+    terminalOpen.commands = commands
+    terminalOpen.token++
+  }
+
+  // 双击目录树中的终端节点（"本地"或某个远程环境）：打开对应执行环境的终端。
+  // 终端面板随会话显示，因此关联到全局新建会话 id 'new'（与聊天 wire 协议
+  // reqBody.session_id='new' 及 ChatPage 的 'new' 终端映射一致）。节点携带的
+  // env_id（remote_envs.json 登记的地址；本地节点为 ''）随 terminalOpen 传给
+  // ChatPage，由其绑定草稿会话的执行环境；mux 按 env_id + session 路由通道。
+  // 当前不在草稿会话（sessionId 非 null）时先请求新建；打开信号延迟一拍，
+  // 确保 ChatPage 先完成切换、openTerminal 时目标会话已就绪并自动显示终端窗口。
+  function handleOpenTerminalFromTree(node, path) {
+    const target = collectTerminalTarget(path)
+    const envId = target ? target.envId : ((node && node.env_id) || '')
+    const commands = target ? target.commands : []
+    if (currentSession.sessionId != null) newSessionRequest.token += 1
+    setTimeout(() => {
+      terminalOpen.sessionId = 'new'
+      terminalOpen.remoteEnvId = envId
+      terminalOpen.commands = commands
+      terminalOpen.token++
+    }, 0)
+    navigate('#/chat')
+    if (window.innerWidth < 1024) collapseSidebar()
+  }
+
+  // 沿 id 路径（如 '3/2/9'）在"终端"根内定位节点，返回 {envId, commands}：
+  // commands 是从环境节点到该终端层沿途各层记录的进入指令，Terminal 连接后
+  // 按序注入（terminalChain.js），逐层到达目标环境。
+  function collectTerminalTarget(path) {
+    const segments = String(path || '').split('/').map(Number)
+    const root = categoryTree.find(n => n && n.type === 'terminal')
+    if (!root || !segments.length) return null
+    let current = root
+    const chain = []
+    for (const id of segments.slice(1)) {
+      current = (current.children || []).find(
+        (c) => c && typeof c === 'object' && c.id === id)
+      if (!current) return null
+      chain.push(current)
+    }
+    const layerCommands = (nodes) => nodes
+      .filter((n) => n.type === 'terminal_layer' && n.command)
+      .map((n) => n.command)
+    if (!chain.length) {
+      // 双击终端根本身：单环境森林的"本地终端"根即可连接的环境节点。
+      return { envId: root.env_id || '', commands: [] }
+    }
+    if (chain[0].type === 'terminal') {
+      return { envId: chain[0].env_id || '', commands: layerCommands(chain.slice(1)) }
+    }
+    // 终端层直接挂在终端根下（单环境形态）：根自身就是执行环境，
+    // 整条 chain 都是要注入的进入指令。
+    return { envId: root.env_id || '', commands: layerCommands(chain) }
+  }
+
+  // 终端环境节点/终端层节点右键：新建子终端（在环境或该层下再挂一层）、
+  // 删除（仅终端层；环境节点来自注册配置，注销环境即从树上消失）。
+  let terminalMenu = $state(null)
+  let terminalLayerDialog = $state(null)
+
+  function handleTerminalNodeContextmenu(node, path, event) {
+    const target = collectTerminalTarget(path)
+    if (!target) return
+    terminalMenu = {
+      path,
+      envId: target.envId,
+      uid: node.type === 'terminal_layer' ? String(node.uid || '') : '',
+      name: node.name || '',
+      command: node.command || '',
+      x: event.clientX,
+      y: event.clientY,
+    }
+  }
+
+  function closeTerminalMenu() {
+    if (terminalMenu) terminalMenu = null
+  }
+
+  function openTerminalLayerDialog() {
+    const m = terminalMenu
+    closeTerminalMenu()
+    if (!m) return
+    terminalLayerDialog = {
+      mode: 'create',
+      envId: m.envId,
+      parentUid: m.uid,
+      parentName: m.name,
+      uid: '',
+      command: '',
+      name: '',
+      error: '',
+      busy: false,
+    }
+  }
+
+  // 编辑已有终端层：预填当前进入指令与名称，uid 定位节点。
+  function openTerminalLayerEditDialog() {
+    const m = terminalMenu
+    closeTerminalMenu()
+    if (!m || !m.uid) return
+    terminalLayerDialog = {
+      mode: 'edit',
+      envId: m.envId,
+      parentUid: '',
+      parentName: '',
+      uid: m.uid,
+      command: m.command,
+      name: m.name,
+      error: '',
+      busy: false,
+    }
+  }
+
+  function closeTerminalLayerDialog() {
+    if (terminalLayerDialog && !terminalLayerDialog.busy) terminalLayerDialog = null
+  }
+
+  async function submitTerminalLayer() {
+    const d = terminalLayerDialog
+    if (!d || d.busy) return
+    if (!d.command.trim()) { d.error = t('terminalLayerCommandRequired'); return }
+    d.busy = true
+    try {
+      const payload = d.mode === 'edit'
+        ? { env_id: d.envId, uid: d.uid, command: d.command.trim(), name: d.name.trim() }
+        : { env_id: d.envId, command: d.command.trim(), name: d.name.trim(), parent_uid: d.parentUid }
+      // env_id 原样带上（本地环境就是空串，不能省略：单环境形态下终端根自己
+      // 就是本地环境节点）。走 api.js 而不是裸 fetch：口令保护的部署里 401 会
+      // 先弹登录再重试，报错也取服务端的 message，而不是只剩 "HTTP 401"。
+      if (d.mode === 'edit') await sessions.updateTerminalLayer(payload)
+      else await sessions.addTerminalLayer(payload)
+      terminalLayerDialog = null
+      await loadCategoryTree(true)
+    } catch (err) {
+      d.error = err.message || String(err)
+      d.busy = false
+    }
+  }
+
+  async function deleteTerminalLayerFromMenu() {
+    const m = terminalMenu
+    closeTerminalMenu()
+    if (!m || !m.uid) return
+    if (!confirm(t('terminalLayerDeleteConfirm', { name: m.name }))) return
+    try {
+      await sessions.removeTerminalLayer({ env_id: m.envId, uid: m.uid })
+      await loadCategoryTree(true)
+    } catch (err) {
+      // 另一端已经把它删掉了（404）：目的已达成，只需刷新树
+      if (err?.status === 404) {
+        await loadCategoryTree(true)
+        return
+      }
+      categoryTreeError = err.message || String(err)
+    }
+  }
+
   // 打开会话日志目录：取本地（父端）log-dir 端点（conversation.json 所在目录），
   // 通知 ChatPage 显示文件管理器面板并导航。会话目录始终在本地——即使会话绑定
   // 远程环境（file journal 在子端）也打开本地会话目录。
@@ -882,8 +1333,11 @@
     longPressTimer = setTimeout(() => {
       longPressTimer = null
       // 在触摸位置弹出菜单
-      menuPos = { x: touch.clientX, y: touch.clientY }
+      menuAnchor = { x: touch.clientX, y: touch.clientY }
+      menuPos = { ...menuAnchor }
+      resetMenuPlacement()
       menuOpenId = sid
+      void clampMenuIntoView()
     }, 500)
   }
 
@@ -1165,13 +1619,77 @@
 </script>
 
 <!-- 点击空白处关闭菜单 -->
-<svelte:window onclick={closeMenu} />
+<svelte:window onclick={closeMenu} onresize={handleViewportResize} />
+
+<!-- 终端节点右键菜单：新建子终端 / 删除（级联）。fixed 渲染在 sidebar 外避免裁剪。 -->
+{#if terminalMenu}
+  <div
+    class="terminal-node-menu"
+    role="menu"
+    style="left:{terminalMenu.x}px; top:{terminalMenu.y}px;"
+    onclick={(e) => e.stopPropagation()}
+  >
+    <button class="terminal-node-menu-item" role="menuitem" onclick={openTerminalLayerDialog}>
+      <span class="menu-emoji">🖥️</span>{t('terminalLayerNew')}
+    </button>
+    {#if terminalMenu.uid}
+      <button class="terminal-node-menu-item" role="menuitem" onclick={openTerminalLayerEditDialog}>
+        <span class="menu-emoji">✏️</span>{t('terminalLayerEdit')}
+      </button>
+      <button class="terminal-node-menu-item danger" role="menuitem" onclick={deleteTerminalLayerFromMenu}>
+        <span class="menu-emoji">🗑️</span>{t('terminalLayerDelete')}
+      </button>
+    {/if}
+  </div>
+{/if}
+
+<!-- 新建子终端对话框：记录进入指令（ssh/docker exec/wsl/psql…），名称可留空自动派生 -->
+{#if terminalLayerDialog}
+  <div class="terminal-layer-backdrop" onclick={closeTerminalLayerDialog}>
+    <div class="terminal-layer-dialog" role="dialog" aria-modal="true" onclick={(e) => e.stopPropagation()}>
+      <div class="terminal-layer-title">
+        {terminalLayerDialog.mode === 'edit'
+          ? `${t('terminalLayerEdit')} — ${terminalLayerDialog.name || terminalLayerDialog.command}`
+          : `${t('terminalLayerNew')}${terminalLayerDialog.parentName ? ` — ${terminalLayerDialog.parentName}` : ''}`}
+      </div>
+      <label class="terminal-layer-field">
+        <span>{t('terminalLayerCommandLabel')}</span>
+        <input
+          type="text"
+          bind:value={terminalLayerDialog.command}
+          placeholder={t('terminalLayerCommandPlaceholder')}
+          disabled={terminalLayerDialog.busy}
+          onkeydown={(e) => { if (e.key === 'Enter') submitTerminalLayer(); if (e.key === 'Escape') closeTerminalLayerDialog() }}
+        />
+      </label>
+      <label class="terminal-layer-field">
+        <span>{t('terminalLayerNameLabel')}</span>
+        <input
+          type="text"
+          bind:value={terminalLayerDialog.name}
+          placeholder={t('terminalLayerNamePlaceholder')}
+          disabled={terminalLayerDialog.busy}
+          onkeydown={(e) => { if (e.key === 'Enter') submitTerminalLayer(); if (e.key === 'Escape') closeTerminalLayerDialog() }}
+        />
+      </label>
+      {#if terminalLayerDialog.error}
+        <div class="terminal-layer-error">{terminalLayerDialog.error}</div>
+      {/if}
+      <div class="terminal-layer-actions">
+        <button class="terminal-layer-btn" onclick={closeTerminalLayerDialog} disabled={terminalLayerDialog.busy}>{t('cancel')}</button>
+        <button class="terminal-layer-btn primary" onclick={submitTerminalLayer} disabled={terminalLayerDialog.busy}>{t('confirm')}</button>
+      </div>
+    </div>
+  </div>
+{/if}
 
 <!-- 浮层菜单：fixed 定位，渲染在 sidebar 之外确保不被裁剪 -->
 {#if menuOpenId !== null}
   <div
     class="session-dropdown"
+    class:constrained={menuConstrained}
     role="menu"
+    bind:this={menuElement}
     style="left:{menuPos.x}px; top:{menuPos.y}px;"
     onclick={(e) => e.stopPropagation()}
     onmouseenter={handleMenuEnter}
@@ -1195,7 +1713,7 @@
       <div
         class="user-message-submenu"
         role="menu"
-        style="width:{userMessageMenuWidth()}px;"
+        style={submenuStyle(userMessageMenuWidth())}
       >
         {#if userMessageMenuLoading}
           <div class="user-message-submenu-status">{t('loading')}</div>
@@ -1235,7 +1753,7 @@
         <div
           class="session-directory-submenu"
           role="menu"
-          style="width:{submenuPanelWidth(520)}px;"
+          style={submenuStyle(submenuPanelWidth(520))}
         >
           {#if sessionDirectoryMenuLoading}
             <div class="user-message-submenu-status">{t('loading')}</div>
@@ -1278,14 +1796,60 @@
      <span class="menu-emoji">📝</span>
       {t('regenerateSummary')}
     </button>
-    <button
-      class="session-dropdown-item"
-      role="menuitem"
-      onclick={(e) => handleOpenTerminal(e, menuOpenId)}
-    >
-      <span class="menu-emoji">💻</span>
-      Open Terminal
-    </button>
+    <div class="session-dropdown-submenu-row" class:active={sessionTerminalMenuOpen}>
+      <div class="session-dropdown-item session-dropdown-submenu-label">
+        <span class="menu-emoji">💻</span>
+        <span>{t('openTerminal')}</span>
+      </div>
+      <button
+        class="submenu-more-btn"
+        aria-label={t('openTerminal')}
+        aria-haspopup="menu"
+        aria-expanded={sessionTerminalMenuOpen}
+        onclick={(e) => openSessionTerminalMenu(e, menuOpenId)}
+        onmouseenter={(e) => openSessionTerminalMenu(e, menuOpenId)}
+      >···</button>
+    </div>
+    {#if sessionTerminalMenuOpen}
+      <div
+        class="session-directory-submenu session-terminal-submenu"
+        role="menu"
+        style={submenuStyle(submenuPanelWidth(420))}
+      >
+        {#if sessionTerminalLoading}
+          <div class="user-message-submenu-status">{t('loading')}</div>
+        {:else if sessionTerminalError}
+          <div class="user-message-submenu-status error">{sessionTerminalError}</div>
+        {:else if sessionTerminalTarget}
+          <div class="user-message-list">
+            <SessionCategoryNode
+              node={{ ...sessionTerminalTarget.node, category: sessionTerminalTarget.path }}
+              depth={0}
+              expandedPaths={sessionTerminalExpandedPaths}
+              selectedCategory=""
+              onToggle={handleSessionTerminalToggle}
+              onSelect={() => {}}
+              onOpenTerminalNode={handleOpenSessionTerminalNode}
+              onNodeContextmenu={(node, path, event) => {
+                // 先关闭会话菜单与面板（避免面板对象指向已刷新的旧树），
+                // 再弹终端层的新建/编辑/删除菜单；操作后树刷新，重开面板即最新。
+                closeMenu()
+                handleTerminalNodeContextmenu(node, path, event)
+              }}
+            />
+          </div>
+        {:else}
+          <div class="user-message-submenu-status">{t('sessionTerminalPanelEmpty')}</div>
+          <button
+            class="session-dropdown-item"
+            role="menuitem"
+            onclick={(e) => handleOpenTerminal(e, menuOpenId)}
+          >
+            <span class="menu-emoji">💻</span>{t('sessionTerminalOpenDirect')}
+          </button>
+        {/if}
+      </div>
+    {/if}
     <div class="session-dropdown-submenu-row" class:active={executionAnalysisOpen}>
       <div class="session-dropdown-item session-dropdown-submenu-label">
       <span class="menu-emoji">📊</span>
@@ -1304,7 +1868,7 @@
       <div
         class="execution-analysis-submenu"
         role="menu"
-        style="width:{submenuPanelWidth(520)}px;"
+        style={submenuStyle(submenuPanelWidth(520))}
       >
         {#if executionAnalysisLoading}
           <div class="user-message-submenu-status">{t('loading')}</div>
@@ -1465,16 +2029,48 @@
       />
     {/if}
   </nav>
-  <!-- 最近会话 / 分类目录面板 -->
+  <!-- 会话面板：标题行是一组模式图标（最近/主题/历史/工作区 + 右侧终端），
+       森林根节点不再进入树框；树框只渲染当前模式根的子级。 -->
   <div class="session-panel">
     <div class="session-panel-heading">
-      <button class="session-panel-title" class:active={!directoryOpen} onclick={showRecentSessions}>{t('sessionPanelTitle')}</button>
-      <button class="directory-toggle" class:active={directoryOpen} onclick={toggleDirectory} title={t('sessionDirectory')}>
-        <span class="directory-glyph">🌲</span>{t('sessionDirectory')}
-      </button>
+      <button
+        class="mode-btn"
+        class:active={viewMode === 'recent'}
+        onclick={showRecentSessions}
+        title={t('sessionModeRecent')}
+        aria-label={t('sessionModeRecent')}
+      ><span class="mode-glyph" aria-hidden="true">{'\u{1F550}\u{FE0F}'}</span></button>
+      <button
+        class="mode-btn"
+        class:active={viewMode === 'category'}
+        onclick={() => showModeState('category')}
+        title={t('sessionModeCategory')}
+        aria-label={t('sessionModeCategory')}
+      ><span class="mode-glyph" aria-hidden="true">{'\u{1F4DA}'}</span></button>
+      <button
+        class="mode-btn"
+        class:active={viewMode === 'history'}
+        onclick={() => showModeState('history')}
+        title={t('sessionModeHistory')}
+        aria-label={t('sessionModeHistory')}
+      ><span class="mode-glyph" aria-hidden="true">{'\u{1F4C5}'}</span></button>
+      <button
+        class="mode-btn"
+        class:active={viewMode === 'workspace'}
+        onclick={() => showModeState('workspace')}
+        title={t('sessionModeWorkspace')}
+        aria-label={t('sessionModeWorkspace')}
+      ><span class="mode-glyph" aria-hidden="true">{'\u{1F5C2}\u{FE0F}'}</span></button>
+      <button
+        class="mode-btn mode-btn-terminal"
+        class:active={viewMode === 'terminal'}
+        onclick={() => showModeState('terminal')}
+        title={t('sessionModeTerminal')}
+        aria-label={t('sessionModeTerminal')}
+      ><span class="mode-glyph" aria-hidden="true">{'\u{1F4BB}'}</span></button>
     </div>
     {#if directoryOpen}
-      <div class="category-tree" bind:this={categoryTreeElement} onscroll={(e) => { directoryTreeScrollTop = e.currentTarget.scrollTop }}>
+      <div class="category-tree" class:full={viewMode === 'terminal'} bind:this={categoryTreeElement} onscroll={(e) => { directoryTreeScrollTop = e.currentTarget.scrollTop }}>
         {#if categoryTreeBuilding}
           <div class="category-tree-building" role="status">
             <span class="category-tree-building-dot" aria-hidden="true"></span>
@@ -1485,22 +2081,24 @@
           <div class="session-loading">{t('loading')}</div>
         {:else if categoryTreeError && categoryTree.length === 0}
           <div class="session-error">{categoryTreeError}</div>
-        {:else if categoryTree.length === 0 && !categoryTreeBuilding}
+        {:else if treeTopNodes.length === 0 && !categoryTreeBuilding}
           <div class="session-empty">{t('sessionDirectoryEmpty')}</div>
         {:else}
-          {#each categoryTree as node (node.id)}
+          {#each treeTopNodes as node (node.category)}
             <SessionCategoryNode
-              node={{ ...node, category: String(node.id) }}
+              node={node}
               expandedPaths={categoryExpandedPaths}
               {selectedCategory}
               onToggle={toggleCategoryPath}
               onSelect={selectCategory}
+              onOpenTerminalNode={handleOpenTerminalFromTree}
+              onNodeContextmenu={handleTerminalNodeContextmenu}
             />
           {/each}
         {/if}
       </div>
     {/if}
-    {#if !directoryOpen || selectedCategory}
+    {#if !directoryOpen || (selectedCategory && viewMode !== 'terminal')}
       <div class="session-list" bind:this={sessionListElement} onscroll={handleSessionScroll}>
         {#if sessionLoading && sessionList.length === 0}
           <div class="session-loading">{t('loading')}</div>
@@ -1704,45 +2302,40 @@
     align-items: stretch;
     flex-shrink: 0;
   }
-  .session-panel-title,
-  .directory-toggle {
-    padding: 6px 8px 4px 10px;
+  /* 模式切换行：森林根折成一行图标，不占树框高度，也不占水平宽度。 */
+  .mode-btn {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    padding: 4px 9px;
     border: none;
     background: none;
     color: var(--text-secondary);
-    font-size: 0.78rem;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
     cursor: pointer;
+    opacity: 0.55;
     transition: background-color 0.15s, color 0.15s, opacity 0.15s;
   }
-  .session-panel-title {
-    flex: 1;
-    text-align: left;
+  .mode-glyph {
+    font-size: 0.92rem;
+    line-height: 1;
   }
-  .directory-toggle {
-    margin-left: auto;
-    padding-left: 6px;
-  }
-  .session-panel-title:hover,
-  .directory-toggle:hover {
-    color: var(--text);
-    opacity: 1;
-  }
-  .session-panel-title:not(.active),
-  .directory-toggle:not(.active) { opacity: 0.55; }
-  .session-panel-title.active,
-  .directory-toggle.active { color: var(--text); opacity: 1; }
-  .directory-glyph { margin-right: 3px; }
+  .mode-btn:hover { color: var(--text); opacity: 1; }
+  .mode-btn.active { color: var(--text); opacity: 1; }
+  .mode-btn-terminal { margin-left: auto; }
   .category-tree {
-    max-height: 46%;
+    /* 分类模式：树框约占侧边栏有效高度的三分之一，其余给会话列表。 */
+    max-height: 34%;
     min-height: 0;
     overflow-y: auto;
     border-top: 1px solid var(--border);
     border-bottom: 1px solid var(--border);
     padding: 3px 0;
     flex-shrink: 1;
+  }
+  /* 终端模式没有会话列表，终端树整体列表占满剩余高度。 */
+  .category-tree.full {
+    flex: 1 1 auto;
+    max-height: none;
   }
   .category-tree-building {
     display: flex;
@@ -1855,6 +2448,20 @@
     padding: 4px 0;
     overflow: visible;
   }
+  /* 极端矮屏：菜单整体比可视区还高时压缩行高并允许内部滚动，
+     这样「删除会话」这类最下面的条目仍然够得着 */
+  .session-dropdown.constrained {
+    max-height: calc(100vh - 16px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+  .session-dropdown.constrained .session-dropdown-item {
+    padding: 5px 14px;
+    font-size: 0.82rem;
+  }
+  .session-dropdown.constrained .submenu-more-btn {
+    height: 22px;
+  }
   .session-dropdown-item {
     display: flex;
     align-items: center;
@@ -1916,9 +2523,10 @@
   .user-message-submenu,
   .session-directory-submenu,
   .execution-analysis-submenu {
-    position: absolute;
-    left: calc(100% + 6px);
-    top: 0;
+    /* fixed：锚点（left/top 或 bottom）与 max-height 由 JS 按可视区算好，
+       既不会被菜单容器的滚动裁剪，也能在贴近屏幕底部时向上展开 */
+    position: fixed;
+    z-index: 10000;
     max-height: min(70vh, 620px);
     display: flex;
     flex-direction: column;
@@ -2170,4 +2778,79 @@
     background: var(--danger);
     color: #fff;
   }
+
+  /* 终端节点右键菜单与新建子终端对话框 */
+  .terminal-node-menu {
+    position: fixed;
+    z-index: 1200;
+    min-width: 160px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.25);
+    padding: 4px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .terminal-node-menu-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 10px;
+    border: none;
+    background: transparent;
+    color: var(--text-secondary);
+    border-radius: 6px;
+    font-size: 0.82rem;
+    text-align: left;
+    cursor: pointer;
+  }
+  .terminal-node-menu-item:hover { background: var(--border); color: var(--text); }
+  .terminal-node-menu-item.danger { color: #c0392b; }
+  .terminal-node-menu-item.danger:hover { background: rgba(192, 57, 43, 0.12); }
+  .terminal-layer-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 1300;
+    background: rgba(0, 0, 0, 0.4);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .terminal-layer-dialog {
+    width: min(460px, calc(100vw - 40px));
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+  }
+  .terminal-layer-title { font-weight: 600; color: var(--text); font-size: 0.95rem; }
+  .terminal-layer-field { display: flex; flex-direction: column; gap: 4px; font-size: 0.8rem; color: var(--text-secondary); }
+  .terminal-layer-field input {
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg-secondary, var(--bg));
+    color: var(--text);
+    font-family: 'courier-new', courier, monospace;
+    font-size: 0.85rem;
+  }
+  .terminal-layer-error { color: #c0392b; font-size: 0.8rem; }
+  .terminal-layer-actions { display: flex; justify-content: flex-end; gap: 8px; }
+  .terminal-layer-btn {
+    padding: 7px 14px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 0.82rem;
+    cursor: pointer;
+  }
+  .terminal-layer-btn.primary { background: var(--primary); border-color: var(--primary); color: #fff; }
+  .terminal-layer-btn:disabled { opacity: 0.6; cursor: default; }
 </style>
