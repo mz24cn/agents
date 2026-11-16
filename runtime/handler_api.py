@@ -2692,9 +2692,11 @@ class HandlerApiMixin:
         """
         session_manager = self.server.session_manager  # type: ignore[attr-defined]
         tree = session_manager.get_category_tree()
-        if not session_manager.category_tree_exists():
+        from runtime import category_tree_builder
+        # 森林 v2：磁盘上仍是 v1 单树（或没有树）时后台重建为多根森林。
+        stale = int(tree.get("version") or 1) < category_tree_builder.TREE_VERSION
+        if not session_manager.category_tree_exists() or stale:
             if len(session_manager.list_sessions()) > 5:
-                from runtime import category_tree_builder
                 category_tree_builder.start_build(
                     session_manager.chats_dir,
                     llm=category_tree_builder.make_summary_llm(session_manager),
@@ -2705,6 +2707,101 @@ class HandlerApiMixin:
                 if state.get("last_error"):
                     tree["build_error"] = state["last_error"]
         self._send_json_response(200, tree)
+
+    def _handle_terminal_layer_add(self) -> None:
+        """POST /v1/sessions/tree/terminal/layer — 新增嵌套终端层。
+
+        body: {env_id, command, name?, parent_uid?}。command 为进入该层的
+        CLI 指令（ssh/docker exec/wsl/su/psql 等），原样记录，双击该层时
+        从环境节点起逐层注入；name 缺省由 command 推导。parent_uid 缺省
+        挂在环境节点下，否则挂在该终端层的子树下。
+        """
+        body = self._read_json_body()
+        if body is None:
+            self._send_json_error(400, "invalid JSON body")
+            return
+        command = str(body.get("command") or "").strip()
+        if not command:
+            self._send_json_error(400, "command is required")
+            return
+        session_manager = self.server.session_manager  # type: ignore[attr-defined]
+        doc = session_manager.get_category_tree()
+        if not doc.get("tree"):
+            self._send_json_error(409, "tree.json not built yet")
+            return
+        from runtime import category_tree_builder
+        try:
+            node = category_tree_builder.add_terminal_layer(
+                doc,
+                str(body.get("env_id") or ""),
+                command,
+                name=str(body.get("name") or ""),
+                parent_uid=str(body.get("parent_uid") or ""),
+            )
+        except ValueError as exc:
+            self._send_json_error(400, str(exc))
+            return
+        if not session_manager.save_category_tree(doc):
+            self._send_json_error(500, "failed to persist tree.json")
+            return
+        self._send_json_response(200, {"ok": True, "node": node})
+
+    def _handle_terminal_layer_update(self) -> None:
+        """POST /v1/sessions/tree/terminal/layer/update — 编辑终端层进入指令。
+
+        body: {env_id, uid, command, name?}。command 必填；name 留空沿用原名。
+        """
+        body = self._read_json_body()
+        if body is None:
+            self._send_json_error(400, "invalid JSON body")
+            return
+        uid = str(body.get("uid") or "").strip()
+        command = str(body.get("command") or "").strip()
+        if not uid:
+            self._send_json_error(400, "uid is required")
+            return
+        if not command:
+            self._send_json_error(400, "command is required")
+            return
+        session_manager = self.server.session_manager  # type: ignore[attr-defined]
+        doc = session_manager.get_category_tree()
+        from runtime import category_tree_builder
+        node = category_tree_builder.update_terminal_layer(
+            doc, str(body.get("env_id") or ""), uid, command,
+            name=str(body.get("name") or ""))
+        if node is None:
+            self._send_json_error(404, f"terminal layer not found: uid={uid!r}")
+            return
+        if not session_manager.save_category_tree(doc):
+            self._send_json_error(500, "failed to persist tree.json")
+            return
+        self._send_json_response(200, {"ok": True, "node": node})
+
+    def _handle_terminal_layer_remove(self) -> None:
+        """POST /v1/sessions/tree/terminal/layer/remove — 删除终端层及其子树。
+
+        body: {env_id, uid}。环境节点本身不可删（来自注册配置，注销远程
+        环境即从树上消失）。
+        """
+        body = self._read_json_body()
+        if body is None:
+            self._send_json_error(400, "invalid JSON body")
+            return
+        uid = str(body.get("uid") or "").strip()
+        if not uid:
+            self._send_json_error(400, "uid is required")
+            return
+        session_manager = self.server.session_manager  # type: ignore[attr-defined]
+        doc = session_manager.get_category_tree()
+        from runtime import category_tree_builder
+        if not category_tree_builder.remove_terminal_layer(
+                doc, str(body.get("env_id") or ""), uid):
+            self._send_json_error(404, f"terminal layer not found: uid={uid!r}")
+            return
+        if not session_manager.save_category_tree(doc):
+            self._send_json_error(500, "failed to persist tree.json")
+            return
+        self._send_json_response(200, {"ok": True})
 
     def _handle_list_sessions(self) -> None:
         """GET /v1/sessions — 分页返回最近会话，category 可筛选末级分类。"""

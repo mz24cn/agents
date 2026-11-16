@@ -279,6 +279,9 @@ _ROUTES: dict[str, list] = {
         (re.compile(r"^/v1/workspace/copy$"), "_handle_workspace_copy", ()),
         (re.compile(r"^/v1/workspace/upload/init$"), "_handle_workspace_upload_init", ()),
         (re.compile(r"^/v1/workspace/upload/([^/]+)/complete$"), "_handle_workspace_upload_complete", (urllib.parse.unquote,)),
+        (re.compile(r"^/v1/sessions/tree/terminal/layer$"), "_handle_terminal_layer_add", ()),
+        (re.compile(r"^/v1/sessions/tree/terminal/layer/update$"), "_handle_terminal_layer_update", ()),
+        (re.compile(r"^/v1/sessions/tree/terminal/layer/remove$"), "_handle_terminal_layer_remove", ()),
         (re.compile(r"^/v1/env-proxy/([^/]+)(?:/.*)?$"), "_handle_env_proxy", (urllib.parse.unquote,)),
     ],
     "PUT": [

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from runtime.models import InferenceResult, Message
 from runtime.session_manager import SessionManager, _parse_title_and_category
 
@@ -194,23 +196,35 @@ def test_do_generate_title_legacy_plain_title_without_tree(tmp_path):
     assert "分类目录" not in calls[0].messages[0].content
 
 
-def test_multi_membership_attach_is_legal(tmp_path):
-    """同一会话可同时挂载到多个末级分类（自动分类 + 人工分类并存）。"""
+def test_attach_is_exclusive_single_category(tmp_path):
+    """v5 单分类语义：挂载到另一个末级分类 = 移动，旧挂载被解除。"""
     sm = SessionManager(str(tmp_path))
     sm.on_session_created("s1", "会话一")
-    (tmp_path / "tree.json").write_text(json.dumps(_tree_fixture()), "utf-8")
+    fixture = _tree_fixture()
+    # 预先把 s1 同时挂在两个旧末级下（旧版多分类数据），挂载应顺带清理。
+    for path in ("1/1/1", "1/1/2"):
+        leaf = _find_terminal(fixture["tree"], path)
+        if "s1" not in leaf["children"]:
+            leaf["children"].append("s1")
+    (tmp_path / "tree.json").write_text(json.dumps(fixture), "utf-8")
 
-    assert sm.attach_session_to_category("s1", "1/1/2") is True
     assert sm.attach_session_to_category("s1", "1/2") is True
-
     tree = _read_tree(tmp_path)
-    assert "s1" in _find_terminal(tree, "1/1/2")["children"]
     assert "s1" in _find_terminal(tree, "1/2")["children"]
-    # 祖先计数按唯一会话去重：Root = {s_old, s1}
-    assert tree[0]["session_count"] == 2
-    # 两个分类查询都能查到该会话
-    assert any(e["session_id"] == "s1" for e in sm.list_sessions_by_category("1/1/2"))
+    assert "s1" not in _find_terminal(tree, "1/1/1")["children"]
+    # 被搬空的 LeafB(1/1/2) 已被剪除（整个节点不复存在）
+    # （与 remove_session_from_tree 的运行时剪枝策略一致，单层包装只在
+    # 完整重建时折叠）。
+    child_names = [c["name"] for c in tree[0]["children"]]
+    assert "Group" in child_names
+    paths = [c["path"] for c in sm.terminal_categories()]
+    assert "1/1/2" not in paths and "1/1/1" in paths and "1/2" in paths
+    # 只有目标分类能查到该会话
     assert any(e["session_id"] == "s1" for e in sm.list_sessions_by_category("1/2"))
+    assert not any(e["session_id"] == "s1" for e in sm.list_sessions_by_category("1/1/1"))
+    # 重复挂载幂等：返回 False，不重复出现
+    assert sm.attach_session_to_category("s1", "1/2") is False
+    assert _find_terminal(_read_tree(tmp_path), "1/2")["children"].count("s1") == 1
 
 
 def test_remove_session_from_tree_prunes_empty_categories(tmp_path):
@@ -270,6 +284,40 @@ def test_remove_session_from_tree_deletes_file_when_empty(tmp_path):
     assert sm.terminal_categories() == []
 
 
+def test_remove_session_keeps_tree_when_terminal_layers_exist(tmp_path):
+    """分类清空但森林里有用户自建嵌套终端层：tree.json 保留，链不丢。
+
+    删掉最后几个会话会清空分类，但"终端"根下的 terminal_layer 是用户手工配的
+    进入指令（ssh→wsl→docker 之类）；连带 tree.json 一起删等于丢用户配置。
+    """
+    sm = SessionManager(str(tmp_path))
+    fixture = _tree_fixture()
+    fixture["tree"][0]["children"] = [
+        {"id": 1, "name": "LeafA", "type": "category", "category": "1/1",
+         "children": ["s_old"], "session_count": 1},
+    ]
+    fixture["tree"].append({
+        "id": 3, "name": "本地终端", "type": "terminal", "environment": "local",
+        "env_id": "", "session_count": 0, "stats": {},
+        "children": [
+            {"id": 9, "uid": "u9", "name": "WSL", "type": "terminal_layer",
+             "command": "wsl", "children": [
+                 {"id": 10, "uid": "u10", "name": "cc", "type": "terminal_layer",
+                  "command": "docker exec -it cc bash", "children": []},
+             ]},
+        ],
+    })
+    (tmp_path / "tree.json").write_text(json.dumps(fixture), "utf-8")
+
+    assert sm.remove_session_from_tree("s_old") is True
+    assert (tmp_path / "tree.json").exists()
+    terminal = next(r for r in _read_tree(tmp_path) if r.get("type") == "terminal")
+    assert terminal["children"][0]["uid"] == "u9"
+    assert terminal["children"][0]["children"][0]["command"] == "docker exec -it cc bash"
+    # 空分类照旧被剪掉：保留的只是用户自建的终端链
+    assert sm.terminal_categories() == []
+
+
 def test_delete_session_updates_tree(tmp_path):
     """DELETE 会话接口链路：delete_session 同步清理 tree.json 挂载。"""
     sm = SessionManager(str(tmp_path))
@@ -292,3 +340,184 @@ def test_delete_session_updates_tree(tmp_path):
         assert "s1" not in _find_terminal(tree, path)["children"]
     assert "1/1/2" not in [c["path"] for c in sm.terminal_categories()]
     assert not (tmp_path / "s1").exists()
+
+
+# ---------------------------------------------------------------------------
+# v2 森林：主题 / 工作区 / 本地终端
+# ---------------------------------------------------------------------------
+
+def _forest_fixture() -> dict:
+    return {
+        "version": 2,
+        "stats": {
+            "conversation_count": 2,
+            "attached_conversation_count": 2,
+            "terminal_category_count": 1,
+            "membership_edge_count": 2,
+            "multi_category_conversation_count": 0,
+            "max_categories_per_conversation": 1,
+            "max_leaf_size": 10,
+            "workspace_node_count": 2,
+        },
+        "tree": [
+            {"id": 1, "name": "主题", "type": "category", "session_count": 2, "stats": {},
+             "children": [
+                 {"id": 1, "name": "Top", "type": "category", "session_count": 2, "children": [
+                     {"id": 1, "name": "Leaf", "type": "category", "category": "1/1/1",
+                      "children": ["s_old", "s_del"], "session_count": 2},
+                 ]},
+             ]},
+            {"id": 2, "name": "工作区", "type": "workspace", "session_count": 2,
+             "stats": {"workspace_count": 2}, "children": [
+                 {"id": 1, "name": "agents", "type": "workspace", "workspace": "/cc/agents",
+                  "session_count": 2, "children": ["s_old", "s_del"], "stats": {}},
+                 {"id": 2, "name": "未指定工作区", "type": "workspace", "workspace": "",
+                  "session_count": 0, "children": [], "stats": {}},
+             ]},
+            {"id": 3, "name": "本地终端", "type": "terminal", "session_count": 0,
+             "children": [], "stats": {}},
+        ],
+    }
+
+
+def test_forest_terminal_categories_excludes_non_category(tmp_path):
+    sm = SessionManager(str(tmp_path))
+    (tmp_path / "tree.json").write_text(json.dumps(_forest_fixture()), "utf-8")
+    assert sm.terminal_categories() == [
+        {"path": "1/1/1", "label": "主题/Top/Leaf"},
+    ]
+
+
+def test_forest_attach_rejects_non_category_targets(tmp_path):
+    sm = SessionManager(str(tmp_path))
+    (tmp_path / "tree.json").write_text(json.dumps(_forest_fixture()), "utf-8")
+    assert sm.attach_session_to_category("s_new", "2/2") is False  # 工作区叶子
+    assert sm.attach_session_to_category("s_new", "3") is False    # 终端根
+    assert sm.attach_session_to_category("s_new", "1/1/1") is True  # 分类叶子正常
+    # 继承/查询只看分类挂载：s_old 也挂在工作区叶子下，但不出现在分类路径中
+    assert sm.session_categories("s_old") == ["1/1/1"]
+    assert sm.session_categories("s_new") == ["1/1/1"]
+
+
+def test_forest_remove_keeps_structural_terminal_root(tmp_path):
+    sm = SessionManager(str(tmp_path))
+    (tmp_path / "tree.json").write_text(json.dumps(_forest_fixture()), "utf-8")
+
+    assert sm.remove_session_from_tree("s_del") is True
+    tree = _read_tree(tmp_path)
+    roots = {r["name"]: r for r in tree}
+    assert "本地终端" in roots  # 结构性节点不因空被剪
+    leaf = _find_terminal(tree, "1/1/1")
+    assert leaf["children"] == ["s_old"]
+    agents = _find_terminal(tree, "2/1")
+    assert agents["children"] == ["s_old"]  # 工作区挂载同步清理
+    stats = json.loads((tmp_path / "tree.json").read_text("utf-8"))["stats"]
+    assert stats["attached_conversation_count"] == 1
+    assert stats["terminal_category_count"] == 1
+
+
+def test_forest_remove_all_sessions_deletes_tree_file(tmp_path):
+    sm = SessionManager(str(tmp_path))
+    (tmp_path / "tree.json").write_text(json.dumps(_forest_fixture()), "utf-8")
+    assert sm.remove_session_from_tree("s_old") is True
+    assert sm.remove_session_from_tree("s_del") is True
+    # 分类子树全空 → 删除 tree.json（下次访问满足条件会重建整个森林）
+    assert not (tmp_path / "tree.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# v3 森林：最近会话根 / 会话历史月份根
+# ---------------------------------------------------------------------------
+
+def _forest_v3_fixture() -> dict:
+    return {
+        "version": 3,
+        "stats": {
+            "conversation_count": 2,
+            "attached_conversation_count": 2,
+            "terminal_category_count": 1,
+            "membership_edge_count": 1,
+            "multi_category_conversation_count": 0,
+            "max_categories_per_conversation": 1,
+            "max_leaf_size": 10,
+            "workspace_node_count": 1,
+            "environment_node_count": 1,
+            "recent_session_count": 2,
+            "recent_limit": 20,
+            "month_node_count": 2,
+        },
+        "tree": [
+            {"id": 1, "name": "主题", "type": "category", "session_count": 2, "stats": {},
+             "children": [
+                 {"id": 1, "name": "Top", "type": "category", "session_count": 2, "children": [
+                     {"id": 1, "name": "Leaf", "type": "category", "category": "1/1/1",
+                      "children": ["s_a", "s_b"], "session_count": 2},
+                 ]},
+             ]},
+            {"id": 2, "name": "工作区", "type": "workspace", "session_count": 2,
+             "stats": {"workspace_count": 1, "environment_count": 1}, "children": [
+                 {"id": 1, "name": "agents", "type": "workspace", "workspace": "/cc/agents",
+                  "session_count": 2, "children": ["s_a", "s_b"], "stats": {}},
+             ]},
+            {"id": 3, "name": "本地终端", "type": "terminal", "session_count": 0,
+             "children": [], "stats": {}},
+            {"id": 4, "name": "最近会话", "type": "recent", "session_count": 2,
+             "stats": {"limit": 20}, "children": ["s_b", "s_a"]},
+            {"id": 5, "name": "会话历史", "type": "history", "session_count": 2,
+             "stats": {"month_count": 2}, "children": [
+                 {"id": 1, "name": "202607", "type": "month", "session_count": 1,
+                  "children": ["s_b"], "stats": {}},
+                 {"id": 2, "name": "202608", "type": "month", "session_count": 1,
+                  "children": ["s_a"], "stats": {}},
+             ]},
+        ],
+    }
+
+
+def _write_index_entries(tmp_path, entries: dict) -> None:
+    (tmp_path / "index.json").write_text(json.dumps(entries, ensure_ascii=False), "utf-8")
+
+
+def test_forest_v3_recent_and_month_queries_use_time_order(tmp_path):
+    """recent/month 末级按时间倒序；category/workspace 末级仍按标题稳定序。"""
+    _write_index_entries(tmp_path, {
+        "s_a": {"session_id": "s_a", "title": "Zebra",
+                "created_at": "2026-08-01T10:00:00", "last_inference_at": "2026-09-02T10:00:00"},
+        "s_b": {"session_id": "s_b", "title": "Alpha",
+                "created_at": "2026-07-01T10:00:00", "last_inference_at": "2026-09-01T10:00:00"},
+    })
+    sm = SessionManager(str(tmp_path))
+    (tmp_path / "tree.json").write_text(json.dumps(_forest_v3_fixture()), "utf-8")
+
+    assert [s["session_id"] for s in sm.list_sessions_by_category("4")] == ["s_a", "s_b"]
+    assert [s["session_id"] for s in sm.list_sessions_by_category("5/2")] == ["s_a"]
+    assert [s["session_id"] for s in sm.list_sessions_by_category("5/1")] == ["s_b"]
+    # 工作区叶子仍是浏览语义：标题稳定序（Alpha, Zebra），不随时间
+    assert [s["session_id"] for s in sm.list_sessions_by_category("2/1")] == ["s_b", "s_a"]
+
+
+def test_forest_v3_history_root_is_not_queryable_leaf(tmp_path):
+    sm = SessionManager(str(tmp_path))
+    (tmp_path / "tree.json").write_text(json.dumps(_forest_v3_fixture()), "utf-8")
+    with pytest.raises(ValueError):
+        sm.list_sessions_by_category("5")  # 历史根含子节点，不是末级
+    with pytest.raises(ValueError):
+        sm.list_sessions_by_category("2")  # 工作区根同理
+
+
+def test_forest_v3_remove_prunes_empty_month_keeps_new_roots(tmp_path):
+    sm = SessionManager(str(tmp_path))
+    (tmp_path / "tree.json").write_text(json.dumps(_forest_v3_fixture()), "utf-8")
+
+    assert sm.remove_session_from_tree("s_a") is True
+    doc = json.loads((tmp_path / "tree.json").read_text("utf-8"))
+    roots = {r["name"]: r for r in doc["tree"]}
+    assert "最近会话" in roots and "会话历史" in roots  # 结构根不因空而消失
+    assert roots["最近会话"]["children"] == ["s_b"]
+    months = roots["会话历史"]["children"]
+    assert [m["name"] for m in months] == ["202607"]  # 空月份被剪除
+    assert roots["最近会话"]["session_count"] == 1
+    leaf = _find_terminal(doc["tree"], "1/1/1")
+    assert leaf["children"] == ["s_b"]
+    # 分类 membership 统计仍只覆盖分类子树
+    assert doc["stats"]["attached_conversation_count"] == 1

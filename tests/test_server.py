@@ -1767,6 +1767,118 @@ class TestSessionAPI:
         assert status == 200
         assert body == expected
 
+    def test_terminal_layer_add_and_remove_api(self, server_with_env):
+        """嵌套终端层 API：新增（含子层）、级联删除、tree.json 持久化。"""
+        import json as _json
+
+        from runtime import category_tree_builder as builder
+
+        chats_dir = server_with_env._context_manager._chats_dir
+        os.makedirs(chats_dir, exist_ok=True)
+        tree_path = os.path.join(chats_dir, "tree.json")
+        doc = {"version": builder.TREE_VERSION, "tree": [builder.build_terminal_root(
+            [{"sid": "s1", "environment": "local"}], [{"id": "http://win:7988"}])]}
+        with open(tree_path, "w", encoding="utf-8") as f:
+            _json.dump(doc, f)
+
+        status, body = _post(server_with_env, "/v1/sessions/tree/terminal/layer",
+                             {"env_id": "http://win:7988", "command": "wsl"})
+        assert status == 200
+        node = body["node"]
+        assert node["name"] == "WSL" and node["type"] == builder.TYPE_TERMINAL_LAYER
+
+        status, body = _post(server_with_env, "/v1/sessions/tree/terminal/layer",
+                             {"env_id": "http://win:7988", "command": "docker exec -it cc bash",
+                              "parent_uid": node["uid"], "name": "cc容器"})
+        assert status == 200
+        child = body["node"]
+        assert child["name"] == "cc容器"
+
+        with open(tree_path, "r", encoding="utf-8") as f:
+            persisted = _json.load(f)
+        assert builder.terminal_layer_chain(
+            persisted, "http://win:7988", child["uid"])[-1]["command"] == "docker exec -it cc bash"
+
+        # 编辑进入指令：留空 name 沿用原名，tree.json 同步更新。
+        status, body = _post(server_with_env, "/v1/sessions/tree/terminal/layer/update",
+                             {"env_id": "http://win:7988", "uid": child["uid"],
+                              "command": "docker exec -it cc2 bash"})
+        assert status == 200
+        assert body["node"]["command"] == "docker exec -it cc2 bash"
+        assert body["node"]["name"] == "cc容器"
+        with open(tree_path, "r", encoding="utf-8") as f:
+            persisted = _json.load(f)
+        assert builder.terminal_layer_chain(
+            persisted, "http://win:7988", child["uid"])[-1]["command"] == "docker exec -it cc2 bash"
+        status, _ = _post(server_with_env, "/v1/sessions/tree/terminal/layer/update",
+                          {"env_id": "http://win:7988", "uid": "missing", "command": "x"})
+        assert status == 404
+        status, _ = _post(server_with_env, "/v1/sessions/tree/terminal/layer/update",
+                          {"env_id": "http://win:7988", "uid": child["uid"], "command": ""})
+        assert status == 400
+
+        # 级联删除（WSL 层连同其下 cc容器 一并移除）
+        status, _ = _post(server_with_env, "/v1/sessions/tree/terminal/layer/remove",
+                          {"env_id": "http://win:7988", "uid": node["uid"]})
+        assert status == 200
+        with open(tree_path, "r", encoding="utf-8") as f:
+            persisted = _json.load(f)
+        assert builder.terminal_layer_chain(persisted, "http://win:7988", child["uid"]) == []
+
+        status, _ = _post(server_with_env, "/v1/sessions/tree/terminal/layer",
+                          {"env_id": "http://win:7988", "command": ""})
+        assert status == 400
+        status, _ = _post(server_with_env, "/v1/sessions/tree/terminal/layer",
+                          {"env_id": "http://nope:1", "command": "wsl"})
+        assert status == 400
+        status, _ = _post(server_with_env, "/v1/sessions/tree/terminal/layer/remove",
+                          {"env_id": "http://win:7988", "uid": "missing"})
+        assert status == 404
+
+    def test_terminal_layer_api_on_local_only_root(self, server_with_env):
+        """只有本地环境（根"本地终端"、无环境子节点）时，env_id='' 的增删改可用。
+
+        这是最常见的单机部署形态：侧边栏在终端模式里对这个根右键"新建子终端"，
+        带的就是 env_id=''。若后端只认环境子节点，这里会 400，功能整体不可用。
+        """
+        import json as _json
+
+        from runtime import category_tree_builder as builder
+
+        chats_dir = server_with_env._context_manager._chats_dir
+        os.makedirs(chats_dir, exist_ok=True)
+        tree_path = os.path.join(chats_dir, "tree.json")
+        doc = {"version": builder.TREE_VERSION, "tree": [builder.build_terminal_root(
+            [{"sid": "s1", "environment": "local"}], [])]}
+        with open(tree_path, "w", encoding="utf-8") as f:
+            _json.dump(doc, f)
+
+        status, body = _post(server_with_env, "/v1/sessions/tree/terminal/layer",
+                             {"env_id": "", "command": "docker exec -it cc bash"})
+        assert status == 200, body
+        node = body["node"]
+        with open(tree_path, "r", encoding="utf-8") as f:
+            persisted = _json.load(f)
+        root = next(r for r in persisted["tree"] if r.get("type") == "terminal")
+        assert [c["uid"] for c in root["children"]] == [node["uid"]]
+
+        status, body = _post(server_with_env, "/v1/sessions/tree/terminal/layer/update",
+                             {"env_id": "", "uid": node["uid"], "command": "podman exec -it cc sh"})
+        assert status == 200 and body["node"]["command"] == "podman exec -it cc sh"
+
+        status, _ = _post(server_with_env, "/v1/sessions/tree/terminal/layer/remove",
+                          {"env_id": "", "uid": node["uid"]})
+        assert status == 200
+        with open(tree_path, "r", encoding="utf-8") as f:
+            persisted = _json.load(f)
+        root = next(r for r in persisted["tree"] if r.get("type") == "terminal")
+        assert root["children"] == []
+
+        # 未知环境仍然 400（单环境根不会充当任意 env_id）。
+        status, _ = _post(server_with_env, "/v1/sessions/tree/terminal/layer",
+                          {"env_id": "http://nope:1", "command": "wsl"})
+        assert status == 400
+
     def test_session_tree_triggers_background_build_when_missing(self, server_with_env, monkeypatch):
         """tree.json 缺失且会话数 > 5 时，GET /v1/sessions/tree 返回空树 + building 标记并触发后台构建。"""
         import json as _json
@@ -1819,6 +1931,43 @@ class TestSessionAPI:
         assert status == 200
         assert body == {"version": 1, "experimental": True, "tree": []}
         assert not builder.build_state()["building"]
+
+    def test_session_tree_rebuilds_when_version_stale(self, server_with_env, monkeypatch):
+        """磁盘上是 v1 单树且会话数 > 5：GET /v1/sessions/tree 后台重建为 v2 森林。"""
+        import json as _json
+
+        import runtime.category_tree_builder as builder
+
+        chats_dir = server_with_env._session_manager.chats_dir
+        os.makedirs(chats_dir, exist_ok=True)
+        for i in range(6):
+            sid = f"260101_92000{i}"
+            session_dir = os.path.join(chats_dir, sid)
+            os.makedirs(session_dir, exist_ok=True)
+            with open(os.path.join(session_dir, "conversation.json"), "w", encoding="utf-8") as f:
+                _json.dump({"meta": {"session_id": sid}, "messages": []}, f)
+            server_with_env._session_manager.on_session_created(sid)
+        with open(os.path.join(chats_dir, "tree.json"), "w", encoding="utf-8") as f:
+            _json.dump({"version": 1, "tree": []}, f)
+
+        builder.reset_state_for_tests()
+        monkeypatch.setattr(builder, "RETRY_COOLDOWN_SECONDS", 0.0)
+
+        status, body = _get(server_with_env, "/v1/sessions/tree")
+        assert status == 200
+        assert body["building"] is True
+
+        import time
+        deadline = time.time() + 60
+        while builder.build_state()["building"] and time.time() < deadline:
+            time.sleep(0.1)
+        assert not builder.build_state()["building"]
+        with open(os.path.join(chats_dir, "tree.json"), "r", encoding="utf-8") as f:
+            rebuilt = _json.load(f)
+        assert rebuilt["version"] == builder.TREE_VERSION
+        assert [r["name"] for r in rebuilt["tree"]] == [
+            "主题", "工作区", "本地终端", "会话历史",
+        ]
 
     def test_search_sessions_respects_search_max_results_after_full_search(self, server_with_env, monkeypatch):
         """GET /v1/sessions/search 在全量搜索命中后再按 SEARCH_MAX_RESULTS 截断。"""

@@ -113,13 +113,28 @@ class SessionManager:
             return {"version": 1, "experimental": True, "tree": []}
         return data
 
+    def save_category_tree(self, data: dict) -> bool:
+        """原子写回整个 tree.json 文档（终端层增删等就地编辑使用）。"""
+        if not isinstance(data, dict) or not isinstance(data.get("tree"), list):
+            return False
+        try:
+            fd, tmp = tempfile.mkstemp(prefix=".tree.", suffix=".tmp", dir=self._chats_dir)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False, indent=2)
+                fh.write("\n")
+            os.replace(tmp, self._category_tree_path)
+        except OSError as exc:
+            logger.warning("save_category_tree: 写入 tree.json 失败: %s", exc)
+            return False
+        return True
+
     def list_sessions_by_category(self, category: str) -> list[dict]:
         """Return indexed sessions attached to a terminal category path.
 
         ``category`` is a slash-separated sequence of numeric node IDs, such as
         ``1/2`` or ``1/2/3``. Terminal categories may occur at different depths.
-        Category nodes remain a tree, while session ID leaves may be repeated in
-        multiple terminal nodes to form cross-links.
+        Single-membership mode (tree.json v5): each session belongs to exactly
+        one terminal category; older data with repeated mounts is still readable.
         """
         parts = [part for part in str(category or "").strip("/").split("/") if part]
         if not parts or any(not part.isdigit() for part in parts):
@@ -149,16 +164,27 @@ class SessionManager:
                 sessions.append(dict(entry))
             elif os.path.isfile(os.path.join(self._chats_dir, session_id, "conversation.json")):
                 sessions.append({"session_id": session_id, "title": session_id})
-        # Directory browsing is a structural view, not the reverse-
-        # chronological recent-sessions view returned by list_sessions(). Use a
-        # stable title order so category results are easy to scan and do not
-        # inherit the time ordering used by the Sidebar's default list.
-        sessions.sort(
-            key=lambda item: (
-                str(item.get("title") or item.get("session_id") or "").casefold(),
-                str(item.get("session_id") or ""),
+        node_kind = str(node.get("type") or "category") if isinstance(node, dict) else "category"
+        if node_kind in ("recent", "month"):
+            # 最近会话 / 会话历史按月节点：时间倒序（与会话列表 last_inference_at
+            # 语义同序），保持树中的顺序与列表展示一致。
+            sessions.sort(
+                key=lambda item: str(
+                    item.get("last_inference_at") or item.get("created_at") or ""
+                ),
+                reverse=True,
             )
-        )
+        else:
+            # Directory browsing is a structural view, not the reverse-
+            # chronological recent-sessions view returned by list_sessions(). Use a
+            # stable title order so category results are easy to scan and do not
+            # inherit the time ordering used by the Sidebar's default list.
+            sessions.sort(
+                key=lambda item: (
+                    str(item.get("title") or item.get("session_id") or "").casefold(),
+                    str(item.get("session_id") or ""),
+                )
+            )
         return sessions
 
     def category_tree_path(self) -> str:
@@ -198,6 +224,9 @@ class SessionManager:
             for item in children:
                 if not isinstance(item, dict):
                     continue
+                # 森林中只有分类节点参与"末级分类"枚举（工作区/终端根不参与）。
+                if str(item.get("type") or "category") != "category":
+                    continue
                 kids = item.get("children", [])
                 node_id = str(item.get("id", ""))
                 name = str(item.get("name") or "")
@@ -213,10 +242,11 @@ class SessionManager:
         return out
 
     def attach_session_to_category(self, session_id: str, category_path: str) -> bool:
-        """将会话挂载到 tree.json 中一个既有的末级分类。
+        """将会话挂载到 tree.json 中一个既有的末级分类（单分类：挂载即移动）。
 
-        末级分类允许挂载多个会话（图状连接）；会话已挂载时不做任何修改。
-        挂载成功后沿祖先链重算 session_count 并原子写入 tree.json。
+        会话至多属于一个末级分类：挂载前先从其它末级分类移除该会话，再挂到
+        目标分类；已在目标分类时不做任何修改并返回 False。挂载成功后沿祖先
+        链重算 session_count 并原子写入 tree.json。
         文件缺失、路径非法或写入失败时记录日志并返回 False，
         绝不影响标题生成主流程。
         """
@@ -246,6 +276,10 @@ class SessionManager:
                 return False
             nodes = [item for item in node.get("children", []) if isinstance(item, dict)]
 
+        if str(node.get("type") or "category") != "category":
+            logger.warning("attach_session_to_category: %r 不是分类节点（type=%s）",
+                           category_path, node.get("type"))
+            return False
         children = node.get("children", [])
         if not isinstance(children, list) or any(isinstance(c, dict) for c in children):
             logger.warning("attach_session_to_category: %r 不是末级分类", category_path)
@@ -253,8 +287,44 @@ class SessionManager:
         if session_id in children:
             return False
 
+        # 单分类模式：先挂到目标末级分类，再从其它末级分类解除该会话的
+        # 挂载（旧多分类数据的重复挂载也会在这里被顺带清理）。先挂后摘还能
+        # 保证目标分类在随后的空分类剪枝中始终非空。
         children.append(session_id)
         node["children"] = children
+        moved = False
+
+        def detach_category_leaf(n: dict) -> None:
+            nonlocal moved
+            if n is node or str(n.get("type") or "category") != "category":
+                return
+            kids = n.get("children", [])
+            if any(isinstance(k, dict) for k in kids):
+                for k in kids:
+                    if isinstance(k, dict):
+                        detach_category_leaf(k)
+            elif session_id in kids:
+                n["children"] = [c for c in kids if c != session_id]
+                moved = True
+
+        for top in data["tree"]:
+            if isinstance(top, dict):
+                detach_category_leaf(top)
+
+        # 被搬空的末级分类（及其因此变空的父分类）一并剪除，避免目录里
+        # 残留 0 会话的空分类；与 remove_session_from_tree 的策略一致。
+        def prune_empty(n: dict) -> bool:
+            kids = n.get("children", [])
+            if any(isinstance(k, dict) for k in kids):
+                kept = [k for k in kids if isinstance(k, dict) and prune_empty(k)]
+                n["children"] = kept
+                return len(kept) > 0
+            return len([c for c in kids if isinstance(c, str)]) > 0
+
+        if moved:
+            for top in data["tree"]:
+                if isinstance(top, dict) and str(top.get("type") or "category") == "category":
+                    prune_empty(top)
 
         def fill(n: dict) -> set:
             kids = n.get("children", [])
@@ -306,20 +376,27 @@ class SessionManager:
         removed_any = False
 
         def prune(node: dict) -> bool:
-            """移除会话后判断节点是否仍有内容（空分类返回 False）。"""
+            """移除会话后判断节点是否仍有内容（空分类返回 False）。
+
+            结构性节点不因无会话而剪除：终端动作节点（本地终端及未来的
+            ssh/docker 节点）、最近会话根与会话历史根；月份节点空了则照
+            常剪除，分类与工作区节点同理。
+            """
             nonlocal removed_any
             kids = node.get("children", [])
+            structural = str(node.get("type") or "category") in (
+                "terminal", "terminal_layer", "recent", "history")
             if any(isinstance(k, dict) for k in kids):
                 kept = []
                 for k in kids:
                     if isinstance(k, dict) and prune(k):
                         kept.append(k)
                 node["children"] = kept
-                return len(kept) > 0
+                return structural or len(kept) > 0
             if session_id in kids:
                 node["children"] = [c for c in kids if c != session_id]
                 removed_any = True
-            return len(node["children"]) > 0
+            return structural or len(node["children"]) > 0
 
         kept_top = []
         for top in data["tree"]:
@@ -329,8 +406,35 @@ class SessionManager:
             return False
         data["tree"] = kept_top
 
-        if not kept_top:
-            # 全部分类已空：删除 tree.json，之后可重新构建
+        # 森林判空只看分类子树：分类全空即视为树失效（删除 tree.json，
+        # 之后满足条件会重建整个森林，包括工作区与终端根）。
+        def count_category(node: dict) -> int:
+            node_kind = str(node.get("type") or "category")
+            if node_kind != "category":
+                return 0
+            kids = node.get("children", [])
+            if any(isinstance(k, dict) for k in kids):
+                return sum(count_category(k) for k in kids if isinstance(k, dict))
+            return len({c for c in kids if isinstance(c, str)})
+
+        def has_user_layer(node: dict) -> bool:
+            """森林里是否还有用户自建的嵌套终端层（terminal_layer）。"""
+            stack = [node]
+            while stack:
+                kids = stack.pop().get("children") or []
+                for k in kids:
+                    if not isinstance(k, dict):
+                        continue
+                    if str(k.get("type") or "") == "terminal_layer":
+                        return True
+                    stack.append(k)
+            return False
+
+        # 分类全空即视为树失效（删除 tree.json，之后满足条件会重建整个森林，
+        # 包括工作区与终端根）——但用户手工搭的嵌套终端链不能跟着分类一起丢：
+        # 删掉最后几个会话不该顺手清空"终端"目录里的自建环境。
+        if (sum(count_category(top) for top in kept_top) == 0
+                and not any(has_user_layer(top) for top in kept_top)):
             try:
                 os.remove(self._category_tree_path)
             except OSError as exc:
@@ -360,6 +464,9 @@ class SessionManager:
             for top in kept_top:
                 def walk(node: dict) -> None:
                     nonlocal terminals
+                    # 统计只覆盖分类子树；工作区/终端挂载不计入分类 membership。
+                    if str(node.get("type") or "category") != "category":
+                        return
                     kids = node.get("children", [])
                     if all(not isinstance(c, dict) for c in kids):
                         terminals += 1
@@ -518,6 +625,9 @@ class SessionManager:
         def walk(children, path_ids: list[str]) -> None:
             for item in children:
                 if not isinstance(item, dict):
+                    continue
+                # 继承只复制分类挂载；工作区/终端节点不参与。
+                if str(item.get("type") or "category") != "category":
                     continue
                 node_id = str(item.get("id", ""))
                 kids = item.get("children", [])
