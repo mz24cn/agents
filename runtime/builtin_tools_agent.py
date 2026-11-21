@@ -241,6 +241,11 @@ def _make_delegate_fn(runtime, thread_local):
                 thread_local.file_journal_user_message_timestamp = journal_timestamp
 
             chunks = []
+            # Where the model round currently in flight started contributing to
+            # ``chunks``.  A round that gets re-rolled contributes nothing (see
+            # the discard marker below), so its slice is cut here -- the same
+            # cut the persistence layer makes on the sub-session's turn.
+            round_chunk_start = 0
             collected_msgs = []
             persistence_warning = ""
             conversation_persister = None
@@ -300,7 +305,13 @@ def _make_delegate_fn(runtime, thread_local):
                         except (TypeError, ValueError, AttributeError):
                             pass
                     collected_msgs.append(msg)
-                    if msg.role == "assistant" and msg.content:
+                    if getattr(msg, "discard_stream_output", False):
+                        # The inference loop is re-rolling this model round
+                        # (degenerate output, or a stream that died mid-way).
+                        # Nothing it streamed may reach the parent agent, just
+                        # as the marker drops it from the sub-session history.
+                        del chunks[round_chunk_start:]
+                    elif msg.role == "assistant" and msg.content:
                         chunks.append(msg.content)
                         # 推送流式增量帧
                         if sse_callback is not None:
@@ -315,6 +326,10 @@ def _make_delegate_fn(runtime, thread_local):
                                 })
                             except Exception:
                                 pass  # SSE 写入失败不中断推理
+                    if msg.role in ("usage", "tool"):
+                        # A round boundary: from here on the chunks belong to
+                        # the next model round, which may itself be re-rolled.
+                        round_chunk_start = len(chunks)
                     if conversation_persister is not None and msg.role in ("usage", "tool"):
                         persist_err = conversation_persister.persist_completed(
                             collected_msgs,
@@ -578,6 +593,10 @@ def _make_talk_to_fn(runtime, thread_local):
             )
 
             chunks = []
+            # Where the model round currently in flight started contributing to
+            # ``chunks``; a round that gets re-rolled contributes nothing, so
+            # its slice is cut on the discard marker below.
+            round_chunk_start = 0
             collected_msgs = []
             persistence_info = None
             conversation_persister = None
@@ -638,7 +657,12 @@ def _make_talk_to_fn(runtime, thread_local):
                         except (TypeError, ValueError, AttributeError):
                             pass
                     collected_msgs.append(msg)
-                    if msg.role == "assistant" and msg.content:
+                    if getattr(msg, "discard_stream_output", False):
+                        # This model round is being re-rolled by the inference
+                        # loop (degenerate output, or a stream that died
+                        # mid-way): its deltas must not reach the calling agent.
+                        del chunks[round_chunk_start:]
+                    elif msg.role == "assistant" and msg.content:
                         chunks.append(msg.content)
                         if parent_sse_callback is not None:
                             try:
@@ -655,6 +679,10 @@ def _make_talk_to_fn(runtime, thread_local):
                                 })
                             except Exception:
                                 pass
+                    if msg.role in ("usage", "tool"):
+                        # Round boundary: later chunks belong to the next model
+                        # round, which may itself be re-rolled.
+                        round_chunk_start = len(chunks)
                     if conversation_persister is not None and msg.role in ("usage", "tool"):
                         persist_err = conversation_persister.persist_completed(
                             collected_msgs,

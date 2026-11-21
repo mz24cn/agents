@@ -531,8 +531,12 @@ def test_infer_stream_retries_read_timeout_before_first_output() -> None:
     assert [m.content for m in messages if m.role == "assistant"] == ["second connection"]
 
 
-def test_infer_stream_does_not_retry_after_first_output() -> None:
-    """Once output is visible, a read failure is returned without replay."""
+def test_infer_stream_retries_mid_stream_timeout_and_drops_partial() -> None:
+    """A stream that stalls after partial output is replayed, not given up on.
+
+    The aborted attempt's deltas are dropped: without the discard marker frame
+    the re-roll would be appended to the truncated text it replaced.
+    """
     import socket
 
     runtime = Runtime(
@@ -545,7 +549,52 @@ def test_infer_stream_does_not_retry_after_first_output() -> None:
     class PartialThenTimeout:
         def __iter__(self):
             yield f"data: {first_chunk}\n\n".encode()
-            raise socket.timeout("timed out mid-stream")
+            raise socket.timeout("The read operation timed out")
+
+        def close(self):
+            pass
+
+    def mock_urlopen(request, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return PartialThenTimeout()
+        return _mock_urlopen_with_stream(
+            _make_openai_sse_response(["complete answer"])
+        )(request, **kwargs)
+
+    request = InferenceRequest(model_id="test-model", text="hi", stream=True)
+    with patch.dict("os.environ", {
+        "MODEL_API_MAX_RETRIES": "2", "MODEL_API_RETRY_DELAY": "0",
+    }), patch("urllib.request.urlopen", side_effect=mock_urlopen):
+        messages = list(runtime.infer_stream(request))
+
+    assert calls == 2, "the stalled round is replayed once"
+    markers = [m for m in messages if getattr(m, "discard_stream_output", False)]
+    assert len(markers) == 1, messages
+    # What the conversation (and the next model round) actually keeps: the
+    # marker cuts the truncated attempt out of the assistant turn, so the
+    # re-roll stands alone instead of continuing it.
+    from runtime.server_state import _merge_single_agent_stream_messages
+    turns, _stat = _merge_single_agent_stream_messages(messages)
+    assert [t.content for t in turns] == ["complete answer"]
+
+
+def test_infer_stream_mid_stream_timeout_reports_error_only_after_retries() -> None:
+    """Every attempt stalling exhausts the backoff budget before the error."""
+    import socket
+
+    runtime = Runtime(
+        model_registry=_make_model_registry("openai"),
+        tool_registry=ToolRegistry(),
+    )
+    calls = 0
+    first_chunk = json.dumps({"choices": [{"delta": {"content": "partial"}}]})
+
+    class PartialThenTimeout:
+        def __iter__(self):
+            yield f"data: {first_chunk}\n\n".encode()
+            raise socket.timeout("The read operation timed out")
 
         def close(self):
             pass
@@ -561,9 +610,91 @@ def test_infer_stream_does_not_retry_after_first_output() -> None:
     }), patch("urllib.request.urlopen", side_effect=mock_urlopen):
         messages = list(runtime.infer_stream(request))
 
-    assert calls == 1
+    assert calls == 3, "one request plus MODEL_API_MAX_RETRIES replays"
     assert messages[0].content == "partial"
-    assert "stream parse" in messages[1].content.lower()
+    assert "stream parse" in messages[-1].content.lower()
+    assert "timed out" in messages[-1].content.lower()
+
+
+def test_infer_stream_round_past_infer_timeout_is_not_replayed() -> None:
+    """MODEL_INFER_TIMEOUT bounds the round, so its stall ends the round.
+
+    Replaying a round that already outlived the operator's per-round wall-clock
+    cap would exceed that cap; a stall inside the cap is replayed (above).
+    """
+    import socket
+    import time as _time
+
+    runtime = Runtime(
+        model_registry=_make_model_registry("openai"),
+        tool_registry=ToolRegistry(),
+    )
+    calls = 0
+    first_chunk = json.dumps({"choices": [{"delta": {"content": "partial"}}]})
+
+    class SlowThenTimeout:
+        def __iter__(self):
+            yield f"data: {first_chunk}\n\n".encode()
+            _time.sleep(0.2)
+            raise socket.timeout("The read operation timed out")
+
+        def close(self):
+            pass
+
+    def mock_urlopen(request, **kwargs):
+        nonlocal calls
+        calls += 1
+        return SlowThenTimeout()
+
+    request = InferenceRequest(model_id="test-model", text="hi", stream=True)
+    with patch.dict("os.environ", {
+        "MODEL_INFER_TIMEOUT": "0.05",
+        "MODEL_API_MAX_RETRIES": "2", "MODEL_API_RETRY_DELAY": "0",
+    }), patch("urllib.request.urlopen", side_effect=mock_urlopen):
+        messages = list(runtime.infer_stream(request))
+
+    assert calls == 1, "the per-round cap replaces the retry budget"
+    assert "model inference timed out" in messages[-1].content
+
+
+def test_infer_stream_retries_peer_dropped_stream() -> None:
+    """A stream cut off by the peer (IncompleteRead) is replayed too."""
+    import http.client
+
+    runtime = Runtime(
+        model_registry=_make_model_registry("openai"),
+        tool_registry=ToolRegistry(),
+    )
+    calls = 0
+    first_chunk = json.dumps({"choices": [{"delta": {"content": "half"}}]})
+
+    class PartialThenDropped:
+        def __iter__(self):
+            yield f"data: {first_chunk}\n\n".encode()
+            raise http.client.IncompleteRead(b"partial body")
+
+        def close(self):
+            pass
+
+    def mock_urlopen(request, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return PartialThenDropped()
+        return _mock_urlopen_with_stream(
+            _make_openai_sse_response(["recovered"])
+        )(request, **kwargs)
+
+    request = InferenceRequest(model_id="test-model", text="hi", stream=True)
+    with patch.dict("os.environ", {
+        "MODEL_API_MAX_RETRIES": "2", "MODEL_API_RETRY_DELAY": "0",
+    }), patch("urllib.request.urlopen", side_effect=mock_urlopen):
+        messages = list(runtime.infer_stream(request))
+
+    assert calls == 2
+    from runtime.server_state import _merge_single_agent_stream_messages
+    turns, _stat = _merge_single_agent_stream_messages(messages)
+    assert [t.content for t in turns] == ["recovered"]
 
 
 def test_infer_stream_returns_iterator() -> None:

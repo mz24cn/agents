@@ -8,6 +8,7 @@ tool call loop handling. Only uses Python standard library modules.
 from __future__ import annotations
 
 import datetime
+import http.client
 import json
 import logging
 import queue
@@ -175,8 +176,12 @@ def _find_repetitive_output_tail(full_content: str) -> Optional[str]:
 
 # Model transport retries are deliberately implemented below the inference/tool
 # loop.  A retry therefore re-sends only the current model request and never
-# repeats an already executed tool call.  MODEL_API_MAX_RETRIES is the number
-# of additional attempts after the first request.
+# repeats an already executed tool call: a round's tool calls are run only once
+# its stream ended normally, so a stream that died *after* emitting partial
+# output is replayable as well -- provided the aborted attempt's deltas are
+# dropped (see the discard marker frame in infer_stream).
+# MODEL_API_MAX_RETRIES is the number of additional attempts after the first
+# request.
 def _get_model_api_max_retries() -> int:
     """Return the number of transient model API retries (default: 2)."""
     try:
@@ -214,10 +219,19 @@ def _is_timeout_error(exc: BaseException) -> bool:
 
 
 def _is_retryable_model_error(exc: BaseException) -> bool:
-    """Whether a model transport failure is safe to retry before output."""
+    """Whether a model transport failure is safe to replay the round for.
+
+    Both failure points of a streaming round count: the request never produced
+    a body (connection refused, retryable HTTP status), and the body started
+    but died half-way.  ``http.client`` failures (``IncompleteRead``,
+    ``BadStatusLine``, ...) belong to the second group -- the peer dropped the
+    stream while chunks were being read, which is as transient as a dead socket.
+    """
     if isinstance(exc, urllib.error.HTTPError):
         return exc.code in _RETRYABLE_MODEL_HTTP_CODES
     if isinstance(exc, (urllib.error.URLError, ConnectionError, socket.timeout, TimeoutError)):
+        return True
+    if isinstance(exc, http.client.HTTPException):
         return True
     return _is_timeout_error(exc)
 
@@ -3389,11 +3403,12 @@ class Runtime:
         # request, tool execution, and inter-round throttle delay.
         overall_start = time.monotonic()
         # Shared retry budget for model rounds that produced nothing usable:
-        # connection and read/parse failures before the protocol emits its first
-        # model output, empty streams, and rounds with no tool call whose text
-        # collapses to nothing once XML markup and whitespace are filtered out.
-        # It is reset after a model round completes successfully.
-        pre_output_retry_count = 0
+        # connection failures, read/parse failures before the protocol emits its
+        # first model output, streams that went silent after partial output,
+        # empty streams, and rounds with no tool call whose text collapses to
+        # nothing once XML markup and whitespace are filtered out.  It is reset
+        # after a model round completes successfully.
+        round_retry_count = 0
         # Retry budget for rounds aborted by the per-round output cap.
         output_cap_retry_count = 0
         #: Pending client-side tool calls handed back to the caller; set when the
@@ -3519,16 +3534,16 @@ class Runtime:
                     connect_error = exc
                     if (
                         _is_retryable_model_error(exc)
-                        and pre_output_retry_count < max_retries
+                        and round_retry_count < max_retries
                     ):
-                        pre_output_retry_count += 1
+                        round_retry_count += 1
                         _logger.warning(
                             "infer_stream transient connection error; retrying | "
                             "url=%s attempt=%d/%d err=%s",
-                            url, pre_output_retry_count, max_retries,
+                            url, round_retry_count, max_retries,
                             getattr(exc, "reason", exc),
                         )
-                        if not _wait_model_retry(pre_output_retry_count, cancel_event):
+                        if not _wait_model_retry(round_retry_count, cancel_event):
                             yield Message(role="assistant", timestamp=_now_iso(),
                                           content="Error: user interrupted.")
                             return
@@ -3845,41 +3860,40 @@ class Runtime:
                                 else:
                                     accumulated_tool_calls[idx]["arguments"] += tc["arguments"]
             except Exception as exc:
-                # A streaming request may connect successfully and then fail
-                # while waiting for its first SSE/NDJSON item. Retry only when
-                # absolutely no content, thinking, or tool-call output has been
-                # observed; after first output, replaying could duplicate text
-                # or repeat a model-generated tool call.
+                # Two failure points of a streaming round reach here: the body
+                # never produced an item, and the body produced deltas and then
+                # went silent or was cut off.  Both are transient transport
+                # failures and both are replayed with exponential backoff -- the
+                # caller only sees an error once the MODEL_API_MAX_RETRIES budget
+                # is spent.  A provider that stalls for one read timeout and
+                # would answer on the next request therefore no longer fails the
+                # turn on the first attempt.
+                #
+                # Replaying after partial output is as safe as replaying before
+                # it: this loop runs a round's tool calls only after its stream
+                # ended normally, so nothing the aborted attempt produced has
+                # executed.  What it *did* stream must not stay, though, or the
+                # re-roll would be appended to truncated text -- the discard
+                # marker frame below drops those deltas from the assistant turn
+                # the caller is assembling.
                 no_model_output = first_token_time is None
-                if (
-                    no_model_output
-                    and _is_retryable_model_error(exc)
-                    and pre_output_retry_count < max_retries
-                ):
-                    pre_output_retry_count += 1
-                    _logger.warning(
-                        "infer_stream failed before first output; retrying | "
-                        "url=%s attempt=%d/%d err=%s",
-                        url, pre_output_retry_count, max_retries, exc,
-                    )
-                    if not _wait_model_retry(pre_output_retry_count, cancel_event):
-                        yield Message(role="assistant", timestamp=_now_iso(),
-                                      content="Error: user interrupted.")
-                        return
-                    continue
+                guard_now = time.monotonic()
                 if (
                     infer_timeout is not None
                     and _is_timeout_error(exc)
-                    and (time.monotonic() - round_start) >= infer_timeout
+                    and (guard_now - round_start) >= infer_timeout
                 ):
-                    timeout_now = time.monotonic()
-                    elapsed_round = timeout_now - round_start
+                    # This round had already outlived MODEL_INFER_TIMEOUT, the
+                    # wall-clock bound the operator set for it.  Spending retry
+                    # budget to run such a round again would break that bound;
+                    # a stall that ends inside it is replayed instead.
+                    elapsed_round = guard_now - round_start
                     _inspect_timeout_output()
                     _logger.error(
                         "infer_stream inference timeout during stream | url=%s "
                         "round=%d elapsed=%.3fs limit=%.3fs %s",
                         url, tool_round, elapsed_round, infer_timeout,
-                        _timeout_diagnostics(timeout_now),
+                        _timeout_diagnostics(guard_now),
                     )
                     yield Message(
                         role="assistant",
@@ -3890,10 +3904,44 @@ class Runtime:
                         ),
                     )
                     return
+                if _is_retryable_model_error(exc) and round_retry_count < max_retries:
+                    round_retry_count += 1
+                    _logger.warning(
+                        "infer_stream failed %s; retrying | "
+                        "url=%s attempt=%d/%d err=%s%s",
+                        "before first output" if no_model_output
+                        else "mid-stream after first output",
+                        url, round_retry_count, max_retries, exc,
+                        "" if no_model_output
+                        else " " + _timeout_diagnostics(guard_now),
+                    )
+                    if not no_model_output:
+                        yield Message(
+                            role="assistant",
+                            timestamp=_now_iso(),
+                            content="",
+                            discard_stream_output=True,
+                        )
+                    if not _wait_model_retry(round_retry_count, cancel_event):
+                        yield Message(role="assistant", timestamp=_now_iso(),
+                                      content="Error: user interrupted.")
+                        return
+                    continue
                 if no_model_output and _is_timeout_error(exc):
+                    _logger.error(
+                        "infer_stream stream died before first output after "
+                        "%d retry(ies) | url=%s err=%s",
+                        round_retry_count, url, exc,
+                    )
                     yield Message(role="assistant", timestamp=_now_iso(),
                                   content=f"Error: model API request timed out after {effective_timeout}s")
                 else:
+                    _logger.error(
+                        "infer_stream stream failed after %d retry(ies) | url=%s "
+                        "round=%d err=%s %s",
+                        round_retry_count, url, tool_round, exc,
+                        _timeout_diagnostics(guard_now),
+                    )
                     yield Message(role="assistant", timestamp=_now_iso(),
                                   content=f"Error: stream parse: {exc}")
                 return
@@ -3948,21 +3996,21 @@ class Runtime:
             # empty assistant round.  Retrying is safe because no model output
             # (and therefore no new tool call) has been exposed or executed.
             if first_token_time is None:
-                if pre_output_retry_count < max_retries:
-                    pre_output_retry_count += 1
+                if round_retry_count < max_retries:
+                    round_retry_count += 1
                     _logger.warning(
                         "infer_stream empty response before first output; retrying | "
                         "url=%s attempt=%d/%d",
-                        url, pre_output_retry_count, max_retries,
+                        url, round_retry_count, max_retries,
                     )
-                    if not _wait_model_retry(pre_output_retry_count, cancel_event):
+                    if not _wait_model_retry(round_retry_count, cancel_event):
                         yield Message(role="assistant", timestamp=_now_iso(),
                                       content="Error: user interrupted.")
                         return
                     continue
                 _logger.error(
                     "infer_stream empty response after retries | url=%s attempts=%d",
-                    url, pre_output_retry_count + 1,
+                    url, round_retry_count + 1,
                 )
                 yield Message(
                     role="assistant",
@@ -3987,13 +4035,13 @@ class Runtime:
             # never released below, and the marker frame drops the thinking
             # deltas that were streamed.
             if not all_tool_calls and _is_degenerate_output(full_content):
-                if pre_output_retry_count < max_retries:
-                    pre_output_retry_count += 1
+                if round_retry_count < max_retries:
+                    round_retry_count += 1
                     _logger.warning(
                         "infer_stream round produced no tool call and no text "
                         "beyond XML markup; re-rolling | url=%s attempt=%d/%d "
                         "content=%r thinking_chars=%d",
-                        url, pre_output_retry_count, max_retries,
+                        url, round_retry_count, max_retries,
                         full_content[:200], len(full_thinking),
                     )
                     yield Message(
@@ -4002,7 +4050,7 @@ class Runtime:
                         content="",
                         discard_stream_output=True,
                     )
-                    if not _wait_model_retry(pre_output_retry_count, cancel_event):
+                    if not _wait_model_retry(round_retry_count, cancel_event):
                         yield Message(role="assistant", timestamp=_now_iso(),
                                       content="Error: user interrupted.")
                         return
@@ -4010,7 +4058,7 @@ class Runtime:
                 _logger.error(
                     "infer_stream round carried no answer after %d re-roll(s); "
                     "keeping its output | url=%s content=%r",
-                    pre_output_retry_count, url, full_content[:200],
+                    round_retry_count, url, full_content[:200],
                 )
 
             # The round is kept.  Release the content prefix that was withheld
@@ -4027,9 +4075,10 @@ class Runtime:
                 held_content = ""
 
             # The round is accepted, so its retries no longer count against the
-            # next one: the pre-output budget is shared by connection failures,
-            # empty streams and degenerate (markup-only) rounds.
-            pre_output_retry_count = 0
+            # next one: the budget is shared by connection failures, streams
+            # that died mid-way, empty streams and degenerate (markup-only)
+            # rounds.
+            round_retry_count = 0
 
             # net_ms = time from request start to stream fully received
             # (empty streams return above and are never recorded as success).
