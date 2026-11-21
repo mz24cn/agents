@@ -201,6 +201,7 @@ _ROUTES: dict[str, list] = {
         (re.compile(r"^/v1/setup$"), "_handle_setup_script", ()),
         (re.compile(r"^/v1/tunnel/parent/status$"), "_handle_tunnel_parent_status", ()),
         (re.compile(r"^/v1/sessions/tree$"), "_handle_session_category_tree", ()),
+        (re.compile(r"^/v1/sessions/labels$"), "_handle_label_get", ()),
         (re.compile(r"^/v1/sessions$"), "_handle_list_sessions", ()),
         (re.compile(r"^/v1/sessions/search$"), "_handle_search_sessions", ()),
         (re.compile(r"^/v1/sessions/events$"), "_handle_sessions_events", ()),
@@ -265,9 +266,10 @@ _ROUTES: dict[str, list] = {
         (re.compile(r"^/v1/sessions/frames/unsubscribe$"), "_handle_session_frames_unsubscribe", ()),
         (re.compile(r"^/v1/sessions/frames/close$"), "_handle_session_frames_close", ()),
         (re.compile(r"^/v1/sessions/([^/]+)/generate-title$"), "_handle_generate_session_title", (urllib.parse.unquote,)),
+        (re.compile(r"^/v1/sessions/([^/]+)/labels$"), "_handle_set_session_labels", (urllib.parse.unquote,)),
+        (re.compile(r"^/v1/sessions/labels/summarize$"), "_handle_label_summarize", ()),
         (re.compile(r"^/v1/sessions/([^/]+)/regenerate-summary$"), "_handle_regenerate_session_summary", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/sessions/([^/]+)/read$"), "_handle_mark_session_read", (urllib.parse.unquote,)),
-        (re.compile(r"^/v1/sessions/([^/]+)/flight$"), "_handle_session_flight", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/sessions/([^/]+)/revoke$"), "_handle_revoke_session", (urllib.parse.unquote,)),
         # Derive a new session from one assistant message (conversation copy).
         (re.compile(r"^/v1/sessions/([^/]+)/fork$"), "_handle_fork_session", (urllib.parse.unquote,)),
@@ -399,7 +401,7 @@ class HandlerBaseMixin:
         encoded = urllib.parse.quote(filename, safe="")
         return f'{safe_disposition}; filename="{fallback}"; filename*=UTF-8\'\'{encoded}'
 
-    def _drain_request_body(self) -> None:
+    def _drain_request_body(self, max_bytes: int = _MAX_JSON_BODY_BYTES) -> None:
         """Consume any unread request body so keep-alive streams stay aligned.
 
         Handlers that never read their body (e.g. ``upload/complete``, which the
@@ -408,13 +410,49 @@ class HandlerBaseMixin:
         request line* on the same connection, corrupting its method/path —
         seen as intermittent 501 ``Unsupported method ('{}POST')`` on the
         following ``upload/init`` request.
+
+        The same desync is what makes *another* request fail: a body left behind
+        by a request that was answered before its body was read (a 404 for an
+        endpoint this server build does not have, a 401 for an expired session,
+        the 409 that holds inference back while an update is applied) turns the
+        next request line into ``{"conn":"tab-1","seconds":300}GET /v1/sessions/…``,
+        i.e. a 501 ``Unsupported method`` charged to a request that was perfectly
+        well formed. So every answer sent *without* dispatching to a handler that
+        reads the body has to drain it.
+
+        A chunk-framed body is consumed chunk by chunk; an oversized body, a
+        truncated one or a socket error leaves the connection without a
+        recoverable boundary, so it is closed instead of guessed at.
         """
         try:
             content_length = int(self.headers.get("Content-Length", 0))
-            if content_length > 0:
-                self.rfile.read(content_length)
-        except (ValueError, OSError):
-            pass
+        except (TypeError, ValueError):
+            self.close_connection = True
+            return
+        if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+            try:
+                for _ in iter_chunked_body(self.rfile, max_bytes):
+                    pass
+            except (_BodyReaderError, OSError):
+                self.close_connection = True
+            return
+        if content_length <= 0:
+            return
+        if content_length > max_bytes:
+            self.close_connection = True
+            return
+        remaining = content_length
+        try:
+            while remaining > 0:
+                block = self.rfile.read(min(remaining, 65536))
+                if not block:
+                    # The client disappeared mid-body: nothing can be assumed
+                    # about what is left on this connection.
+                    self.close_connection = True
+                    return
+                remaining -= len(block)
+        except OSError:
+            self.close_connection = True
 
     def _read_json_body(self) -> Optional[dict]:
         """Read and parse JSON from the request body.
@@ -656,6 +694,10 @@ class HandlerBaseMixin:
         if self._is_authorized(method, path):
             return True
         self._send_json_response(401, {"error": "unauthorized", "message": "Authentication required"})
+        # The request is over and its body may never have been read. Answering a
+        # POST/PUT/DELETE without draining it leaves those bytes to become the
+        # start of the next request line on this reused keep-alive connection.
+        self._drain_request_body()
         return False
 
     def _send_session_cookie(self, token: str, max_age: int) -> None:
@@ -707,6 +749,18 @@ class HandlerBaseMixin:
                 return True
         return False
 
+    def _route_miss(self) -> None:
+        """No handler matched this method+path: answer 404, then keep the wire aligned.
+
+        A 404 is a complete answer, but it is not the whole request: a client
+        that sent a JSON body has already put those bytes on this connection.
+        Left unread they are read back as the start of the *next* request line
+        (``{"conn":…,"seconds":300}GET /v1/sessions/…``) and the next, unrelated
+        request dies with 501 Unsupported method.
+        """
+        self._send_json_error(404, f"Not found: {self.path}")
+        self._drain_request_body()
+
     def do_GET(self) -> None:
         """Handle GET requests."""
         # Strip query string before routing so GET endpoints can accept query params.
@@ -744,7 +798,7 @@ class HandlerBaseMixin:
                 self._handle_asr_ws()
                 return
             if not self._dispatch_route("GET", path):
-                self._send_json_error(404, f"Not found: {self.path}")
+                self._route_miss()
             return
         self._handle_static_file()
 
@@ -1535,20 +1589,28 @@ class HandlerBaseMixin:
         inference_registered = False
         if is_inference:
             lock = getattr(self.server, "inference_update_lock", None)
+            update_in_progress = False
             if lock is not None:
                 with lock:
                     if getattr(self.server, "update_in_progress", False):
-                        self._send_json_response(409, {
-                            "error": "update_in_progress",
-                            "message": "Inference is temporarily unavailable while an update is being applied",
-                        })
-                        return
-                    self.server.active_inference_count = int(getattr(self.server, "active_inference_count", 0) or 0) + 1
-                    inference_registered = True
+                        update_in_progress = True
+                    else:
+                        self.server.active_inference_count = int(getattr(self.server, "active_inference_count", 0) or 0) + 1
+                        inference_registered = True
+            if update_in_progress:
+                # Answered outside the lock: this branch also has to discard the
+                # inference payload the client already put on the wire, and
+                # nothing about reading a socket belongs inside that lock.
+                self._send_json_response(409, {
+                    "error": "update_in_progress",
+                    "message": "Inference is temporarily unavailable while an update is being applied",
+                })
+                self._drain_request_body()
+                return
 
         try:
             if not self._dispatch_route("POST", path):
-                self._send_json_error(404, f"Not found: {self.path}")
+                self._route_miss()
         finally:
             if inference_registered:
                 lock = getattr(self.server, "inference_update_lock", None)
@@ -1564,7 +1626,7 @@ class HandlerBaseMixin:
         if path.startswith("/v1/") and not self._require_authorized("PUT", path):
             return
         if not self._dispatch_route("PUT", path):
-            self._send_json_error(404, f"Not found: {self.path}")
+            self._route_miss()
 
     def do_DELETE(self) -> None:
         """Handle DELETE requests."""
@@ -1572,7 +1634,7 @@ class HandlerBaseMixin:
         if path.startswith("/v1/") and not self._require_authorized("DELETE", path):
             return
         if not self._dispatch_route("DELETE", path):
-            self._send_json_error(404, f"Not found: {self.path}")
+            self._route_miss()
 
     # ------------------------------------------------------------------
     # Auth handlers
@@ -1600,6 +1662,7 @@ class HandlerBaseMixin:
         self.wfile.write(body)
 
     def _handle_auth_logout(self) -> None:
+        self._drain_request_body()   # this endpoint never reads one
         body = json.dumps({"ok": True}).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")

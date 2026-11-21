@@ -1966,7 +1966,7 @@ class TestSessionAPI:
             rebuilt = _json.load(f)
         assert rebuilt["version"] == builder.TREE_VERSION
         assert [r["name"] for r in rebuilt["tree"]] == [
-            "主题", "工作区", "本地终端", "会话历史",
+            "主题", "工作区", "标签", "本地终端", "会话历史",
         ]
 
     def test_search_sessions_respects_search_max_results_after_full_search(self, server_with_env, monkeypatch):
@@ -2002,12 +2002,85 @@ class TestSessionAPI:
 
 # ------------------------------------------------------------------
 # POST /v1/sessions/{id}/generate-title (title set or generate)
-# POST /v1/sessions/{id}/flight (persistent flight mode)
 # ------------------------------------------------------------------
 
 
-class TestSessionTitleAndFlight:
-    """标题设定/生成与飞行模式持久化（index.json）的 HTTP 集成测试。"""
+class TestInferenceOwnershipAcrossShutdown:
+    """A run belongs to this agentsvc process; index.json is what says so.
+
+    Stopping the instance must end the runs it owns, and an instance that starts
+    while the record still says "推理中" must conclude that its predecessor was
+    killed -- and close those sessions instead of leaving them streaming.
+    """
+
+    def test_shutdown_force_stops_the_inferences_it_still_owns(
+            self, server_with_env):
+        from runtime import server_state
+        sid = "260101_140001"
+        server_with_env._session_manager.on_session_created(sid, "hi")
+        cancel_event = threading.Event()
+        server_state.begin_session_stream(sid, cancel_event)
+        server_with_env._session_manager.set_session_inferring(sid, True)
+        server_with_env._active_infers[sid] = cancel_event
+        try:
+            assert server_with_env._session_manager.inferring_sessions() == [sid]
+
+            stopped = server_with_env.stop_inferences()
+
+            assert stopped == [sid]
+            assert cancel_event.is_set(), "the generation must be told to stop"
+            assert server_state._session_statuses[sid] == "done_error_unread", \
+                "an interrupted run is a failed one, not one that never finishes"
+            assert server_with_env._session_manager.inferring_sessions() == [], \
+                "a clean stop leaves no session looking as if it were still running"
+        finally:
+            server_with_env._active_infers.pop(sid, None)
+            server_state._session_streams.pop(sid, None)
+            with server_state._session_state_lock:
+                server_state._session_statuses.pop(sid, None)
+                server_state._unread_sessions.pop(sid, None)
+
+    def test_sessions_left_inferring_by_an_unclean_stop_are_failed_once(
+            self, runtime, tmp_path):
+        """Restart into a chats dir whose index still claims running inferences."""
+        from runtime import server_state
+        from runtime.session_manager import SessionManager
+
+        chats_dir = str(tmp_path / "chats")
+        manager = SessionManager(chats_dir)
+        for sid in ("260101_140002", "260101_140003"):
+            session_dir = os.path.join(chats_dir, sid)
+            os.makedirs(session_dir, exist_ok=True)
+            with open(os.path.join(session_dir, "conversation.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump({"meta": {"session_id": sid},
+                           "messages": [{"role": "user", "content": "hi"}]}, f)
+            manager.on_session_created(sid, "hi")
+        manager.set_session_inferring("260101_140002", True)
+
+        srv2 = RuntimeHTTPServer(runtime, chats_dir=chats_dir)
+        srv2.start_background(host="127.0.0.1", port=0)
+        try:
+            assert srv2._interrupted_on_boot == ["260101_140002"]
+            assert server_state._session_statuses["260101_140002"] == "done_error_unread"
+            assert "260101_140002" in server_state._unread_sessions
+            assert "260101_140003" not in server_state._session_statuses
+            assert srv2._session_manager.inferring_sessions() == []
+        finally:
+            srv2.stop()
+
+        # A second restart of the same data sees no residue: the conclusion was
+        # drawn once, not re-decided every time the instance comes up.
+        srv3 = RuntimeHTTPServer(runtime, chats_dir=chats_dir)
+        srv3.start_background(host="127.0.0.1", port=0)
+        try:
+            assert srv3._interrupted_on_boot == []
+        finally:
+            srv3.stop()
+
+
+class TestSessionTitle:
+    """标题设定/生成的 HTTP 集成测试。"""
 
     def _create_session(self, srv, session_id):
         import json as _json
@@ -2086,55 +2159,91 @@ class TestSessionTitleAndFlight:
             {"title": "x"},
         )
         assert status == 404
-        assert "error" in body
 
-    def test_flight_mode_persisted_to_index(self, server_with_env):
-        from runtime import server_state
+
+class TestSessionLabelsApi:
+    """标签 API：POST labels 整组替换、generate-title 顺带带标签、
+    GET/POST 标签聚合文档。"""
+
+    def _create_session(self, server, sid):
+        import json as _json
+        sm = server._session_manager
+        session_dir = os.path.join(sm._chats_dir, sid)
+        os.makedirs(session_dir, exist_ok=True)
+        with open(os.path.join(session_dir, "conversation.json"), "w", encoding="utf-8") as f:
+            _json.dump({
+                "meta": {"session_id": sid, "workspace": "/x/proj"},
+                "messages": [{"role": "user", "content": "标签测试"}],
+            }, f, ensure_ascii=False)
+        sm.on_session_created(sid, "hi")
+        return sm
+
+    def test_post_labels_roundtrip_and_validation(self, server_with_env):
         sm = self._create_session(server_with_env, "260101_120001")
-        server_state._flight_sessions.clear()
-        try:
-            status, body = _post(
-                server_with_env,
-                "/v1/sessions/260101_120001/flight",
-                {"enabled": True},
-            )
-            assert status == 200
-            assert body["enabled"] is True
-            assert sm._read_index()["260101_120001"]["flight_mode"] is True
-
-            status, body = _post(
-                server_with_env,
-                "/v1/sessions/260101_120001/flight",
-                {"enabled": False},
-            )
-            assert status == 200
-            assert body["enabled"] is False
-            assert sm._read_index()["260101_120001"]["flight_mode"] is False
-        finally:
-            server_state._flight_sessions.clear()
-
-    def test_flight_mode_restored_after_restart(self, server_with_env, runtime, tmp_path):
-        """重启后（新的 RuntimeHTTPServer 实例）从 index.json 恢复飞行模式。"""
-        from runtime import server_state
-        sm = self._create_session(server_with_env, "260101_130001")
-        status, _ = _post(
+        status, body = _post(
             server_with_env,
-            "/v1/sessions/260101_130001/flight",
-            {"enabled": True},
+            "/v1/sessions/260101_120001/labels",
+            {"labels": [" tts ", "部署，tts", ""]},
+        )
+        assert status == 200 and body["status"] == "success"
+        assert body["labels"] == ["tts", "部署"]  # 服务端兜底切分全角逗号并去重
+        assert sm._read_index()["260101_120001"]["labels"] == ["tts", "部署"]
+
+        status, _ = _post(server_with_env, "/v1/sessions/ghost/labels", {"labels": ["x"]})
+        assert status == 404
+        status, _ = _post(server_with_env, "/v1/sessions/260101_120001/labels", {})
+        assert status == 400
+
+    def test_generate_title_with_labels_orthogonal(self, server_with_env):
+        sm = self._create_session(server_with_env, "260101_120002")
+        # 标题与标签正交：人工标题 + labels 同时提交
+        status, body = _post(
+            server_with_env,
+            "/v1/sessions/260101_120002/generate-title",
+            {"title": "标题", "labels": ["a", "b，a"]},
         )
         assert status == 200
-        try:
-            # 模拟重启：清空内存中的飞行模式集合
-            server_state._flight_sessions.clear()
-            assert server_state.is_session_flight_mode("260101_130001") is False
+        assert body["title"] == "标题" and body["title_given"] is True
+        assert body["labels"] == ["a", "b"]
+        entry = sm._read_index()["260101_120002"]
+        assert entry["labels"] == ["a", "b"] and entry["title_given"] is True
 
-            chats_dir = server_with_env._session_manager.chats_dir
-            srv2 = RuntimeHTTPServer(runtime, chats_dir=chats_dir)
-            srv2.start_background(host="127.0.0.1", port=0)
-            try:
-                assert server_state.is_session_flight_mode("260101_130001") is True
-                assert srv2._session_manager.flight_sessions() == ["260101_130001"]
-            finally:
-                srv2.stop()
-        finally:
-            server_state._flight_sessions.clear()
+        # labels 非列表 → 400；标题为空走生成，即便生成失败（无概要模型 →
+        # 500），标签也应已落盘——两半操作互不阻塞。
+        status, _ = _post(
+            server_with_env,
+            "/v1/sessions/260101_120002/generate-title",
+            {"title": "t", "labels": "a,b"},
+        )
+        assert status == 400
+        status, _ = _post(
+            server_with_env,
+            "/v1/sessions/260101_120002/generate-title",
+            {"title": "", "labels": ["c"]},
+        )
+        assert status in (200, 500)
+        assert sm._read_index()["260101_120002"]["labels"] == ["c"]
+
+    def test_label_doc_and_summarize_endpoints(self, server_with_env, tmp_path, monkeypatch):
+        from runtime import label_store
+        monkeypatch.setattr(label_store, "labels_dir", lambda: str(tmp_path / "labels"))
+        sm = self._create_session(server_with_env, "260101_120003")
+        _post(server_with_env, "/v1/sessions/260101_120003/labels", {"labels": ["聚合"]})
+
+        # 未知标签 → 400
+        status, _ = _post(server_with_env, "/v1/sessions/labels/summarize", {"label": "没有"})
+        assert status == 400
+        # 未生成时 GET 返回 doc=null
+        status, body = _get(server_with_env, "/v1/sessions/labels?label=%E8%81%9A%E5%90%88")
+        assert status == 200 and body["doc"] is None
+
+        # 无概要模型时降级拼接，仍落盘并可读回
+        from runtime import category_tree_builder
+        monkeypatch.setattr(category_tree_builder, "make_summary_llm", lambda sm: None)
+        status, body = _post(server_with_env, "/v1/sessions/labels/summarize", {"label": "聚合"})
+        assert status == 200
+        doc = body["doc"]
+        assert doc["session_count"] == 1 and "标签测试" in doc["summary"]
+
+        status, body = _get(server_with_env, "/v1/sessions/labels?label=%E8%81%9A%E5%90%88")
+        assert status == 200 and body["doc"]["session_count"] == 1
