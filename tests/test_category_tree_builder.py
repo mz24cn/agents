@@ -121,7 +121,7 @@ def test_build_rules_sklearn(tmp_path):
 
 
 def test_forest_roots_workspace_and_terminal(tmp_path):
-    """v7 森林：四根齐全（最近会话根已取消）；工作区按事实分组且含未指定桶；历史根生效。"""
+    """v8 森林：五根齐全（最近会话根已取消）；工作区按事实分组且含未指定桶；历史根生效。"""
     chats = tmp_path / "chats"
     chats.mkdir()
     sids = _make_topics(chats, [f"topic{i}xyzabc" for i in range(3)], per_topic=4)
@@ -130,9 +130,12 @@ def test_forest_roots_workspace_and_terminal(tmp_path):
 
     doc = builder.build_document(_rows_from(chats), max_leaf=10, seed=137)
     roots = _forest_roots(doc)
-    assert list(roots) == ["主题", "工作区", "本地终端", "会话历史"]
+    assert list(roots) == ["主题", "工作区", "标签", "本地终端", "会话历史"]
     assert roots["主题"]["id"] == 1 and roots["主题"]["type"] == "category"
     assert roots["工作区"]["id"] == 2 and roots["工作区"]["type"] == "workspace"
+    # v8 标签根：无标签语料下是空的结构性根，但入口常在
+    assert roots["标签"]["id"] == 6 and roots["标签"]["type"] == "labels"
+    assert roots["标签"]["children"] == []
     assert roots["本地终端"]["id"] == 3 and roots["本地终端"]["type"] == "terminal"
     assert roots["本地终端"]["children"] == []
     assert roots["本地终端"]["session_count"] == 0
@@ -1135,3 +1138,68 @@ def test_build_prefers_coarser_splits(tmp_path):
     # 旧行为会按 8 簇递归切出 15+ 个碎叶；约束后应显著更少
     assert len(sizes) <= 10, sizes
     assert sum(sizes) == len(sids)
+
+
+# ---------------------------------------------------------------------------
+# 分类合并（collapse_small_category_subtrees / 工作区副本）
+# ---------------------------------------------------------------------------
+
+def _cat(nid: int, name: str, children: list) -> dict:
+    return {"id": nid, "name": name, "type": "category",
+            "session_count": 0, "children": children, "stats": {}}
+
+
+def test_collapse_small_category_subtrees_rule():
+    nodes = [
+        _cat(1, "A", [
+            _cat(1, "B", [
+                _cat(1, "D", ["d1", "d2", "d3", "d4"]),
+                _cat(2, "E", ["e1", "e2", "e3"]),
+            ]),
+            _cat(2, "F", [f"f{i}" for i in range(1, 10)]),
+        ]),
+        _cat(2, "G", [_cat(1, "H", ["h1", "h2", "h3"])]),
+    ]
+    assert builder.collapse_small_category_subtrees(nodes, 10) is True
+    a = nodes[0]
+    assert all(isinstance(c, dict) for c in a["children"])  # A 子树 16 > 10，保持内部
+    b = a["children"][0]
+    assert b["children"] == ["d1", "d2", "d3", "d4", "e1", "e2", "e3"]  # B(7) 收拢
+    assert b["session_count"] == 7
+    assert a["children"][1]["name"] == "F"  # 纯末级不动
+    assert nodes[1]["children"] == ["h1", "h2", "h3"]  # G 在最高可容纳节点收拢
+    assert nodes[1]["session_count"] == 3
+    # 幂等
+    assert builder.collapse_small_category_subtrees(nodes, 10) is False
+
+
+def test_collapse_boundary_keeps_siblings_separate():
+    nodes = [
+        _cat(1, "X", [_cat(1, "X1", ["x1", "x2", "x3", "x4"])]),
+        _cat(2, "Y", [_cat(1, "Y1", ["y1", "y2", "y3", "y4"])]),
+    ]
+    # 门槛恰等于子树会话数（<=）即合并；但绝不跨兄弟并池
+    assert builder.collapse_small_category_subtrees(nodes, 4) is True
+    assert nodes[0]["children"] == ["x1", "x2", "x3", "x4"]
+    assert nodes[1]["children"] == ["y1", "y2", "y3", "y4"]
+    assert builder.collapse_small_category_subtrees(nodes, 3) is False  # 已扁平
+
+
+def test_collapse_tolerates_mixed_children_without_losing_sessions():
+    nodes = [_cat(1, "M", ["s_direct", _cat(1, "N", ["s_n"])])]
+    assert builder.collapse_small_category_subtrees(nodes, 5) is True
+    assert sorted(nodes[0]["children"]) == ["s_direct", "s_n"]
+
+
+def test_workspace_category_copy_collapses_small_subtrees():
+    category_roots = [
+        _cat(1, "L1", [_cat(1, "L2", [_cat(1, "L3", ["s1", "s2", "s3"])])]),
+    ]
+    flat = builder.workspace_category_children(category_roots, ["s1", "s2", "s3"], max_leaf=10)
+    assert len(flat) == 1
+    assert flat[0]["id"] == 1  # 沿用原顶层分类 id
+    assert flat[0]["children"] == ["s1", "s2", "s3"]
+    assert flat[0]["session_count"] == 3
+    # 不给门槛：保持 v6 原层级（旧调用方语义）
+    deep = builder.workspace_category_children(category_roots, ["s1", "s2", "s3"])
+    assert deep[0]["children"][0]["children"][0]["children"] == ["s1", "s2", "s3"]

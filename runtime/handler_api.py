@@ -78,12 +78,11 @@ from runtime.server_state import (
     attach_frame_channel,
     clear_session_stream_state,
     close_frame_channel,
+    get_session_status,
     detach_frame_channel,
-    flight_sessions_snapshot,
     frame_channel_subscribe,
     frame_channel_unsubscribe,
     register_session_stream_with_snapshot,
-    set_session_flight_mode,
     snapshot_session_titles,
     unsubscribe_session_stream,
 )
@@ -1569,6 +1568,7 @@ class HandlerApiMixin:
 
     def _handle_detect_env(self) -> None:
         """POST /v1/env/detect — 扫描项目目录，返回检测到的 key 列表。"""
+        self._drain_request_body()   # this endpoint never reads a body
         env_manager = self.server.env_manager  # type: ignore[attr-defined]
         runtime_dir = os.path.dirname(os.path.abspath(__file__))
         accessories_dir = os.path.realpath(os.path.join(runtime_dir, "..", "accessories"))
@@ -1607,6 +1607,11 @@ class HandlerApiMixin:
 
         # -- op=hello: version and inference status (normal authorization) --
         op = self._get_query_param("op", "")
+        if self.command == "POST" and op != "push":
+            # Only op=push consumes a request body. Every other answer on this
+            # endpoint is sent without reading one, and bytes left in the socket
+            # come back as the start of the next request line.
+            self._drain_request_body()
         if op == "hello":
             versions = self._local_setup_versions()
             inference_active = bool(getattr(self.server, "active_infers", {})) or bool(
@@ -2356,7 +2361,6 @@ class HandlerApiMixin:
             "event": "init",
             "sessions": snapshot,
             "titles": snapshot_session_titles(snapshot.keys()),
-            "flight_sessions": flight_sessions_snapshot(),
         }, ensure_ascii=False)
         try:
             self.wfile.write(f"data: {init_payload}\n\n".encode("utf-8"))
@@ -2551,19 +2555,29 @@ class HandlerApiMixin:
                 "type": "chan_init", "conn": conn, "generation": generation,
             }))
             self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            detach_frame_channel(conn, generation)
+        except (BrokenPipeError, ConnectionResetError, OSError) as err:
+            logger.info(
+                "frame_channel stream ended conn=%s generation=%s error=%s (before chan_init)",
+                conn, generation, err,
+            )
+            detach_frame_channel(conn, generation, channel)
             return
 
         try:
-            while True:
+            while not channel.get("closed"):
                 try:
                     item = channel["queue"].get(timeout=15)
                 except _queue.Empty:
                     self.wfile.write(b": keepalive\n\n")
                     self.wfile.flush()
                     continue
-                if item.get("type") == "attach_flush":
+                kind = item.get("type")
+                if kind == "close":
+                    # The channel was removed from the registry (closed, evicted,
+                    # or its grace expired). Stop writing: bytes from an object
+                    # nobody owns are read by the tab as a healthy connection.
+                    break
+                if kind == "attach_flush":
                     # Either this connection's own wake-up marker (ignore) or a
                     # newer connection took the channel over (stop writing).
                     if item.get("generation") != generation:
@@ -2571,13 +2585,19 @@ class HandlerApiMixin:
                     continue
                 self.wfile.write(self._frame_channel_wire(item))
                 self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            pass
+        except (BrokenPipeError, ConnectionResetError, OSError) as err:
+            # The tab stopped accepting bytes (closed tab, killed connection,
+            # proxy cut). Without this line the only trace is the later
+            # "nobody is watching" cancellation, which looks spontaneous.
+            logger.info(
+                "frame_channel stream ended conn=%s generation=%s error=%s",
+                conn, generation, err,
+            )
         finally:
-            detached = detach_frame_channel(conn, generation)
+            detached = detach_frame_channel(conn, generation, channel)
             if channel_debug:
                 logger.warning(
-                    "frame_channel close conn=%s generation=%s detached=%s",
+                    "frame_channel handler exiting conn=%s generation=%s detached=%s",
                     conn, generation, detached,
                 )
 
@@ -2588,6 +2608,12 @@ class HandlerApiMixin:
         ``sub_init`` snapshot plus the retained frames after ``after`` onto the
         channel. Returns the same snapshot synchronously so the caller can
         render immediately.
+
+        Refused with ``registered: false, reason: "no_reader"`` when that ``conn``
+        has no attached GET: there is then nothing that could deliver the frames,
+        and answering yes would let the caller release the connection that *is*
+        watching. ``registered`` is therefore a statement about the delivery path,
+        not about the command being accepted.
         """
         data = self._read_json_body()
         if data is None:
@@ -2605,6 +2631,7 @@ class HandlerApiMixin:
         self._send_json_response(200, {
             "ok": True,
             "registered": registered,
+            **({"reason": snapshot["reason"]} if snapshot.get("reason") else {}),
             "active": snapshot["active"],
             "persisted_seq": snapshot["persisted_seq"],
             "latest_seq": snapshot["latest_seq"],
@@ -2625,7 +2652,13 @@ class HandlerApiMixin:
         self._send_json_response(200, {"ok": True, "removed": removed})
 
     def _handle_session_frames_close(self) -> None:
-        """POST /v1/sessions/frames/close {conn} — release the whole tab channel."""
+        """POST /v1/sessions/frames/close {conn, reason?} — release the tab channel.
+
+        A tab releases its channel when it stops routing anything *or* when it goes
+        to the background, because a browser gives each origin only ~6 long-lived
+        connections. That is a delivery decision only: the sessions it was carrying
+        keep running and keep their frames retained.
+        """
         data = self._read_json_body()
         if data is None:
             return
@@ -2633,7 +2666,8 @@ class HandlerApiMixin:
         if not conn:
             self._send_json_error(400, "conn is required")
             return
-        closed = close_frame_channel(conn)
+        reason = str(data.get("reason") or "close_command").strip() or "close_command"
+        closed = close_frame_channel(conn, reason=reason)
         self._send_json_response(200, {"ok": True, "closed": closed})
 
     def _session_search_max_results(self) -> int:
@@ -2674,7 +2708,19 @@ class HandlerApiMixin:
         total = len(sessions)
         start = (page - 1) * page_size
         end = start + page_size
-        page_sessions = sessions[start:end]
+        # Hand the frontend an authoritative status per row: the persisted
+        # index fields (e.g. status="paused") travel untouched, and the live
+        # in-memory status (the same source the session-events init snapshot
+        # replays on SSE connect) is overlaid as `_status` on a copy, so a
+        # plain page load needs no SSE round-trip and never mutates the
+        # index dicts returned by list_sessions().
+        page_sessions = []
+        for entry in sessions[start:end]:
+            session_id = str(entry.get("session_id") or "")
+            live_status = get_session_status(session_id) if session_id else None
+            if live_status:
+                entry = {**entry, "_status": live_status}
+            page_sessions.append(entry)
         return {
             "sessions": page_sessions,
             "page": page,
@@ -3008,21 +3054,9 @@ class HandlerApiMixin:
             return
         self._send_json_response(200, result)
 
-    def _handle_session_flight(self, session_id: str) -> None:
-        body = self._read_json_body()
-        if body is None:
-            return
-        enabled = set_session_flight_mode(session_id, bool(body.get("enabled")))
-        # 持久化飞行模式设定到 index.json，重启后仍保持该会话的飞行模式
-        session_manager = self.server.session_manager  # type: ignore[attr-defined]
-        if session_manager is not None:
-            session_manager.set_session_flight_mode(session_id, enabled)
-        from runtime.server_state import _broadcast_session_event
-        _broadcast_session_event(session_id, "flight_mode", {"enabled": enabled})
-        self._send_json_response(200, {"session_id": session_id, "enabled": enabled})
-
     def _handle_mark_session_read(self, session_id: str) -> None:
         """POST /v1/sessions/{session_id}/read — 将指定会话标记为已读。"""
+        self._drain_request_body()   # this endpoint never reads a body
         was_unread = False
         with _session_state_lock:
             if session_id in _unread_sessions:
@@ -3046,8 +3080,6 @@ class HandlerApiMixin:
         except ValueError as exc:
             self._send_json_error(400, str(exc))
             return
-        # index.json 中对应条目已移除：一并清理内存中的飞行模式状态
-        set_session_flight_mode(session_id, False)
         # 会话流 broker（含未消费的 pause/interject 缓冲）与状态标记也随目录
         # 一起消失；若仍有活动 generation，cancel_event 令其 unwind，而不是
         # 向已删除的目录继续落盘。
@@ -3158,9 +3190,15 @@ class HandlerApiMixin:
             （index.json 标记 ``title_given: true``，原模型生成的标题记入
             ``title_generated``）；
           * 无请求体或 title 为空：走模型生成标题的原逻辑。
+
+        ``labels`` 键（列表）与标题正交：出现即整组替换会话标签
+        （空列表 = 清空），同步 index.json 与 tree.json 标签根；响应
+        总是回带当前 labels。
         """
         session_manager = self.server.session_manager  # type: ignore[attr-defined]
         given = ""
+        labels_provided = False
+        labels_body: object = None
         try:
             content_length = int(self.headers.get("Content-Length", 0) or 0)
         except (TypeError, ValueError):
@@ -3171,24 +3209,42 @@ class HandlerApiMixin:
                 return  # 错误响应已发送
             if isinstance(body, dict):
                 given = str(body.get("title") or "").strip()
+                if "labels" in body:
+                    labels_provided = True
+                    labels_body = body.get("labels")
         try:
+            labels_now: list[str] = []
+            if labels_provided:
+                if not isinstance(labels_body, list):
+                    self._send_json_error(400, "labels must be a list of strings")
+                    return
+                labels_now = session_manager.set_session_labels(
+                    session_id, labels_body)
             if given:
                 title = session_manager.set_title_manually(session_id, given)
+                if not labels_provided:
+                    labels_now = list((session_manager._read_index().get(session_id)
+                                       or {}).get("labels") or [])
                 self._send_json_response(200, {
                     "status": "success",
                     "session_id": session_id,
                     "title": title,
                     "title_given": True,
+                    "labels": labels_now,
                 })
             else:
                 # 强制生成标题（跳过 token 阈值检查）
                 title = session_manager.generate_title_forced(session_id)
                 if title:
+                    if not labels_provided:
+                        labels_now = list((session_manager._read_index().get(session_id)
+                                           or {}).get("labels") or [])
                     self._send_json_response(200, {
                         "status": "success",
                         "session_id": session_id,
                         "title": title,
                         "title_given": False,
+                        "labels": labels_now,
                     })
                 else:
                     self._send_json_error(500, f"Failed to generate title for session: {session_id}")
@@ -3199,8 +3255,72 @@ class HandlerApiMixin:
             self._send_json_error(400, str(exc))
             return
 
+    def _handle_set_session_labels(self, session_id: str) -> None:
+        """POST /v1/sessions/{session_id}/labels — 整组替换会话标签。"""
+        session_manager = self.server.session_manager  # type: ignore[attr-defined]
+        body = self._read_json_body()
+        if body is None:
+            return
+        if not isinstance(body, dict) or not isinstance(body.get("labels"), list):
+            self._send_json_error(400, "body must be {labels: [...]}")
+            return
+        try:
+            labels = session_manager.set_session_labels(session_id, body["labels"])
+        except FileNotFoundError:
+            self._send_json_error(404, f"Session not found: {session_id}")
+            return
+        self._send_json_response(200, {
+            "status": "success",
+            "session_id": session_id,
+            "labels": labels,
+        })
+
+    def _handle_label_summarize(self) -> None:
+        """POST /v1/sessions/labels/summarize — 生成标签级概要/记忆/配置。
+
+        合并该标签全部会话的概要+记忆（未生成的用首尾摘录），经 SUMMARY
+        模型合成；统计执行环境/工作区/模型/工具/AI代理的众数作为相关配置。
+        结果写入 DATA_DIR/labels/<label>.json。
+        """
+        from runtime import label_store
+        session_manager = self.server.session_manager  # type: ignore[attr-defined]
+        body = self._read_json_body()
+        if body is None:
+            return
+        label = str((body or {}).get("label") or "").strip() if isinstance(body, dict) else ""
+        if not label:
+            self._send_json_error(400, "body must be {label: '...'}")
+            return
+        try:
+            doc = label_store.summarize_label(label, session_manager)
+        except ValueError as exc:
+            self._send_json_error(400, str(exc))
+            return
+        except Exception as exc:
+            logger.warning("label summarize failed (label=%s): %s", label, exc)
+            self._send_json_error(500, f"Failed to summarize label: {label}")
+            return
+        self._send_json_response(200, {"status": "success", "doc": doc})
+
+    def _handle_label_get(self) -> None:
+        """GET /v1/sessions/labels?label=… — 读取标签聚合文档（可能为 null）。"""
+        from runtime import label_store
+        parsed = urllib.parse.urlparse(self.path)
+        params = urllib.parse.parse_qs(parsed.query)
+        label = (params.get("label") or [""])[0].strip()
+        if not label:
+            self._send_json_error(400, "query param label is required")
+            return
+        doc = label_store.load_label_doc(label)
+        self._send_json_response(200, {
+            "status": "success",
+            "label": label,
+            "doc": doc,
+        })
+
     def _handle_regenerate_session_summary(self, session_id: str) -> None:
         """POST /v1/sessions/{session_id}/regenerate-summary — 手动重新生成概要和记忆。"""
+        self._drain_request_body()   # this endpoint never reads a body
         context_manager = self.server.context_manager  # type: ignore[attr-defined]
         try:
             # Verify session exists
@@ -3212,6 +3332,19 @@ class HandlerApiMixin:
                 return
 
             context_manager.compress_context_forced(session_id)
+            # 手动重新生成概要后顺带刷新标题与主题分类（与上下文压缩后的自动
+            # 时机一致：compression_updated=True 会跳过"已生成过"的守卫）；
+            # 失败不影响概要重生成本身。
+            try:
+                session_manager = getattr(self.server, "session_manager", None)
+                if session_manager is not None:
+                    session_manager.update_index(
+                        session_id, generate_title=True, compression_updated=True)
+            except Exception as exc:
+                logging.warning(
+                    "regenerate-summary: title/category refresh failed for session %s: %s",
+                    session_id, exc,
+                )
             self._send_json_response(200, {
                 "status": "success",
                 "session_id": session_id,

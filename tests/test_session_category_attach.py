@@ -16,8 +16,13 @@ from runtime.models import InferenceResult, Message
 from runtime.session_manager import SessionManager, _parse_title_and_category
 
 
-def _tree_fixture() -> dict:
-    """Root 下：Group(1/1) 含两个末级 LeafA(1/1/1)/LeafB(1/1/2)，以及二级末级 LeafC(1/2)。"""
+def _tree_fixture(pad: int = 0) -> dict:
+    """Root 下：Group(1/1) 含两个末级 LeafA(1/1/1)/LeafB(1/1/2)，以及二级末级 LeafC(1/2)。
+
+    pad>0 时 LeafA 里塞 pad 个填充会话：分类合并规则下，子树会话数不超过
+    dynamic_max_leaf(总数) 的分类会被收拢；需要保留深层结构的测试必须让
+    Group 子树超过门槛。"""
+    pad_ids = [f"p{i:02d}" for i in range(pad)]
     return {
         "version": 1,
         "tree": [
@@ -28,7 +33,7 @@ def _tree_fixture() -> dict:
                         "id": 1, "name": "Group", "type": "category",
                         "children": [
                             {"id": 1, "name": "LeafA", "type": "category", "category": "1/1/1",
-                             "children": ["s_old"], "session_count": 1},
+                             "children": pad_ids + ["s_old"], "session_count": len(pad_ids) + 1},
                             {"id": 2, "name": "LeafB", "type": "category", "category": "1/1/2",
                              "children": [], "session_count": 0},
                         ],
@@ -86,7 +91,7 @@ def test_terminal_categories_empty_without_tree(tmp_path):
 
 def test_attach_session_to_category_updates_counts(tmp_path):
     sm = SessionManager(str(tmp_path))
-    (tmp_path / "tree.json").write_text(json.dumps(_tree_fixture()), "utf-8")
+    (tmp_path / "tree.json").write_text(json.dumps(_tree_fixture(pad=41)), "utf-8")
 
     assert sm.attach_session_to_category("s1", "1/1/2") is True
     tree = _read_tree(tmp_path)
@@ -94,9 +99,9 @@ def test_attach_session_to_category_updates_counts(tmp_path):
     assert leaf_b["children"] == ["s1"]
     assert leaf_b["session_count"] == 1
     group = _find_terminal(tree, "1/1")
-    assert group["session_count"] == 2  # s_old(LeafA) + s1(LeafB)
+    assert group["session_count"] == 43  # 41 填充 + s_old(LeafA) + s1(LeafB)
     root = tree[0]
-    assert root["session_count"] == 2  # s_old 与 s1 去重
+    assert root["session_count"] == 43  # s_old 与 s1 去重（LeafC 复用 s_old）
 
     # 幂等：重复挂载不改变文件
     before = (tmp_path / "tree.json").read_text("utf-8")
@@ -145,7 +150,7 @@ def test_do_generate_title_with_category_attaches_session(tmp_path):
     sm = SessionManager(str(tmp_path))
     sm.on_session_created("s1", "第一条用户消息")
     _write_conversation(tmp_path, "s1", "帮我排查推理超时问题")
-    (tmp_path / "tree.json").write_text(json.dumps(_tree_fixture()), "utf-8")
+    (tmp_path / "tree.json").write_text(json.dumps(_tree_fixture(pad=41)), "utf-8")
 
     infer, calls = _fake_infer('{"title": "推理超时排查", "category": "1/1/2"}')
     sm._infer_fn = infer
@@ -200,7 +205,7 @@ def test_attach_is_exclusive_single_category(tmp_path):
     """v5 单分类语义：挂载到另一个末级分类 = 移动，旧挂载被解除。"""
     sm = SessionManager(str(tmp_path))
     sm.on_session_created("s1", "会话一")
-    fixture = _tree_fixture()
+    fixture = _tree_fixture(pad=41)
     # 预先把 s1 同时挂在两个旧末级下（旧版多分类数据），挂载应顺带清理。
     for path in ("1/1/1", "1/1/2"):
         leaf = _find_terminal(fixture["tree"], path)
@@ -230,22 +235,23 @@ def test_attach_is_exclusive_single_category(tmp_path):
 def test_remove_session_from_tree_prunes_empty_categories(tmp_path):
     """删除会话后，空分类被剪掉；仍有会话的分类保留。"""
     sm = SessionManager(str(tmp_path))
-    fixture = _tree_fixture()
+    fixture = _tree_fixture(pad=41)
     # 先让 s1 挂到只有它自己的 LeafB，删掉 s1 后 LeafB 应被剪除
     (tmp_path / "tree.json").write_text(json.dumps(fixture), "utf-8")
     assert sm.attach_session_to_category("s1", "1/1/2") is True
 
     assert sm.remove_session_from_tree("s1") is True
     tree = _read_tree(tmp_path)
-    # LeafA(1/1/1) 仍有 s_old，保留；LeafC(1/2) 仍有 s_old，保留
-    assert _find_terminal(tree, "1/1/1")["children"] == ["s_old"]
+    # LeafA(1/1/1) 仍有 s_old（与填充会话一起），保留；LeafC(1/2) 仍有 s_old，保留
+    assert "s_old" in _find_terminal(tree, "1/1/1")["children"]
+    assert "s1" not in _find_terminal(tree, "1/1/1")["children"]
     assert _find_terminal(tree, "1/2")["children"] == ["s_old"]
     # LeafB(1/1/2) 已不存在
     paths = [c["path"] for c in sm.terminal_categories()]
     assert "1/1/2" not in paths
-    # 计数重算：Group 只剩 LeafA
-    assert _find_terminal(tree, "1/1")["session_count"] == 1
-    assert tree[0]["session_count"] == 1
+    # 计数重算：Group 只剩 LeafA（含填充）
+    assert _find_terminal(tree, "1/1")["session_count"] == 42
+    assert tree[0]["session_count"] == 42
 
     # 再次移除同一会话：无变化
     assert sm.remove_session_from_tree("s1") is False
@@ -254,7 +260,7 @@ def test_remove_session_from_tree_prunes_empty_categories(tmp_path):
 def test_remove_session_from_tree_removes_all_memberships(tmp_path):
     """会话位于多个末级分类时，删除会移除其全部挂载。"""
     sm = SessionManager(str(tmp_path))
-    (tmp_path / "tree.json").write_text(json.dumps(_tree_fixture()), "utf-8")
+    (tmp_path / "tree.json").write_text(json.dumps(_tree_fixture(pad=41)), "utf-8")
     sm.attach_session_to_category("s1", "1/1/2")
     sm.attach_session_to_category("s1", "1/2")
 
@@ -329,7 +335,7 @@ def test_delete_session_updates_tree(tmp_path):
                     "messages": [{"role": "user", "content": "hi"}]}, ensure_ascii=False),
         "utf-8",
     )
-    (tmp_path / "tree.json").write_text(json.dumps(_tree_fixture()), "utf-8")
+    (tmp_path / "tree.json").write_text(json.dumps(_tree_fixture(pad=41)), "utf-8")
     assert sm.attach_session_to_category("s1", "1/1/2") is True
 
     sm.delete_session("s1")
@@ -394,9 +400,10 @@ def test_forest_attach_rejects_non_category_targets(tmp_path):
     assert sm.attach_session_to_category("s_new", "2/2") is False  # 工作区叶子
     assert sm.attach_session_to_category("s_new", "3") is False    # 终端根
     assert sm.attach_session_to_category("s_new", "1/1/1") is True  # 分类叶子正常
+    # 挂载后 3 个会话仍在门槛（5*log2）之下：Top(1/1) 被分类合并成末级。
     # 继承/查询只看分类挂载：s_old 也挂在工作区叶子下，但不出现在分类路径中
-    assert sm.session_categories("s_old") == ["1/1/1"]
-    assert sm.session_categories("s_new") == ["1/1/1"]
+    assert sm.session_categories("s_old") == ["1/1"]
+    assert sm.session_categories("s_new") == ["1/1"]
 
 
 def test_forest_remove_keeps_structural_terminal_root(tmp_path):
@@ -407,7 +414,8 @@ def test_forest_remove_keeps_structural_terminal_root(tmp_path):
     tree = _read_tree(tmp_path)
     roots = {r["name"]: r for r in tree}
     assert "本地终端" in roots  # 结构性节点不因空被剪
-    leaf = _find_terminal(tree, "1/1/1")
+    # 剩 1 个会话：Top(1/1/1) 链被分类合并，Top(1/1) 直接挂会话
+    leaf = _find_terminal(tree, "1/1")
     assert leaf["children"] == ["s_old"]
     agents = _find_terminal(tree, "2/1")
     assert agents["children"] == ["s_old"]  # 工作区挂载同步清理
@@ -517,7 +525,23 @@ def test_forest_v3_remove_prunes_empty_month_keeps_new_roots(tmp_path):
     months = roots["会话历史"]["children"]
     assert [m["name"] for m in months] == ["202607"]  # 空月份被剪除
     assert roots["最近会话"]["session_count"] == 1
-    leaf = _find_terminal(doc["tree"], "1/1/1")
+    # 删除后剩 1 会话，低于门槛：主题链合并，Top(1/1) 成为末级
+    leaf = _find_terminal(doc["tree"], "1/1")
     assert leaf["children"] == ["s_b"]
     # 分类 membership 统计仍只覆盖分类子树
     assert doc["stats"]["attached_conversation_count"] == 1
+
+
+def test_attach_collapses_small_topic_subtrees(tmp_path):
+    """小树挂载后触发分类合并：Group(1/1) 的链收拢为直挂会话，LeafC 不动。"""
+    sm = SessionManager(str(tmp_path))
+    (tmp_path / "tree.json").write_text(json.dumps(_tree_fixture()), "utf-8")
+
+    assert sm.attach_session_to_category("s1", "1/1/2") is True
+    tree = _read_tree(tmp_path)
+    group = _find_terminal(tree, "1/1")
+    assert group["children"] == ["s_old", "s1"]
+    assert group["session_count"] == 2
+    assert _find_terminal(tree, "1/2")["children"] == ["s_old"]
+    paths = [c["path"] for c in sm.terminal_categories()]
+    assert sorted(paths) == ["1/1", "1/2"]  # 1/1/1、1/1/2 已被合并

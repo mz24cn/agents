@@ -14,7 +14,10 @@
 
 硬性规则（写盘前校验，违反即拒绝写出）：
   * 末级分类最多包含 ``max_leaf_size``（默认动态值 max(2, 5*log2(总会话数))，
-    显式传参可覆盖）个会话，超过即递归拆分；
+    显式传参可覆盖）个会话，超过即递归拆分；同一门槛同时驱动**分类合并**：
+    工作区副本拷贝后与运行期删除/搬移后，子树会话数不超过门槛的分类子树
+    收拢到其最高分类节点（collapse_small_category_subtrees），小工作区
+    不必穿透全深度；
   * 分类只有在确实拆成至少 2 个非空子组时才拥有子分类，
     任何分类都不会出现"只有一个子分类"的冗余层级；
   * 顶层不加包装层：全部会话若拆成"一个包含子分类的根"，顶层直接取
@@ -84,13 +87,17 @@ def dynamic_max_leaf(session_count: int) -> int:
 #   v7 移除"最近会话"根：前端把五根折叠成一行模式图标，最近会话直接用会话
 #   列表 API 的整体列表（不再有 20 条上限的树根）；森林只剩 主题/工作区/
 #   终端/会话历史 四根。
-TREE_VERSION = 7
+TREE_VERSION = 9
 CATEGORY_ROOT_NAME = "主题"
 WORKSPACE_ROOT_NAME = "工作区"
 TERMINAL_ROOT_NAME = "本地终端"
 # 存在远程执行环境时的终端根名（其默认子节点为"本地"，远程环境与之同级）。
 TERMINAL_MULTI_ROOT_NAME = "终端"
 HISTORY_ROOT_NAME = "会话历史"
+# 标签根：会话经 index.json 条目的 labels 列表携带多个标签；每个标签一个末级
+# 节点（type=label，children 为会话 ID），与 主题/工作区/终端/历史 平级。
+LABELS_ROOT_NAME = "标签"
+LABELS_ROOT_ID = 6
 UNKNOWN_WORKSPACE_NAME = "未指定工作区"
 # 工作区目录下不在主题树中的会话（如上次刷新后新建的）兜底分类节点名。
 UNKNOWN_CATEGORY_NAME = "未分类"
@@ -101,6 +108,9 @@ TYPE_ENVIRONMENT = "environment"
 TYPE_RECENT = "recent"  # v3–v6 遗留（旧 tree.json 兼容读取；v7 起不再构建）
 TYPE_HISTORY = "history"
 TYPE_MONTH = "month"
+# 标签根（labels）与标签末级节点（label）：v8 起 index.json labels 事实驱动。
+TYPE_LABELS = "labels"
+TYPE_LABEL = "label"
 # 嵌套终端层：终端环境节点下的用户自定义子终端（command 为进入该层的
 # CLI 指令，如 ssh/docker exec/wsl/psql；双击时从环境节点起逐层注入）。
 TYPE_TERMINAL_LAYER = "terminal_layer"
@@ -598,6 +608,8 @@ def load_sessions(chats_dir: Path) -> list[dict]:
             "workspace": workspace, "files": files,
             "created_at": created_at, "last_activity": last_activity,
             "environment": environment, "environment_id": environment_id,
+            "labels": [str(x).strip() for x in (entry.get("labels") or [])
+                       if str(x).strip()],
         })
     return rows
 
@@ -1195,11 +1207,76 @@ def _copied_category_sids(nodes: list) -> set:
     return out
 
 
-def workspace_category_children(category_roots: list, sids: list) -> list:
+def subtree_session_count(node: dict) -> int:
+    """节点子树内去重后的会话 id 数；容忍混合 children（字符串与子分类并存）。"""
+    found: set = set()
+
+    def walk(n: dict) -> None:
+        for k in n.get("children") or []:
+            if isinstance(k, dict):
+                walk(k)
+            elif isinstance(k, str):
+                found.add(k)
+
+    walk(node)
+    return len(found)
+
+
+def collapse_small_category_subtrees(nodes: list, threshold: int) -> bool:
+    """分类合并：会话数不超过门槛的分类子树，就地收拢到其根节点直挂会话。
+
+    自顶向下，在子树会话数 <= threshold 的最高分类节点处收拢：把整棵子树的
+    会话按文档序去重并到该节点 children，其下所有中间分类消失——寥寥几个
+    会话不再需要穿过与主题树同样深的层级。节点 id/名称/类型保持，不跨兄弟
+    合并、不把会话并进分类之外的节点（工作区目录/环境节点 children 必须保持
+    纯分类子树）。构建期天然不需要（拆分保证内部节点子树 > max_leaf），用于
+    工作区副本拷贝与运行期删除/搬移后的收缩维护。幂等：已扁平的再跑无变化。
+    返回是否发生结构变化。"""
+    changed = False
+
+    def gather(node: dict) -> list:
+        out: list = []
+
+        def walk(n: dict) -> None:
+            for k in n.get("children") or []:
+                if isinstance(k, dict):
+                    walk(k)
+                elif isinstance(k, str) and k not in out:
+                    out.append(k)
+
+        walk(node)
+        return out
+
+    def walk(children: list) -> None:
+        nonlocal changed
+        for node in children:
+            if not isinstance(node, dict):
+                continue
+            kids = node.get("children") or []
+            if not any(isinstance(k, dict) for k in kids):
+                continue
+            if (str(node.get("type") or "category") == TYPE_CATEGORY
+                    and subtree_session_count(node) <= max(int(threshold), 0)):
+                node["children"] = gather(node)
+                node["session_count"] = len(node["children"])
+                node["stats"] = {}
+                changed = True
+                continue
+            walk(kids)
+
+    walk(nodes)
+    return changed
+
+
+def workspace_category_children(category_roots: list, sids: list,
+                                max_leaf: int | None = None) -> list:
     """主题树 + 单个工作区的会话集 → 挂在工作区目录下的分类副本。
 
     未出现在主题树中的会话（上次刷新之后新建/挂载的）兜底进"未分类"节点，
-    保证工作区目录下的会话总数与工作区 session_count 一致、不丢会话。"""
+    保证工作区目录下的会话总数与工作区 session_count 一致、不丢会话。
+    副本按原层级拷贝后紧跟分类合并：单个工作区里往往只剩少量会话，子树会话
+    数不超过 max_leaf（默认 dynamic_max_leaf，即 5*log2 门槛）的收拢到最高
+    可容纳节点，避免为几个会话穿透整棵主题深度。"""
     allowed = {str(s) for s in sids}
     copied = copy_category_subtree_for_sessions(category_roots, allowed)
     missing = [str(s) for s in sids if str(s) not in _copied_category_sids(copied)]
@@ -1213,11 +1290,14 @@ def workspace_category_children(category_roots: list, sids: list) -> list:
             "children": missing,
             "stats": {},
         })
+    if max_leaf:
+        collapse_small_category_subtrees(copied, int(max_leaf))
     return copied
 
 
 def _workspace_nodes(rows: list[dict], start_id: int = 1,
-                     category_roots: list | None = None) -> list[dict]:
+                     category_roots: list | None = None,
+                     max_leaf: int | None = None) -> list[dict]:
     """一组会话 → workspace 目录节点（按会话数降序；未指定的排最后）。
 
     category_roots 提供时，目录节点下挂主题分类树的按工作区筛选副本
@@ -1234,7 +1314,7 @@ def _workspace_nodes(rows: list[dict], start_id: int = 1,
     for offset, ws in enumerate(ordered):
         sids = sorted(set(groups[ws]))
         name = _workspace_display_name(ws, used) if ws else UNKNOWN_WORKSPACE_NAME
-        children = (workspace_category_children(category_roots, sids)
+        children = (workspace_category_children(category_roots, sids, max_leaf)
                     if category_roots else sids)
         nodes.append({
             "id": start_id + offset,
@@ -1249,7 +1329,8 @@ def _workspace_nodes(rows: list[dict], start_id: int = 1,
 
 
 def build_workspace_root(rows: list[dict],
-                         category_roots: list | None = None) -> dict:
+                         category_roots: list | None = None,
+                         max_leaf: int | None = None) -> dict:
     """"工作区"根：执行环境子层 → workspace 目录节点（事实分组，无大小上限）。
 
     先按会话执行环境（meta.remote_env，缺省即"本地"）分层，层内按归一化
@@ -1269,7 +1350,8 @@ def build_workspace_root(rows: list[dict],
     children: list = []
     if len(env_groups) <= 1:
         children = _workspace_nodes(next(iter(env_groups.values()), []),
-                                    category_roots=category_roots)
+                                    category_roots=category_roots,
+                                    max_leaf=max_leaf)
         workspace_leaf_count = len(children)
     else:
         ordered_envs = sorted(
@@ -1278,7 +1360,8 @@ def build_workspace_root(rows: list[dict],
         )
         workspace_leaf_count = 0
         for offset, (env_key, env_rows) in enumerate(ordered_envs, 1):
-            workspace_nodes = _workspace_nodes(env_rows, category_roots=category_roots)
+            workspace_nodes = _workspace_nodes(env_rows, category_roots=category_roots,
+                                                  max_leaf=max_leaf)
             workspace_leaf_count += len(workspace_nodes)
             children.append({
                 "id": offset,
@@ -1647,6 +1730,47 @@ def build_history_root(rows: list[dict]) -> dict:
         "session_count": len(attached),
         "children": children,
         "stats": {"month_count": len(children)},
+    }
+
+
+def build_labels_root(rows: list[dict]) -> dict:
+    """"标签"根：index.json labels 事实分组。标签末级节点按会话数降序、
+    同数按名称排序；节点内会话按最近活动降序（与月份节点一致）。
+
+    标签根是结构性根：没有会话携带标签时 children 为空但根保留，
+    前端模式行始终有入口。
+    """
+    groups: dict = {}
+    for r in rows:
+        for label in r.get("labels") or []:
+            key = str(label).strip()
+            if key:
+                groups.setdefault(key, []).append(r)
+    children: list = []
+    attached: set = set()
+    ordered = sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+    for offset, (label, group) in enumerate(ordered, 1):
+        sids: list = []
+        for r in _recency_sort(group):
+            sid = str(r["sid"])
+            if sid not in sids:
+                sids.append(sid)
+        attached.update(sids)
+        children.append({
+            "id": offset,
+            "name": label,
+            "type": TYPE_LABEL,
+            "session_count": len(sids),
+            "children": sids,
+            "stats": {},
+        })
+    return {
+        "id": LABELS_ROOT_ID,
+        "name": LABELS_ROOT_NAME,
+        "type": TYPE_LABELS,
+        "session_count": len(attached),
+        "children": children,
+        "stats": {"label_count": len(children)},
     }
 
 
@@ -2151,13 +2275,17 @@ def build_document(rows: list[dict], max_leaf: int | None = None, seed: int = DE
             "category_query": "join category node IDs with /; terminal paths may have different depths, e.g. 2/2 or 1/1/3",
             "graph_note": "Single-membership mode: each session ID occurs under exactly one terminal category node.",
             "forest_note": (
-                "v7 forest roots: 1=" + CATEGORY_ROOT_NAME + " (clustering categories, type=category), "
+                "v9 forest roots: 1=" + CATEGORY_ROOT_NAME + " (clustering categories, type=category), "
                 "2=" + WORKSPACE_ROOT_NAME + " (type=workspace; optional " + TYPE_ENVIRONMENT + " layer from "
                 "meta.remote_env collapsed when only the local environment exists; each workspace directory "
                 "node hosts a filtered copy of the category tree restricted to that workspace's sessions, "
                 "empty categories pruned, unmounted sessions fall back to a " + UNKNOWN_CATEGORY_NAME
-                + " node; workspace path separators \\ and / keep their original style, only duplicated/"
+                + " node; category subtrees holding at most max_leaf sessions (dynamic 5*log2 threshold) "
+                "collapse onto their topmost category so small workspaces stay shallow; workspace path separators \\ and / keep their original style, only duplicated/"
                 "trailing separators collapse), "
+                "6=" + LABELS_ROOT_NAME + " (type=labels with " + TYPE_LABEL + " leaves; a session carries "
+                "any number of labels via its index.json ``labels`` list; label nodes ordered by session "
+                "count desc then name, sessions inside a label ordered by last activity desc), "
                 "3=" + TERMINAL_ROOT_NAME + "/" + TERMINAL_MULTI_ROOT_NAME + " (action node, type=terminal; "
                 "renamed \"" + TERMINAL_MULTI_ROOT_NAME + "\" with \"本地\" + one child per registered remote "
                 "environment (remote_envs.json; each child carries env_id for terminals-mux routing; when only "
@@ -2179,7 +2307,8 @@ def build_document(rows: list[dict], max_leaf: int | None = None, seed: int = DE
         },
         "tree": [
             build_category_root(tree),
-            build_workspace_root(rows, category_roots=tree),
+            build_workspace_root(rows, category_roots=tree, max_leaf=max_leaf),
+            build_labels_root(rows),
             build_terminal_root(rows, remote_envs,
                                 existing_root=_terminal_root_of(existing_document)
                                 if existing_document else None),
@@ -2187,10 +2316,12 @@ def build_document(rows: list[dict], max_leaf: int | None = None, seed: int = DE
         ],
     }
     workspace_root = doc["tree"][1]
-    terminal_root = doc["tree"][2]
-    history_root = doc["tree"][3]
+    labels_root = doc["tree"][2]
+    terminal_root = doc["tree"][3]
+    history_root = doc["tree"][4]
     doc["stats"]["workspace_node_count"] = workspace_root["stats"].get("workspace_count", 0)
     doc["stats"]["environment_node_count"] = workspace_root["stats"].get("environment_count", 0)
+    doc["stats"]["label_node_count"] = labels_root["stats"].get("label_count", 0)
     doc["stats"]["terminal_environment_count"] = len(terminal_root.get("children") or [])
     doc["stats"]["month_node_count"] = history_root["stats"].get("month_count", 0)
     return doc
@@ -2270,23 +2401,33 @@ def refresh_facts(doc: dict, rows: list[dict], remote_envs: list[dict] | None = 
 
     # 按 type 找根而不是按名字；根名随后统一为当前常量（根名可随版本改）。
     category_root["name"] = CATEGORY_ROOT_NAME
+    # 保留的主题子树同样归一化做分类合并：历史删除/搬移可能留下低于门槛的深链。
+    if live_sids:
+        collapse_small_category_subtrees(category_root.get("children") or [],
+                                         dynamic_max_leaf(len(live_sids)))
     old_terminal_root = next((r for r in roots if r.get("type") == TYPE_TERMINAL), None)
     workspace_root = build_workspace_root(
-        rows, category_roots=category_root.get("children") or [])
+        rows, category_roots=category_root.get("children") or [],
+        max_leaf=dynamic_max_leaf(len(live_sids)))
+    labels_root = build_labels_root(rows)
     terminal_root = build_terminal_root(rows, remote_envs, existing_root=old_terminal_root)
     history_root = build_history_root(rows)
 
     doc["version"] = TREE_VERSION
     doc["generated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
-    doc["tree"] = [category_root, workspace_root, terminal_root, history_root]
+    doc["tree"] = [category_root, workspace_root, labels_root,
+                   terminal_root, history_root]
     doc.setdefault("schema", {})["forest_note"] = (
-        "v7 forest roots: 1=" + CATEGORY_ROOT_NAME + " (clustering categories, type=category, "
+        "v9 forest roots: 1=" + CATEGORY_ROOT_NAME + " (clustering categories, type=category, "
         "single-membership: each session under exactly one terminal category), "
         "2=" + WORKSPACE_ROOT_NAME + " (type=workspace; optional " + TYPE_ENVIRONMENT
         + " layer from meta.remote_env collapsed when only the local environment exists; each workspace "
         "directory node hosts a filtered copy of the category tree restricted to that workspace's "
         "sessions, empty categories pruned, unmounted sessions fall back to a " + UNKNOWN_CATEGORY_NAME
-        + " node), "
+        + " node; category subtrees holding at most max_leaf sessions (dynamic 5*log2 threshold) are "
+        "collapsed onto their topmost category so small workspaces stay shallow), "
+        "6=" + LABELS_ROOT_NAME + " (type=labels with " + TYPE_LABEL + " leaves; a session carries "
+        "any number of labels via its index.json ``labels`` list), "
         "3=" + TERMINAL_ROOT_NAME + "/" + TERMINAL_MULTI_ROOT_NAME + " (action node, type=terminal; "
         "renamed \"" + TERMINAL_MULTI_ROOT_NAME + "\" with \"本地\" + one child per registered remote "
         "environment (remote_envs.json; each child carries env_id for terminals-mux routing; when only "
@@ -2305,12 +2446,189 @@ def refresh_facts(doc: dict, rows: list[dict], remote_envs: list[dict] | None = 
     stats["max_categories_per_conversation"] = max((len(p) for p in seen_in.values()), default=0)
     stats["workspace_node_count"] = workspace_root["stats"].get("workspace_count", 0)
     stats["environment_node_count"] = workspace_root["stats"].get("environment_count", 0)
+    stats["label_node_count"] = labels_root["stats"].get("label_count", 0)
     stats["terminal_environment_count"] = len(terminal_root.get("children") or [])
     stats["month_node_count"] = history_root["stats"].get("month_count", 0)
     stats.pop("recent_session_count", None)
     stats.pop("recent_limit", None)
     stats.setdefault("max_leaf_size", dynamic_max_leaf(len(live_sids)))
     return doc
+
+
+def _category_leaf_entries(category_root: dict) -> list:
+    """主题子树全部末级分类：[{path, label}]，path 含分类根 ID（如 1/2/1）。"""
+    out: list = []
+
+    def walk(node: dict, ids: list, names: list) -> None:
+        nid = str(node.get("id"))
+        name = str(node.get("name") or "")
+        kids = node.get("children") or []
+        if any(isinstance(k, dict) for k in kids):
+            for k in kids:
+                if isinstance(k, dict):
+                    walk(k, ids + [nid], names + [name])
+        else:
+            out.append({"path": "/".join(ids + [nid]),
+                        "label": "/".join(names + [name])})
+
+    walk(category_root, [], [])
+    return out
+
+
+def _attached_category_sids(category_root: dict) -> set:
+    out: set = set()
+    stack = [category_root]
+    while stack:
+        for k in stack.pop().get("children") or []:
+            if isinstance(k, dict):
+                stack.append(k)
+            elif isinstance(k, str):
+                out.add(k)
+    return out
+
+
+def _conversation_excerpt(chats_dir, session_id: str, limit: int = 10) -> str:
+    """前 limit 条非空 user/assistant 消息摘要（与标题生成 prompt 同形制）。"""
+    path = Path(chats_dir) / str(session_id) / "conversation.json"
+    try:
+        data = json.loads(path.read_text("utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    parts: list = []
+    for msg in (data or {}).get("messages") or []:
+        if len(parts) >= limit:
+            break
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            content = "\n".join(
+                x.get("text", "") for x in content
+                if isinstance(x, dict) and isinstance(x.get("text"), str)
+            )
+        if isinstance(content, str) and content.strip():
+            parts.append(f"{role}: {content[:200]}")
+    return "\n".join(parts)
+
+
+def _fill_tree_counts(doc: dict) -> None:
+    """重算所有根子树的 session_count（attach/classify 后就地保持计数一致）。"""
+
+    def fill(n: dict) -> set:
+        kids = n.get("children", [])
+        if any(isinstance(k, dict) for k in kids):
+            found: set = set()
+            for k in kids:
+                if isinstance(k, dict):
+                    found |= fill(k)
+            n["session_count"] = len(found)
+            return found
+        ids = {c for c in kids if isinstance(c, str)}
+        n["session_count"] = len(ids)
+        return ids
+
+    for top in doc.get("tree") or []:
+        if isinstance(top, dict):
+            fill(top)
+
+
+def classify_missing_sessions(doc: dict, chats_dir, llm, rows: list | None = None,
+                             update_index: bool = True) -> dict:
+    """给未挂载任何末级分类的会话用 SUMMARY LLM 选择既有末级分类并挂载。
+
+    适用场景：运行中服务未及时完成标题/分类挂载（模型超时、旧进程缺挂载
+    逻辑），或 refresh-facts 后仍缺席主题子树的会话。只选择既有分类，绝不
+    新增分类节点——新分类边界只能由完整重建产生；模型认为没有合适分类时
+    计入 no_category（保持未挂载，工作区目录下会落到"未分类"兜底）。
+    顺带为缺失生成标题的会话补写 index.json 标题（title_given 的不动）。
+    调用方之后应执行 refresh_facts 同步工作区副本与统计。
+    """
+    from runtime.session_manager import _parse_title_and_category
+
+    roots = [r for r in doc.get("tree") or [] if isinstance(r, dict)]
+    category_root = next((r for r in roots if r.get("type") == TYPE_CATEGORY), None)
+    if category_root is None:
+        raise ValueError(f"no type={TYPE_CATEGORY!r} root in existing tree; run a full build instead")
+    entries = _category_leaf_entries(category_root)
+    if not entries:
+        raise ValueError("no terminal categories in existing tree; run a full build instead")
+
+    rows = rows if rows is not None else load_sessions(Path(chats_dir))
+    attached = _attached_category_sids(category_root)
+    valid_paths = {item["path"] for item in entries}
+    category_lines = "\n".join(
+        f"{item['path']} {item['label']}" for item in entries[:300])
+
+    index_path = Path(chats_dir) / "index.json"
+    try:
+        index = json.loads(index_path.read_text("utf-8"))
+        if not isinstance(index, dict):
+            index = {}
+    except (OSError, json.JSONDecodeError):
+        index = {}
+
+    counts = {"classified": 0, "no_category": 0, "failed": 0, "title_filled": 0}
+    index_changed = False
+    for row in rows:
+        sid = str(row["sid"])
+        if sid in attached:
+            continue
+        excerpt = _conversation_excerpt(chats_dir, sid)
+        if not excerpt:
+            counts["failed"] += 1
+            continue
+        prompt = (
+            "请分析以下对话，完成两件事：\n"
+            "1. 生成一个简短的标题（不超过20个字）。\n"
+            "2. 从下面的分类目录中选择该会话最贴切的一个末级分类，返回其完整路径（形如 1/2/3）；"
+            "若没有合适的分类，category 返回空字符串。只能选择目录中已有的路径，不得新增或改写。\n\n"
+            "分类目录（路径 名称）：\n"
+            + category_lines + "\n\n"
+            "只输出一个 JSON 对象，格式为 {\"title\": \"标题\", \"category\": \"路径\"}，"
+            "不要输出任何其他文字或代码块标记。\n\n"
+            + excerpt
+        )
+        try:
+            raw = llm(prompt)
+        except Exception as exc:
+            logger.warning("classify_missing: LLM 调用失败 (session=%s): %s", sid, exc)
+            counts["failed"] += 1
+            continue
+        title, category = _parse_title_and_category(str(raw or ""))
+        if category and category in valid_paths:
+            node = None
+            nodes = doc["tree"]
+            for part in [p for p in category.strip("/").split("/") if p]:
+                node = next((item for item in nodes
+                             if isinstance(item, dict) and str(item.get("id")) == part), None)
+                if node is None:
+                    break
+                nodes = [item for item in node.get("children", []) if isinstance(item, dict)]
+            if node is not None and all(not isinstance(c, dict) for c in node.get("children") or []):
+                node.setdefault("children", []).append(sid)
+                attached.add(sid)
+                counts["classified"] += 1
+        elif category:
+            logger.warning("classify_missing: 模型返回未知分类路径 (session=%s): %r", sid, category)
+            counts["failed"] += 1
+        else:
+            counts["no_category"] += 1
+        entry = index.get(sid)
+        if (title and isinstance(entry, dict) and not entry.get("title_given")
+                and not str(entry.get("title_generated") or "")):
+            entry["title"] = title[:100]
+            entry["title_generated"] = title[:100]
+            index_changed = True
+            counts["title_filled"] += 1
+
+    _fill_tree_counts(doc)
+    if index_changed and update_index:
+        from runtime.common import atomic_write_json
+        atomic_write_json(str(index_path), index)
+    return counts
 
 
 def _atomic_write_json(path: Path, doc: dict) -> None:
@@ -2393,8 +2711,11 @@ def main(argv=None) -> int:
     ap.add_argument("--llm", action="store_true",
                     help="用 SUMMARY_MODEL 模型做 LLM 命名（默认离线高频词命名）")
     ap.add_argument("--refresh-facts", action="store_true",
-                    help="只刷新事实根（工作区/终端/最近/历史），保留主题子树与 LLM 命名；"
+                    help="只刷新事实根（工作区/终端/历史），保留主题子树与 LLM 命名；"
                          "不跑聚类与命名，可用于旧版本→当前版本升级")
+    ap.add_argument("--classify-missing", action="store_true",
+                    help="为未挂载任何末级分类的会话调用 SUMMARY LLM 选择既有分类"
+                         "（配合 --llm；缺生成标题的会话顺带补标题），随后刷新事实根")
     args = ap.parse_args(argv)
 
     chats_dir = Path(args.chats_dir)
@@ -2403,14 +2724,27 @@ def main(argv=None) -> int:
         return 2
     output = Path(args.output) if args.output else chats_dir / "tree.json"
 
-    if args.refresh_facts:
+    if args.refresh_facts or args.classify_missing:
         if not output.is_file():
             print(f"tree not found: {output}; run a full build instead", file=sys.stderr)
             return 2
+        if args.classify_missing and not args.llm:
+            print("--classify-missing requires --llm", file=sys.stderr)
+            return 2
         doc = json.loads(output.read_text("utf-8"))
         print(f"current version={doc.get('version')} -> target={TREE_VERSION}")
+        rows = load_sessions(chats_dir)
+        if args.classify_missing:
+            llm = cli_summary_llm(str(chats_dir))
+            try:
+                counts = classify_missing_sessions(
+                    doc, str(chats_dir), llm, rows, update_index=not args.dry_run)
+            except ValueError as exc:
+                print(f"classify refused: {exc}", file=sys.stderr)
+                return 1
+            print("classify-missing:", json.dumps(counts, ensure_ascii=False))
         try:
-            doc = refresh_facts(doc, load_sessions(chats_dir), load_remote_envs(chats_dir))
+            doc = refresh_facts(doc, rows, load_remote_envs(chats_dir))
         except ValueError as exc:
             print(f"refresh refused: {exc}", file=sys.stderr)
             return 1
