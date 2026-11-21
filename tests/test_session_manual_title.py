@@ -1,4 +1,4 @@
-"""人工设定标题（title_given）与飞行模式持久化（index.json）测试。"""
+"""人工设定标题（title_given）的持久化（index.json）测试。"""
 import json
 
 import pytest
@@ -162,75 +162,3 @@ def test_do_generate_title_resets_title_given(tmp_path):
     assert index["s1"]["title"] == "新生成标题"
     assert index["s1"]["title_generated"] == "新生成标题"
     assert index["s1"]["title_given"] is False
-
-
-
-# ---------------------------------------------------------------------------
-# 飞行模式持久化
-# ---------------------------------------------------------------------------
-
-def test_flight_mode_persisted_to_index(tmp_path):
-    sm = SessionManager(str(tmp_path))
-    sm.on_session_created("s1", "第一条用户消息")
-
-    sm.set_session_flight_mode("s1", True)
-    index = sm._read_index()
-    assert index["s1"]["flight_mode"] is True
-
-    sm.set_session_flight_mode("s1", False)
-    index = sm._read_index()
-    assert index["s1"]["flight_mode"] is False
-
-
-def test_flight_sessions_lists_persisted_sessions(tmp_path):
-    sm = SessionManager(str(tmp_path))
-    sm.on_session_created("s1", "消息一")
-    sm.on_session_created("s2", "消息二")
-    sm.set_session_flight_mode("s2", True)
-    sm.set_session_flight_mode("s1", True)
-
-    assert sm.flight_sessions() == ["s1", "s2"]
-
-
-def test_flight_mode_creates_missing_index_entry(tmp_path):
-    sm = SessionManager(str(tmp_path))
-
-    # 会话尚不在 index 中：补写默认条目
-    sm.set_session_flight_mode("s1", True)
-
-    index = sm._read_index()
-    assert index["s1"]["flight_mode"] is True
-    assert index["s1"]["title"] == "s1"
-
-
-def test_load_flight_sessions_hydrates_memory(tmp_path):
-    sm = SessionManager(str(tmp_path))
-    sm.on_session_created("s1", "消息一")
-    sm.set_session_flight_mode("s1", True)
-
-    # 模拟重启：清空内存中的飞行模式集合
-    server_state._flight_sessions.clear()
-    try:
-        assert server_state.is_session_flight_mode("s1") is False
-
-        server_state.load_flight_sessions(sm.flight_sessions())
-        assert server_state.is_session_flight_mode("s1") is True
-        assert server_state.flight_sessions_snapshot() == ["s1"]
-    finally:
-        server_state._flight_sessions.clear()
-
-
-def test_delete_session_removes_flight_mode_from_index(tmp_path):
-    sm = SessionManager(str(tmp_path))
-    session_id = "s1"
-    (tmp_path / session_id).mkdir()
-    (tmp_path / session_id / "conversation.json").write_text(
-        json.dumps({"messages": [], "meta": {"turn_count": 0}}), "utf-8"
-    )
-    sm.on_session_created(session_id, "消息一")
-    sm.set_session_flight_mode(session_id, True)
-
-    sm.delete_session(session_id)
-
-    assert sm.flight_sessions() == []
-    assert session_id not in sm._read_index()

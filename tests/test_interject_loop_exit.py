@@ -51,7 +51,6 @@ from tests.test_infer_pause_resume import _StubInterjectHandler
 def clean_session_stream_state():
     with server_state._session_stream_lock:
         server_state._session_streams.clear()
-        server_state._flight_sessions.clear()
     with server_state._session_state_lock:
         server_state._session_statuses.clear()
         server_state._unread_sessions.clear()
@@ -59,7 +58,6 @@ def clean_session_stream_state():
     yield
     with server_state._session_stream_lock:
         server_state._session_streams.clear()
-        server_state._flight_sessions.clear()
     with server_state._session_state_lock:
         server_state._session_statuses.clear()
         server_state._unread_sessions.clear()
@@ -139,6 +137,9 @@ def test_gates_are_generation_scoped():
     ) == "closing"
 
     second = threading.Event()
+    # The first run was stopped before its successor started -- a live
+    # generation is never displaced by a new request.
+    first.set()
     begin_session_stream("s1", second)
     assert queue_infer_interjection(
         "s1", second, {"role": "user", "content": "fresh"}

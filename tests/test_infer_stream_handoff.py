@@ -4,10 +4,15 @@ Why this exists: web/src/lib/api.js releases the ``POST /v1/infer/stream``
 connection as soon as the backend confirms the session is carried by the tab's
 frame channel, so the browser can watch a session it started with one shared
 connection instead of two. That release looks exactly like a browser close from
-the server side, and the broker's "a non-flight inference nobody is watching is
-an orphan" rule used to fire on it: the short gap between closing the POST and
-registering the channel subscription cancelled healthy generations, which the
-user saw as ``Error: user interrupted.`` without ever pressing stop.
+the server side, and it used to be treated as one: the broker had an "an inference
+nobody is watching is an orphan" rule, and the short gap between closing the POST
+and registering the channel subscription was enough to fire it. Healthy
+generations were cancelled, which users saw as ``Error: user interrupted.``
+without ever pressing stop.
+
+That rule is gone -- an inference is owned by its session, so releasing the POST
+is a delivery change and nothing else. What these tests still pin down is the part
+that has to stay correct: no frame may be lost or duplicated across the handoff.
 
 These tests drive the real HTTP handler: a real POST closed mid-generation, a
 real frame channel with replay, and a scripted model whose tokens arrive slowly
@@ -46,7 +51,6 @@ def clean_stream_and_channel_state():
         server_state.frame_channel_reset()
         with server_state._session_stream_lock:
             server_state._session_streams.clear()
-            server_state._flight_sessions.clear()
         with server_state._session_state_lock:
             server_state._session_statuses.clear()
             server_state._unread_sessions.clear()
@@ -259,21 +263,6 @@ def _wait_for_stream_entry(session_id, timeout=15.0):
     raise AssertionError(f"no broker state for {session_id}")
 
 
-def _stream_field(session_id, field):
-    with server_state._session_stream_lock:
-        stream = server_state._session_streams.get(session_id)
-        return None if stream is None else stream.get(field)
-
-
-def _wait_until(predicate, timeout=10.0, what="condition"):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if predicate():
-            return True
-        time.sleep(0.02)
-    raise AssertionError(f"timed out waiting for {what}")
-
-
 def _start_generation(server):
     """Kick off an inference and return (poster, session_id, stream entry)."""
     poster = StreamPoster(server, {
@@ -320,8 +309,8 @@ def _errors_seen(events):
 def test_handoff_abort_after_subscribe_does_not_cancel(continue_server):
     """The steady state: the channel watches before the POST is released.
 
-    The starter disconnect must not arm any cancellation at all — the
-    generation is observed.
+    Releasing the connection that started the run is a delivery change and cannot
+    arm anything: there is no abandonment timer left to arm.
     """
     srv = continue_server
     with _patch_model_urlopen(srv, _model_urlopen):
@@ -335,14 +324,7 @@ def test_handoff_abort_after_subscribe_does_not_cancel(continue_server):
             )
 
             poster.wait_closed()
-            _wait_until(
-                lambda: _stream_field(session_id, "starter_connected") is False,
-                what="the server to notice the released POST",
-            )
             entry = _wait_for_stream_entry(session_id)
-            assert entry["unobserved_timer"] is None, (
-                "an observed generation must not be scheduled for cancellation"
-            )
             assert entry["cancel_event"].wait(timeout=2.0) is False, (
                 "the handoff must not cancel the generation"
             )
@@ -363,12 +345,11 @@ def test_channel_takeover_race_does_not_cancel_inference(continue_server, monkey
     """The reported regression, timed on purpose.
 
     The POST is released *before* the subscribe command lands, so for a moment
-    the generation has no observer at all. That window used to be fatal; now it
-    is a grace period, and a subscription that arrives inside it rescues the
-    run.
+    nothing is delivering this generation at all. There is no window around that
+    gap any more -- it is simply a gap -- and the subscription that lands after
+    it still receives every frame, in order, from the replay.
     """
     srv = continue_server
-    monkeypatch.setenv("SESSION_UNOBSERVED_GRACE_S", "5")
     with _patch_model_urlopen(srv, _model_urlopen):
         channel = FrameChannel(srv, "tab-racing")
         try:
@@ -376,21 +357,14 @@ def test_channel_takeover_race_does_not_cancel_inference(continue_server, monkey
             poster.wait_closed()  # starter gone before the subscribe command lands
 
             entry = _wait_for_stream_entry(session_id)
-            _wait_until(
-                lambda: _stream_field(session_id, "unobserved_timer") is not None,
-                what="the unobserved cancellation to be scheduled",
-            )
             time.sleep(0.4)  # the gap that used to be long enough to kill the run
 
             reply = _subscribe(srv, "tab-racing", session_id)
             assert reply["registered"] is True
             assert reply["active"] is True
 
-            assert _stream_field(session_id, "unobserved_timer") is None, (
-                "a returning watcher must disarm the pending cancellation"
-            )
             assert entry["cancel_event"].wait(timeout=3.0) is False, (
-                "a subscription that arrived inside the grace window must rescue the generation"
+                "the generation was cancelled while nobody was watching it"
             )
             assert channel.wait_for(lambda e: e.get("kind") == "done", timeout=20), (
                 "the rescued generation never finished on the channel"
@@ -408,61 +382,3 @@ def test_channel_takeover_race_does_not_cancel_inference(continue_server, monkey
     assistant_turns = [m for m in session["messages"] if m.get("role") == "assistant"]
     assert ANSWER_TEXT in (assistant_turns[-1].get("content") or "")
     assert not any("user interrupted" in (m.get("content") or "") for m in assistant_turns)
-
-
-def test_starter_released_with_no_watcher_is_still_cancelled(continue_server, monkeypatch):
-    """The orphan rule survives: only the delay is new.
-
-    A channel that is attached but subscribes to nothing proves the rule is not
-    being softened into "any open connection counts" — the generation still
-    goes, it just gets the grace window first.
-    """
-    srv = continue_server
-    monkeypatch.setenv("SESSION_UNOBSERVED_GRACE_S", "0.5")
-    with _patch_model_urlopen(srv, _model_urlopen):
-        channel = FrameChannel(srv, "tab-idle")  # attached, zero subscriptions
-        try:
-            poster, session_id = _start_generation(srv)
-            poster.wait_closed()
-            _wait_until(
-                lambda: _stream_field(session_id, "starter_connected") is False,
-                what="the server to notice the released POST",
-            )
-            entry = _wait_for_stream_entry(session_id)
-            assert not entry["subscribers"], (
-                "an attached channel that watches no session must not count as an observer"
-            )
-            assert entry["cancel_event"].wait(timeout=5.0), (
-                "a generation nobody watches must still be cancelled once the window passes"
-            )
-        finally:
-            channel.close()
-
-
-def test_zero_grace_restores_the_legacy_interruption(continue_server, monkeypatch):
-    """What the window buys, stated as its opposite.
-
-    With SESSION_UNOBSERVED_GRACE_S=0 the broker is back to the strict rule that
-    produced the reported symptom: releasing the POST in the middle of the
-    handoff — before the subscribe command lands — cancels a healthy generation
-    the instant the server notices the broken pipe. Kept as a test so the escape
-    hatch stays honest and the window is never removed by accident.
-    """
-    srv = continue_server
-    monkeypatch.setenv("SESSION_UNOBSERVED_GRACE_S", "0")
-    with _patch_model_urlopen(srv, _model_urlopen):
-        channel = FrameChannel(srv, "tab-strict")
-        try:
-            poster, session_id = _start_generation(srv)
-            poster.wait_closed()
-
-            entry = _wait_for_stream_entry(session_id)
-            _wait_until(
-                lambda: entry["cancel_event"].is_set(),
-                what="the legacy immediate cancellation",
-            )
-            assert _stream_field(session_id, "unobserved_timer") is None, (
-                "with no window there is nothing to schedule"
-            )
-        finally:
-            channel.close()

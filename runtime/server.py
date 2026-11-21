@@ -76,18 +76,21 @@ from runtime.server_state import (
     _terminal_sessions,
     _terminal_sessions_lock,
     _unread_sessions,
+    broadcast_compression_event,
     cleanup_expired_terminal_sessions,
     get_or_create_terminal,
     get_terminal_for_session,
     get_terminal_session,
     IncrementalConversationPersister,
-    load_flight_sessions,
+    seed_interrupted_status,
+    set_inferring_sink,
     merge_stream_messages,
     persist_conversation,
     register_terminal_session,
     set_session_title_provider,
     unregister_terminal_session,
     stream_batch_is_protocol_complete,
+    transition_session_stream_status,
 )
 
 
@@ -557,6 +560,14 @@ class RuntimeHTTPServer:
             prompt_template_manager=self._prompt_template_manager,
             model_registry=self._runtime._model_registry,
         )
+        # Compression is invisible work inside a running generation: it pauses
+        # the inference for seconds without producing a token.  Give it the same
+        # observability a tool call has -- two SSE events (started / completed)
+        # on the session's stream, plus an audit entry in conversation.json --
+        # so "why is this session quiet" and "what did its context look like
+        # around turn N" are both answerable.  See
+        # ``ContextManager.set_compression_event_sink``.
+        self._context_manager.set_compression_event_sink(broadcast_compression_event)
       # Initialize SessionManager
         self._session_manager = SessionManager(
             chats_dir=chats_dir if chats_dir is not None else os.path.join(_DATA_DIR, "chat_data"),
@@ -568,9 +579,20 @@ class RuntimeHTTPServer:
         # index.json 中的权威标题，前端可直接凭事件恢复侧边栏标题，
         # 避免临时用户消息标题一直留存到刷新页面。
         set_session_title_provider(self._session_manager.get_title_info)
-        # 恢复持久化的飞行模式设定：重启后老的飞行模式会话继续对话时
-        # 仍保持飞行模式（无浏览器连接也允许推理继续）。
-        load_flight_sessions(self._session_manager.flight_sessions())
+        # 推理属于会话，不属于连接：进程活着推理就活着，没有任何“因为没人在看所以取消”的路径。
+        # 因此 index.json 里残留的 ``inferring`` 标记只有一种解释——上一个实例没有正常收尾
+        # （被 kill / 崩溃 / 断电）。新实例把这些会话落成失败完成，而不是让 UI 永远显示
+        # “推理中”。见 docs/design-review-inference-stream.md。
+        set_inferring_sink(self._session_manager.set_session_inferring)
+        self._interrupted_on_boot = self._session_manager.fail_inferring_sessions()
+        seed_interrupted_status(self._interrupted_on_boot)
+        if self._interrupted_on_boot:
+            logging.getLogger("runtime.server").warning(
+                "startup: %s session(s) were left inferring by an unclean shutdown; "
+                "marked done_error_unread: %s",
+                len(self._interrupted_on_boot),
+                ", ".join(self._interrupted_on_boot[:10]),
+            )
         # 软暂停的跨重启识别是**惰性**的：不在启动时扫描全部会话目录，
         # 而是在会话被打开/使用时逐点检查 resume_state.json sidecar
         # （见 handler_infer._recognize_pause_from_disk）。
@@ -699,8 +721,71 @@ class RuntimeHTTPServer:
         )
         self._thread.start()
 
+    def stop_inferences(self, drain_seconds: float = 3.0) -> list[str]:
+        """Force-stop every inference this process still owns (shutdown path).
+
+        A generation cannot outlive the process that started it: it has no way to
+        be resumed, and its frames are only kept in memory. The honest sequence is
+        therefore to stop the runs *here* -- set the cancel events, interrupt the
+        tool processes a running turn is waiting on, and record the sessions as
+        failed-completed -- and then drop their durable "推理中" markers. Skipping
+        that step would make a deliberate shutdown indistinguishable, to the next
+        instance, from a crash.
+
+        Returns the session ids that were stopped.
+        """
+        active = getattr(self, "_active_infers", None) or {}
+        stopped = sorted(active)
+        if not stopped:
+            return []
+        from runtime.builtin_tools import cancel_running_command, kill_active_process
+
+        for session_id, cancel_event in list(active.items()):
+            try:
+                cancel_event.set()
+            except Exception:
+                pass
+            # A turn blocked in a tool call never reaches the next cancel check, so
+            # interrupt what it is waiting for instead of only asking it to stop.
+            for hook in (kill_active_process, cancel_running_command):
+                try:
+                    hook(session_id)
+                except Exception as exc:  # noqa: BLE001 - shutdown is best-effort
+                    logging.getLogger("runtime.server").warning(
+                        "shutdown: %s failed for session %s: %s",
+                        hook.__name__, session_id, exc,
+                    )
+            try:
+                transition_session_stream_status(
+                    session_id, cancel_event, "done_error_unread",
+                )
+            except Exception:
+                pass
+        logging.getLogger("runtime.server").warning(
+            "shutdown: force-stopped %s inference session(s): %s",
+            len(stopped), ", ".join(stopped[:10]),
+        )
+        # Give the loops a moment to unwind through their normal persistence path
+        # (the inference writes its progress incrementally, so at worst the round
+        # that was executing is lost).
+        deadline = time.monotonic() + max(0.0, drain_seconds)
+        while active and time.monotonic() < deadline:
+            time.sleep(0.05)
+        # Whatever marker is still standing belongs to a run this instance ended:
+        # only a killed process leaves one behind, and that case is handled by
+        # ``fail_inferring_sessions`` at the next start.
+        session_manager = getattr(self, "_session_manager", None)
+        if session_manager is not None:
+            for session_id in session_manager.inferring_sessions():
+                session_manager.set_session_inferring(session_id, False)
+        return stopped
+
     def stop(self) -> None:
-        """Shut down the HTTP server."""
+        """Shut down the HTTP server, after the inferences this process owns."""
+        try:
+            self.stop_inferences()
+        except Exception as exc:  # noqa: BLE001 - shutdown must not be blocked by cleanup
+            logging.getLogger("runtime.server").warning("shutdown: stop_inferences failed: %s", exc)
         if self._server is not None:
             self._server.shutdown()
             self._server.server_close()

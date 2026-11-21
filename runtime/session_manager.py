@@ -24,6 +24,17 @@ logger = logging.getLogger("runtime.session_manager")
 MAX_CATEGORY_LIST = 300
 
 
+def _iter_string_children(node: dict):
+    """深度优先产出 node 子树中所有字符串叶子（会话 ID）。"""
+    stack = [node]
+    while stack:
+        for k in stack.pop().get("children") or []:
+            if isinstance(k, dict):
+                stack.append(k)
+            else:
+                yield k
+
+
 def _parse_title_and_category(text: str) -> tuple[str, str]:
     """解析标题生成请求的模型回复，返回 (title, category)。
 
@@ -165,9 +176,9 @@ class SessionManager:
             elif os.path.isfile(os.path.join(self._chats_dir, session_id, "conversation.json")):
                 sessions.append({"session_id": session_id, "title": session_id})
         node_kind = str(node.get("type") or "category") if isinstance(node, dict) else "category"
-        if node_kind in ("recent", "month"):
-            # 最近会话 / 会话历史按月节点：时间倒序（与会话列表 last_inference_at
-            # 语义同序），保持树中的顺序与列表展示一致。
+        if node_kind in ("recent", "month", "label"):
+            # 最近会话 / 会话历史按月节点 / 标签节点：时间倒序（与会话列表
+            # last_inference_at 语义同序），保持树中的顺序与列表展示一致。
             sessions.sort(
                 key=lambda item: str(
                     item.get("last_inference_at") or item.get("created_at") or ""
@@ -316,7 +327,8 @@ class SessionManager:
         def prune_empty(n: dict) -> bool:
             kids = n.get("children", [])
             if any(isinstance(k, dict) for k in kids):
-                kept = [k for k in kids if isinstance(k, dict) and prune_empty(k)]
+                kept = [k for k in kids if not isinstance(k, dict)]
+                kept += [k for k in kids if isinstance(k, dict) and prune_empty(k)]
                 n["children"] = kept
                 return len(kept) > 0
             return len([c for c in kids if isinstance(c, str)]) > 0
@@ -326,6 +338,39 @@ class SessionManager:
                 if isinstance(top, dict) and str(top.get("type") or "category") == "category":
                     prune_empty(top)
 
+        # 主题挂载之后同步事实根：会话若还没出现在工作区目录/会话历史里就地补挂
+        # （新会话的即时入口在 on_session_created → ensure_session_facts，这里兜底），
+        # 再把工作区目录下的主题分类副本从"未分类"迁移到该分类的镜像路径。
+        try:
+            self._apply_session_facts(data, session_id)
+            self._mirror_category_in_workspace(data, session_id, parts)
+            # 搬移/剪空之后主题侧与工作区副本侧都可能变小——顺手做分类合并。
+            self._collapse_category_copies(data)
+        except Exception as exc:
+            logger.warning(
+                "attach_session_to_category: 同步工作区副本失败 (session=%s): %s",
+                session_id, exc,
+            )
+
+        self._fill_and_stats(data)
+
+        try:
+            fd, tmp = tempfile.mkstemp(prefix=".tree.", suffix=".tmp", dir=self._chats_dir)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False, indent=2)
+                fh.write("\n")
+            os.replace(tmp, self._category_tree_path)
+        except OSError as exc:
+            logger.warning("attach_session_to_category: 写入 tree.json 失败: %s", exc)
+            return False
+        return True
+
+    # ------------------------------------------------------------------
+    # 事实根（工作区目录 / 会话历史月份）的增量维护
+    # ------------------------------------------------------------------
+
+    def _fill_and_stats(self, data: dict) -> None:
+        """重算全部根 subtree 的 session_count，并刷新工作区/历史/成员统计块。"""
         def fill(n: dict) -> set:
             kids = n.get("children", [])
             if any(isinstance(k, dict) for k in kids):
@@ -339,20 +384,479 @@ class SessionManager:
             n["session_count"] = len(ids)
             return ids
 
-        for top in data["tree"]:
-            if isinstance(top, dict):
-                fill(top)
+        roots = [r for r in data.get("tree") or [] if isinstance(r, dict)]
+        for top in roots:
+            fill(top)
 
+        for top in roots:
+            kind = str(top.get("type") or "")
+            kids = [c for c in top.get("children") or [] if isinstance(c, dict)]
+            if kind == "workspace":
+                env_nodes = [c for c in kids if str(c.get("type") or "") == "environment"]
+                ws_nodes = 0
+
+                def count_ws(node: dict) -> None:
+                    nonlocal ws_nodes
+                    for c in node.get("children") or []:
+                        if isinstance(c, dict):
+                            if str(c.get("type") or "") == "workspace":
+                                ws_nodes += 1
+                            count_ws(c)
+
+                count_ws(top)
+                stats = top.setdefault("stats", {})
+                stats["workspace_count"] = ws_nodes
+                stats["environment_count"] = len(env_nodes) or 1
+            elif kind == "history":
+                stats = top.setdefault("stats", {})
+                stats["month_count"] = len(
+                    [c for c in kids if str(c.get("type") or "") == "month"])
+            elif kind == "labels":
+                stats = top.setdefault("stats", {})
+                stats["label_count"] = len(
+                    [c for c in kids if str(c.get("type") or "") == "label"])
+
+        # 文档级统计（分类子树 membership；工作区/环境/月份节点数量）
+        stats = data.setdefault("stats", {})
+        membership: Counter = Counter()
+        terminals = 0
+
+        def walk_cat(node: dict) -> None:
+            nonlocal terminals
+            if str(node.get("type") or "category") != "category":
+                return
+            kids = node.get("children", [])
+            if all(not isinstance(c, dict) for c in kids):
+                terminals += 1
+                for sid in kids:
+                    membership[str(sid)] += 1
+            else:
+                for c in kids:
+                    if isinstance(c, dict):
+                        walk_cat(c)
+
+        for top in roots:
+            if str(top.get("type") or "category") == "category":
+                walk_cat(top)
+        stats["attached_conversation_count"] = len(membership)
+        stats["terminal_category_count"] = terminals
+        stats["membership_edge_count"] = sum(membership.values())
+        stats["multi_category_conversation_count"] = sum(v > 1 for v in membership.values())
+        stats["max_categories_per_conversation"] = (
+            max(membership.values()) if membership else 0)
+
+        def stat_of(kind: str, key: str, default=0):
+            top = next((r for r in roots if str(r.get("type") or "") == kind), None)
+            return (top.get("stats") or {}).get(key, default) if top else default
+
+        stats["workspace_node_count"] = stat_of("workspace", "workspace_count")
+        stats["environment_node_count"] = stat_of("workspace", "environment_count")
+        stats["month_node_count"] = stat_of("history", "month_count")
+        stats["label_node_count"] = stat_of("labels", "label_count")
+
+    def _session_fact_fields(self, session_id: str) -> tuple:
+        """读取会话事实字段：(归一化 workspace, 执行环境 key, 月份 YYYYMM)。"""
+        from runtime.category_tree_builder import (
+            _normalize_workspace, month_key, normalize_environment)
+        meta: dict = {}
+        conv_path = os.path.join(self._chats_dir, session_id, "conversation.json")
         try:
-            fd, tmp = tempfile.mkstemp(prefix=".tree.", suffix=".tmp", dir=self._chats_dir)
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(data, fh, ensure_ascii=False, indent=2)
-                fh.write("\n")
-            os.replace(tmp, self._category_tree_path)
-        except OSError as exc:
-            logger.warning("attach_session_to_category: 写入 tree.json 失败: %s", exc)
+            with open(conv_path, "r", encoding="utf-8") as fh:
+                meta = (json.load(fh) or {}).get("meta") or {}
+        except (OSError, json.JSONDecodeError):
+            meta = {}
+        created = str(meta.get("created_at") or "")
+        if not created:
+            created = str((self._read_index().get(session_id) or {}).get("created_at") or "")
+        return (
+            _normalize_workspace(meta.get("workspace")),
+            normalize_environment(meta.get("remote_env")),
+            month_key(created),
+        )
+
+    def _apply_session_facts(self, data: dict, session_id: str,
+                             fields: Optional[tuple] = None) -> bool:
+        """把会话补挂进工作区目录（未分类兜底）、会话历史月份节点与标签根，
+        就地平改 data。
+
+        只处理 v6+ 森林（工作区目录挂分类副本、未分类兜底）；v5 及更老的
+        workspace 节点 children 是会话 ID 列表，直接追加字符串。返回是否有修改。
+
+        标签根（v8）是增量**补齐**语义：mount index.json 条目里已有的 labels；
+        移除标签由 set_session_labels 显式同步（它同时改 index 与树）。
+
+        扩展契约：这是所有挂载路径（创建 ensure_session_facts、主题 attach、
+        自动压缩与手动重新生成共用的 update_index 漏斗）唯一的事实根入口。
+        以后新增任何分类体系（新的森林根）时，必须在这里登记该根的增量补挂
+        逻辑，并让 tests/test_session_fact_roots.py 的按根类型不变量测试覆盖
+        它——保证自动与手动生成的"所属目录"始终一致。
+        """
+        from runtime.category_tree_builder import (
+            TYPE_CATEGORY, TYPE_ENVIRONMENT, TYPE_HISTORY, TYPE_LABEL,
+            TYPE_LABELS, TYPE_MONTH, TYPE_WORKSPACE, UNKNOWN_CATEGORY_NAME,
+            UNKNOWN_WORKSPACE_NAME, _workspace_display_name,
+            environment_display_name)
+
+        sid = str(session_id)
+        workspace, env_key, month = fields or self._session_fact_fields(sid)
+        changed = False
+        roots = [r for r in data.get("tree") or [] if isinstance(r, dict)]
+
+        def subtree_has_sid(node: dict) -> bool:
+            stack = [node]
+            while stack:
+                for k in stack.pop().get("children") or []:
+                    if isinstance(k, dict):
+                        stack.append(k)
+                    elif str(k) == sid:
+                        return True
             return False
-        return True
+
+        def next_id(nodes: list) -> int:
+            return max([int(n.get("id") or 0) for n in nodes], default=0) + 1
+
+        # ---- 会话历史：YYYYMM 月份节点（时间倒序），新会话最近活动 → 头部 ----
+        hist = next((r for r in roots if str(r.get("type") or "") == TYPE_HISTORY), None)
+        if hist is not None and month:
+            months = [c for c in hist.get("children") or [] if isinstance(c, dict)]
+            target = next((c for c in months if str(c.get("name")) == month), None)
+            if target is None:
+                node = {"id": next_id(months), "name": month, "type": TYPE_MONTH,
+                        "session_count": 1, "children": [sid], "stats": {}}
+                idx = next((i for i, c in enumerate(months)
+                            if str(c.get("name") or "") < month), len(months))
+                hist.setdefault("children", []).insert(idx, node)
+                changed = True
+            elif sid not in [str(c) for c in target.get("children") or []]:
+                target.setdefault("children", []).insert(0, sid)
+                changed = True
+
+        # ---- 工作区目录：执行环境层（若存在）→ workspace 节点 → 未分类 ----
+        ws_root = next((r for r in roots if str(r.get("type") or "") == TYPE_WORKSPACE),
+                       None)
+        if ws_root is not None and not subtree_has_sid(ws_root):
+            kids = [c for c in ws_root.get("children") or [] if isinstance(c, dict)]
+            if kids and all(str(c.get("type") or "") == TYPE_ENVIRONMENT for c in kids):
+                container = next(
+                    (c for c in kids if str(c.get("environment") or "") == env_key), None)
+                if container is None:
+                    container = {"id": next_id(kids),
+                                 "name": environment_display_name(env_key),
+                                 "type": TYPE_ENVIRONMENT, "environment": env_key,
+                                 "session_count": 0, "children": [], "stats": {}}
+                    ws_root.setdefault("children", []).append(container)
+                    changed = True
+            else:
+                container = ws_root
+
+            wkids = [c for c in container.get("children") or [] if isinstance(c, dict)]
+            want_name = workspace or UNKNOWN_WORKSPACE_NAME
+            wnode = next(
+                (c for c in wkids
+                 if str(c.get("workspace") or "") == workspace
+                 or (not workspace and str(c.get("name") or "") == UNKNOWN_WORKSPACE_NAME)),
+                None)
+            if wnode is None:
+                used = {str(c.get("name") or "") for c in wkids}
+                wnode = {"id": next_id(wkids),
+                         "name": _workspace_display_name(workspace, used)
+                         if workspace else UNKNOWN_WORKSPACE_NAME,
+                         "type": TYPE_WORKSPACE, "workspace": workspace,
+                         "session_count": 0, "children": [], "stats": {}}
+                container.setdefault("children", []).append(wnode)
+                changed = True
+            wkids_raw = wnode.get("children") or []
+            if wkids_raw and all(not isinstance(k, dict) for k in wkids_raw):
+                # v5 形态：children 直接是会话 ID 列表
+                wnode.setdefault("children", []).append(sid)
+            else:
+                # v6+ 形态：分类副本 + 未分类兜底
+                copy_nodes = [c for c in wkids_raw if isinstance(c, dict)]
+                leaf = next((c for c in copy_nodes
+                             if str(c.get("name") or "") == UNKNOWN_CATEGORY_NAME), None)
+                if leaf is None:
+                    leaf = {"id": next_id(copy_nodes), "name": UNKNOWN_CATEGORY_NAME,
+                            "type": TYPE_CATEGORY, "session_count": 0,
+                            "children": [], "stats": {}}
+                    wnode.setdefault("children", []).append(leaf)
+                leaf.setdefault("children", []).append(sid)
+            changed = True
+
+        # ---- 标签根（v8）：按 index.json 条目的 labels 补齐挂载 ----
+        labels_root = next((r for r in roots if str(r.get("type") or "") == TYPE_LABELS),
+                           None)
+        if labels_root is not None:
+            entry_labels = [str(x).strip()
+                            for x in ((self._read_index().get(sid) or {})
+                                      .get("labels") or [])
+                            if str(x).strip()]
+            lkids = [c for c in labels_root.get("children") or [] if isinstance(c, dict)]
+            for label in entry_labels:
+                target = next((c for c in lkids
+                               if str(c.get("name") or "") == label), None)
+                if target is None:
+                    target = {"id": next_id(lkids), "name": label,
+                              "type": TYPE_LABEL, "session_count": 1,
+                              "children": [], "stats": {}}
+                    labels_root.setdefault("children", []).append(target)
+                    lkids.append(target)
+                    changed = True
+                if sid not in [str(c) for c in target.get("children") or []]:
+                    target.setdefault("children", []).insert(0, sid)
+                    changed = True
+
+        return changed
+
+    def _collapse_category_copies(self, data: dict) -> bool:
+        """分类合并（收缩维护）：会话数不超过末级门槛的分类子树就地收拢。
+
+        门槛与构建期同一语义：``dynamic_max_leaf(总分类会话数)``，即
+        max(2, 5*log2(n))。主题根与工作区副本同时适用——删除/搬移会话后，
+        原来靠拆分撑开的层级可能只剩几个会话，继续保留全深度只是让使用
+        者白白穿透；收拢到子树会话数不超过门槛的最高分类节点为止。与
+        构建期的 ``workspace_category_children`` 合并步同一函数，幂等。
+        """
+        from runtime.category_tree_builder import (
+            TYPE_CATEGORY, TYPE_WORKSPACE, collapse_small_category_subtrees,
+            dynamic_max_leaf, subtree_session_count)
+
+        roots = [r for r in data.get("tree") or [] if isinstance(r, dict)]
+        total = sum(subtree_session_count(r) for r in roots
+                    if str(r.get("type") or "") == TYPE_CATEGORY)
+        if total <= 0:
+            return False
+        threshold = dynamic_max_leaf(total)
+        changed = False
+        for r in roots:
+            if str(r.get("type") or "") in (TYPE_CATEGORY, TYPE_WORKSPACE):
+                if collapse_small_category_subtrees(r.get("children") or [], threshold):
+                    changed = True
+        return changed
+
+    def _mirror_category_in_workspace(self, data: dict, session_id: str,
+                                      parts: list) -> bool:
+        """把会话从工作区分类副本的"未分类"迁移到该主题分类路径的镜像叶子。
+
+        parts 是主题树的完整 ID 路径（含分类根，如 1/2/1/1）。副本沿用原节点
+        ID 与名称（copy_category_subtree_for_sessions 的约定），因此镜像链按
+        相同 ID 逐级查找/创建。v5 形态（children 为会话 ID 列表）不做镜像。
+        """
+        from runtime.category_tree_builder import (
+            TYPE_CATEGORY, TYPE_WORKSPACE, UNKNOWN_CATEGORY_NAME)
+
+        sid = str(session_id)
+        roots = [r for r in data.get("tree") or [] if isinstance(r, dict)]
+        # 收集路径各段的 (id, name)（跳过分类根段，副本里不含根）
+        chain: list = []
+        nodes = roots
+        for offset, part in enumerate(parts):
+            node = next((item for item in nodes
+                         if isinstance(item, dict) and str(item.get("id")) == part), None)
+            if node is None:
+                return False
+            if offset > 0:
+                chain.append((str(node.get("id")), str(node.get("name") or "")))
+            nodes = [item for item in node.get("children", []) if isinstance(item, dict)]
+        if not chain:
+            return False
+
+        ws_root = next((r for r in roots
+                        if str(r.get("type") or "") == TYPE_WORKSPACE), None)
+        if ws_root is None:
+            return False
+
+        ws_nodes: list = []
+
+        def collect(node: dict) -> None:
+            for c in node.get("children") or []:
+                if isinstance(c, dict):
+                    if str(c.get("type") or "") == TYPE_WORKSPACE:
+                        ws_nodes.append(c)
+                    collect(c)
+
+        collect(ws_root)
+
+        def next_id(nodes: list) -> int:
+            return max([int(n.get("id") or 0) for n in nodes], default=0) + 1
+
+        changed = False
+        for wnode in ws_nodes:
+            if not any(
+                str(k) == sid
+                for k in _iter_string_children(wnode)
+            ):
+                continue
+            raw = wnode.get("children") or []
+            if raw and all(not isinstance(k, dict) for k in raw):
+                continue  # v5 形态：字符串列表，_apply_session_facts 已处理
+            # 从所有副本叶子移除该会话
+            def detach(node: dict) -> None:
+                kids = node.get("children", [])
+                if any(isinstance(k, dict) for k in kids):
+                    for k in kids:
+                        if isinstance(k, dict):
+                            detach(k)
+                elif sid in kids:
+                    node["children"] = [c for c in kids if str(c) != sid]
+
+            detach(wnode)
+            # 沿主题路径 ID 逐级查找/创建镜像节点，把会话挂到末级
+            cursor_children = wnode.setdefault("children", [])
+            for offset, (seg_id, seg_name) in enumerate(chain):
+                nxt = next((c for c in cursor_children
+                            if isinstance(c, dict) and str(c.get("id")) == seg_id
+                            and str(c.get("name") or "") == seg_name), None)
+                if nxt is None:
+                    # 镜像节点已被分类合并成"直挂会话"形态时，先把字符串会话
+                    # 包进"未分类"子分类再落新链——children 保持纯字典或纯字符
+                    # 串，后续合并步会重新收拢，不会再碎。
+                    direct = [c for c in cursor_children if not isinstance(c, dict)]
+                    if direct:
+                        rest = [c for c in cursor_children if isinstance(c, dict)]
+                        bucket = next((c for c in rest
+                                       if str(c.get("name") or "") == UNKNOWN_CATEGORY_NAME), None)
+                        if bucket is None:
+                            bucket = {"id": next_id(rest), "name": UNKNOWN_CATEGORY_NAME,
+                                      "type": TYPE_CATEGORY, "session_count": len(direct),
+                                      "children": [str(c) for c in direct], "stats": {}}
+                            rest.append(bucket)
+                        else:
+                            bucket.setdefault("children", []).extend(str(c) for c in direct)
+                            bucket["session_count"] = len(bucket["children"])
+                        cursor_children[:] = rest
+                    # 优先沿用原分类 ID（副本约定）；该层已被"未分类"等占位时
+                    # 顺延取新 ID，查询路径按实际 id 仍可达。
+                    used_ids = {str(c.get("id")) for c in cursor_children
+                                if isinstance(c, dict)}
+                    nid = (int(seg_id)
+                           if seg_id.isdigit() and seg_id not in used_ids
+                           else next_id(cursor_children))
+                    nxt = {"id": nid, "name": seg_name, "type": TYPE_CATEGORY,
+                           "session_count": 0, "children": [], "stats": {}}
+                    cursor_children.append(nxt)
+                if offset == len(chain) - 1:
+                    nxt.setdefault("children", []).append(sid)
+                else:
+                    cursor_children = nxt.setdefault("children", [])
+            # 移除变空的副本分类（含搬空的"未分类"）
+            def prune(node: dict) -> bool:
+                kids = node.get("children", [])
+                if any(isinstance(k, dict) for k in kids):
+                    kept = [k for k in kids if not isinstance(k, dict)]
+                    kept += [k for k in kids if isinstance(k, dict) and prune(k)]
+                    node["children"] = kept
+                    return len(kept) > 0
+                return len([c for c in kids if isinstance(c, str)]) > 0
+
+            prune(wnode)
+            changed = True
+        return changed
+
+    def ensure_session_facts(self, session_id: str) -> bool:
+        """把新会话增量补挂进 tree.json 的工作区目录与会话历史根。
+
+        主题分类由标题生成链路（generate_title → attach_session_to_category）
+        负责；这里只保证纯事实根（工作区目录/月份历史）不依赖 LLM 就有入口，
+        未分类会话在工作区目录副本下落到"未分类"节点。tree.json 不存在时
+        静默跳过（首次构建由后台版本门控完成）。
+        """
+        try:
+            with open(self._category_tree_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return False
+        if not isinstance(data, dict) or not isinstance(data.get("tree"), list):
+            return False
+        try:
+            changed = self._apply_session_facts(data, session_id)
+        except Exception as exc:
+            logger.warning("ensure_session_facts: 补挂失败 (session=%s): %s", session_id, exc)
+            return False
+        if not changed:
+            return False
+        self._fill_and_stats(data)
+        return self.save_category_tree(data)
+
+    def set_session_labels(self, session_id: str, labels) -> list[str]:
+        """整组替换会话标签：写 index.json 条目的 ``labels``，并同步 tree.json
+        标签根（添加/移除挂载、创建/剪除标签节点）。返回清洗后的标签列表。
+
+        清洗规则与模型/工具/AI代理的标签输入一致：字符串化、去空白、去空、
+        保序去重。会话必须已存在于 index.json（未入册视为 404 语义，抛
+        FileNotFoundError）。tree.json 不存在或没有标签根时只更新索引——
+        下次构建/事实刷新会按索引重建标签根。
+        """
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for raw in labels or []:
+            # 服务端兜底与前端 parseLabels 同规则的再切分：调用方即便没有
+            # 预分割（比如脚本直接 POST 一整串），全角/半角逗号、分号、空白
+            # 也能拆开。
+            for item in re.split(r"[,，;；\s]+", str(raw)):
+                item = item.strip()
+                if item and item not in seen:
+                    seen.add(item)
+                    cleaned.append(item)
+        index = self._read_index()
+        entry = index.get(session_id)
+        if not isinstance(entry, dict):
+            raise FileNotFoundError(f"Session not in index: {session_id}")
+        if cleaned:
+            entry["labels"] = cleaned
+        else:
+            entry.pop("labels", None)
+        self._write_index(index)
+        self._sync_tree_labels(session_id, cleaned)
+        return cleaned
+
+    def _sync_tree_labels(self, session_id: str, labels: list[str]) -> bool:
+        """把 tree.json 标签根与该会话的 labels 对齐（就地编辑后原子保存）。"""
+        try:
+            with open(self._category_tree_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return False
+        if not isinstance(data, dict) or not isinstance(data.get("tree"), list):
+            return False
+        from runtime.category_tree_builder import TYPE_LABEL, TYPE_LABELS
+        labels_root = next(
+            (r for r in data["tree"]
+             if isinstance(r, dict) and str(r.get("type") or "") == TYPE_LABELS),
+            None)
+        if labels_root is None:
+            return False
+        sid = str(session_id)
+        kids = [c for c in labels_root.get("children") or [] if isinstance(c, dict)]
+        changed = False
+        # 先移除：该会话从所有标签节点退出，空标签节点随之剪除。
+        kept: list = []
+        for node in kids:
+            children = node.get("children") or []
+            if sid in [str(c) for c in children]:
+                node["children"] = [c for c in children if str(c) != sid]
+                changed = True
+            if node["children"]:
+                kept.append(node)
+            else:
+                changed = True
+        labels_root["children"] = kept
+        # 再挂载：缺失的标签节点按名称追加（下次完整构建时统一排序）。
+        def next_id(nodes: list) -> int:
+            return max([int(n.get("id") or 0) for n in nodes], default=0) + 1
+        for label in labels:
+            target = next((c for c in kept if str(c.get("name") or "") == label), None)
+            if target is None:
+                target = {"id": next_id(kept), "name": label, "type": TYPE_LABEL,
+                          "session_count": 1, "children": [], "stats": {}}
+                kept.append(target)  # kept 就是 labels_root["children"]，勿二次 append
+                changed = True
+            if sid not in [str(c) for c in target.get("children") or []]:
+                target.setdefault("children", []).insert(0, sid)
+                changed = True
+        if not changed:
+            return False
+        self._fill_and_stats(data)
+        return self.save_category_tree(data)
 
     def remove_session_from_tree(self, session_id: str) -> bool:
         """把会话从 tree.json 的全部末级分类中移除，并剪掉空分类。
@@ -385,9 +889,13 @@ class SessionManager:
             nonlocal removed_any
             kids = node.get("children", [])
             structural = str(node.get("type") or "category") in (
-                "terminal", "terminal_layer", "recent", "history")
+                "terminal", "terminal_layer", "recent", "history", "labels")
             if any(isinstance(k, dict) for k in kids):
-                kept = []
+                # 容忍混合 children：字符串会话保留（并同样移除本会话）
+                strs = [k for k in kids if not isinstance(k, dict) and k != session_id]
+                if len(strs) != len([k for k in kids if not isinstance(k, dict)]):
+                    removed_any = True
+                kept = strs
                 for k in kids:
                     if isinstance(k, dict) and prune(k):
                         kept.append(k)
@@ -453,6 +961,10 @@ class SessionManager:
             ids = {c for c in kids if isinstance(c, str)}
             n["session_count"] = len(ids)
             return ids
+
+        # 删除后收缩维护：子树会话数不超过门槛的分类就地合并（主题根与
+        # 工作区副本同一规则），避免留下深层链上挂着寥寥几个会话。
+        self._collapse_category_copies(data)
 
         for top in kept_top:
             fill(top)
@@ -563,11 +1075,15 @@ class SessionManager:
                 "last_total_tokens": None,
                 "title_generated": "",
                 "title_given": False,
-                "flight_mode": False,
             }
             self._write_index(index)
         except Exception as exc:
             logger.warning("on_session_created: 写入 index.json 失败 (session=%s): %s", session_id, exc)
+        # 新会话立即进入工作区目录与会话历史事实根（不依赖 LLM 标题/分类链路）
+        try:
+            self.ensure_session_facts(session_id)
+        except Exception as exc:
+            logger.warning("on_session_created: 补挂事实根失败 (session=%s): %s", session_id, exc)
 
     def on_session_forked(
         self,
@@ -580,8 +1096,7 @@ class SessionManager:
 
         标题优先取显式传入值，其次父会话标题，最后退回首条用户消息
         （``on_session_created`` 的默认行为）。``forked_from`` 让侧边栏可以
-        标出衍生会话，也保留了「这条会话从哪里来」的信息；飞行模式设定
-        一并继承，因为衍生分支上的使用习惯与父会话一致。
+        标出衍生会话，也保留了「这条会话从哪里来」的信息。
 
         Args:
             session_id: 新建的衍生会话 ID。
@@ -605,8 +1120,6 @@ class SessionManager:
             if inherited:
                 entry["title"] = inherited[:100]
             entry["forked_from"] = parent_session_id
-            if parent_entry.get("flight_mode"):
-                entry["flight_mode"] = True
 
             index[session_id] = entry
             self._write_index(index)
@@ -688,7 +1201,6 @@ class SessionManager:
                 "last_total_tokens": None,
                 "title_generated": "",
                 "title_given": False,
-                "flight_mode": False,
             })
 
             # 读取 conversation.json 的 meta.turn_count
@@ -716,6 +1228,39 @@ class SessionManager:
                 session_id,
                 last_total_tokens,
                 compression_updated=compression_updated,
+            )
+
+    def set_session_status(self, session_id: str, status: Optional[str]) -> None:
+        """Persist a resting session status (currently only ``"paused"``) to index.json.
+
+        In-memory statuses (:mod:`runtime.server_state`) are lost on restart,
+        so the sidebar list — which is built from index entries — would show a
+        paused session as if it had simply finished. Writing the marker into
+        the index keeps the pause visible across server restarts and page
+        reloads, without any boot-time scan.
+
+        Args:
+            session_id: Target session.
+            status: ``"paused"`` to mark; ``None`` / ``""`` clears the field.
+
+        The write is a no-op when the index entry is absent (a session that
+        never reached persistence has no resting state to mark).
+        """
+        try:
+            index = self._read_index()
+            entry = index.get(session_id)
+            if entry is None:
+                return
+            if status:
+                entry["status"] = status
+            else:
+                entry.pop("status", None)
+            index[session_id] = entry
+            self._write_index(index)
+        except Exception as exc:
+            logger.warning(
+                "set_session_status: 写入 index.json 失败 (session=%s): %s",
+                session_id, exc,
             )
 
     def generate_title(
@@ -963,21 +1508,22 @@ class SessionManager:
         except Exception as exc:
             logger.warning("remove_from_index: 更新 index.json 失败 (session=%s): %s", session_id, exc)
 
-    def set_session_flight_mode(self, session_id: str, enabled: bool) -> None:
-        """持久化会话的飞行模式设定到 index.json（``flight_mode`` 字段）。
+    def set_session_inferring(self, session_id: str, inferring: bool) -> None:
+        """把「这个会话正在推理中」记进 index.json（``inferring`` / ``inferring_since``）。
 
-        会话尚不在 index 中时（如刚创建）补写默认条目，保证设定不丢失。
-        失败时仅记录日志（不影响内存状态与请求流程）。
+        推理的生命周期属于会话本身，与浏览器连接无关，所以"是否正在推理"必须在磁盘上
+        有一份凭证：正常收尾（完成 / 停止 / 失败 / 关闭时强停）时清除；实例被强杀时它会
+        残留，下一个实例据此把该会话判为异常中断（见 ``fail_inferring_sessions``）。
 
-        Args:
-            session_id: 会话 ID。
-            enabled: 是否启用飞行模式。
+        写失败只记日志：标记缺失最多让一次崩溃看起来像正常停止，绝不能反过来影响推理。
         """
         from runtime.common import now_iso
         try:
             index = self._read_index()
             entry = index.get(session_id)
             if not isinstance(entry, dict):
+                if not inferring:
+                    return            # 会话已不存在：不需要为它补写"已结束"
                 now = now_iso()
                 entry = {
                     "session_id": session_id,
@@ -988,29 +1534,44 @@ class SessionManager:
                     "last_total_tokens": None,
                     "title_generated": "",
                     "title_given": False,
-                    "flight_mode": False,
                 }
-            entry["flight_mode"] = bool(enabled)
+            if inferring:
+                if not entry.get("inferring"):
+                    entry["inferring"] = True
+                    entry["inferring_since"] = now_iso()
+            else:
+                entry.pop("inferring", None)
+                entry.pop("inferring_since", None)
             index[session_id] = entry
             self._write_index(index)
         except Exception as exc:
             logger.warning(
-                "set_session_flight_mode: 写入 index.json 失败 (session=%s): %s",
+                "set_session_inferring: 写入 index.json 失败 (session=%s): %s",
                 session_id, exc,
             )
 
-    def flight_sessions(self) -> list[str]:
-        """列出 index.json 中启用飞行模式的会话 ID（升序）。
-
-        供服务启动时恢复内存中的飞行模式集合，使重启后老的飞行模式会话
-        继续对话时仍保持飞行模式设定。
-        """
+    def inferring_sessions(self) -> list[str]:
+        """列出 index.json 标记为推理中的会话 ID（升序）。"""
         index = self._read_index()
         return sorted(
             session_id
             for session_id, entry in index.items()
-            if isinstance(entry, dict) and entry.get("flight_mode")
+            if isinstance(entry, dict) and entry.get("inferring")
         )
+
+    def fail_inferring_sessions(self) -> list[str]:
+        """启动时清掉残留的推理中标记，返回这些会话 ID（调用方落成失败完成）。
+
+        本实例刚初始化，不可能有任何会话真的在推理：标记还在，就说明上一个实例没有走到
+        收尾（进程被强杀 / 崩溃 / 断电）。调用方把这些会话标记为 ``done_error_unread``，
+        侧栏据此显示失败完成，而不是永远显示"推理中"。
+        """
+        session_ids = self.inferring_sessions()
+        if not session_ids:
+            return []
+        for session_id in session_ids:
+            self.set_session_inferring(session_id, False)
+        return session_ids
 
     def list_sessions(self, session_ids: Optional[set[str]] = None) -> list[dict]:
         """读取 index.json，返回所有 SessionIndexEntry 列表，按 last_inference_at 降序排列。

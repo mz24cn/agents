@@ -22,7 +22,6 @@ Usage:
 import os
 import signal
 import sys
-import time
 from runtime.server import RuntimeHTTPServer
 
 PID_FILE_NAME = "server.pid"
@@ -101,21 +100,11 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         pass
     finally:
-        # 优雅收尾：先通知进行中的推理线程终止并落盘，再关闭服务器。
-        # 推理线程是 daemon 线程，直接 stop() 会在进程退出时被强制终止，
-        # 可能丢失最后一轮对话输出。这里 set 所有 active_infers 的
-        # cancel_event 并短暂等待，让推理线程走正常的最终持久化分支。
-        # （配合推理过程中的增量持久化，最多丢失正在执行的最后一轮。）
-        try:
-            active = getattr(server, "_active_infers", None) or {}
-            for ev in list(active.values()):
-                try:
-                    ev.set()
-                except Exception:
-                    pass
-            if active:
-                time.sleep(3)
-        except Exception:
-            pass
+        # 优雅收尾：本实例还在跑的推理必须先停下来，再关服务器。
+        # stop() 会调用 stop_inferences()：set cancel_event、打断正在等结果的工具进程、
+        # 把这些会话记为失败完成，并清除 index.json 里的“推理中”标记；这样下一次启动
+        # 不会把一次正常关闭误判成崩溃（残留标记 = 上个实例被强杀）。
+        # 推理线程是 daemon 线程，直接退出会在进程销毁时被强制终止，丢失最后一轮输出，
+        # 所以 stop_inferences 内部会短暂等待线程走完正常的最终持久化分支。
         server.stop()
         _remove_pid_file()

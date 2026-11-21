@@ -40,6 +40,7 @@ else:
 from runtime.common import (
     env_int,
     get_system_encoding,
+    get_request_context,
     estimate_chat_message_tokens,
     estimate_chat_prompt_tokens,
     estimate_message_payload_tokens,
@@ -986,6 +987,7 @@ def persist_conversation(
             context_manager.compress_context(
                 session_id, new_turns, last_total_tokens=last_total_tokens,
                 inference_model_id=model_id,
+                trigger="post_turn",
             )
         summary_version_after = context_manager.get_summary(session_id)[1].get(
             "summary_version", 0
@@ -1338,6 +1340,7 @@ class InLoopContextCompressor:
                         inference_model_id=self.inference_model_id,
                         inference_max_context=max_context,
                         deep=deep,
+                        trigger="pre_send",
                     )
                     after = context_manager.get_summary(session_id)[1].get(
                         "summarized_up_to_turn"
@@ -1704,13 +1707,17 @@ def snapshot_session_titles(session_ids) -> dict:
 
 # Per-session inference message broker. Frames are retained for the lifetime of
 # the inference and fanned out to every browser that has opened the session.
-# Outside flight mode, however, the producer may run only while at least one
-# such browser connection (including the starter SSE) remains alive.
+#
+# An inference belongs to the session, never to a connection. It ends when the
+# user stops it, when the work finishes, or when this process shuts down -- and
+# never because a socket went away. Which connections happen to be open decides
+# who *sees* the frames, nothing else. There is deliberately no "cancel because
+# nobody is watching" path: every interruption incident of the past was such a
+# path, because a browser dropping a long-lived request is routine (tab hidden,
+# proxy restart, HTTP/1.1 per-origin limit, reload) and reads identical to a
+# client that has left for good.
 _session_stream_lock = threading.RLock()
 _session_streams: dict[str, dict] = {}
-# "Flight mode" is shared by all browsers and explicitly permits inference to
-# continue with zero browser connections.
-_flight_sessions: set[str] = set()
 
 
 def _session_stream_debug_enabled() -> bool:
@@ -1732,183 +1739,142 @@ def _session_stream_frame_summary(frame: dict) -> str:
     )
 
 
-# How long a non-flight generation may go without an observer before it is
-# cancelled. Every browser connection that counts as an observer can blip: the
-# POST -> frame-channel hand-off, a channel reconnect, a subscribe command that
-# has to be retried. Cancelling on the *first* of those made users see
-# "Error: user interrupted." for inferences they never aborted, while a tab that
-# is genuinely gone only has to stay gone. Overridable for tests.
-UNOBSERVED_GRACE_S = 10.0
+#: Persistence hook for the "this session is inferring" marker, wired by
+#: ``RuntimeHTTPServer`` to ``SessionManager.set_session_inferring``. The broker
+#: deliberately does not know where index.json lives; it only announces that a
+#: generation started or reached its terminal state, and the storage layer writes
+#: it down. That marker is what lets a fresh instance tell "stopped on shutdown"
+#: apart from "killed mid-run" (see ``fail_inferring_sessions``).
+_inferring_sink = None
 
 
-def _unobserved_grace_s() -> float:
-    raw = os.environ.get("SESSION_UNOBSERVED_GRACE_S", "")
-    if not raw.strip():
-        return UNOBSERVED_GRACE_S
+def set_inferring_sink(sink) -> None:
+    """Install the persistence hook: ``sink(session_id, inferring: bool)``."""
+    global _inferring_sink
+    _inferring_sink = sink
+
+
+def _note_inferring(session_id: str, inferring: bool) -> None:
+    """Announce a generation boundary to the persistence hook (never fatal)."""
+    sink = _inferring_sink
+    if sink is None or not session_id:
+        return
     try:
-        return max(0.0, float(raw))
-    except ValueError:
-        return UNOBSERVED_GRACE_S
-
-
-def _disarm_unobserved_cancel_locked(stream: dict) -> None:
-    """Forget a pending "nobody is watching" cancellation (an observer returned)."""
-    timer = stream.get("unobserved_timer")
-    if timer is not None:
-        stream["unobserved_timer"] = None
-        try:
-            timer.cancel()
-        except Exception:
-            pass
-
-
-def _frame_channel_is_live(conn_id) -> bool:
-    """Is that tab's shared frame channel connected right now?
-
-    Deliberately read without ``_frame_channels_lock``: callers hold
-    ``_session_stream_lock``, and taking the channel lock here would invert the
-    order ``_drop_frame_channel_locked`` takes (channels -> sessions), i.e. a
-    deadlock risk. A stale read is benign in both directions: a channel that is
-    really going away is dropped within ``FRAME_CHANNEL_GRACE_S``, which re-runs
-    this decision, and a channel that just re-attached rescues the generation.
-    """
-    if not conn_id:
-        return False
-    channel = _frame_channels.get(conn_id)
-    return bool(channel and channel.get("connected"))
-
-
-def note_session_watched_by(session_id: str, conn_id: str) -> None:
-    """Remember which tab watched this generation (per-tab liveness).
-
-    A tab that stops routing *one* session while its channel stays connected has
-    not abandoned the inference: in the chat UI, closing that conversation (or a
-    page teardown) unsubscribes exactly one session. The channel going away is
-    the signal that the browser left, so ``_drop_frame_channel_locked`` re-runs
-    the unobserved check for the generations this tab had watched.
-    """
-    with _session_stream_lock:
-        stream = _session_streams.get(session_id)
-        if stream is not None:
-            stream["watched_by"] = conn_id
-
-
-def _cancel_unobserved_streams_of_conn_locked(conn_id: str) -> None:
-    """Re-check generations whose last watcher was this (now gone) tab."""
-    for session_id, stream in list(_session_streams.items()):
-        if stream.get("watched_by") == conn_id:
-            _cancel_unobserved_stream_locked(session_id, stream, reason="tab_left")
-
-
-def _resolve_unobserved_cancel(session_id: str, cancel_event, reason: str) -> None:
-    """Cancel after the grace window, unless an observer came back meanwhile."""
-    with _session_stream_lock:
-        stream = _session_streams.get(session_id)
-        if stream is None or stream.get("cancel_event") is not cancel_event:
-            return                      # superseded generation; not ours to cancel
-        stream["unobserved_timer"] = None
-        if stream["done"] or session_id in _flight_sessions:
-            return
-        if _frame_channel_is_live(stream.get("watched_by")):
-            return                      # the tab is still there, only unwatched it
-        if stream["starter_connected"] or stream["subscribers"]:
-            logging.getLogger("runtime.server").info(
-                "session_stream unobserved_grace_rescued sid=%s reason=%s "
-                "subscribers=%s starter_connected=%s",
-                session_id, reason, len(stream["subscribers"]),
-                stream["starter_connected"],
-            )
-            return
-        cancel_event.set()
+        sink(session_id, inferring)
+    except Exception as exc:  # noqa: BLE001 - persistence is never the run's problem
         logging.getLogger("runtime.server").warning(
-            "session_stream CANCELLED sid=%s reason=%s (unobserved for %ss)",
-            session_id, reason, _unobserved_grace_s(),
+            "session_stream inferring_marker_failed sid=%s inferring=%s: %s",
+            session_id, inferring, exc,
         )
 
 
-def _cancel_unobserved_stream_locked(session_id: str, stream: dict,
-                                     reason: str = "unobserved") -> bool:
-    """Cancel an active non-flight stream after its last browser disconnects.
+def seed_interrupted_status(session_ids) -> None:
+    """Give sessions an unclean instance left behind a terminal status.
 
-    Must be called with ``_session_stream_lock`` held. The starter inference SSE
-    counts as one session-specific connection, as does every retained/live
-    subscriber created after a browser opens the session (a per-tab frame channel
-    registers one subscriber per session it watches).
-
-    Returns True only when the cancellation happened here. A deferred one returns
-    False, so callers never claim a cancellation that has not happened yet.
+    A generation cannot outlive its process, so a session whose persisted marker
+    still says "inferring" has failed. Marking it ``done_error_unread`` is what
+    makes the sidebar show a completed-with-error session instead of one that is
+    forever streaming, and what keeps the resume gate from treating it as active.
     """
-    if stream["done"] or session_id in _flight_sessions:
-        return False
-    if stream["starter_connected"] or stream["subscribers"]:
-        return False
-    if _frame_channel_is_live(stream.get("watched_by")):
-        # The tab that watched this generation is still connected with its shared
-        # frame channel; it merely stopped routing this session (closing that
-        # conversation unsubscribes it). The user is one click away from resuming
-        # the stream, so this generation is not abandoned: the cancellation runs
-        # when that channel is dropped instead.
-        return False
-    cancel_event = stream.get("cancel_event")
-    if cancel_event is None:
-        return False
-    grace = _unobserved_grace_s()
-    if grace <= 0:
-        cancel_event.set()
-        logging.getLogger("runtime.server").warning(
-            "session_stream CANCELLED sid=%s reason=%s (no grace)", session_id, reason,
-        )
-        return True
-    if stream.get("unobserved_timer") is not None:
-        return False                    # a cancellation is already scheduled
-    timer = threading.Timer(
-        grace, _resolve_unobserved_cancel, args=(session_id, cancel_event, reason),
-    )
-    timer.daemon = True
-    stream["unobserved_timer"] = timer
-    timer.start()
-    logging.getLogger("runtime.server").info(
-        "session_stream unobserved sid=%s reason=%s grace=%ss", session_id, reason, grace,
-    )
-    return False
+    if not session_ids:
+        return
+    with _session_state_lock:
+        for session_id in session_ids:
+            _session_statuses[session_id] = "done_error_unread"
+            _unread_sessions[session_id] = "done_error_unread"
 
 
-def begin_session_stream(session_id: str, cancel_event=None) -> None:
-    """Start a new inference generation and retire any previous broker."""
+def begin_session_stream(session_id: str, cancel_event=None):
+    """Open a new inference generation, unless the session already has a live one.
+
+    This is the moment the session becomes "推理中" in the durable sense: from
+    here on the run is owned by this process and recorded in index.json, whether
+    or not any browser is attached.
+
+    A session has exactly one generation at a time, and the way to end one is to
+    ask it to end: the user's stop or pause, letting it run to completion, or
+    process shutdown. Arriving with another request is not a way to end one.  So
+    while a generation is live -- an owner event that has neither finished nor
+    been asked to stop -- this call refuses and leaves that generation completely
+    untouched: its broker, retained frames, ``active_infers`` slot and durable
+    推理中 marker all stay its.
+
+    Refusing is the non-destructive half of what superseding used to do, and it
+    matters more than the cancelling it replaces. Replacing a live broker takes
+    over the one ``active_infers`` slot the session has, so from then on
+    ``/v1/infer/abort`` -- stop, force, pause, interjection -- can only ever
+    reach the newcomer; the run it displaced keeps issuing model requests and
+    executing tools (which mutate the workspace) for its whole remaining round
+    budget, invisible and unreachable, because only its writes to
+    conversation.json were gated by generation ownership. A session that looked
+    idle was therefore still spending model calls and editing files, with nothing
+    left to stop it.
+
+    Returns ``None`` when this call opened the generation, or the live
+    generation's ``cancel_event`` when the request was refused -- the caller must
+    answer without having taken anything.  A finished broker, or one whose run
+    has already been asked to stop, is replaced silently: nothing gets
+    interrupted, and the outgoing run's own cleanup is gated on its identity, so
+    it cannot write over this one.
+    """
     with _session_stream_lock:
         previous = _session_streams.get(session_id)
-        previous_subscribers = list(previous["subscribers"]) if previous else []
-        stale_event = None
         if previous is not None:
-            # A pending "nobody is watching" cancellation must not be dropped just
-            # because a replacement generation took over the registry entry: the
-            # retired generation is still running and still unobserved.
-            if previous.get("unobserved_timer") is not None:
-                stale_event = previous.get("cancel_event")
-            _disarm_unobserved_cancel_locked(previous)
+            previous_event = previous.get("cancel_event")
+            if (
+                previous_event is not None
+                and not previous.get("done")
+                and not previous_event.is_set()
+            ):
+                logging.getLogger("runtime.server").warning(
+                    "session_stream busy_refused sid=%s: this generation owns "
+                    "the session and was left running; the request that reached "
+                    "it was refused instead of taking the session over (stop or "
+                    "pause first if that was the intent)",
+                    session_id,
+                )
+                return previous_event
+        previous_subscribers = list(previous["subscribers"]) if previous else []
         _session_streams[session_id] = {
             "next_seq": 1,
             "persisted_seq": 0,
             "frames": [],
             "subscribers": [],
-            "starter_connected": True,
             "cancel_event": cancel_event,
             "done": False,
             # Set by the tool loop at the moment it decides to finish with an
             # empty interjection buffer; the interject endpoint refuses
             # anything after that point instead of buffering it forever.
             "loop_closing": False,
-            "unobserved_timer": None,
         }
-    if stale_event is not None and stale_event is not cancel_event:
-        stale_event.set()
-    # Wake retained GET handlers attached to the retired generation. Their UI
-    # observes the authoritative streaming status and reconnects to this broker.
+    _note_inferring(session_id, True)
+    # Wake retained GET handlers attached to the generation this one replaced --
+    # only ever a finished or already-stopping one, since a live generation
+    # refuses the replacement above.  Their UI observes the authoritative
+    # streaming status and reconnects to this broker.
     for send_fn in previous_subscribers:
         try:
             send_fn(None)
         except Exception:
             pass
+    return None
+
+
+def session_stream_is_live(session_id: str) -> bool:
+    """True while a generation owns this session and can still be stopped.
+
+    The predicate serves the request gate: a new request that reached a session
+    whose run is live would take that session over and leave the run unstoppable,
+    so the gate answers 409 for it -- streamed and non-streamed alike. A broker
+    nobody can stop -- no owner event at all, or one already set -- is not a live
+    run, and holding a session shut for it would leave no way out but a restart.
+    """
+    with _session_stream_lock:
+        stream = _session_streams.get(session_id)
+        if stream is None or stream.get("done"):
+            return False
+        event = stream.get("cancel_event")
+        return event is not None and not event.is_set()
 
 
 def publish_session_stream_frame(
@@ -1916,6 +1882,7 @@ def publish_session_stream_frame(
     frame: dict,
     owner_event=None,
     event: Optional[str] = None,
+    create_if_absent: bool = True,
 ) -> Optional[int]:
     """Publish a retained frame for the current inference generation.
 
@@ -1923,6 +1890,19 @@ def publish_session_stream_frame(
     the old handler may still unwind while the replacement inference is already
     producing output. ``owner_event`` prevents that stale handler from
     publishing into the replacement stream's broker.
+
+    ``create_if_absent=False`` refuses to invent a generation: the frame is
+    dropped (``None``) when no live broker exists for the session.  Control
+    frames emitted from outside an inference (e.g. a manual summary
+    regeneration) use that, because a phantom stream would report a starter
+    that never connected and keep its frames retained for nothing.
+
+    The same refusal applies to an ownerless frame even when
+    ``create_if_absent`` is left on. A broker is the record of a *generation*,
+    so it needs the run's identity to be bound to: without an ``owner_event`` it
+    cannot be stopped (abort reaches a run through its event), its frames are
+    retained for nobody, and the session is marked "推理中" in index.json for a
+    run that does not exist -- which the next instance would read as a crash.
     """
     if not session_id:
         return 0
@@ -1930,6 +1910,8 @@ def publish_session_stream_frame(
     with _session_stream_lock:
         stream = _session_streams.get(session_id)
         if stream is None:
+            if not create_if_absent or owner_event is None:
+                return None
             begin_session_stream(session_id, owner_event)
             stream = _session_streams[session_id]
         elif owner_event is not None and stream.get("cancel_event") is not owner_event:
@@ -1951,12 +1933,11 @@ def publish_session_stream_frame(
                 seq,
                 stream["persisted_seq"],
                 len(subscribers),
-                stream["starter_connected"],
                 _session_stream_frame_summary(frame),
             )
     if debug_info is not None:
         logging.getLogger("runtime.server").warning(
-            "session_stream publish sid=%s seq=%s persisted=%s subscribers=%s starter=%s %s",
+            "session_stream publish sid=%s seq=%s persisted=%s subscribers=%s %s",
             session_id, *debug_info,
         )
     dead = []
@@ -1972,9 +1953,7 @@ def publish_session_stream_frame(
             if current:
                 previous_count = len(current["subscribers"])
                 current["subscribers"] = [fn for fn in current["subscribers"] if fn not in dead]
-                if len(current["subscribers"]) != previous_count:
-                    _cancel_unobserved_stream_locked(session_id, current)
-                    if _session_stream_debug_enabled():
+                if len(current["subscribers"]) != previous_count and _session_stream_debug_enabled():
                         logging.getLogger("runtime.server").warning(
                             "session_stream removed_dead sid=%s dead=%s subscribers=%s",
                             session_id, len(dead), len(current["subscribers"]),
@@ -1993,6 +1972,76 @@ def mark_session_stream_persisted(session_id: str, seq: int, owner_event=None) -
         return True
 
 
+#: ``status`` value of the context-compression control frame.  ``role=status``
+#: keeps it out of the conversation (no consumer treats it as a turn, and it is
+#: never persisted), exactly like the client-side-tool handoff frame.
+COMPRESSION_STATUS = "context_compression"
+
+
+def compression_stream_frame(session_id: str, payload: dict) -> dict:
+    """Build the SSE control frame for one compression lifecycle event."""
+    return {
+        "role": "status",
+        "source": "system",
+        "status": COMPRESSION_STATUS,
+        "session_id": session_id,
+        **payload,
+    }
+
+
+def broadcast_compression_event(session_id: str, payload: dict) -> None:
+    """Deliver one context-compression lifecycle event to this session's clients.
+
+    Installed as the compression event sink of
+    :class:`runtime.context_manager.ContextManager`
+    (:meth:`ContextManager.set_compression_event_sink`), which calls it twice
+    per attempt that reaches the model: ``payload["phase"]`` ``"started"`` just
+    before the request goes out, ``"completed"`` with the outcome afterwards.
+
+    Routing follows the way a tool call reaches its clients, because to the
+    user a compression is exactly that -- something inside their running
+    generation that takes seconds and has to appear between the frames before
+    and after it, in order.  Three situations, in that spirit:
+
+    1. the compression runs on the thread of the inference that owns the
+       session (the ordinary case: post-turn, mid-loop and pre-send triggers):
+       use that handler's SSE callback, which publishes into the retained
+       broker and mirrors to the starter connection;
+    2. a worker thread of a live generation whose own callback belongs to a
+       different session (a group-chat agent, a nested tool): publish into the
+       session's existing broker, and never create one;
+    3. no generation at all (``regenerate-summary``, forking an oversized
+       history): fall back to the global session-events channel, which every
+       tab already watches for status and title updates.
+
+    Best effort in every case: an undeliverable event must never disturb the
+    compression it describes, and a stateless inference (no ``session_id``)
+    simply has nowhere to deliver to.
+    """
+    if not session_id:
+        return
+    frame = compression_stream_frame(session_id, payload)
+    callback = get_request_context("sse_callback")
+    if callback is not None and get_request_context("session_id") == session_id:
+        try:
+            # ``False`` means this handler was superseded by a newer inference:
+            # its generation is no longer retained, and pushing the event into
+            # the replacement stream would date that one with an event of the
+            # old run.  Drop it; the replacement compresses on its own terms.
+            callback(frame)
+            return
+        except Exception as exc:  # noqa: BLE001 - observability is never fatal
+            logger.debug(
+                "compression event: starter callback failed for session %s: %s",
+                session_id, exc,
+            )
+    if publish_session_stream_frame(
+        session_id, frame, create_if_absent=False
+    ) is not None:
+        return
+    _broadcast_session_event(session_id, "compression", dict(payload))
+
+
 def finish_session_stream(session_id: str, owner_event=None) -> bool:
     """Finish only the broker generation owned by ``owner_event``."""
     with _session_stream_lock:
@@ -2008,6 +2057,10 @@ def finish_session_stream(session_id: str, owner_event=None) -> bool:
             send_fn(None)
         except Exception:
             pass
+    # The generation reached its end here (completed, stopped, or force-aborted):
+    # the durable "推理中" marker goes away with it, so a later instance can tell
+    # a finished run apart from one whose process was killed.
+    _note_inferring(session_id, False)
     return True
 
 
@@ -2049,6 +2102,18 @@ def transition_session_stream_status(
         # happens here.
         _enqueue_session_event_frame(frame)
         return True
+
+
+def get_session_status(session_id: str) -> Optional[str]:
+    """Return the live in-memory status of a session, if any.
+
+    Values: ``streaming`` / ``paused`` / ``done_success_unread`` /
+    ``done_error_unread`` / ``idle`` (set by mark-read), else ``None``.
+    Exposed so list APIs can hand the frontend an authoritative per-session
+    status instead of leaving the UI to infer it from SSE timing alone.
+    """
+    with _session_state_lock:
+        return _session_statuses.get(session_id)
 
 
 def seed_paused_status(session_id: str, agent_ids=None) -> bool:
@@ -2392,11 +2457,14 @@ def subscribe_session_stream(session_id: str, send_fn) -> bool:
         if stream is None or stream["done"]:
             return False
         stream["subscribers"].append(send_fn)
-        _disarm_unobserved_cancel_locked(stream)
         return True
 
 
 def unsubscribe_session_stream(session_id: str, send_fn) -> None:
+    """Drop one subscriber. Releasing the last one changes nothing else.
+
+    The inference keeps running: an observer left, the session did not end.
+    """
     with _session_stream_lock:
         stream = _session_streams.get(session_id)
         if stream is not None:
@@ -2404,57 +2472,6 @@ def unsubscribe_session_stream(session_id: str, send_fn) -> None:
                 stream["subscribers"].remove(send_fn)
             except ValueError:
                 return
-            _cancel_unobserved_stream_locked(session_id, stream,
-                                             reason="last_subscriber_left")
-
-
-def disconnect_session_stream_starter(session_id: str, owner_event=None) -> bool:
-    """Mark the inference-starting browser connection as disconnected.
-
-    A stale POST connection must not disconnect the starter belonging to a
-    replacement inference for the same session.
-    """
-    with _session_stream_lock:
-        stream = _session_streams.get(session_id)
-        if stream is None:
-            return False
-        if owner_event is not None and stream.get("cancel_event") is not owner_event:
-            return False
-        stream["starter_connected"] = False
-        return _cancel_unobserved_stream_locked(session_id, stream)
-
-
-def set_session_flight_mode(session_id: str, enabled: bool) -> bool:
-    with _session_stream_lock:
-        if enabled:
-            _flight_sessions.add(session_id)
-        else:
-            _flight_sessions.discard(session_id)
-            stream = _session_streams.get(session_id)
-            if stream is not None:
-                _cancel_unobserved_stream_locked(session_id, stream)
-        return session_id in _flight_sessions
-
-
-def load_flight_sessions(session_ids) -> None:
-    """从持久化来源（index.json）恢复内存中的飞行模式集合。
-
-    服务启动时调用：重启后老的飞行模式会话在继续对话时仍保持飞行模式设定
-    （无浏览器连接时也允许推理继续）。
-    """
-    with _session_stream_lock:
-        for session_id in session_ids or []:
-            _flight_sessions.add(session_id)
-
-
-def is_session_flight_mode(session_id: str) -> bool:
-    with _session_stream_lock:
-        return session_id in _flight_sessions
-
-
-def flight_sessions_snapshot() -> list[str]:
-    with _session_stream_lock:
-        return sorted(_flight_sessions)
 
 
 def register_session_stream_with_snapshot(session_id: str, send_fn, after_seq: int = -1) -> tuple[bool, dict]:
@@ -2465,6 +2482,14 @@ def register_session_stream_with_snapshot(session_id: str, send_fn, after_seq: i
     copies are built afterwards, outside the lock: retained frames are
     append-only and envelopes are never mutated in place, so a pointer copy
     taken at registration time is a stable snapshot.
+
+    Ordering is a separate matter, and this path only gets it half-way: a frame
+    published after registration can reach the writer before the replay has been
+    written. The frame channel stages those frames and therefore guarantees
+    ``sub_init`` -> replay -> live (see ``frame_channel_subscribe``); this legacy
+    per-session reader does not, so a client of it that watches the sequence
+    numbers has to re-connect with its cursor when a number jumps -- which is the
+    same repair the browser tab does, one connection at a time.
     """
     with _session_stream_lock:
         stream = _session_streams.get(session_id)
@@ -2473,7 +2498,6 @@ def register_session_stream_with_snapshot(session_id: str, send_fn, after_seq: i
         registered = not stream["done"]
         if registered:
             stream["subscribers"].append(send_fn)
-            _disarm_unobserved_cancel_locked(stream)
         effective_after = stream["persisted_seq"] if after_seq < 0 else after_seq
         done = stream["done"]
         persisted_seq = stream["persisted_seq"]
@@ -2510,9 +2534,9 @@ def register_session_stream_with_snapshot(session_id: str, send_fn, after_seq: i
 #
 # A channel carries the retained + live frames of *every* session one tab
 # watches, over a single SSE connection. It registers one subscriber per watched
-# session with the existing per-session broker, so the "cancel the inference when
-# nobody is watching" rule (``_cancel_unobserved_stream_locked``) keeps working
-# exactly as before: the channel is simply one more subscriber of each session.
+# session with the existing per-session broker. The channel is purely a delivery
+# path: losing it stops delivery for that tab and has no effect on the inference
+# itself, which keeps running and keeps its frames retained for the next reader.
 #
 # ``conn`` ids are minted by the browser tab. ``get_or_create_frame_channel`` /
 # ``attach_frame_channel`` reuse the existing channel when the id is already
@@ -2524,18 +2548,49 @@ def register_session_stream_with_snapshot(session_id: str, send_fn, after_seq: i
 # Channel ``send_fn``s are only ever invoked by the broker *outside*
 # ``_session_stream_lock``, so they can safely take this lock.
 
-# A detached channel keeps its per-session subscriptions for this long, so a tab
-# that is merely reconnecting (or throttled because it is in the background, where
-# a 1s timer can be delayed to a minute) does not lose the inferences it watches.
-# The cost of the window is memory plus an inference that outlives a dead tab by
-# up to this long; the cost of a short one is a cancelled run the user never
-# aborted. Overridable for deployments that want the GPU back sooner.
-FRAME_CHANNEL_GRACE_S = 60.0
+# How long a *detached* channel object is kept so a reconnecting reader can reuse
+# it (same subscriptions, no new generation). Pure resource housekeeping: a
+# dropped channel releases its per-session subscriptions, and the reconnecting
+# reader re-subscribes with its own cursor and replays the gap from the broker.
+# Nothing an inference does depends on this window.
+FRAME_CHANNEL_GRACE_S = 2.0
 FRAME_CHANNEL_QUEUE_MAXSIZE = 8192
 FRAME_CHANNEL_MAX = 64
 
 _frame_channels: dict[str, dict] = {}
 _frame_channels_lock = threading.RLock()
+
+# Every attach is handed a fresh number from this process-wide counter rather
+# than a per-channel tally that restarts at 1. A channel object is dropped and a
+# new one built under the same ``conn`` once its grace expires -- and a reader of
+# the *previous* incarnation used to match the new channel's generation 1, mark
+# the new connection disconnected and release the subscriptions of a tab that
+# was streaming just fine. A token that is never reused makes "is this reader
+# the current one" decidable for good.
+_frame_channel_generation = 0
+
+
+def _next_frame_channel_generation() -> int:
+    """Take the next channel-generation token (called under the channel lock)."""
+    global _frame_channel_generation
+    _frame_channel_generation += 1
+    return _frame_channel_generation
+
+
+def _frame_channel_stage(channel: dict, session_id: str) -> list:
+    """Start holding this session's frames instead of delivering them."""
+    return channel.setdefault("staging", {}).setdefault(session_id, [])
+
+
+def _frame_channel_flush(channel: dict, session_id: str) -> list:
+    """Stop holding this session's frames and return everything that was held.
+
+    Every exit of a (re-)subscribe calls it: a gate left behind would hold that
+    session's frames in a list nobody ever reads.
+    """
+    with _frame_channels_lock:
+        staged = channel.get("staging", {}).pop(session_id, None)
+    return staged or []
 
 
 def _frame_channel_push(channel: dict, item: dict) -> bool:
@@ -2546,31 +2601,49 @@ def _frame_channel_push(channel: dict, item: dict) -> bool:
         return True
     except _queue.Full:
         # The broker retains every frame, so a dropped live frame is not lost
-        # data: the tab reconnects and replays from its own cursor. Returning
+        # data -- but it *is* a hole in what this tab sees, and the tab closes
+        # it itself: it tracks the sequence it received per session, and a jump
+        # re-subscribes that session from the last sequence it applied. Counting
+        # the drops here is what makes that repair rate measurable. Returning
         # False would mark this subscriber dead and could cancel an inference
         # that is merely being read slowly, so report success instead.
+        channel["dropped"] = int(channel.get("dropped", 0)) + 1
         logging.getLogger("runtime.server").warning(
-            "frame_channel queue_full conn=%s sid=%s qsize=%s",
-            channel.get("id"), item.get("session_id"), channel["queue"].qsize(),
+            "frame_channel queue_full conn=%s sid=%s seq=%s qsize=%s dropped=%s",
+            channel.get("id"), item.get("session_id"), item.get("seq"),
+            channel["queue"].qsize(), channel["dropped"],
         )
         return True
 
 
 def _make_frame_channel_send_fn(channel: dict, session_id: str):
-    """Bridge one broker subscriber to this channel's outgoing queue."""
+    """Bridge one broker subscriber to this channel's outgoing queue.
+
+    While a subscription for this session is being armed, the channel is not
+    allowed to deliver for it yet: frames that race in during that hand-off are
+    staged instead of overtaking their own ``sub_init`` (see
+    :func:`frame_channel_subscribe`).
+    """
     def _send(envelope) -> bool:
         if envelope is None:
-            # The broker uses None to retire a generation / finish the stream.
-            with _frame_channels_lock:
+            item = {"type": "done", "session_id": session_id}
+        else:
+            item = {
+                "type": "frame",
+                "session_id": session_id,
+                "seq": envelope["seq"],
+                "event": envelope.get("event"),
+                "frame": envelope["frame"],
+            }
+        with _frame_channels_lock:
+            if envelope is None:
+                # The broker uses None to retire a generation / finish the stream.
                 channel["sessions"].pop(session_id, None)
-            return _frame_channel_push(channel, {"type": "done", "session_id": session_id})
-        return _frame_channel_push(channel, {
-            "type": "frame",
-            "session_id": session_id,
-            "seq": envelope["seq"],
-            "event": envelope.get("event"),
-            "frame": envelope["frame"],
-        })
+            staged = channel.get("staging", {}).get(session_id)
+            if staged is not None:
+                staged.append(item)
+                return True
+        return _frame_channel_push(channel, item)
     return _send
 
 
@@ -2585,6 +2658,20 @@ def _new_frame_channel_locked(conn_id: str) -> dict:
         "grace_timer": None,
         "created": time.monotonic(),
         "last_seen": time.monotonic(),
+        # An attached SSE reader. One conn can legitimately have more than one
+        # (two tabs sharing a sessionStorage conn id, or a proxy that keeps the
+        # upstream of a replaced request open). Whichever one dies must not
+        # declare the tab gone while another is still streaming frames.  It is
+        # also the definition of "this channel can deliver": subscriptions are
+        # refused while it is zero.
+        "handlers": 0,
+        # Set when the channel is removed from the registry, so the reader that
+        # still holds a reference to this object stops writing instead of
+        # pumping keepalives into a browser that takes them for a live channel.
+        "closed": False,
+        # session_id -> frames held back while that subscription is being armed.
+        # Empty except during the hand-off of a (re-)subscribe.
+        "staging": {},
     }
     _frame_channels[conn_id] = channel
     # Bound the registry: evict the least recently seen disconnected channels.
@@ -2594,10 +2681,9 @@ def _new_frame_channel_locked(conn_id: str) -> dict:
             key=lambda c: c["last_seen"],
         )
         for victim in stale[: len(_frame_channels) - FRAME_CHANNEL_MAX]:
-            _drop_frame_channel_locked(victim["id"], victim)
-    # A channel created by a subscribe command that never attaches must not
-    # leak its subscriptions.
-    _arm_frame_channel_grace(conn_id, 0)
+            _drop_frame_channel_locked(victim["id"], victim, cause="channel_limit")
+    # No grace timer at birth: only an attaching reader creates a channel now, so
+    # there is no half-built channel that could leak a subscription nobody reads.
     return channel
 
 
@@ -2628,6 +2714,8 @@ def _arm_frame_channel_grace(conn_id: str, generation: int) -> None:
                 return
             if current["generation"] != generation:
                 return
+            if current["handlers"] > 0:
+                return              # another reader of this conn is still alive
             _drop_frame_channel_locked(conn_id, current)
 
     timer = threading.Timer(_frame_channel_grace_s(), _expire)
@@ -2636,17 +2724,28 @@ def _arm_frame_channel_grace(conn_id: str, generation: int) -> None:
     timer.start()
 
 
-def _drop_frame_channel_locked(conn_id: str, channel: dict) -> None:
+def _drop_frame_channel_locked(conn_id: str, channel: dict, cause: str = "grace_expired") -> None:
     """Remove the channel and every per-session subscription it holds."""
     timer = channel.get("grace_timer")
     if timer is not None:
         timer.cancel()
         channel["grace_timer"] = None
-    # Before any subscription is released: the tab being gone is exactly what the
-    # per-tab liveness check must stop rescuing, and releasing subscriptions is
-    # what re-runs that check.
+    # Tell the reader to stop first. Left to its own devices it exits only when a
+    # write fails, so it used to go on pumping keepalives out of an object that is
+    # no longer the registry's channel -- and the browser reads those bytes as a
+    # healthy connection (observed: 26-29s, once 20 minutes). The flag also covers
+    # the case of a full queue dropping the wake-up.
+    channel["closed"] = True
+    _frame_channel_push(channel, {"type": "close", "generation": channel["generation"],
+                                  "reason": cause})
+    # Release every per-session subscription this channel held. The inferences
+    # behind them are untouched: they keep running and keep their frames
+    # retained, which is what makes "open that conversation again" work.
     channel["connected"] = False
     released = sorted(channel["sessions"])
+    # How long the transport had already been gone: the difference between
+    # "the browser never came back" and "the page asked us to stop".
+    detached_for = time.monotonic() - float(channel.get("last_seen") or time.monotonic())
     for session_id, send_fn in list(channel["sessions"].items()):
         channel["sessions"].pop(session_id, None)
         try:
@@ -2655,17 +2754,14 @@ def _drop_frame_channel_locked(conn_id: str, channel: dict) -> None:
             pass
     if _frame_channels.get(conn_id) is channel:
         _frame_channels.pop(conn_id, None)
-    # Generations this tab had already unsubscribed hold no observer at all, so
-    # nothing else would re-evaluate them: this tab leaving is their signal.
-    with _session_stream_lock:
-        _cancel_unobserved_streams_of_conn_locked(conn_id)
-    if released:
-        # Without this line a dropped channel is invisible in the log, and its
-        # released subscriptions look like a spontaneous inference cancellation.
-        logging.getLogger("runtime.server").info(
-            "frame_channel dropped conn=%s generation=%s released=%s",
-            conn_id, channel.get("generation"), released,
-        )
+    # Without this line a dropped channel is invisible in the log, and its
+    # released subscriptions look like a spontaneous inference cancellation.
+    logging.getLogger("runtime.server").info(
+        "frame_channel dropped conn=%s generation=%s cause=%s handlers=%s "
+        "released=%s detached_for=%.1fs",
+        conn_id, channel.get("generation"), cause, channel.get("handlers"),
+        released, detached_for,
+    )
 
 
 def get_or_create_frame_channel(conn_id: str) -> dict:
@@ -2691,15 +2787,24 @@ def attach_frame_channel(conn_id: str) -> tuple[dict, int]:
         channel = _frame_channels.get(conn_id)
         if channel is None:
             channel = _new_frame_channel_locked(conn_id)
-        reattach = channel["generation"] > 0 or channel["sessions"]
-        channel["generation"] += 1
-        generation = channel["generation"]
+        reattach = bool(channel["generation"] > 0 or channel["sessions"])
+        channel["generation"] = generation = _next_frame_channel_generation()
         channel["connected"] = True
+        channel["handlers"] = int(channel.get("handlers", 0)) + 1
         channel["last_seen"] = time.monotonic()
         timer = channel.get("grace_timer")
         if timer is not None:
             timer.cancel()
             channel["grace_timer"] = None
+        # Every attach is logged: a cancellation blamed on "nobody is watching"
+        # is only credible once the log can show whether the tab ever came back
+        # (and how many times) after it first connected.
+        logging.getLogger("runtime.server").info(
+            "frame_channel attach conn=%s generation=%s reattached=%s "
+            "handlers=%s sessions=%s",
+            conn_id, generation, reattach, channel["handlers"],
+            sorted(channel["sessions"]),
+        )
     if reattach:
         import queue as _queue
         drained = 0
@@ -2723,79 +2828,149 @@ def attach_frame_channel(conn_id: str) -> tuple[dict, int]:
     return channel, generation
 
 
-def detach_frame_channel(conn_id: str, generation: int) -> bool:
+def detach_frame_channel(conn_id: str, generation: int, channel: dict | None = None) -> bool:
     """Mark the channel's SSE connection as gone; keep it for the grace window.
 
+    ``channel`` is the object this reader was attached to. Passing it lets a
+    reader of a *dropped* incarnation bow out quietly: when the registry's entry
+    under the same ``conn`` is a different object, this connection belongs to a
+    channel that has already been retired, and decrementing the counters of the
+    tab that replaced it would cut a streaming connection short.
+
     Subscriptions deliberately stay registered for ``FRAME_CHANNEL_GRACE_S`` so a
-    reconnect (same tab, same ``conn`` id) does not cancel inferences that are
-    still being watched. After the window they are released, which restores the
-    "nobody is watching" cancellation rule for a tab that is really gone.
+    reconnect (same tab, same ``conn`` id) lands on the same channel and replays
+    its gap instead of re-subscribing from scratch. Releasing them after the
+    window is resource housekeeping only: the inferences they carry keep running
+    either way, and no cancellation depends on this window.
     """
     with _frame_channels_lock:
-        channel = _frame_channels.get(conn_id)
-        if channel is None or channel["generation"] != generation:
-            # A newer connection already owns this channel; this handler is stale.
+        current = _frame_channels.get(conn_id)
+        if current is None:
             return False
-        channel["connected"] = False
-        channel["last_seen"] = time.monotonic()
-        _arm_frame_channel_grace(conn_id, generation)
-        return True
+        if channel is not None and current is not channel:
+            logging.getLogger("runtime.server").info(
+                "frame_channel detach ignored conn=%s generation=%s "
+                "(that channel was retired; %s is the live one)",
+                conn_id, generation, current.get("generation"),
+            )
+            return False
+        channel = current
+        channel["handlers"] = max(0, int(channel.get("handlers", 0)) - 1)
+        owned = channel["generation"] == generation
+        if owned:
+            channel["connected"] = False
+            channel["last_seen"] = time.monotonic()
+        if channel["handlers"] > 0:
+            # Another reader of this same conn is still streaming (two tabs that
+            # share a sessionStorage conn id, or a proxy holding the upstream of
+            # a replaced request open). The tab has not left, so the countdown
+            # that ends in releasing its subscriptions must not start.
+            logging.getLogger("runtime.server").info(
+                "frame_channel detached conn=%s generation=%s handlers_left=%s "
+                "(another reader still attached) sessions=%s",
+                conn_id, generation, channel["handlers"], sorted(channel["sessions"]),
+            )
+            return False
+        logging.getLogger("runtime.server").info(
+            "frame_channel detached conn=%s generation=%s grace=%ss sessions=%s",
+            conn_id, channel["generation"], _frame_channel_grace_s(),
+            sorted(channel["sessions"]),
+        )
+        # Even when this handler was stale, it may be the last reader: the channel
+        # is unattended now and the clock has to run for the current generation.
+        _arm_frame_channel_grace(conn_id, channel["generation"])
+        return owned
 
 
 def frame_channel_subscribe(conn_id: str, session_id: str, after_seq: int = -1) -> tuple[bool, dict]:
     """Watch ``session_id`` on this channel and replay its gap frames in order.
 
-    Registration with the per-session broker and the ``sub_init`` + replay push
-    are atomic against live delivery (the channel ``send_fn`` takes the same
-    lock), so no frame can land before its ``sub_init`` or be duplicated by the
-    replay.
+    Three things have to reach the reader in exactly this order: ``sub_init``,
+    the replay of whatever the tab missed, then live frames. Snapshotting
+    atomically is not sufficient on its own -- ``register_session_stream_with_snapshot``
+    did that already, and each sequence still arrived exactly once -- but a frame
+    published during the hand-off overtook its own ``sub_init`` and landed
+    *before* the replay, so the reader saw sequence 7, then 1, 2, … 7. A tab that
+    tracks what it has applied (which is how it repairs holes) then mistakes the
+    replay for a duplicate and drops the frames it is missing. So frames that
+    race in while the hand-off runs are *staged* on the channel and flushed after
+    the replay, in sequence order.
     """
     with _frame_channels_lock:
         channel = _frame_channels.get(conn_id)
-        if channel is None:
-            channel = _new_frame_channel_locked(conn_id)
-        channel["last_seen"] = time.monotonic()
-        previous = channel["sessions"].pop(session_id, None)
+        # A subscription is a promise that frames will be delivered, and only an
+        # attached SSE reader can deliver one. A channel without a reader used to
+        # be created on demand here and answer ``registered: true``, which is the
+        # answer the client's hand-off gate reads as permission to release the
+        # POST that *is* the observer -- and seconds later the detach grace
+        # revoked that subscription and started the abandonment window. So a conn
+        # is subscribable exactly while its reader is attached, and the client
+        # has to open the GET first (``registered: false`` says so).
+        attached = channel is not None and channel["handlers"] > 0
+        if attached:
+            channel["last_seen"] = time.monotonic()
+            previous = channel["sessions"].pop(session_id, None)
+            _frame_channel_stage(channel, session_id)
+    if not attached:
+        logging.getLogger("runtime.server").info(
+            "frame_channel subscribe refused conn=%s sid=%s (no attached reader)",
+            conn_id, session_id,
+        )
+        snapshot = get_session_stream_snapshot(session_id)
+        snapshot["reason"] = "no_reader"
+        return False, snapshot
     if previous is not None:
         # A fresh cursor replaces the old subscription (re-subscribe after a
         # retired generation, or a duplicate subscribe from the same tab).
         unsubscribe_session_stream(session_id, previous)
 
     send_fn = _make_frame_channel_send_fn(channel, session_id)
-    registered, snapshot = register_session_stream_with_snapshot(session_id, send_fn, after_seq)
-    if registered:
-        note_session_watched_by(session_id, conn_id)
-    with _frame_channels_lock:
-        current = _frame_channels.get(conn_id)
-        if current is not channel:
-            # Torn down concurrently: undo and report as not watched.
-            try:
-                unsubscribe_session_stream(session_id, send_fn)
-            except Exception:
-                pass
-            return False, snapshot
-        current["sessions"][session_id] = send_fn
-        current["last_seen"] = time.monotonic()
-        _frame_channel_push(current, {
-            "type": "sub_init",
-            "session_id": session_id,
-            "active": snapshot["active"],
-            "persisted_seq": snapshot["persisted_seq"],
-            "latest_seq": snapshot["latest_seq"],
-        })
-        for item in snapshot["frames"]:
+    try:
+        registered, snapshot = register_session_stream_with_snapshot(session_id, send_fn, after_seq)
+        with _frame_channels_lock:
+            current = _frame_channels.get(conn_id)
+            if current is not channel:
+                # Torn down concurrently: undo and report as not watched.
+                try:
+                    unsubscribe_session_stream(session_id, send_fn)
+                except Exception:
+                    pass
+                return False, snapshot
+            current["sessions"][session_id] = send_fn
+            current["last_seen"] = time.monotonic()
             _frame_channel_push(current, {
-                "type": "frame",
+                "type": "sub_init",
                 "session_id": session_id,
-                "seq": item["seq"],
-                "event": item.get("event"),
-                "frame": item["frame"],
+                "active": snapshot["active"],
+                "persisted_seq": snapshot["persisted_seq"],
+                "latest_seq": snapshot["latest_seq"],
             })
-        if not registered:
-            # Mirrors the immediate ``[DONE]`` of GET /v1/sessions/{id}/stream:
-            # this session is not streaming, so the client may finalize now
-            # instead of waiting for a frame that will never come.
-            _frame_channel_push(current, {"type": "done", "session_id": session_id})
+            replayed_through = 0
+            for item in snapshot["frames"]:
+                _frame_channel_push(current, {
+                    "type": "frame",
+                    "session_id": session_id,
+                    "seq": item["seq"],
+                    "event": item.get("event"),
+                    "frame": item["frame"],
+                })
+                replayed_through = max(replayed_through, int(item["seq"]))
+            # Everything that was published while the hand-off was running, in
+            # sequence order, minus the frames the replay has just carried.
+            raced = [item for item in _frame_channel_flush(channel, session_id) if not (
+                item.get("type") == "frame" and int(item.get("seq") or 0) <= replayed_through
+            )]
+            for item in sorted(raced, key=lambda i: int(i.get("seq") or 0)
+                               if i.get("type") == "frame" else float("inf")):
+                _frame_channel_push(current, item)
+            if not registered:
+                # Mirrors the immediate ``[DONE]`` of GET /v1/sessions/{id}/stream:
+                # this session is not streaming, so the client may finalize now
+                # instead of waiting for a frame that will never come.
+                _frame_channel_push(current, {"type": "done", "session_id": session_id})
+    finally:
+        # Whatever happened, this session is delivering again.
+        _frame_channel_flush(channel, session_id)
     return registered, snapshot
 
 
@@ -2806,26 +2981,30 @@ def frame_channel_unsubscribe(conn_id: str, session_id: str) -> bool:
         if channel is None:
             return False
         send_fn = channel["sessions"].pop(session_id, None)
+        _frame_channel_flush(channel, session_id)
         channel["last_seen"] = time.monotonic()
-        still_watched = session_id in channel["sessions"]
     if send_fn is None:
         return False
-    if not still_watched:
-        # The tab is still connected, so record it as the last watcher: the
-        # generation gets cancelled when the tab goes, not when this one session
-        # stops being routed (closing that conversation does exactly that).
-        note_session_watched_by(session_id, conn_id)
     unsubscribe_session_stream(session_id, send_fn)
     return True
 
 
-def close_frame_channel(conn_id: str) -> bool:
-    """Tear the channel down now (the tab closed or navigated away)."""
+def close_frame_channel(conn_id: str, reason: str = "close_command") -> bool:
+    """Tear the channel down now (the tab closed, hid, or ran out of work).
+
+    ``reason`` is only for the log: it says which page command ended the delivery.
+    Tearing a channel down never touches the inference behind it.
+    """
     with _frame_channels_lock:
         channel = _frame_channels.get(conn_id)
         if channel is None:
             return False
-        _drop_frame_channel_locked(conn_id, channel)
+        # Reached only on an explicit browser command (POST /v1/sessions/frames/close):
+        # the page asked to stop carrying these sessions without releasing their
+        # subscriptions first. The drop line below reports the reason with
+        # detached_for ~= 0 (the transport was still live), which separates that
+        # from a transport that died and simply never came back.
+        _drop_frame_channel_locked(conn_id, channel, cause=reason)
         return True
 
 
@@ -2838,6 +3017,9 @@ def frame_channel_snapshot() -> dict:
                 "connected": channel["connected"],
                 "generation": channel["generation"],
                 "queued": channel["queue"].qsize(),
+                # Live frames this tab was too slow to take; the tab closes the
+                # resulting hole by its cursor, this says how often it has to.
+                "dropped": int(channel.get("dropped", 0)),
             }
             for conn_id, channel in _frame_channels.items()
         }

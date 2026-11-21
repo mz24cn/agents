@@ -1,7 +1,19 @@
-"""Connection-lifetime policy tests for retained session inference streams."""
+"""Ownership tests for the retained session inference stream.
+
+A generation belongs to its session and is identified by its ``owner_event``. No
+connection owns it, and no connection can end it. These tests pin what that
+means in practice:
+
+* nothing an observer does -- subscribing, unsubscribing, going away for good --
+  reaches the inference that it was watching;
+* a generation that has already ended still cannot publish into its successor's
+  stream, finish it, or overwrite its status;
+* a second request cannot take a live generation's session over -- one slot per
+  session means a displaced run could not be reached by any stop button
+  afterwards (see also ``tests/test_session_generation_ownership.py``).
+"""
 
 import threading
-import time
 
 import pytest
 
@@ -9,14 +21,9 @@ from runtime import server_state
 
 
 @pytest.fixture(autouse=True)
-def clean_session_stream_state(monkeypatch):
-    # These tests assert the connection policy itself. The deferred window that
-    # protects a hand-off/reconnect from cancelling the generation is covered by
-    # the *_grace_* tests below, which set their own window.
-    monkeypatch.setenv("SESSION_UNOBSERVED_GRACE_S", "0")
+def clean_session_stream_state():
     with server_state._session_stream_lock:
         server_state._session_streams.clear()
-        server_state._flight_sessions.clear()
     with server_state._session_state_lock:
         server_state._session_statuses.clear()
         server_state._unread_sessions.clear()
@@ -24,142 +31,122 @@ def clean_session_stream_state(monkeypatch):
     yield
     with server_state._session_stream_lock:
         server_state._session_streams.clear()
-        server_state._flight_sessions.clear()
     with server_state._session_state_lock:
         server_state._session_statuses.clear()
         server_state._unread_sessions.clear()
         server_state._session_event_subscribers.clear()
 
 
-def test_last_starter_disconnect_cancels_non_flight_inference():
+def test_observers_coming_and_going_never_touch_the_generation():
+    """Subscribers are registered and released; that is all they ever do.
+
+    The broker used to derive "nobody is watching, so this is an orphan" from the
+    same bookkeeping, which is how a hand-off, a reload, a hidden tab or a stale
+    ``finally`` block ended up cancelling an inference nobody had stopped.
+    """
     cancel_event = threading.Event()
     server_state.begin_session_stream("session-1", cancel_event)
 
-    assert server_state.disconnect_session_stream_starter("session-1") is True
-    assert cancel_event.is_set()
-
-
-def test_other_open_browser_keeps_non_flight_inference_alive():
-    cancel_event = threading.Event()
-    subscriber = lambda envelope: True
-    server_state.begin_session_stream("session-1", cancel_event)
+    first = lambda envelope: True
     registered, snapshot = server_state.register_session_stream_with_snapshot(
-        "session-1", subscriber
+        "session-1", first,
     )
+    assert registered is True and snapshot["active"] is True
 
-    assert registered is True
-    assert snapshot["active"] is True
-    assert server_state.disconnect_session_stream_starter("session-1") is False
+    second = lambda envelope: True
+    server_state.register_session_stream_with_snapshot("session-1", second)
+    server_state.unsubscribe_session_stream("session-1", first)
+    server_state.unsubscribe_session_stream("session-1", second)
+    # A duplicate/stale unsubscribe is a no-op rather than a re-evaluation.
+    server_state.unsubscribe_session_stream("session-1", first)
+
+    with server_state._session_stream_lock:
+        assert server_state._session_streams["session-1"]["subscribers"] == []
+        assert server_state._session_streams["session-1"]["done"] is False
     assert not cancel_event.is_set()
+    assert server_state.publish_session_stream_frame(
+        "session-1", {"role": "assistant", "delta": "still running"},
+    ) == 1
 
-    server_state.unsubscribe_session_stream("session-1", subscriber)
-    assert cancel_event.is_set()
+
+def test_the_abandonment_machinery_is_gone_not_merely_disabled():
+    """No window, no grace, no flight switch, no "starter disconnected" hook.
+
+    Each of these was a way for a transport event to end a run, and each one had
+    to be patched at least once. Deleting the names is what keeps the next
+    interruption from being fixed by re-introducing one of them.
+    """
+    for gone in (
+        "_cancel_unobserved_stream_locked",
+        "_arm_unobserved_cancel_locked",
+        "_resolve_unobserved_cancel",
+        "_hold_session_locked",
+        "_frame_channel_is_live",
+        "frame_channel_hold",
+        "disconnect_session_stream_starter",
+        "set_session_flight_mode",
+        "load_flight_sessions",
+        "DETACHED_WINDOW_S",
+        "_flight_sessions",
+    ):
+        assert not hasattr(server_state, gone), f"{gone} is back"
+
+    with server_state._session_stream_lock:
+        server_state.begin_session_stream("session-1", threading.Event())
+        stream = server_state._session_streams["session-1"]
+    for field in ("unobserved_timer", "watched_by", "hold_until", "starter_connected"):
+        assert field not in stream, f"{field} is back"
 
 
-def test_stale_unsubscribe_does_not_cancel_after_a_replacement_subscriber_left():
+def test_a_second_request_cannot_take_a_live_generation_over():
+    """The session stays with the run that is producing output.
+
+    There is one ``active_infers`` slot per session, so a generation that loses
+    its broker also loses the only handle ``/v1/infer/abort`` -- stop, force,
+    pause, interjection -- has on it. Turning its frames away hides the run
+    without ending it: it keeps issuing model requests and executing tools for
+    its whole remaining round budget, invisible and unstoppable. So the newcomer
+    is refused, and ending a generation stays something the user can reach.
+    """
+    first_event, second_event = threading.Event(), threading.Event()
+    server_state.begin_session_stream("session-1", first_event)
+
+    incumbent = server_state.begin_session_stream("session-1", second_event)
+
+    assert incumbent is first_event, "the refused request is told who owns the session"
+    assert not first_event.is_set(), "the incumbent is left running, not cancelled"
+    assert not second_event.is_set()
+    with server_state._session_stream_lock:
+        stream = server_state._session_streams["session-1"]
+    assert stream["cancel_event"] is first_event
+    assert stream["done"] is False
+    assert server_state.publish_session_stream_frame(
+        "session-1", {"role": "assistant", "delta": "still running"},
+        owner_event=first_event,
+    ) == 1
+    assert server_state.publish_session_stream_frame(
+        "session-1", {"role": "assistant", "delta": "mine now?"},
+        owner_event=second_event,
+    ) is None, "a refused request owns nothing to write through"
+
+
+def test_events_hub_subscribers_are_not_part_of_the_session_stream():
+    """The global status hub has its own subscriber list, deliberately.
+
+    Sidebar/status subscribers cannot register a per-session observer, so they
+    never appear in -- or disappear from -- a generation's delivery accounting.
+    """
     cancel_event = threading.Event()
-    stale_subscriber = lambda envelope: True
     server_state.begin_session_stream("session-1", cancel_event)
-    server_state.register_session_stream_with_snapshot("session-1", stale_subscriber)
-    server_state.unsubscribe_session_stream("session-1", stale_subscriber)
-
-    # The starter is still alive, so the first unsubscribe did not cancel.
-    assert not cancel_event.is_set()
-    server_state.disconnect_session_stream_starter("session-1")
-    assert cancel_event.is_set()
-
-    # A duplicate/stale finally block must be a no-op rather than re-evaluating
-    # connection policy for a subscriber that is no longer registered.
-    server_state.unsubscribe_session_stream("session-1", stale_subscriber)
-
-
-def test_flight_mode_allows_zero_session_subscribers_until_disabled():
-    cancel_event = threading.Event()
-    server_state.begin_session_stream("session-1", cancel_event)
-    server_state.set_session_flight_mode("session-1", True)
-
-    assert server_state.disconnect_session_stream_starter("session-1") is False
-    assert not cancel_event.is_set()
-
-    enabled = server_state.set_session_flight_mode("session-1", False)
-    assert enabled is False
-    assert cancel_event.is_set()
-
-
-def test_global_agent_service_connection_does_not_count_as_session_subscription():
-    """Only starter/session-stream connections are represented in the broker."""
-    cancel_event = threading.Event()
-    server_state.begin_session_stream("session-1", cancel_event)
-
-    # Global /v1/sessions/events subscribers live in a separate collection and
-    # therefore cannot keep this session-specific inference alive.
     server_state._session_event_subscribers.append(lambda data: True)
     try:
-        assert server_state.disconnect_session_stream_starter("session-1") is True
-        assert cancel_event.is_set()
+        with server_state._session_stream_lock:
+            assert server_state._session_streams["session-1"]["subscribers"] == []
+        assert server_state.publish_session_stream_frame(
+            "session-1", {"role": "assistant", "delta": "x"}) == 1
+        assert not cancel_event.is_set()
     finally:
         server_state._session_event_subscribers.clear()
-
-
-# --- deferred cancellation window (the POST -> frame-channel hand-off) ---------
-
-def test_unobserved_cancellation_waits_so_a_handoff_can_take_over(monkeypatch):
-    """A momentarily unobserved generation must not be cancelled on the spot.
-
-    Releasing the initiating POST stream and registering the shared frame-channel
-    subscriber are two separate requests, so the broker can be briefly observed
-    by nobody. Cancelling at that instant is what users saw as
-    "Error: user interrupted." for inferences they never aborted.
-    """
-    monkeypatch.setenv("SESSION_UNOBSERVED_GRACE_S", "0.3")
-    cancel_event = threading.Event()
-    server_state.begin_session_stream("session-1", cancel_event)
-
-    assert server_state.disconnect_session_stream_starter("session-1") is False
-    assert not cancel_event.is_set()
-
-    # The hand-off subscription lands inside the window -> nothing is cancelled.
-    subscriber = lambda envelope: True
-    registered, _snapshot = server_state.register_session_stream_with_snapshot(
-        "session-1", subscriber
-    )
-    assert registered is True
-    time.sleep(0.45)
-    assert not cancel_event.is_set()
-
-    # And when the observer really does go away, the window still cancels it.
-    server_state.unsubscribe_session_stream("session-1", subscriber)
-    assert not cancel_event.is_set()
-    time.sleep(0.45)
-    assert cancel_event.is_set()
-
-
-def test_flight_mode_toggled_on_inside_the_window_disarms_the_cancellation(monkeypatch):
-    monkeypatch.setenv("SESSION_UNOBSERVED_GRACE_S", "0.2")
-    cancel_event = threading.Event()
-    server_state.begin_session_stream("session-1", cancel_event)
-
-    server_state.disconnect_session_stream_starter("session-1")
-    assert not cancel_event.is_set()
-
-    assert server_state.set_session_flight_mode("session-1", True) is True
-    time.sleep(0.35)
-    assert not cancel_event.is_set()
-
-
-def test_pending_cancellation_of_a_retired_generation_still_runs(monkeypatch):
-    """A new generation must not swallow the old generation's pending cancel."""
-    monkeypatch.setenv("SESSION_UNOBSERVED_GRACE_S", "0.2")
-    old_event = threading.Event()
-    server_state.begin_session_stream("session-1", old_event)
-    server_state.disconnect_session_stream_starter("session-1")
-    assert not old_event.is_set()
-
-    new_event = threading.Event()
-    server_state.begin_session_stream("session-1", new_event)
-    time.sleep(0.35)
-    assert old_event.is_set()
-    assert not new_event.is_set()
 
 
 def test_stale_generation_cannot_finish_or_publish_into_replacement_stream():
@@ -172,6 +159,9 @@ def test_stale_generation_cannot_finish_or_publish_into_replacement_stream():
     server_state.register_session_stream_with_snapshot(
         "session-1", old_subscriber_events.append,
     )
+    # A live generation is never replaced; the old run was stopped first, and it
+    # is that outgoing run whose frames and cleanup must now stay out of the way.
+    old_event.set()
     server_state.begin_session_stream("session-1", new_event)
     assert old_subscriber_events == [None]
     server_state.register_session_stream_with_snapshot(
@@ -202,6 +192,9 @@ def test_stale_generation_cannot_overwrite_replacement_streaming_status():
         "session-1", old_event, "streaming",
     ) is True
 
+    # Stopped first, so the successor is allowed to start; its cleanup below is
+    # then the outgoing run arriving late.
+    old_event.set()
     server_state.begin_session_stream("session-1", new_event)
     assert server_state.transition_session_stream_status(
         "session-1", new_event, "streaming",
@@ -213,16 +206,3 @@ def test_stale_generation_cannot_overwrite_replacement_streaming_status():
     assert server_state._session_statuses["session-1"] == "streaming"
     assert "session-1" not in server_state._unread_sessions
     assert '"status": "done_error_unread"' not in "".join(frames)
-
-
-def test_stale_starter_disconnect_does_not_cancel_replacement_inference():
-    old_event = threading.Event()
-    new_event = threading.Event()
-
-    server_state.begin_session_stream("session-1", old_event)
-    server_state.begin_session_stream("session-1", new_event)
-
-    assert server_state.disconnect_session_stream_starter(
-        "session-1", owner_event=old_event,
-    ) is False
-    assert not new_event.is_set()

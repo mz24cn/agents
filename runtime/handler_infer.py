@@ -37,14 +37,11 @@ from runtime.models import (
     ToolConfig,
 )
 from runtime.server_state import (
-    _session_stream_lock,
-    _session_streams,
     answered_client_tool_call_ids,
     begin_session_stream,
     clear_infer_control,
     claim_client_tool_answers,
     close_infer_loop,
-    disconnect_session_stream_starter,
     end_paused_session_status,
     finish_session_stream,
     get_infer_exit_reason,
@@ -60,6 +57,7 @@ from runtime.server_state import (
     release_client_tool_answers,
     request_pause_infer,
     seed_paused_status,
+    session_stream_is_live,
     set_session_stream_agents,
     stream_batch_is_protocol_complete,
     StreamUsageEstimator,
@@ -591,6 +589,35 @@ class HandlerInferMixin:
                         raw_session_id,
                     )
 
+        # === 一个会话同时只有一个世代（流式与非流式同一条规则）===
+        # 后端能稳定判定"这个会话正在推理"：本进程里有一个未结束、也未被要求结束
+        # 的世代（它的 broker 持有 cancel_event）。这样的会话不许被新请求接管 --
+        # 无论 POST /v1/infer/stream 还是非流式 POST /v1/infer。正在跑的那一代只
+        # 能由用户 stop/pause、租约丢失或进程收尾来结束；接管会夺走该会话唯一的
+        # active_infers 槽，旧代从此再也触达不到 abort/stop，只能继续烧模型调用、
+        # 执行工具改动工作区，而界面上看着已经空闲。
+        # 判定不了的情形不在这儿挡路：本进程没有 broker（重启后的残留 index.json
+        # 标记、上一代已按要求结束）都放行，那正是自愈路径。
+        if use_session and session_id is not None and session_stream_is_live(session_id):
+            logger.warning(
+                "infer refused sid=%s: a generation is already running in this "
+                "process (streamed or not); the request was rejected instead of "
+                "taking the session over",
+                session_id,
+            )
+            self._send_json_response(
+                409,
+                {
+                    "error": (
+                        "session is already inference in this process; "
+                        "stop or pause the running turn before starting another"
+                    ),
+                    "code": "session_inferring",
+                    "session_id": session_id,
+                },
+            )
+            return None
+
         # === Retry / resume validation ===
         continued_user_message_timestamp = None
         resume_context: Optional[list] = None
@@ -602,25 +629,11 @@ class HandlerInferMixin:
                 self._send_json_error(404, f"Session not found: {raw_session_id}")
                 return None
             if is_resume:
-                # A resume may only target a resting (paused) session. If a
-                # generation is still running — e.g. a pause was requested but
+                # A resume may only target a resting (paused) session. A
+                # generation that is still running -- a pause was requested but
                 # has not reached its round boundary yet, or another client
-                # already resumed — starting a parallel request would trigger
-                # the supersede-and-cancel path and destroy the running turn.
-                with _session_stream_lock:
-                    active = _session_streams.get(session_id)
-                    still_streaming = (
-                        active is not None
-                        and not active.get("done")
-                        and not (active.get("cancel_event") is not None and active["cancel_event"].is_set())
-                    )
-                if still_streaming:
-                    self._send_json_error(
-                        409,
-                        "session is still inference; pause has not taken effect yet "
-                        "or the session was already resumed",
-                    )
-                    return None
+                # already resumed -- is refused by the one-generation gate above,
+                # which covers streamed and non-streamed requests alike.
                 # M3: consume the pause sidecar. Its context snapshot carries
                 # the transient loop state that was never persisted as such
                 # (skill-disclosure frames, the in-loop compression rebuild,
@@ -645,6 +658,10 @@ class HandlerInferMixin:
                         "(paused_at=%s, context_turns=%d)",
                         session_id, pause_state.get("paused_at"), len(snapshot),
                     )
+                # The resume supersedes the resting state regardless of whether
+                # a sidecar survived: clear the persisted sidebar marker so the
+                # list stops showing the pause chip once the turn is running.
+                self.server.session_manager.set_session_status(session_id, None)  # type: ignore[attr-defined]
             if not is_resume and len(agent_ids) > 1 and not retry_agent_id:
                 self._send_json_error(400, "group-chat retry requires retry_agent_id")
                 return None
@@ -1366,12 +1383,36 @@ class HandlerInferMixin:
             "1", "true", "yes", "on",
         }
         if session_id is not None:
-            begin_session_stream(session_id, cancel_event)
+            incumbent = begin_session_stream(session_id, cancel_event)
+            if incumbent is not None:
+                # Reached only in the narrow window between the one-generation
+                # gate in _prepare_infer_request (which answers a clean 409) and
+                # this line: another request opened the session's generation
+                # while this one was being prepared.  The incumbent keeps
+                # everything -- its broker, its ``active_infers`` slot, the
+                # durable 推理中 marker -- because a running generation is ended
+                # by the user's stop/pause, by running to completion, or by
+                # process shutdown, not by a request that turned up late.  This
+                # one backs out having taken nothing: it never registered in
+                # ``active_infers``, and
+                # publishing is owner-gated, so no frame of ours can enter that
+                # session's stream.
+                logger.warning(
+                    "infer backed out sid=%s: another generation owns this "
+                    "session; it was left running untouched",
+                    session_id,
+                )
+                sink.error(
+                    "session is already inference in this process; "
+                    "stop or pause the running turn before starting another"
+                )
+                return
             if _body.get("resume") is not True:
                 # Any generation other than a resume supersedes the paused
                 # resting state; its sidecar would be stale context (and a
                 # stale durable paused-marker) for any later resume.
                 context_manager.clear_pause_state(session_id)
+                self.server.session_manager.set_session_status(session_id, None)  # type: ignore[attr-defined]
             set_session_stream_agents(session_id, cancel_event, agent_ids)
             # Continue has already removed the persisted final assistant turn.
             # Retain a control frame before status broadcast so every other
@@ -1436,24 +1477,27 @@ class HandlerInferMixin:
                 sink.write(payload)
 
         def _mark_starter_disconnected(exc: Exception) -> None:
+            """The initiating browser stopped listening; the run goes on.
+
+            A starter socket dying is a delivery event, never an ownership event:
+            every frame from here on is still published to the broker, retained,
+            and replayed to whoever opens this session again.
+            """
             nonlocal client_connected
             if not client_connected:
                 return
             client_connected = False
-            cancelled = bool(session_id) and disconnect_session_stream_starter(
-                session_id, owner_event=cancel_event,
-            )
             logger.warning(
-                "infer_stream: starter SSE disconnected%s: %s: %s",
-                "; cancelling unobserved non-flight inference" if cancelled else "",
+                "infer_stream: starter SSE disconnected; the inference continues "
+                "and its frames stay retained for replay: %s: %s",
                 type(exc).__name__, exc,
             )
 
         def _sse_write(frame: dict, event: Optional[str] = None) -> bool:
             """Publish once, then best-effort mirror to the starter browser.
 
-            Losing the starter cancels a non-flight inference only when no other
-            browser has opened and is still subscribed to this session.
+            Publishing does not depend on a browser being attached: the broker is
+            the record, the socket is one view of it.
             """
             nonlocal latest_stream_seq
             published_seq = publish_session_stream_frame(
@@ -1807,11 +1851,6 @@ class HandlerInferMixin:
             # client fetching the journal immediately after [DONE] sees the
             # final workspace state rather than an intermediate tool snapshot.
             self._finalize_file_journal()
-            if client_connected:
-                try:
-                    _write_sse_payload(b"data: [DONE]\n\n")
-                except Exception:
-                    client_connected = False
 
             # Check the terminal outcome before final persistence.  Failed or
             # interrupted inference must still append its assistant error turn,
@@ -1825,6 +1864,11 @@ class HandlerInferMixin:
             # the conversation is intact and persisted, but the outcome is a
             # resting "paused" state, not a finished answer. No title
             # generation on this path (the aligned decision: 暂停收尾不更新标题).
+            # The same resting-state logic suppresses the end-of-turn context
+            # compression: the turn is not over, a summary LLM call would only
+            # add seconds to the pause and roll up history the resumed
+            # generation continues inside. The resumed generation performs the
+            # post_turn compression normally when it actually completes.
             paused_exit = (
                 session_id is not None
                 and get_infer_exit_reason(session_id, cancel_event) == "paused"
@@ -1832,10 +1876,25 @@ class HandlerInferMixin:
             if use_session and self._is_active_stream(session_id, cancel_event):
                 persist_exc = conversation_persister.finalize(
                     collected_messages,
+                    compress=not paused_exit,
                     update_title=not has_error and not paused_exit,
                 )
                 if persist_exc is not None:
                     logger.error("infer_stream: failed to save conversation for session %s: %s", session_id, persist_exc)
+
+            # The turn is over only once its final persistence -- including the
+            # context compression it may trigger, which can take seconds -- has
+            # finished.  [DONE] therefore goes out HERE rather than right after
+            # the generator drained: a client that stops reading at [DONE] would
+            # otherwise never see this round's compression lifecycle pair (the
+            # events live on the same response, and on the retained broker for
+            # other tabs).  Same reasoning as _finalize_file_journal above: what
+            # the client reads at [DONE] must already be final.
+            if client_connected:
+                try:
+                    _write_sse_payload(b"data: [DONE]\n\n")
+                except Exception:
+                    client_connected = False
 
             if (
                 paused_exit
@@ -1869,6 +1928,13 @@ class HandlerInferMixin:
                         "infer_stream: failed to write pause sidecar for session %s: %s",
                         session_id, exc,
                     )
+                else:
+                    # Mirror the marker into index.json so the sidebar list
+                    # keeps showing the pause (across restarts and reloads)
+                    # without any boot-time scan. Only paired with a
+                    # successfully written sidecar: an index marker without a
+                    # sidecar could not be resumed anyway.
+                    self.server.session_manager.set_session_status(session_id, "paused")  # type: ignore[attr-defined]
 
             # --- Session Status Stream: broadcast the terminal outcome ---
             if session_id is not None:
@@ -1966,7 +2032,14 @@ class HandlerInferMixin:
             return False
         if not sidecar:
             return False
-        return seed_paused_status(session_id, sidecar.get("agent_ids") or [])
+        if not seed_paused_status(session_id, sidecar.get("agent_ids") or []):
+            return False
+        # Self-heal the durable marker for pauses written before index.json
+        # mirroring existed: recognition already proved the sidecar, so the
+        # list API can serve the yellow marker on later reloads without
+        # relying on the in-memory seed surviving a restart.
+        self.server.session_manager.set_session_status(session_id, "paused")  # type: ignore[attr-defined]
+        return True
 
     def _handle_infer_pause_status(self) -> None:
         """GET /v1/infer/pause-status?session_id=... — 单会话 paused 检查。
@@ -2028,6 +2101,10 @@ class HandlerInferMixin:
             # it would let a later restart resurrect the paused marker.
             try:
                 self.server.context_manager.clear_pause_state(session_id)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            try:
+                self.server.session_manager.set_session_status(session_id, None)  # type: ignore[attr-defined]
             except Exception:
                 pass
             self._send_json_response(200, {"ok": True, "action": "end", "ended": ended})
@@ -2122,14 +2199,24 @@ class HandlerInferMixin:
         else:
             self._send_json_response(200, {"ok": True, "status": "not_active", "session_id": session_id})
 
-    def _force_abort(self, session_id: str, owner_event=None) -> None:
-        """Kill running tool processes and force the targeted generation done."""
+    @staticmethod
+    def _interrupt_session_tool_processes(session_id: str, reason: str) -> None:
+        """Interrupt the tool calls this session's run is blocked in.
+
+        Setting a cancel event only takes effect at the run's next cancel check.
+        A turn waiting on a command, on an exec_cli call of the session's
+        persistent terminal, or on an MCP round trip never reaches that check, so
+        stopping a run means also interrupting what it is waiting for. Both hooks
+        are keyed by session id, so they touch this session's work only.
+        """
         # 1. Kill any running exec_cli process for this session.
         try:
             from runtime.builtin_tools import kill_active_process
             kill_active_process(session_id)
         except Exception as exc:
-            logger.error("force_abort: kill_active_process failed for %s: %s", session_id, exc)
+            logger.error(
+                "%s: kill_active_process failed for %s: %s", reason, session_id, exc,
+            )
 
         # 1b. Interrupt exec_cli calls on the session's persistent terminal.
         # No hook is registered for the user-abort path, and an abandoned
@@ -2141,7 +2228,14 @@ class HandlerInferMixin:
             from runtime.builtin_tools import cancel_running_command
             cancel_running_command(session_id)
         except Exception as exc:
-            logger.error("force_abort: cancel_running_command failed for %s: %s", session_id, exc)
+            logger.error(
+                "%s: cancel_running_command failed for %s: %s",
+                reason, session_id, exc,
+            )
+
+    def _force_abort(self, session_id: str, owner_event=None) -> None:
+        """Kill running tool processes and force the targeted generation done."""
+        self._interrupt_session_tool_processes(session_id, "force_abort")
 
         # 2. Kill all MCP stdio server processes so pending call_tool() unblocks.
         try:

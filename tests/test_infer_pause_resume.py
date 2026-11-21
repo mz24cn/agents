@@ -66,7 +66,6 @@ from tests.test_incremental_persist_and_continue import (
 def clean_session_stream_state():
     with server_state._session_stream_lock:
         server_state._session_streams.clear()
-        server_state._flight_sessions.clear()
     with server_state._session_state_lock:
         server_state._session_statuses.clear()
         server_state._unread_sessions.clear()
@@ -74,7 +73,6 @@ def clean_session_stream_state():
     yield
     with server_state._session_stream_lock:
         server_state._session_streams.clear()
-        server_state._flight_sessions.clear()
     with server_state._session_state_lock:
         server_state._session_statuses.clear()
         server_state._unread_sessions.clear()
@@ -90,7 +88,10 @@ def test_pause_request_requires_current_generation_owner():
     assert request_pause_infer("s1", cancel_event) is True
 
     # A replacement generation owns the session; the old event must be a no-op.
+    # (The replacement only exists because that run was stopped first -- a live
+    # generation is never displaced by a new request.)
     newer_event = threading.Event()
+    cancel_event.set()
     begin_session_stream("s1", newer_event)
     assert request_pause_infer("s1", cancel_event) is False
     assert request_pause_infer("s1", newer_event) is True
@@ -373,6 +374,251 @@ def test_pause_stops_loop_at_boundary_and_broadcasts_paused(continue_server):
     # tool result (fully executed round), waiting to be interpreted.
     turns = cm.load_conversation(session_id)
     assert turns[-1].role == "tool"
+
+
+def test_pause_suppresses_end_of_turn_compression(continue_server):
+    """A paused generation must not run the final post_turn compression.
+
+    Pause is a resting state, not a completed turn: the summary LLM call
+    would only delay the pause and roll up history the resumed generation
+    continues inside. The resumed generation that actually completes does
+    trigger it.
+    """
+    srv = continue_server
+    cm = srv._context_manager
+    session_id = cm.create_session()
+
+    compress_calls: list = []
+    original_compress = cm.compress_context
+
+    def spy(sid, *args, **kwargs):
+        compress_calls.append(kwargs.get("trigger", "auto"))
+        return original_compress(sid, *args, **kwargs)
+
+    cm.compress_context = spy
+    try:
+        r2_gate = threading.Event()
+        r1 = _openai_sse_text("", tool_calls=[("echo", "{}")])
+        r2 = _openai_sse_text("", tool_calls=[("echo", "{}")])
+        r3 = _openai_sse_text("All done.")
+
+        def side_effect(request, **kwargs):
+            body = json.loads(request.data.decode("utf-8"))
+            if "tool" in json.dumps(body.get("messages", [])):
+                r2_gate.wait(timeout=10)
+                return _make_resp(r2)
+            return _make_resp(r1)
+
+        payload = json.dumps({
+            "session_id": session_id,
+            "model_id": "test-model",
+            "tool_ids": ["echo"],
+            "messages": [{"role": "user", "content": "go"}],
+            "stream": True,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            _url(srv, "/v1/infer/stream"), data=payload,
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with _patch_model_urlopen(srv, side_effect):
+            resp = urllib.request.urlopen(req, timeout=15)
+            paused = False
+            for raw in resp:
+                text = raw.decode("utf-8", "replace")
+                if '"role": "tool"' in text and not paused:
+                    status, res = _post_json(
+                        srv, "/v1/infer/abort",
+                        {"session_id": session_id, "action": "pause"},
+                    )
+                    assert status == 200 and res.get("effective") is True
+                    r2_gate.set()
+                    paused = True
+        r2_gate.set()
+
+        assert server_state._session_statuses.get(session_id) == "paused"
+        # History is intact and persisted, the sidecar is written, but the
+        # end-of-turn compression never ran on this generation.
+        assert cm.load_conversation(session_id)[-1].role == "tool"
+        assert cm.read_pause_state(session_id) is not None
+        assert cm.get_summary(session_id)[1].get("summary_version", 0) == 0
+        assert "post_turn" not in compress_calls
+
+        # A resumed generation that actually completes compresses as usual.
+        status, body = _post_stream(srv, {
+            "session_id": session_id,
+            "model_id": "test-model",
+            "tool_ids": ["echo"],
+            "resume": True,
+            "messages": [],
+        }, _scripted_urlopen([_openai_sse_text("Interpreted at last.")]))
+        assert status == 200, f"resume failed: {body[:500]}"
+        assert "Interpreted at last." in body
+        assert "post_turn" in compress_calls
+    finally:
+        cm.compress_context = original_compress
+
+
+def test_normal_completion_still_compresses(continue_server):
+    """Guard: the pause suppression must not affect ordinary completions."""
+    srv = continue_server
+    cm = srv._context_manager
+    session_id = cm.create_session()
+
+    compress_calls: list = []
+    original_compress = cm.compress_context
+
+    def spy(sid, *args, **kwargs):
+        compress_calls.append(kwargs.get("trigger", "auto"))
+        return original_compress(sid, *args, **kwargs)
+
+    cm.compress_context = spy
+    try:
+        status, body = _post_stream(srv, {
+            "session_id": session_id,
+            "model_id": "test-model",
+            "tool_ids": [],
+            "messages": [{"role": "user", "content": "hello"}],
+        }, _scripted_urlopen([_openai_sse_text("hi there")]))
+        assert status == 200, f"send failed: {body[:500]}"
+        assert "hi there" in body
+        assert "post_turn" in compress_calls
+    finally:
+        cm.compress_context = original_compress
+
+
+def test_pause_status_persisted_in_index_and_cleared_later(continue_server):
+    """pause persists a durable paused marker into index.json; resume, a plain
+    send, and the end action each clear it again."""
+    srv = continue_server
+    cm = srv._context_manager
+    sid = cm.create_session()
+
+    def run_paused_generation():
+        """One generation: a tool round streams, the soft pause lands, the
+        generator stops at the next boundary."""
+        gate2 = threading.Event()
+        r1 = _openai_sse_text("", tool_calls=[("echo", "{}")])
+        r2 = _openai_sse_text("", tool_calls=[("echo", "{}")])
+        n_calls = [0]
+
+        def side_effect(request, **kwargs):
+            n_calls[0] += 1
+            if n_calls[0] == 1:
+                return _make_resp(r1)
+            gate2.wait(timeout=10)
+            return _make_resp(r2)
+
+        payload = json.dumps({
+            "session_id": sid,
+            "model_id": "test-model",
+            "tool_ids": ["echo"],
+            "messages": [{"role": "user", "content": "go"}],
+            "stream": True,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            _url(srv, "/v1/infer/stream"), data=payload,
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with _patch_model_urlopen(srv, side_effect):
+            resp = urllib.request.urlopen(req, timeout=15)
+            paused = False
+            for raw in resp:
+                if b'"role": "tool"' in raw and not paused:
+                    st, res = _post_json(
+                        srv, "/v1/infer/abort",
+                        {"session_id": sid, "action": "pause"},
+                    )
+                    assert st == 200 and res.get("effective") is True
+                    gate2.set()
+                    paused = True
+        gate2.set()
+        assert server_state._session_statuses.get(sid) == "paused"
+
+    def index_status():
+        return srv._session_manager._read_index().get(sid, {}).get("status")
+
+    run_paused_generation()
+    # The marker is durable: index.json carries it, so restarts and reloads
+    # keep the sidebar marker without any boot-time scan...
+    assert index_status() == "paused"
+    # ...and the list API passes index fields through untouched.
+    status, listing = _get_json(srv, "/v1/sessions?page=1&page_size=50")
+    assert status == 200
+    entry = next(e for e in listing["sessions"] if e["session_id"] == sid)
+    assert entry.get("status") == "paused"
+    # The list API also carries the live in-memory status, so the sidebar
+    # never depends on SSE timing or backend-memory luck after a reload.
+    assert entry.get("_status") == "paused"
+
+    # A resume supersedes the resting state at generation start.
+    status, body = _post_stream(srv, {
+        "session_id": sid,
+        "model_id": "test-model",
+        "tool_ids": ["echo"],
+        "resume": True,
+        "messages": [],
+    }, _scripted_urlopen([_openai_sse_text("finished after resume")]))
+    assert status == 200, f"resume failed: {body[:500]}"
+    assert index_status() is None
+
+    # A second pause marks again; a plain (non-resume) send clears again.
+    run_paused_generation()
+    assert index_status() == "paused"
+    status, body = _post_stream(srv, {
+        "session_id": sid,
+        "model_id": "test-model",
+        "tool_ids": [],
+        "messages": [{"role": "user", "content": "new direction"}],
+    }, _scripted_urlopen([_openai_sse_text("redirected")]))
+    assert status == 200, f"send failed: {body[:500]}"
+    assert index_status() is None
+
+    # The end action clears the marker without running a generation.
+    srv._session_manager.set_session_status(sid, "paused")
+    assert index_status() == "paused"
+    st, res = _post_json(srv, "/v1/infer/abort",
+                         {"session_id": sid, "action": "end"})
+    assert st == 200 and res.get("ok") is True
+    assert index_status() is None
+
+
+def test_pause_recognition_heals_index_and_list_surfaces_status(continue_server):
+    """Disk-recognised pauses self-heal index.json and ride the list API.
+
+    Covers the restart-gap cases without depending on backend memory:
+    a session paused by a build that predates index mirroring keeps only
+    the sidecar; after the backend restarts (memory blank) the UI's
+    pause-status check heals the durable marker, and /v1/sessions then
+    carries both the persisted `status` and the live `_status` so the
+    frontend can paint the row from the list response alone.
+    """
+    from runtime.context_manager import ContextManager
+
+    srv = continue_server
+    cm = srv._context_manager
+    sid = cm.create_session()
+    # Legacy shape: index entry exists (from an earlier generation) plus a
+    # pause sidecar, but the entry carries no mirrored status field.
+    srv._session_manager.update_index(sid, generate_title=False)
+    assert "status" not in srv._session_manager._read_index().get(sid, {})
+    cm.write_pause_state(sid, {
+        "version": ContextManager.PAUSE_STATE_VERSION,
+        "kind": "infer_pause", "session_id": sid,
+        "paused_at": "x", "context": [],
+    })
+
+    # Simulate the post-restart gap: no backend memory of this pause.
+    server_state._session_statuses.pop(sid, None)
+
+    status, res = _get_json(srv, f"/v1/infer/pause-status?session_id={sid}")
+    assert status == 200 and res.get("paused") is True
+    assert srv._session_manager._read_index().get(sid, {}).get("status") == "paused"
+
+    status, listing = _get_json(srv, "/v1/sessions?page=1&page_size=50")
+    assert status == 200
+    entry = next(e for e in listing["sessions"] if e["session_id"] == sid)
+    assert entry.get("status") == "paused"
+    assert entry.get("_status") == "paused"
 
 
 def test_resume_continues_from_paused_history(continue_server):
