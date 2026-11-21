@@ -12,6 +12,7 @@ import gzip
 import logging
 import re
 import stat
+import uuid
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional
@@ -521,6 +522,22 @@ _COMPRESS_BACKOFF_MIN_FAILURES: int = 3
 #: fires; acting at 90 % leaves room for the next request (which re-sends a
 #: slightly larger prompt) without waiting for the provider to reject it.
 _IN_LOOP_THRESHOLD_RATIO: float = 0.9
+
+#: How many compression audit entries one assistant turn keeps in
+#: ``conversation.json`` (``messages[i].meta.compressions``, oldest first).  A
+#: long tool chain can compress at every round, so the list is bounded; the
+#: number of entries the cap dropped is kept beside it
+#: (``meta.compressions_trimmed``) so the trail is honest about its own
+#: truncation.
+_COMPRESSION_MARKER_CAP: int = 12
+#: A provider error can be a whole HTML page; an audit entry only needs enough
+#: of it to identify the failure.
+_COMPRESSION_ERROR_MAX_CHARS: int = 300
+#: Why a compression ran.  ``auto`` is the legacy/unspecified label; the
+#: inference pipeline passes the precise one (see ``compress_context``).
+COMPRESSION_TRIGGERS: tuple[str, ...] = (
+    "auto", "post_turn", "in_loop", "pre_send", "manual",
+)
 
 #: Fragments that reveal a summary is the compression prompt's own output-format
 #: example (persisted when a failed LLM call's input prompt was mistakenly
@@ -1820,6 +1837,84 @@ def get_file_journal_diff(session_dir: str, timestamp: str) -> dict:
     return {"turn_key": turn_key, "files": files}
 
 
+class _CompressionSpan:
+    """The two SSE events and the audit entry of ONE compression attempt.
+
+    :meth:`compress_context` starts the span only once its guards have decided
+    to actually query the compression model, reports the outcome through
+    :meth:`finish` at every exit, and closes the span in a ``finally`` so that
+    a body which raises -- or one that grew an exit nobody remembered to
+    report -- can never leave a ``started`` unanswered.  That pairing is what
+    the UI relies on: an indicator opened by ``started`` and never closed by
+    ``completed`` would hang until the page is reloaded.
+
+    The ``completed`` payload doubles as the audit entry persisted into
+    ``conversation.json``: the SSE event is gone as soon as the stream is,
+    while the question ("what was the context doing around turn N?") outlives
+    the session.
+    """
+
+    def __init__(
+        self,
+        cm: "ContextManager",
+        session_id: str,
+        trigger: str,
+    ) -> None:
+        self._cm = cm
+        self.session_id = session_id
+        self.trigger = trigger if trigger in COMPRESSION_TRIGGERS else "auto"
+        #: Identifies THIS attempt in both SSE events and the audit entry, so a
+        #: client that sees the same event twice (live mirror + retained-frame
+        #: replay) and a reader of conversation.json talk about one compression.
+        self.attempt = uuid.uuid4().hex[:12]
+        self._mono = 0.0
+        self._base: dict = {}
+        self.started = False
+        self.finished = False
+
+    def start(self, **fields) -> None:
+        """Announce that the compression request is about to be sent."""
+        self.started = True
+        self._mono = time.monotonic()
+        self._base = {
+            "attempt": self.attempt,
+            "trigger": self.trigger,
+            "session_id": self.session_id,
+            **fields,
+        }
+        self._cm._emit_compression_event(
+            self.session_id, {**self._base, "phase": "started"}
+        )
+
+    def finish(self, *, success: bool, error: str = "", **fields) -> None:
+        """Announce the outcome and record it in the conversation."""
+        if not self.started or self.finished:
+            return
+        self.finished = True
+        entry = {
+            **self._base,
+            "phase": "completed",
+            "success": bool(success),
+            "error": (error or "")[:_COMPRESSION_ERROR_MAX_CHARS],
+            "duration_ms": int((time.monotonic() - self._mono) * 1000),
+            "at": now_iso(),
+            **fields,
+        }
+        self._cm._emit_compression_event(self.session_id, entry)
+        self._cm._record_compression_marker(
+            self.session_id,
+            {k: v for k, v in entry.items() if k not in ("phase", "session_id")},
+        )
+
+    def close(self) -> None:
+        """Answer an open span after the body left without reporting."""
+        if self.started and not self.finished:
+            self.finish(
+                success=False,
+                error="compression ended without an outcome (interrupted or crashed)",
+            )
+
+
 class ContextManager:
     """Manages multi-turn conversation sessions: directory creation, file I/O,
     tool call recording, and artifact storage.
@@ -1887,6 +1982,11 @@ class ContextManager:
         # Per-session compression failure state (consecutive failures, token
         # count and timestamp at last failure) used for backoff.
         self._compress_failure_state: dict[str, dict] = {}
+        # Transport for the compression lifecycle events (see
+        # :meth:`set_compression_event_sink`).  ``None`` (the default, and what
+        # every embedder/test gets) keeps compression silent: this module does
+        # not know about SSE, only about the files it writes.
+        self._compression_event_fn: Optional[Callable[[str, dict], None]] = None
         # Sessions for which the placeholder-summary warning was already logged.
         self._placeholder_summary_warned: set[str] = set()
 
@@ -3300,6 +3400,124 @@ class ContextManager:
         window = min(known) if known else 0
         return (model_id, window)
 
+    # ------------------------------------------------------------------
+    # Compression observability: SSE lifecycle events + conversation audit
+    # ------------------------------------------------------------------
+
+    def set_compression_event_sink(
+        self, sink: Optional[Callable[[str, dict], None]]
+    ) -> None:
+        """Install the transport for context-compression lifecycle events.
+
+        The sink is invoked as ``sink(session_id, payload)`` twice per
+        compression that actually reaches the model: once with
+        ``payload["phase"] == "started"`` just before the request goes out, and
+        once with ``payload["phase"] == "completed"`` after ``summary.md`` /
+        ``memory.md`` have been written -- or after the attempt failed, with the
+        reason in ``payload["error"]`` and ``payload["success"]`` false.
+        Compressions the guards decline (below threshold, nothing new to
+        compress, failure backoff) emit NOTHING: the pair exists to mark the
+        window during which the session is waiting on the compression model, and
+        a lone ``started`` would leave that question permanently unanswered.
+
+        The payload is transport-agnostic on purpose; the server installs a sink
+        that publishes it onto the session's SSE stream (see
+        ``runtime.server_state.broadcast_compression_event``).  A raising sink is
+        logged and ignored -- observability must never be the reason a
+        compression fails.  ``None`` removes the sink again.
+        """
+        self._compression_event_fn = sink
+
+    def _emit_compression_event(self, session_id: str, payload: dict) -> None:
+        """Deliver one compression lifecycle event, best effort."""
+        sink = self._compression_event_fn
+        if sink is None:
+            return
+        try:
+            sink(session_id, dict(payload))
+        except Exception as exc:  # noqa: BLE001 - observability is never fatal
+            logging.debug(
+                "compress_context: event sink failed for session %s (%s): %s",
+                session_id, payload.get("phase"), exc,
+            )
+
+    def _record_compression_marker(self, session_id: str, entry: dict) -> None:
+        """Append *entry* to the audit trail of the assistant turn in progress.
+
+        ``conversation.json`` is the only record of what a session actually
+        looked like, and ``summary.md`` keeps nothing of the versions it
+        replaced -- so once a compression has run, the question "what did the
+        model get told about its own history at that point" is otherwise
+        unanswerable.  Every attempt (including failed ones) is therefore
+        recorded on the turn that was current when it ran.
+
+        The entry lands in ``messages[i].meta.compressions`` (oldest first) of
+        the LAST assistant turn, because that is the reply the compression made
+        room for; a session with no assistant turn yet gets it on the final
+        message rather than losing it.  ``meta`` is persistence-only
+        bookkeeping (see :func:`turn_to_message_dict`), so the trail never
+        reaches a provider nor inflates a token estimate.
+
+        Best effort: an unreadable or malformed conversation file skips the
+        marker quietly -- a broken audit trail must not break compression.
+        """
+        conv_path = self._conversation_path(session_id)
+        try:
+            with open(conv_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError) as exc:
+            logging.debug(
+                "compression marker: cannot read %s (%s)", conv_path, exc
+            )
+            return
+        messages = data.get("messages") if isinstance(data, dict) else None
+        if not isinstance(messages, list) or not messages:
+            return
+        index = next(
+            (
+                i
+                for i in range(len(messages) - 1, -1, -1)
+                if isinstance(messages[i], dict)
+                and messages[i].get("role") == "assistant"
+            ),
+            len(messages) - 1,
+        )
+        turn = messages[index]
+        if not isinstance(turn, dict):
+            return
+        meta = turn.get("meta")
+        history: list = []
+        if not isinstance(meta, dict):
+            meta = {}
+        existing = meta.get("compressions")
+        if isinstance(existing, list):
+            history = [item for item in existing if isinstance(item, dict)]
+        record = dict(entry)
+        # Position + timestamp of the turn this describes: an auditor comparing
+        # ``summarized_up_to_turn`` against the conversation must be able to tie
+        # the entry to the turn even after later turns were appended.
+        record.setdefault("turn_index", index)
+        record.setdefault("turn_timestamp", turn.get("timestamp") or "")
+        history.append(record)
+        trimmed = meta.get("compressions_trimmed")
+        trimmed = trimmed if isinstance(trimmed, int) and trimmed > 0 else 0
+        if len(history) > _COMPRESSION_MARKER_CAP:
+            trimmed += len(history) - _COMPRESSION_MARKER_CAP
+            history = history[-_COMPRESSION_MARKER_CAP:]
+        meta["compressions"] = history
+        if trimmed:
+            meta["compressions_trimmed"] = trimmed
+        turn["meta"] = meta
+        top_meta = data.get("meta")
+        if isinstance(top_meta, dict):
+            top_meta["updated_at"] = now_iso()
+        try:
+            self._atomic_write(conv_path, json.dumps(data, ensure_ascii=False, indent=2))
+        except OSError as exc:
+            logging.debug(
+                "compression marker: cannot write %s (%s)", conv_path, exc
+            )
+
     def compress_context(
         self,
         session_id: str,
@@ -3310,6 +3528,7 @@ class ContextManager:
         inference_model_id: str = "",
         inference_max_context: int = 0,
         deep: bool = False,
+        trigger: str = "auto",
     ) -> None:
         """Compress conversation history in a single LLM call.
 
@@ -3400,6 +3619,59 @@ class ContextManager:
                 (oversized turns among them are offloaded to a file, and the
                 in-flight round is pulled back verbatim by
                 :meth:`assemble_context`).
+            trigger: Label for WHY this compression ran -- ``"post_turn"``
+                (inference finished, from ``persist_conversation``),
+                ``"in_loop"`` (a completed tool round reached 90 % of the
+                model's window), ``"pre_send"`` (the pre-send guard measured an
+                oversized request), ``"manual"`` (regeneration / fork guard) or
+                ``"auto"`` when the caller does not say.  Changes no behaviour;
+                it is carried verbatim into the SSE lifecycle events and the
+                ``conversation.json`` audit entry, where it is what tells a
+                later reader which guard decided to rewrite the context.
+
+        Emitted through *span*: two SSE lifecycle events (``started`` before
+        the request, ``completed`` after the files were written or the
+        attempt failed) and one audit entry appended to the current
+        assistant turn in ``conversation.json`` (see
+        :meth:`_record_compression_marker`).  Compressions the guards
+        decline emit nothing at all -- a lone ``started`` would leave a UI
+        showing "compressing" forever.
+        """
+        span = _CompressionSpan(self, session_id, trigger)
+        try:
+            self._compress_context_impl(
+                session_id,
+                turns,
+                last_total_tokens=last_total_tokens,
+                forced=forced,
+                trigger_threshold=trigger_threshold,
+                inference_model_id=inference_model_id,
+                inference_max_context=inference_max_context,
+                deep=deep,
+                span=span,
+            )
+        finally:
+            span.close()
+
+    def _compress_context_impl(
+        self,
+        session_id: str,
+        turns: list[ConversationTurn],
+        *,
+        last_total_tokens: Optional[int] = None,
+        forced: bool = False,
+        trigger_threshold: Optional[int] = None,
+        inference_model_id: str = "",
+        inference_max_context: int = 0,
+        deep: bool = False,
+        span: "_CompressionSpan",
+    ) -> None:
+        """Body of :meth:`compress_context` -- see that method for the contract.
+
+        *span* carries the SSE lifecycle / audit-trail bookkeeping the wrapper
+        created: this body starts it once its guards have decided to query the
+        model, reports the outcome at every exit, and the wrapper closes it in
+        a ``finally`` if this body raises.
         """
         # Choose which model performs the compression and the window to bound
         # the prompt to, so the request succeeds in ONE call (see the docstring
@@ -3524,6 +3796,31 @@ class ContextManager:
         raw_output = ""
         success = False
         empty_retries = 0
+        # Every exit below reports through this span: the SSE pair (so a client
+        # knows the session is waiting on the compression model, and for how
+        # long) and the audit entry in conversation.json.  Values the exits
+        # share are computed once here.  Note the naming: ``summary_version`` /
+        # ``summarized_up_to_turn_target`` describe the state BEFORE and the
+        # plan for this attempt; every ``completed`` payload overrides
+        # ``summary_version`` / ``summarized_up_to_turn`` with what is actually
+        # on disk afterwards, which on a failure is the previous summary.
+        span.start(
+            model_id=model_id,
+            window=window,
+            budget=budget,
+            tokens=effective_tokens,
+            threshold=threshold,
+            forced=forced,
+            deep=deep,
+            delta_start=delta_start,
+            delta_turns=len(delta),
+            summarized_up_to_turn_target=summarized_up_to,
+            summary_version=existing_version,
+            prompt_chars=len(prompt),
+            retries=0,
+        )
+        memory_entries: Optional[int] = None
+        memory_rejected = 0
         while True:
             result = None
             try:
@@ -3606,6 +3903,15 @@ class ContextManager:
                 session_id, model_id, error or "unknown error",
             )
             self._record_compress_failure(session_id, effective_tokens or 0)
+            span.finish(
+                success=False,
+                error=error or "compression request failed",
+                retries=empty_retries,
+                output_chars=len(raw_output or ""),
+                summary_version=existing_version,
+                summarized_up_to_turn=existing_fm.get("summarized_up_to_turn"),
+                memory_entries=None,
+            )
             return
 
         # --- Parse summary block ---
@@ -3628,6 +3934,15 @@ class ContextManager:
                 session_id,
             )
             self._record_compress_failure(session_id, effective_tokens or 0)
+            span.finish(
+                success=False,
+                error="model echoed the prompt's own format example",
+                retries=empty_retries,
+                output_chars=len(raw_output or ""),
+                summary_version=existing_version,
+                summarized_up_to_turn=existing_fm.get("summarized_up_to_turn"),
+                memory_entries=None,
+            )
             return
 
         # Persist summary
@@ -3685,10 +4000,12 @@ class ContextManager:
                         "memory entries for session %s",
                         rejected, session_id,
                     )
+                memory_rejected = rejected
                 merged = self._merge_memory_entries(session_id, entries)
                 # Persist to memory.md and update in-memory cache
                 self.save_memory(session_id, merged)
                 self._memory_store[session_id] = merged
+                memory_entries = len(merged)
             except Exception as exc:  # noqa: BLE001
                 logging.warning(
                     "compress_context: failed to parse <memory> block for "
@@ -3704,6 +4021,16 @@ class ContextManager:
             )
 
         self._record_compress_success(session_id)
+        span.finish(
+            success=True,
+            retries=empty_retries,
+            output_chars=len(raw_output or ""),
+            summary_chars=len(summary_text),
+            summary_version=existing_version + 1,
+            summarized_up_to_turn=summarized_up_to,
+            memory_entries=memory_entries,
+            memory_rejected=memory_rejected,
+        )
 
     def compress_context_in_loop(
         self,
@@ -3772,6 +4099,7 @@ class ContextManager:
             trigger_threshold=threshold,
             inference_model_id=inference_model_id,
             inference_max_context=max_context,
+            trigger="in_loop",
         )
         return True
 
@@ -3806,7 +4134,8 @@ class ContextManager:
         # path.
         fake_tokens = self._max_tokens_in_context + 1
         self.compress_context(
-            session_id, turns, last_total_tokens=fake_tokens, forced=True
+            session_id, turns, last_total_tokens=fake_tokens, forced=True,
+            trigger="manual",
         )
 
     def get_summary(self, session_id: str) -> tuple[str, dict]:

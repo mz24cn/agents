@@ -2,6 +2,7 @@
   import MarkdownRenderer from './MarkdownRenderer.svelte'
   import ThinkingBlock from './ThinkingBlock.svelte'
   import ToolCallCard from './ToolCallCard.svelte'
+  import CompressionMarker from './CompressionMarker.svelte'
   import ImageViewer from './ImageViewer.svelte'
   import AudioPlayer from './AudioPlayer.svelte'
   import CopyButton from './CopyButton.svelte'
@@ -11,6 +12,7 @@
   import { highlight } from '../../lib/highlight.js'
   import { isToolErrorContent } from '../../lib/tool-result.js'
   import { parseFileRefParts, restoreFileRefTags } from '../../lib/file-ref.js'
+  import { compressionEntriesOf } from '../../lib/compression-status.js'
 
   let { msg, agentList = [], onRevoke, collapseButton = null, onCollapse, hasFileChanges = false, onToggleFileDiff, fileDiffData = null, fileDiffVisible = false, compact = false, replyDetailed = null, onToggleReplyMode, toolResultsById = {}, scrollTargetIndex = null, showRetry = false, onRetry, retryDisabled = false, onFork, forkDisabled = false, forkBusy = false } = $props()
 
@@ -124,6 +126,12 @@
   const turnMeta = $derived(
     msg.role === 'user' && msg.meta && typeof msg.meta === 'object' ? msg.meta : null
   )
+  // ── 上下文压缩标记（messages[i].meta.compressions）───────────────────────
+  // 一次压缩（重写 summary/memory）在某条消息上做，就像一次工具调用：它停顿几
+  // 秒、不产出 token，却决定了后续请求拿到的上下文。推理进行中由 started /
+  // completed 事件把它就地挂到当轮助手消息上；重新进入会话时，同一份记录从
+  // conversation.json 原位置读回来，不依赖任何流。
+  const compressions = $derived(compressionEntriesOf(msg))
   const turnMetaTitle = $derived.by(() => {
     if (!turnMeta) return ''
     const lines = []
@@ -479,6 +487,10 @@
     <AudioPlayer audio={msg.audio} />
   {/if}
 {/if}
+
+  {#if compressions.length}
+    <CompressionMarker entries={compressions} {compact} />
+  {/if}
 </div>
 
 {#if msg.role === 'user' && fileDiffVisible && fileDiffData?.files}
