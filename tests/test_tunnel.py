@@ -229,6 +229,42 @@ def test_wsutil_accept_key_deterministic():
     assert wsutil.ws_accept_key(key) == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
 
 
+def test_wsutil_set_nodelay_applies_on_tcp_socket():
+    a = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    b = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        b.bind(("127.0.0.1", 0))
+        b.listen(1)
+        a.connect(b.getsockname())
+        peer, _addr = b.accept()
+        try:
+            wsutil.set_nodelay(a)
+            assert a.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY) == 1
+        finally:
+            peer.close()
+    finally:
+        a.close()
+        b.close()
+
+
+def test_wsutil_set_nodelay_is_best_effort():
+    """No socket may take a connection down over a latency option.
+
+    AF_UNIX pairs (used by the frame round-trip tests, and reachable in
+    production if a bind ever moves to a unix socket) carry no TCP options;
+    a closed socket carries none either.  set_nodelay must swallow both.
+    """
+    u1, u2 = socket.socketpair()
+    try:
+        wsutil.set_nodelay(u1)  # must not raise (ENOPROTOOPT)
+    finally:
+        u1.close()
+        u2.close()
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.close()
+    wsutil.set_nodelay(s)  # must not raise (EBADF)
+
+
 # ---------------------------------------------------------------------------
 # End-to-end: parent + child real servers
 # ---------------------------------------------------------------------------
@@ -318,6 +354,71 @@ def test_register_online_call_and_stream(tmp_path):
         # give the (stopped) client a few reconnect cycles to try to revive
         time.sleep(3)
         assert _parent_tunnel_envs(parent_srv) == []
+
+
+def test_nodelay_set_on_all_tunnel_data_sockets(tmp_path, monkeypatch):
+    """Regression (E1-A): the tunnel data plane must run without Nagle.
+
+    One chunked tunnel request is four small writes (req header / req-chunk
+    header / body / eof) and a response is the same sequence back; the
+    child's loopback self-call splits its body from its headers.  With
+    Nagle on, every write that follows an unacknowledged one waits for that
+    ACK and lands on the peer's delayed-ACK timer: measured p50 for a 4 KiB
+    loopback read was 97 ms over the reverse tunnel vs 8.8 ms direct, a
+    fixed per-call cost (cold == warm).  The three sockets of that plane:
+    the parent's accepted tunnel socket, the child's dialed tunnel socket,
+    and the child's loopback self-call socket.
+    """
+    with _real_server(tmp_path, "parent_data") as parent, \
+         _real_server(tmp_path, "child_data", workspace=tmp_path / "child_ws") as child:
+        parent_srv, _ = parent
+        child_srv, child_data = child
+        _set_child_source(child_srv, child_data, f"http://127.0.0.1:{parent_srv.port}/")
+
+        status, body = _request(child_srv, "POST", "/v1/tunnel/parent/register")
+        assert status == 200, body
+        env_id = body["env_id"]
+        _wait_until(lambda: any(
+            e["id"] == env_id and e.get("online")
+            for e in _parent_tunnel_envs(parent_srv)), message="tunnel env online")
+        manager = parent_srv._tunnel_manager
+
+        # 1. Parent side: the accepted tunnel socket every req sequence is
+        #    written on (TunnelManager._TunnelConn.sock).
+        conn = manager.conn_for_env(env_id)
+        assert conn is not None
+        assert conn.sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY) == 1, \
+            "parent accepted tunnel socket kept Nagle on"
+
+        # 2. Child side: the dialed tunnel socket every resp sequence is
+        #    written on (WSClient._sock; the _PrefixedSocket wrapper
+        #    delegates getsockopt to the raw TCP socket).
+        child_client = child_srv._tunnel_client
+        ws = child_client._live_ws
+        assert ws is not None
+        assert ws._sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY) == 1, \
+            "child dialed tunnel socket kept Nagle on"
+
+        # 3. Child side: the loopback self-call socket, inspected at the
+        #    kernel right after connect (the socket is closed by the time
+        #    the call returns, so a spy is the only witness).
+        lb_host, lb_port, lb_tls = child_client._loopback_target()
+        assert not lb_tls
+        flags: list = []
+        real_connect = http.client.HTTPConnection.connect
+
+        def _spy_connect(self):
+            real_connect(self)
+            if str(self.host) == lb_host and int(self.port) == lb_port:
+                flags.append(self.sock.getsockopt(socket.IPPROTO_TCP,
+                                                  socket.TCP_NODELAY))
+
+        monkeypatch.setattr(http.client.HTTPConnection, "connect", _spy_connect)
+        status_code, _h, raw = manager.call_env(env_id, "GET", "/v1/tools")
+        assert status_code == 200
+        assert flags, "no loopback self-call connected to the child's own port"
+        assert all(f == 1 for f in flags), \
+            f"loopback self-call socket kept Nagle on ({flags})"
 
 
 def test_child_unregister(tmp_path):

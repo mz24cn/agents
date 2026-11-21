@@ -36,6 +36,7 @@ from runtime.wsutil import (
     OP_CLOSE,
     OP_PONG,
     OP_TEXT,
+    set_nodelay,
     ws_accept_key,
     ws_recv_frame,
     ws_send_frame,
@@ -305,6 +306,14 @@ class WSClient:
                 sock = socket.create_connection((host, port), timeout=timeout)
             except OSError as exc:
                 raise WSClientError(f"Cannot connect to {host}:{port}: {exc}") from exc
+
+        # Nagle off before any frame goes out: this is the child's tunnel
+        # socket (a response is header + body chunks + terminator, several
+        # small sendalls), the loopback socket of a stream bridge, and the
+        # parent's direct dial to a child terminal -- all multi-write.  Set
+        # once on the bare TCP socket so it also holds through a TLS wrap.
+        # See wsutil.set_nodelay for the measured stall it removes.
+        set_nodelay(sock)
 
         if parsed.scheme == "wss":
             try:

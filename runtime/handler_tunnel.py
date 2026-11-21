@@ -130,6 +130,12 @@ class HandlerTunnelMixin:
             sock.settimeout(None)
         except OSError:
             pass
+        # The parent writes each tunnel request as several small frames on
+        # this one accepted socket (req header / req-chunk header / body /
+        # eof); with Nagle on, every write after an unacknowledged one waits
+        # for its ACK and lands on the child's delayed-ACK timer (~40-90 ms
+        # per call).  See wsutil.set_nodelay for the measurement.
+        wsutil.set_nodelay(sock)
         try:
             sock.sendall(wsutil.ws_handshake_response(key).encode("utf-8"))
         except OSError:

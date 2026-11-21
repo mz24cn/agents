@@ -1005,6 +1005,12 @@ class TunnelClient:
         # upload or a streamed response must not be cut off mid-body.
         if getattr(conn, "sock", None) is not None:
             conn.sock.settimeout(None)
+            # The self-call is the one hop of the tunnel data plane that runs
+            # entirely on loopback -- and loopback does not exempt it: the
+            # header flush and the (separately sent) body write sit behind
+            # Nagle against the local server's delayed ACK.  Same ~40-90 ms
+            # per call as the wire hops; see wsutil.set_nodelay.
+            wsutil.set_nodelay(conn.sock)
         headers = {
             str(k): str(v)
             for k, v in (headers_in or {}).items()
