@@ -1199,8 +1199,13 @@ def test_two_clients_answering_at_the_same_moment_one_wins(tmp_path) -> None:
                     })],
                 })
                 assert status == 409, refused
-                assert refused.get("code") == "client_tool_already_answered", refused
-                assert refused.get("answered_call_ids") == ["call_c1"], refused
+                # Refused by the one-generation gate: the winner's generation is
+                # still live, so this submission never reaches the answer
+                # arbitration at all. Same promise, earlier door -- and once the
+                # winner's run ends, the same duplicate is refused by the history
+                # half (code ``client_tool_already_answered``; see
+                # test_a_second_answer_for_the_same_call_is_refused above).
+                assert refused.get("code") == "session_inferring", refused
             finally:
                 gate.set()
                 winner.join(timeout=30)
