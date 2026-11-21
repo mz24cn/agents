@@ -121,6 +121,28 @@ def local_tz_offset_minutes() -> int:
     return int(offset.total_seconds() // 60) if offset is not None else 0
 
 
+CONFIG_FILENAMES = ("models.json", "tools.json", "mcp_servers.json",
+                    "prompt_templates.json")
+
+
+def config_source_paths(data_dir: str) -> list[str]:
+    """The files whose newest mtime *is* this environment's ``last_config``.
+
+    Shared by the advertised version, the config filter of
+    :meth:`EnvManager.build_delta_tar` and the timestamp the setup payload
+    hands to a new installation: all three must talk about exactly these
+    files, or an environment advertises a version that no file backs.
+    """
+    paths = [os.path.join(data_dir, name) for name in CONFIG_FILENAMES]
+    agents_dir = os.path.join(data_dir, "agents")
+    if os.path.isdir(agents_dir):
+        for root, _dirs, files in os.walk(agents_dir):
+            paths.extend(os.path.join(root, filename)
+                         for filename in files
+                         if filename.endswith(".json"))
+    return paths
+
+
 def compute_setup_versions(env_manager: "EnvManager", data_dir: str,
                            project_root: str | None = None) -> dict:
     """Compute this environment's advertised build versions.
@@ -156,21 +178,7 @@ def compute_setup_versions(env_manager: "EnvManager", data_dir: str,
         backend = datetime.datetime.fromtimestamp(latest_mtime).strftime("%y%m%d_%H%M%S")
 
     config_mtime: float = 0.0
-    config_paths = [
-        os.path.join(data_dir, "models.json"),
-        os.path.join(data_dir, "tools.json"),
-        os.path.join(data_dir, "mcp_servers.json"),
-        os.path.join(data_dir, "prompt_templates.json"),
-    ]
-    agents_dir = os.path.join(data_dir, "agents")
-    if os.path.isdir(agents_dir):
-        for root, _dirs, files in os.walk(agents_dir):
-            config_paths.extend(
-                os.path.join(root, filename)
-                for filename in files
-                if filename.endswith(".json")
-            )
-    for path in config_paths:
+    for path in config_source_paths(data_dir):
         try:
             if os.path.isfile(path):
                 config_mtime = max(config_mtime, os.path.getmtime(path))
@@ -186,6 +194,45 @@ def compute_setup_versions(env_manager: "EnvManager", data_dir: str,
         "last_config": last_config,
         "tz_offset": local_tz_offset_minutes(),
     }
+
+
+def _carry_source_mtime(dst_path: str, src_path: str,
+                        fallback_mtime: float | None = None) -> None:
+    """Give a regenerated file the timestamp of the file it was regenerated from.
+
+    The setup payload writes ``~/.agents_runtime`` config files fresh (they come
+    from the live registries, not from a file copy, see
+    :meth:`EnvManager._write_runtime_configs`), so without this every installed
+    environment carries the *install instant* as their mtime -- and mtime is the
+    version.  The child then advertises a ``last_config`` newer than its own
+    update source, which is the baseline of every later config delta: config
+    files never cross the ``mtime > config_since`` filter again (``op=update``
+    reports "already latest"), and a parent's push is refused outright by the
+    per-axis downgrade guard, blocking frontend and backend updates too.
+
+    Project files never had this problem because ``_copy_project`` uses
+    ``shutil.copy2``/``copytree``, which carry metadata along.
+
+    A source that does not exist -- configuration that lives only in the live
+    registries and was never persisted -- falls back to ``fallback_mtime``, the
+    instant the source environment already advertises as ``last_config``: the
+    payload ships that content to the child anyway, so stamping it "now" would
+    achieve nothing but cutting the child off from its source.  Without a
+    fallback the file keeps "now".
+    """
+    times: tuple[float, float] | None = None
+    try:
+        source_stat = os.stat(src_path)
+        times = (source_stat.st_atime, source_stat.st_mtime)
+    except OSError:
+        if fallback_mtime is not None:
+            times = (fallback_mtime, fallback_mtime)
+    if times is None:
+        return
+    try:
+        os.utime(dst_path, times)
+    except OSError:
+        pass
 
 
 class EnvManager:
@@ -429,7 +476,7 @@ class EnvManager:
                 collected[arcname] = fpath
 
         # Runtime configuration files use their own independent threshold.
-        for filename in ("models.json", "tools.json", "mcp_servers.json", "prompt_templates.json"):
+        for filename in CONFIG_FILENAMES:
             fpath = os.path.join(data_dir, filename)
             try:
                 if (os.path.isfile(fpath) and not os.path.islink(fpath)
@@ -591,7 +638,7 @@ class EnvManager:
                                agent_manager: object | None,
                                include_env: bool = False) -> None:
         if include_env:
-            self._dump_json(os.path.join(cfg_dir, "env.json"), self.read())
+            self._dump_json(os.path.join(cfg_dir, "env.json"), self.read(), self._env_path)
         auth_path = os.path.join(data_dir, "auth_token.json")
         if os.path.isfile(auth_path):
             import shutil
@@ -608,7 +655,23 @@ class EnvManager:
                   if model_registry else self._read_json_file(os.path.join(data_dir, "models.json"), []))
         tools = ([t.to_dict() for t in tool_registry.list_all() if not getattr(t, "builtin", False)]
                  if tool_registry else self._read_json_file(os.path.join(data_dir, "tools.json"), []))
-        self._dump_json(os.path.join(cfg_dir, "models.json"), models)
+        # The instant this environment advertises as ``last_config``.  A config
+        # file that exists only in the live registries has no timestamp of its
+        # own, so it falls back to this one instead of "now": a fresh install
+        # must advertise exactly its source's config version, or it can never
+        # receive a config update from that source again.
+        config_instant = max(
+            (os.path.getmtime(path) for path in config_source_paths(data_dir)
+             if os.path.isfile(path)),
+            default=0.0) or None
+
+        def dump(name: str, content) -> None:
+            """Ship one top-level config file: re-serialized from the live
+            registries, but stamped with the mtime of its on-disk source."""
+            self._dump_json(os.path.join(cfg_dir, name), content,
+                            os.path.join(data_dir, name), config_instant)
+
+        dump("models.json", models)
         mcp_cfg = self._read_json_file(os.path.join(data_dir, "mcp_servers.json"), {})
         if mcp_manager is not None:
             for attr in ("to_config", "get_config", "config"):
@@ -620,17 +683,22 @@ class EnvManager:
                         mcp_cfg = obj; break
                 except Exception:
                     pass
-        self._dump_json(os.path.join(cfg_dir, "mcp_servers.json"), mcp_cfg)
+        dump("mcp_servers.json", mcp_cfg)
         templates = ([t.to_dict() for t in prompt_template_manager.list_all()]
                      if prompt_template_manager else self._read_json_file(os.path.join(data_dir, "prompt_templates.json"), []))
-        self._dump_json(os.path.join(cfg_dir, "prompt_templates.json"), templates)
+        dump("prompt_templates.json", templates)
         agents_dir = os.path.join(cfg_dir, "agents")
         os.makedirs(agents_dir, exist_ok=True)
         agents = agent_manager.list_all() if agent_manager else []
         if agents:
             for agent in agents:
-                safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", str(agent.get("agent_id", "agent")))
-                self._dump_json(os.path.join(agents_dir, f"{safe_id}.json"), agent)
+                agent_id = str(agent.get("agent_id", "agent"))
+                safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", agent_id)
+                self._dump_json(
+                    os.path.join(agents_dir, f"{safe_id}.json"), agent,
+                    os.path.join(data_dir, "agents", f"{agent_id}.json"),
+                    config_instant,
+                )
         else:
             src_agents = os.path.join(data_dir, "agents")
             if os.path.isdir(src_agents):
@@ -663,7 +731,7 @@ class EnvManager:
                         "tool_id=%s, %s=%s。安装后相关工具或AI代理可能无法正常工作。",
                         tool.get("tool_id", ""), key, pth,
                     )
-        self._dump_json(os.path.join(cfg_dir, "tools.json"), tools)
+        dump("tools.json", tools)
 
     def _read_json_file(self, path: str, default):
         try:
@@ -674,10 +742,20 @@ class EnvManager:
             logger.warning("读取配置文件失败 %s: %s", path, exc)
         return default
 
-    def _dump_json(self, path: str, data) -> None:
+    def _dump_json(self, path: str, data, source_path: str | None = None,
+                   fallback_mtime: float | None = None) -> None:
+        """Write JSON to ``path``; ``source_path`` optionally lends it its mtime.
+
+        See :func:`_carry_source_mtime`: a config file re-serialized from the
+        live registries must not reach the peer stamped with the packaging
+        instant, because that instant becomes the peer's advertised config
+        version and therefore the baseline of every later config delta.
+        """
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(data, fh, ensure_ascii=False, indent=2)
+        if source_path:
+            _carry_source_mtime(path, source_path, fallback_mtime)
 
     def _render_setup_script_sh(self, encoded_payload: str) -> str:
         return r"""#!/bin/sh

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import io
+import json
 import os
 import tarfile
 from pathlib import Path
@@ -356,3 +357,142 @@ def test_compute_setup_versions_derives_frontend_from_dist(tmp_path: Path) -> No
     versions = compute_setup_versions(manager, str(data), project_root=str(project))
 
     assert versions["frontend_build"] == _stamp(built)
+
+
+class _StubAgentManager:
+    """Stand-in for AgentManager: agents come from ``list_all``, not from a copy."""
+
+    def __init__(self, *agents: dict) -> None:
+        self._agents = list(agents)
+
+    def list_all(self) -> list[dict]:
+        return [dict(agent) for agent in self._agents]
+
+
+class _StubEntry:
+    def __init__(self, payload: dict) -> None:
+        self._payload = payload
+
+    def to_dict(self) -> dict:
+        return dict(self._payload)
+
+
+class _StubRegistry:
+    """Stand-in for ModelRegistry/ToolRegistry holding un-persisted state."""
+
+    def __init__(self, *entries: _StubEntry) -> None:
+        self._entries = list(entries)
+
+    def list_all(self) -> list[_StubEntry]:
+        return list(self._entries)
+
+
+class _StubRuntime:
+    def __init__(self, model_registry=None, tool_registry=None) -> None:
+        self._model_registry = model_registry
+        self._tool_registry = tool_registry
+
+
+def _payload_mtime(payload: bytes, arcname: str) -> float:
+    with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
+        for member in archive.getmembers():
+            if member.name.lstrip("./") == arcname:
+                return member.mtime
+    raise AssertionError(f"{arcname} is not in the payload")
+
+
+def _extract_config_tree(payload: bytes, target: Path) -> Path:
+    """Unpack the payload's ``agents_runtime/`` tree the way the script does."""
+    target.mkdir(parents=True, exist_ok=True)
+    # 3.12 added the extract filter; the default warns from 3.12 on and changes
+    # in 3.14.  Both filters keep file mtimes, which is what is under test.
+    kwargs = {"filter": "data"} if hasattr(tarfile, "data_filter") else {}
+    with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
+        archive.extractall(
+            target,
+            members=[m for m in archive.getmembers()
+                     if m.name.lstrip("./").startswith("agents_runtime/")],
+            **kwargs,
+        )
+    return target / "agents_runtime"
+
+
+def test_full_setup_payload_keeps_config_file_mtimes(tmp_path: Path) -> None:
+    """Installing must not restamp ~/.agents_runtime — there, mtime *is* the version.
+
+    Config files are re-serialized from the live registries rather than copied,
+    so they used to arrive stamped with the packaging instant.  That instant
+    became the child's advertised ``last_config``, which doubles as the baseline
+    of every later config delta: no config file on the parent ever cleared the
+    ``mtime > config_since`` filter again, and a pushed delta was refused
+    outright by the per-axis downgrade guard -- so the install had cut the child
+    off from its own update source.  Project files were never affected, because
+    ``_copy_project`` copies metadata along.
+    """
+    project, data, manager = _sample_project(tmp_path)
+    built = 1_000_000_000
+    sources = {
+        "env.json": '{"APP_TITLE": "source"}',
+        "models.json": "[]",
+        "tools.json": "[]",
+        "mcp_servers.json": "{}",
+        "prompt_templates.json": "[]",
+        "agents/a1.json": '{"agent_id": "a1", "name": "one"}',
+    }
+    stamps = {name: built + 10 * index for index, name in enumerate(sorted(sources))}
+    for name, content in sources.items():
+        _write(data / name, content + "\n")
+        os.utime(data / name, (stamps[name], stamps[name]))
+
+    payload = manager._build_setup_payload(
+        project_root=str(project),
+        data_dir=str(data),
+        runtime=None,
+        prompt_template_manager=None,
+        # The branch that re-serializes agents instead of copying their files.
+        agent_manager=_StubAgentManager({"agent_id": "a1", "name": "one"}),
+        include_project=True,
+        include_env=True,
+    )
+
+    for name in sources:
+        assert _payload_mtime(payload, f"agents_runtime/{name}") == stamps[name], name
+
+
+def test_installed_environment_advertises_its_sources_config_version(tmp_path: Path) -> None:
+    """What ``curl … | sh`` writes into ~/.agents_runtime must not outdate its source.
+
+    Here only ``prompt_templates.json`` exists on disk; the rest is shipped as
+    an empty structure, or (for models) as state the source never persisted.
+    Stamping those with "now" was enough to leave the child permanently ahead of
+    the parent on the config axis, so it falls back to the instant the parent
+    already advertises.
+    """
+    project, data, manager = _sample_project(tmp_path)
+    built = 1_000_000_000
+    _write(data / "prompt_templates.json", "[]\n")
+    os.utime(data / "prompt_templates.json", (built, built))
+    parent = compute_setup_versions(manager, str(data), project_root=str(project))
+    assert parent["last_config"] == _stamp(built)
+
+    payload = manager._build_setup_payload(
+        project_root=str(project),
+        data_dir=str(data),
+        runtime=_StubRuntime(model_registry=_StubRegistry(_StubEntry({"model_id": "m"}))),
+        prompt_template_manager=None,
+        agent_manager=None,
+        include_project=True,
+        include_env=False,
+    )
+
+    child_data = _extract_config_tree(payload, tmp_path / "install")
+    child = compute_setup_versions(
+        EnvManager(str(child_data / "env.json")), str(child_data),
+        project_root=str(project),
+    )
+
+    assert child["last_config"] == parent["last_config"]
+    # Sanity: the shipped files really are there, so the equality is not two
+    # empty directories agreeing by accident.
+    assert (child_data / "models.json").is_file()
+    assert json.loads((child_data / "models.json").read_text(encoding="utf-8"))
