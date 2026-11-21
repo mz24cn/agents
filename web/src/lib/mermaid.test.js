@@ -3,6 +3,8 @@
  * Tests for mermaid.js — extractMermaidFences mermaid 围栏提取
  * 覆盖：闭合围栏提取、未闭合（流式中）不提取、其他语言代码块不受影响、占位符内容转义
  */
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { describe, it, expect } from 'vitest'
 import { extractMermaidFences, normalizeMermaidSource, standaloneSvg } from './mermaid.js'
 
@@ -135,5 +137,24 @@ describe('standaloneSvg — 导出用自包含 SVG（下载 SVG/PNG 前置）', 
     // 原节点 width 仍是 100%（未被污染）
     expect(src.getAttribute('width')).toBe('100%')
     expect(src.getAttribute('xmlns')).toBeNull()
+  })
+})
+
+describe('mermaid 不得给整页加出滚动条 —— markdown.css 里的 pin 守卫', () => {
+  // 真实踩坑：mermaid 的 insertTooltip() 把 <div class="mermaidTooltip"> append 到 <body>，
+  // 并且永不删除。它拿到 position:absolute（mermaid 自己写在行内样式上）却没有 top/left，
+  // 于是停在静止位置 —— 也就是 </body> 之前、整页底下几个像素。界面本来是 100vh 刚好不出
+  // 滚动条，这 6px 让 document 多出滚动区：打开过含 mermaid 图的会话之后，窗口右侧多出一条
+  // 上下滚动条，切会话、切 Setup 都不消失，只有刷新才带走（刷新把这条 div 一起带走）。
+  // 防线只有 markdown.css 里那条 `body > .mermaidTooltip { position: fixed !important }`
+  // —— fixed 元素不参与文档的滚动区域，而本页文档本身不滚动（滚动都在 .message-list 里），
+  // mermaid 悬停时写的行内 top/left 在视口坐标下等价，提示框位置不受影响。
+  // 删掉它就复发，所以在这里钉住。
+  const css = readFileSync(join(__dirname, 'markdown.css'), 'utf8')
+
+  it('body 直下的 .mermaidTooltip 被钉到视口（fixed，且带 !important 才盖得住行内样式）', () => {
+    const rule = css.match(/body\s*>\s*\.mermaidTooltip\s*\{([^}]*)\}/)
+    expect(rule, 'markdown.css 需要保留 body > .mermaidTooltip 规则').toBeTruthy()
+    expect(rule[1]).toMatch(/position:\s*fixed\s*!important/)
   })
 })

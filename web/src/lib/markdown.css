@@ -117,6 +117,18 @@
   height: auto;
 }
 
+/* mermaid 的 insertTooltip() 会把 <div class="mermaidTooltip"> append 到 <body> 上，并且永远不删。
+   它拿到 position:absolute（mermaid 自己写在行内样式里）却没有 top/left，于是停在静止位置 ——
+   也就是 </body> 之前、整个界面底下几个像素。界面本来是 100vh 刚好不出滚动条，这 6px 让 document
+   多出滚动区：打开过含 mermaid 图的会话之后，窗口右侧就多出一条上下滚动条，切会话/切 Setup 都不消失，
+   只有刷新才没了（刷新会把这条 div 一起带走）。
+   钉到视口上：fixed 元素不参与文档的滚动区域，而本页文档本身不滚动（滚动都在 .message-list 里），
+   所以 mermaid 悬停时写入的行内 top/left（页面坐标）在视口坐标下等价，提示框位置不受影响。
+   !important 必需：position:absolute 写在行内样式上，普通规则盖不住。 */
+body > .mermaidTooltip {
+  position: fixed !important;
+}
+
 /* Mermaid 工具栏：放大/缩小 + 导出（悬停显示，避免长图视觉干扰） */
 .md-view .mermaid-toolbar {
   position: absolute;
