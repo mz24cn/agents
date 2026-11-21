@@ -3,7 +3,7 @@
  * 会话面板"模式图标行"测试（v7：森林根折成一行图标）。
  *
  * 验证：
- *   1. 标题行是 5 个纯图标按钮（最近/主题/历史/工作区 + 右对齐终端），无文字；
+ *   1. 标题行是 6 个纯图标按钮（最近/主题/历史/工作区/标签 + 右对齐终端），无文字；
  *   2. recent 模式只有整体会话列表，没有树框；
  *   3. 分类模式（主题/工作区/历史）渲染"根的子级"——根节点本身不出现在树里，
  *      查询路径仍带根 id 前缀；分类框约占 1/3 高度（会话列表可见）；
@@ -46,6 +46,13 @@ const TREE = [
         env_id: 'http://10.0.0.1:7988', session_count: 0, children: [],
       },
     ],
+  },
+  {
+    id: 6, name: '标签', type: 'labels', session_count: 1,
+    children: [
+      { id: 1, name: 'TTS', type: 'label', session_count: 1, children: ['s1'], stats: {} },
+    ],
+    stats: { label_count: 1 },
   },
   {
     id: 5, name: '会话历史', type: 'history', session_count: 1,
@@ -112,10 +119,14 @@ afterAll(() => {
 })
 
 describe('会话面板模式图标行', () => {
-  it('标题行是 5 个纯图标按钮，终端按钮右对齐', async () => {
+  it('标题行是 6 个纯图标按钮，标签紧随工作区，终端按钮右对齐', async () => {
     const buttons = await mountSidebar()
-    expect(buttons.length).toBe(5)
-    const last = buttons[4]
+    expect(buttons.length).toBe(6)
+    const last = buttons[5]
+    // 标签按钮在工作区按钮之后、终端之前
+    expect(buttons[3].getAttribute('aria-label')).toContain('工作区')
+    expect(buttons[4].getAttribute('aria-label')).toContain('标签')
+    expect(buttons[4].textContent).toContain('\u{1F3F7}')
     expect(last.classList.contains('mode-btn-terminal')).toBe(true)
     // 不再显示模式文字（仅图标 glyph）
     for (const button of buttons) {
@@ -152,7 +163,7 @@ describe('会话面板模式图标行', () => {
 
   it('终端模式渲染终端列表、树框 full 占满高度且无会话列表', async () => {
     const buttons = await mountSidebar()
-    buttons[4].click()
+    buttons[5].click()
     await drain()
     const treeBox = document.querySelector('.category-tree')
     expect(treeBox).toBeTruthy()
@@ -180,6 +191,24 @@ describe('会话面板模式图标行', () => {
     expect(topicRow.querySelector('.category-kind')).toBeFalsy()
     // 主题模式不是 full：分类框限高，选择末级后会话列表可见
     expect(document.querySelector('.category-tree').classList.contains('full')).toBe(false)
+  })
+
+  it('标签模式渲染标签节点；点击标签加载该标签的会话列表', async () => {
+    const buttons = await mountSidebar()
+    buttons[4].click()
+    await drain()
+    const treeBox = document.querySelector('.category-tree')
+    expect(treeBox).toBeTruthy()
+    // 标签根本身不出现，标签叶提为顶层（路径仍带根 id 前缀 6/…）
+    expect(treeBox.textContent).not.toContain('标签')
+    const labelRow = document.querySelector('[data-category-path="6/1"]')
+    expect(labelRow).toBeTruthy()
+    expect(labelRow.textContent).toContain('TTS')
+    expect(document.querySelector('.session-list')).toBeFalsy()
+    labelRow.click()
+    await drain()
+    expect(document.querySelector('.session-list')).toBeTruthy()
+    expect(document.querySelector('.session-list').textContent).toContain('会话一')
   })
 
   it('回到最近模式：树框消失，整体列表回来', async () => {

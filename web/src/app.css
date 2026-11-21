@@ -11,6 +11,8 @@
   --danger-hover: #c53030;
   --success: #38a169;
   --warning: #e67e22;
+  /* 暂停会话的列表标记色（区别于 streaming 的橙色） */
+  --paused: #c9971c;
 }
 
 :root[data-theme="dark"] {
@@ -25,6 +27,7 @@
   --danger-hover: #feb2b2;
   --success: #68d391;
   --warning: #f0a050;
+  --paused: #e8c14d;
 }
 
 /* ===== Base Styles ===== */

@@ -3,7 +3,8 @@
  * Validates: Requirements 6.1–6.6, 4.1, 5.5, 5.6
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { env, sessions, inferStream, subscribeSessionStream, isSessionStreamWatched, subscribeSessionEvents, __resetSessionEventsHubForTests, __resetSessionFramesHubForTests, remoteEnv, remoteEnvHomeUrl, maskRemoteEnvUrl, isRemoteLogoImage, resolveRemoteEnvLogo, tools, build } from './api.js'
+import { env, sessions, inferStream, subscribeSessionStream, isSessionStreamWatched, subscribeSessionEvents, __resetSessionEventsHubForTests, __resetSessionFramesHubForTests, __reconcileSessionFramesForTests,
+  __reconcileSessionEventsForTests, remoteEnv, remoteEnvHomeUrl, maskRemoteEnvUrl, isRemoteLogoImage, resolveRemoteEnvLogo, tools, build } from './api.js'
 
 // ---------------------------------------------------------------------------
 // Helper: create a mock fetch that returns the given data with the given status
@@ -192,7 +193,8 @@ describe('subscribeSessionStream (shared frame channel)', () => {
 
     first.end()
     await settle()
-    vi.advanceTimersByTime(1000)   // FRAMES_RECONNECT_MS
+    // One reconciler tick re-opens the channel: no per-concern backoff timer.
+    __reconcileSessionFramesForTests()
     await settle()
 
     expect(transport.calls.channel).toHaveLength(2)
@@ -246,8 +248,8 @@ describe('subscribeSessionStream (shared frame channel)', () => {
     first.push(chanFrame('session-b', 7, 'b7'))
     await settle()
     first.end()
-
-    await vi.advanceTimersByTimeAsync(1000)
+    await settle()
+    __reconcileSessionFramesForTests()
     await settle()
 
     // One reconnect for the whole tab, not one per session.
@@ -278,8 +280,8 @@ describe('subscribeSessionStream (shared frame channel)', () => {
     first.push(subInit('session-a', 9))
     await settle()
     first.end()
-
-    await vi.advanceTimersByTimeAsync(1000)
+    await settle()
+    __reconcileSessionFramesForTests()
     await settle()
 
     const resumed = transport.calls.commands.filter((c) => c.url === '/v1/sessions/frames/subscribe')
@@ -305,8 +307,8 @@ describe('subscribeSessionStream (shared frame channel)', () => {
     for (let seq = 1; seq <= 600; seq++) first.push(chanFrame('session-a', seq, `x${seq}`))
     for (let i = 0; i < 40; i++) await settle()
     first.end()
-
-    await vi.advanceTimersByTimeAsync(1000)
+    await settle()
+    __reconcileSessionFramesForTests()
     await settle()
 
     const resumed = transport.calls.commands.filter((c) => c.url === '/v1/sessions/frames/subscribe')
@@ -334,6 +336,62 @@ describe('subscribeSessionStream (shared frame channel)', () => {
     await settle()
     expect(transport.calls.channel).toHaveLength(1)
   })
+
+  it('hands the channel back the moment this tab routes nothing', async () => {
+    vi.useFakeTimers()
+    const first = makeChannel()
+    const second = makeChannel()
+    const transport = framesTransport([first, second])
+    vi.stubGlobal('fetch', transport.fetch)
+
+    const unsubscribe = subscribeSessionStream('session-a', vi.fn(), vi.fn(), vi.fn())
+    await settle()
+    first.push(chanInit('t'))
+    await settle()
+
+    // Connection budget: an idle tab may not park one of the ~6 per-origin slots
+    // "just in case". Releasing the channel is safe now because the backend decides
+    // abandonment from its detached window rather than from this socket -- and the
+    // close carries the reason, so its log can still tell "the page released the
+    // channel" apart from "the browser left".
+    unsubscribe()
+    await settle()
+    const closed = transport.calls.commands.filter((c) => c.url === '/v1/sessions/frames/close')
+    expect(closed).toHaveLength(1)
+    expect(closed[0].body.reason).toBe('idle')
+
+    // Re-opening the conversation costs a reconnect and resumes from the cursor.
+    subscribeSessionStream('session-a', vi.fn(), vi.fn(), vi.fn(), null, 12)
+    await settle()
+    expect(transport.calls.channel).toHaveLength(2)
+    const resumed = transport.calls.commands.filter((c) => c.url === '/v1/sessions/frames/subscribe')
+    expect(resumed.at(-1).body).toMatchObject({ session_id: 'session-a', after: 12 })
+  })
+
+  it('holds no long-lived connection while the tab is idle', async () => {
+    vi.useFakeTimers()
+    const channel = makeChannel()
+    const transport = framesTransport([channel])
+    vi.stubGlobal('fetch', transport.fetch)
+
+    const unsubscribe = subscribeSessionStream('session-a', vi.fn(), vi.fn(), vi.fn())
+    await settle()
+    channel.push(chanInit('t'))
+    await settle()
+    unsubscribe()
+    await settle()
+
+    // Whatever the idle window is, it is not paid for with a connection: after the
+    // release the tab holds zero long-lived streams until it watches something
+    // again. (The old code held the socket for 60s to protect the run; the server
+    // window does that now.)
+    await vi.advanceTimersByTimeAsync(300_000)
+    await settle()
+    expect(transport.calls.channel).toHaveLength(1)
+    const opensAfterRelease = transport.calls.channel.slice(1)
+    expect(opensAfterRelease).toHaveLength(0)
+  })
+
 })
 
 // ---------------------------------------------------------------------------
@@ -570,7 +628,7 @@ describe('subscribeSessionEvents (shared hub)', () => {
     un2()
   })
 
-  it('流异常后延迟 1 秒重连，事件继续送达', async () => {
+  it('流异常后由对账循环重连，事件继续送达（不再有独立的重连计时器）', async () => {
     vi.useFakeTimers()
     const first = sseEventStream(['data: {"event":"init","sessions":{},"titles":{}}\n\n'])
     const second = sseEventStream([
@@ -584,7 +642,9 @@ describe('subscribeSessionEvents (shared hub)', () => {
     const un = subscribeSessionEvents((e) => events.push(e), () => {})
     await flushPromises()
 
-    await vi.advanceTimersByTimeAsync(1000)
+    // One reconciler tick notices the stream is gone and re-opens it: there is no
+    // per-stream backoff timer any more.
+    __reconcileSessionEventsForTests()
     await flushPromises()
 
     expect(fetch).toHaveBeenCalledTimes(2)
@@ -1212,5 +1272,88 @@ describe('build.checkSource', () => {
     expect(parsed.searchParams.get('op')).toBe('source-hello')
     expect(parsed.searchParams.get('source')).toBe('http://parent:7988/v1/setup?token=p')
     expect(result).toEqual({ remote: {}, local: {} })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 交接的确认只认通道本身：命令的 JSON 回答只说明命令被接受，不说明有人能收到帧。
+// 后端现在对没有读者的 conn 直接回答 registered:false（否则它会建一个没人读的
+// 通道对象，2 秒防泄漏宽限再把订阅收回，并在 120 秒后取消那次没有人为停止的推理）。
+// 前端因此必须：(1) 等到通道送出 sub_init 才释放 POST；(2) 被拒时重开通道，
+// 而不是在同一条断链上重发命令。
+// ---------------------------------------------------------------------------
+
+describe('handoff is confirmed by the channel itself', () => {
+  beforeEach(() => { __resetSessionFramesHubForTests() })
+  afterEach(() => { __resetSessionFramesHubForTests(); vi.useRealTimers() })
+
+  it('keeps carrying the session when the channel acknowledges but delivers nothing', async () => {
+    vi.useFakeTimers()
+    const channel = makeChannel()            // stays silent: no sub_init ever arrives
+    const transport = framesTransport([channel])
+    const encoder = new TextEncoder()
+    const postResponse = new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode('event: init\ndata: {"session_id":"session-q","stream_seq":1}\n\n'))
+        controller.enqueue(encoder.encode('id: 2\ndata: {"role":"assistant","content":"carried-by-post"}\n\n'))
+      },
+    }), { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+    vi.stubGlobal('fetch', vi.fn((url, opts = {}) => (
+      url === '/v1/infer/stream' ? Promise.resolve(postResponse) : transport.fetch(url, opts)
+    )))
+
+    const messages = []
+    inferStream({ messages: [] }, (msg) => messages.push(msg.content), vi.fn(), vi.fn())
+    await settle()
+    // The command said registered:true. On the strength of that answer the POST
+    // used to abort itself, and the frames then went to a channel the tab was
+    // not reading -- so the run was cancelled although nobody pressed Stop.
+    expect(transport.calls.commands.some((c) => c.url === '/v1/sessions/frames/subscribe')).toBe(true)
+    expect(messages).toEqual([])
+
+    vi.advanceTimersByTime(3000)
+    await settle()
+    expect(messages).toEqual(['carried-by-post'])
+    expect(isSessionStreamWatched('session-q')).toBe(false)
+  })
+
+  it('re-opens the channel when a subscription is refused as undeliverable', async () => {
+    vi.useFakeTimers()
+    const channels = [makeChannel(), makeChannel()]
+    const opens = []
+    const commands = []
+    vi.stubGlobal('fetch', vi.fn((url, opts = {}) => {
+      if (url.startsWith('/v1/sessions/frames?conn=')) {
+        opens.push(url)
+        return Promise.resolve(channels[Math.min(opens.length - 1, channels.length - 1)].response)
+      }
+      commands.push({ url, body: JSON.parse(opts.body) })
+      if (url === '/v1/sessions/frames/subscribe') {
+        return Promise.resolve({
+          ok: true, status: 200,
+          json: () => Promise.resolve({
+            ok: true, registered: false, reason: 'no_reader',
+            active: true, persisted_seq: 0, latest_seq: 0, replayed: 0,
+          }),
+        })
+      }
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ ok: true }) })
+    }))
+
+    subscribeSessionStream('session-r', () => {}, () => {}, () => {}, null, 3)
+    await settle()
+    expect(commands.filter((c) => c.url === '/v1/sessions/frames/subscribe')).toHaveLength(1)
+
+    // A refusal means this conn has no delivery path. The channel is re-opened
+    // and the watch re-armed from the entry's own cursor -- but on the
+    // reconciler's clock, not in a loop around the command that was refused.
+    await settle()
+    expect(opens).toHaveLength(1)
+    vi.advanceTimersByTime(2000)
+    await settle()
+    expect(opens).toHaveLength(2)
+    const subscribed = commands.filter((c) => c.url === '/v1/sessions/frames/subscribe')
+    expect(subscribed.map((c) => c.body.after)).toEqual([3, 3])
+    expect(isSessionStreamWatched('session-r')).toBe(true)
   })
 })

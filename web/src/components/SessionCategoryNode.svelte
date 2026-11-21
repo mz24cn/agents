@@ -47,6 +47,8 @@
     recent: '\u{1F550}\u{FE0F}',     // 🕐️
     history: '\u{1F4C5}',            // 📅
     month: '\u{1F4C6}',              // 📆
+    labels: '\u{1F3F7}\u{FE0F}',     // 🏷️ 标签根（模式行图标）
+    label: '\u{1F3F7}\u{FE0F}',      // 🏷️ 标签末级（children 为会话 ID）
   }
   // 森林根已折叠进侧边栏的模式图标行、不再渲染为树节点：普通 category 节点
   // （含提为顶层的主题一级分类）一律不带图标，其余特殊类型按表带图标。
@@ -76,7 +78,11 @@
   }
 
   function handleContextmenu(event) {
-    if (!isTerminalAction || !(isTerminalEnv || isTerminalLayer) || !onNodeContextmenu) return
+    if (!onNodeContextmenu) return
+    // 标签末级节点有自己的菜单（生成概要和记忆 / 生成新会话）；
+    // 终端环境/终端层维持原有的新建/编辑/删除菜单。
+    const isLabelNode = nodeKind === 'label'
+    if (!isLabelNode && !(isTerminalAction && (isTerminalEnv || isTerminalLayer))) return
     event.preventDefault()
     event.stopPropagation()
     onNodeContextmenu(node, path, event)

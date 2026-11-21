@@ -1,7 +1,7 @@
 <script>
   import { onMount, onDestroy, setContext, untrack } from 'svelte'
   import { writable } from 'svelte/store'
-  import { inferStream, abortInferStream, interjectInfer, getPauseStatus, subscribeSessionEvents, subscribeSessionStream, isSessionStreamWatched, agents as agentsApi, sessions as sessionsApi, remoteEnv as remoteEnvApi } from '../../lib/api.js'
+  import { inferStream, abortInferStream, interjectInfer, getPauseStatus, subscribeSessionEvents, subscribeSessionStream, isSessionStreamWatched, setStreamReconcileHook, agents as agentsApi, sessions as sessionsApi, remoteEnv as remoteEnvApi } from '../../lib/api.js'
   import { catalog, loadAgents, loadTools, loadEnvVars, refreshAgents } from '../../lib/catalog-state.svelte.js'
   import ModelSelector from './ModelSelector.svelte'
   import ToolSelector from './ToolSelector.svelte'
@@ -17,6 +17,7 @@
   import { buildFileJournalTurnKeyMap } from '../../lib/file-journals.js'
   import { restoreFileRefTags } from '../../lib/file-ref.js'
   import { mergeToolCallDeltas, startsNewToolCallRound } from '../../lib/stream-messages.js'
+  import { reconcileStatusSnapshot } from '../../lib/session-status-snapshot.js'
   import { createStreamFrameBatcher as createSharedFrameBatcher } from '../../lib/stream-batcher.js'
   import AskUserDialog from './AskUserDialog.svelte'
   import {
@@ -31,10 +32,16 @@
     runClientToolCall,
   } from '../../lib/client-tools.js'
   import { assistantIndexForToolCall, insertToolMessage } from '../../lib/stream-tool-placement.js'
+  import {
+    attachCompressionFrame,
+    compressionFrameFromEvent,
+    isCompressionFrame,
+    settleCompressionEntries,
+  } from '../../lib/compression-status.js'
   import { t } from '../../lib/i18n.svelte.js'
   import { forkContextWarning } from '../../lib/session-fork.js'
   import { navigate } from '../../lib/router.svelte.js'
-  import { sessionRestore, sessionDownload, newSessionCreated, sessionDeleted, sessionForked, currentSession, newSessionRequest, terminalOpen, openSessionLogDir, awaitingUserAnswer } from '../../lib/session-state.svelte.js'
+  import { sessionRestore, sessionDownload, newSessionCreated, sessionDeleted, sessionForked, currentSession, newSessionRequest, terminalOpen, openSessionLogDir, awaitingUserAnswer, labelSessionRequest } from '../../lib/session-state.svelte.js'
   import DownloadProgress from './DownloadProgress.svelte'
   import { collapseSidebar } from '../../lib/sidebar-width.svelte.js'
   import Terminal from '../Terminal.svelte'
@@ -191,13 +198,12 @@
   let directlyConsumedSessions = new Set()
   let directStreamLastSeq = new Map()
   let backendStreamingSessions = new Set()
-  // One frame channel per tab made watching a *running* inference almost free,
-  // so a streaming session must never end up with no observer: the backend
-  // cancels a non-flight generation once nobody watches it, and a flight-mode
-  // one would keep running while this tab silently receives nothing. If the
-  // channel entry of a still-streaming session disappears (torn-down channel, an
-  // unexpected per-session done), re-attach it here.
-  let streamWatchSweep = null
+  // One frame channel per tab makes watching a running inference almost free, so
+  // a session this page believes is streaming must always have a delivery path --
+  // the run itself does not depend on one. If the channel entry of a
+  // still-streaming session disappears (torn-down channel, an unexpected
+  // per-session done), re-attach it here. This runs on the api layer's single
+  // reconciler tick rather than on an interval of its own.
   function rearmMissingStreamWatches() {
     for (const sid of backendStreamingSessions) {
       if (!sessionStore[storeKey(sid)] || isSessionStreamWatched(sid)) continue
@@ -233,6 +239,29 @@
     pauseRequestedSessions = next
   }
   function storeKey(sid) { return sid || '__new__' }
+
+  // ── 上下文压缩（重写 summary / memory）：像工具调用一样显示在会话里 ──────
+  // 压缩不产出任何 token，只让推理停几秒：没有提示的话，界面看起来就像卡住。
+  // started 在当轮助手消息上挂一个待处理标记，completed 把它落成结果；同一次压缩
+  // 后端也写进了 conversation.json（messages[i].meta.compressions），所以推理结束
+  // 后重新进入会话，标记仍能在原来的那条消息上还原出来，不依赖任何流。
+  function recordCompressionFrame(store, frame) {
+    const applied = attachCompressionFrame(store.messages, frame)
+    if (applied) store.messages = applied.messages
+  }
+
+  /**
+   * Forget "still compressing" markers whose completion event never arrived.
+   *
+   * The generation is over (or paused), so the pair that opened that marker was
+   * lost on the way here -- leaving it spinning would tell the user the session
+   * is waiting when it is not. conversation.json holds the real record and the
+   * next load of the session shows it.
+   */
+  function settleCompressionEntriesIn(store) {
+    const settled = settleCompressionEntries(store.messages)
+    if (settled) store.messages = settled
+  }
 
   function streamUiDebug(event, details = {}) {
     try {
@@ -491,7 +520,14 @@
           commands: terminalOpen.commands || [],
         }
       } else {
-        openTerminal(sid, terminalOpen.commands || [])
+        // untrack(): openTerminal 读 terminals（找已有条目）又写 terminals（新 Map +
+        // 新条目），在这个 effect 里直接调用就等于让 effect 依赖它自己写的那个 state。
+        // 带进入指令的子终端（terminal_layer）每次重跑都会把 chain 换成新数组再写一次，
+        // 于是 effect 永远不自愈：Svelte 报 effect_update_depth_exceeded，Terminal
+        // 的 open 帧一帧都发不出去，顶栏的终端标记停在 Loading...。空链（直接进环境
+        // 终端）第二轮不再写，所以看不出问题 —— 只有子终端会卡。
+        // 这里只该响应“打开请求”本身，不该响应终端状态。
+        untrack(() => openTerminal(sid, terminalOpen.commands || []))
       }
     }
   })
@@ -1394,12 +1430,11 @@
       {
         // The POST stream is only the initiator handshake. Hand this session's
         // frames to the tab's shared frame channel through a *tracked*
-        // subscription, so the page can tell whether the channel still watches
-        // it (and re-subscribe if it does not). inferStream releases the POST
-        // connection only after the backend confirms the subscription: cancelling
-        // a non-flight inference happens the moment its starter is gone with
-        // nobody watching, which otherwise looked like a spurious
-        // "Error: user interrupted.".
+        // subscription, so the page can tell whether the channel actually
+        // delivers them (and re-subscribe if it does not). inferStream releases
+        // the POST connection only once that is settled: until then the POST
+        // response is the session's only delivery path, and rendering from both
+        // at once would apply every frame twice.
         onHandoff: (sid, afterSeq) => {
           if (Number.isFinite(afterSeq)) directStreamLastSeq.set(sid, afterSeq)
           subscribeToExistingSession(sid, { handoff: true })
@@ -1565,6 +1600,14 @@
     const store = sessionStore[keyRef.key]
     if (!store) return  // session store was cleaned up
     const msgs = store.messages
+
+    if (isCompressionFrame(msg)) {
+      // 压缩的启动 / 完成帧：它既不是消息也不该被持久化 —— 挂到当轮那条消息的
+      // meta.compressions 上（与 conversation.json 里那份记录同形状），于是它像
+      // 工具调用一样出现在会话里；重新进入会话时还原的也正是同一份数据。
+      recordCompressionFrame(store, msg)
+      return
+    }
 
     if (msg.type === 'remove_trailing_assistant') {
       // Continue/retry is destructive on disk. Reproduce that mutation in all
@@ -1973,6 +2016,20 @@
     const sid = keyRef.key === '__new__' ? null : keyRef.key
     const store = sessionStore[keyRef.key]
     if (sid) {
+      // A refused generation is not a dropped connection. The session already had
+      // a generation, so the backend answered 409 instead of letting this request
+      // displace it -- a run ends by stop, pause, finishing, or an agentsvc
+      // restart, never by another request turning up. Nothing of ours entered the
+      // conversation (no init frame ever arrived), so there is no run of ours to
+      // resume: say what happened, and follow the generation that really is
+      // running rather than leaving this tab idle or "reconnecting".
+      if (err?.payload?.code === 'session_inferring') {
+        errorMsg = t('sessionInferringConflict')
+        if (store) store.streamConnection = 'connected'
+        backendStreamingSessions.add(sid)
+        subscribeToExistingSession(sid, { handoff: true })
+        return
+      }
       // POST is only the initiator transport. If it drops after init, hand the
       // first browser over to the resumable retained GET stream. GET will send
       // [DONE] immediately when the conversation already finished meanwhile.
@@ -2398,6 +2455,49 @@
     }
   })
 
+  // 监听标签节点的"生成新会话"：干净草稿上套用标签聚合——
+  // 概要/记忆按系统提示词写入（等同提示词模板"作为系统提示词"），
+  // 执行环境/工作区/模型/工具/AI代理取聚合文档里的众数统计。
+  let lastLabelSessionToken = 0
+  $effect(() => {
+    const token = labelSessionRequest.token
+    if (!token || token === lastLabelSessionToken) return
+    lastLabelSessionToken = token
+    const label = labelSessionRequest.label
+    const summary = labelSessionRequest.summary || ''
+    const memory = labelSessionRequest.memory || ''
+    const config = labelSessionRequest.config || {}
+    if (!summary && !memory) return
+    startNewSession()
+    const parts = []
+    if (summary) parts.push(`【标签「${label}」聚合概要】\n${summary}`)
+    if (memory) parts.push(`【标签「${label}」聚合记忆】\n${memory}`)
+    systemPromptText = parts.join('\n\n')
+    systemPromptTemplate = null
+    if (config.model_id) {
+      selectedModelId = config.model_id
+      try { localStorage.setItem(STORAGE_MODEL_KEY, config.model_id) } catch { /* 存储异常不影响套用 */ }
+    }
+    if (Array.isArray(config.tool_ids)) {
+      selectedToolIds = [...config.tool_ids]
+      try { localStorage.setItem(STORAGE_TOOLS_KEY, JSON.stringify(selectedToolIds)) } catch { /* 同上 */ }
+    }
+    if (Array.isArray(config.agent_ids) && config.agent_ids.length) {
+      selectedAgentIds = [...config.agent_ids]
+      try { localStorage.setItem('chat_selected_agents', JSON.stringify(selectedAgentIds)) } catch { /* 同上 */ }
+    }
+    // 环境切换会重绑工作区到子端默认值，所以先切环境、再覆盖标签统计出的工作区。
+    // 草稿尚无 sessionId：workspacePath 直接随首条消息的 reqBody.workspace 落盘。
+    const applyWorkspace = () => {
+      if (config.workspace) handleWorkspaceChange(config.workspace)
+    }
+    if (config.remote_env_id && config.remote_env_id !== selectedRemoteEnvId) {
+      void handleRemoteEnvChange(config.remote_env_id).then(applyWorkspace)
+    } else {
+      applyWorkspace()
+    }
+  })
+
   // 监听会话删除事件：同步清空右侧面板（效果等同新建会话）
   $effect(() => {
     const deletedSid = sessionDeleted.sessionId
@@ -2515,23 +2615,32 @@
     loadRemoteEnvs()
     // 页面隐藏（关闭/刷新/切后台）时，同步落盘 3 秒延迟窗口内尚未写入的草稿
     window.addEventListener('pagehide', flushDraftNow)
-    streamWatchSweep = setInterval(rearmMissingStreamWatches, 5_000)
+    setStreamReconcileHook(rearmMissingStreamWatches)
     _unsubscribeSessionEvents = subscribeSessionEvents(
       (data) => {
         if (data.event === 'init') {
-          const pausedSnapshot = new Set()
+          // The snapshot replaces this page's belief instead of adding to it, and
+          // names the sessions whose local view is now a lie about a run that is
+          // over -- see lib/session-status-snapshot.js.
+          const snapshot = reconcileStatusSnapshot(
+            backendStreamingSessions, data.sessions, directlyConsumedSessions,
+          )
           for (const [sid, status] of Object.entries(data.sessions || {})) {
-            if (status === 'streaming') backendStreamingSessions.add(sid)
-            else if (status === 'paused') pausedSnapshot.add(sid)
             const s = sessionStore[storeKey(sid)]
-            if (s && status === 'streaming') {
+            if (!s) continue
+            if (status === 'streaming') {
               s.isStreaming = true
               subscribeToExistingSession(sid)
-            } else if (s && status === 'paused') {
+            } else if (status === 'paused' || snapshot.ended.includes(sid)) {
+              // Its frames are on disk; a streaming flag or a compression marker
+              // whose completion event never arrived claims a run that is not
+              // running, so both come off.
               s.isStreaming = false
+              settleCompressionEntriesIn(s)
             }
           }
-          backendPausedSessions = pausedSnapshot
+          backendStreamingSessions = snapshot.streaming
+          backendPausedSessions = snapshot.paused
         } else if (data.event === 'message' && data.session_id && data.status) {
           const sid = data.session_id
           const s = sessionStore[storeKey(sid)]
@@ -2547,12 +2656,17 @@
             markPauseRequested(sid, false)
             directlyConsumedSessions.delete(sid)
             directStreamLastSeq.delete(sid)
+            if (s) settleCompressionEntriesIn(s)
           } else if (data.status.startsWith('done_')) {
             backendStreamingSessions.delete(sid)
             markPaused(sid, false)
             markPauseRequested(sid, false)
             directlyConsumedSessions.delete(sid)
             directStreamLastSeq.delete(sid)
+            // 生成结束：还挂着"正在压缩"的标记说明那一对事件断在了半路（流被
+            // 撕开、页面错过帧），必须收掉；真实记录在 conversation.json 里，
+            // 下次打开会话会按原位置还原。
+            if (s) settleCompressionEntriesIn(s)
           }
           if (s && data.status === 'streaming') {
             s.isStreaming = true
@@ -2560,6 +2674,12 @@
           } else if (s && (data.status.startsWith('done_') || data.status === 'paused')) {
             s.isStreaming = false
           }
+        } else if (data.event === 'compression') {
+          // 会话此刻没有正在进行的推理（手动重新生成摘要、派生超长历史时的
+          // 压缩），后端因此走全局事件通道而不是那条并不存在的会话流。
+          const frame = compressionFrameFromEvent(data)
+          const store = sessionStore[storeKey(data.session_id)]
+          if (frame && store) recordCompressionFrame(store, frame)
         }
       },
       () => { /* silently ignore SSE errors */ },
@@ -2567,10 +2687,7 @@
   })
   onDestroy(() => {
     window.removeEventListener('pagehide', flushDraftNow)
-    if (streamWatchSweep) {
-      clearInterval(streamWatchSweep)
-      streamWatchSweep = null
-    }
+    setStreamReconcileHook(null)
     // SPA 路由离开聊天页时也落盘草稿，再次进入聊天页可还原
     flushDraftNow()
     if (_unsubscribeSessionEvents) {

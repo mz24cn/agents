@@ -269,6 +269,10 @@ const translations = {
     // ChatPage
     systemPromptLabel: '系统提示词:',
     streamError: '流式响应出错',
+    // 后端拒绝在已有世代上再开一个：这条消息根本没进入会话，必须说清楚，
+    // 否则用户只看到自己的消息凭空消失。
+    sessionInferringConflict: '该会话正在推理中（可能在另一个标签页），这条消息没有发送。'
+      + '请先停止当前推理，或切到那个标签页插话。',
     addAsAgent: '添加为AI代理',
     addAsAgentNickname: '输入AI代理昵称',
     addAsAgentConfirm: '确认添加',
@@ -334,6 +338,17 @@ const translations = {
     imageUnavailable: '图片不可用（文件已移动或删除）',
     fileRefContent: '文件内容',
     imageTranscription: '图片识别内容',
+
+    // 上下文压缩标记（ChatPage / MessageBubble）：压缩是推理环节的隐形耗时，
+    // started/completed 两条 SSE 事件把它显示成会话里的一次"工具调用"，同一份
+    // 记录也在 conversation.json 里，重新进入会话时在原位置还原。
+    compressingContext: '正在压缩会话上下文…',
+    contextCompressed: '上下文已压缩',
+    contextCompressFailedShort: '上下文压缩失败',
+    // 完成态只报"压缩出了什么"：v2:1194字符,73条目（摘要版本 / 摘要字数 / 记忆条目）
+    compressionStatChars: '{n}字符',
+    compressionStatEntries: '{n}条目',
+    compressionStatSep: ',',
 
     // MessageBubble
     roleUser: '👤 用户',
@@ -604,6 +619,7 @@ const translations = {
     sessionModeCategory: '按主题分类浏览会话',
     sessionModeHistory: '按月份浏览会话历史',
     sessionModeWorkspace: '按工作区浏览会话',
+    sessionModeLabels: '按标签浏览会话',
     sessionModeTerminal: '终端',
     sessionDirectories: '所属目录',
     noSessionDirectories: '该会话暂无所属目录',
@@ -634,16 +650,22 @@ const translations = {
     userMessages: '用户消息',
     noUserMessages: '暂无用户消息',
     emptyUserMessage: '（空消息）',
-    flightMode: '飞行模式',
-    flightModeFailed: '切换飞行模式失败',
     deleteSession: '删除会话',
     deleteSessionFailed: '删除会话失败',
   confirmDeleteSession: '确定要删除会话「{title}」（{id}）吗？',
     confirmDeleteSessionById: '确定要删除会话「{id}」吗？',
-    generateTitle: '标题设定或生成',
-    generateTitleFailed: '标题设定或生成失败',
+    generateTitle: '设置标题与标签',
+    generateTitleFailed: '标题或标签设置失败',
     titleDialogHint: '输入标题后确定 = 人工设定标题；留空后确定 = 使用模型生成标题',
     titleDialogPlaceholder: '输入会话标题（留空则使用模型生成）',
+    titleDialogLabelsHint: '标签（可多个，逗号或空格分隔；清空后确定 = 移除全部标签）',
+    titleDialogLabelsPlaceholder: '为会话添加标签，如：tts，部署,生产环境',
+    labelSummarize: '生成概要和记忆',
+    labelNewSession: '生成新会话',
+    labelSummarizing: '正在生成标签概要和记忆：',
+    labelPreparingNewSession: '正在准备标签新会话：',
+    labelSummarizeDone: '标签「{label}」的概要和记忆已生成',
+    labelSummarizeFailed: '标签概要和记忆生成失败',
     regenerateSummary: '重新生成概要和记忆',
     regenerateSummaryFailed: '重新生成概要和记忆失败',
     executionAnalysis: '执行过程分析',
@@ -1068,6 +1090,11 @@ const translations = {
     // ChatPage
     systemPromptLabel: 'System prompt:',
     streamError: 'Streaming error',
+    // The backend refused to open a second generation on a session that has one.
+    // The message never entered the conversation, so say so: otherwise the user
+    // just watches their own message vanish.
+    sessionInferringConflict: 'This session is already inferring (possibly in another tab); '
+      + 'your message was not sent. Stop the running turn first, or switch to that tab to interject.',
     addAsAgent: 'Add as Agent',
     addAsAgentNickname: 'Agent nickname',
     addAsAgentConfirm: 'Confirm',
@@ -1133,6 +1160,17 @@ const translations = {
     imageUnavailable: 'Image unavailable (moved or deleted)',
     fileRefContent: 'File content',
     imageTranscription: 'Image transcription',
+
+    // Context-compression marker (ChatPage / MessageBubble): compression is the
+    // invisible wait inside a turn, shown in the conversation like a tool call
+    // and restored from conversation.json when the session is reopened.
+    compressingContext: 'Compressing the conversation context…',
+    contextCompressed: 'Context compressed',
+    contextCompressFailedShort: 'Context compression failed',
+    // A finished attempt reports only what it produced: v2:1194 chars, 73 entries
+    compressionStatChars: '{n} chars',
+    compressionStatEntries: '{n} entries',
+    compressionStatSep: ', ',
 
     // MessageBubble
     roleUser: '👤 User',
@@ -1403,6 +1441,13 @@ const translations = {
     sessionModeCategory: 'Browse sessions by topic',
     sessionModeHistory: 'Browse sessions by month',
     sessionModeWorkspace: 'Browse sessions by workspace',
+    sessionModeLabels: 'Browse sessions by label',
+    labelSummarize: 'Generate summary & memory',
+    labelNewSession: 'Generate new session',
+    labelSummarizing: 'Generating label summary & memory: ',
+    labelPreparingNewSession: 'Preparing label new session: ',
+    labelSummarizeDone: 'Summary & memory generated for label \u201c{label}\u201d',
+    labelSummarizeFailed: 'Failed to generate label summary & memory',
     sessionModeTerminal: 'Terminals',
     sessionDirectories: 'Directories',
     noSessionDirectories: 'This session is not in any directory',
@@ -1433,8 +1478,6 @@ const translations = {
     userMessages: 'User Messages',
     noUserMessages: 'No user messages',
     emptyUserMessage: '(Empty message)',
-    flightMode: 'Flight mode',
-    flightModeFailed: 'Failed to toggle flight mode',
     deleteSession: 'Delete session',
     deleteSessionFailed: 'Failed to delete session',
   confirmDeleteSession: 'Delete session "{title}" ({id})?',

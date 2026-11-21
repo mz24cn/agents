@@ -3,10 +3,11 @@
   import { router, navigate } from '../lib/router.svelte.js'
   import { t } from '../lib/i18n.svelte.js'
   import { sessions, subscribeSessionEvents } from '../lib/api.js'
-  import { sessionRestore, sessionDownload, newSessionCreated, sessionDeleted, sessionForked, currentSession, newSessionRequest, terminalOpen, openSessionLogDir, messageScrollRequest, awaitingUserAnswer } from '../lib/session-state.svelte.js'
+  import { sessionRestore, sessionDownload, newSessionCreated, sessionDeleted, sessionForked, currentSession, newSessionRequest, terminalOpen, openSessionLogDir, messageScrollRequest, awaitingUserAnswer, labelSessionRequest } from '../lib/session-state.svelte.js'
   import { sidebarWidth, setSidebarWidth, toggleSidebarCollapsed, collapseSidebar, SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH } from '../lib/sidebar-width.svelte.js'
   import SessionCategoryNode from './SessionCategoryNode.svelte'
   import { locateTerminalEnvNode } from '$lib/terminalChain.js'
+  import { parseLabels } from '$lib/labels.js'
 
   const SESSION_PAGE_SIZE = 100
 
@@ -89,6 +90,9 @@
   let titleDialogLoading = $state(false)
   let titleDialogError = $state('')
   let titleDialogInput = $state(null)
+  // 标签草稿：与模型/工具/AI代理的标签输入同一套 parseLabels 语义
+  // （半角/全角逗号、空白均可分隔）。确认时整组替换会话标签。
+  let titleDialogLabels = $state('')
 
   // hover 弹出菜单状态：鼠标悬停到 ... 按钮即弹出，悬停在菜单上保持显示
   let hoverBtnId = $state(null)   // 当前鼠标悬停的 ... 按钮 session id
@@ -103,7 +107,6 @@
   // --- Session Status Stream ---
   // Maps session_id -> status string from SSE events
   let sessionStatuses = $state({})
-  let flightSessions = $state(new Set())
   // 本次页面会话内「衍生会话 -> 原会话 ID」的记录，仅用于在条目前显示来源标记。
   // 普通 Map 即可：写入时机总在 sessionList 重新赋值之前，渲染时读取即可见。
   const forkParents = new Map()
@@ -159,7 +162,6 @@
           // Merge all statuses from init snapshot
           const sids = data.sessions || {}
           const titles = data.titles || {}
-          flightSessions = new Set(data.flight_sessions || [])
           for (const [sid, status] of Object.entries(sids)) {
             _applyStatusToSessionList(sid, status)
             // init 快照附带权威标题：重连后补回那些错过了终态事件的
@@ -174,11 +176,6 @@
           if (data.title && typeof data.status === 'string' && data.status.startsWith('done_')) {
             applySseTitle(data.session_id, data.title, data.title_given)
           }
-        } else if (data.event === 'flight_mode') {
-          const next = new Set(flightSessions)
-          if (data.enabled) next.add(data.session_id)
-          else next.delete(data.session_id)
-          flightSessions = next
         } else if (data.event === 'title_update') {
           applySseTitle(data.session_id, data.title, data.title_given)
         }
@@ -191,6 +188,10 @@
 
   onDestroy(() => {
     stopCategoryTreePolling()
+    if (labelStatusTimer) {
+      clearTimeout(labelStatusTimer)
+      labelStatusTimer = null
+    }
     if (_unsubscribeSessionEvents) {
       _unsubscribeSessionEvents()
       _unsubscribeSessionEvents = null
@@ -262,7 +263,11 @@
             : entry.title_given,
           _status: sessionStatuses[entry.session_id]
             || sessionList.find(current => current.session_id === entry.session_id)?._status
-            || entry._status,
+            || entry._status
+            // 持久化回退：服务重启或全新页面加载时没有 SSE 实时状态，
+            // index.json 里持久化的 paused 标记必须接管，否则暂停中的会话
+            // 与“结束且已读”的会话毫无区别，极易被忽略。
+            || (entry.status === 'paused' ? 'paused' : undefined),
         }
       })
       if (append) {
@@ -638,8 +643,13 @@
     } catch (err) {
       if (sessionDownload.token !== downloadToken) return
       restoreError = err.message || t('restoreSessionFailed')
-      // 后端在 session not found 时会删除该记录，前端同步移除
-      sessionList = sessionList.filter(s => s.session_id !== sessionId)
+      // 只有后端明确回答"这个会话不存在"（404）时才把条目从列表里同步移除。
+      // 其它失败一律不是"会话没了"：5xx / 501 / 代理抖动 / keep-alive 串流错位
+      // 都只是这一次传输坏了，会话在磁盘上好好的。曾经一次 501 让侧边栏条目
+      // 当场消失、刷新又回来 —— 前端不能凭一次失败的传输状态删除 UI 状态。
+      if (err.status === 404) {
+        sessionList = sessionList.filter(s => s.session_id !== sessionId)
+      }
     } finally {
       clearTimeout(progressDelay)
       if (sessionDownload.token === downloadToken) {
@@ -1210,6 +1220,7 @@
   let terminalLayerDialog = $state(null)
 
   function handleTerminalNodeContextmenu(node, path, event) {
+    if (node?.type === 'label') { openLabelNodeMenu(node, event); return }
     const target = collectTerminalTarget(path)
     if (!target) return
     terminalMenu = {
@@ -1220,6 +1231,80 @@
       command: node.command || '',
       x: event.clientX,
       y: event.clientY,
+    }
+  }
+
+  // 标签末级节点右键：生成概要和记忆 / 生成新会话。聚合文档存
+  // DATA_DIR/labels/<label>.json（runtime/label_store.py），这里只触发与消费。
+  let labelMenu = $state(null)      // { label, x, y }
+  let labelAction = $state(null)    // 进行态 { label, kind: 'summarize'|'new' }
+  let labelStatus = $state(null)    // 短暂结果提示 { text, error }
+  let labelStatusTimer = null
+
+  function openLabelNodeMenu(node, event) {
+    labelMenu = { label: String(node.name || ''), x: event.clientX, y: event.clientY }
+  }
+
+  function closeLabelMenu() {
+    if (labelMenu) labelMenu = null
+  }
+
+  function setLabelStatus(text, error = false) {
+    labelStatus = { text, error }
+    if (labelStatusTimer) clearTimeout(labelStatusTimer)
+    labelStatusTimer = setTimeout(() => { labelStatus = null }, 5000)
+  }
+
+  // 生成概要和记忆：合并该标签全部会话的概要/记忆 + 众数配置统计。
+  async function runLabelSummarize() {
+    const m = labelMenu
+    closeLabelMenu()
+    if (!m || labelAction) return
+    labelAction = { label: m.label, kind: 'summarize' }
+    try {
+      await sessions.summarizeLabel(m.label)
+      setLabelStatus(t('labelSummarizeDone', { label: m.label }))
+    } catch (err) {
+      setLabelStatus(err?.message || t('labelSummarizeFailed'), true)
+    } finally {
+      labelAction = null
+    }
+  }
+
+  // 生成新会话：取（或先生成）聚合文档，交给 ChatPage 消费——
+  // 概要/记忆写入系统提示词，配置（环境/工作区/模型/工具/代理）套用到草稿。
+  async function runLabelNewSession() {
+    const m = labelMenu
+    closeLabelMenu()
+    if (!m || labelAction) return
+    const label = m.label
+    try {
+      labelAction = { label, kind: 'new' }
+      let doc = null
+      try {
+        doc = (await sessions.labelDoc(label))?.doc || null
+      } catch (err) {
+        doc = null
+      }
+      if (!doc || !(doc.summary || doc.memory)) {
+        labelAction = { label, kind: 'summarize' }
+        doc = (await sessions.summarizeLabel(label))?.doc || null
+      }
+      if (!doc) {
+        setLabelStatus(t('labelSummarizeFailed'), true)
+        return
+      }
+      labelSessionRequest.label = label
+      labelSessionRequest.summary = doc.summary || ''
+      labelSessionRequest.memory = doc.memory || ''
+      labelSessionRequest.config = doc.config || null
+      labelSessionRequest.token += 1
+      navigate('#/chat')
+      if (window.innerWidth < 1024) collapseSidebar()
+    } catch (err) {
+      setLabelStatus(err?.message || t('labelSummarizeFailed'), true)
+    } finally {
+      labelAction = null
     }
   }
 
@@ -1355,8 +1440,9 @@
     }
   }
 
-  // “标题设定或生成”：弹出输入框，初值为当前标题（人工指定或模型生成的均显示）。
-  // 留空确定 = 走模型生成标题的原逻辑；非空确定 = 人工设定标题。
+  // "设置标题与标签"：弹出对话框，标题与标签各自预填当前值。
+  // 标题留空确定 = 走模型生成标题的原逻辑；非空确定 = 人工设定标题。
+  // 标签整组替换（空 = 清空），编辑分隔符语义与模型/工具/AI代理一致。
   function handleOpenTitleDialog(e, sid) {
     e.stopPropagation()
     closeMenu()
@@ -1365,6 +1451,7 @@
     const current = entry?.title
     titleDialogSid = sid
     titleDialogValue = current && current !== sid ? current : ''
+    titleDialogLabels = (entry?.labels || []).join(', ')
     titleDialogError = ''
     titleDialogLoading = false
     titleDialogOpen = true
@@ -1388,17 +1475,29 @@
     const sid = titleDialogSid
     if (!sid) return
     const title = titleDialogValue.trim()
+    // parseLabels：与模型/工具/AI代理标签输入完全相同的分隔与清洗语义。
+    const labels = parseLabels(titleDialogLabels)
     titleDialogLoading = true
     titleDialogError = ''
     try {
-      const result = await sessions.generateTitle(sid, title)
+      const result = await sessions.generateTitle(sid, title, labels)
       if (result && result.status === 'success') {
-        // 更新本地列表中的标题
+        // 更新本地列表中的标题与标签
+        const nextLabels = Array.isArray(result.labels) ? result.labels : labels
         sessionList = sessionList.map(s =>
           s.session_id === sid
-            ? { ...s, title: result.title, title_given: !!result.title_given }
+            ? { ...s, title: result.title, title_given: !!result.title_given, labels: nextLabels }
             : s
         )
+        // 标签根挂载已在后端同步；刷新森林，并让标签模式下的会话列表即时对齐
+        await loadCategoryTree(true)
+        if (viewMode === 'labels' && selectedCategory) {
+          const labelsRootNow = findRootByKind(categoryTree, 'labels')
+          const stillMounted = (labelsRootNow?.children || [])
+            .some(c => c && String(c.id) === String(selectedCategory).split('/')[1])
+          if (stillMounted) await loadSessions()
+          else { selectedCategory = ''; clearSessionListState() }
+        }
       }
       titleDialogOpen = false
       titleDialogSid = null
@@ -1429,21 +1528,6 @@
       }
     } catch (err) {
       restoreError = err.message || t('regenerateSummaryFailed')
-    }
-  }
-
-  async function handleToggleFlight(e, sid) {
-    e.stopPropagation()
-    const enabled = !flightSessions.has(sid)
-    closeMenu()
-    try {
-      await sessions.setFlightMode(sid, enabled)
-      const next = new Set(flightSessions)
-      if (enabled) next.add(sid)
-      else next.delete(sid)
-      flightSessions = next
-    } catch (err) {
-      restoreError = err.message || t('flightModeFailed')
     }
   }
 
@@ -1619,7 +1703,7 @@
 </script>
 
 <!-- 点击空白处关闭菜单 -->
-<svelte:window onclick={closeMenu} onresize={handleViewportResize} />
+<svelte:window onclick={() => { closeMenu(); closeLabelMenu() }} onresize={handleViewportResize} />
 
 <!-- 终端节点右键菜单：新建子终端 / 删除（级联）。fixed 渲染在 sidebar 外避免裁剪。 -->
 {#if terminalMenu}
@@ -1640,6 +1724,23 @@
         <span class="menu-emoji">🗑️</span>{t('terminalLayerDelete')}
       </button>
     {/if}
+  </div>
+{/if}
+
+<!-- 标签节点右键菜单：生成概要和记忆 / 生成新会话 -->
+{#if labelMenu}
+  <div
+    class="terminal-node-menu"
+    role="menu"
+    style="left:{labelMenu.x}px; top:{labelMenu.y}px;"
+    onclick={(e) => e.stopPropagation()}
+  >
+    <button class="terminal-node-menu-item" role="menuitem" onclick={runLabelSummarize}>
+      <span class="menu-emoji">🧩</span>{t('labelSummarize')}
+    </button>
+    <button class="terminal-node-menu-item" role="menuitem" onclick={runLabelNewSession}>
+      <span class="menu-emoji">✨</span>{t('labelNewSession')}
+    </button>
   </div>
 {/if}
 
@@ -1936,16 +2037,6 @@
       {t('openSessionLogDir')}
     </button>
     <button
-      class="session-dropdown-item"
-      role="menuitemcheckbox"
-      aria-checked={flightSessions.has(menuOpenId)}
-      onclick={(e) => handleToggleFlight(e, menuOpenId)}
-    >
-      <span class="menu-emoji">✈️</span>
-      <span>{t('flightMode')}</span>
-      {#if flightSessions.has(menuOpenId)}<span class="menu-check">✓</span>{/if}
-    </button>
-    <button
       class="session-dropdown-item session-dropdown-danger"
       role="menuitem"
       onclick={(e) => handleDeleteSession(e, menuOpenId)}
@@ -1971,6 +2062,14 @@
         bind:value={titleDialogValue}
         placeholder={t('titleDialogPlaceholder')}
         maxlength="100"
+        onkeydown={handleTitleDialogKeydown}
+      />
+      <p class="title-dialog-hint">{t('titleDialogLabelsHint')}</p>
+      <input
+        class="title-dialog-input"
+        type="text"
+        bind:value={titleDialogLabels}
+        placeholder={t('titleDialogLabelsPlaceholder')}
         onkeydown={handleTitleDialogKeydown}
       />
       {#if titleDialogError}
@@ -2062,6 +2161,13 @@
         aria-label={t('sessionModeWorkspace')}
       ><span class="mode-glyph" aria-hidden="true">{'\u{1F5C2}\u{FE0F}'}</span></button>
       <button
+        class="mode-btn"
+        class:active={viewMode === 'labels'}
+        onclick={() => showModeState('labels')}
+        title={t('sessionModeLabels')}
+        aria-label={t('sessionModeLabels')}
+      ><span class="mode-glyph" aria-hidden="true">{'\u{1F3F7}\u{FE0F}'}</span></button>
+      <button
         class="mode-btn mode-btn-terminal"
         class:active={viewMode === 'terminal'}
         onclick={() => showModeState('terminal')}
@@ -2069,6 +2175,16 @@
         aria-label={t('sessionModeTerminal')}
       ><span class="mode-glyph" aria-hidden="true">{'\u{1F4BB}'}</span></button>
     </div>
+    {#if labelAction || labelStatus}
+      <div class="label-action-status" class:error={labelStatus?.error} role="status">
+        {#if labelAction}
+          <span class="category-tree-building-dot" aria-hidden="true"></span>
+          {labelAction.kind === 'summarize' ? t('labelSummarizing') : t('labelPreparingNewSession')}「{labelAction.label}」
+        {:else}
+          {labelStatus.text}
+        {/if}
+      </div>
+    {/if}
     {#if directoryOpen}
       <div class="category-tree" class:full={viewMode === 'terminal'} bind:this={categoryTreeElement} onscroll={(e) => { directoryTreeScrollTop = e.currentTarget.scrollTop }}>
         {#if categoryTreeBuilding}
@@ -2127,7 +2243,6 @@
                   <span class="session-fork" title={t('forkSource').replace('{id}', forkParents.get(entry.session_id))}>⑂</span>
                 {/if}
                 {getSessionDisplay(entry).display}
-                {#if flightSessions.has(entry.session_id)}<span class="session-flight">✈️</span>{/if}
                 {#if awaitingUserAnswer.sessionIds.includes(entry.session_id)}
                   <span class="session-awaiting" title={t('awaitingUserAnswer')}>❓</span>
                 {/if}
@@ -2307,7 +2422,7 @@
     flex: 0 0 auto;
     display: inline-flex;
     align-items: center;
-    padding: 4px 9px;
+    padding: 4px 6px;
     border: none;
     background: none;
     color: var(--text-secondary);
@@ -2322,6 +2437,17 @@
   .mode-btn:hover { color: var(--text); opacity: 1; }
   .mode-btn.active { color: var(--text); opacity: 1; }
   .mode-btn-terminal { margin-left: auto; }
+  /* 标签聚合动作的短暂状态条（生成概要和记忆 / 生成新会话）。 */
+  .label-action-status {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    font-size: 0.76rem;
+    color: var(--text-secondary);
+    flex-shrink: 0;
+  }
+  .label-action-status.error { color: var(--danger, #d33); }
   .category-tree {
     /* 分类模式：树框约占侧边栏有效高度的三分之一，其余给会话列表。 */
     max-height: 34%;
@@ -2406,6 +2532,12 @@
   }
   .session-item.status-done-error-unread {
     color: var(--danger, #e53e3e);
+    font-weight: 600;
+  }
+  /* 暂停中的会话：黄色加粗、非斜体（streaming 是橙色斜体），
+     保证在列表里一眼可见、不会和"结束已读"混淆。 */
+  .session-item.status-paused {
+    color: var(--paused);
     font-weight: 600;
   }
   .session-menu-btn {
@@ -2655,7 +2787,6 @@
     background-color: rgba(229, 62, 62, 0.08);
   }
  .menu-check { margin-left: auto; font-weight: 700; color: #22c55e; }
-  .session-flight { margin-left: .35rem; font-size: .9em; vertical-align: -0.1em; }
   /* 这条会话有一个未回答的 AskUser：切走页面时也需要看得见，所以标记要显眼 */
   .session-awaiting {
     margin-left: .35rem;

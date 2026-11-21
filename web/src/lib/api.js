@@ -355,10 +355,9 @@ export function inferStream(body, onMessage, onDone, onError, onInit = null, onS
             }
             if (Number.isFinite(data.stream_seq)) onSequence?.(data.stream_seq)
             // Release the POST connection only once the channel confirms it
-            // watches this session: outside flight mode the backend cancels a
-            // generation as soon as its starter is gone while nobody observes
-            // it, so aborting before the subscription landed showed up as
-            // "Error: user interrupted." for inferences the user never aborted.
+            // delivers this session's frames. Until then the POST response is
+            // the only delivery path, and consuming both at once would apply
+            // every frame twice; the run itself is independent of either.
             framesWatchingReady(data.session_id)
               .catch(() => false)
               .then((watched) => {
@@ -561,8 +560,13 @@ export const sessions = {
   meta:          (sessionId)     => request('GET',    `/v1/sessions/${encodeURIComponent(sessionId)}/meta`),
   executionAnalysis: (sessionId) => request('GET',    `/v1/sessions/${encodeURIComponent(sessionId)}/execution-analysis`),
   delete:        (sessionId)     => request('DELETE', `/v1/sessions/${encodeURIComponent(sessionId)}`),
-  // title 非空 = 人工设定标题；空 = 模型生成标题
-  generateTitle: (sessionId, title = '') => request('POST', `/v1/sessions/${encodeURIComponent(sessionId)}/generate-title`, { title }),
+  // title 非空 = 人工设定标题；空 = 模型生成标题。
+  // labels 非 null = 整组替换会话标签（[] = 清空）；null = 不动标签。
+  generateTitle: (sessionId, title = '', labels = null) => request('POST', `/v1/sessions/${encodeURIComponent(sessionId)}/generate-title`, { title, ...(labels !== null ? { labels } : {}) }),
+  setLabels:     (sessionId, labels) => request('POST', `/v1/sessions/${encodeURIComponent(sessionId)}/labels`, { labels }),
+  // 标签聚合：合并该标签全部会话的概要/记忆 + 统计常用配置（存 DATA_DIR/labels/）。
+  summarizeLabel: (label)    => request('POST', '/v1/sessions/labels/summarize', { label }),
+  labelDoc:      (label)     => request('GET',    `/v1/sessions/labels?label=${encodeURIComponent(label)}`),
   regenerateSummary: (sessionId) => request('POST',   `/v1/sessions/${encodeURIComponent(sessionId)}/regenerate-summary`),
   // workspace：会话当前认定的工作区。服务端以 journal manifest 记录的工作区为准，
   // 这个值只作兜底（manifest 没记 workspace 的老会话）——不传的话服务端会退回
@@ -574,7 +578,6 @@ export const sessions = {
   markRead:      (sessionId)     => request('POST',   `/v1/sessions/${encodeURIComponent(sessionId)}/read`),
   fileJournals:  (sessionId)     => request('GET',    `/v1/sessions/${encodeURIComponent(sessionId)}/file-journals`),
   fileJournalDiff: (sessionId, turnKey) => request('GET', `/v1/sessions/${encodeURIComponent(sessionId)}/file-journals/${encodeURIComponent(turnKey)}`),
-  setFlightMode: (sessionId, enabled) => request('POST', `/v1/sessions/${encodeURIComponent(sessionId)}/flight`, { enabled }),
   // 嵌套终端层：森林"终端"根下用户自建的子环境（进入指令 ssh/wsl/docker exec…，
   // 双击时逐层注入，见 web/src/lib/terminalChain.js）。env_id='' 即"本地"——
   // 单环境形态下终端根本身就是本地环境节点，不能省略这个键。
@@ -599,21 +602,46 @@ export const sessions = {
  *
  * 连接数因此与并发会话数无关：1 条事件 hub + 1 条帧通道。
  */
-const FRAMES_WATCHDOG_MS = 45_000
-const FRAMES_RECONNECT_MS = 1_000
+// The backend writes an SSE comment heartbeat on this channel at least every 15s
+// (the channel loop's queue.get(timeout=15)), so "no bytes for two heartbeats" is
+// the only sound liveness signal a browser has: silence means the socket is gone,
+// never merely "this conversation happens to be thinking".
+const FRAMES_KEEPALIVE_MS = 15_000
+const FRAMES_STALE_MS = 2 * FRAMES_KEEPALIVE_MS
+// One reconciler tick for this whole subsystem, replacing the per-concern timers
+// this used to carry (a 1s reconnect backoff, a 45s silence watchdog, a 60s idle
+// channel teardown, a page-level 5s watch sweep). Each was an independent guess
+// about the same question -- "is this tab still here, and still watching?" -- and
+// they raced each other. The tick asks it once, from state:
+//   should this tab have a channel?       open it, or hand it back
+//   is every watch registered?            re-subscribe from its own cursor
+//   has the channel stopped delivering?   drop it and reconnect
+const STREAM_RECONCILE_MS = 2_000
 const FRAMES_CONN_KEY = 'agents_frames_conn'
-// Upper bound for waiting until the channel really watches a session before the
-// POST that started the inference releases itself. The backend tolerates a
-// momentary loss of every observer (SESSION_UNOBSERVED_GRACE_S), so a slow
-// subscribe command is survivable; this bound only stops a broken channel from
-// pinning the POST connection forever.
+// Upper bound for waiting until the channel proves it delivers a session -- one
+// byte of that session on the channel itself -- before the POST that started the
+// inference releases itself. Nothing hangs on that release: the run belongs to
+// the session, not to the request that started it. This bound only stops a
+// broken channel from pinning the POST connection forever.
 const FRAMES_HANDOFF_WAIT_MS = 2_000
-const FRAMES_SUBSCRIBE_RETRY_MS = 400
 // Upper bound on frames handed to the page but not yet acknowledged by it. A
 // page that cannot acknowledge (a batcher waiting for a paint a hidden tab will
 // never serve, a detached component) must not pin the resume cursor: every
 // reconnect would otherwise replay the whole generation from the stale cursor.
 const FRAMES_MAX_PENDING_APPLIES = 512
+// How many times one session's watch may be re-armed to close a hole in the
+// sequence before the page stops trying and leaves the run alone. A hole means
+// the backend had to drop a live frame for this tab (its channel queue was over
+// full); the frames are still retained, so re-subscribing from the cursor this
+// tab applied normally fills it in. Without a bound, a frame trimmed out of the
+// server's buffer would have this tab re-subscribing forever.
+const FRAMES_MAX_GAP_HEALS = 3
+// How many frames beyond a hole may arrive before the repair brings the hole
+// itself, and have to be remembered as already delivered so the replay does not
+// apply them twice. In practice this is a handful -- the repair re-subscribes at
+// once -- and beyond the bound the page prefers a possible duplicate to losing
+// the tail of a live run.
+const FRAMES_MAX_OUT_OF_ORDER = 512
 
 /** Per-tab channel id: stable across reloads of the same tab. */
 function framesConnId() {
@@ -630,26 +658,167 @@ const sessionFramesHub = {
   conn: '',
   entries: new Map(),   // sessionId -> subscription entry
   controller: null,
-  reconnectTimer: null,
-  watchdogTimer: null,
+  reconcileTimer: null,
   generation: 0,
   connecting: false,
   connected: false,
+  lastByteAt: 0,        // any bytes, including the backend's 15s heartbeat
   lastError: null,
+  reconnectRequested: false,   // a watch was refused: the channel is not what we believe
 }
 
-function framesClearWatchdog() {
-  if (sessionFramesHub.watchdogTimer) clearTimeout(sessionFramesHub.watchdogTimer)
-  sessionFramesHub.watchdogTimer = null
+/**
+ * The only timer this subsystem owns. It is a reconciliation loop, not a timeout:
+ * every liveness question used to have its own timer guessing at the answer (a 1s
+ * reconnect backoff, a 45s silence watchdog, a 60s idle-channel teardown, a page
+ * level 5s watch sweep), and each guess could be wrong at a different moment --
+ * which is how "the run was cancelled although nobody pressed Stop" came back five
+ * times in a row. The tick reads the state instead and logs what it decided.
+ */
+function framesStopReconciler() {
+  const hub = sessionFramesHub
+  if (hub.reconcileTimer) clearInterval(hub.reconcileTimer)
+  hub.reconcileTimer = null
 }
 
-function framesArmWatchdog(generation) {
-  framesClearWatchdog()
-  sessionFramesHub.watchdogTimer = setTimeout(() => {
-    if (generation !== sessionFramesHub.generation) return
-    streamDebug('frames_watchdog', { generation })
-    sessionFramesHub.controller?.abort()
-  }, FRAMES_WATCHDOG_MS)
+function framesEnsureReconciler() {
+  if (sessionFramesHub.reconcileTimer) return
+  sessionFramesHub.reconcileTimer = setInterval(reconcileStreams, STREAM_RECONCILE_MS)
+}
+
+/**
+ * Coming back to the foreground only re-opens what is missing.
+ *
+ * Hiding is not a lifecycle signal: the tab is still there with the same watches,
+ * and the generations it started keep running whether or not anything is reading
+ * them. Releasing the channel on hide used to be justified as giving one of the
+ * browser's ~6 connections per origin back, and what it actually bought was a
+ * gap in the frames of a live run for as long as the tab stayed away -- plus the
+ * whole class of "I came back and there was nothing to replay" failures. A page
+ * that is really going away says so on ``pagehide``, and that half is still
+ * acted on below.
+ */
+function framesOnVisibilityChange() {
+  if (typeof document === 'undefined') return
+  if (document.visibilityState === 'hidden') return
+  framesEnsureReconciler()
+  reconcileStreams()
+}
+
+/**
+ * bfcache freezes a live page; a real unload just lets go. Neither is a
+ * cancellation signal -- browsers fire pagehide on reload too, and ending a run
+ * because the user pressed reload is exactly the bug class this whole file is
+ * about. The page comes back, re-opens its channel, and replays.
+ */
+function framesOnPageHide(event) {
+  const hub = sessionFramesHub
+  if (!hub.conn) return
+  framesTeardown(event && event.persisted ? 'bfcache' : 'page_unload')
+}
+
+if (typeof document !== 'undefined') {
+  document.addEventListener('visibilitychange', framesOnVisibilityChange)
+  window.addEventListener('pagehide', framesOnPageHide)
+}
+
+/**
+ * The page-level half of the sweep. A component that owns the session store
+ * registers this so "the backend is still running a session this tab stopped
+ * routing" is repaired on the same tick instead of by its own interval.
+ */
+let streamReconcileHook = null
+
+export function setStreamReconcileHook(hook) {
+  streamReconcileHook = typeof hook === 'function' ? hook : null
+  // A page that registered a hook wants the sweep even in the case that hook is
+  // there to repair -- a lost watch leaves no entry behind, and a timer that only
+  // runs while entries exist would never notice.
+  if (streamReconcileHook) framesEnsureReconciler()
+}
+
+function framesReconcile() {
+  const hub = sessionFramesHub
+  let action = ''
+
+  if (hub.entries.size > 0) {
+    if (hub.reconnectRequested) {
+      // A watch was refused, so the belief that this conn can deliver is what
+      // has to go. Deferred to this tick rather than done from the command's
+      // callback: the reconciler is the only clock this subsystem has, and a
+      // channel that keeps refusing must not be re-opened as fast as promises
+      // resolve.
+      action = 'reconnect_refused'
+      framesReconnectChannel()
+    } else if (!hub.conn || (!hub.connected && !hub.connecting)) {
+      action = hub.conn ? 'reconnect' : 'open'
+      framesConnect()
+    } else if (hub.connected && hub.lastByteAt
+               && Date.now() - hub.lastByteAt > FRAMES_STALE_MS) {
+      // Two heartbeats of silence: the socket died without anyone saying so (a
+      // proxy cut that never sent FIN, a half-open keepalive). Nothing about the
+      // *conversation* is quiet here -- the backend heartbeats every 15s even for
+      // an idle channel -- so silence can only mean the transport.
+      const silentMs = Date.now() - hub.lastByteAt
+      streamDebug('frames_stale', {
+        conn: hub.conn, generation: hub.generation, silent_ms: silentMs,
+      })
+      action = 'reconnect_stale'
+      framesReconnectChannel()
+    }
+    if (hub.connected) {
+      // A subscribe command that never landed leaves the backend without an
+      // observer for that session; the channel is alive, so re-send it.
+      for (const entry of hub.entries.values()) {
+        if (entry.registeredGeneration === hub.generation) continue
+        action = action || 'resubscribe'
+        framesSubscribeCommand(entry)
+      }
+    }
+  } else if (hub.conn) {
+    // Nothing routed any more: the connection belongs to the budget, not to a
+    // "just in case". A page that is merely in the background still routes its
+    // watches, so it keeps this one.
+    action = 'close_idle'
+    framesTeardown('idle')
+  }
+
+  try {
+    streamReconcileHook?.()
+  } catch {
+    // A page hook must not be able to take the channel down with it.
+  }
+
+  if (action) {
+    streamDebug('frames_reconcile', { action, conn: hub.conn, sessions: hub.entries.size })
+  }
+}
+
+/**
+ * One interval for every long-lived stream this tab owns. The stop condition
+ * therefore has to look at both halves: a tab with watches, an open channel, or
+ * status-event listeners needs the loop; a page that streams nothing at all does
+ * not. Visibility is not part of it -- a background tab keeps its watches, and
+ * its reconciler is what notices a socket that died while nobody was looking.
+ */
+function reconcileStreams() {
+  framesReconcile()
+  hubReconcile()
+
+  const framesBusy = Boolean(sessionFramesHub.conn) || sessionFramesHub.entries.size > 0
+  if (!framesBusy && sessionEventsHub.listeners.size === 0 && !streamReconcileHook) {
+    framesStopReconciler()
+  }
+}
+
+/** Run one reconciler tick on demand (tests, and the page after a state change). */
+export function __reconcileSessionFramesForTests() {
+  framesReconcile()
+}
+
+/** The events-hub half of one tick, on demand (tests). */
+export function __reconcileSessionEventsForTests() {
+  hubReconcile()
 }
 
 function framesCommand(path, payload) {
@@ -683,24 +852,34 @@ function framesSubscribeCommand(entry) {
     return entry.subscribePending
   }
   entry.registeredGeneration = hub.generation
-  const send = () => framesCommand('/v1/sessions/frames/subscribe', {
+  return (entry.subscribePending = framesCommand('/v1/sessions/frames/subscribe', {
     conn: hub.conn,
     session_id: entry.sessionId,
     after: entry.lastSeq,
-  }).then((result) => result.ok === true && result.registered !== false)
-  return (entry.subscribePending = send().then((registered) => {
-    if (registered) return true
-    // The command did not land (proxy hiccup, 5xx, dropped connection): the
-    // backend still has no observer for this session, so retry once on the same
-    // channel before the caller decides whether it may release its own stream.
-    if (entry.registeredGeneration !== hub.generation || !hub.conn) return false
-    return new Promise((resolve) => setTimeout(resolve, FRAMES_SUBSCRIBE_RETRY_MS))
-      .then(() => {
-        if (entry.registeredGeneration !== hub.generation || !hub.conn) return false
-        entry.registeredGeneration = -1
-        return (entry.subscribePending = send())
-      })
+  }).then((result) => {
+    if (result.ok === true && result.registered !== false) return true
+    // Refused, or it never landed: this conn has no delivery path. The GET *is*
+    // the observer, so re-open it and let the connect sweep register the watch
+    // again from this entry's cursor. Re-sending the command over a channel that
+    // cannot deliver would only have produced a registration nobody can read --
+    // which is how a run ended up with no observer at all.
+    entry.registeredGeneration = -1
+    hub.reconnectRequested = true
+    return false
   }))
+}
+
+/** Drop the channel socket and open another one; watches are re-armed by the
+ *  connect sweep, each from its own cursor. */
+function framesReconnectChannel() {
+  const hub = sessionFramesHub
+  hub.reconnectRequested = false
+  hub.generation += 1
+  hub.controller?.abort()
+  hub.controller = null
+  hub.connected = false
+  hub.connecting = false
+  framesConnect()
 }
 
 // Callers that must not release their own connection before the channel is
@@ -726,20 +905,42 @@ export function isSessionStreamWatched(sessionId) {
 }
 
 /**
- * Promise that settles true once the backend confirmed it watches this session on
- * this tab's channel, false if that did not happen within FRAMES_HANDOFF_WAIT_MS.
- * `subscribeSessionStream` records the pending command per entry, so this never
- * triggers a second subscribe.
+ * Promise that settles true once this tab's channel has *delivered* for this
+ * session -- its ``sub_init`` or first frame arrived on the channel itself -- and
+ * false if that did not happen within FRAMES_HANDOFF_WAIT_MS, or if the channel
+ * went away first. The caller keeps its own connection until then.
+ *
+ * The subscribe command's JSON answer is deliberately not enough: it says the
+ * command was accepted, not that anything can receive the frames. A backend that
+ * answers "registered" for a channel with no reader, while the caller releases
+ * the connection that *was* watching, leaves the generation with no observer and
+ * it is cancelled a window later -- reported to the page as
+ * "Error: user interrupted." on a run nobody aborted.
  */
 function framesWatchingReady(sessionId) {
   const entry = sessionFramesHub.entries.get(String(sessionId))
   if (!entry) return Promise.resolve(false)
-  const pending = entry.subscribePending
-  if (!pending) return Promise.resolve(false)
-  return Promise.race([
-    Promise.resolve(pending).then((registered) => registered === true),
-    new Promise((resolve) => setTimeout(() => resolve(false), FRAMES_HANDOFF_WAIT_MS)),
-  ])
+  if (entry.delivered) return Promise.resolve(true)
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), FRAMES_HANDOFF_WAIT_MS)
+    entry.deliveryWaiters.push((value) => {
+      clearTimeout(timer)
+      resolve(value)
+    })
+  })
+}
+
+/** One byte for this session on the channel proves the watch is real. */
+function framesConfirmDelivery(entry) {
+  if (entry.delivered) return
+  entry.delivered = true
+  for (const resolve of entry.deliveryWaiters.splice(0)) resolve(true)
+}
+
+/** A channel that goes away or a watch that is dropped settles the wait now
+ *  instead of letting the caller sit on it for the whole bound. */
+function framesAbandonDelivery(entry) {
+  for (const resolve of entry.deliveryWaiters.splice(0)) resolve(false)
 }
 
 /**
@@ -750,15 +951,85 @@ function framesWatchingReady(sessionId) {
 function framesAcknowledge(entry, seq) {
   entry.lastSeq = Math.max(entry.lastSeq, seq)
   entry.pendingApplications = Math.max(0, entry.pendingApplications - 1)
-  if (entry.pendingApplications === 0 && entry.reconnectAfterApplications) {
-    entry.reconnectAfterApplications = false
-    if (sessionFramesHub.connected) framesSubscribeCommand(entry)
+}
+
+/**
+ * Close a hole in what this tab is being told.
+ *
+ * The channel hands over one session's frames in increasing sequence order, so a
+ * jump means the backend dropped one on the way here (its per-tab queue went over
+ * full -- it logs that, and the run itself is unaffected). Those frames are still
+ * retained server-side, so repair it the way a reconnect does: re-subscribe this
+ * session from ``lastSeq``, the last sequence this tab actually applied. The
+ * replay then carries the hole, and every frame this tab already has is skipped
+ * by the duplicate check in the dispatch below.
+ */
+function framesHealGap(entry, seq) {
+  if (entry.gapHeals >= FRAMES_MAX_GAP_HEALS) {
+    // The repair did not close the hole, so the frames in it are gone from the
+    // backend's buffer too. Say so once per session instead of re-subscribing
+    // forever: the conversation on disk stays correct, this tab just stops
+    // showing the tail of that generation until it is reopened.
+    if (entry.gapHeals === FRAMES_MAX_GAP_HEALS) {
+      streamDebug('frames_gap_unrepaired', {
+        sessionId: entry.sessionId, through: entry.receivedSeq,
+        cursor: entry.lastSeq, seen: seq,
+      })
+    }
+    entry.gapHeals += 1
+    return
   }
+  entry.gapHeals += 1
+  streamDebug('frames_gap', {
+    sessionId: entry.sessionId, missing_from: entry.receivedSeq + 1, missing_to: seq - 1,
+    cursor: entry.lastSeq, attempt: entry.gapHeals,
+  })
+  // Force a fresh subscribe command (the per-generation idempotence guard in
+  // framesSubscribeCommand would otherwise consider this session registered).
+  entry.registeredGeneration = -1
+  framesSubscribeCommand(entry)
+}
+
+/** Has this tab already been handed that frame? */
+function framesAlreadyHave(entry, seq) {
+  return seq <= entry.receivedSeq || (entry.ahead?.has(seq) ?? false)
+}
+
+/**
+ * Move the contiguous watermark, closing a hole whose frames have all arrived.
+ *
+ * ``receivedSeq`` is the watermark of *contiguous* delivery, which is what makes
+ * a jump detectable in the first place: were it simply the highest sequence seen,
+ * the replay that fills a hole would look like a duplicate of it and the hole
+ * would never close. Frames above the hole are remembered (``ahead``) so that
+ * filling it does not replay those a second time as well.
+ *
+ * Returns false when the frame sits beyond a hole (out of order).
+ */
+function framesAdvanceWatermark(entry, seq) {
+  // Nothing has been established as contiguous yet (no cursor, and this session's
+  // sub_init carried no persisted sequence): take the frame as the new reference
+  // rather than claim a hole that cannot be known.
+  if (entry.receivedSeq < 0) {
+    entry.receivedSeq = seq
+    return true
+  }
+  if (seq > entry.receivedSeq + 1) return false
+  entry.receivedSeq = seq
+  while (entry.ahead.has(entry.receivedSeq + 1)) {
+    entry.ahead.delete(entry.receivedSeq + 1)
+    entry.receivedSeq += 1
+  }
+  return true
 }
 
 function framesApply(entry, seq, eventName, frame) {
   entry.onMessage?.(frame, seq, eventName)
   if (seq == null) return
+  // The cursor says where this tab is *complete*, so it never moves past a hole:
+  // a frame handed over above a gap being repaired must not lift the resume point
+  // over the frames still missing underneath it.
+  const completeThrough = Math.min(seq, entry.receivedSeq)
   if (entry.onApplied) {
     entry.pendingApplications += 1
     // The frames are already handed to the UI; only the cursor advance is
@@ -767,19 +1038,18 @@ function framesApply(entry, seq, eventName, frame) {
       streamDebug('frames_cursor_released_unacknowledged', {
         sessionId: entry.sessionId, seq, pending: entry.pendingApplications,
       })
-      entry.reconnectAfterApplications = false
       entry.pendingApplications = 0
-      entry.lastSeq = Math.max(entry.lastSeq, seq)
+      entry.lastSeq = Math.max(entry.lastSeq, completeThrough)
       return
     }
     let acknowledged = false
     entry.onApplied(() => {
       if (acknowledged) return
       acknowledged = true
-      framesAcknowledge(entry, seq)
+      framesAcknowledge(entry, completeThrough)
     })
   } else {
-    entry.lastSeq = Math.max(entry.lastSeq, seq)
+    entry.lastSeq = Math.max(entry.lastSeq, completeThrough)
   }
 }
 
@@ -794,7 +1064,9 @@ function framesFinish(entry) {
   } catch (err) {
     console.warn('[sessionFramesHub] onDone error', err)
   }
-  if (hub.entries.size === 0) framesTeardown()
+  // Nothing is routed after this session's generation retired. The channel is
+  // handed back on the next reconciler tick rather than from inside the read loop
+  // that is currently delivering this event.
 }
 
 function framesDispatch(currentEvent, payload) {
@@ -813,17 +1085,42 @@ function framesDispatch(currentEvent, payload) {
       if (Number.isFinite(persistedSeq)) entry.lastSeq = Math.max(entry.lastSeq, persistedSeq)
       entry.baselineInitialized = true
     }
+    // Everything up to the cursor is already this tab's own baseline, so the
+    // next frame must be the very next sequence; that is what makes a jump
+    // detectable as a dropped frame rather than a different generation.
+    if (entry.receivedSeq < entry.lastSeq) entry.receivedSeq = entry.lastSeq
     streamDebug('frames_sub_init', { sessionId: entry.sessionId, lastSeq: entry.lastSeq, ...payload })
+    framesConfirmDelivery(entry)
     entry.onInit?.(payload)
     return
   }
   if (currentEvent === 'done') {
+    framesConfirmDelivery(entry)
     streamDebug('frames_done', { sessionId: entry.sessionId, lastSeq: entry.lastSeq })
     framesFinish(entry)
     return
   }
   if (currentEvent === 'frame') {
     const seq = Number.isFinite(payload?.seq) ? payload.seq : null
+    framesConfirmDelivery(entry)
+    if (seq != null) {
+      if (framesAlreadyHave(entry, seq)) {
+        // Already handed to this tab: a repair re-subscribe replays from the
+        // cursor, and applying one frame twice would double every token in the
+        // answer, so reading the channel is idempotent by sequence.
+        streamDebug('frames_duplicate', {
+          sessionId: entry.sessionId, seq, through: entry.receivedSeq,
+        })
+        return
+      }
+      if (!framesAdvanceWatermark(entry, seq)) {
+        // Beyond a hole. Keep the frame -- its content is real and this tab has it
+        // now -- remember that it arrived out of order, and go and get what is
+        // missing underneath it.
+        if (entry.ahead.size < FRAMES_MAX_OUT_OF_ORDER) entry.ahead.add(seq)
+        framesHealGap(entry, seq)
+      }
+    }
     framesApply(entry, seq, payload?.event || 'message', payload?.frame)
     if (shouldLogStreamFrame(seq, payload?.frame)) {
       streamDebug('frames_frame', {
@@ -846,43 +1143,51 @@ function framesDispatchError(err) {
   }
 }
 
-function framesScheduleReconnect() {
+/**
+ * Hand the tab's channel back.
+ *
+ * ``reason`` travels to the backend and lands in its ``frame_channel dropped``
+ * log, which is what keeps "the page released the connection" distinguishable from
+ * "the transport never came back". Nothing else follows: the generations this tab
+ * was watching keep running and keep their frames retained.
+ */
+function framesTeardown(reason = 'unspecified') {
   const hub = sessionFramesHub
-  if (hub.reconnectTimer) return
-  hub.reconnectTimer = setTimeout(() => {
-    hub.reconnectTimer = null
-    hub.connected = false
-    if (hub.entries.size > 0) framesConnect()
-  }, FRAMES_RECONNECT_MS)
-}
-
-function framesTeardown() {
-  const hub = sessionFramesHub
+  // A teardown closes the tab's channel, which is what tells the backend that
+  // nobody is watching any more. When it happens while a generation is still
+  // running, the reason here is the whole explanation, so log it.
+  streamDebug('frames_teardown', {
+    reason, conn: hub.conn, generation: hub.generation, sessions: hub.entries.size,
+  })
   hub.generation += 1
-  framesClearWatchdog()
   framesResolveReady(false)
-  if (hub.reconnectTimer) {
-    clearTimeout(hub.reconnectTimer)
-    hub.reconnectTimer = null
+  for (const entry of hub.entries.values()) framesAbandonDelivery(entry)
+  if (hub.conn) {
+    framesCommand('/v1/sessions/frames/close', { conn: hub.conn, reason })
   }
-  if (hub.conn) framesCommand('/v1/sessions/frames/close', { conn: hub.conn })
   hub.controller?.abort()
   hub.controller = null
   hub.connected = false
   hub.connecting = false
   hub.conn = ''
+  hub.lastByteAt = 0
   hub.lastError = null
+  if (hub.entries.size === 0) framesStopReconciler()
 }
 
 function framesConnect() {
   const hub = sessionFramesHub
   if (hub.connecting || hub.connected) return
   if (hub.entries.size === 0) return
+  // A background tab opens this channel too. Its reader is still an I/O callback
+  // (only rendering and timers are throttled), and the alternative -- tearing it
+  // down on hide -- is what left returning users facing a hole in a live run.
+  framesEnsureReconciler()
   hub.connecting = true
   const generation = ++hub.generation
   hub.conn = framesConnId()
   hub.controller = new AbortController()
-  framesArmWatchdog(generation)
+  hub.lastByteAt = Date.now()
   streamDebug('frames_connect', { conn: hub.conn, generation, sessions: hub.entries.size })
   apiFetch(`/v1/sessions/frames?conn=${encodeURIComponent(hub.conn)}`, { signal: hub.controller.signal })
     .then((res) => {
@@ -905,18 +1210,18 @@ function framesConnect() {
       const pump = () => reader.read().then(({ done, value }) => {
         if (generation !== hub.generation) return
         if (done) {
-          framesClearWatchdog()
           streamDebug('frames_eof', { generation })
           hub.connected = false
           hub.connecting = false
           hub.lastError = new Error('Session frames stream closed')
           framesDispatchError(hub.lastError)
-          if (hub.entries.size > 0) framesScheduleReconnect()
+          // No backoff timer: the reconciler tick re-opens the channel from each
+          // session's own cursor, whether or not this tab is in the foreground.
           return
         }
         // Any bytes (including SSE comment heartbeats) prove the connection is
         // still delivering data.
-        framesArmWatchdog(generation)
+        hub.lastByteAt = Date.now()
         buffer += decoder.decode(value, { stream: true })
         const lines = buffer.split('\n')
         buffer = lines.pop() || ''
@@ -941,7 +1246,6 @@ function framesConnect() {
     })
     .catch((err) => {
       if (generation !== hub.generation) return
-      framesClearWatchdog()
       hub.connected = false
       hub.connecting = false
       // Nobody may wait on a connection that is never going to happen: release
@@ -952,7 +1256,8 @@ function framesConnect() {
         hub.lastError = err
         framesDispatchError(err)
       }
-      if (hub.entries.size > 0) framesScheduleReconnect()
+      // The reconciler retries; no per-error timer, and nothing is retried for a
+      // page that has nothing left to route.
     })
 }
 
@@ -980,13 +1285,25 @@ export function subscribeSessionStream(sessionId, onMessage, onDone, onError, on
     onMessage, onDone, onError, onInit, onApplied,
     lastSeq: Number.isFinite(Number(after)) ? Number(after) : -1,
     baselineInitialized: Number.isFinite(Number(after)) && Number(after) >= 0,
+    // Highest sequence this tab has been *handed* as a contiguous run, as opposed
+    // to applied: the reference for spotting a hole (a frame the backend had to
+    // drop) and for skipping the frames a repair replay hands over again.
+    receivedSeq: Number.isFinite(Number(after)) ? Number(after) : -1,
+    // Frames that arrived beyond a hole, waiting for the replay that fills it.
+    ahead: new Set(),
+    gapHeals: 0,
     pendingApplications: 0,
-    reconnectAfterApplications: false,
+    // What a hand-off waits for: a byte of this session on the channel.
+    delivered: false,
+    deliveryWaiters: [],
   }
   // Replaces any previous subscription for the same session (e.g. the POST
   // stream handing the session over to the channel, or a re-subscribe after a
   // retired inference generation).
   hub.entries.set(sessionId, entry)
+  // Watching something is what starts the reconciler; it stops again once this
+  // tab routes nothing, so an idle page carries no timer either.
+  framesEnsureReconciler()
   if (hub.connected) {
     entry.subscribePending = framesSubscribeCommand(entry)
   } else {
@@ -1011,9 +1328,14 @@ function framesUnwatch(sessionId, onlyIfEntry = null) {
   const key = String(sessionId)
   const entry = hub.entries.get(key)
   if (!entry || (onlyIfEntry && entry !== onlyIfEntry)) return false
+  framesAbandonDelivery(entry)
   hub.entries.delete(key)
   if (hub.conn) framesCommand('/v1/sessions/frames/unsubscribe', { conn: hub.conn, session_id: key })
-  if (hub.entries.size === 0) framesTeardown()
+  // Reconcile now rather than on a timer: the connection belongs to the browser's
+  // budget as soon as this tab routes nothing. The generations this tab watched
+  // stay alive on the server-side window, so re-opening the conversation finds
+  // them running.
+  if (hub.entries.size === 0) framesReconcile()
   return true
 }
 
@@ -1056,31 +1378,68 @@ function framesHandoff(sessionId, afterSeq, { onMessage, onDone, onError, onAppl
 const sessionEventsHub = {
   listeners: new Map(),
   controller: null,
-  reconnectTimer: null,
-  watchdogTimer: null,
   generation: 0,
   connecting: false,
+  lastByteAt: 0,        // any bytes, including the backend's 30s heartbeat
   lastInit: null,
   pending: new Map(),   // 等待 init 的迟到监听者：sid -> [event, ...]
   buffer: [],           // init 之后到达的近期事件（有界），供迟到监听者补发
   bufferInitSeq: -1,    // buffer 所基于的 init 的 generation
   lastError: null,
 }
-const HUB_WATCHDOG_MS = 45_000
+// The status stream heartbeats every 30s (handler_api: event_q.get(timeout=30)),
+// so two missed heartbeats is the stale bound for this connection as well. It is
+// reconciled by the same tick as the frame channel: one loop decides both.
+const HUB_KEEPALIVE_MS = 30_000
+const HUB_STALE_MS = 2 * HUB_KEEPALIVE_MS
 const HUB_BUFFER_MAX = 1000
 
-function hubClearWatchdog() {
-  if (sessionEventsHub.watchdogTimer) clearTimeout(sessionEventsHub.watchdogTimer)
-  sessionEventsHub.watchdogTimer = null
+function hubTeardown(reason) {
+  const hub = sessionEventsHub
+  hub.generation += 1
+  streamDebug('events_teardown', { reason, generation: hub.generation })
+  hub.controller?.abort()
+  hub.controller = null
+  hub.connecting = false
+  hub.lastByteAt = 0
+  hub.lastInit = null
+  hub.buffer = []
+  hub.bufferInitSeq = -1
+  hub.lastError = null
+  hub.pending.clear()
 }
 
-function hubArmWatchdog(generation) {
-  hubClearWatchdog()
-  sessionEventsHub.watchdogTimer = setTimeout(() => {
-    if (generation !== sessionEventsHub.generation) return
-    streamDebug('events_watchdog', { generation })
-    sessionEventsHub.controller?.abort()
-  }, HUB_WATCHDOG_MS)
+/**
+ * The events hub half of the single reconciler tick.
+ *
+ * Listeners decide this one, not visibility: the status stream is what tells a
+ * tab that a run it is not even looking at has finished, and a background tab is
+ * the case where that matters most (the sidebar badge has to be right before the
+ * user comes back).
+ */
+function hubReconcile() {
+  const hub = sessionEventsHub
+  let action = ''
+
+  if (hub.listeners.size > 0) {
+    if (!hub.controller) {
+      action = 'open'
+      hubConnect()
+    } else if (!hub.connecting && hub.lastByteAt
+               && Date.now() - hub.lastByteAt > HUB_STALE_MS) {
+      // Silent for two heartbeats: the socket is gone even though nothing said so.
+      const silentMs = Date.now() - hub.lastByteAt
+      streamDebug('events_stale', { generation: hub.generation, silent_ms: silentMs })
+      action = 'reconnect_stale'
+      hub.generation += 1
+      hub.controller?.abort()
+      hub.controller = null
+      hub.connecting = false
+      hubConnect()
+    }
+  }
+
+  if (action) streamDebug('events_reconcile', { action, listeners: hub.listeners.size })
 }
 
 /** 把事件分发给全体监听器；init 之前到达的事件为等待者缓存。 */
@@ -1157,11 +1516,13 @@ function hubConnect() {
   const hub = sessionEventsHub
   if (hub.connecting) return
   if (hub.listeners.size === 0) return
+  // Listeners, not visibility, decide this: a background tab is exactly where a
+  // finished run has to be noticed before the user returns.
   hub.connecting = true
   const generation = ++hub.generation
   hub.controller = new AbortController()
+  hub.lastByteAt = Date.now()
   streamDebug('events_connect', { generation })
-  hubArmWatchdog(generation)
   apiFetch('/v1/sessions/events', { signal: hub.controller.signal })
     .then((res) => {
       if (generation !== hub.generation) return
@@ -1173,17 +1534,17 @@ function hubConnect() {
       const pump = () => reader.read().then(({ done, value }) => {
         if (generation !== hub.generation) return
         if (done) {
-          hubClearWatchdog()
           streamDebug('events_eof', { generation })
           hub.connecting = false
+          hub.controller = null
           hub.lastError = new Error('Session events stream closed')
           hubDispatchError(hub.lastError)
-          if (hub.listeners.size > 0) hub.scheduleReconnect()
+          // The reconciler re-opens it; no backoff timer of its own.
           return
         }
         // Includes SSE comment heartbeats. Any bytes prove that this
         // connection is still delivering data through the proxy/browser.
-        hubArmWatchdog(generation)
+        hub.lastByteAt = Date.now()
         buffer += decoder.decode(value, { stream: true })
         const lines = buffer.split('\n')
         buffer = lines.pop() || ''
@@ -1214,23 +1575,14 @@ function hubConnect() {
     })
     .catch((err) => {
       if (generation !== hub.generation) return
-      hubClearWatchdog()
+      hub.connecting = false
+      hub.controller = null
       if (err.name !== 'AbortError') {
         hub.lastError = err
         hubDispatchError(err)
       }
-      if (hub.listeners.size > 0) hub.scheduleReconnect()
+      // The reconciler retries; no per-error timer.
     })
-}
-
-sessionEventsHub.scheduleReconnect = () => {
-  const hub = sessionEventsHub
-  if (hub.reconnectTimer) return
-  hub.reconnectTimer = setTimeout(() => {
-    hub.reconnectTimer = null
-    hub.connecting = false
-    if (hub.listeners.size > 0) hubConnect()
-  }, 1000)
 }
 
 /**
@@ -1253,7 +1605,7 @@ sessionEventsHub.scheduleReconnect = () => {
  */
 export function subscribeSessionEvents(onEvent, onError) {
   const hub = sessionEventsHub
-  if (hub.listeners.size === 0 && !hub.reconnectTimer) {
+  if (hub.listeners.size === 0) {
     // Fresh hub: the first listener gets the "just connected" experience —
     // lastError starts clean for it.
     hub.lastError = null
@@ -1273,65 +1625,41 @@ export function subscribeSessionEvents(onEvent, onError) {
   if (lastError) {
     try { onError?.(lastError) } catch { /* ignore */ }
   }
+  // One reconciler serves both long-lived streams of this tab.
+  framesEnsureReconciler()
   hubConnect()
   return () => {
     hub.listeners.delete(sid)
     hub.pending.delete(sid)
-    if (hub.listeners.size === 0) {
-      // Last listener left: tear the shared connection down.
-      hub.generation += 1
-      hubClearWatchdog()
-      if (hub.reconnectTimer) {
-        clearTimeout(hub.reconnectTimer)
-        hub.reconnectTimer = null
-      }
-      hub.controller?.abort()
-      hub.controller = null
-      hub.connecting = false
-      hub.lastInit = null
-      hub.buffer = []
-      hub.bufferInitSeq = -1
-      hub.lastError = null
-      hub.pending.clear()
-    }
+    if (hub.listeners.size === 0) hubTeardown('last_listener')
   }
 }
 
 /** Test helper: fully reset the shared hub between test cases. */
 export function __resetSessionEventsHubForTests() {
   const hub = sessionEventsHub
-  hub.generation += 1
-  hubClearWatchdog()
-  if (hub.reconnectTimer) {
-    clearTimeout(hub.reconnectTimer)
-    hub.reconnectTimer = null
-  }
-  hub.controller?.abort()
-  hub.controller = null
-  hub.connecting = false
+  hubTeardown('test_reset')
   hub.listeners.clear()
-  hub.lastInit = null
-  hub.buffer = []
-  hub.bufferInitSeq = -1
+  hub.lastByteAt = 0
   hub.lastError = null
   hub.pending.clear()
+  // The reconciler serves both streams; a test reset must not leave it running.
+  framesStopReconciler()
 }
 
 /** Drop the shared frame channel without issuing a close command (tests only). */
 export function __resetSessionFramesHubForTests() {
   const hub = sessionFramesHub
   hub.generation += 1
-  framesClearWatchdog()
-  if (hub.reconnectTimer) {
-    clearTimeout(hub.reconnectTimer)
-    hub.reconnectTimer = null
-  }
+  framesStopReconciler()
+  streamReconcileHook = null
   hub.controller?.abort()
   hub.controller = null
   hub.entries.clear()
   hub.connected = false
   hub.connecting = false
   hub.conn = ''
+  hub.lastByteAt = 0
   hub.lastError = null
   try { sessionStorage.removeItem(FRAMES_CONN_KEY) } catch { /* private mode */ }
 }

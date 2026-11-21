@@ -63,7 +63,8 @@ async function mountInTerminalMode() {
   instance = mount(Sidebar, { target: host })
   await drain()
   const buttons = document.querySelectorAll('.session-panel-heading .mode-btn')
-  buttons[4].click()   // 终端模式
+  // 终端按钮按类定位（模式行新增标签按钮后不再依赖固定下标）
+  document.querySelector('.session-panel-heading .mode-btn-terminal').click()   // 终端模式
   await drain()
   return buttons
 }

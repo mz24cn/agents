@@ -43,6 +43,12 @@ export const terminalOpen = $state({ sessionId: null, remoteEnvId: '', commands:
 //   Terminal 连接后按序注入；见 $lib/terminalChain.js
 // token: number — 每次点击递增，确保重复打开也能响应
 
+// 标签生成新会话请求：Sidebar 标签节点菜单触发（先新建会话），ChatPage 消费：
+// 把标签聚合概要/记忆写为系统提示词，并套用标签的相关配置设定。
+export const labelSessionRequest = $state({ token: 0, label: '', summary: '', memory: '', config: null })
+// token: number 递增；label/summary/memory: 标签聚合文档文本；
+// config: { remote_env_id, workspace, model_id, agent_ids, tool_ids }（众数统计）
+
 // 会话日志目录打开请求：Sidebar 菜单触发，ChatPage 监听并打开文件管理器导航到该目录。
 // 会话目录始终在本地（父端）：推理在父端发生，conversation.json 所在目录必然存在，
 // 即使会话绑定远程环境（file journal 在子端）也打开本地会话目录。
