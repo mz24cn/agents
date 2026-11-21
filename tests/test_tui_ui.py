@@ -506,6 +506,7 @@ class StubClient:
     def __init__(self):
         self.last_body = None
         self.posts: List[tuple] = []
+        self.deletes: List[str] = []
 
     def agents(self):
         return [{"agent_id": "a1", "nickname": "小莲", "model_id": "m1",
@@ -521,6 +522,18 @@ class StubClient:
     def env(self):
         return {"env": {"AGENTS_URL": "http://0.0.0.0:18988",
                         "AGENTS_VERSION": "1.2.3"}}
+
+    def env_set(self, key, value):
+        self.posts.append(("/v1/env", {"key": key, "value": value}))
+        env_map = dict(self.env()["env"])
+        env_map[key] = value
+        return {"env": env_map}
+
+    def env_delete(self, key):
+        self.deletes.append(key)
+        env_map = dict(self.env()["env"])
+        env_map.pop(key, None)
+        return {"env": env_map}
 
     def auth_status(self):
         return None
@@ -714,6 +727,87 @@ def test_status_command_reports_badge_placeholder_and_enabled_flag():
     # The diagnostic line must expose enabled (not only configured/state) and
     # must render a placeholder instead of a dangling empty badge.
     assert "- 隧道：（无）（configured=True, enabled=False, state=idle）" in text
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# /env — list, add (spaces / KEY=VALUE), remove
+# ══════════════════════════════════════════════════════════════════════════
+
+def test_env_add_command_posts_pair_and_reports_total():
+    client = StubClient()
+    application = _bare_app(client)
+    application._run_command("/env add MY_KEY some value with spaces")
+    assert ("/v1/env", {"key": "MY_KEY",
+                        "value": "some value with spaces"}) in client.posts
+    text = _system_text(application)
+    assert "已设置环境变量：MY_KEY=some value with spaces" in text
+    assert "共 3 项" in text                    # stub base 2 + the new one
+
+
+def test_env_add_key_equals_value_single_token():
+    client = StubClient()
+    application = _bare_app(client)
+    application._run_command("/env add MY_KEY=a=b")
+    assert client.posts == [("/v1/env", {"key": "MY_KEY", "value": "a=b"})]
+
+
+def test_env_add_without_value_posts_empty_string():
+    client = StubClient()
+    application = _bare_app(client)
+    application._run_command("/env add MY_KEY")
+    assert client.posts == [("/v1/env", {"key": "MY_KEY", "value": ""})]
+
+
+def test_env_add_without_key_shows_usage_and_posts_nothing():
+    client = StubClient()
+    application = _bare_app(client)
+    application._run_command("/env add")
+    assert client.posts == []
+    assert "用法：/env add" in _system_text(application)
+
+
+def test_env_remove_command_deletes_key():
+    client = StubClient()
+    application = _bare_app(client)
+    application._run_command("/env remove AGENTS_URL")
+    assert client.deletes == ["AGENTS_URL"]
+    assert "已删除环境变量：AGENTS_URL" in _system_text(application)
+
+
+def test_env_remove_without_key_shows_usage_and_deletes_nothing():
+    client = StubClient()
+    application = _bare_app(client)
+    application._run_command("/env remove")
+    assert client.deletes == []
+    assert "用法：/env remove" in _system_text(application)
+
+
+def test_env_list_command_shares_sorted_entries_and_count():
+    client = StubClient()
+    application = _bare_app(client)
+    application._run_command("/env")
+    text = _system_text(application)
+    assert "环境变量（2 项）" in text
+    assert "- AGENTS_VERSION=1.2.3" in text
+    assert text.index("AGENTS_URL") < text.index("AGENTS_VERSION")
+
+
+def test_env_unknown_subcommand_shows_usage():
+    application = _bare_app(StubClient())
+    application._run_command("/env frobnicate")
+    assert "用法：/env |" in _system_text(application)
+
+
+def test_env_add_client_error_is_reported_not_raised():
+    client = StubClient()
+
+    def boom(key, value):
+        raise RuntimeError("service down")
+
+    client.env_set = boom
+    application = _bare_app(client)
+    application._run_command("/env add MY_KEY v")
+    assert "环境变量设置失败：service down" in _system_text(application)
 
 
 # ══════════════════════════════════════════════════════════════════════════

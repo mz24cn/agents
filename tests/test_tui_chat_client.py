@@ -546,6 +546,30 @@ class TestConvenienceMethods:
         client = ServiceClient(service.base_url)
         assert client.env() == {"env": {"AGENTS_URL": "http://x:7988"}}
 
+    def test_env_set_and_delete(self, service):
+        service.routes["/v1/env"] = (
+            200, {"Content-Type": "application/json"},
+            _json_bytes({"env": {"MY_KEY": "my value"}}),
+        )
+        # FakeService keys routes by the raw (still-percent-encoded) path.
+        service.routes["/v1/env/MY%20KEY"] = (
+            200, {"Content-Type": "application/json"},
+            _json_bytes({"env": {}}),
+        )
+        client = ServiceClient(service.base_url)
+
+        assert client.env_set("MY_KEY", "my value") == {
+            "env": {"MY_KEY": "my value"}}
+        req = service.last_request()
+        assert req["method"] == "POST"
+        assert json.loads(req["body"]) == {"key": "MY_KEY",
+                                           "value": "my value"}
+
+        assert client.env_delete("MY KEY") == {"env": {}}
+        req = service.last_request()
+        assert req["method"] == "DELETE"
+        assert urllib.parse.urlparse(req["path"]).path == "/v1/env/MY%20KEY"
+
     def test_agents_models_tools_unwrap_envelopes(self, service):
         service.routes["/v1/agents"] = (
             200, {"Content-Type": "application/json"},

@@ -440,6 +440,23 @@ class ServiceClient:
         """GET /v1/env → {"env": {...}}."""
         return self.get("/v1/env")
 
+    def env_set(self, key: str, value: str) -> dict:
+        """POST /v1/env {"key": k, "value": v} → {"env": {...}}.
+
+        The service writes env.json and syncs the pair into its own
+        ``os.environ`` (``runtime/env_manager.py::EnvManager.set``), so the
+        value is live for tool calls without a restart.
+        """
+        return self.post("/v1/env", {"key": key, "value": value})
+
+    def env_delete(self, key: str) -> dict:
+        """DELETE /v1/env/{key} → {"env": {...}}.
+
+        A missing key is a silent no-op server-side; the returned map is the
+        post-delete state either way.
+        """
+        return self.delete("/v1/env/" + urllib.parse.quote(str(key), safe=""))
+
     def agents(self) -> list[dict]:
         data = self.get("/v1/agents")
         if isinstance(data, dict):

@@ -58,7 +58,7 @@ class TuiOptions:
 
 COMMAND_NAMES = [
     "new", "sessions", "continue", "title", "agent", "model", "tools",
-    "status", "tunnel", "plain", "help", "exit",
+    "status", "tunnel", "env", "plain", "help", "exit",
 ]
 
 _KEYMAP_ROWS = [
@@ -87,6 +87,9 @@ _COMMAND_ROWS = [
     ("/tunnel", "隧道状态全字段"),
     ("/tunnel register <url>", "注册到母端"),
     ("/tunnel unregister", "从母端注销"),
+    ("/env", "列出服务环境变量"),
+    ("/env add <K> <V>", "新增/修改环境变量（也支持 KEY=VALUE）"),
+    ("/env remove <K>", "删除环境变量"),
     ("/plain", "运行时切换 plain 模式（再次切换回 TUI）"),
     ("/help", "本帮助页"),
     ("/exit", "退出"),
@@ -196,6 +199,7 @@ class App:
             "tools": self._cmd_tools,
             "status": self._cmd_status,
             "tunnel": self._cmd_tunnel,
+            "env": self._cmd_env,
             "plain": self._cmd_plain,
             "help": self._cmd_help,
             "exit": self._cmd_exit,
@@ -1137,6 +1141,62 @@ class App:
                     "env_id", "detail"):
             lines.append(f"- {key}: {st.get(key)}")
         lines.append(f"- 徽标: {ui_mod.tunnel_badge(st) or '（无）'}")
+        self._emit_system("\n".join(lines))
+
+    def _cmd_env(self, args, rest) -> None:
+        sub = args[0].lower() if args else ""
+        if sub == "add":
+            # ``rest`` is everything after "/env" verbatim: only the first
+            # two tokens (sub, key) are peeled off, so a VALUE containing
+            # spaces survives intact.
+            tail = rest.split(None, 2)
+            key = tail[1] if len(tail) > 1 else ""
+            value = tail[2] if len(tail) > 2 else ""
+            if "=" in key:
+                # /env add KEY=VALUE（也接受 KEY=VALUE 后接带空格的值）
+                key, _, inline = key.partition("=")
+                value = f"{inline} {value}".strip() if inline else value
+            if not key:
+                self._emit_system(
+                    "用法：/env add <KEY> <VALUE>（或 /env add KEY=VALUE）")
+                return
+            try:
+                result = self.client.env_set(key, value)
+            except Exception as exc:
+                self._emit_system(f"环境变量设置失败：{exc}")
+                return
+            env_map = result.get("env") if isinstance(result, dict) else None
+            total = f"（共 {len(env_map)} 项）" if isinstance(env_map, dict) else ""
+            self._emit_system(f"已设置环境变量：{key}={value}{total}")
+            return
+        if sub == "remove":
+            if len(args) < 2:
+                self._emit_system("用法：/env remove <KEY>")
+                return
+            try:
+                self.client.env_delete(args[1])
+            except Exception as exc:
+                self._emit_system(f"环境变量删除失败：{exc}")
+                return
+            # 后端对不存在的 key 是静默 no-op，这里无法区分"删除"与"本就没有"。
+            self._emit_system(f"已删除环境变量：{args[1]}")
+            return
+        if sub:
+            self._emit_system(
+                "用法：/env | /env add <KEY> <VALUE> | /env remove <KEY>")
+            return
+        try:
+            env = self.client.env()
+        except Exception as exc:
+            self._emit_system(f"获取环境变量失败：{exc}")
+            return
+        env_map = env.get("env", {}) if isinstance(env, dict) else {}
+        if not env_map:
+            self._emit_system("没有环境变量（/env add KEY VALUE 新增）。")
+            return
+        lines = [f"环境变量（{len(env_map)} 项）："]
+        for k in sorted(env_map):
+            lines.append(f"- {k}={ui_mod.truncate_to_width(str(env_map[k]), 60)}")
         self._emit_system("\n".join(lines))
 
     def _cmd_plain(self, args, rest) -> None:

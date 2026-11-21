@@ -70,6 +70,9 @@ python tui.py --new             # 强制新会话
 | /tunnel | 隧道状态全字段（含状态徽标） |
 | /tunnel register <url> | 注册到母端 |
 | /tunnel unregister | 从母端注销 |
+| /env | 列出服务环境变量（写 env.json 并同步进服务进程 os.environ） |
+| /env add <K> <V> | 新增/修改环境变量，也写 `KEY=VALUE` 一体形式 |
+| /env remove <K> | 删除环境变量 |
 | /plain | 运行时切换 plain 模式（再次切回 TUI） |
 | /help | 帮助页（键位 + 命令全表） |
 | /exit | 退出 |
