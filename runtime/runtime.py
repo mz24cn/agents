@@ -31,8 +31,13 @@ from runtime.common import (
     snapshot_request_context,
     restore_request_context,
     estimate_chat_prompt_tokens,
+    estimate_chat_prompt_tokens_capped,
     estimate_chat_prompt_tokens_calibrated,
     get_prompt_token_calibration,
+    get_context_window_observation,
+    is_context_overflow_error,
+    learn_from_provider_rejection,
+    provider_prompt_tokens,
     record_prompt_token_calibration,
     is_notable_prompt_token_calibration,
     estimate_message_payload_tokens,
@@ -86,6 +91,24 @@ def _get_model_api_timeout() -> int:
 # it has one, otherwise a fraction of the window clamped to [1024, 8192].
 def _get_context_output_reserve_override() -> int:
     return env_int("CONTEXT_OUTPUT_RESERVE_TOKENS", 0)
+
+
+# CONTEXT_OVERFLOW_RECOVERIES (attempts): how many times one model round may be
+# re-sent after the endpoint rejected it as oversized (``request exceeds the
+# context window: prompt (131218 tokens) leaves no room to answer in the context
+# (131072)``).  Every attempt first folds the endpoint's own count back into this
+# model's estimate, then runs the context remedies (compress -> offload -> drop
+# oldest) and re-measures before re-sending, so a session that reached its
+# window mid-loop keeps running instead of ending on a rejected request.
+# Unset -> the default below; 0 disables the recovery (the historical
+# behaviour: report the rejection and end the generation).
+_DEFAULT_CONTEXT_OVERFLOW_RECOVERIES = 2
+
+
+def _get_context_overflow_recoveries() -> int:
+    """Return CONTEXT_OVERFLOW_RECOVERIES (attempts), read dynamically each call."""
+    value = env_int("CONTEXT_OVERFLOW_RECOVERIES", _DEFAULT_CONTEXT_OVERFLOW_RECOVERIES)
+    return max(0, min(value, 5))
 
 
 # MODEL_INFER_TIMEOUT (seconds) caps one continuous streaming inference output:
@@ -1453,6 +1476,23 @@ class Runtime:
                         "infer HTTP error | url=%s code=%s reason=%s body=%s",
                         url, exc.code, exc.reason, error_body[:2000],
                     )
+                    # This entry point has no session context to compress, so it
+                    # cannot repair the request -- but a size rejection is still
+                    # worth reading.  Folding the endpoint's count (and the window
+                    # it enforces) into this model's measurements is what stops
+                    # every later streamed turn of that model from walking into
+                    # the same rejection: the pre-send guard of infer_stream then
+                    # measures against the real number and compresses first.
+                    if is_context_overflow_error(error_body) or exc.code == 413:
+                        learn_from_provider_rejection(
+                            error_body or f"HTTP {exc.code}: {exc.reason}",
+                            model_id=getattr(model_config, "model_id", "") or request.model_id,
+                            estimated=estimate_chat_prompt_tokens_capped(
+                                messages, tools if tools else None,
+                            ),
+                            window=int(getattr(model_config, "max_context", 0) or 0),
+                            origin="infer",
+                        )
                     return InferenceResult(
                         success=False,
                         messages=messages,
@@ -3066,6 +3106,29 @@ class Runtime:
         "max_tokens", "max_completion_tokens", "max_output_tokens",
     )
 
+    @staticmethod
+    def _effective_context_window_tokens(model_config: object) -> int:
+        """Window to measure this model against; ``0`` = still unknown.
+
+        ``ModelConfig.max_context`` is what the operator believed the endpoint
+        allows.  Once an endpoint has rejected one of our requests with a window
+        of its own (``... leaves no room to answer in the context (131072)``),
+        the smaller of the two rules: a hosted model can be downgraded, a local
+        server can run a ``num_ctx`` smaller than the registry claims, and the
+        field is often simply left empty.  An observation never *raises* the
+        window -- like token calibration, it may only make a "may I send this?"
+        answer stricter.
+        """
+        configured = int(getattr(model_config, "max_context", 0) or 0)
+        observed = get_context_window_observation(
+            getattr(model_config, "model_id", "") or ""
+        )
+        if observed <= 0:
+            return configured
+        if configured <= 0:
+            return observed
+        return min(configured, observed)
+
     @classmethod
     def _context_send_budget_tokens(cls, model_config: object) -> int:
         """Return the prompt-token ceiling for one request; ``0`` = unknown.
@@ -3076,11 +3139,14 @@ class Runtime:
         ``CONTEXT_OUTPUT_RESERVE_TOKENS`` when set, otherwise the model's own
         configured output cap, otherwise ``min(8192, max(1024, window // 16))``.
 
+        The window used is :meth:`_effective_context_window_tokens`, i.e. the
+        smallest window this endpoint has actually enforced if it has said so.
+
         A reserve larger than half the window is clamped, and a ceiling that
         would not be positive disables the guard instead of rejecting every
         request: an unknown/absurd configuration must not break inference.
         """
-        window = int(getattr(model_config, "max_context", 0) or 0)
+        window = cls._effective_context_window_tokens(model_config)
         if window <= 0:
             return 0
         reserve = _get_context_output_reserve_override()
@@ -3130,7 +3196,7 @@ class Runtime:
         if budget <= 0:
             return messages, "", 0
 
-        window = int(getattr(model_config, "max_context", 0) or 0)
+        window = self._effective_context_window_tokens(model_config)
         model_id = getattr(model_config, "model_id", "") or ""
         tool_schemas = tools if tools else None
 
@@ -3186,13 +3252,170 @@ class Runtime:
             "window=%d messages=%d",
             model_id, after, budget, window, len(messages),
         )
-        return messages, (
-            f"Error: context too large to send: about {after} prompt tokens do not "
+        return messages, self._context_refusal_message(
+            model_id, after, budget, window,
+        ), after
+
+    @staticmethod
+    def _context_refusal_message(model_id: str, estimated: int, budget: int, window: int) -> str:
+        """Why a request was not sent, as the loop reports it to the user."""
+        observed = get_context_window_observation(model_id)
+        learned = ""
+        if 0 < observed < window:
+            learned = (
+                f" Its endpoint enforces only {observed} tokens, learned from a"
+                f" request that endpoint rejected."
+            )
+        return (
+            f"Error: context too large to send: about {estimated} prompt tokens do not "
             f"fit the {budget} available to model {model_id} (window {window} tokens, "
             f"{window - budget} kept for the reply). It was compressed and its "
-            f"oversized output offloaded to files, which was not enough. Start a "
-            f"new session, or split this step into smaller pieces."
-        ), after
+            f"oversized output offloaded to files, which was not enough.{learned} "
+            f"Start a new session, or split this step into smaller pieces."
+        )
+
+    def _recover_context_before_send(
+        self,
+        messages: list,
+        tools: Optional[list],
+        model_config: object,
+        on_context_overflow: Optional[Callable],
+        rejection: str,
+        session_id: str = "",
+    ) -> tuple[list, str, int]:
+        """Make an oversized request fit after the endpoint itself refused it.
+
+        The pre-send guard measures with our own calibrated estimate; an endpoint
+        can still reject the request, because its counter is the authority and
+        this model's ratio may never have been observed -- or because it enforces
+        a window smaller than ``max_context`` says.  The reference session ended
+        exactly there::
+
+            request exceeds the context window: prompt (131218 tokens) leaves no
+            room to answer in the context (131072); requests are never truncated
+
+        -- 131 218 counted against 131 072, where the configured window is 131 072
+        *including* the reply and our estimate sat below the guard's ceiling.
+
+        A rejection is the most reliable measurement this runtime will ever get:
+        the endpoint's own count, from the exact payload, on the exact model.  So
+        first fold it into the model's token calibration and, when it names one,
+        into its enforced window.  Then run the same remedies the guard uses
+        (summarise oldest turns -> offload oversized outputs -> drop oldest),
+        re-measure, and let the caller re-send.  The whole loop is what turns a
+        6 767-turn session dying at turn 6 767 into one that keeps working.
+
+        *rejection* is the endpoint's answer verbatim; an empty string still
+        triggers the remedies (they are the only thing that can save the round),
+        it just teaches nothing.
+
+        Returns ``(messages, error, estimated)``.  ``error`` empty means the
+        caller should re-send **the returned list**; it hands back the list it was
+        given, unchanged, when nothing more can be done -- the caller then reports
+        the endpoint's rejection instead of re-sending it.
+        """
+        model_id = getattr(model_config, "model_id", "") or ""
+        message = rejection if isinstance(rejection, str) else str(rejection or "")
+        tool_schemas = tools or None
+        attempts = _get_context_overflow_recoveries()
+        budget = self._context_send_budget_tokens(model_config)
+
+        def _raw_estimate(msgs: list) -> int:
+            """Unscaled size of a request -- the denominator of a ratio.
+
+            The calibration sample has to divide the provider's count by the
+            number this runtime would have produced on its own; folding in an
+            already-corrected number would compound the correction.
+            """
+            return estimate_chat_prompt_tokens_capped(msgs, tool_schemas)
+
+        def _estimate(msgs: list) -> int:
+            """Size as this model actually charges for it (calibration applied).
+
+            Bounded by *budget* exactly like the guard's estimator, so the remedy
+            hook and this loop compare the same numbers, and walking a context the
+            endpoint has already called enormous costs no more than it must.
+            """
+            return estimate_chat_prompt_tokens_calibrated(
+                msgs, tool_schemas, model_id, budget,
+            )
+
+        # 1. Learn.  Everything below is measured against what was just learned.
+        try:
+            learn_from_provider_rejection(
+                message,
+                model_id=model_id,
+                estimated=_raw_estimate(messages),
+                window=int(getattr(model_config, "max_context", 0) or 0),
+                session_id=session_id,
+                origin="context recovery",
+            )
+        except Exception:  # pragma: no cover - bookkeeping must never break inference
+            _logger.debug(
+                "context recovery: could not fold the rejection into calibration",
+                exc_info=True,
+            )
+
+        counted = provider_prompt_tokens(message)
+        if attempts <= 0 or budget <= 0 or on_context_overflow is None:
+            _logger.warning(
+                "context recovery: not attempted | model=%s attempts=%d budget=%d "
+                "counted_by_endpoint=%s",
+                model_id, attempts, budget, counted,
+            )
+            return messages, "", _estimate(messages)
+
+        window = self._effective_context_window_tokens(model_config)
+        estimated = _estimate(messages)
+        working = list(messages)
+        for attempt in range(1, attempts + 1):
+            # Ask for the smaller context before judging anything.  The endpoint
+            # has just rejected this very payload: that is a fact about the
+            # request, not about our arithmetic, and "my estimate says it fits"
+            # has already been disproved once.  So the remedy runs first and the
+            # fit is judged on what it produced.
+            try:
+                replacement, after = on_context_overflow(
+                    working, budget, _estimate, window,
+                )
+            except Exception:  # the remedies must never break inference either
+                _logger.exception(
+                    "context recovery: remedies failed; reporting the rejection | "
+                    "estimated=%d budget=%d",
+                    estimated, budget,
+                )
+                return messages, "", estimated
+            if after:
+                estimated = after
+            changed = bool(replacement) and list(replacement) != working
+            if changed:
+                working = list(replacement)
+            _logger.warning(
+                "context recovery: remedy round %d/%d | model=%s estimated=%d "
+                "budget=%d window=%d counted_by_endpoint=%s messages=%d changed=%s",
+                attempt, attempts, model_id, estimated, budget, window, counted,
+                len(working), changed,
+            )
+            if estimated <= budget:
+                return working, "", estimated
+            if not changed:
+                break  # the remedies have nothing left to do: re-sending is futile
+
+        if estimated > budget:
+            # Nothing softer is left.  The hook already ran its full chain --
+            # summarise, summarise deeper, offload this round's oversized tool
+            # results to files, drop the oldest turns -- so what is measured now
+            # is the smallest this context can get without discarding the answer
+            # the user asked for.
+            _logger.warning(
+                "context recovery: exhausted | model=%s estimated=%d budget=%d "
+                "window=%d messages=%d",
+                model_id, estimated, budget, window, len(working),
+            )
+            return working, self._context_refusal_message(
+                model_id, estimated, budget, window,
+            ), estimated
+        return working, "", estimated
 
     def _maybe_refresh_context(
         self,
@@ -3409,6 +3632,18 @@ class Runtime:
         # nothing once XML markup and whitespace are filtered out.  It is reset
         # after a model round completes successfully.
         round_retry_count = 0
+        # Budget for rounds the endpoint refused as oversized, refilled whenever
+        # a model round is accepted (see round_retry_count below).  Consumed by
+        # the context recovery in the HTTP-error branch; a rollout that needs one
+        # repair per tool round is buying headroom each round, so it must not run
+        # out of budget -- what bounds the repair loop instead is that every
+        # resend has to be *smaller than the last repaired one*
+        # (context_recovery_floor, enforced in the HTTP-error branch).
+        context_recover_left = _get_context_overflow_recoveries()
+        #: Smallest raw (uncalibrated) prompt size a recovery already achieved in
+        #: this rollout.  A repair that cannot beat it would resend a request this
+        #: very endpoint just refused, so it is reported instead of re-sent.
+        context_recovery_floor = 0
         # Retry budget for rounds aborted by the per-round output cap.
         output_cap_retry_count = 0
         #: Pending client-side tool calls handed back to the caller; set when the
@@ -3565,6 +3800,80 @@ class Runtime:
                     detail = f"HTTP {exc.code}: {exc.reason}"
                     if error_body:
                         detail += f" | body: {error_body[:500]}"
+                    # A rejected request that names the context window is not a
+                    # dead end, it is a measurement of the exact payload from the
+                    # exact endpoint -- the most trustworthy one this runtime ever
+                    # gets. So heal instead of ending the session: fold the
+                    # endpoint's count (and the window it enforces) into this
+                    # model's calibration, run the context remedies, and re-run
+                    # this round. The pre-send guard then measures the shrunken
+                    # request with that learned factor and either lets it through
+                    # or says so in a sentence the user can act on.
+                    if (
+                        context_recover_left > 0
+                        and (
+                            is_context_overflow_error(error_body)
+                            or is_context_overflow_error(detail)
+                            or exc.code == 413
+                        )
+                    ):
+                        context_recover_left -= 1
+                        recovered, recovery_error, recovered_estimate = (
+                            self._recover_context_before_send(
+                                messages, tools, model_config,
+                                on_context_overflow, error_body or detail,
+                                str(getattr(request, "session_id", "") or ""),
+                            )
+                        )
+                        if recovery_error == "" and recovered is not messages:
+                            # Measured in raw units on purpose: the calibrated
+                            # estimate may *rise* when this rejection taught the
+                            # model a bigger token factor even though the request
+                            # itself did shrink.  Raw units keep one yardstick.
+                            repaired_size = estimate_chat_prompt_tokens_capped(
+                                recovered, tools if tools else None,
+                            )
+                            if (
+                                context_recovery_floor
+                                and repaired_size >= context_recovery_floor
+                            ):
+                                # The remedies ran and produced a request no
+                                # smaller than the one just refused: sending it
+                                # again would be a loop, not a repair.
+                                _logger.warning(
+                                    "infer_stream: context repair bought no further "
+                                    "headroom; not re-sending | model=%s raw_estimate=%d "
+                                    "floor=%d counted_by_endpoint=%s",
+                                    getattr(model_config, "model_id", "")
+                                    or request.model_id,
+                                    repaired_size, context_recovery_floor,
+                                    provider_prompt_tokens(error_body),
+                                )
+                                detail += (
+                                    "\nThe context was repaired as far as it could be "
+                                    "without discarding the answer, but that request is "
+                                    "no smaller than the one just refused, so it was not "
+                                    "sent again."
+                                )
+                            else:
+                                context_recovery_floor = max(int(repaired_size), 1)
+                                messages = recovered
+                                _logger.warning(
+                                    "infer_stream: context rejection recovered; re-running "
+                                    "the round | model=%s code=%s counted_by_endpoint=%s "
+                                    "re_estimated=%d budget=%d messages=%d attempts_left=%d",
+                                    getattr(model_config, "model_id", "") or request.model_id,
+                                    exc.code, provider_prompt_tokens(error_body),
+                                    recovered_estimate,
+                                    self._context_send_budget_tokens(model_config),
+                                    len(messages), context_recover_left,
+                                )
+                                continue
+                        if recovery_error:
+                            note = recovery_error
+                            if note.startswith("Error: "):
+                                note = note[len("Error: "):]
+                            detail = f"{detail}\n{note}"
                     yield Message(role="assistant", timestamp=_now_iso(), content=f"Error: {detail}")
                 elif _is_timeout_error(exc):
                     _logger.error("infer_stream timeout | url=%s timeout=%ss", url, effective_timeout)
@@ -4079,6 +4388,9 @@ class Runtime:
             # that died mid-way, empty streams and degenerate (markup-only)
             # rounds.
             round_retry_count = 0
+            # Same for oversized rejections: the repaired request got through, so
+            # the next round starts with a full repair budget again.
+            context_recover_left = _get_context_overflow_recoveries()
 
             # net_ms = time from request start to stream fully received
             # (empty streams return above and are never recorded as success).

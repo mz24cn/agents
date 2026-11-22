@@ -15,6 +15,7 @@ import datetime
 import hashlib
 import locale
 import json
+import logging
 import os
 import re
 import signal
@@ -472,6 +473,264 @@ def estimate_chat_prompt_tokens_calibrated(
     walk_cap = max(1, int(cap / factor)) if cap > 0 else 0
     base = estimate_chat_prompt_tokens_capped(messages, tools, walk_cap)
     return max(1, int(base * factor)) if base > 0 else base
+
+
+# ---------------------------------------------------------------------------
+# Reading a provider's "your request does not fit my context window" rejection
+# ---------------------------------------------------------------------------
+#
+# An endpoint that refuses a request as oversized answers in prose, and that
+# prose is worth more than the traceback built around it: it names the prompt
+# tokens the endpoint counted for OUR request, and usually the window it
+# enforces.  Both numbers turn a guess ("this model has a 128 000-token window,
+# my estimate says the prompt fits") into a measurement, which is what lets an
+# inference loop recover from such a rejection -- re-measure, compress, offload,
+# resend -- instead of ending the session on it, as sessions that ran straight
+# into ``request exceeds the context window: prompt (131218 tokens) leaves no
+# room to answer in the context (131072)`` used to.
+#
+#: How providers phrase "your request is larger than my context window".  Used
+#: to tell an oversized request apart from every other failure: only the former
+#: carries a usable measurement of our own estimate, and only the former can be
+#: repaired by making the context smaller.
+CONTEXT_OVERFLOW_ERROR_RE = re.compile(
+    r"exceeds the (?:available )?context"
+    r"|context window"
+    r"|context length exceeded"
+    r"|maximum context length"
+    r"|leaves no room"
+    r"|too many tokens"
+    r"|prompt is too long"
+    r"|exceed context limit"
+    r"|context_length_exceeded",
+    re.IGNORECASE,
+)
+
+#: Where in that message the provider states the size IT counted, ordered by
+#: specificity (first match wins).  Both shapes below were seen in production:
+#: ``prompt (242845 tokens) leaves no room to answer in the context (196608)``
+#: and ``request (300000 tokens) exceeds the available context size (131072)``.
+PROVIDER_PROMPT_TOKENS_RES: tuple[re.Pattern, ...] = (
+    re.compile(r"prompt\s*\(?\s*(\d+)\s*tokens?\)", re.IGNORECASE),
+    re.compile(r"request\s*\(\s*(\d+)\s*tokens?\)", re.IGNORECASE),
+    re.compile(r"(?:however )?you requested\s+(\d+)\s*tokens?", re.IGNORECASE),
+    re.compile(r"requested\s+(\d+)\s*tokens?", re.IGNORECASE),
+    re.compile(r"(\d+)\s+tokens?\s*>", re.IGNORECASE),
+)
+
+#: Where the provider states the window IT enforces -- ``(pattern, group)``
+#: pairs, again best match first.  The arithmetic shape (``130000 + 8192 >
+#: 131072``) names the window as the right-hand side, not the first number it
+#: prints.
+PROVIDER_CONTEXT_WINDOW_RES: tuple[tuple[re.Pattern, int], ...] = (
+    (re.compile(r"maximum context length is\s*\(?\s*(\d+)", re.IGNORECASE), 1),
+    (re.compile(r"\bin the context\s*\(?\s*(\d+)", re.IGNORECASE), 1),
+    (re.compile(r"available context (?:size|window)\s*\(?\s*(\d+)", re.IGNORECASE), 1),
+    (re.compile(r"(\d+)\s*\+\s*\d+\s*>\s*(\d+)", re.IGNORECASE), 2),
+    (re.compile(r"(\d+)\s+tokens?\s*>\s*(\d+)", re.IGNORECASE), 2),
+    (re.compile(r"context (?:window|size|length) of\s*\(?\s*(\d+)", re.IGNORECASE), 1),
+)
+
+
+def _error_text(error: object) -> str:
+    """Flatten whatever an API failure carries into one searchable string."""
+    if isinstance(error, str):
+        return error
+    return str(error or "")
+
+
+def is_context_overflow_error(error: object) -> bool:
+    """Whether *error* says "this request is larger than my context window".
+
+    Callers use this to separate a rejection that a smaller context can repair
+    from one that cannot (bad key, no quota, model overloaded), so the loop only
+    ever spends a compression round on a problem compression can fix.
+    """
+    text = _error_text(error)
+    return bool(text) and bool(CONTEXT_OVERFLOW_ERROR_RE.search(text))
+
+
+def provider_prompt_tokens(error: object) -> int:
+    """Prompt tokens the provider counted for a rejected request (0 = unknown).
+
+    An overflow rejection is a free measurement: the provider just told us how
+    many tokens a request of ours really costs.  Returning ``0`` when the
+    message carries no number keeps the caller on the old path instead of
+    guessing.
+    """
+    text = _error_text(error)
+    for pattern in PROVIDER_PROMPT_TOKENS_RES:
+        match = pattern.search(text)
+        if match:
+            try:
+                return int(match.group(1))
+            except (TypeError, ValueError):  # pragma: no cover - regex-guarded
+                return 0
+    return 0
+
+
+def provider_context_window(error: object) -> int:
+    """The context window the provider stated in its rejection (0 = unstated).
+
+    ``ModelConfig.max_context`` is what the operator believed; this is what the
+    endpoint enforces.  They disagree whenever a hosted model was downgraded, a
+    local server runs a smaller ``num_ctx`` than the registry claims, or the
+    field was simply never filled in.
+    """
+    text = _error_text(error)
+    for pattern, group in PROVIDER_CONTEXT_WINDOW_RES:
+        match = pattern.search(text)
+        if match:
+            try:
+                value = int(match.group(group))
+            except (TypeError, ValueError, IndexError):  # pragma: no cover
+                return 0
+            return value if value > 0 else 0
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Context windows an endpoint has actually enforced
+# ---------------------------------------------------------------------------
+#
+# A rejection like ``... leaves no room to answer in the context (131072)`` is
+# the endpoint itself naming the window it enforces, which is worth keeping for
+# the rest of this process: from then on every pre-send measurement of that
+# model is bounded by the real number rather than by a blank or stale
+# ``ModelConfig.max_context``.  Like token calibration, an observation may only
+# ever make a "may I send this?" answer stricter -- a model configured at
+# 1 000 000 tokens whose endpoint rejected at 131 072 is bounded by 131 072.
+_CONTEXT_WINDOW_MAX_MODELS = 64
+_context_window_observations: dict = {}
+_context_window_lock = threading.Lock()
+
+
+def record_context_window_observation(model_id: str, window: object) -> int:
+    """Fold an endpoint-stated *window* into *model_id*'s observed window.
+
+    Returns the window now in force for that model (0 when nothing is known).
+    The smallest observation wins: an endpoint that rejected at 131 072 once
+    will not accept 1 000 000 later, but a second, smaller rejection means the
+    first one came from a different (bigger) deployment.
+    """
+    key = (model_id or "").strip()
+    try:
+        value = int(window or 0)
+    except (TypeError, ValueError):
+        return get_context_window_observation(key)
+    if not key or value <= 0:
+        return get_context_window_observation(key)
+    with _context_window_lock:
+        current = _context_window_observations.get(key, 0)
+        merged = value if current <= 0 else min(current, value)
+        # Re-inserting keeps dict order == least-recently-used order.
+        _context_window_observations.pop(key, None)
+        _context_window_observations[key] = merged
+        while len(_context_window_observations) > _CONTEXT_WINDOW_MAX_MODELS:
+            _context_window_observations.pop(next(iter(_context_window_observations)))
+        return merged
+
+
+def get_context_window_observation(model_id: str) -> int:
+    """Window *model_id*'s endpoint has enforced (``0`` = never observed)."""
+    key = (model_id or "").strip()
+    if not key:
+        return 0
+    with _context_window_lock:
+        return _context_window_observations.get(key, 0)
+
+
+def clear_context_window_observations(model_id: str = "") -> None:
+    """Forget observed windows (all of them, or just *model_id*)."""
+    with _context_window_lock:
+        if model_id:
+            _context_window_observations.pop((model_id or "").strip(), None)
+        else:
+            _context_window_observations.clear()
+
+
+def learn_from_provider_rejection(
+    error: object,
+    *,
+    model_id: str,
+    estimated: int,
+    window: int = 0,
+    session_id: str = "",
+    origin: str = "context",
+) -> Optional[float]:
+    """Teach this model from a request its endpoint rejected as oversized.
+
+    *estimated* is the size WE measured for that very request, in the same raw
+    (uncalibrated) units the estimate is built in; *error* is whatever the
+    endpoint answered.  Two facts come out of that pair:
+
+    * the window the endpoint enforces, when its message names one -- filed for
+      the rest of this process (:func:`record_context_window_observation`), so a
+      model whose ``max_context`` is blank, stale or simply optimistic is measured
+      against reality from then on;
+    * the tokenisation ratio, which is raised to the observed share rather than
+      smoothed into an average: this sample counted the exact payload we just
+      measured, and several doomed attempts would be needed before an EWMA of it
+      converged (see :func:`set_prompt_token_calibration`).
+
+    Both may only ever make a later "may I send this?" answer *stricter*, which is
+    what lets an inference loop recover from such a rejection instead of ending on
+    it.  Returns the factor now in force, or ``None`` when the rejection taught
+    nothing (not an overflow rejection, no number in it, or a share too implausible
+    to be about this request at all).
+    """
+    text = error if isinstance(error, str) else str(error or "")
+    if not model_id or not CONTEXT_OVERFLOW_ERROR_RE.search(text):
+        return None
+    label = f"{origin}: "
+    where = (f"session {session_id}" if session_id else "a request")
+    # The same rejection usually also states the window the endpoint enforces.
+    # Filing it lets every later measurement of this model -- here, and in the
+    # inference loop's pre-send guard -- be bounded by what the endpoint really
+    # allows instead of what models.json claims (or the blank the operator left
+    # behind).
+    stated = provider_context_window(text)
+    if stated > 0 and (window <= 0 or stated < window):
+        record_context_window_observation(model_id, stated)
+        logging.warning(
+            "%smodel %s enforces a %d-token context window (registry says %s); "
+            "later requests of this model are measured against the enforced one",
+            label, model_id, stated, window or "unknown",
+        )
+    actual = provider_prompt_tokens(text)
+    measured = int(estimated or 0)
+    if actual <= 0 or measured <= 0:
+        logging.warning(
+            "%s%s was rejected as oversized by model %s, but the rejection names "
+            "no token count (~%d estimated here); the next attempt repeats the "
+            "current budget",
+            label, where, model_id, measured,
+        )
+        return None
+    factor = record_prompt_token_calibration(model_id, measured, actual)
+    if factor is None:
+        logging.warning(
+            "%s%s overflow measurement for model %s (~%d estimated here vs %d "
+            "counted) is outside the credible band; not folding it in",
+            label, where, model_id, measured, actual,
+        )
+        return None
+    # This sample is not a report about some other request: the provider counted
+    # the very prompt we just built and measured.  Smoothing it into an EWMA would
+    # take several doomed attempts to converge (0.4 weight on a 1.35 ratio needs
+    # four), so the floor is raised to the measurement itself -- which can only
+    # ever make a later "may I send this?" answer stricter, the one direction
+    # calibration is allowed to move in.
+    ratio = actual / measured
+    if ratio > factor:
+        set_prompt_token_calibration(model_id, ratio)
+        factor = ratio
+    logging.warning(
+        "%s%s was rejected as oversized (model=%s: we estimated ~%d, the provider "
+        "counted %d -> factor %.2f); its next request is measured with that ratio",
+        label, where, model_id, measured, actual, factor,
+    )
+    return factor
 
 
 # ---------------------------------------------------------------------------

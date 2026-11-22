@@ -559,7 +559,6 @@ from runtime.common import (  # noqa: E402
     env_int,
     get_prompt_token_calibration,
     record_prompt_token_calibration,
-    set_prompt_token_calibration,
     sha256_bytes,
 )
 
@@ -710,47 +709,14 @@ def _compression_prompt_budget(
     return budget
 
 
-#: How providers phrase "your request is larger than my context window".  Used
-#: to tell an oversized request apart from every other compression failure: only
-#: the former carries a usable measurement of our own estimate.
-_CONTEXT_OVERFLOW_ERROR_RE = re.compile(
-    r"exceeds the (?:available )?context"
-    r"|context window"
-    r"|maximum context length"
-    r"|leaves no room"
-    r"|too many tokens",
-    re.IGNORECASE,
+#: How providers phrase "your request is larger than my context window", where
+#: they state the size they counted, and what to do with that number: all of it
+#: lives in :mod:`runtime.common` next to the token-calibration table and the
+#: observed-window table it feeds, so the compression path and the inference loop
+#: read one and the same rejection identically.
+from runtime.common import (  # noqa: E402
+    learn_from_provider_rejection,
 )
-
-#: Where in that message the provider states the size IT counted, ordered by
-#: specificity (first match wins).  Both shapes below were seen in production:
-#: ``prompt (242845 tokens) leaves no room to answer in the context (196608)``
-#: and ``request (300000 tokens) exceeds the available context size (131072)``.
-_PROVIDER_PROMPT_TOKENS_RES: tuple[re.Pattern, ...] = (
-    re.compile(r"prompt\s*\(?\s*(\d+)\s*tokens?\)", re.IGNORECASE),
-    re.compile(r"request\s*\(\s*(\d+)\s*tokens?\)", re.IGNORECASE),
-    re.compile(r"(?:however )?you requested\s+(\d+)\s*tokens?", re.IGNORECASE),
-    re.compile(r"requested\s+(\d+)\s+tokens?", re.IGNORECASE),
-)
-
-
-def _context_overflow_tokens(error: object) -> int:
-    """Prompt tokens the provider counted for a rejected request (0 = unknown).
-
-    An overflow rejection is a free measurement: the provider just told us how
-    many tokens a request of ours really costs.  Returning ``0`` when the
-    message carries no number keeps the caller on the old path instead of
-    guessing.
-    """
-    text = error if isinstance(error, str) else str(error or "")
-    for pattern in _PROVIDER_PROMPT_TOKENS_RES:
-        match = pattern.search(text)
-        if match:
-            try:
-                return int(match.group(1))
-            except (TypeError, ValueError):  # pragma: no cover - regex-guarded
-                return 0
-    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -3072,47 +3038,56 @@ class ContextManager:
 
         Returns True when a factor was recorded.
         """
-        if not model_id or not _CONTEXT_OVERFLOW_ERROR_RE.search(
-            error if isinstance(error, str) else str(error or "")
-        ):
-            return False
-        actual = _context_overflow_tokens(error)
-        measured = _estimate_tokens_fast(prompt)
-        if actual <= 0 or measured <= 0:
-            logging.warning(
-                "compress_context: session %s was rejected as oversized by model "
-                "%s, but the rejection names no token count (~%d estimated here); "
-                "the next attempt repeats the current budget",
-                session_id, model_id, measured,
-            )
-            return False
-        factor = record_prompt_token_calibration(model_id, measured, actual)
-        if factor is None:
-            logging.warning(
-                "compress_context: session %s overflow measurement for model %s "
-                "(~%d estimated here vs %d counted) is outside the credible band; "
-                "not folding it in",
-                session_id, model_id, measured, actual,
-            )
-            return False
-        # This sample is not a report about some other request: the provider
-        # counted the very prompt we just built and measured here.  Smoothing it
-        # into an EWMA would take several doomed attempts to converge (0.4 weight
-        # on a 1.35 ratio needs four), so the floor is raised to the measurement
-        # itself -- which can only ever make a later "may I send this?" answer
-        # stricter, the one direction calibration is allowed to move in.
-        ratio = actual / measured
-        if ratio > factor:
-            set_prompt_token_calibration(model_id, ratio)
-            factor = ratio
-        logging.warning(
-            "compress_context: session %s compression request rejected as "
-            "oversized (model=%s: we estimated ~%d, the provider counted %d -> "
-            "factor %.2f); its next attempt is bounded to about %d estimated "
-            "tokens",
-            session_id, model_id, measured, actual, factor,
-            _compression_prompt_budget(window, model_id) or 0,
+        return ContextManager.record_provider_overflow(
+            error,
+            model_id=model_id,
+            estimated=_estimate_tokens_fast(prompt),
+            window=window,
+            session_id=session_id,
+            origin="compress_context",
         )
+
+    @classmethod
+    def record_provider_overflow(
+        cls,
+        error: object,
+        *,
+        model_id: str,
+        estimated: int,
+        window: int = 0,
+        session_id: str = "",
+        origin: str = "context",
+    ) -> bool:
+        """Fold a provider's "this request is too big" answer into what we know.
+
+        The measurement itself lives in
+        :func:`runtime.common.learn_from_provider_rejection`, because the same
+        rejection is worth reading in two places: here, where a compression
+        attempt died on it, and in the inference loop, where the request that
+        died on it is the one the loop is trying to send (see
+        ``Runtime._recover_context_before_send``).  This wrapper adds the part
+        only the compressor knows -- what its next attempt will therefore be
+        bounded to.
+
+        Returns True when a factor was recorded.
+        """
+        factor = learn_from_provider_rejection(
+            error,
+            model_id=model_id,
+            estimated=estimated,
+            window=window,
+            session_id=session_id,
+            origin=origin,
+        )
+        if factor is None:
+            return False
+        budget = _compression_prompt_budget(window, model_id)
+        if budget > 0:
+            logging.warning(
+                "%s: model %s now measures a compression prompt against about %d "
+                "estimated tokens",
+                origin, model_id, budget,
+            )
         return True
 
     def _merge_memory_entries(
