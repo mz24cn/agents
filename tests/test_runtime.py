@@ -11,6 +11,7 @@ from hypothesis import strategies as st
 import pytest
 
 import os
+import time
 from runtime.models import InferenceRequest, Message, ModelConfig
 from runtime.runtime import Runtime
 from runtime.registry import ModelRegistry, ToolRegistry
@@ -2005,7 +2006,9 @@ def test_exec_cli_reuses_persistent_terminal_across_calls(monkeypatch, session_c
 
     def fake_execute_command(sid, command, timeout=300, **kwargs):
         looked_up_sessions.append(sid)
-        return "fake-terminal-output"
+        return {"stdout": "fake-terminal-output", "completion": "pattern",
+                "pattern_source": "auto", "pattern": "^user@host",
+                "pattern_miss": False, "status": "ok"}
 
     # 兜底 subprocess 路径绝不应被触发：worker 丢失 session_id 时会走到这里
     def boom_run(*args, **kwargs):
@@ -2102,9 +2105,14 @@ def test_find_prompt_marker_takes_newest_line():
     assert m._find_prompt_marker(text) == "root@cc"
 
 
-def test_exec_cli_defaults_to_derived_prompt_pattern(monkeypatch, session_ctx):
-    """未显式传 prompt_pattern 时，exec_cli 把派生的 ^user@host 传给终端路径；
-    显式传值优先；空命令（进度读取）只复用已缓存的派生结果。"""
+def test_exec_cli_passes_prompt_pattern_through_to_terminal_path(monkeypatch, session_ctx):
+    """入口不推导 prompt_pattern：空串原样交给终端路径按“当前界面”逐次判定
+    （shell → python3 里的 ">>>" → exit 后回到 shell）；显式 pattern 原样透传。
+
+    旧实现在入口推导一次并永久缓存到 terminal_info，嵌套程序里每一步都退化成
+    空闲等待（实测 1058ms/步 vs 53ms/步）。另外入口必须把 dict 结果渲染成文本，
+    pattern_miss 等状态要能被调用方看见。
+    """
     import runtime.builtin_tools_misc as _bt_misc
     import runtime.server as _server
 
@@ -2115,29 +2123,42 @@ def test_exec_cli_defaults_to_derived_prompt_pattern(monkeypatch, session_ctx):
         return ti
 
     def fake_execute_command(sid, command, timeout=1000,
-                             prompt_pattern="", read_after_delay=0):
+                             prompt_pattern="", read_after_delay=0,
+                             extra_env=""):
         captured.update(timeout=timeout, prompt_pattern=prompt_pattern,
-                        command=command)
-        return "ok"
+                        command=command, extra_env=extra_env)
+        return {"stdout": "ok", "completion": "pattern", "status": "ok",
+                "pattern": prompt_pattern,
+                "pattern_source": "explicit" if prompt_pattern else "auto",
+                "pattern_miss": False}
 
     monkeypatch.setattr(_server, "get_or_create_terminal", fake_get_or_create_terminal)
     monkeypatch.setattr(_bt_misc, "execute_command_in_terminal", fake_execute_command)
 
-    _bt_misc._exec_cli(command="echo hi", prompt_pattern="")
-    assert captured["prompt_pattern"] == "^root@cc"
+    assert _bt_misc._exec_cli(command="echo hi", prompt_pattern="") == "ok"
+    assert captured["prompt_pattern"] == "", "入口不应再自行推导 prompt_pattern"
 
-    # 显式 prompt_pattern 优先，不派生
+    # 显式 prompt_pattern 优先，原样透传
     _bt_misc._exec_cli(command="echo hi", prompt_pattern="MY-RE")
     assert captured["prompt_pattern"] == "MY-RE"
 
-    # 空命令（进度读取）复用缓存的派生结果
-    _bt_misc._exec_cli(command="", prompt_pattern="")
-    assert captured["prompt_pattern"] == "^root@cc"
-
-    # 缓存为空串（自定义提示符）时空命令传空串
-    ti["prompt_pattern"] = ""
+    # 空命令（进度读取）同样不推导
     _bt_misc._exec_cli(command="", prompt_pattern="")
     assert captured["prompt_pattern"] == ""
+
+    # extra_env 透传给终端路径（常驻 shell 里只补差异）
+    _bt_misc._exec_cli(command="echo hi", extra_env="FOO=bar")
+    assert captured["extra_env"] == "FOO=bar"
+
+    # 错误 pattern 必须让调用方看出来：否则它每步静默烧掉一个 timeout
+    def fake_miss(sid, command, **kwargs):
+        return {"stdout": "hi", "completion": "idle", "status": "ok",
+                "pattern": "nope", "pattern_source": "explicit",
+                "pattern_miss": True}
+
+    monkeypatch.setattr(_bt_misc, "execute_command_in_terminal", fake_miss)
+    rendered = _bt_misc._exec_cli(command="echo hi", prompt_pattern="nope")
+    assert "hi" in rendered and "pattern_miss=true" in rendered, repr(rendered)
 
 
 def test_unix_pty_single_reader_fans_out_to_browser_and_buffer(monkeypatch):
@@ -2269,14 +2290,31 @@ def _close_real_terminal(session_id: str) -> None:
 
 
 def _run_cli(session_id: str, command: str, *, tool_use_id: str = "",
-             timeout: int = 3000, prompt_pattern: str = "") -> str:
-    """在“本次调用”的线程里执行 exec_cli 终端路径（worker 线程各自带上下文）。"""
+             timeout: int = 3000, prompt_pattern: str = "",
+             extra_env: str = "") -> str:
+    """在“本次调用”的线程里执行 exec_cli 终端路径（worker 线程各自带上下文）。
+
+    返回调用方看到的文本（渲染后的结果）。需要断言完成判定 / 终端状态等
+    结构化字段时用 ``_cli``，它返回原始 dict。
+    """
+    from runtime.builtin_tools_misc import _render_exec_cli_result
+
+    return _render_exec_cli_result(
+        _cli(session_id, command, tool_use_id=tool_use_id, timeout=timeout,
+             prompt_pattern=prompt_pattern, extra_env=extra_env))
+
+
+def _cli(session_id: str, command: str, *, tool_use_id: str = "",
+         timeout: int = 3000, prompt_pattern: str = "",
+         extra_env: str = "") -> dict:
+    """同上，但返回结构化结果（completion / pattern / rebuilt ...）。"""
     from runtime.builtin_tools_misc import execute_command_in_terminal
     from runtime.common import set_request_context
 
     set_request_context(session_id=session_id, tool_use_id=tool_use_id)
     return execute_command_in_terminal(
-        session_id, command, timeout=timeout, prompt_pattern=prompt_pattern)
+        session_id, command, timeout=timeout, prompt_pattern=prompt_pattern,
+        extra_env=extra_env)
 
 
 def _warm_terminal(session_id: str) -> str:
@@ -2513,6 +2551,545 @@ def test_exec_cli_queued_call_interruptible_without_disturbing_running_call():
         running.join(20)
         assert "SIBLING-DONE" in holder["out"], (
             f"替排队调用发的中断误伤了正在执行的命令: {holder['out']!r}")
+    finally:
+        _close_real_terminal(sid)
+
+
+# ------------------------------------------------------------------
+# 完成判定跟着“当前界面”走；终端退出后重建；注册表回收
+# ------------------------------------------------------------------
+# 实测（同主机、同任务，唯一变量是完成判定）：python3 每步 1058ms vs 53ms、
+# sqlite3 每步 8603ms vs 471ms、错误显式 pattern 每步 3072ms（比不给 pattern 还差
+# 49×）；shell 退出后调用只会“空输出 + 超时”；172 次 trial 后注册表里仍有 38 个
+# 终端存活。下面的测试把这四类事故钉死。
+
+#: 一个永远不会出现在屏幕上的显式 pattern（模拟调用方给错）
+NEVER_MATCHING_PATTERN = r"never-seen-prompt-[a-z0-9]+$"
+
+
+def test_exec_cli_nested_repl_uses_its_own_prompt():
+    """改动 A 验收：默认判定下进入 python3，每步用自动推导的 ">>>"，不再空等。
+
+    旧实现只在终端启动时推导一次 shell 的 ^user@host，进入嵌套程序后屏幕尾部不
+    再出现它 → 每步落回空闲判定（timeout 那么久）。现在每次调用按屏幕尾部重新
+    判定，退出嵌套程序后再恢复 shell 的 pattern。
+    """
+    sid = "cli-nested-python"
+    _open_real_terminal(sid)
+    try:
+        shell_pattern = _warm_terminal(sid)
+        assert shell_pattern.startswith("^"), shell_pattern
+
+        res = _cli(sid, "python3", timeout=1500)
+        assert res["completion"] == "pattern", repr(res)
+        assert res["terminal_exited"] is False
+
+        durations: list[float] = []
+        for expr in ("print(6*7)", "x = 21", "print(x*2)"):
+            start = time.monotonic()
+            res = _cli(sid, expr, timeout=1500)
+            durations.append(time.monotonic() - start)
+            assert res["completion"] == "pattern", repr(res)
+            assert res["pattern_source"] == "auto", repr(res)
+            assert ">>>" in res["pattern"], repr(res)
+        assert "42" in res["stdout"], repr(res)
+        assert res["interpreter"] == "python", repr(res)
+        # 旧行为：每步空等 timeout（1500ms）；现在按提示符判定，几十毫秒量级
+        assert max(durations) < 1.0, f"嵌套 REPL 每步仍在空等 timeout: {durations}"
+
+        # 退出嵌套程序：pattern 必须回到 shell，后续 shell 命令不受残留 pattern 影响
+        _cli(sid, "exit", timeout=1500)
+        from runtime import server_state as ss
+
+        ti = ss.get_terminal_for_session(sid)
+        assert ti["prompt_pattern"] == shell_pattern, (
+            f"exit 回 shell 后 pattern 未恢复: {ti['prompt_pattern']!r}")
+        assert ti["prompt_interpreter"] == "shell", repr(ti["prompt_interpreter"])
+        after = _cli(sid, "echo AFTER-NESTED", timeout=1500)
+        assert "AFTER-NESTED" in after["stdout"], repr(after)
+        assert after["completion"] == "pattern", repr(after)
+    finally:
+        _close_real_terminal(sid)
+
+
+def test_exec_cli_nested_sqlite_prompt_is_auto_detected():
+    """改动 A 验收：sqlite3 内 4 步不再空等（实测 8603ms/步 → 应 <1s）。"""
+    import shutil
+
+    if not shutil.which("sqlite3"):
+        pytest.skip("sqlite3 not installed")
+    sid = "cli-nested-sqlite"
+    _open_real_terminal(sid)
+    try:
+        _warm_terminal(sid)
+        res = _cli(sid, "sqlite3 :memory:", timeout=3000)
+        assert res["completion"] == "pattern", repr(res)
+
+        durations: list[float] = []
+        for sql in ("create table t(x int);", "insert into t values (41),(42);",
+                    "select x from t;"):
+            start = time.monotonic()
+            res = _cli(sid, sql, timeout=3000)
+            durations.append(time.monotonic() - start)
+            assert res["completion"] == "pattern", repr(res)
+            assert "sqlite>" in res["pattern"], repr(res)
+        assert "42" in res["stdout"], repr(res)
+        assert res["interpreter"] == "sqlite", repr(res)
+        assert max(durations) < 1.0, f"sqlite3 每步仍在空等 timeout: {durations}"
+    finally:
+        _cli(sid, ".quit", timeout=1500)
+        _close_real_terminal(sid)
+
+
+def test_exec_cli_exit_restores_the_shell_prompt():
+    """改动 A 验收：exit 回 shell 后 pattern 必须回到 shell 提示符。
+
+    两个方向都要跟着界面走：残留 shell pattern 会让 REPL 每一步空等，残留
+    ">>>" pattern 会让 exit 之后的 shell 命令空等（甚至按残留标记提前截断）。
+    """
+    sid = "cli-exit-restore"
+    _open_real_terminal(sid)
+    try:
+        _warm_terminal(sid)
+
+        enter = _cli(sid, "python3", timeout=2000)
+        assert enter["interpreter"] == "python", repr(enter)
+        step = _cli(sid, "print('IN-REPL')", timeout=1000)
+        assert step["completion"] == "pattern" and ">>>" in step["pattern"], repr(step)
+
+        _cli(sid, "exit()", timeout=1500)           # REPL 退出，回到 shell
+
+        start = time.monotonic()
+        after = _cli(sid, "seq 1 5", timeout=1000)
+        elapsed = time.monotonic() - start
+        assert after["completion"] == "pattern", repr(after)
+        assert ">>>" not in after["pattern"], repr(after)
+        assert after["interpreter"] == "shell", repr(after)
+        # 未被残留 pattern 提前截断：5 行输出都在
+        assert all(n in after["stdout"] for n in "12345"), repr(after)
+        assert elapsed < 0.8, f"exit 回 shell 后仍在空等: {elapsed:.2f}s"
+    finally:
+        _close_real_terminal(sid)
+
+
+def test_exec_cli_wrong_explicit_pattern_reports_pattern_miss():
+    """改动 A 验收：错误显式 pattern 不得一路等到 timeout。
+
+    连续未命中（而输出已静止）就按空闲判定返回，并回传 pattern_miss=true、生效
+    pattern 与调用方原本要求的那个 pattern，让调用方能纠正。
+    """
+    sid = "cli-wrong-pattern"
+    _open_real_terminal(sid)
+    try:
+        _warm_terminal(sid)
+        durations: list[float] = []
+        for i in range(3):
+            start = time.monotonic()
+            res = _cli(sid, f"echo MISSED-{i}", timeout=1000,
+                       prompt_pattern=NEVER_MATCHING_PATTERN)
+            durations.append(time.monotonic() - start)
+            assert res["pattern_miss"] is True, repr(res)
+            assert res["completion"] == "idle", repr(res)
+            assert res["pattern_requested"] == NEVER_MATCHING_PATTERN, repr(res)
+            assert "root@" in res.get("pattern_hint", ""), repr(res)
+            assert f"MISSED-{i}" in res["stdout"], repr(res)
+            assert res["status"] == "ok", repr(res)
+        # 旧行为：一路等到 timeout 上限（实测 3072ms/步）；现在与默认空闲同级
+        assert max(durations) < 2.5, f"错误 pattern 仍等到超时: {durations}"
+    finally:
+        _close_real_terminal(sid)
+
+
+def test_exec_cli_reports_still_running_instead_of_spinning():
+    """timeout 是“输出静止”窗口，不是“命令跑完了”：没有完成信号时必须在上限内
+    返回，并明确说明命令可能还在跑（而不是静默耗到调用方给的 timeout）。"""
+    import runtime.builtin_tools_misc as m
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(m, "PATTERN_WAIT_CAP_SECONDS", 0.4)
+    sid = "cli-still-running"
+    _open_real_terminal(sid)
+    try:
+        _warm_terminal(sid)
+        start = time.monotonic()
+        res = _cli(sid, "sleep 4; echo TOO-LATE", timeout=1000,
+                   prompt_pattern=NEVER_MATCHING_PATTERN)
+        elapsed = time.monotonic() - start
+        assert elapsed < 2.0, f"没有完成信号时仍耗了 {elapsed:.2f}s"
+        assert res["status"] == "still_running", repr(res)
+        assert "TOO-LATE" not in res["stdout"], repr(res)
+        assert res["completion"] == "idle", repr(res)
+    finally:
+        monkeypatch.setattr(m, "PATTERN_WAIT_CAP_SECONDS", 10.0)
+        monkeypatch.undo()
+        _close_real_terminal(sid)
+
+
+def test_exec_cli_rebuilds_terminal_after_shell_exit():
+    """改动 B 验收：终端里 exit 之后不得再出现“空输出 + 超时”。
+
+    死亡终端从注册表注销，并默认重建同 session 的新终端（工作目录重放），本次
+    调用直接在新终端上跑，响应带 rebuilt=true。
+    """
+    sid = "cli-shell-exit"
+    ti = _open_real_terminal(sid)
+    try:
+        assert "ONE" in _cli(sid, "echo ONE", timeout=3000)["stdout"]
+        # 把 cwd 记下来，重建时应重放
+        ti["last_cwd"] = "/tmp"
+        _cli(sid, "exit", timeout=1500)
+
+        from runtime import server_state as ss
+
+        start = time.monotonic()
+        res = _cli(sid, "echo TWO", timeout=2000)
+        elapsed = time.monotonic() - start
+        assert "TWO" in res["stdout"], repr(res)
+        assert res["rebuilt"] is True, repr(res)
+        assert not res["terminal_exited"], repr(res)
+        assert elapsed < 5.0, f"自动重建过慢: {elapsed:.2f}s"
+
+        new_ti = ss.get_terminal_for_session(sid)
+        assert new_ti is not None and new_ti is not ti
+        assert new_ti.get("rebuilt_from") == f"{sid}:auto", new_ti.get("rebuilt_from")
+
+        # 重建不只是换个 shell：上次记住的工作目录要重放
+        at = _cli(sid, "pwd", timeout=2000)
+        assert "/tmp" in at["stdout"], repr(at)
+
+        # 注册表里不得残留 shell 已退出的条目
+        ss.prune_dead_terminals()
+        assert all(entry["alive"] for entry in ss.terminal_snapshot()), (
+            ss.terminal_snapshot())
+    finally:
+        _close_real_terminal(sid)
+
+
+def test_render_exec_cli_result_surfaces_completion_state():
+    """模型看到的文本要带上"这次是怎么结束的"，且正常完成时不加噪声。"""
+    import runtime.builtin_tools_misc as m
+
+    assert m._render_exec_cli_result(
+        {"stdout": "plain", "completion": "pattern", "status": "ok"}) == "plain"
+
+    text = m._render_exec_cli_result({
+        "stdout": "MISSED-0", "completion": "idle", "status": "ok",
+        "pattern": NEVER_MATCHING_PATTERN, "pattern_miss": True,
+        "pattern_hint": "^root@cc",
+    })
+    assert text.startswith("MISSED-0"), text
+    assert "pattern_miss=true" in text and "^root@cc" in text, text
+
+    text = m._render_exec_cli_result({"stdout": "AFTER", "completion": "pattern",
+                                      "status": "ok", "rebuilt": True})
+    assert "terminal_rebuilt=true" in text, text
+
+    text = m._render_exec_cli_result({"stdout": "", "completion": "idle",
+                                      "status": "terminal_exited",
+                                      "terminal_exited": True, "exit_code": 1})
+    assert "terminal_exited=true exit_code=1" in text, text
+
+    text = m._render_exec_cli_result({"stdout": "partial", "completion": "idle",
+                                      "status": "still_running",
+                                      "note": "may still be running"})
+    assert "still_running=true" in text and "may still be running" in text, text
+
+
+def test_exec_cli_dead_terminal_reports_exit_instead_of_empty_timeout(monkeypatch):
+    """改动 B：判定退出后必须显式回报，不能返回空 stdout + 超时。
+
+    重建失败（产品策略/环境不允许）时也要带 terminal_exited / rebuild_required，
+    并把死亡终端从注册表注销。
+    """
+    import runtime.builtin_tools_misc as m
+    import runtime.server as srv
+    from runtime import server_state as ss
+
+    key = "sess-p-1:auto"
+    info = _fake_terminal("root@cc:/tmp# ")
+    info["terminal_id"] = key
+    info["pty_eof"] = True                 # reader 读到 EOF：shell 已退出
+    retired: list[str] = []
+    monkeypatch.setattr(ss, "unregister_terminal_session",
+                        lambda tid: retired.append(tid))
+    monkeypatch.setattr(srv, "get_terminal_for_session", lambda sid: info)
+    monkeypatch.setattr(srv, "get_or_create_terminal", lambda sid, **kw: None)
+
+    res = m.execute_command_in_terminal("sess-p-1", "echo hi", timeout=500)
+    assert res["status"] == "terminal_exited", repr(res)
+    assert res["terminal_exited"] is True, repr(res)
+    assert res["rebuild_required"] is True, repr(res)
+    assert retired == [key], f"退出终端未从注册表注销: {retired!r}"
+
+
+def test_prune_dead_terminals_drops_exited_shells():
+    """改动 B 验收：注册表 / GET /v1/terminals 里不得残留 shell 已退出的条目。"""
+    import os
+    import pty
+    import subprocess
+    import sys
+
+    if sys.platform == "win32":
+        pytest.skip("unix PTY path")
+    from runtime import server_state as ss
+
+    master, slave = pty.openpty()
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.2)"],
+                            stdin=slave, stdout=slave, stderr=slave)
+    os.close(slave)
+    key = "dead-shell:auto"
+    info = {"session_id": "dead-shell", "sock": None, "disconnected_at": None,
+            "active": True, "pid": proc.pid, "master_fd": master,
+            **ss._terminal_buffer_fields(), **ss._terminal_lifecycle_fields()}
+    with ss._terminal_sessions_lock:
+        ss._terminal_sessions[key] = info
+    try:
+        deadline = time.monotonic() + 5.0
+        pruned: list[str] = []
+        while time.monotonic() < deadline:
+            pruned = ss.prune_dead_terminals()
+            if key in pruned:
+                break
+            time.sleep(0.1)
+        assert key in pruned, "shell 已退出的终端没有被注销"
+        assert key not in ss._terminal_sessions
+        assert all(entry["alive"] for entry in ss.terminal_snapshot()), (
+            ss.terminal_snapshot())
+    finally:
+        with ss._terminal_sessions_lock:
+            ss._terminal_sessions.pop(key, None)
+        try:
+            os.close(master)
+        except OSError:
+            pass
+
+
+def test_exec_cli_extra_env_applies_once_to_the_persistent_shell():
+    """extra_env 写进常驻 shell：只补与 shell 现有 env 的差异，因此每次调用带同一
+    组变量不需要再输入一遍 export（重建 shell 后才会整组重放）。"""
+    sid = "cli-extra-env"
+    _open_real_terminal(sid)
+    try:
+        _warm_terminal(sid)
+        res = _cli(sid, "echo [$EXEC_CLI_PROBE]", timeout=2000,
+                   extra_env="EXEC_CLI_PROBE='alpha beta'")
+        assert "alpha beta" in res["stdout"], repr(res)
+        from runtime import server_state as ss
+
+        ti = ss.get_terminal_for_session(sid)
+        assert ti["shell_env"] == {"EXEC_CLI_PROBE": "alpha beta"}, ti["shell_env"]
+
+        again = _cli(sid, "echo [$EXEC_CLI_PROBE]", timeout=2000,
+                     extra_env="EXEC_CLI_PROBE='alpha beta'")
+        assert "alpha beta" in again["stdout"], repr(again)
+
+        changed = _cli(sid, "echo [$EXEC_CLI_PROBE]", timeout=2000,
+                       extra_env="EXEC_CLI_PROBE=gamma")
+        assert "[gamma]" in changed["stdout"], repr(changed)
+    finally:
+        _close_real_terminal(sid)
+
+
+def test_env_prefix_only_types_the_difference():
+    """改动 C 附带：常驻 shell 的 env 只输入差异（K= 撤销，删掉的键 unset）。"""
+    import runtime.builtin_tools_misc as m
+
+    ti: dict = {}
+    assert m._env_prefix(ti, "A=1 B=2") == "export A='1' ; export B='2'"
+    m._record_env(ti, "A=1 B=2")
+    assert m._env_prefix(ti, "A=1 B=2") == "", "env 未变化不应再输入一遍"
+    assert m._env_prefix(ti, "A=9") == "export A='9' ; unset B"
+    assert m._env_prefix(ti, "") == "unset A ; unset B"
+    m._record_env(ti, "A=9")
+    assert m._env_prefix(ti, "") == "unset A", "记录后只该撤销仍然存在的键"
+    # 非法项被忽略而不是让命令失败
+    assert m._env_prefix({}, "BAD NAME; ALSO=1") == "export ALSO='1'"
+    assert m._parse_env_pairs("K='a b'") == {"K": "a b"}
+
+
+def test_terminal_registry_reclaims_idle_exec_cli_terminals(monkeypatch):
+    """改动 C 验收：{session}:auto 终端从不置 disconnected_at，必须按 last_used_at
+    的空闲时限回收（实测 172 次 trial 后仍有 38 个终端存活）。"""
+    from runtime import server_state as ss
+
+    sid = "idle-reclaim"
+    key = f"{sid}:auto"
+    info = {"session_id": sid, "sock": None, "disconnected_at": None,
+            "active": True, **ss._terminal_buffer_fields(),
+            **ss._terminal_lifecycle_fields()}
+    with ss._terminal_sessions_lock:
+        ss._terminal_sessions[key] = info
+    try:
+        monkeypatch.setenv("TERMINAL_IDLE_TIMEOUT", "60")
+        assert key not in ss.reap_terminal_sessions()["idle"], (
+            "刚用过的终端被误回收")
+        assert key in ss._terminal_sessions
+
+        info["last_used_at"] = time.monotonic() - 120      # 闲置 2 分钟
+        assert key in ss.reap_terminal_sessions()["idle"], (
+            "{session}:auto 终端未按 last_used_at 的空闲时限回收")
+        assert key not in ss._terminal_sessions
+    finally:
+        with ss._terminal_sessions_lock:
+            ss._terminal_sessions.pop(key, None)
+
+
+def test_terminal_env_timeouts_are_parsed_as_int(monkeypatch):
+    """改动 C 回归：os.getenv(...) 返回 str 与 float 比较会 TypeError，回收线程
+    当场死掉，之后什么都不再回收。TERMINAL_SESSION_TIMEOUT=60 必须可用。"""
+    from runtime import server_state as ss
+
+    monkeypatch.delenv("TERMINAL_SESSION_TIMEOUT", raising=False)
+    assert ss._env_timeout("TERMINAL_SESSION_TIMEOUT", 3600) == 3600
+    monkeypatch.setenv("TERMINAL_SESSION_TIMEOUT", "60")
+    assert ss._env_timeout("TERMINAL_SESSION_TIMEOUT", 3600) == 60
+    for bad in ("soon", "", "0", "-5", "60s"):
+        monkeypatch.setenv("TERMINAL_SESSION_TIMEOUT", bad)
+        assert ss._env_timeout("TERMINAL_SESSION_TIMEOUT", 3600) == 3600, bad
+
+    # 服务不崩 + 60 s 后条目被回收（验收：TERMINAL_SESSION_TIMEOUT=60）
+    monkeypatch.setenv("TERMINAL_SESSION_TIMEOUT", "60")
+    key = "detached-timeout:auto"
+    info = {"session_id": "detached-timeout", "sock": None,
+            "active": True, **ss._terminal_buffer_fields(),
+            **ss._terminal_lifecycle_fields()}
+    info["disconnected_at"] = time.monotonic() - 90
+    info["last_used_at"] = time.monotonic() - 90
+    with ss._terminal_sessions_lock:
+        ss._terminal_sessions[key] = info
+    try:
+        retired = ss.reap_terminal_sessions()          # 不得抛异常
+        assert key in retired["detached"], retired
+        assert key not in ss._terminal_sessions
+    finally:
+        with ss._terminal_sessions_lock:
+            ss._terminal_sessions.pop(key, None)
+
+
+@pytest.fixture()
+def isolated_terminal_registry():
+    """Hand a capacity test a terminal registry of its own.
+
+    ``_terminal_sessions`` is process-global, and other suites (the remote-env
+    trials) leave entries behind.  ``enforce_terminal_capacity()`` then evicts
+    *those* as well, which makes an assertion about which keys were dropped
+    depend on test order rather than on the behaviour under test.
+    """
+    from runtime import server_state as ss
+
+    with ss._terminal_sessions_lock:
+        foreign = dict(ss._terminal_sessions)
+        ss._terminal_sessions.clear()
+    try:
+        yield
+    finally:
+        with ss._terminal_sessions_lock:
+            ss._terminal_sessions.clear()
+            ss._terminal_sessions.update(foreign)
+
+
+def test_terminal_registry_capacity_evicts_least_recently_used(
+    monkeypatch, isolated_terminal_registry
+):
+    """改动 C：注册表有上限，长期跑不会单调累积；最近用过的不被淘汰。"""
+    from runtime import server_state as ss
+
+    now = time.monotonic()
+    keys: list[str] = []
+    for i in range(5):
+        key = f"cap-{i}:auto"
+        info = {"session_id": f"cap-{i}", "sock": None, "disconnected_at": None,
+                "active": True, **ss._terminal_buffer_fields(),
+                **ss._terminal_lifecycle_fields()}
+        info["created_at"] = info["last_used_at"] = now - 1000 - i
+        with ss._terminal_sessions_lock:
+            ss._terminal_sessions[key] = info
+        keys.append(key)
+    attached_key = "cap-attached:auto"
+    info = {"session_id": "cap-attached", "sock": object(),   # 浏览器仍连着
+            "disconnected_at": None, "active": True,
+            **ss._terminal_buffer_fields(), **ss._terminal_lifecycle_fields()}
+    info["created_at"] = info["last_used_at"] = now - 2000
+    with ss._terminal_sessions_lock:
+        ss._terminal_sessions[attached_key] = info
+    keys.append(attached_key)
+
+    try:
+        live_before = len(ss._terminal_sessions)
+        monkeypatch.setenv("TERMINAL_MAX_SESSIONS", str(live_before - 2))
+        evicted = ss.enforce_terminal_capacity()
+        assert len(evicted) == 2, evicted
+        assert len(ss._terminal_sessions) == live_before - 2
+        # 淘汰最久未使用的；仍在用的（attached / 较新）保留
+        assert attached_key not in evicted, "attached 终端被淘汰了"
+        assert {"cap-4:auto", "cap-3:auto"} == set(evicted), evicted
+        for key in ("cap-0:auto", "cap-1:auto", "cap-2:auto"):
+            assert key in ss._terminal_sessions, evicted
+    finally:
+        with ss._terminal_sessions_lock:
+            for key in keys:
+                ss._terminal_sessions.pop(key, None)
+
+
+def test_terminal_capacity_holds_under_a_burst_of_new_sessions(
+    monkeypatch, isolated_terminal_registry
+):
+    """突发新建（都还在淘汰宽限期内）也必须把注册表压回上限。
+
+    否则"一次 trial 一个终端"会永久累积 PTY 与 session 状态——实测 172 次 trial
+    之后仍有 38 个终端存活。宽限期只是避免淘汰正在用的终端，不能变成上限失效。
+    """
+    from runtime import server_state as ss
+
+    now = time.monotonic()
+    keys: list[str] = []
+
+    class _BusyQueue:
+        def busy(self):
+            return True
+
+    for i in range(6):
+        key = f"burst-{i}:auto"
+        info = {"session_id": f"burst-{i}", "sock": None, "disconnected_at": None,
+                "active": True, **ss._terminal_buffer_fields(),
+                **ss._terminal_lifecycle_fields()}
+        info["created_at"] = info["last_used_at"] = now - i   # 全是刚用过的
+        with ss._terminal_sessions_lock:
+            ss._terminal_sessions[key] = info
+        keys.append(key)
+    busy_key = "burst-busy:auto"
+    info = {"session_id": "burst-busy", "sock": None, "disconnected_at": None,
+            "active": True, "command_queue": _BusyQueue(),
+            **ss._terminal_buffer_fields(), **ss._terminal_lifecycle_fields()}
+    info["created_at"] = info["last_used_at"] = now - 5000
+    with ss._terminal_sessions_lock:
+        ss._terminal_sessions[busy_key] = info
+    keys.append(busy_key)
+
+    try:
+        monkeypatch.setenv("TERMINAL_MAX_SESSIONS", "3")
+        evicted = ss.enforce_terminal_capacity()
+        assert len(ss._terminal_sessions) == 3, ss._terminal_sessions
+        assert busy_key not in evicted, "正在跑命令的终端被淘汰了"
+        # 上限必须真的成立：即便没有"够老"的终端，也按最久未使用淘汰
+        assert set(evicted) == {"burst-5:auto", "burst-4:auto",
+                                "burst-3:auto", "burst-2:auto"}, evicted
+        assert {"burst-0:auto", "burst-1:auto"} <= set(ss._terminal_sessions)
+    finally:
+        with ss._terminal_sessions_lock:
+            for key in keys:
+                ss._terminal_sessions.pop(key, None)
+
+
+def test_exec_cli_moves_the_terminal_usage_clock():
+    """改动 C：回收看的是 last_used_at，每次 exec_cli 调用都必须拨动它。"""
+    sid = "cli-usage-clock"
+    ti = _open_real_terminal(sid)
+    try:
+        ti["last_used_at"] = 0.0
+        _cli(sid, "true", timeout=2000)
+        assert ti["last_used_at"] > time.monotonic() - 10, (
+            "exec_cli 未更新 last_used_at")
     finally:
         _close_real_terminal(sid)
 

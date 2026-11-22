@@ -1484,6 +1484,75 @@ class TestEnvAPI:
         assert body["env"]["KEY_B"] == "val_b"
 
 
+class TestTerminalAPI:
+    """GET /v1/terminals 的运维可见性与死活清理（改动 B/C 验收）。"""
+
+    def test_list_terminals_reports_liveness_usage_and_limits(self, server_with_env):
+        """条目里必须带 alive / shell_pid / last_used_at，外层带回收上限。"""
+        from runtime import server_state as ss
+
+        sid = "ops-visible"
+        key = f"{sid}:auto"
+        assert ss.get_or_create_terminal(sid, cols=80, rows=24) is not None
+        try:
+            status, body = _get(server_with_env, "/v1/terminals")
+            assert status == 200
+            assert body.get("idle_timeout_seconds"), body
+            assert body.get("max_terminals"), body
+            entry = next((t for t in body["terminals"] if t["terminal_id"] == key),
+                         None)
+            assert entry is not None, body
+            assert entry["alive"] is True, entry
+            assert isinstance(entry["shell_pid"], int), entry
+            assert entry["last_used_at"], entry
+            assert entry["idle_seconds"] is not None and entry["idle_seconds"] < 10, entry
+            assert entry["idle"] is False, entry
+        finally:
+            ss.unregister_terminal_session(key)
+
+    def test_list_terminals_drops_terminals_whose_shell_exited(self, server_with_env):
+        """exit / 崩溃后的终端不得继续被列出（否则后续调用只会空转到超时）。"""
+        import pty
+        import subprocess
+        import sys
+        import time as _time
+
+        if sys.platform == "win32":
+            pytest.skip("unix PTY path")
+        from runtime import server_state as ss
+
+        master, slave = pty.openpty()
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.2)"],
+                                stdin=slave, stdout=slave, stderr=slave)
+        os.close(slave)
+        key = "exited-shell:auto"
+        info = {"session_id": "exited-shell", "sock": None, "disconnected_at": None,
+                "active": True, "pid": proc.pid, "master_fd": master,
+                **ss._terminal_buffer_fields(), **ss._terminal_lifecycle_fields()}
+        with ss._terminal_sessions_lock:
+            ss._terminal_sessions[key] = info
+        try:
+            entry, body = {"terminal_id": key}, {}
+            deadline = _time.monotonic() + 6.0
+            while _time.monotonic() < deadline:
+                status, body = _get(server_with_env, "/v1/terminals")
+                assert status == 200, body
+                entry = next((t for t in body["terminals"]
+                              if t["terminal_id"] == key), None)
+                if entry is None:
+                    break
+                _time.sleep(0.2)
+            assert entry is None, f"已退出的终端仍被列出: {body}"
+            assert key not in ss._terminal_sessions
+        finally:
+            with ss._terminal_sessions_lock:
+                ss._terminal_sessions.pop(key, None)
+            try:
+                os.close(master)
+            except OSError:
+                pass
+
+
 class TestSessionAPI:
     """Tests for GET /v1/sessions and GET /v1/sessions/{session_id} endpoints."""
 
@@ -1700,6 +1769,10 @@ class TestSessionAPI:
             index = _json.load(f)
         index["260101_100002"]["title"] = "Zulu topic"
         index["260101_100003"]["title"] = "Alpha topic"
+        # 末级分类列表一律按最终会话时间倒序（与"最近会话"同序）。标题字母序
+        # （Alpha < Zulu）与时间序刻意相反，用来证明排序不再退回标题浏览语义。
+        index["260101_100002"]["last_inference_at"] = "2026-01-01T00:00:00"
+        index["260101_100003"]["last_inference_at"] = "2026-01-02T00:00:00"
         with open(index_path, "w", encoding="utf-8") as f:
             _json.dump(index, f)
 
@@ -1737,7 +1810,8 @@ class TestSessionAPI:
         ]
 
         # A second-level node may be terminal when a redundant only-child
-        # third level has been collapsed.
+        # third level has been collapsed. 挂载顺序不同（100003 在前）也不改变
+        # 结果：末级列表按最终会话时间倒序，而不是 tree.json 里的书写顺序。
         status, body = _get(server_with_env, "/v1/sessions?category=1/4")
         assert status == 200
         assert body["category"] == "1/4"

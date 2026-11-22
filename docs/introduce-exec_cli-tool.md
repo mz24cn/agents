@@ -43,24 +43,28 @@
 
 ## 三、参数逐个说
 
-`exec_cli` 共 5 个参数，全部围绕两个问题展开：**"往终端发什么"** 与 **"何时算收集完成"**。
+`exec_cli` 共 6 个参数，全部围绕两个问题展开：**"往终端发什么"** 与 **"何时算收集完成"**。
 
 | 参数 | 必填 | 说明 | 推荐用法 / 技巧 |
 |---|---|---|---|
 | `command` | ✅ | 发送到持久化终端的命令/输入 | 传**空字符串**时不发送任何输入，仅读取最新终端进度——适合轮询长任务的最新输出 |
 | `cwd` | 可选 | 命令工作目录（**仅对 shell 命令生效**） | 实现上包装为 `cd <目录> && <命令>`；对 ssh、mysql 等交互式程序不生效 |
-| `prompt_pattern` | 可选 | 正则表达式，**匹配到可见终端输出**即完成收集；**不传时默认使用从终端派生的本机 shell 提示符标记**（如 `^root@cc`），命令跑完、shell 回到提示符立即返回 | 需要等待**特定程序**的提示符（ssh 远端主机、容器、REPL 等——其提示符与本机 shell 不同）时显式传模式：**先观察命令提示符，再用其前缀作为匹配模式**，如 `\$`、`#`、`user@host:~$` |
+| `prompt_pattern` | 可选 | 正则表达式，**匹配到可见终端输出**即完成收集；**不传时按"当前界面"逐次判定**：shell 的 `user@host` 标记、进了 `python3` 就是 `^>>>\s*$`、进了 `sqlite3` 就是 `^sqlite>\s*$`、`pdb` 是 `^(Pdb)\s*$`，退出嵌套程序又自动回到 shell 的提示符 | **多数情况留空即可**（自动跟随界面，见下节）。只有当目标提示符不在已知集合里（远端主机的自定义 PS1、陌生 REPL）才显式传，且**先观察屏幕尾部再取其字面**（如 `ops@prod-host:~\$`）；给错 pattern 不会一直空等，但每一步都要多等一个静默窗口，响应里会带 `pattern_miss=true` 提醒纠正 |
 | `timeout` | 可选 | 无新输出的毫秒数后返回（默认 `1000`；设为 `0` 禁用）；传大值同时延长本次调用被允许运行的最长时间 | 适合"命令跑完就不再有输出"的场景；对持续刷新的程序（如 `top`）需谨慎；长任务（编译、下载）传大值（如 `600000`）即可获得长运行窗口 |
 | `read_after_delay` | 可选 | 读取该毫秒数后**无论有无输出**都返回（默认 `0`，禁用） | 适合"只读固定时长窗口的输出"——如采样一段日志或交互程序的瞬时反馈 |
+| `extra_env` | 可选 | 本次调用的环境变量（`K=V`、`K="a b"`、`K=` 撤销），写进**常驻 shell** 供后续调用继承 | 只输入与该 shell 现有环境的**差异**，所以每次调用带同一组变量不再重复 `export`；终端被重建时整组重放 |
 
 ### 完成条件：谁先满足谁生效
 
-- `prompt_pattern` 匹配到 → 立即返回。**不显式传 `prompt_pattern` 时，默认使用从终端输出缓冲派生的本机 shell 提示符标记**（默认 bash/zsh/fish 提示符都带 `user@hostname`，派生结果形如 `^root@cc`）：普通 shell 命令一跑完、shell 一回到提示符就返回，比纯静默等待更精确。匹配只针对**命令发送之后的新输出**，屏幕上残留的旧提示符不会造成提前返回；派生结果按终端缓存。注意：若命令自身输出有**以 `user@host` 开头的行**（与提示符同形），也会提前完成——与显式传 `prompt_pattern` 的语义一致，此类命令可显式传别的模式或 `0` 静默窗口规避。shell 提示符不含 `user@hostname` 标记时（自定义 PS1、PowerShell 等）默认值为空，退回下面的静默等待；
+- **完成标记属于"当前界面"，每次调用重新判定。** 一条常驻 PTY 会在几个界面间来回：shell 提示符 → `python3` 的 `>>> ` → `sqlite3` 的 `sqlite> ` → `(Pdb) ` → `exit` 之后又回到 shell。标记只在终端启动时派生一次的话，进入嵌套程序后旧标记早已滚出屏幕尾部，只能退回静默等待——实测每步 1058ms（python3 REPL）、1058ms（pdb）、8603ms（sqlite3）。现在每次调用读干屏幕尾部再判定界面：命中已知提示符（`>>>` / `...` / `sqlite>` / `(Pdb)` / `PS1>` / `> ` / `$` / `#` …）就把完成标记换成锚定到行尾的转义串（`^>>>\s*$`、`^sqlite>\s*$`…）并记下当前解释器，检测到 shell 提示符重新出现就换回 shell 标记。同一任务、同一终端、只改完成判定的对照实测：python3 内 10 步 p50 **51ms**，sqlite3 内 4 步 p50 **50ms**（原来 1058ms / 8603ms）。
+  保守规则保留：屏幕尾部读不出提示符时不会把"无标记"当成永久结论（连续两次无标记才认定自定义 PS1），也不会把画面中部的某个 `user@host` 行误当作当前界面——那正是"以为回到了 shell"的误判来源。
+- **显式 `prompt_pattern` 有失败保护。** 给错 pattern（例如用 `$` 去等 root shell 的 `#`）过去会一路等到 timeout，实测每步 3072ms——比不给 pattern 慢 49×、比正确 pattern 慢 45.9×，而输出仍然正确，调用方几乎无从发现。现在"等的 pattern 没出现而 PTY 输出已静止"最多两个窗口就按空闲判定返回，并回传 `pattern_miss=true`、生效的 `pattern`、调用方原本要求的 `pattern_requested`、以及屏幕真实尾部 `pattern_hint`；等 pattern 本身另有 10s 硬上限，不会随 `timeout` 无限拉长。实测 p50 **1055ms**，与默认空闲判定同级。
+- **返回结构显式区分完成方式**：`completion ∈ {pattern, idle, delay, cancelled}`、`pattern_source ∈ {explicit, auto, none}`、`pattern_miss`、`interpreter`、`status ∈ {ok, still_running, terminal_exited}`、`rebuilt`、`exit_code`、`terminal_id`、`cwd`、`shell_pid`。"提示符命中"、"输出静止"、"命令可能还在跑"、"终端已经死了"不再长成同一个样子，也只有这样才可能被回归测试钉住。
 - `timeout` 静默窗口到期（有已收集输出或未发送命令）→ 返回；
 - `read_after_delay` 计时到 → 无论有无输出都返回；
 - 三者之上，本次调用整体还受运行时 `TOOL_EXEC_TIMEOUT` 守卫（默认 200 秒）约束：`timeout` 参数会叠加在这个基础值之上（数值 ≥5000 按毫秒、更小按秒解释），因此传大 `timeout` 既拉长静默窗口、也拉长允许运行的最长时间。到限后调用方收到超时错误，运行时同时**中断这条 exec_cli 调用**（exec_cli 注册了 abort hook：停止收集并对 shell 发 `Ctrl-C`），不会留下一条还在吞终端输出的后台收集器；用户按 Stop 同样会中断在飞的 exec_cli 调用。命令未跑完前仍可随时用空 `command` 读回进度——Agent 不会被一条卡死的命令永久挂起。
 
-> 环境变量速查：`TOOL_EXEC_TIMEOUT`（默认 200s，所有工具调用的外层守卫上限；exec_cli 通过 `timeout` 参数在其上叠加）、`EXEC_DEFAULT_TIMEOUT`（默认 180s，即 `TOOL_EXEC_TIMEOUT` 200s − 20s 余量；exec_shell 默认超时）、`OUTPUT_CHECK_INTERVAL`（默认 0.05s，终端输出轮询间隔）。
+> 环境变量速查：`TOOL_EXEC_TIMEOUT`（默认 200s，所有工具调用的外层守卫上限；exec_cli 通过 `timeout` 参数在其上叠加）、`EXEC_DEFAULT_TIMEOUT`（默认 180s，即 `TOOL_EXEC_TIMEOUT` 200s − 20s 余量；exec_shell 默认超时）、`OUTPUT_CHECK_INTERVAL`（默认 0.05s，终端输出轮询间隔）；终端生命周期：`TERMINAL_IDLE_TIMEOUT`（默认 1800s，exec_cli 常驻终端的空闲回收时限）、`TERMINAL_SESSION_TIMEOUT`（默认 3600s，浏览器 tab detach 后回收）、`TERMINAL_MAX_SESSIONS`（默认 64，终端注册表的 LRU 上限）。这几个终端值一律按 `int` 解析，非法值回落默认并记 warning（历史上 `os.getenv` 返回 str 与 `now - disconnected_at` 的 float 比较会 TypeError，回收线程当场死掉，之后什么都不再回收）。
 
 ---
 
@@ -75,6 +79,8 @@
 - **支持每会话多个并发终端**：在一个终端里跑长驻进程（如开发服务器），在另一个终端里继续执行其他命令，互不阻塞。
 - **同一个终端串行、输出按调用归属**：一个 PTY 一次只能驱动一条前台命令，屏幕输出也无法事后按调用切分，因此同一终端上的并发调用按 FIFO 排队，各自收集自己起点之后的输出（空 `command` 的进度读取不占用终端）。要真正并行，就再开一个终端或改用 `exec_shell`。
 - **终端不可用时自动降级**：当某上下文拿不到终端会话时，`exec_cli` 会回退为 subprocess 单次执行，保证工具永远"能用"，只是失去持久化能力。
+- **shell 退出后不再静默空转**：终端里的 shell 退出（`exit`、崩溃、容器结束）由轻量 liveness 判定（PTY 子进程 `poll()` / reader 读到 EOF），条目随即从注册表注销；默认在同一 session 上重建一个新终端、**本次调用就在替换后的终端上跑完**，响应带 `rebuilt=true`（重放工作目录与该次调用的 `extra_env`）。实测 `exit` 之后紧跟 `echo` 用时 355ms；若重建不可用则回 `terminal_exited=true` / `rebuild_required=true` 与 `exit_code`——不再出现"空输出 + 耗尽 timeout"这种无法与"还在跑"区分的结果。`GET /v1/terminals` 里也不残留 shell 已退出的条目。
+- **终端会被回收，注册表不再只增不减**：每次 exec_cli 调用与浏览器里的每次按键都会拨动该终端的 `last_used_at`；回收看三个时钟——shell 已退出（立即）、闲置超过 `TERMINAL_IDLE_TIMEOUT`（默认 1800s）、浏览器 tab detach 超过 `TERMINAL_SESSION_TIMEOUT`（默认 3600s），其上还有 `TERMINAL_MAX_SESSIONS`（默认 64）的 LRU 上限（attached / 正在跑命令 / 刚用过的不被淘汰）。删除 session 时其常驻终端同步注销。`GET /v1/terminals` 返回每条的 `alive` / `shell_pid` / `last_used_at` / `idle_seconds` / `idle` 以及这两个上限，泄漏可以从进程外面核对。
 
 > 诚实说明能力边界：交互程序的行为取决于程序本身是否支持非交互输入（如部分程序要求密码必须由 tty 输入），以及 `TOOL_EXEC_TIMEOUT` 外层守卫对单次调用时长的约束（可用 `timeout` 参数在允许范围内延长）——这些是工程设计上的权衡，而非缺陷。
 
@@ -101,7 +107,7 @@ Last login: Mon Jul 29 10:12:33 2024 from 10.0.1.2
 ops@prod-host-01:~$
 ```
 
-观察远程主机的命令提示符（如 `ops@prod-host-01:~$`），用其前缀作为 `prompt_pattern` 的匹配模式。若目标主机要求密码/密钥口令，Agent 可再用 `exec_cli` 发送对应输入；配合预置的 SSH 密钥则全程免交互。**一次登录后，后续所有调用都在这条持久化会话里执行，不需要重复认证。**
+登录后远程主机的提示符（如 `ops@prod-host-01:~$`）会被自动认成新的完成标记——`user@host` 是通用形态，所以后面的调用通常**不必**再传 `prompt_pattern`（示例里显式传只是为了对照旧写法；提示符不带 `user@host` 的陌生环境才需要显式给）。若目标主机要求密码/密钥口令，Agent 可再用 `exec_cli` 发送对应输入；配合预置的 SSH 密钥则全程免交互。**一次登录后，后续所有调用都在这条持久化会话里执行，不需要重复认证。**
 
 ### 第 2 步：进入隔离容器（无法访问公网的现场环境）
 

@@ -3136,6 +3136,208 @@ def read_terminal_tail(terminal_info: dict, chunks: int = 200) -> str:
         return "".join(buf[-max(1, chunks):])
 
 
+# ---------------------------------------------------------------------------
+# Terminal lifecycle: usage clock, liveness, reclamation
+# ---------------------------------------------------------------------------
+# Every session that ever ran one exec_cli call keeps a PTY registered, so the
+# registry needs a clock that moves and a reaper that reads it.  It had neither
+# for ``{session_id}:auto`` terminals: cleanup only looked at
+# ``disconnected_at``, which only the browser-attach path ever sets, so 172
+# trials left 38 live PTYs (and their scroll buffers) behind.  Worse, the one
+# comparison that did run --
+#     now - disconnected_at > os.getenv("TERMINAL_SESSION_TIMEOUT", 3600)
+# -- raises TypeError as soon as the variable *is* set (getenv hands back a
+# str, now / disconnected_at are floats), which killed the reaper thread for
+# the remaining life of the process, after which nothing was ever reclaimed.
+
+#: quiet this long -> reclaimed (an exec_cli terminal never "disconnects")
+TERMINAL_IDLE_TIMEOUT = 1800
+#: a browser terminal stays registered this long after its tab detached
+TERMINAL_SESSION_TIMEOUT = 3600
+#: hard ceiling on simultaneously live PTYs, whatever the clocks say
+TERMINAL_MAX_SESSIONS = 64
+#: never evict over the ceiling a terminal used more recently than this
+TERMINAL_EVICTION_GRACE = 120
+
+
+def _env_timeout(name: str, default: int) -> int:
+    """``int(os.getenv(name))``; an unusable value warns and falls back."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s=%r; falling back to %s", name, raw, default)
+        return default
+    if value <= 0:
+        logger.warning("Invalid %s=%r (must be > 0); falling back to %s",
+                       name, raw, default)
+        return default
+    return value
+
+
+def _terminal_lifecycle_fields() -> dict:
+    """Fresh usage-clock / exit bookkeeping for a terminal entry."""
+    now = time.monotonic()
+    return {
+        "created_at": now,
+        "last_used_at": now,      # moved by exec_cli calls and terminal input
+        "exit_code": None,        # set once the shell is known to have exited
+        "pty_eof": False,         # the single PTY reader hit EOF / an error
+    }
+
+
+def touch_terminal(terminal_info: Optional[dict]) -> None:
+    """Move the terminal's idle clock (call it on every use of the PTY)."""
+    if isinstance(terminal_info, dict):
+        terminal_info["last_used_at"] = time.monotonic()
+
+
+def _exit_code_from_status(status: int) -> int:
+    """Shell-style exit code from a wait() status word (negative: signalled)."""
+    if os.WIFSIGNALED(status):
+        return -os.WTERMSIG(status)
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    return 0
+
+
+def _reap_terminal_child(terminal_info: dict) -> tuple[bool, Optional[int]]:
+    """Non-blocking wait for the PTY child; records exit_code when it died."""
+    pid = terminal_info.get("pid")
+    if not pid:
+        return True, None
+    try:
+        waited, status = os.waitpid(int(pid), os.WNOHANG)
+    except (ChildProcessError, OSError):
+        # Not our child (a test double's pid) or already reaped elsewhere: no
+        # evidence, so do not declare a healthy session dead on a guess.
+        return True, None
+    if waited != int(pid):
+        return True, None                     # still running
+    code = _exit_code_from_status(status)
+    terminal_info["exit_code"] = code
+    terminal_info["pty_eof"] = True
+    logger.debug("Terminal shell pid=%s exited, code=%s", pid, code)
+    return False, code
+
+
+def terminal_liveness(terminal_info: Optional[dict]) -> tuple[bool, Optional[int]]:
+    """Return ``(alive, exit_code)`` for the terminal's shell.
+
+    Cheap on purpose -- one ``waitpid(WNOHANG)``, or ``isalive()`` on Windows --
+    because exec_cli runs it before and after every call: a shell that ran
+    ``exit`` (or crashed, or lost its container) must surface as an explicit
+    ``terminal_exited`` instead of an empty screen once the caller's timeout
+    has been spent.
+
+    An inconclusive answer counts as *alive*: hand-built / faked terminal dicts
+    carry a pid that was never our child, and there is no point in killing a
+    session over a signal we cannot support.
+    """
+    if not isinstance(terminal_info, dict):
+        return False, None
+
+    recorded = terminal_info.get("exit_code")
+    if recorded is not None:
+        return False, recorded
+    if terminal_info.get("pty_eof"):
+        # The stream ended; reap the child for its status if nobody has yet.
+        _reap_terminal_child(terminal_info)
+        return False, terminal_info.get("exit_code")
+
+    proc = terminal_info.get("proc")          # winpty PtyProcess
+    if proc is not None:
+        try:
+            if proc.isalive():
+                return True, None
+        except AttributeError:
+            return True, None
+        except Exception as exc:              # cannot tell -> assume alive
+            logger.debug("terminal liveness (proc) failed: %s", exc)
+            return True, None
+        code = getattr(proc, "exit_code", None)
+        terminal_info["exit_code"] = code
+        terminal_info["pty_eof"] = True
+        return False, code
+
+    if not terminal_info.get("pid"):
+        return True, None                     # nothing to poll
+    return _reap_terminal_child(terminal_info)
+
+
+def mark_terminal_eof(terminal_info: Optional[dict]) -> None:
+    """The PTY stream ended: remember it, and grab the exit code if possible."""
+    if not isinstance(terminal_info, dict):
+        return
+    terminal_info["pty_eof"] = True
+    if terminal_info.get("exit_code") is None:
+        _reap_terminal_child(terminal_info)
+
+
+def get_terminal_id_for_session(session_id: str) -> Optional[str]:
+    """Registry key of *session_id*'s terminal.
+
+    Retiring a terminal needs its key, not just its dict -- which is why
+    ``get_or_create_terminal`` cannot simply overwrite an exited entry.
+    """
+    with _terminal_sessions_lock:
+        for tid, info in _terminal_sessions.items():
+            if info.get("session_id") == session_id:
+                return tid
+    return None
+
+
+def terminal_is_busy(terminal_info: dict) -> bool:
+    """True while an exec_cli call owns this terminal (duck-typed queue)."""
+    queue = terminal_info.get("command_queue")
+    try:
+        return bool(queue and queue.busy())
+    except Exception:
+        return False
+
+
+def prune_dead_terminals() -> list[str]:
+    """Unregister terminals whose shell has exited; return their ids.
+
+    ``GET /v1/terminals`` answers with this first: an exited PTY must not stay
+    in the registry, because the next caller reads it as "a command that
+    produced nothing" and waits out its whole timeout.
+    """
+    dead: list[tuple[str, Optional[int]]] = []
+    with _terminal_sessions_lock:
+        for tid, info in list(_terminal_sessions.items()):
+            alive, code = terminal_liveness(info)
+            if not alive:
+                dead.append((tid, code))
+    for tid, code in dead:
+        logger.info("Terminal %s shell exited (exit_code=%s); unregistering",
+                    tid, code)
+        unregister_terminal_session(tid)
+    return [tid for tid, _ in dead]
+
+
+def unregister_terminals_for_session(session_id: str) -> list[str]:
+    """Destroy every terminal that belongs to *session_id* (session destroyed).
+
+    A terminal outlives one inference run but not its session: deleting the
+    session must not leave a PTY -- workspace, environment and scroll buffer
+    included -- registered until the idle timeout happens to fire.
+    """
+    if not session_id:
+        return []
+    ids: list[str] = []
+    with _terminal_sessions_lock:
+        for tid, info in list(_terminal_sessions.items()):
+            if (info.get("session_id") == session_id or tid == session_id
+                    or tid.startswith(f"{session_id}:")):
+                ids.append(tid)
+    for tid in ids:
+        unregister_terminal_session(tid)
+    return ids
+
+
 def get_terminal_session(terminal_id: str) -> Optional[dict]:
     """Get terminal session by terminal_id."""
     with _terminal_sessions_lock:
@@ -3151,6 +3353,7 @@ def register_terminal_session(terminal_id: str, master_fd, pid, sock, session_id
             "sock": sock,
             "session_id": session_id,
             **_terminal_buffer_fields(),
+            **_terminal_lifecycle_fields(),
             "disconnected_at": None,  # When the session was disconnected (for cleanup)
             "active": True,  # Whether this connection is active
         }
@@ -3171,17 +3374,58 @@ def get_or_create_terminal(
         send_output: Optional output callback installed before a new PTY starts
     
     Returns terminal_info dict, or None if creation failed.
+
+    A terminal whose shell has exited (``exit``, a crash, a container that went
+    away) is never handed back: it is unregistered -- so ``GET /v1/terminals``
+    stops advertising an entry that can only produce empty timeouts -- and a
+    fresh PTY is spawned for the same session.  ``rebuilt_from`` on the returned
+    dict records that replacement, and the session's initialisation is replayed
+    (workspace directory, environment, and the last ``cd`` the terminal asked
+    for).
     """
-    # Try to find existing terminal
+    # Try to find existing terminal -- and check that its shell is still there.
     terminal_info = get_terminal_for_session(session_id)
+    replay: Optional[dict] = None
     if terminal_info:
-        if send_output is not None:
-            terminal_info["send_output"] = send_output
-        return terminal_info
-    
-    # Create new terminal session
-    terminal_id = f"{session_id}:auto"
+        alive, exit_code = terminal_liveness(terminal_info)
+        if alive:
+            touch_terminal(terminal_info)
+            if send_output is not None:
+                terminal_info["send_output"] = send_output
+            return terminal_info
+        terminal_id = get_terminal_id_for_session(session_id) or f"{session_id}:auto"
+        logger.info(
+            "Terminal %s shell exited (exit_code=%s); rebuilding it",
+            terminal_id, exit_code)
+        replay = {
+            "from": terminal_id,
+            "cwd": terminal_info.get("last_cwd") or "",
+            "cols": terminal_info.get("cols") or cols,
+            "rows": terminal_info.get("rows") or rows,
+            "send_output": terminal_info.get("send_output"),
+        }
+        unregister_terminal_session(terminal_id)
+        if terminal_info.get("sock") is not None:
+            # A browser tab was watching this PTY: tell it the channel is gone
+            # so a later attach re-opens it instead of writing into a corpse.
+            send_fn = terminal_info.get("send_output")
+            if callable(send_fn):
+                try:
+                    send_fn("\r\n[shell exited"
+                            f"{'' if exit_code is None else f', exit code {exit_code}'}]\r\n")
+                except Exception:
+                    pass
+    if replay:
+        cols, rows = replay["cols"], replay["rows"]
+        if send_output is None:
+            send_output = replay["send_output"]
+    else:
+        terminal_id = f"{session_id}:auto"
     session_id_short = session_id.split(":")[0] if session_id else session_id
+    # One terminal per session (the key is "{session_id}:auto"), but sessions
+    # come and go and every one of them keeps a PTY: keep the registry inside
+    # its ceiling instead of letting 172 trials leave 38 shells behind.
+    enforce_terminal_capacity()
     
     if sys.platform == "win32":
         try:
@@ -3210,6 +3454,9 @@ def get_or_create_terminal(
                     "active": True,
                     "disconnected_at": None,
                     **_terminal_buffer_fields(),
+                    **_terminal_lifecycle_fields(),
+                    "cols": cols,
+                    "rows": rows,
                     "shell_kind": "powershell",
                     "send_output": send_output,
                 }
@@ -3238,15 +3485,21 @@ def get_or_create_terminal(
                                 append_terminal_output(terminal_info, data)
                             else:
                                 logger.debug("read_pty: EOF for %s (win32)", terminal_id)
+                                mark_terminal_eof(terminal_info)
                                 break
                         except EOFError:
                             logger.debug("read_pty: EOFError for %s (win32)", terminal_id)
+                            mark_terminal_eof(terminal_info)
                             break
                 except Exception as e:
                     logger.error("read_pty: unexpected error for %s (win32): %s", terminal_id, e)
-                logger.debug("read_pty thread exiting for %s (win32)", terminal_id)
+                # Reaching here means nobody is draining this PTY any more; if
+                # that was because the shell died, say so instead of letting
+                # exec_cli wait out its timeout on an empty screen.
+                mark_terminal_eof(terminal_info)
             threading.Thread(target=read_pty, daemon=True).start()
             
+            _apply_terminal_replay(terminal_info, replay)
             return terminal_info
         except Exception as e:
             logger.debug("Failed to create winpty terminal: %s", e)
@@ -3288,6 +3541,9 @@ def get_or_create_terminal(
                     "active": True,
                     "disconnected_at": None,
                     **_terminal_buffer_fields(),
+                    **_terminal_lifecycle_fields(),
+                    "cols": cols,
+                    "rows": rows,
                     "shell_kind": os.path.basename(shell or "/bin/bash"),
                     "send_output": send_output,
                 }
@@ -3319,22 +3575,105 @@ def get_or_create_terminal(
                                     append_terminal_output(terminal_info, text)
                                 else:
                                     logger.debug("read_pty: EOF for %s", terminal_id)
+                                    mark_terminal_eof(terminal_info)
                                     break
                         except select.error as e:
                             logger.debug("read_pty: select error for %s: %s", terminal_id, e)
+                            mark_terminal_eof(terminal_info)
                             break
                         except OSError as e:
                             logger.debug("read_pty: OSError for %s: %s", terminal_id, e)
+                            mark_terminal_eof(terminal_info)
                             break
                 except Exception as e:
                     logger.error("read_pty: unexpected error for %s: %s", terminal_id, e)
-                logger.debug("read_pty thread exiting for %s", terminal_id)
+                # Whoever was reading this PTY is gone.  If the shell ended,
+                # record it (with its exit code) so exec_cli can report a dead
+                # terminal instead of an empty screen after its timeout.
+                mark_terminal_eof(terminal_info)
             threading.Thread(target=read_pty, daemon=True).start()
             
+            _apply_terminal_replay(terminal_info, replay)
             return terminal_info
         except Exception as e:
             logger.debug("Failed to create pty terminal: %s", e)
             return None
+
+
+def _apply_terminal_replay(terminal_info: dict, replay: Optional[dict]) -> None:
+    """Tag a rebuilt terminal and replay what the dead one had been asked for.
+
+    Replacing a shell is only useful if the replacement starts where the old
+    one left off: the creation path already replays the session's workspace
+    directory and environment, and the last ``cwd`` an exec_cli call used is
+    replayed here as a startup command.  Best effort -- a fresh shell that
+    cannot take the line yet must not fail the rebuild.
+    """
+    if not replay:
+        return
+    terminal_info["rebuilt_from"] = replay.get("from") or ""
+    cwd = replay.get("cwd") or ""
+    if not cwd:
+        return
+    try:
+        if sys.platform == "win32":
+            proc = terminal_info.get("proc")
+            if proc:
+                proc.write(f"Set-Location -LiteralPath '{cwd}'\r")
+        else:
+            import shlex
+
+            master_fd = terminal_info.get("master_fd")
+            if master_fd is not None:
+                os.write(master_fd, f"cd {shlex.quote(cwd)}\n".encode("utf-8"))
+        terminal_info["last_cwd"] = cwd
+        logger.info("Rebuilt terminal %s in %s",
+                    terminal_info.get("rebuilt_from"), cwd)
+    except Exception as exc:
+        logger.debug("Could not replay cwd %r into the rebuilt terminal: %s",
+                     cwd, exc)
+
+
+def enforce_terminal_capacity() -> list[str]:
+    """Evict least-recently-used terminals once the ceiling is passed.
+
+    Without a ceiling the registry only ever grows: sessions come and go, and
+    every one of them keeps a PTY, its buffers and its prompt state until the
+    idle timeout happens to fire.  Attached (browser) and busy (exec_cli)
+    terminals, and anything used within the last grace period, are never
+    chosen -- so the bound costs nothing to a session that is actually using
+    its terminal.
+    """
+    max_live = _env_timeout("TERMINAL_MAX_SESSIONS", TERMINAL_MAX_SESSIONS)
+    grace = _env_timeout("TERMINAL_EVICTION_GRACE", TERMINAL_EVICTION_GRACE)
+    now = time.monotonic()
+    victims: list[str] = []
+    with _terminal_sessions_lock:
+        excess = len(_terminal_sessions) - max_live
+        if excess > 0:
+            idle_candidates: list[tuple[float, str]] = []
+            young_candidates: list[tuple[float, str]] = []
+            for tid, info in _terminal_sessions.items():
+                if info.get("sock") is not None or terminal_is_busy(info):
+                    continue
+                last_used = info.get("last_used_at") or info.get("created_at") or now
+                if now - last_used < grace:
+                    young_candidates.append((last_used, tid))
+                else:
+                    idle_candidates.append((last_used, tid))
+            idle_candidates.sort()
+            young_candidates.sort()
+            victims = [tid for _, tid in idle_candidates[:excess]]
+            # A burst of new sessions must not push the registry past the ceiling
+            # merely because every entry is young: after the idle ones, the least
+            # recently used go too.  Without that, "one trial, one terminal"
+            # accumulates one PTY per trial forever -- the leak being fixed here.
+            victims += [tid for _, tid in young_candidates[:excess - len(victims)]]
+    for tid in victims:
+        logger.info("Evicting idle terminal %s (registry over %s terminals)",
+                    tid, max_live)
+        unregister_terminal_session(tid)
+    return victims
 
 
 def unregister_terminal_session(terminal_id: str) -> None:
@@ -3355,21 +3694,27 @@ def unregister_terminal_session(terminal_id: str) -> None:
                     except Exception:
                         pass
             else:
-                # Unix: use os.kill
-                try:
-                    os.kill(session["pid"], signal.SIGKILL)
-                except OSError:
-                    pass
-                
-                # Wait for process to exit (with timeout)
-                try:
-                    os.waitpid(session["pid"], os.WNOHANG)
-                except (OSError, ChildProcessError):
-                    pass
-                
+                # Unix: use os.kill.  Tolerate entries that never finished
+                # wiring up (no pid / master_fd): a partially created terminal
+                # must still be removable from the registry.
+                pid = session.get("pid")
+                if isinstance(pid, int):
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+
+                    # Wait for process to exit (with timeout)
+                    try:
+                        os.waitpid(pid, os.WNOHANG)
+                    except (OSError, ChildProcessError):
+                        pass
+
                 # Close master fd
                 try:
-                    os.close(session["master_fd"])
+                    master_fd = session.get("master_fd")
+                    if isinstance(master_fd, int):
+                        os.close(master_fd)
                 except OSError:
                     pass
 
@@ -3383,22 +3728,112 @@ def get_terminal_for_session(session_id: str) -> Optional[dict]:
     return None
 
 
-def cleanup_expired_terminal_sessions() -> None:
-    """Clean up terminal sessions that have been disconnected for too long."""
-    while True:
-        time.sleep(60)  # Check every minute
-        now = time.monotonic()
-        expired = []
-        
-        with _terminal_sessions_lock:
-            for tid, info in list(_terminal_sessions.items()):
-                disconnected_at = info.get("disconnected_at")
-                if disconnected_at and (now - disconnected_at) > os.getenv("TERMINAL_SESSION_TIMEOUT", 3600):
-                    expired.append(tid)
-        
-        for tid in expired:
-            logger.info("Cleaning up expired terminal session: %s", tid)
+def _terminal_reap_interval_s() -> float:
+    """How often to sweep: often enough for a 60 s timeout to be honoured."""
+    timeouts = [
+        _env_timeout("TERMINAL_IDLE_TIMEOUT", TERMINAL_IDLE_TIMEOUT),
+        _env_timeout("TERMINAL_SESSION_TIMEOUT", TERMINAL_SESSION_TIMEOUT),
+    ]
+    return max(5.0, min(60.0, min(timeouts) / 4.0))
+
+
+def _iso_from_monotonic(value: Optional[float], now_mono: float) -> Optional[str]:
+    """Wall-clock stamp for a monotonic reading (ops-facing output)."""
+    if value is None:
+        return None
+    return time.strftime("%Y-%m-%dT%H:%M:%S",
+                         time.localtime(time.time() - (now_mono - value)))
+
+
+def terminal_snapshot() -> list[dict]:
+    """Ops view of the registry: liveness, usage clock and prompt state.
+
+    ``GET /v1/terminals`` answers with this, so a leak can be spotted from the
+    outside -- how long a terminal has been idle, which shell pid holds it, and
+    whether that pid is still alive.
+    """
+    now_mono = time.monotonic()
+    snapshot: list[dict] = []
+    with _terminal_sessions_lock:
+        for tid, info in _terminal_sessions.items():
+            alive, exit_code = terminal_liveness(info)
+            last_used = info.get("last_used_at")
+            snapshot.append({
+                "terminal_id": tid,
+                "session_id": info.get("session_id", ""),
+                "shell_pid": info.get("pid"),
+                "alive": alive,
+                "exit_code": exit_code,
+                "shell_kind": info.get("shell_kind", ""),
+                "prompt_pattern": info.get("prompt_pattern") or "",
+                "prompt_interpreter": info.get("prompt_interpreter") or "",
+                "attached": info.get("sock") is not None,
+                "busy": terminal_is_busy(info),
+                "created_at": _iso_from_monotonic(info.get("created_at"), now_mono),
+                "last_used_at": _iso_from_monotonic(last_used, now_mono),
+                "idle_seconds": (round(now_mono - last_used, 1)
+                                 if last_used is not None else None),
+            })
+    return snapshot
+
+
+def reap_terminal_sessions(now: Optional[float] = None) -> dict:
+    """Retire exited, idle, detached and over-capacity terminals.
+
+    Three separate clocks matter and the old sweep only knew one of them:
+
+      * the shell died (``exit``, a crash, a lost container) -> retire at once;
+      * nobody touched the terminal for ``TERMINAL_IDLE_TIMEOUT`` seconds --
+        the clock an exec_cli (``{session_id}:auto``) terminal answers to, since
+        it is never "disconnected" and so used to be reclaimed *never*;
+      * a browser terminal whose tab detached for ``TERMINAL_SESSION_TIMEOUT``
+        seconds -> retire, as before.
+
+    On top of that the registry is kept inside ``TERMINAL_MAX_SESSIONS``.
+    """
+    now = time.monotonic() if now is None else now
+    idle_timeout = _env_timeout("TERMINAL_IDLE_TIMEOUT", TERMINAL_IDLE_TIMEOUT)
+    session_timeout = _env_timeout("TERMINAL_SESSION_TIMEOUT",
+                                   TERMINAL_SESSION_TIMEOUT)
+    retired: dict[str, list[str]] = {"exited": [], "idle": [], "detached": []}
+
+    with _terminal_sessions_lock:
+        for tid, info in list(_terminal_sessions.items()):
+            alive, exit_code = terminal_liveness(info)
+            if not alive:
+                retired["exited"].append(tid)
+                continue
+            last_used = info.get("last_used_at") or info.get("created_at") or now
+            disconnected_at = info.get("disconnected_at")
+            if now - last_used > idle_timeout:
+                retired["idle"].append(tid)
+            elif (disconnected_at
+                  and now - disconnected_at > session_timeout):
+                retired["detached"].append(tid)
+
+    for reason, ids in retired.items():
+        for tid in ids:
+            logger.info("Reaping terminal session %s (%s)", tid, reason)
             unregister_terminal_session(tid)
+    retired["over_capacity"] = enforce_terminal_capacity()
+    return retired
+
+
+def cleanup_expired_terminal_sessions() -> None:
+    """Reclaim terminals that are dead, idle, detached or over the ceiling.
+
+    A pass may not take the thread down: one bad comparison here used to stop
+    reclamation for the rest of the process' life (``os.getenv`` returns a str,
+    so comparing it against ``now - disconnected_at`` raised TypeError), which
+    is how PTYs accumulated across hundreds of trials.  Timeouts are parsed as
+    ints and the pass is wrapped.
+    """
+    while True:
+        time.sleep(_terminal_reap_interval_s())
+        try:
+            reap_terminal_sessions()
+        except Exception:
+            logger.exception("Terminal reaper pass failed")
 
 
 # Start cleanup thread

@@ -93,6 +93,19 @@ def test_remote_terminal_absent_for_other_session():
     assert _remote_session_has_terminal(proxy, "session-1", False) is False
 
 
+def test_remote_terminal_ignored_when_its_shell_died():
+    """A listed-but-dead child terminal is not an open terminal.
+
+    Exposing exec_cli for it reproduces the reported failure: every call spends
+    its whole timeout and comes back with no output.
+    """
+    proxy = _FakeRemoteProxy(result=(200, {"terminals": [
+        {"terminal_id": "session-1:auto", "session_id": "session-1",
+         "alive": False, "exit_code": 0, "shell_pid": 4242},
+    ]}))
+    assert _remote_session_has_terminal(proxy, "session-1", False) is False
+
+
 def test_remote_terminal_probe_is_best_effort():
     # Any failure (child unreachable / non-200 / malformed) degrades to False
     # instead of breaking inference.

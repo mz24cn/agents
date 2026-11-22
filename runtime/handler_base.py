@@ -46,7 +46,13 @@ from runtime.server_state import (
     get_or_create_terminal,
     get_terminal_for_session,
     get_terminal_session,
+    prune_dead_terminals,
+    terminal_snapshot,
+    touch_terminal,
     unregister_terminal_session,
+    _env_timeout,
+    TERMINAL_IDLE_TIMEOUT,
+    TERMINAL_MAX_SESSIONS,
     _terminal_sessions,
     _terminal_sessions_lock,
 )
@@ -803,15 +809,31 @@ class HandlerBaseMixin:
         self._handle_static_file()
 
     def _handle_list_terminals(self) -> None:
-        """GET /v1/terminals — list active terminal sessions."""
-        with _terminal_sessions_lock:
-            terminals = []
-            for tid, info in _terminal_sessions.items():
-                terminals.append({
-                    "terminal_id": tid,
-                    "session_id": info["session_id"],
-                })
-        self._send_json_response(200, {"terminals": terminals})
+        """GET /v1/terminals — list live terminal sessions, and drop dead ones.
+
+        A terminal whose shell exited (``exit``, a crash, a container that went
+        away) is retired before answering: listed as alive, it is what made
+        every later exec_cli call come back with no output after spending its
+        whole timeout.  Each entry also carries ``alive`` / ``shell_pid`` /
+        ``last_used_at`` / ``idle`` so a leak is visible -- and explainable --
+        from outside the process, next to the limits the reaper works to.
+        """
+        prune_dead_terminals()
+        idle_timeout = _env_timeout("TERMINAL_IDLE_TIMEOUT", TERMINAL_IDLE_TIMEOUT)
+        terminals = terminal_snapshot()
+        for entry in terminals:
+            idle_seconds = entry.get("idle_seconds")
+            entry["idle"] = (idle_seconds is not None
+                             and idle_seconds >= idle_timeout)
+        self._send_json_response(200, {
+            "terminals": terminals,
+            # The two rules that keep this list from growing forever, so an
+            # operator can tell why an entry is still here and what would
+            # reclaim it.
+            "idle_timeout_seconds": idle_timeout,
+            "max_terminals": _env_timeout("TERMINAL_MAX_SESSIONS",
+                                          TERMINAL_MAX_SESSIONS),
+        })
 
     def _handle_delete_terminal(self, terminal_id: str) -> None:
         """DELETE /v1/terminals/{terminal_id} — destroy a terminal session."""
@@ -1487,6 +1509,9 @@ class HandlerBaseMixin:
                     # so stop routing to it here rather than repeating the drop.
                     channels.pop(term_id, None)
                 return
+            # Typing into a terminal is using it: keep it off the reaper's
+            # idle list without waiting for exec_cli to say so.
+            touch_terminal(info)
             try:
                 if sys.platform == "win32":
                     proc = info.get("proc")

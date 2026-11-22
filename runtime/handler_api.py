@@ -84,6 +84,7 @@ from runtime.server_state import (
     frame_channel_unsubscribe,
     register_session_stream_with_snapshot,
     snapshot_session_titles,
+    unregister_terminals_for_session,
     unsubscribe_session_stream,
 )
 
@@ -3084,6 +3085,11 @@ class HandlerApiMixin:
         # 一起消失；若仍有活动 generation，cancel_event 令其 unwind，而不是
         # 向已删除的目录继续落盘。
         clear_session_stream_state(session_id)
+        # 该 session 的常驻终端（{session_id}:auto 及浏览器 attach 的终端）随
+        # session 一起销毁：PTY、工作目录与滚动缓冲都是这个 session 的状态，
+        # 留到空闲超时才回收等于泄漏。
+        for tid in unregister_terminals_for_session(session_id):
+            logger.info("Terminal unregistered with its session: %s", tid)
         # 远程会话：子端存在同 id 的孤儿会话目录（文件 journal / delegate 子会话）。
         # fire-and-forget 清理，不阻塞删除响应，也不因清理失败而报错。
         if remote_env_id:

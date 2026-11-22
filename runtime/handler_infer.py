@@ -181,6 +181,10 @@ def _remote_session_has_terminal(
     for term in data.get("terminals") or []:
         if not isinstance(term, dict):
             continue
+        if term.get("alive") is False:
+            # Listed but its shell already exited: same as having no terminal,
+            # and exec_cli on it would only spend its timeout on an empty screen.
+            continue
         terminal_id = str(term.get("terminal_id") or "")
         term_session = str(term.get("session_id") or "")
         # Child terminals are keyed by ``{session_id}:auto`` and also carry a
