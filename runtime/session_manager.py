@@ -146,6 +146,10 @@ class SessionManager:
         ``1/2`` or ``1/2/3``. Terminal categories may occur at different depths.
         Single-membership mode (tree.json v5): each session belongs to exactly
         one terminal category; older data with repeated mounts is still readable.
+
+        Ordering is the same for every leaf kind（主题分类 / 工作区目录 / 历史
+        月份 / 标签 / 遗留 recent 根）：newest final session time first, so each
+        leaf's session list stays in sync with the Sidebar's default 最近会话 list.
         """
         parts = [part for part in str(category or "").strip("/").split("/") if part]
         if not parts or any(not part.isdigit() for part in parts):
@@ -175,27 +179,17 @@ class SessionManager:
                 sessions.append(dict(entry))
             elif os.path.isfile(os.path.join(self._chats_dir, session_id, "conversation.json")):
                 sessions.append({"session_id": session_id, "title": session_id})
-        node_kind = str(node.get("type") or "category") if isinstance(node, dict) else "category"
-        if node_kind in ("recent", "month", "label"):
-            # 最近会话 / 会话历史按月节点 / 标签节点：时间倒序（与会话列表
-            # last_inference_at 语义同序），保持树中的顺序与列表展示一致。
-            sessions.sort(
-                key=lambda item: str(
-                    item.get("last_inference_at") or item.get("created_at") or ""
-                ),
-                reverse=True,
-            )
-        else:
-            # Directory browsing is a structural view, not the reverse-
-            # chronological recent-sessions view returned by list_sessions(). Use a
-            # stable title order so category results are easy to scan and do not
-            # inherit the time ordering used by the Sidebar's default list.
-            sessions.sort(
-                key=lambda item: (
-                    str(item.get("title") or item.get("session_id") or "").casefold(),
-                    str(item.get("session_id") or ""),
-                )
-            )
+        # 所有末级节点（主题分类叶子 / 工作区叶子 / 历史月份 / 标签 / 遗留 recent
+        # 根）一律按「最终会话时间」倒序，与 list_sessions() 的 last_inference_at
+        # 语义同序：主题、工作区、标签只是筛选维度，用户在每个类别里同样希望先看到
+        # 最近活动的会话。时间缺失退回 created_at，两者都没有的落在末尾；排序是稳定
+        # 的，同一时刻沿用 tree.json 里的挂载顺序（标签节点天然是新会话在前）。
+        sessions.sort(
+            key=lambda item: str(
+                item.get("last_inference_at") or item.get("created_at") or ""
+            ),
+            reverse=True,
+        )
         return sessions
 
     def category_tree_path(self) -> str:

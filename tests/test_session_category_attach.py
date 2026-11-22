@@ -486,8 +486,8 @@ def _write_index_entries(tmp_path, entries: dict) -> None:
     (tmp_path / "index.json").write_text(json.dumps(entries, ensure_ascii=False), "utf-8")
 
 
-def test_forest_v3_recent_and_month_queries_use_time_order(tmp_path):
-    """recent/month 末级按时间倒序；category/workspace 末级仍按标题稳定序。"""
+def test_forest_v3_leaf_queries_use_time_order(tmp_path):
+    """所有末级（recent/month/category/workspace）一律按最终会话时间倒序。"""
     _write_index_entries(tmp_path, {
         "s_a": {"session_id": "s_a", "title": "Zebra",
                 "created_at": "2026-08-01T10:00:00", "last_inference_at": "2026-09-02T10:00:00"},
@@ -500,8 +500,38 @@ def test_forest_v3_recent_and_month_queries_use_time_order(tmp_path):
     assert [s["session_id"] for s in sm.list_sessions_by_category("4")] == ["s_a", "s_b"]
     assert [s["session_id"] for s in sm.list_sessions_by_category("5/2")] == ["s_a"]
     assert [s["session_id"] for s in sm.list_sessions_by_category("5/1")] == ["s_b"]
-    # 工作区叶子仍是浏览语义：标题稳定序（Alpha, Zebra），不随时间
-    assert [s["session_id"] for s in sm.list_sessions_by_category("2/1")] == ["s_b", "s_a"]
+    # 主题分类叶子：时间倒序（s_a 最近），不再是标题字母序（Alpha, Zebra）
+    assert [s["session_id"] for s in sm.list_sessions_by_category("1/1/1")] == ["s_a", "s_b"]
+    # 工作区叶子同样按时间，而不是标题稳定序
+    assert [s["session_id"] for s in sm.list_sessions_by_category("2/1")] == ["s_a", "s_b"]
+
+
+def test_leaf_time_order_falls_back_and_stays_stable(tmp_path):
+    """缺 last_inference_at 退回 created_at；两者都缺落末尾；同刻按挂载顺序稳定。"""
+    _write_index_entries(tmp_path, {
+        "s_infer": {"session_id": "s_infer", "title": "有推理",
+                    "created_at": "2026-01-01T00:00:00", "last_inference_at": "2026-09-05T00:00:00"},
+        "s_created": {"session_id": "s_created", "title": "只有创建时间",
+                      "created_at": "2026-09-04T00:00:00"},
+        "s_bare_b": {"session_id": "s_bare_b", "title": "无时间"},
+        "s_bare_a": {"session_id": "s_bare_a", "title": "无时间"},
+        "s_same": {"session_id": "s_same", "title": "同刻",
+                   "created_at": "2026-09-03T00:00:00", "last_inference_at": "2026-09-04T00:00:00"},
+    })
+    doc = _forest_v3_fixture()
+    doc["tree"][0]["children"][0]["children"][0]["children"] = [
+        "s_bare_b", "s_infer", "s_created", "s_same", "s_bare_a",
+    ]
+    (tmp_path / "tree.json").write_text(json.dumps(doc), "utf-8")
+
+    sm = SessionManager(str(tmp_path))
+    assert [s["session_id"] for s in sm.list_sessions_by_category("1/1/1")] == [
+        "s_infer",          # last_inference_at 最新
+        "s_created",        # 与 s_same 同一时刻 → 保持挂载顺序
+        "s_same",
+        "s_bare_b",         # 无任何时间 → 末尾，仍按挂载顺序
+        "s_bare_a",
+    ]
 
 
 def test_forest_v3_history_root_is_not_queryable_leaf(tmp_path):

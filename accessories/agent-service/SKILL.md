@@ -71,7 +71,7 @@ api_json() { method="$1"; path="$2"; data="$3"; curl -fsS -X "$method" "$SERVER_
 | `POST` | `/v1/infer` | 非流式推理 |
 | `POST` | `/v1/infer/stream` | SSE 流式推理 |
 | `POST` | `/v1/infer/abort` | 中止指定 session 的流式推理 |
-| `GET` | `/v1/sessions` | 列出历史会话 |
+| `GET` | `/v1/sessions` | 列出历史会话（按最终会话时间倒序；`?category=<节点id路径>` 查某个末级分类下的会话，同样按时间倒序） |
 | `GET` | `/v1/sessions/search?q=...` | 搜索会话（按标题/内容关键词） |
 | `GET` | `/v1/sessions/{session_id}` | 获取会话完整记录 |
 | `DELETE` | `/v1/sessions/{session_id}` | 删除会话 |
