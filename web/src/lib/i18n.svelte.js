@@ -403,6 +403,8 @@ const translations = {
 
     // MessageList
     startChat: '开始对话吧 💬',
+    historyFoldHint: '为加速显示，已省略中间 {turns} 轮对话（{messages} 条消息）',
+    historyFoldExpand: '点击显示完整会话历史',
 
     // ModelSelector
     modelLabel: '模型',
@@ -1225,6 +1227,8 @@ const translations = {
 
     // MessageList
     startChat: 'Start a conversation 💬',
+    historyFoldHint: 'Skipped {turns} middle turns ({messages} messages) to load faster',
+    historyFoldExpand: 'Click to show the full session history',
 
     // ModelSelector
     modelLabel: 'Model',

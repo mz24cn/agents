@@ -10,6 +10,7 @@
   import { resolveFileJournalTurnKey } from '../../lib/file-journals.js'
   import { isToolErrorContent } from '../../lib/tool-result.js'
   import { buildTurnAgentGrouping } from '../../lib/message-groups.js'
+  import { computeHistoryFold, scanTurns, snapshotEndIndex, turnContaining } from '../../lib/message-history-fold.js'
   import { canForkMessage, lastForkableIndex } from '../../lib/session-fork.js'
   import { currentSession, messageScrollRequest } from '../../lib/session-state.svelte.js'
 
@@ -18,6 +19,10 @@
   let isAtBottom = $state(true)
   // Ephemeral per-turn overrides. This state lives only in this keyed
   // MessageList instance and is discarded when the session changes.
+  // 长会话默认只渲染第一轮 + 最后两轮（见 lib/message-history-fold.js）。这条会话里用户
+  // 点过横幅之后置位；MessageList 按 sessionId 重建，所以换会话又回到默认折叠。
+  let historyExpanded = $state(false)
+
   let replyModeOverrides = $state(new Set())
   
   // 获取 appLogoStore
@@ -108,6 +113,13 @@
     messages.length
     if (!token || token === handledScrollToken || targetSessionId !== currentSession.sessionId || !Number.isInteger(targetIndex)) return
     if (messages[targetIndex]?.role !== 'user') return
+    // 跳转目标落在被省略的中间轮次里：先展开整段历史再滚。historyFold 是这个 effect 的
+    // 依赖，展开后它会再跑一次，那时 token 还没被标记为已处理，滚动照常进行。
+    const targetTurn = turnContaining(turnBounds, targetIndex)
+    if (targetTurn && historyFold.hiddenStarts.has(targetTurn.startIndex)) {
+      historyExpanded = true
+      return
+    }
 
     handledScrollToken = token
     requestAnimationFrame(() => {
@@ -119,71 +131,72 @@
     if (scrollCorrectionTimer) clearTimeout(scrollCorrectionTimer)
   })
 
-  // 计算消息分组：每个 user 消息及其后的 assistant/tool 消息为一组
-  const groups = $derived(() => {
-    const result = []
-    let i = 0
-    while (i < messages.length) {
-      if (messages[i].role === 'user') {
-        const startIndex = i
-        let endIndex = i
-        let lastAssistantIndex = -1
-        for (let j = i + 1; j < messages.length; j++) {
-          if (messages[j].role === 'user') break
-          endIndex = j
-          if (messages[j].role === 'assistant') {
-            lastAssistantIndex = j
-          }
-        }
-        const isCollapsed = collapsedGroups.has(startIndex)
-        // 是否存在中间消息（user 和 lastAssistant 之间的 tool/assistant）
-        const hasIntermediate = lastAssistantIndex >= 0 && lastAssistantIndex > startIndex + 1
+  // 轮次边界（每条 user 消息连同其后的 assistant/tool 为一轮）。这一步很便宜，
+  // 折叠窗口要先靠它决定哪些轮次根本不进 DOM。
+  const turnBounds = $derived(scanTurns(messages))
+  const turns = $derived(turnBounds.filter(bound => !bound.ungrouped))
 
-        // Compact mode represents one user turn with exactly one outer card per
-        // participating agent. Unscoped assistant messages share the default
-        // assistant card, while tool results follow their declaring tool_use_id.
-        const { effectiveAgentIds, compactAgentBlocks } = buildTurnAgentGrouping(
-          messages,
-          startIndex + 1,
-          endIndex,
-        )
+  // 「进入会话」时一次性定下折叠快照：foldSnapshotEnd 记下快照里最后一轮的 endIndex，
+  // 之后新流进来的轮次永远渲染 —— 否则用户发完第 4 条消息，刚看过的上一轮会被收起来。
+  // 它故意不是 $state：写它不该触发重算（重算由 turns 驱动），也就不多渲染一整帧。
+  let foldSnapshotEnd = null
+  const historyFold = $derived.by(() => {
+    foldSnapshotEnd = snapshotEndIndex(turns, foldSnapshotEnd)
+    const snapshot = foldSnapshotEnd === null ? [] : turns.filter(bound => bound.endIndex <= foldSnapshotEnd)
+    return computeHistoryFold(snapshot, { expanded: historyExpanded })
+  })
 
-        // Detailed blocks preserve the old behavior: each assistant message starts
-        // a new visual block and its following tool messages stay with it.
-        const detailedAgentBlocks = []
-        let detailedStart = startIndex + 1
-        let detailedAgentId = null
-        for (let j = startIndex + 1; j <= endIndex; j++) {
-          const m = messages[j]
-          const msgAgentId = effectiveAgentIds.get(j)
-          if (m.role === 'assistant') {
-            if (detailedStart < j) detailedAgentBlocks.push({ start: detailedStart, end: j - 1, agentId: detailedAgentId })
-            detailedStart = j
-            detailedAgentId = msgAgentId
-          } else if (m.role === 'tool') {
-            if (msgAgentId && detailedAgentId && msgAgentId !== detailedAgentId) {
-              detailedAgentBlocks.push({ start: detailedStart, end: j - 1, agentId: detailedAgentId })
-              detailedStart = j
-              detailedAgentId = msgAgentId
-            } else if (!detailedAgentId && msgAgentId) {
-              detailedAgentId = msgAgentId
-            }
-          }
-        }
-        if (detailedStart <= endIndex) {
-          detailedAgentBlocks.push({ start: detailedStart, end: endIndex, agentId: detailedAgentId })
-        }
+  // 计算消息分组：折叠窗口外的轮次只留一个 historyHidden 标记，agent 分组那套重活
+  // （buildTurnAgentGrouping、详细块）一概不算 —— 这就是「加速展示」的来源。
+  const groups = $derived(turnBounds.map(bound => {
+    if (bound.ungrouped) return { ...bound }
+    if (historyFold.hiddenStarts.has(bound.startIndex)) return { ...bound, historyHidden: true }
+    return { ...buildTurnGroup(bound), historyFoldAfter: historyFold.bannerAfterStart === bound.startIndex }
+  }))
 
-        result.push({ startIndex, endIndex, lastAssistantIndex, isCollapsed, hasIntermediate, compactAgentBlocks, detailedAgentBlocks })
-        i = endIndex + 1
-      } else {
-        // 非 user 消息（如 system 消息）单独处理，不折叠
-        result.push({ startIndex: i, endIndex: i, lastAssistantIndex: -1, isCollapsed: false, hasIntermediate: false, compactAgentBlocks: [], detailedAgentBlocks: [], ungrouped: true })
-        i++
+  function buildTurnGroup(bound) {
+    const { startIndex, endIndex, lastAssistantIndex } = bound
+    const isCollapsed = collapsedGroups.has(startIndex)
+    // 是否存在中间消息（user 和 lastAssistant 之间的 tool/assistant）
+    const hasIntermediate = lastAssistantIndex >= 0 && lastAssistantIndex > startIndex + 1
+
+    // Compact mode represents one user turn with exactly one outer card per
+    // participating agent. Unscoped assistant messages share the default
+    // assistant card, while tool results follow their declaring tool_use_id.
+    const { effectiveAgentIds, compactAgentBlocks } = buildTurnAgentGrouping(
+      messages,
+      startIndex + 1,
+      endIndex,
+    )
+
+    // Detailed blocks preserve the old behavior: each assistant message starts
+    // a new visual block and its following tool messages stay with it.
+    const detailedAgentBlocks = []
+    let detailedStart = startIndex + 1
+    let detailedAgentId = null
+    for (let j = startIndex + 1; j <= endIndex; j++) {
+      const m = messages[j]
+      const msgAgentId = effectiveAgentIds.get(j)
+      if (m.role === 'assistant') {
+        if (detailedStart < j) detailedAgentBlocks.push({ start: detailedStart, end: j - 1, agentId: detailedAgentId })
+        detailedStart = j
+        detailedAgentId = msgAgentId
+      } else if (m.role === 'tool') {
+        if (msgAgentId && detailedAgentId && msgAgentId !== detailedAgentId) {
+          detailedAgentBlocks.push({ start: detailedStart, end: j - 1, agentId: detailedAgentId })
+          detailedStart = j
+          detailedAgentId = msgAgentId
+        } else if (!detailedAgentId && msgAgentId) {
+          detailedAgentId = msgAgentId
+        }
       }
     }
-    return result
-  })
+    if (detailedStart <= endIndex) {
+      detailedAgentBlocks.push({ start: detailedStart, end: endIndex, agentId: detailedAgentId })
+    }
+
+    return { ...bound, isCollapsed, hasIntermediate, compactAgentBlocks, detailedAgentBlocks }
+  }
 
   function isGroupDetailed(startIndex) {
     return replyModeOverrides.has(startIndex) ? !displayMessageDetails : displayMessageDetails
@@ -414,11 +427,11 @@
       <div class="empty-text">{t('startChat')}</div>
     </div>
   {:else}
-    {#each groups() as group (group.startIndex)}
+    {#each groups as group (group.startIndex)}
       {#if group.ungrouped}
         <!-- 非 user 消息（如 system 消息）单独显示，不折叠 -->
         <MessageBubble msg={messages[group.startIndex]} {agentList} {onRevoke} />
-      {:else}
+      {:else if !group.historyHidden}
         {@const userMsg = messages[group.startIndex]}
         {@const fileJournalTurnKey = resolveFileJournalTurnKey(fileJournalTurnKeyMap, userMsg.timestamp)}
         {@const groupDetailed = isGroupDetailed(group.startIndex)}
@@ -537,6 +550,19 @@
           {/if}
         </div>
       {/if}
+
+      {#if group.historyFoldAfter}
+        <!-- 全宽单行横幅：中间轮次为加速显示而不渲染，点击才补全（含其用户消息与紧凑/详细回复） -->
+        <button
+          class="history-fold"
+          type="button"
+          title={t('historyFoldExpand')}
+          onclick={() => { historyExpanded = true }}
+        >
+          <span class="history-fold-text">{t('historyFoldHint', { turns: historyFold.hiddenTurns, messages: historyFold.hiddenMessages })}</span>
+          <span class="history-fold-action">{t('historyFoldExpand')}</span>
+        </button>
+      {/if}
     {/each}
   {/if}
 </div>
@@ -582,6 +608,41 @@
   }
   .group.collapsed {
     gap: 12px;
+  }
+
+  /* 省略中间轮次的横幅：全宽、单行，整条可点 */
+  .history-fold {
+    align-self: stretch;
+    width: 100%;
+    box-sizing: border-box;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 6px 12px;
+    border: 1px dashed var(--border, #444);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-secondary, #888);
+    font-family: inherit;
+    font-size: 0.8rem;
+    line-height: 1.5;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  .history-fold:hover {
+    border-color: var(--primary, #4a9eff);
+    color: var(--text, #333);
+  }
+  .history-fold-text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .history-fold-action {
+    flex-shrink: 0;
+    color: var(--primary, #4a9eff);
+    text-decoration: underline;
   }
 
   /* Detailed mode keeps the original, visually invisible grouping container. */
