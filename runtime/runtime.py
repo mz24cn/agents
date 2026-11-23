@@ -36,6 +36,7 @@ from runtime.common import (
     get_prompt_token_calibration,
     get_context_window_observation,
     is_context_overflow_error,
+    is_fatal_model_error,
     learn_from_provider_rejection,
     provider_prompt_tokens,
     record_prompt_token_calibration,
@@ -221,7 +222,9 @@ def _get_model_api_retry_delay() -> float:
         return 1.0
 
 
-_RETRYABLE_MODEL_HTTP_CODES = frozenset({408, 425, 429, 500, 502, 503, 504, 524})
+# There is deliberately no list of "statuses worth retrying" here any more: the
+# rule is the other way round (see runtime/common.py's fail-fast section), and
+# _is_retryable_model_error spells out the few statuses that end a round.
 
 # Rounds an otherwise-finished generation may run purely because a user
 # interjection arrived in time (see infer_stream's close_gate).  Matches the
@@ -241,22 +244,35 @@ def _is_timeout_error(exc: BaseException) -> bool:
     )
 
 
-def _is_retryable_model_error(exc: BaseException) -> bool:
-    """Whether a model transport failure is safe to replay the round for.
+def _is_retryable_model_error(exc: BaseException, body: str = "") -> bool:
+    """Whether a model-side failure should be replayed instead of ending here.
 
-    Both failure points of a streaming round count: the request never produced
-    a body (connection refused, retryable HTTP status), and the body started
-    but died half-way.  ``http.client`` failures (``IncompleteRead``,
-    ``BadStatusLine``, ...) belong to the second group -- the peer dropped the
-    stream while chunks were being read, which is as transient as a dead socket.
+    Default is *yes*.  A provider's status and body are its guess at why the call
+    failed, and an unnamed guess is far more often a transient gateway/transport
+    problem than a deterministic rejection, so the round is re-sent with backoff
+    unless the failure names a reason a resend cannot change (see
+    ``runtime.common.is_fatal_model_error``: rejected credentials, unknown model,
+    no credit, malformed request).  Context-overflow rejections are also not
+    replayed -- resending the same oversized bytes is the one thing the endpoint
+    just told us will not work; the context ladder (compress/offload) is the
+    remedy, and it runs in the caller's own handler.
     """
     if isinstance(exc, urllib.error.HTTPError):
-        return exc.code in _RETRYABLE_MODEL_HTTP_CODES
+        detail = body or str(exc)
+        if exc.code == 413 or is_context_overflow_error(detail):
+            return False
+        return not is_fatal_model_error(detail, exc.code)
     if isinstance(exc, (urllib.error.URLError, ConnectionError, socket.timeout, TimeoutError)):
         return True
     if isinstance(exc, http.client.HTTPException):
         return True
-    return _is_timeout_error(exc)
+    if is_fatal_model_error(str(exc)):
+        return False
+    # Anything else this loop can hit -- a half-parsed payload, a provider field
+    # that is not the shape we expected, a decoder that raised -- is a model-side
+    # failure with no reason named, so it gets the same backoff replay a dead
+    # socket gets.  MODEL_API_MAX_RETRIES bounds the cost of being wrong.
+    return True
 
 
 def _wait_model_retry(attempt: int, cancel_event: Optional[object] = None) -> bool:
@@ -1464,7 +1480,7 @@ class Runtime:
                         error_body = exc.read().decode("utf-8", errors="replace")
                     except Exception:
                         pass
-                    if _is_retryable_model_error(exc) and attempt < max_retries:
+                    if _is_retryable_model_error(exc, error_body) and attempt < max_retries:
                         _logger.warning(
                             "infer transient HTTP error; retrying | url=%s code=%s "
                             "attempt=%d/%d body=%s",
@@ -1493,10 +1509,18 @@ class Runtime:
                             window=int(getattr(model_config, "max_context", 0) or 0),
                             origin="infer",
                         )
+                    failure = f"HTTP {exc.code}: {exc.reason}. {error_body}".strip()
+                    if attempt == 0 and is_fatal_model_error(error_body, exc.code):
+                        # Same sentence the streaming path gives: the absence of
+                        # retries is stated, not left to be inferred.
+                        failure += (
+                            " The endpoint named a reason that replaying the request "
+                            "cannot change, so this was not retried."
+                        )
                     return InferenceResult(
                         success=False,
                         messages=messages,
-                        error=f"HTTP {exc.code}: {exc.reason}. {error_body}".strip(),
+                        error=failure,
                         error_code=str(exc.code),
                     )
                 except (socket.timeout, urllib.error.URLError) as exc:
@@ -3754,6 +3778,7 @@ class Runtime:
                 url, data=body_bytes, headers=headers, method="POST")
             http_resp = None
             connect_error = None
+            connect_error_body = ""
             while True:
                 # Capture monotonic and wall-clock values immediately before
                 # each actual send. Retry timing therefore describes the
@@ -3767,16 +3792,29 @@ class Runtime:
                     break
                 except Exception as exc:
                     connect_error = exc
+                    # Read the error body here, once: the retry decision needs the
+                    # provider's own words (a 400 saying "invalid api key" ends the
+                    # round, a 400 saying nothing ends up replayed), and an error
+                    # body can only be read once -- the reporting path below would
+                    # otherwise find it empty.
+                    connect_error_body = ""
+                    if isinstance(exc, urllib.error.HTTPError):
+                        try:
+                            connect_error_body = exc.read().decode("utf-8", errors="replace")
+                        except Exception:
+                            pass
                     if (
-                        _is_retryable_model_error(exc)
+                        _is_retryable_model_error(exc, connect_error_body)
                         and round_retry_count < max_retries
                     ):
                         round_retry_count += 1
                         _logger.warning(
                             "infer_stream transient connection error; retrying | "
-                            "url=%s attempt=%d/%d err=%s",
+                            "url=%s attempt=%d/%d err=%s%s",
                             url, round_retry_count, max_retries,
                             getattr(exc, "reason", exc),
+                            "" if not connect_error_body
+                            else f" body={connect_error_body[:200]}",
                         )
                         if not _wait_model_retry(round_retry_count, cancel_event):
                             yield Message(role="assistant", timestamp=_now_iso(),
@@ -3788,11 +3826,7 @@ class Runtime:
             if connect_error is not None:
                 exc = connect_error
                 if isinstance(exc, urllib.error.HTTPError):
-                    error_body = ""
-                    try:
-                        error_body = exc.read().decode("utf-8", errors="replace")
-                    except Exception:
-                        pass
+                    error_body = connect_error_body
                     _logger.error(
                         "infer_stream HTTP error | url=%s code=%s reason=%s body=%s",
                         url, exc.code, exc.reason, error_body[:2000],
@@ -3800,6 +3834,18 @@ class Runtime:
                     detail = f"HTTP {exc.code}: {exc.reason}"
                     if error_body:
                         detail += f" | body: {error_body[:500]}"
+                    # Says why nothing was replayed.  The default is to replay a
+                    # model-side failure; a round that stopped at its first send
+                    # did so because the endpoint named a reason a resend cannot
+                    # change, and the caller should not have to infer that.
+                    if (
+                        round_retry_count == 0
+                        and is_fatal_model_error(error_body or detail, exc.code)
+                    ):
+                        detail += (
+                            "\nThe endpoint named a reason that replaying the "
+                            "request cannot change, so this was not retried."
+                        )
                     # A rejected request that names the context window is not a
                     # dead end, it is a measurement of the exact payload from the
                     # exact endpoint -- the most trustworthy one this runtime ever
@@ -4324,7 +4370,13 @@ class Runtime:
                 yield Message(
                     role="assistant",
                     timestamp=_now_iso(),
-                    content="Error: model API returned an empty response.",
+                    # Says how many sends were made: an empty stream is a
+                    # model-side failure, so it was already replayed with backoff
+                    # (MODEL_API_MAX_RETRIES) and this is the last attempt's result.
+                    content=(
+                        f"Error: model API returned an empty response after "
+                        f"{round_retry_count + 1} attempt(s)."
+                    ),
                 )
                 return
 

@@ -550,6 +550,78 @@ def is_context_overflow_error(error: object) -> bool:
     return bool(text) and bool(CONTEXT_OVERFLOW_ERROR_RE.search(text))
 
 
+# ---------------------------------------------------------------------------
+# Model-side failures: retry by default, fail fast only on a named reason
+# ---------------------------------------------------------------------------
+#
+# A status code and an error body are a provider's *guess* at why the call
+# failed, and most guesses are wrong in the harmless direction: a gateway that
+# answers 500 (or 400, or a body we could not parse) right now often answers the
+# next request.  So the retry rule is inverted from the usual status allowlist:
+# a model-side failure is replayed with backoff unless it states a reason that
+# replaying the identical request cannot change.
+#
+# Two reasons stop the backoff loop, and they end differently:
+#   fatal    -- this request can never succeed here (bad credential, unknown
+#               model, no credit, endpoint gone).  End the round and say so.
+#   overflow -- the payload does not fit the window.  Compressing it is the
+#               remedy, resending it is not; the context ladder owns those
+#               (see learn_from_provider_rejection).
+#
+# Keeping this list narrow is what makes the default affordable: every entry has
+# to be a reason a resend demonstrably cannot fix.
+
+#: Addressed wrong rather than late: wrong key, no permission, no such model.
+FAIL_FAST_MODEL_HTTP_CODES = frozenset({401, 403, 404, 405, 406, 410, 422})
+
+#: Wording that names a reason a resend cannot change, whatever the status was.
+FAIL_FAST_MODEL_ERROR_RES = (
+    # Credentials and permission: retrying a rejected key never unlocks it.
+    re.compile(r"invalid api key|incorrect api key|api key (?:is )?(?:invalid|expired|revoked)"),
+    re.compile(r"unauthori[sz]ed|authentication (?:failed|required)|permission denied|access denied|forbidden"),
+    re.compile(r"invalid x-api-key|token (?:is )?(?:invalid|expired|revoked)|expired token"),
+    # The model or endpoint does not exist here.
+    re.compile(r"model.{0,60}?(?:not found|does not exist|is not available)"),
+    re.compile(r"no such model|unknown model|invalid model|model_not_found|unknown endpoint"),
+    # No credit: a resend spends nothing and succeeds never.  The quota wording is
+    # deliberately narrow (plan/billing shaped) because a plain rate limit is the
+    # textbook case for backing off and coming back.
+    re.compile(r"insufficient balance|insufficient credits?|out of credits?|credit balance"),
+    re.compile(r"insufficient_quota|plan and billing|payment required|prepaid balance"),
+    # The request is malformed in a way the caller must fix, not wait out.
+    re.compile(r"invalid parameter|invalid_parameter|unsupported parameter|unknown parameter|unexpected keyword|field required|missing required|invalid request body|invalid_request_error"),
+    # A provider-side refusal to serve this content at all.
+    re.compile(r"content policy|content_policy|content filter|flagged by our systems"),
+)
+
+
+def is_fatal_model_error(error: object, code: int = 0) -> bool:
+    """Whether a model-side failure must end the round instead of be replayed.
+
+    ``code`` is the HTTP status when the failure carried one, else 0.  Wording is
+    weighed before the status because providers put billing failures behind a
+    429, and a bare 429 otherwise means exactly "back off and come back".
+    """
+    text = _error_text(error).lower()
+    if not text and not code:
+        return False
+    # An oversized payload is not fatal, it is fixable -- and the fix is the
+    # context ladder, never a resend of the same bytes.
+    if code == 413 or is_context_overflow_error(text):
+        return False
+    # A server-error status is transient whatever its body says: an nginx page
+    # served as 502 can contain the words "403 Forbidden", and that must not end
+    # a round the way a real refusal would.
+    if code >= 500 or code in (408, 425):
+        return False
+    for pattern in FAIL_FAST_MODEL_ERROR_RES:
+        if pattern.search(text):
+            return True
+    # With no specific reason named, the round is replayed: a status nobody
+    # listed (and a body nobody wrote) gets the benefit of the doubt.
+    return code in FAIL_FAST_MODEL_HTTP_CODES
+
+
 def provider_prompt_tokens(error: object) -> int:
     """Prompt tokens the provider counted for a rejected request (0 = unknown).
 

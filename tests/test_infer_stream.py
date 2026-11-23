@@ -157,7 +157,11 @@ def test_infer_stream_openai_empty_stream_is_error() -> None:
 
     assert len(messages) == 1
     assert messages[0].role == "assistant"
-    assert messages[0].content == "Error: model API returned an empty response."
+    # The count is part of the message: with retries switched off this is the
+    # single send, and the operator can see no backoff was attempted.
+    assert messages[0].content == (
+        "Error: model API returned an empty response after 1 attempt(s)."
+    )
 
 
 def test_infer_stream_retries_empty_response_before_output() -> None:
