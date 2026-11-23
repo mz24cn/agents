@@ -46,6 +46,7 @@ from runtime.server_state import (
     get_or_create_terminal,
     get_terminal_for_session,
     get_terminal_session,
+    mark_session_terminal,
     prune_dead_terminals,
     terminal_snapshot,
     touch_terminal,
@@ -836,9 +837,24 @@ class HandlerBaseMixin:
         })
 
     def _handle_delete_terminal(self, terminal_id: str) -> None:
-        """DELETE /v1/terminals/{terminal_id} — destroy a terminal session."""
+        """DELETE /v1/terminals/{terminal_id} — destroy a terminal session.
+
+        Also drops the session-level ``meta.terminal`` marker: this call is what
+        the frontend's "destroy the window" action means, and without it a
+        terminal the user closed on purpose would be reopened -- PTY and all --
+        the next time the session is opened.  Done before the lookup below,
+        because a session bound to a child environment has no PTY registered
+        here (it runs over there) while its conversation, and therefore its
+        marker, is the parent's.
+        """
         terminal_id = urllib.parse.unquote(terminal_id)
         session = get_terminal_session(terminal_id)
+        mark_session_terminal(
+            (session or {}).get("session_id")
+            or terminal_id.split(":")[0] or terminal_id,
+            enabled=False,
+            context_manager=getattr(self.server, "context_manager", None),
+        )
         if not session:
             # Frontend may send the bare session_id (without ":auto" suffix).
             # Try lookup by session_id as well.
@@ -1451,6 +1467,12 @@ class HandlerBaseMixin:
                 channels[term_id] = {"env_id": env_id}
                 bridge.open(env_id, term_id, cols=cols, rows=rows,
                             workspace=workspace if isinstance(workspace, str) else "")
+                # The window is open, so the session-level marker is written
+                # here rather than by get_or_create_terminal: no PTY is created
+                # on this side at all.  conversation.json lives on the parent,
+                # which is exactly where the frontend reads the marker back.
+                mark_session_terminal(term_id.split(":")[0] or term_id,
+                                      context_manager=getattr(self.server, "context_manager", None))
                 return
             if workspace:
                 from runtime.common import set_request_context as _set_ctx
@@ -1476,6 +1498,11 @@ class HandlerBaseMixin:
                 info["send_output"] = emit
             channels[term_id] = info
             self._terminal_set_winsize(info, cols, rows)
+            # Same marker as the env branch above, written through the context
+            # manager so "open the window, send nothing, refresh" still works:
+            # get_or_create_terminal only queues it in memory.
+            mark_session_terminal(session_id,
+                                  context_manager=getattr(self.server, "context_manager", None))
             send_msg({"op": "opened", "c": term_id})
 
         def detach(term_id: str, *, notify: bool) -> None:

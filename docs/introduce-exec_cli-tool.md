@@ -224,6 +224,7 @@ curl -s http://{host}:7988/v1/setup | sh
 - **链是活的**：某层配错或目标宕机，链停在该层 paused，人在现场可直接补救，而非整链失败重来。
 - **落点是会话的持久化终端**：与 `exec_cli` 驱动的是同一个 PTY——Agent 在该会话里工作时，已登录状态、当前位置天然在手。
 - **会话驱动定位**：会话右键"⋯ → 打开终端"弹出子面板，按该会话的 `meta.remote_env` 定位到终端树中的目标环境并默认全部展开，双击任意层进入。
+- **刷新页面后窗口还在**：会话的终端窗口是否打开过持久化在 `conversation.json` 的 `meta.terminal`（值为 `"enabled"`；与 `remote_env` / `workspace` 同一份会话 meta，`GET /v1/sessions`、`GET /v1/sessions/{id}`、`GET /v1/sessions/{id}/meta` 原样返回）。落盘时机是**终端真的被打开那一刻**（母端 `mark_session_terminal`），不是看 tool_ids 里 有没有 `exec_cli`——模型一次没调过它，终端就根本没开过，刷新后凭空起一个 shell 是替用户做决定。ChatPage 据此重建终端条目：`Terminal.svelte` 一挂载就 attach，于是窗口开着、后端 PTY 立刻存在，只是面板收起没显示，顶栏的 💻 同一时刻回来；PTY 已被 `TERMINAL_IDLE_TIMEOUT` 回收的就地新建。双击销毁终端走 `DELETE /v1/terminals/{id}`，顺手把这一笔抹掉，下次刷新就不会自己复活。
 
 ---
 

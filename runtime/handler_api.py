@@ -3016,6 +3016,10 @@ class HandlerApiMixin:
         会话**打开终端：那条通道的 ``env_id`` 必须在该会话的 meta 没被加载过之
         前也知道，否则终端会在母端起一个本地 PTY，而它的会话其实属于某个子环境
         （见 web/src/components/chat/ChatPage.svelte 的 sessionRemoteEnvIds）。
+        同一个接口也带着会话级 ``terminal``（值为 ``"enabled"`` 表示这条会话的终端
+        窗口打开过，缺字段就是没打开过）：刷新页面后 ChatPage 据此把窗口开回来
+        —— 面板可以先收起，通道是真 attach 着的（写盘见 server_state.py 的
+        ``mark_session_terminal``，双击销毁走 ``DELETE /v1/terminals/{id}`` 抹掉）。
         """
         try:
             self.server.session_manager.session_dir(session_id)  # type: ignore[attr-defined]

@@ -860,7 +860,9 @@ def persist_conversation(
             生成标题。为 None 时跳过 index 更新（适用于 sub-session 场景）。
         update_title: 是否允许本次持久化触发自动标题生成。流式推理的前置和
             工具轮次增量落盘应传 False；只有推理完成后的最终落盘传 True。
-        tool_ids: 可选的工具 ID 列表，记录到会话 meta 中，便于回溯。
+        tool_ids: 可选的工具 ID 列表，记录到会话 meta 中，便于回溯。会话级
+            ``terminal`` 标记（这条会话的终端窗口打开过）不在这里判断，它来自
+            ``session_terminal_marked``：只有终端真的被打开过才落盘。
         extra_meta: 可选的额外 meta 字段（如 parent_session_id），与 tool_ids
             一并通过 save_conversation 的 extra_meta 参数一次写入。
         agent_ids: 可选的 agent ID 列表（多选支持），用于标记 role=assistant 的消息的 agent_id。
@@ -959,10 +961,19 @@ def persist_conversation(
             if last_total_tokens == 0 and last_stat.get("usage_reported") is False:
                 last_total_tokens = None
         merged_extra: Optional[dict] = None
-        if tool_ids is not None or extra_meta or model_id or agent_ids or workspace:
+        # Read once: the marker is a process-wide fact, and persistence may run
+        # on the writer thread while a terminal opens on the WS thread.
+        terminal_marked = session_terminal_marked(session_id)
+        if (terminal_marked or tool_ids is not None or extra_meta
+                or model_id or agent_ids or workspace):
             merged_extra = {}
             if tool_ids is not None:
                 merged_extra["tool_ids"] = tool_ids
+            # 会话级标记：这条会话的终端窗口打开过。取值来自下面的
+            # ``_terminal_marked_sessions``（终端真正被打开时才落），不是取自 tool_ids：
+            # exec_cli 在工具集里只说明"允许用终端"，模型一直没调它，终端就根本没开过。
+            if terminal_marked:
+                merged_extra[TERMINAL_META_KEY] = TERMINAL_META_ENABLED
             if model_id is not None:
                 merged_extra["model_id"] = model_id
             # Store agent_ids array
@@ -3040,6 +3051,89 @@ def frame_channel_reset() -> None:
 _terminal_sessions: dict[str, dict] = {}
 _terminal_sessions_lock = threading.Lock()
 
+#: Session-level marker: "这条会话的终端窗口打开过".  Stored in
+#: conversation.json's meta as ``"terminal": "enabled"`` -- absent means it has
+#: never been opened, which is how an old conversation reads it too.
+#:
+#: The registry below is the authority inside this process; the meta field is
+#: what survives a page refresh (and a server restart).  The frontend keeps a
+#: session's terminal state in memory, so without this field a refreshed page
+#: has no idea the session had a terminal window: the top-bar entry is gone and
+#: the only way back is to find the environment again in the sidebar's terminal
+#: tree and double-click it.
+#:
+#: Deliberately *not* derived from ``meta.tool_ids``: exec_cli in the tool set
+#: only says a terminal was allowed.  If the model never called it, no terminal
+#: was ever opened, and resurrecting one on every visit would be inventing state
+#: the user never asked for.
+TERMINAL_META_KEY = "terminal"
+TERMINAL_META_ENABLED = "enabled"
+
+#: Sessions whose terminal has been opened in this process.  Also the queue for
+#: "not on disk yet": a session that has never persisted has no
+#: conversation.json to patch, so the fact waits here and lands in meta on the
+#: first persistence (see ``persist_conversation``).
+_terminal_marked_sessions: set[str] = set()
+_terminal_marked_lock = threading.Lock()
+
+
+def session_terminal_marked(session_id: str) -> bool:
+    """True when *session_id*'s terminal has been opened in this process."""
+    if not session_id:
+        return False
+    with _terminal_marked_lock:
+        return session_id in _terminal_marked_sessions
+
+
+def mark_session_terminal(
+    session_id: str,
+    *,
+    enabled: bool = True,
+    context_manager=None,
+) -> None:
+    """Record that *session_id* has (or no longer has) a terminal window.
+
+    Called when a terminal channel is opened for the session -- from the
+    browser (``/v1/terminals/ws``) or because exec_cli drove the PTY -- and with
+    ``enabled=False`` when the user destroys it (``DELETE /v1/terminals/{id}``).
+
+    Two writes on purpose:
+
+    - the in-memory set, so a session that has not persisted anything yet still
+      gets the field on its first persistence, and so a later persistence can
+      re-stamp it after a writer that did not go through this function;
+    - the ``conversation.json`` meta patch, so "open a terminal, say nothing,
+      refresh" still brings the window back.  ``context_manager`` is optional
+      only because the PTY-creation path has no handle on one; there the
+      in-memory set carries the fact until the next turn is persisted.
+
+    Never raises: a failed meta patch must not take a working terminal down.
+    """
+    if not session_id:
+        return
+    with _terminal_marked_lock:
+        if enabled:
+            _terminal_marked_sessions.add(session_id)
+        else:
+            _terminal_marked_sessions.discard(session_id)
+    if context_manager is None:
+        return
+    try:
+        context_manager.update_conversation_meta(
+            session_id,
+            {TERMINAL_META_KEY: TERMINAL_META_ENABLED} if enabled else None,
+            () if enabled else (TERMINAL_META_KEY,),
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(
+            "Could not record terminal marker for session %s: %s", session_id, exc)
+
+
+def reset_session_terminal_marks() -> None:
+    """Drop every marker (test isolation)."""
+    with _terminal_marked_lock:
+        _terminal_marked_sessions.clear()
+
 # ---------------------------------------------------------------------------
 # Terminal output buffer: read with cursors, never by draining
 # ---------------------------------------------------------------------------
@@ -3383,6 +3477,12 @@ def get_or_create_terminal(
     (workspace directory, environment, and the last ``cd`` the terminal asked
     for).
     """
+    # Being handed a terminal is what "这条会话的终端窗口打开过" means, so both
+    # callers -- the browser channel and exec_cli driving the PTY -- stamp the
+    # in-memory marker here.  Neither hands this function a context manager, so
+    # the field reaches conversation.json on the next persistence; the browser
+    # channel additionally patches it straight away (handler_base.attach).
+    mark_session_terminal(session_id)
     # Try to find existing terminal -- and check that its shell is still there.
     terminal_info = get_terminal_for_session(session_id)
     replay: Optional[dict] = None

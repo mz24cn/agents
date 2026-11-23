@@ -167,7 +167,11 @@
     });
 
     term.open(termEl);
-    fitAddon.fit();
+    // 隐藏挂载是常态了（刷新后恢复出来的窗口就是「开着但收起」）：display:none
+    // 下 offsetParent 为 null，fit() 量出 0 会把 1x1 的 winsize 发给 PTY。跳过
+    // 它，通道按 xterm 默认的 80x24 起；面板展开时下面的 ResizeObserver 与
+    // effect 会 fit 并把真实尺寸 resize 过去。
+    if (termEl?.offsetParent) fitAddon.fit();
 
     // ── Ctrl+C / Cmd+C → copy when there is a selection ──────────
     // xterm.js sends Ctrl+C to the PTY as SIGINT by default.  When the user
@@ -265,15 +269,17 @@
 
   // 连接目标 = 执行环境（本地/子端）+ 会话。目标变化（切换执行环境、
   // 绑定异步解析完成）时关掉旧通道并在新的共享 socket 上重新打开；首次挂载
-  // 时也走这里。visible 只决定何时首次挂载通道：隐藏期间仍然保持附着 ——
-  // 后端 PTY 一直在跑，但脱离期间打印的内容不会补发，浏览器里那份 xterm
-  // 回滚缓冲就是唯一的历史；共享 socket 让这份"随时可恢复"不再多占连接。
+  // 时也走这里。**不看 visible**：ChatPage 只为「有终端窗口的会话」挂载本组件
+  // （手工打开的，或刷新后按会话 meta.terminal 恢复出来的），所以挂载就是「窗口
+  // 开着」，收起只是没显示 —— 后端 PTY 由此立刻存在，隐藏期间也一直在跑。脱离
+  // 期间打印的内容不会补发，浏览器里那份 xterm 回滚缓冲就是唯一的历史；共享
+  // socket 让这份"随时可恢复"不再多占连接。
   let wsTarget = ''
   $effect(() => {
     // 目标 = 执行环境（local 或某个子环境的 id）+ 会话。用 env id 而不是 host：
     // 两个子环境可能同 host 不同部署路径，host 相同但环境不同。
     const target = `${remoteEnvId || LOCAL_ENV_ID}\u0000${sessionId ?? ''}`
-    if (!visible || !sessionId || destroyed) return
+    if (!sessionId || destroyed) return
     if (target === wsTarget && chan) return
     wsTarget = target
     const timer = setTimeout(() => connect(), 0);

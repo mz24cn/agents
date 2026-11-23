@@ -56,6 +56,7 @@ def server(tmp_path):
             for tid in list(server_state._terminal_sessions):
                 if tid not in before:
                     server_state.unregister_terminal_session(tid)
+            server_state.reset_session_terminal_marks()
             srv.stop()
 
 
@@ -190,6 +191,62 @@ class MuxClient:
 # ------------------------------------------------------------------
 # Tests
 # ------------------------------------------------------------------
+
+
+def test_opening_a_channel_stamps_the_session_marker(server):
+    """打开通道 = 这条会话有终端窗口，标记当场落到 conversation.json。
+
+    刷新页面后前端要把顶栏的入口和窗口本身找回来，只能读会话 meta；而
+    conversation.json 在母端，所以本地 PTY 和被路由到子环境的通道都写这一份。
+    """
+    cm = server._context_manager
+    sid = cm.create_session()
+    cm.save_conversation(sid, [])
+    server_state.reset_session_terminal_marks()
+
+    client = MuxClient(server.port)
+    try:
+        client.open(sid)
+        client.opened(sid)
+
+        with open(cm._conversation_path(sid), "r", encoding="utf-8") as fh:
+            meta = json.load(fh)["meta"]
+        assert meta["terminal"] == "enabled"
+        assert server_state.session_terminal_marked(sid) is True
+    finally:
+        client.close()
+
+
+def test_destroying_a_terminal_clears_the_marker(server):
+    """断开不是销毁，销毁才把标记抹掉。
+
+    切会话、刷新页面都会断开 WS 通道（PTY 留在后端待重连），那种情况标记必须
+    还在；只有前端双击销毁走的 DELETE 才表示"这条会话我不要这个终端了"。
+    """
+    cm = server._context_manager
+    sid = cm.create_session()
+    cm.save_conversation(sid, [])
+    server_state.reset_session_terminal_marks()
+
+    def marker():
+        with open(cm._conversation_path(sid), "r", encoding="utf-8") as fh:
+            return json.load(fh)["meta"].get("terminal")
+
+    client = MuxClient(server.port)
+    client.open(sid)
+    client.opened(sid)
+    client.close()
+    assert marker() == "enabled"
+    assert server_state.session_terminal_marked(sid) is True
+
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{server.port}/v1/terminals/{sid}", method="DELETE")
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        resp.read()
+
+    assert marker() is None
+    assert server_state.session_terminal_marked(sid) is False
+    assert server_state.get_terminal_for_session(sid) is None
 
 
 def test_mux_carries_two_terminals_on_one_socket(server):
@@ -418,6 +475,7 @@ def test_mux_requires_authorization_when_auth_enabled(tmp_path):
             for tid in list(server_state._terminal_sessions):
                 if tid not in before:
                     server_state.unregister_terminal_session(tid)
+            server_state.reset_session_terminal_marks()
             srv.stop()
 
 

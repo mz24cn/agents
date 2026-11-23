@@ -64,6 +64,7 @@
     sessionWorkspace,
   } from '../../lib/session-env-registry.svelte.js'
   import { planTerminalChain } from '../../lib/terminalChain.js'
+  import { sessionHasTerminal, unconnectedTerminal } from '../../lib/session-terminal.js'
 
   const STORAGE_MODEL_KEY = 'chat_selected_model'
   const STORAGE_TOOLS_KEY = 'chat_selected_tools'
@@ -670,6 +671,19 @@
     }
   }
 
+  // 刷新页面后重新打开会话：把它的终端窗口开回来（面板可以先收起）。
+  // terminals 是**一次页面加载**的内存状态，刷新即空，窗口也就没了；会话 meta
+  // 里的 terminal="enabled" 记的是这条会话的终端窗口打开过（后端在打开那一刻
+  // 落盘、双击销毁时抹掉，见 runtime/server_state.py 的 mark_session_terminal）
+  // ，据此重建条目即可：Terminal.svelte 一挂载就 attach，于是窗口是开着的、后端
+  // PTY 立刻存在，只是 terminalVisible 仍为 false 没显示出来 —— 顶栏的 💻 同一
+  // 时刻回来。工具集里有 exec_cli 但终端从没打开过的会话没有这个字段，不会因此
+  // 凭空起一个 shell；PTY 若已被 TERMINAL_IDLE_TIMEOUT 回收，attach 就地新建。
+  function restoreTerminalWindow(sid, meta) {
+    if (!sid || !sessionHasTerminal(meta) || terminals.has(sid)) return
+    terminals = new Map(terminals).set(sid, unconnectedTerminal(sid))
+  }
+
   // Close button: single click = hide, double click = destroy
   let closeClickTimer = null
   function handleTerminalCloseClick() {
@@ -699,10 +713,14 @@
     const envId = envIdOverride ?? terminalRemoteEnvId(sid)
     if (envId) {
       destroyTerminalInEnv(envId, sid)
-    } else {
-      fetch(`/v1/terminals/${encodeURIComponent(sid)}`, { method: 'DELETE' })
-        .catch(err => console.warn('Failed to delete terminal:', err))
     }
+    // 不管 PTY 跑在哪一侧，都要知会母端一句「这条会话的终端窗口关了」：母端会话
+    // meta 里那笔 terminal 标记是靠这个请求抹掉的，不抹的话刷新后这条会话会自己
+    // 再起一个 shell。会话绑定到子环境时母端注册表里没有这条 PTY，请求会 404，
+    // 但标记照样被清 —— 它本来就是母端这份 conversation.json 的事（见
+    // runtime/handler_base.py 的 _handle_delete_terminal）。
+    fetch(`/v1/terminals/${encodeURIComponent(sid)}`, { method: 'DELETE' })
+      .catch(err => console.warn('Failed to delete terminal:', err))
     // Remove from local state
     const newTerminals = new Map(terminals)
     newTerminals.delete(sid)
@@ -2393,6 +2411,14 @@
           selectedToolIds = meta.tool_ids
           localStorage.setItem(STORAGE_TOOLS_KEY, JSON.stringify(meta.tool_ids))
         }
+        // 终端窗口：meta 说这一会话的终端打开过，就把窗口开回来（面板收起，
+        // 顶栏 💻 同时回来；见 restoreTerminalWindow）。放在 env 绑定之后 ——
+        // 条目的 remoteEnvId 由 session-env-registry 解析，绑定先落好它才是对的，
+        // 否则窗口会连到母端的本地 shell 而不是这条会话所在的子环境。
+        // 必须 untrack：这条 effect 读 pending、写一堆状态，一旦把 terminals 读成
+        // 依赖，它自己写的条目就会再把它叫醒（effect_update_depth_exceeded，
+        // terminalOpen 那条 effect 里记着同一条教训）。
+        untrack(() => restoreTerminalWindow(sid, meta))
         // 恢复工作区路径（仅当不同于当前设置时才触发更新）
         const newWorkspace = meta.workspace || defaultWorkspacePath
         if (newWorkspace && newWorkspace !== workspacePath) {

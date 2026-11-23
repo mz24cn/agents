@@ -12,6 +12,7 @@ import gzip
 import logging
 import re
 import stat
+import threading
 import uuid
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -1955,6 +1956,12 @@ class ContextManager:
         self._compression_event_fn: Optional[Callable[[str, dict], None]] = None
         # Sessions for which the placeholder-summary warning was already logged.
         self._placeholder_summary_warned: set[str] = set()
+        #: Serializes the read-modify-write of ``conversation.json`` between the
+        #: inference persistence path (:meth:`save_conversation`) and the
+        #: meta-only patch (:meth:`update_conversation_meta`).  A patch that
+        #: slipped between a save's read and its rename would write back an
+        #: older ``messages`` array, i.e. drop the turn that was just persisted.
+        self._conversation_file_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Dynamic configuration properties (re-read env vars on every access)
@@ -2139,6 +2146,14 @@ class ContextManager:
     def _conversation_path(self, session_id: str) -> str:
         return os.path.join(self._chats_dir, session_id, "conversation.json")
 
+    #: Top-level meta fields that belong to the **session** rather than to a
+    #: turn, and that are written from outside the inference path -- opening a
+    #: terminal channel has no turn to ride on, so it patches meta by itself
+    #: (``mark_session_terminal`` in runtime/server_state.py).  Rebuilding the
+    #: meta block must not drop them, which is why ``save_conversation`` carries
+    #: them over the same way it carries ``created_at``.
+    SESSION_META_FLAGS: tuple[str, ...] = ("terminal",)
+
     def save_conversation(
         self,
         session_id: str,
@@ -2163,11 +2178,29 @@ class ContextManager:
                 These are written alongside the standard fields in one atomic
                 write, so no second read-modify-write pass is needed.
         """
+        # The whole read-modify-write is serialized against
+        # :meth:`update_conversation_meta`, which reads its messages back from
+        # this file: letting that patch land between the read here and the
+        # rename below would have it write an older ``messages`` array over the
+        # one just saved.
+        with self._conversation_file_lock:
+            self._save_conversation_locked(
+                session_id, turns, last_total_tokens, extra_meta)
+
+    def _save_conversation_locked(
+        self,
+        session_id: str,
+        turns: list[ConversationTurn],
+        last_total_tokens: Optional[int] = None,
+        extra_meta: Optional[dict] = None,
+    ) -> None:
+        """Body of :meth:`save_conversation`; call with the file lock held."""
         conv_path = self._conversation_path(session_id)
 
         # Preserve created_at from existing file when available.
         existing_created_at: Optional[str] = None
         existing_last_total_tokens: Optional[int] = None
+        existing_session_flags: dict = {}
         if os.path.isfile(conv_path):
             try:
                 with open(conv_path, "r", encoding="utf-8") as fh:
@@ -2177,6 +2210,14 @@ class ContextManager:
                 previous_tokens = existing_meta.get("last_total_tokens")
                 if isinstance(previous_tokens, int):
                     existing_last_total_tokens = previous_tokens
+                # Session-wide flags are written outside the inference path --
+                # a terminal channel opening has no turn to ride on -- so the
+                # next persistence must not erase them.  ``terminal`` is one of
+                # them (``mark_session_terminal`` in runtime/server_state.py);
+                # extra_meta below still wins, so an explicit write overrides it.
+                for flag in self.SESSION_META_FLAGS:
+                    if flag in existing_meta:
+                        existing_session_flags[flag] = existing_meta[flag]
             except (ValueError, OSError, KeyError):
                 pass
 
@@ -2198,6 +2239,7 @@ class ContextManager:
         )
         if effective_last_total_tokens is not None:
             meta["last_total_tokens"] = effective_last_total_tokens
+        meta.update(existing_session_flags)
         if extra_meta:
             meta.update(extra_meta)
 
@@ -2209,6 +2251,65 @@ class ContextManager:
         data = {"meta": meta, "messages": messages}
         text = json.dumps(data, ensure_ascii=False, indent=2)
         self._atomic_write(conv_path, text)
+
+    def update_conversation_meta(
+        self,
+        session_id: str,
+        updates: Optional[dict] = None,
+        remove: tuple[str, ...] = (),
+    ) -> bool:
+        """Patch the top-level ``meta`` block of ``conversation.json`` in place.
+
+        :meth:`save_conversation` rebuilds ``meta`` from the turns it is handed,
+        so a fact that is **not** a turn has nowhere to go until the next
+        persistence.  Opening a terminal channel for a session is such a fact
+        (``mark_session_terminal`` in runtime/server_state.py): the user may
+        open the window and never send another message, yet a page refresh has
+        to bring it back.  This writes the fact to the file that is already
+        there -- the ``messages`` array is copied through untouched, only
+        ``meta`` changes.
+
+        Deliberately does not bump ``updated_at``: the conversation did not
+        change, and the sidebar sorts by that field.
+
+        Takes the same lock as :meth:`save_conversation`, so a patch cannot land
+        between that method's read and its rename -- the only way it could
+        rewrite the file with a message list older than the one just saved.
+        Writers that do not take this lock (compression, fork/branch) are out of
+        scope; the in-memory marker re-stamps the field on the next persistence
+        if such a write wins the race.
+
+        Args:
+            session_id: Target session.
+            updates: Fields to set in ``meta``.
+            remove: Fields to drop from ``meta``.
+
+        Returns:
+            True when the file was rewritten; False when there is nothing to
+            patch (no conversation file yet -- the caller keeps the fact in
+            memory until the first persistence writes it).
+        """
+        conv_path = self._conversation_path(session_id)
+        if not os.path.isfile(conv_path):
+            return False
+        with self._conversation_file_lock:
+            try:
+                with open(conv_path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+            except (ValueError, OSError):
+                return False
+            if not isinstance(data, dict):
+                return False
+            meta = data.get("meta")
+            if not isinstance(meta, dict):
+                meta = {"session_id": session_id}
+            if updates:
+                meta.update(updates)
+            for key in remove:
+                meta.pop(key, None)
+            data["meta"] = meta
+            self._atomic_write(conv_path, json.dumps(data, ensure_ascii=False, indent=2))
+        return True
 
     def load_conversation(self, session_id: str) -> list[ConversationTurn]:
         """Read and deserialize ``conversation.json`` for *session_id*.
