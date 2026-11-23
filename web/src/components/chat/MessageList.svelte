@@ -10,7 +10,7 @@
   import { resolveFileJournalTurnKey } from '../../lib/file-journals.js'
   import { isToolErrorContent } from '../../lib/tool-result.js'
   import { buildTurnAgentGrouping } from '../../lib/message-groups.js'
-  import { computeHistoryFold, scanTurns, snapshotEndIndex, turnContaining } from '../../lib/message-history-fold.js'
+  import { computeHistoryFold, scanTurns, snapshotBoundaryStart, turnContaining, turnsInSnapshot } from '../../lib/message-history-fold.js'
   import { canForkMessage, lastForkableIndex } from '../../lib/session-fork.js'
   import { currentSession, messageScrollRequest } from '../../lib/session-state.svelte.js'
 
@@ -136,14 +136,15 @@
   const turnBounds = $derived(scanTurns(messages))
   const turns = $derived(turnBounds.filter(bound => !bound.ungrouped))
 
-  // 「进入会话」时一次性定下折叠快照：foldSnapshotEnd 记下快照里最后一轮的 endIndex，
+  // 「进入会话」时一次性定下折叠快照：foldSnapshotStart 记下快照里最后一轮的 startIndex，
   // 之后新流进来的轮次永远渲染 —— 否则用户发完第 4 条消息，刚看过的上一轮会被收起来。
+  // 用 startIndex 而不是 endIndex：endIndex 会随流式帧往后长，按它划界会让推理中的最后一轮
+  // 掉出快照，尾窗往前挪一轮，横幅前面就凭空多显示一轮。
   // 它故意不是 $state：写它不该触发重算（重算由 turns 驱动），也就不多渲染一整帧。
-  let foldSnapshotEnd = null
+  let foldSnapshotStart = null
   const historyFold = $derived.by(() => {
-    foldSnapshotEnd = snapshotEndIndex(turns, foldSnapshotEnd)
-    const snapshot = foldSnapshotEnd === null ? [] : turns.filter(bound => bound.endIndex <= foldSnapshotEnd)
-    return computeHistoryFold(snapshot, { expanded: historyExpanded })
+    foldSnapshotStart = snapshotBoundaryStart(turns, foldSnapshotStart)
+    return computeHistoryFold(turnsInSnapshot(turns, foldSnapshotStart), { expanded: historyExpanded })
   })
 
   // 计算消息分组：折叠窗口外的轮次只留一个 historyHidden 标记，agent 分组那套重活

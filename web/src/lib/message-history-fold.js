@@ -48,14 +48,30 @@ export function scanTurns(messages) {
 }
 
 /**
- * 「进入会话时」的快照终点：第一次看见非空轮次就把当时的最后一轮 endIndex 定下来，
+ * 「进入会话时」的快照分界线：第一次看见非空轮次就把当时最后一轮的 **startIndex** 定下来，
  * 之后原样返回。会话中途新流进来的轮次因此落在快照外，永远不会被折叠 —— 否则用户发完
  * 第 4 条消息，刚看过的上一轮回答会突然被收到横幅后面。
+ *
+ * 划线刻意用 startIndex，不是 endIndex：endIndex 是「扫描当刻数组的末尾」，不是轮次的稳定
+ * 身份。推理中的会话每来一条 assistant / 工具结果帧，最后一轮的 endIndex 就往后长一格，按
+ * endIndex 划界会让这一轮自己掉出快照，快照的尾窗整体往前挪一轮 —— 横幅前面凭空多显示一轮
+ * （「最后两轮」变成「最后三轮」），横幅里的省略轮数也跟着缩水。startIndex 只在真的出现新的
+ * user 消息时才多出一个，正是我们要的那条线。
  */
-export function snapshotEndIndex(turns, previous = null) {
+export function snapshotBoundaryStart(turns, previous = null) {
   if (previous !== null) return previous
   const list = Array.isArray(turns) ? turns : []
-  return list.length > 0 ? list[list.length - 1].endIndex : null
+  return list.length > 0 ? list[list.length - 1].startIndex : null
+}
+
+/**
+ * 快照里的轮次 = 进入会话时已经存在的那些。分界线之后（新流进来的）轮次不在里面，因而不会
+ * 出现在 hiddenStarts 里，也就永远不会被折叠。
+ */
+export function turnsInSnapshot(turns, boundaryStart) {
+  if (boundaryStart === null || boundaryStart === undefined) return []
+  const list = Array.isArray(turns) ? turns : []
+  return list.filter(turn => turn.startIndex <= boundaryStart)
 }
 
 function emptyFold() {

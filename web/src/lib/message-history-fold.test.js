@@ -8,8 +8,9 @@ import fc from 'fast-check'
 import {
   computeHistoryFold,
   scanTurns,
-  snapshotEndIndex,
+  snapshotBoundaryStart,
   turnContaining,
+  turnsInSnapshot,
   HISTORY_FOLD_USER_THRESHOLD,
 } from './message-history-fold.js'
 
@@ -107,14 +108,15 @@ describe('computeHistoryFold — 折叠窗口', () => {
 
   it('快照之外的新轮次永不进隐藏区（会话中途继续聊不会把上一轮收走）', () => {
     const entered = scanTurns(conversation(5))
-    const snapshotEnd = snapshotEndIndex(entered, null)
-    expect(snapshotEnd).toBe(9)
+    const boundary = snapshotBoundaryStart(entered, null)
+    expect(boundary).toBe(8)                       // 进入时最后一轮那条 user 的下标
 
     // 用户又发了一轮：进入时的快照不变，新轮次在快照之外。
     const grown = scanTurns(conversation(6))
-    expect(snapshotEndIndex(grown, snapshotEnd)).toBe(snapshotEnd)
+    expect(snapshotBoundaryStart(grown, boundary)).toBe(boundary)
+    expect(turnsInSnapshot(grown, boundary)).toHaveLength(5)
 
-    const fold = computeHistoryFold(grown.filter(t => t.endIndex <= snapshotEnd))
+    const fold = computeHistoryFold(turnsInSnapshot(grown, boundary))
     // 快照里是 5 轮：省中间两轮（turn2、turn3），新流进来的第 6 轮不在快照里，照常渲染。
     expect([...fold.hiddenStarts]).toEqual([2, 4])
     expect(grown.at(-1).startIndex).toBe(10)
@@ -122,12 +124,14 @@ describe('computeHistoryFold — 折叠窗口', () => {
   })
 
   it('快照只在第一次看见非空轮次时定下（会话消息是异步补进来的）', () => {
-    let snapshot = snapshotEndIndex([], null)
-    expect(snapshot).toBeNull()
-    snapshot = snapshotEndIndex(scanTurns(conversation(4)), snapshot)
-    expect(snapshot).toBe(7)
-    snapshot = snapshotEndIndex(scanTurns(conversation(8)), snapshot)
-    expect(snapshot).toBe(7)
+    let boundary = snapshotBoundaryStart([], null)
+    expect(boundary).toBeNull()
+    boundary = snapshotBoundaryStart(scanTurns(conversation(4)), boundary)
+    expect(boundary).toBe(6)
+    boundary = snapshotBoundaryStart(scanTurns(conversation(8)), boundary)
+    expect(boundary).toBe(6)
+    // 分界线还没定下来（消息没到）时没有快照轮次
+    expect(turnsInSnapshot(scanTurns(conversation(3)), null)).toEqual([])
   })
 })
 
@@ -188,6 +192,72 @@ describe('折叠窗口不变量（随机会话）', () => {
         },
       ),
       { numRuns: 40 },
+    )
+  })
+})
+
+describe('推理中的会话 — 往快照最后一轮里流式追加消息', () => {
+  /** 进入会话之后，最后一轮里陆续到来的 assistant(带 tool_calls) + 工具结果帧。 */
+  function toolFrames(count) {
+    const frames = []
+    for (let i = 0; i < count; i++) {
+      frames.push({ role: 'assistant', content: '', tool_calls: [{ id: `live${i}`, name: 'read_file' }] })
+      frames.push({ role: 'tool', content: 'ok', tool_use_id: `live${i}` })
+    }
+    return frames
+  }
+
+  it('追加一次工具往返：隐藏区一字不改（否则横幅前多显示一轮）', () => {
+    const entered = conversation(5)
+    const boundary = snapshotBoundaryStart(scanTurns(entered), null)
+    const before = computeHistoryFold(turnsInSnapshot(scanTurns(entered), boundary))
+
+    const turnList = scanTurns([...entered, ...toolFrames(1)])
+    const after = computeHistoryFold(turnsInSnapshot(turnList, boundary))
+
+    expect([...after.hiddenStarts]).toEqual([...before.hiddenStarts])
+    expect(after.hiddenTurns).toBe(before.hiddenTurns)
+    expect(after.hiddenMessages).toBe(before.hiddenMessages)
+    expect(after.bannerAfterStart).toBe(before.bannerAfterStart)
+    // 渲染出的轮次仍是头 1 轮 + 尾 2 轮，不会多出第三轮。
+    expect(turnList.filter(t => !after.hiddenStarts.has(t.startIndex)).map(t => t.startIndex)).toEqual([0, 6, 8])
+  })
+
+  it('快照轮数不随流式帧增长：4 轮的会话不会因为一帧就整个不折叠', () => {
+    const entered = conversation(4)
+    const boundary = snapshotBoundaryStart(scanTurns(entered), null)
+    for (let frames = 0; frames <= 6; frames++) {
+      const turnList = scanTurns([...entered, ...toolFrames(frames)])
+      expect(turnsInSnapshot(turnList, boundary), `${frames} 帧后快照轮数`).toHaveLength(4)
+      const fold = computeHistoryFold(turnsInSnapshot(turnList, boundary))
+      expect(fold.collapsed, `${frames} 帧后仍然折叠`).toBe(true)
+      expect([...fold.hiddenStarts]).toEqual([2])
+      expect(turnList.filter(t => !fold.hiddenStarts.has(t.startIndex))).toHaveLength(3)
+    }
+  })
+
+  it('随机：往最后一轮追加任意多条非 user 帧，折叠窗口与横幅数字恒定', () => {
+    fc.assert(
+      fc.property(
+        fc.integer({ min: 4, max: 20 }),
+        fc.integer({ min: 0, max: 12 }),
+        (turnCount, frames) => {
+          const entered = conversation(turnCount)
+          const boundary = snapshotBoundaryStart(scanTurns(entered), null)
+          const before = computeHistoryFold(turnsInSnapshot(scanTurns(entered), boundary))
+
+          const turnList = scanTurns([...entered, ...toolFrames(frames)])
+          const after = computeHistoryFold(turnsInSnapshot(turnList, boundary))
+
+          expect(turnsInSnapshot(turnList, boundary)).toHaveLength(turnCount)
+          expect([...after.hiddenStarts]).toEqual([...before.hiddenStarts])
+          expect(after.hiddenTurns).toBe(before.hiddenTurns)
+          expect(after.hiddenMessages).toBe(before.hiddenMessages)
+          // 可见轮次恒为 3（头 1 + 尾 2），不会因为流式帧变成 4。
+          expect(turnList.filter(t => !after.hiddenStarts.has(t.startIndex))).toHaveLength(3)
+        },
+      ),
+      { numRuns: 50 },
     )
   })
 })
