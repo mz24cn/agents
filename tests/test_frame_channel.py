@@ -282,8 +282,8 @@ def test_a_frame_published_mid_handoff_cannot_overtake_its_own_sub_init(monkeypa
     """
     real = server_state.register_session_stream_with_snapshot
 
-    def register_then_publish(session_id, send_fn, after_seq=-1):
-        result = real(session_id, send_fn, after_seq)
+    def register_then_publish(session_id, send_fn, after_seq=-1, limit=None):
+        result = real(session_id, send_fn, after_seq, limit)
         # The interleaving the broker permits: this frame is handed to the channel
         # while the hand-off is still pushing sub_init and the replay.
         server_state.publish_session_stream_frame(
@@ -370,6 +370,183 @@ def test_a_frame_dropped_for_a_slow_tab_is_still_retained_and_askable(monkeypatc
         "tab-a", "session-1", after_seq=0
     )
     assert [item["seq"] for item in snapshot["frames"]] == [1, 2, 3, 4, 5]
+
+
+def test_a_saturated_channel_discards_the_oldest_frame_not_the_newest():
+    """A slow tab keeps its live tail, and its cursor stays the whole truth.
+
+    Refusing the newest frame used to leave the tab's resume cursor exactly where
+    it was, so every later frame was refused too: the queue stayed full for the
+    rest of the generation, the page saw nothing more, and the hole it would have
+    repaired was never even noticed. Sliding the head forward keeps the newest
+    frames flowing, keeps the cursor pointing at the first thing genuinely
+    missing, and keeps the skipped span in the log.
+    """
+    monkey = server_state
+    monkey.FRAME_CHANNEL_QUEUE_MAXSIZE = 2
+    try:
+        channel, _generation = _watching_tab("tab-a")
+        monkey.begin_session_stream("session-1", threading.Event())
+        assert monkey.frame_channel_subscribe("tab-a", "session-1", after_seq=0)[0] is True
+        # The reader took sub_init; what is queued from here is frames only.
+        _drain(channel)
+        for n in range(1, 6):
+            monkey.publish_session_stream_frame(
+                "session-1", {"role": "assistant", "content": str(n)}
+            )
+        queued = [item["seq"] for item in _drain(channel) if item["type"] == "frame"]
+    finally:
+        monkey.FRAME_CHANNEL_QUEUE_MAXSIZE = 8192
+
+    assert queued == [4, 5], "the queue kept the newest frames, not the oldest"
+    assert channel["dropped"] == 3
+    assert channel["drop_spans"]["session-1"] == [1, 3]
+    with server_state._session_stream_lock:
+        retained = [item["seq"] for item in server_state._session_streams["session-1"]["frames"]]
+    assert retained == [1, 2, 3, 4, 5], "discarding from the queue loses nothing"
+
+
+def test_an_overflowing_channel_says_so_once_not_per_frame(caplog):
+    """Saturation is one event with a size, and the size is what a reader wants.
+
+    Eleven days of one server produced 1,373,329 WARNING lines and a 208 MB log
+    out of exactly this condition, which buried every other diagnostic in the
+    file. The count is still exact; the reporting is not per frame.
+    """
+    server_state.FRAME_CHANNEL_QUEUE_MAXSIZE = 8
+    server_state.FRAME_CHANNEL_DROP_LOG_EVERY = 512
+    try:
+        channel, _generation = _watching_tab("tab-a")
+        server_state.begin_session_stream("session-1", threading.Event())
+        server_state.frame_channel_subscribe("tab-a", "session-1", after_seq=0)
+        _drain(channel)
+        with caplog.at_level(logging.WARNING, logger="runtime.server"):
+            for n in range(1, 4001):
+                server_state.publish_session_stream_frame(
+                    "session-1", {"role": "assistant", "content": str(n)}
+                )
+            # The reader comes back for the tail: that is the end of the episode,
+            # and the end is where the total is stated.
+            _drain(channel)
+            server_state.publish_session_stream_frame(
+                "session-1", {"role": "assistant", "content": "caught up"}
+            )
+    finally:
+        server_state.FRAME_CHANNEL_QUEUE_MAXSIZE = 8192
+    lines = [record.getMessage() for record in caplog.records
+             if "frame_channel queue_" in record.getMessage()]
+    assert channel["dropped"] == 3992
+    assert len(lines) <= 12, f"one overflow produced {len(lines)} log lines"
+    assert any("dropped=1 " in line for line in lines), "the fall is reported when it starts"
+    assert lines[-1].startswith("frame_channel queue_drained") and "dropped=3992" in lines[-1], \
+        "the last line states the size of the overflow"
+
+
+def test_a_replay_is_chunked_and_the_rest_stays_askable():
+    """A huge gap comes back in chunks instead of overrunning the live queue.
+
+    Pushing the whole backlog through the tab's bounded queue filled it (8192
+    slots) and threw the rest away -- 86,081 frames for one tab in one afternoon
+    -- and the page's repair replayed the same backlog and dropped it again. A
+    chunk is small enough to fit beside the live frames; ``replay_pending`` says
+    how much is left, and asking again from the cursor the tab has reached brings
+    the next chunk.
+    """
+    server_state.FRAME_CHANNEL_REPLAY_CHUNK = 2
+    try:
+        channel, _generation = _watching_tab("tab-a")
+        server_state.begin_session_stream("session-1", threading.Event())
+        for n in range(1, 6):
+            server_state.publish_session_stream_frame(
+                "session-1", {"role": "assistant", "content": str(n)}
+            )
+        _registered, snapshot = server_state.frame_channel_subscribe(
+            "tab-a", "session-1", after_seq=0
+        )
+        first = [item["seq"] for item in _drain(channel) if item["type"] == "frame"]
+        assert snapshot["replayed"] == 2
+        assert snapshot["replay_pending"] == 3
+        assert snapshot["replayed_through"] == 2
+        # The tab applies what it was given, then asks again from where it got to.
+        _registered, second = server_state.frame_channel_subscribe(
+            "tab-a", "session-1", after_seq=2
+        )
+        _drain(channel)
+    finally:
+        server_state.FRAME_CHANNEL_REPLAY_CHUNK = 1024
+
+    assert first == [1, 2], "the queue never carried more than one chunk"
+    assert [item["seq"] for item in second["frames"]] == [3, 4]
+    assert second["replay_pending"] == 1
+    with server_state._session_stream_lock:
+        retained = [item["seq"] for item in server_state._session_streams["session-1"]["frames"]]
+    assert retained == [1, 2, 3, 4, 5], "chunking delivery never trims the retained buffer"
+
+
+def test_consecutive_deltas_are_delivered_as_one_frame_covering_their_range():
+    """The wire carries one model round's worth of text, the broker keeps a frame
+    per published delta.
+
+    A long generation publishes a frame per token (120k observed for one run),
+    and every step downstream pays for that: a queue slot, a JSON encode, a
+    socket write, a page apply. The merge rule is the page's own, so nothing is
+    collapsed here that the UI would not have applied as one update anyway.
+    """
+    def item(seq, content, **extra):
+        frame = {"role": "assistant", "content": content}
+        frame.update(extra)
+        return {"type": "frame", "session_id": "session-1", "seq": seq, "event": None,
+                "frame": frame}
+
+    merged = server_state.merge_channel_items(item(7, "he"), item(8, "llo"))
+    assert merged["frame"]["content"] == "hello"
+    assert merged["seq"] == 8, "the tab's cursor and duplicate check stay exact"
+    assert merged["covers_from"] == 7, "the range it stands for is not read as a hole"
+
+    assert server_state.frames_mergeable(item(7, "a"), item(8, "b")) is True
+    # Not mergeable: a gap in the sequence, another agent, a tool-call delta,
+    # or the frame of another session.
+    assert server_state.frames_mergeable(item(7, "a"), item(9, "b")) is False
+    assert server_state.frames_mergeable(item(7, "a", agent_id="a"), item(8, "b", agent_id="b")) is False
+    assert server_state.frames_mergeable(
+        item(7, "", tool_calls=[{"index": 0}]), item(8, "", tool_calls=[{"index": 0}])
+    ) is False
+    other = item(8, "b")
+    other["session_id"] = "session-2"
+    assert server_state.frames_mergeable(item(7, "a"), other) is False
+    tool_delta = {"type": "frame", "session_id": "session-1", "seq": 2, "event": None,
+                  "frame": {"role": "tool", "name": "exec_shell", "tool_use_id": "t1",
+                            "streaming": True, "delta": "x"}}
+    assert server_state.frames_mergeable(tool_delta, {
+        **tool_delta, "seq": 3,
+        "frame": {**tool_delta["frame"], "delta": "y"},
+    }) is True
+    assert server_state.frames_mergeable(item(7, "a"), tool_delta) is False
+
+
+def test_a_drained_batch_is_written_as_few_events_covering_their_ranges():
+    """What the reader actually puts on the wire for one drain.
+
+    The tab's cursor advances on the sequence of the frame it received, so a
+    collapsed run has to say the range it stands for -- otherwise the page reads
+    the jump as a dropped frame and goes to fetch frames it already has.
+    """
+    from runtime.handler_api import HandlerApiMixin
+
+    def item(seq, content):
+        return {"type": "frame", "session_id": "session-1", "seq": seq, "event": None,
+                "frame": {"role": "assistant", "content": content}}
+
+    batch = [item(1, "a"), item(2, "b"), item(3, "c"),
+             {"type": "sub_init", "session_id": "session-1", "persisted_seq": 0},
+             item(4, "d"), item(5, "e")]
+    written = HandlerApiMixin._frame_channel_batch(batch)
+    assert [entry.get("seq") for entry in written] == [3, None, 5]
+    assert written[0]["frame"]["content"] == "abc"
+    assert written[0]["covers_from"] == 1
+    assert written[-1]["covers_from"] == 4
+    wire = HandlerApiMixin._frame_channel_wire(written[0]).decode("utf-8")
+    assert '"covers_from": 1' in wire and '"seq": 3' in wire
 
 
 # ---------------------------------------------------------------------------

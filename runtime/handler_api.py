@@ -78,10 +78,13 @@ from runtime.server_state import (
     attach_frame_channel,
     clear_session_stream_state,
     close_frame_channel,
+    FRAME_CHANNEL_DRAIN_MAX,
+    frames_mergeable,
     get_session_status,
     detach_frame_channel,
     frame_channel_subscribe,
     frame_channel_unsubscribe,
+    merge_channel_items,
     register_session_stream_with_snapshot,
     snapshot_session_titles,
     unregister_terminals_for_session,
@@ -2496,7 +2499,8 @@ class HandlerApiMixin:
     # Multiplexed session frame channel (one SSE connection per browser tab)
     # ------------------------------------------------------------------
 
-    def _frame_channel_wire(self, item: dict) -> bytes:
+    @staticmethod
+    def _frame_channel_wire(item: dict) -> bytes:
         """Encode one channel item as an SSE block.
 
         ``event:`` is reserved for channel control (``chan_init`` /
@@ -2512,12 +2516,35 @@ class HandlerApiMixin:
                 "event": item.get("event"),
                 "frame": item.get("frame"),
             }
+            # Set when this one frame stands for a contiguous run of sequences
+            # (coalesced deltas): the tab advances its watermark across the whole
+            # range instead of reading it as a dropped frame.
+            if item.get("covers_from") is not None:
+                payload["covers_from"] = item["covers_from"]
             return (
                 f"event: frame\nid: {item.get('seq')}\n"
                 f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
             ).encode("utf-8")
         control = {k: v for k, v in item.items() if k != "type"}
         return f"event: {kind}\ndata: {json.dumps(control, ensure_ascii=False)}\n\n".encode("utf-8")
+
+    @staticmethod
+    def _frame_channel_batch(items: list) -> list:
+        """Collapse adjacent coalescible items of one drained batch.
+
+        A batch is what the reader took out of a channel queue in one go, so
+        merging here is what turns a burst of token deltas into the few writes
+        the socket actually needs. The merge rule is the page's own
+        (``frames_mergeable``), and the merged frame says which sequence range it
+        replaced.
+        """
+        merged: list = []
+        for item in items:
+            if merged and frames_mergeable(merged[-1], item):
+                merged[-1] = merge_channel_items(merged[-1], item)
+            else:
+                merged.append(item)
+        return merged
 
     def _handle_session_frames(self) -> None:
         """GET /v1/sessions/frames?conn=<tab id> — one SSE connection that
@@ -2572,20 +2599,38 @@ class HandlerApiMixin:
                     self.wfile.write(b": keepalive\n\n")
                     self.wfile.flush()
                     continue
-                kind = item.get("type")
-                if kind == "close":
-                    # The channel was removed from the registry (closed, evicted,
-                    # or its grace expired). Stop writing: bytes from an object
-                    # nobody owns are read by the tab as a healthy connection.
-                    break
-                if kind == "attach_flush":
-                    # Either this connection's own wake-up marker (ignore) or a
-                    # newer connection took the channel over (stop writing).
-                    if item.get("generation") != generation:
+                # Take everything already queued and write it in one flush. One
+                # syscall per frame is how this loop falls behind a long
+                # generation in the first place, and behind here is where the
+                # channel starts discarding frames.
+                batch = [item]
+                if FRAME_CHANNEL_DRAIN_MAX > 1:
+                    batch.extend(channel["queue"].drain(FRAME_CHANNEL_DRAIN_MAX - 1))
+                merged = self._frame_channel_batch(batch)
+                payload = bytearray()
+                stop = False
+                for queued in merged:
+                    kind = queued.get("type")
+                    if kind == "close":
+                        # The channel was removed from the registry (closed,
+                        # evicted, or its grace expired). Stop writing: bytes from
+                        # an object nobody owns are read by the tab as a healthy
+                        # connection.
+                        stop = True
                         break
-                    continue
-                self.wfile.write(self._frame_channel_wire(item))
-                self.wfile.flush()
+                    if kind == "attach_flush":
+                        # Either this connection's own wake-up marker (ignore) or
+                        # a newer connection took the channel over (stop).
+                        if queued.get("generation") != generation:
+                            stop = True
+                            break
+                        continue
+                    payload += self._frame_channel_wire(queued)
+                if payload:
+                    self.wfile.write(bytes(payload))
+                    self.wfile.flush()
+                if stop:
+                    break
         except (BrokenPipeError, ConnectionResetError, OSError) as err:
             # The tab stopped accepting bytes (closed tab, killed connection,
             # proxy cut). Without this line the only trace is the later
@@ -2636,7 +2681,12 @@ class HandlerApiMixin:
             "active": snapshot["active"],
             "persisted_seq": snapshot["persisted_seq"],
             "latest_seq": snapshot["latest_seq"],
-            "replayed": len(snapshot["frames"]),
+            # How much of the gap this subscribe actually put on the channel and
+            # how much is still retained behind it. The caller needs both to know
+            # whether to wait for frames or ask again from a moved cursor.
+            "replayed": snapshot.get("replayed", len(snapshot["frames"])),
+            "replayed_through": snapshot.get("replayed_through"),
+            "replay_pending": snapshot.get("replay_pending", 0),
         })
 
     def _handle_session_frames_unsubscribe(self) -> None:

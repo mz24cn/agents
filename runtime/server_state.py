@@ -2485,7 +2485,33 @@ def unsubscribe_session_stream(session_id: str, send_fn) -> None:
                 return
 
 
-def register_session_stream_with_snapshot(session_id: str, send_fn, after_seq: int = -1) -> tuple[bool, dict]:
+def _frames_after_index(frames: list, after_seq: int) -> int:
+    """First index in ``frames`` whose sequence is greater than ``after_seq``.
+
+    The buffer is append-only and sequence-dense (one envelope per published
+    frame, seq 1..N, never trimmed while a generation lives), so the cursor *is*
+    the index. The binary search is the guard for a buffer that stops having that
+    property; copying the list to filter it was not an option either way -- one
+    long generation holds 120k envelopes, and every subscribing tab used to copy
+    the whole array to throw almost all of it away.
+    """
+    if not frames or after_seq < 0:
+        return 0
+    first, last = frames[0].get("seq"), frames[-1].get("seq")
+    if first == 1 and last == len(frames):
+        return min(max(int(after_seq), 0), len(frames))
+    low, high = 0, len(frames)
+    while low < high:
+        mid = (low + high) // 2
+        if int(frames[mid].get("seq") or 0) <= after_seq:
+            low = mid + 1
+        else:
+            high = mid
+    return low
+
+
+def register_session_stream_with_snapshot(session_id: str, send_fn, after_seq: int = -1,
+                                          limit: Optional[int] = None) -> tuple[bool, dict]:
     """Atomically register a subscriber and take its replay snapshot.
 
     Registration and the frame *pointer* snapshot are atomic under the lock so
@@ -2493,6 +2519,13 @@ def register_session_stream_with_snapshot(session_id: str, send_fn, after_seq: i
     copies are built afterwards, outside the lock: retained frames are
     append-only and envelopes are never mutated in place, so a pointer copy
     taken at registration time is a stable snapshot.
+
+    ``limit`` bounds how many replay frames are copied out. A tab whose cursor
+    is far behind does not need all of them at once -- it asks for the next
+    chunk once it has applied this one -- and pushing an unbounded replay at a
+    bounded delivery queue is what turned a slow tab into a conversation with
+    pieces missing. ``replay_pending`` says how much is still being held back;
+    the retained buffer itself is never trimmed, whoever asks still gets it all.
 
     Ordering is a separate matter, and this path only gets it half-way: a frame
     published after registration can reach the writer before the replay has been
@@ -2505,7 +2538,9 @@ def register_session_stream_with_snapshot(session_id: str, send_fn, after_seq: i
     with _session_stream_lock:
         stream = _session_streams.get(session_id)
         if stream is None:
-            return False, {"active": False, "done": True, "persisted_seq": 0, "latest_seq": 0, "frames": []}
+            return False, {"active": False, "done": True, "persisted_seq": 0, "latest_seq": 0,
+                           "frames": [], "replayed": 0, "replay_pending": 0,
+                           "replayed_through": 0}
         registered = not stream["done"]
         if registered:
             stream["subscribers"].append(send_fn)
@@ -2513,13 +2548,18 @@ def register_session_stream_with_snapshot(session_id: str, send_fn, after_seq: i
         done = stream["done"]
         persisted_seq = stream["persisted_seq"]
         latest_seq = stream["next_seq"] - 1
-        frames_snapshot = list(stream["frames"])
+        frames = stream["frames"]
+        start = _frames_after_index(frames, effective_after)
+        available = len(frames) - start
+        take = available if limit is None else min(available, max(0, int(limit)))
+        replay_window = (start, start + take)
         if _session_stream_debug_enabled():
             debug_info = (after_seq, effective_after, registered, persisted_seq,
                           latest_seq, len(stream["subscribers"]))
         else:
             debug_info = None
-    replay = [item.copy() for item in frames_snapshot if item["seq"] > effective_after]
+    replay = [frames[i].copy() for i in range(*replay_window)]
+    replay_pending = max(0, available - (replay_window[1] - replay_window[0]))
     if debug_info is not None:
         logging.getLogger("runtime.server").warning(
             "session_stream register sid=%s requested_after=%s effective_after=%s active=%s "
@@ -2532,6 +2572,13 @@ def register_session_stream_with_snapshot(session_id: str, send_fn, after_seq: i
         "persisted_seq": persisted_seq,
         "latest_seq": latest_seq,
         "frames": replay,
+        # What this subscription was handed, what is still retained behind it,
+        # and the highest sequence that will ever be replayed for it. A tab uses
+        # these to tell "the rest is coming in chunks" from "this cursor is so
+        # far behind that the authoritative conversation is the cheaper repair".
+        "replayed": len(replay),
+        "replay_pending": max(0, replay_pending),
+        "replayed_through": replay[-1]["seq"] if replay else effective_after,
     }
 
 
@@ -2567,6 +2614,22 @@ def register_session_stream_with_snapshot(session_id: str, send_fn, after_seq: i
 FRAME_CHANNEL_GRACE_S = 2.0
 FRAME_CHANNEL_QUEUE_MAXSIZE = 8192
 FRAME_CHANNEL_MAX = 64
+# How many retained frames one (re-)subscribe may push onto the channel before it
+# has to let the tab catch up. A subscribe used to push the *whole* gap: the first
+# 8192 of it filled the queue and the rest was discarded -- one afternoon of one
+# long session logged 86,081 drops for a single tab, and the page's re-subscribe
+# (the repair for a hole) replayed the same still-huge backlog and dropped it
+# again. Chunking keeps the queue a window that slides forward; the tab asks for
+# the next chunk once it has applied this one.
+FRAME_CHANNEL_REPLAY_CHUNK = 1024
+# One overflow of a channel is one fact, not one fact per frame. Saturating a
+# tab's queue used to emit a WARNING for every dropped frame: 1,373,329 lines and
+# 208 MB of log in eleven days, which buried every other diagnostic in the file.
+FRAME_CHANNEL_DROP_LOG_EVERY = 512
+# How many queued items one read of the channel may take at once. A long
+# generation produces frames faster than a socket can be flushed one at a time,
+# and the reader falling behind is exactly what makes the queue overflow.
+FRAME_CHANNEL_DRAIN_MAX = 256
 
 _frame_channels: dict[str, dict] = {}
 _frame_channels_lock = threading.RLock()
@@ -2588,6 +2651,107 @@ def _next_frame_channel_generation() -> int:
     return _frame_channel_generation
 
 
+class _FrameChannelQueue:
+    """Bounded FIFO for one tab's channel, whose head slides when it is full.
+
+    ``queue.Queue`` can only refuse an item at the tail. For a tab that reads
+    slowly that is the wrong end to protect: the tab's resume cursor is the last
+    sequence it *applied*, so refusing the newest frame leaves the cursor exactly
+    where it was, every later frame is refused as well, and the queue stays full
+    for the rest of the generation -- the tab stops seeing anything at all and
+    never even notices the hole it would have repaired. Discarding the oldest
+    undelivered frame instead keeps the queue a window that keeps sliding
+    forward: the page still gets the live tail, its cursor still marks precisely
+    where it is complete, and the sequence jump it sees is what triggers the
+    replay of what was skipped (nothing here is lost -- the broker retains every
+    frame of the generation).
+
+    Control items (``sub_init`` / ``done`` / ``close`` / ``attach_flush``) are
+    never expendable: a dropped frame shows a hole the page can close, a dropped
+    control item shows a conversation that never finishes. When one sits at the
+    head the new frame is refused instead -- transient, because the reader drains
+    the head first.
+
+    Only the surface the channel actually uses is implemented: ``put`` /
+    ``get`` / ``get_nowait`` / ``qsize`` / ``empty`` / ``drain``. ``get`` keeps
+    raising ``queue.Empty`` so the reader loop and its 15s heartbeat are
+    unchanged.
+    """
+
+    def __init__(self, maxsize: int = 0):
+        import collections
+        import queue as _queue
+        self._queue_error = _queue.Empty
+        self._items = collections.deque()
+        self._cond = threading.Condition()
+        # Public: the reader asks whether this channel is still at its limit.
+        self.maxsize = max(0, int(maxsize))
+
+    def qsize(self) -> int:
+        with self._cond:
+            return len(self._items)
+
+    def empty(self) -> bool:
+        with self._cond:
+            return not self._items
+
+    def put(self, item: dict):
+        """Append ``item``, evicting the oldest queued frame when full.
+
+        Returns ``(queued, discarded)``: whether this item made it in, and which
+        item (an older frame, or this one in the rare case where the head cannot
+        be skipped) had to go.
+        """
+        with self._cond:
+            discarded = None
+            if self.maxsize and len(self._items) >= self.maxsize:
+                if self._items and self._items[0].get("type") == "frame":
+                    discarded = self._items.popleft()
+                else:
+                    return False, item
+            self._items.append(item)
+            self._cond.notify()
+            return True, discarded
+
+    def put_nowait(self, item: dict) -> None:
+        """Append without eviction (registration-time items must not push out
+        a ``sub_init`` that has not been written yet)."""
+        with self._cond:
+            self._items.append(item)
+            self._cond.notify()
+
+    def get_nowait(self) -> dict:
+        with self._cond:
+            if not self._items:
+                raise self._queue_error()
+            return self._items.popleft()
+
+    def get(self, timeout: Optional[float] = None) -> dict:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._cond:
+            while not self._items:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    raise self._queue_error()
+                self._cond.wait(remaining)
+            return self._items.popleft()
+
+    def drain(self, limit: int) -> list:
+        """Take up to ``limit`` queued items without waiting.
+
+        The reader writes a drained batch with one flush instead of one per
+        frame: at the rate one long generation produces frames, a syscall per
+        frame is what makes the tab fall behind in the first place.
+        """
+        with self._cond:
+            taken = []
+            for _ in range(max(0, int(limit))):
+                if not self._items:
+                    break
+                taken.append(self._items.popleft())
+            return taken
+
+
 def _frame_channel_stage(channel: dict, session_id: str) -> list:
     """Start holding this session's frames instead of delivering them."""
     return channel.setdefault("staging", {}).setdefault(session_id, [])
@@ -2605,26 +2769,138 @@ def _frame_channel_flush(channel: dict, session_id: str) -> list:
 
 
 def _frame_channel_push(channel: dict, item: dict) -> bool:
-    """Enqueue one channel item. Returns False when the queue is overfull."""
-    import queue as _queue
-    try:
-        channel["queue"].put_nowait(item)
+    """Enqueue one channel item, making room at the head when the queue is full.
+
+    Returns False only for a subscriber that must be released; an overfull queue
+    is never one of those, because marking it so would cancel an inference that
+    is merely being read slowly. The frames are not lost: the broker retains the
+    whole generation, the tab notices the jump in the sequence, and it re-arms
+    its watch from the last sequence it actually applied. What the count and the
+    log record is how often that repair had to run.
+    """
+    _queued, discarded = channel["queue"].put(item)
+    if discarded is None:
+        # The first frame this channel has room for again ends the overflow
+        # episode: say what its final size was, so the log states both when a
+        # tab fell behind and how far behind it got, without a line per frame.
+        dropped = int(channel.get("dropped", 0))
+        if dropped and dropped != channel.get("drop_reported") \
+                and channel["queue"].qsize() < channel["queue"].maxsize:
+            channel["drop_reported"] = dropped
+            logging.getLogger("runtime.server").warning(
+                "frame_channel queue_drained conn=%s sid=%s dropped=%s spans=%s",
+                channel.get("id"), item.get("session_id"), dropped,
+                {key: list(value) for key, value in channel.get("drop_spans", {}).items()},
+            )
         return True
-    except _queue.Full:
-        # The broker retains every frame, so a dropped live frame is not lost
-        # data -- but it *is* a hole in what this tab sees, and the tab closes
-        # it itself: it tracks the sequence it received per session, and a jump
-        # re-subscribes that session from the last sequence it applied. Counting
-        # the drops here is what makes that repair rate measurable. Returning
-        # False would mark this subscriber dead and could cancel an inference
-        # that is merely being read slowly, so report success instead.
-        channel["dropped"] = int(channel.get("dropped", 0)) + 1
+    # ``put`` hands back the item it discarded: an older queued frame normally,
+    # the incoming one in the rare case where the head is a control item that
+    # cannot be skipped without delivering it out of order.
+    channel["dropped"] = int(channel.get("dropped", 0)) + 1
+    dropped = channel["dropped"]
+    seq = discarded.get("seq")
+    sid = discarded.get("session_id")
+    if sid is not None and isinstance(seq, int):
+        span = channel.setdefault("drop_spans", {}).get(sid)
+        if span is None:
+            channel["drop_spans"][sid] = [seq, seq]
+        else:
+            span[0] = min(span[0], seq)
+            span[1] = max(span[1], seq)
+    if dropped == 1 or dropped % FRAME_CHANNEL_DROP_LOG_EVERY == 0:
+        # Once per overflow and then once every FRAME_CHANNEL_DROP_LOG_EVERY:
+        # saturation is one event with a size, and the size is what matters.
         logging.getLogger("runtime.server").warning(
-            "frame_channel queue_full conn=%s sid=%s seq=%s qsize=%s dropped=%s",
+            "frame_channel queue_full conn=%s sid=%s seq=%s qsize=%s dropped=%s "
+            "evicted_oldest=%s unrepaired_through=%s",
             channel.get("id"), item.get("session_id"), item.get("seq"),
-            channel["queue"].qsize(), channel["dropped"],
+            channel["queue"].qsize(), dropped,
+            discarded is not item, channel.get("drop_spans", {}).get(sid),
         )
-        return True
+    return True
+
+
+def _channel_frame_identity(frame: dict) -> tuple:
+    """Identity a delta belongs to: two frames merge only within one message."""
+    return (
+        frame.get("role"),
+        frame.get("agent_id") or frame.get("assistant_id") or "",
+        frame.get("name") or "",
+        frame.get("tool_use_id") or "",
+        frame.get("target_agent_id") or "",
+    )
+
+
+def frames_mergeable(left: dict, right: dict) -> bool:
+    """Can two frames be delivered as one? Mirrors the page's own merge rule
+    (``web/src/lib/stream-batcher.js``), so nothing arrives here that the UI
+    would not have applied as a single update anyway.
+
+    Coalescing happens on the way out rather than in the broker: the retained
+    record keeps one envelope per published frame (that sequence space is what
+    every consumer, replay and resume is built on), while the wire only ever
+    carries one model round's worth of text. Without this, a long generation
+    publishes a frame per token -- 120k frames observed -- and every per-frame
+    cost downstream (a queue slot, a JSON encode, a socket write, a page apply)
+    is paid 120k times.
+    """
+    if left.get("session_id") != right.get("session_id"):
+        return False
+    if left.get("type") != "frame" or right.get("type") != "frame":
+        return False
+    if left.get("event") != right.get("event"):
+        return False
+    left_seq, right_seq = left.get("seq"), right.get("seq")
+    if not isinstance(left_seq, int) or not isinstance(right_seq, int):
+        return False
+    if right_seq != left_seq + 1:
+        # Only a contiguous pair can be replaced by one item: the merged frame
+        # says which range it stands for, and a hole inside that range would be
+        # invisible to the tab's cursor.
+        return False
+    frame_left, frame_right = left.get("frame") or {}, right.get("frame") or {}
+    if frame_left.get("role") != frame_right.get("role"):
+        return False
+    identity = _channel_frame_identity(frame_left)
+    if identity != _channel_frame_identity(frame_right):
+        return False
+    if frame_right.get("role") == "assistant":
+        # A tool-call delta carries protocol the page merges by ``_index``; the
+        # text of a plain answer is the only thing safe to concatenate here.
+        return not frame_left.get("tool_calls") and not frame_right.get("tool_calls")
+    if frame_right.get("role") == "tool":
+        return frame_left.get("streaming") is True and frame_right.get("streaming") is True
+    return False
+
+
+def merge_channel_items(left: dict, right: dict) -> dict:
+    """Collapse two mergeable channel items into the one the page receives.
+
+    The merged item carries the higher ``seq`` -- so the tab's resume cursor and
+    its duplicate check stay exact -- plus ``covers_from``, the lowest sequence it
+    stands for. The tab needs that range to keep its contiguity watermark honest:
+    without it a merged pair looks like a dropped frame.
+    """
+    frame = dict(left.get("frame") or {})
+    right_frame = dict(right.get("frame") or {})
+    if right_frame.get("role") == "assistant":
+        frame["content"] = (frame.get("content") or "") + (right_frame.get("content") or "")
+        if frame.get("thinking") is None and right_frame.get("thinking") is None:
+            frame.pop("thinking", None)
+        else:
+            frame["thinking"] = (frame.get("thinking") or "") + (right_frame.get("thinking") or "")
+    else:
+        frame["delta"] = (frame.get("delta") or "") + (right_frame.get("delta") or "")
+    frame.update({k: v for k, v in right_frame.items() if k not in ("content", "thinking", "delta")})
+    covers_from = left.get("covers_from")
+    if not isinstance(covers_from, int):
+        covers_from = left.get("seq")
+    merged = dict(left)
+    merged["frame"] = frame
+    merged["seq"] = right.get("seq")
+    merged["event"] = right.get("event")
+    merged["covers_from"] = covers_from
+    return merged
 
 
 def _make_frame_channel_send_fn(channel: dict, session_id: str):
@@ -2659,10 +2935,9 @@ def _make_frame_channel_send_fn(channel: dict, session_id: str):
 
 
 def _new_frame_channel_locked(conn_id: str) -> dict:
-    import queue as _queue
     channel = {
         "id": conn_id,
-        "queue": _queue.Queue(maxsize=FRAME_CHANNEL_QUEUE_MAXSIZE),
+        "queue": _FrameChannelQueue(FRAME_CHANNEL_QUEUE_MAXSIZE),
         "sessions": {},
         "generation": 0,
         "connected": False,
@@ -2937,7 +3212,9 @@ def frame_channel_subscribe(conn_id: str, session_id: str, after_seq: int = -1) 
 
     send_fn = _make_frame_channel_send_fn(channel, session_id)
     try:
-        registered, snapshot = register_session_stream_with_snapshot(session_id, send_fn, after_seq)
+        registered, snapshot = register_session_stream_with_snapshot(
+            session_id, send_fn, after_seq, limit=FRAME_CHANNEL_REPLAY_CHUNK,
+        )
         with _frame_channels_lock:
             current = _frame_channels.get(conn_id)
             if current is not channel:
@@ -2949,15 +3226,22 @@ def frame_channel_subscribe(conn_id: str, session_id: str, after_seq: int = -1) 
                 return False, snapshot
             current["sessions"][session_id] = send_fn
             current["last_seen"] = time.monotonic()
+            replay = snapshot["frames"]
+            replayed_through = int(snapshot.get("replayed_through") or 0)
             _frame_channel_push(current, {
                 "type": "sub_init",
                 "session_id": session_id,
                 "active": snapshot["active"],
                 "persisted_seq": snapshot["persisted_seq"],
                 "latest_seq": snapshot["latest_seq"],
+                # A tab that reads these has to be able to tell a chunked replay
+                # from a completed one: the rest is still retained, and asking
+                # again from the cursor it has reached brings the next chunk.
+                "replayed": snapshot.get("replayed", len(replay)),
+                "replayed_through": replayed_through,
+                "replay_pending": snapshot.get("replay_pending", 0),
             })
-            replayed_through = 0
-            for item in snapshot["frames"]:
+            for item in replay:
                 _frame_channel_push(current, {
                     "type": "frame",
                     "session_id": session_id,
@@ -2968,11 +3252,26 @@ def frame_channel_subscribe(conn_id: str, session_id: str, after_seq: int = -1) 
                 replayed_through = max(replayed_through, int(item["seq"]))
             # Everything that was published while the hand-off was running, in
             # sequence order, minus the frames the replay has just carried.
-            raced = [item for item in _frame_channel_flush(channel, session_id) if not (
-                item.get("type") == "frame" and int(item.get("seq") or 0) <= replayed_through
-            )]
-            for item in sorted(raced, key=lambda i: int(i.get("seq") or 0)
-                               if i.get("type") == "frame" else float("inf")):
+            raced = _frame_channel_flush(channel, session_id)
+            raced_frames = sorted(
+                (item for item in raced
+                 if item.get("type") == "frame" and int(item.get("seq") or 0) > replayed_through),
+                key=lambda item: int(item.get("seq") or 0),
+            )
+            raced_other = [item for item in raced if item.get("type") != "frame"]
+            # The same budget covers the raced frames: a hand-off that raced with
+            # a live burst must not be the thing that overruns the queue either.
+            room = max(0, FRAME_CHANNEL_REPLAY_CHUNK - len(replay))
+            for item in raced_frames[:room]:
+                _frame_channel_push(current, item)
+                replayed_through = max(replayed_through, int(item.get("seq") or 0))
+            if len(raced_frames) > room:
+                # Held back, not lost: these frames are retained by the broker,
+                # and the tab's next subscribe from its reached cursor brings them.
+                snapshot["replay_pending"] = int(snapshot.get("replay_pending") or 0) + (
+                    len(raced_frames) - room
+                )
+            for item in raced_other:
                 _frame_channel_push(current, item)
             if not registered:
                 # Mirrors the immediate ``[DONE]`` of GET /v1/sessions/{id}/stream:
@@ -3031,6 +3330,10 @@ def frame_channel_snapshot() -> dict:
                 # Live frames this tab was too slow to take; the tab closes the
                 # resulting hole by its cursor, this says how often it has to.
                 "dropped": int(channel.get("dropped", 0)),
+                # session_id -> [lowest, highest] sequence this channel skipped
+                # for want of room: the span a slow tab has to have replayed.
+                "drop_spans": {key: list(value)
+                               for key, value in channel.get("drop_spans", {}).items()},
             }
             for conn_id, channel in _frame_channels.items()
         }
