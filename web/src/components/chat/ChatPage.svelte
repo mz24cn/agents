@@ -207,6 +207,10 @@
   // reconciler tick rather than on an interval of its own.
   function rearmMissingStreamWatches() {
     for (const sid of backendStreamingSessions) {
+      // A resync owns this session's watch while it re-reads the conversation:
+      // re-arming underneath it would apply frames onto messages that are about
+      // to be replaced.
+      if (streamViewResyncInFlight.has(sid)) continue
       if (!sessionStore[storeKey(sid)] || isSessionStreamWatched(sid)) continue
       subscribeToExistingSession(sid)
     }
@@ -300,6 +304,87 @@
     if (unsubscribe) {
       unsubscribe()
       delete sessionStreamSubscriptions[sid]
+    }
+  }
+
+  // A frame channel that cannot catch up has, by definition, a turn on screen
+  // with pieces missing: the backend discarded frames this tab could not read in
+  // time, the repair did not close the hole, and everything above that hole was
+  // held back rather than appended over it. The run on the server and the
+  // conversation on disk are both intact, so rebuild the view from the
+  // authoritative copy -- the repair the user performs by reloading the page,
+  // done for them and scoped to the one session that needs it.
+  const streamViewResyncInFlight = new Set()
+  const streamViewResyncAt = new Map()
+  const STREAM_VIEW_RESYNC_COOLDOWN_MS = 10_000
+
+  async function resyncStreamView(sid, info = {}) {
+    if (!sid || streamViewResyncInFlight.has(sid)) return
+    // This tab started the inference and is still carrying it: the POST owns the
+    // frames, and replacing the store underneath it would fight that stream.
+    if (directlyConsumedSessions.has(sid)) return
+    const last = streamViewResyncAt.get(sid) || 0
+    if (Date.now() - last < STREAM_VIEW_RESYNC_COOLDOWN_MS) return
+    // Stamp before anything else: the cooldown also keeps a session that merely
+    // had its warm watch stopped from being re-armed and degrading again every
+    // reconciler tick.
+    streamViewResyncAt.set(sid, Date.now())
+    // Stop routing frames for this session first: anything still arriving would
+    // be applied on top of the messages this is about to replace.
+    const unsubscribe = sessionStreamSubscriptions[sid]
+    delete sessionStreamSubscriptions[sid]
+    unsubscribe?.()
+    directStreamLastSeq.delete(sid)
+    if (storeKey(sid) !== storeKey(sessionId)) {
+      // A warm watch on a session that is not on screen: no view is at stake, and
+      // pulling a whole authoritative conversation into memory to keep a fold
+      // current is not worth it. Stop the futile replay; opening the session
+      // fetches it and re-arms the watch.
+      return
+    }
+    streamViewResyncInFlight.add(sid)
+    // Rare, and the only trace of "the page noticed its own view was incomplete
+    // and is fixing it": worth one line regardless of the debug switch.
+    console.warn('[session-stream-ui] view resync', {
+      sessionId: sid, reason: info?.reason || '', cursor: info?.cursor, through: info?.through,
+    })
+    errorMsg = t('streamViewResync')
+    try {
+      const data = await sessionsApi.get(sid)
+      const msgs = (data?.messages || []).map(m => ({ ...m }))
+      const key = storeKey(sid)
+      const existing = sessionStore[key]
+      const userIndices = new Set()
+      for (let i = 0; i < msgs.length; i++) if (msgs[i].role === 'user') userIndices.add(i)
+      // Decided after the fetch, not before it: the run may have ended while the
+      // conversation was being re-read, and a cleared stop button that the next
+      // frame contradicts is worse than a momentary flicker.
+      const running = backendStreamingSessions.has(sid)
+      sessionStore[key] = {
+        ...(existing || {}),
+        messages: msgs,
+        isStreaming: running,
+        streamConnection: running ? 'connecting' : 'idle',
+        collapsedGroups: existing?.collapsedGroups ?? userIndices,
+      }
+      shouldScrollToBottom = true
+      // Re-arm the watch from the persisted baseline: the frames after it are the
+      // not-yet-persisted tail of the run, which is exactly what has to be
+      // rebuilt on screen. A fresh baseline is also what keeps this cheap -- the
+      // backlog this view fell behind is never replayed at it.
+      if (running) subscribeToExistingSession(sid)
+      errorMsg = ''
+    } catch (err) {
+      // The reload failed: keep the incomplete view rather than nothing, and
+      // re-arm from a fresh baseline (never the stale cursor) a moment later.
+      errorMsg = err?.message || t('restoreSessionFailed')
+      setTimeout(() => {
+        if (backendStreamingSessions.has(sid) && !sessionStreamSubscriptions[sid]) {
+          subscribeToExistingSession(sid)
+        }
+      }, 3_000)
+    } finally {
+      streamViewResyncInFlight.delete(sid)
     }
   }
 
@@ -404,6 +489,10 @@
       },
       handoff ? (directStreamLastSeq.get(sid) ?? -1) : -1,
       (acknowledge) => frameBatcher.then(acknowledge),
+      // This watch has stopped being able to make itself whole: rebuild the
+      // conversation from the server's copy instead of going on appending to a
+      // view with pieces missing.
+      (info) => { void resyncStreamView(sid, info) },
     )
     sessionStreamSubscriptions[sid] = unsubscribe
   }

@@ -351,6 +351,7 @@ export function inferStream(body, onMessage, onDone, onError, onInit = null, onS
                 onMessage,
                 onDone,
                 onApplied: (acknowledge) => acknowledge(),
+                onDegrade: options.onDegrade ?? null,
               })
             }
             if (Number.isFinite(data.stream_seq)) onSequence?.(data.stream_seq)
@@ -630,18 +631,19 @@ const FRAMES_HANDOFF_WAIT_MS = 2_000
 // reconnect would otherwise replay the whole generation from the stale cursor.
 const FRAMES_MAX_PENDING_APPLIES = 512
 // How many times one session's watch may be re-armed to close a hole in the
-// sequence before the page stops trying and leaves the run alone. A hole means
-// the backend had to drop a live frame for this tab (its channel queue was over
-// full); the frames are still retained, so re-subscribing from the cursor this
-// tab applied normally fills it in. Without a bound, a frame trimmed out of the
-// server's buffer would have this tab re-subscribing forever.
+// sequence before the page stops trying and asks the conversation itself. A hole
+// means the backend had to discard a frame for this tab (its channel queue was
+// over full); the frames are still retained server-side, so re-subscribing from
+// the cursor this tab applied normally fills it in. Without a bound, a frame that
+// is genuinely gone would have this tab re-subscribing forever. The budget is
+// restored once the tab has caught up with everything it was ever handed.
 const FRAMES_MAX_GAP_HEALS = 3
-// How many frames beyond a hole may arrive before the repair brings the hole
-// itself, and have to be remembered as already delivered so the replay does not
-// apply them twice. In practice this is a handful -- the repair re-subscribes at
-// once -- and beyond the bound the page prefers a possible duplicate to losing
-// the tail of a live run.
-const FRAMES_MAX_OUT_OF_ORDER = 512
+// How far behind a watch has to be before replaying frames at it stops being the
+// way to catch up. The frames underneath a cursor that far back are already in
+// conversation.json, which the page can read in one request -- and a replay of
+// tens of thousands of frames is what turns a slow tab into a conversation with
+// whole passages missing. Observed: one tab 86,081 frames behind its own run.
+const FRAMES_RESYNC_LAG = 4096
 
 /** Per-tab channel id: stable across reloads of the same tab. */
 function framesConnId() {
@@ -767,6 +769,14 @@ function framesReconcile() {
       framesReconnectChannel()
     }
     if (hub.connected) {
+      // A replay the backend chunked: the backstop for a page whose frames were
+      // acknowledged without the pump noticing (the pump normally runs from the
+      // acknowledgement itself).
+      for (const entry of hub.entries.values()) {
+        if (!entry.replayPending || entry.lastSeq <= entry.subscribedAtSeq) continue
+        action = action || 'replay_chunk'
+        framesPumpReplay(entry)
+      }
       // A subscribe command that never landed leaves the backend without an
       // observer for that session; the channel is alive, so re-send it.
       for (const entry of hub.entries.values()) {
@@ -852,6 +862,10 @@ function framesSubscribeCommand(entry) {
     return entry.subscribePending
   }
   entry.registeredGeneration = hub.generation
+  // The cursor this command replays from. A chunked replay only makes progress
+  // by moving it, so the pump that asks for the next chunk can tell a step
+  // forward from a re-request of the chunk it already has.
+  entry.subscribedAtSeq = entry.lastSeq
   return (entry.subscribePending = framesCommand('/v1/sessions/frames/subscribe', {
     conn: hub.conn,
     session_id: entry.sessionId,
@@ -951,29 +965,55 @@ function framesAbandonDelivery(entry) {
 function framesAcknowledge(entry, seq) {
   entry.lastSeq = Math.max(entry.lastSeq, seq)
   entry.pendingApplications = Math.max(0, entry.pendingApplications - 1)
+  // A tab that has applied everything the backend ever handed it has closed the
+  // holes it was chasing: its repair budget is whole again. Bounding the budget
+  // only makes sense if paying for a hole actually restores it.
+  if (entry.gapHeals > 0 && entry.lastSeq >= entry.highestSeen) entry.gapHeals = 0
+  framesPumpReplay(entry)
+}
+
+/**
+ * Ask for the next chunk of a replay the backend deliberately truncated.
+ *
+ * A subscribe brings at most one chunk of what a lagging tab missed; the rest
+ * stays retained. The tab pulls it by re-subscribing from the cursor it has
+ * reached -- which only makes progress while that cursor has actually moved, so
+ * a chunk nobody acknowledged is never replayed in a loop.
+ */
+function framesPumpReplay(entry) {
+  if (!entry.replayPending || entry.degraded) return
+  if (entry.lastSeq <= entry.subscribedAtSeq) return
+  entry.replayPending = false      // the next sub_init restates what is left
+  entry.registeredGeneration = -1
+  framesSubscribeCommand(entry)
 }
 
 /**
  * Close a hole in what this tab is being told.
  *
  * The channel hands over one session's frames in increasing sequence order, so a
- * jump means the backend dropped one on the way here (its per-tab queue went over
- * full -- it logs that, and the run itself is unaffected). Those frames are still
- * retained server-side, so repair it the way a reconnect does: re-subscribe this
- * session from ``lastSeq``, the last sequence this tab actually applied. The
- * replay then carries the hole, and every frame this tab already has is skipped
- * by the duplicate check in the dispatch below.
+ * jump means the backend discarded some on the way here (its per-tab queue went
+ * over full -- it logs that, and the run itself is unaffected). Those frames are
+ * still retained server-side, so repair it the way a reconnect does: re-subscribe
+ * this session from ``lastSeq``, the last sequence this tab actually applied.
+ *
+ * A truncated replay is not a hole and does not cost the budget: the backend has
+ * already told this tab how much is still coming (``replay_pending``), and the
+ * pump above fetches it.
  */
 function framesHealGap(entry, seq) {
+  if (entry.replayPending) {
+    framesPumpReplay(entry)
+    return
+  }
   if (entry.gapHeals >= FRAMES_MAX_GAP_HEALS) {
-    // The repair did not close the hole, so the frames in it are gone from the
-    // backend's buffer too. Say so once per session instead of re-subscribing
-    // forever: the conversation on disk stays correct, this tab just stops
-    // showing the tail of that generation until it is reopened.
+    // The repair did not close the hole. Say so once per session, hand the
+    // conversation over to the authoritative copy, and stop re-subscribing: what
+    // this tab has been shown is missing pieces, and appending to it would keep
+    // showing it that way.
     if (entry.gapHeals === FRAMES_MAX_GAP_HEALS) {
-      streamDebug('frames_gap_unrepaired', {
-        sessionId: entry.sessionId, through: entry.receivedSeq,
-        cursor: entry.lastSeq, seen: seq,
+      framesDegrade(entry, 'gap_unrepaired', {
+        through: entry.receivedSeq, cursor: entry.lastSeq, seen: seq,
       })
     }
     entry.gapHeals += 1
@@ -990,23 +1030,31 @@ function framesHealGap(entry, seq) {
   framesSubscribeCommand(entry)
 }
 
-/** Has this tab already been handed that frame? */
-function framesAlreadyHave(entry, seq) {
-  return seq <= entry.receivedSeq || (entry.ahead?.has(seq) ?? false)
+/**
+ * Has this tab already been told any part of that frame?
+ *
+ * A frame may stand for a run of sequences (the channel coalesces consecutive
+ * deltas and says so with ``covers_from``), and the batching of a replay is not
+ * necessarily the batching of the live delivery it replaces. So "have I had this"
+ * is a question about the whole range: anything from ``covers_from`` up to the
+ * watermark has been applied already, and applying part of it a second time would
+ * repeat text in the middle of the answer.
+ */
+function framesAlreadyHave(entry, seq, coversFrom) {
+  const from = Number.isFinite(coversFrom) ? coversFrom : seq
+  return from <= entry.receivedSeq
 }
 
 /**
- * Move the contiguous watermark, closing a hole whose frames have all arrived.
+ * Move the contiguous watermark.
  *
  * ``receivedSeq`` is the watermark of *contiguous* delivery, which is what makes
  * a jump detectable in the first place: were it simply the highest sequence seen,
- * the replay that fills a hole would look like a duplicate of it and the hole
- * would never close. Frames above the hole are remembered (``ahead``) so that
- * filling it does not replay those a second time as well.
+ * a frame that arrived over a hole would look like the hole never happened.
  *
  * Returns false when the frame sits beyond a hole (out of order).
  */
-function framesAdvanceWatermark(entry, seq) {
+function framesAdvanceWatermark(entry, seq, coversFrom) {
   // Nothing has been established as contiguous yet (no cursor, and this session's
   // sub_init carried no persisted sequence): take the frame as the new reference
   // rather than claim a hole that cannot be known.
@@ -1014,13 +1062,35 @@ function framesAdvanceWatermark(entry, seq) {
     entry.receivedSeq = seq
     return true
   }
-  if (seq > entry.receivedSeq + 1) return false
-  entry.receivedSeq = seq
-  while (entry.ahead.has(entry.receivedSeq + 1)) {
-    entry.ahead.delete(entry.receivedSeq + 1)
-    entry.receivedSeq += 1
-  }
+  const from = Number.isFinite(coversFrom) ? Math.min(coversFrom, seq) : seq
+  if (from > entry.receivedSeq + 1) return false
+  entry.receivedSeq = Math.max(entry.receivedSeq, seq)
   return true
+}
+
+/**
+ * This watch cannot be made whole by replaying frames at it.
+ *
+ * Reported once per subscription, to the page that owns it: the run on the server
+ * is fine, the conversation on disk is fine, and what needs doing is to read the
+ * answer from one of those instead of going on appending to a view that has
+ * pieces missing.
+ */
+function framesDegrade(entry, reason, details = {}) {
+  if (entry.degraded) return
+  entry.degraded = true
+  streamDebug('frames_degraded', {
+    sessionId: entry.sessionId, reason, cursor: entry.lastSeq,
+    through: entry.receivedSeq, ...details,
+  })
+  try {
+    entry.onDegrade?.({
+      sessionId: entry.sessionId, reason,
+      cursor: entry.lastSeq, through: entry.receivedSeq, ...details,
+    })
+  } catch {
+    // A page hook must not be able to take the channel down with it.
+  }
 }
 
 function framesApply(entry, seq, eventName, frame) {
@@ -1040,6 +1110,7 @@ function framesApply(entry, seq, eventName, frame) {
       })
       entry.pendingApplications = 0
       entry.lastSeq = Math.max(entry.lastSeq, completeThrough)
+      framesPumpReplay(entry)
       return
     }
     let acknowledged = false
@@ -1050,6 +1121,7 @@ function framesApply(entry, seq, eventName, frame) {
     })
   } else {
     entry.lastSeq = Math.max(entry.lastSeq, completeThrough)
+    framesPumpReplay(entry)
   }
 }
 
@@ -1078,10 +1150,12 @@ function framesDispatch(currentEvent, payload) {
   const entry = hub.entries.get(payload?.session_id)
   if (!entry) return   // unsubscribed while the frame was in flight
   if (currentEvent === 'sub_init') {
+    const persistedSeq = Number(payload?.persisted_seq)
+    const pendingReplay = Number(payload?.replay_pending) || 0
+    entry.replayPending = pendingReplay > 0
     if (!entry.baselineInitialized) {
       // First registration: conversation.json is the local baseline, so the
       // resume cursor starts at the last persisted sequence.
-      const persistedSeq = Number(payload?.persisted_seq)
       if (Number.isFinite(persistedSeq)) entry.lastSeq = Math.max(entry.lastSeq, persistedSeq)
       entry.baselineInitialized = true
     }
@@ -1090,6 +1164,17 @@ function framesDispatch(currentEvent, payload) {
     // detectable as a dropped frame rather than a different generation.
     if (entry.receivedSeq < entry.lastSeq) entry.receivedSeq = entry.lastSeq
     streamDebug('frames_sub_init', { sessionId: entry.sessionId, lastSeq: entry.lastSeq, ...payload })
+    // A cursor this far behind is not worth replaying frames at: the frames under
+    // it are already persisted, and the page can read the same answer from there
+    // in one request. This is the "reopen the conversation" repair, done by the
+    // page rather than by the user pressing reload.
+    const behindPersisted = Number.isFinite(persistedSeq)
+      && persistedSeq - entry.lastSeq > FRAMES_RESYNC_LAG
+    if (behindPersisted || pendingReplay > FRAMES_RESYNC_LAG) {
+      framesDegrade(entry, behindPersisted ? 'behind_persisted' : 'replay_backlog', {
+        persisted_seq: persistedSeq, replay_pending: pendingReplay,
+      })
+    }
     framesConfirmDelivery(entry)
     entry.onInit?.(payload)
     return
@@ -1102,23 +1187,32 @@ function framesDispatch(currentEvent, payload) {
   }
   if (currentEvent === 'frame') {
     const seq = Number.isFinite(payload?.seq) ? payload.seq : null
+    const coversFrom = Number.isFinite(payload?.covers_from) ? payload.covers_from : null
     framesConfirmDelivery(entry)
     if (seq != null) {
-      if (framesAlreadyHave(entry, seq)) {
+      entry.highestSeen = Math.max(entry.highestSeen, seq)
+      if (framesAlreadyHave(entry, seq, coversFrom)) {
         // Already handed to this tab: a repair re-subscribe replays from the
         // cursor, and applying one frame twice would double every token in the
         // answer, so reading the channel is idempotent by sequence.
         streamDebug('frames_duplicate', {
           sessionId: entry.sessionId, seq, through: entry.receivedSeq,
         })
+        // Part of this frame is old and part of it is not -- a replay batches
+        // differently from the live delivery it replaced. The new part cannot be
+        // applied without repeating the old part on screen, so ask for it again
+        // from the watermark instead.
+        if (seq > entry.receivedSeq) framesHealGap(entry, seq)
         return
       }
-      if (!framesAdvanceWatermark(entry, seq)) {
-        // Beyond a hole. Keep the frame -- its content is real and this tab has it
-        // now -- remember that it arrived out of order, and go and get what is
-        // missing underneath it.
-        if (entry.ahead.size < FRAMES_MAX_OUT_OF_ORDER) entry.ahead.add(seq)
+      if (!framesAdvanceWatermark(entry, seq, coversFrom)) {
+        // Beyond a hole. Not applied: this is the whole shape of the failure --
+        // appending content that sits above a gap leaves an answer that reads as
+        // though paragraphs were eaten, which is what the tab looked like while
+        // its channel was discarding frames. The repair replays this frame back
+        // with the gap underneath it filled.
         framesHealGap(entry, seq)
+        return
       }
     }
     framesApply(entry, seq, payload?.event || 'message', payload?.frame)
@@ -1277,21 +1371,35 @@ function framesConnect() {
  *
  * @returns {function} Call to stop watching this session (and to close the
  *                     shared channel when it was the last one).
+ *
+ * ``onDegrade``, when supplied, is called with ``{sessionId, reason, ...}`` when
+ * this watch can no longer be made whole by replaying frames at it: the repair
+ * budget for a hole ran out, or the cursor fell so far behind that the persisted
+ * conversation is the shorter way to the same answer. The run and the frames are
+ * unaffected -- it is what this tab has been shown that needs rebuilding.
  */
-export function subscribeSessionStream(sessionId, onMessage, onDone, onError, onInit = null, after = -1, onApplied = null) {
+export function subscribeSessionStream(sessionId, onMessage, onDone, onError, onInit = null,
+                                       after = -1, onApplied = null, onDegrade = null) {
   const hub = sessionFramesHub
   const entry = {
     sessionId,
-    onMessage, onDone, onError, onInit, onApplied,
+    onMessage, onDone, onError, onInit, onApplied, onDegrade,
     lastSeq: Number.isFinite(Number(after)) ? Number(after) : -1,
     baselineInitialized: Number.isFinite(Number(after)) && Number(after) >= 0,
     // Highest sequence this tab has been *handed* as a contiguous run, as opposed
     // to applied: the reference for spotting a hole (a frame the backend had to
-    // drop) and for skipping the frames a repair replay hands over again.
+    // discard) and for skipping the frames a repair replay hands over again.
     receivedSeq: Number.isFinite(Number(after)) ? Number(after) : -1,
-    // Frames that arrived beyond a hole, waiting for the replay that fills it.
-    ahead: new Set(),
+    // Highest sequence this tab has ever been offered, contiguous or not. Once the
+    // cursor reaches it the tab has been given everything, holes included.
+    highestSeen: -1,
     gapHeals: 0,
+    // The backend truncated this subscription's replay and is holding the rest
+    // back; the pump asks for the next chunk as the cursor moves.
+    replayPending: false,
+    subscribedAtSeq: Number.isFinite(Number(after)) ? Number(after) : -1,
+    // Reported once per subscription: a watch that cannot catch up says so once.
+    degraded: false,
     pendingApplications: 0,
     // What a hand-off waits for: a byte of this session on the channel.
     delivered: false,
@@ -1349,7 +1457,7 @@ export function unwatchSessionStream(sessionId) {
  * dedicated POST connection for it. Called by inferStream() right after the
  * POST's `init` event, which carries the session id and the sequence baseline.
  */
-function framesHandoff(sessionId, afterSeq, { onMessage, onDone, onError, onApplied }) {
+function framesHandoff(sessionId, afterSeq, { onMessage, onDone, onError, onApplied, onDegrade }) {
   return subscribeSessionStream(
     sessionId,
     (frame, seq, eventName) => onMessage?.(frame, eventName, seq),
@@ -1358,6 +1466,7 @@ function framesHandoff(sessionId, afterSeq, { onMessage, onDone, onError, onAppl
     null,
     afterSeq,
     onApplied ?? null,
+    onDegrade ?? null,
   )
 }
 
