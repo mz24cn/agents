@@ -42,6 +42,7 @@
   import { forkContextWarning } from '../../lib/session-fork.js'
   import { navigate } from '../../lib/router.svelte.js'
   import { sessionRestore, sessionDownload, newSessionCreated, sessionDeleted, sessionForked, currentSession, newSessionRequest, terminalOpen, openSessionLogDir, awaitingUserAnswer, labelSessionRequest } from '../../lib/session-state.svelte.js'
+  import { buildFirstTurnSystemMessages, sourceLabelsForRequest } from '../../lib/label-session-request.js'
   import DownloadProgress from './DownloadProgress.svelte'
   import { collapseSidebar } from '../../lib/sidebar-width.svelte.js'
   import Terminal from '../Terminal.svelte'
@@ -881,6 +882,11 @@
   // 系统提示词：纯文本或模板引用
   let systemPromptText = $state('')          // 纯文本形式
   let systemPromptTemplate = $state(null)    // { template_id, arguments } 形式，非 null 时优先使用
+  // 系统提示词的来源标签：标签节点"发起新会话"写入的聚合概要/记忆带有这个来源
+  // 标记。发请求时随消息一起送出（label_origin + source_labels），后端据此
+  //   * 保证代理系统提示词不会覆盖标签带来的上下文（合并进同一条 system）
+  //   * 把来源标签持久化到新会话（index.json/tree.json），而不只是 UI 上显示
+  let systemPromptOrigin = $state('')
 
   // 工作区文件管理器面板状态
   let workspacePanelOpen = $state(false)
@@ -1156,12 +1162,15 @@
   function handleApplyAsSystem(finalText) {
     systemPromptText = finalText
     systemPromptTemplate = null
+    // 手动"作为系统提示词"不是标签来源：不带来源标记，代理提示词按原语义替换它
+    systemPromptOrigin = ''
     templatePanelOpen = false
   }
 
   function handleApplyAsSystemTemplate(templateId, args) {
     systemPromptTemplate = { template_id: templateId, arguments: args }
     systemPromptText = ''
+    systemPromptOrigin = ''
     templatePanelOpen = false
   }
 
@@ -1188,6 +1197,17 @@
     return meta
   }
 
+  // 首轮请求里的系统消息。标签"发起新会话"写入的系统提示词带 label_origin，
+  // 后端据此知道这条是被标签聚合带来的，必须与所选 AI 代理自己的系统提示词
+  // 合并进同一条 system，而不是被覆盖掉。
+  function firstTurnSystemMessages() {
+    return buildFirstTurnSystemMessages({
+      text: systemPromptText,
+      template: systemPromptTemplate,
+      origin: systemPromptOrigin,
+    })
+  }
+
   function handleSend(text) {
     if (!selectedModelId && selectedAgentIds.length === 0 || isStreaming) return
     errorMsg = ''
@@ -1195,11 +1215,7 @@
     // Only send system message on the first request (no session yet)
     // On subsequent requests, the backend will restore it from session history
     if (!sessionId) {
-      if (systemPromptTemplate) {
-        apiMessages.push({ role: 'system', content: '', prompt_template: systemPromptTemplate.template_id, arguments: systemPromptTemplate.arguments })
-      } else if (systemPromptText) {
-        apiMessages.push({ role: 'system', content: systemPromptText })
-      }
+      apiMessages.push(...firstTurnSystemMessages())
     }
     apiMessages.push({ role: 'user', content: text })
     const pendingUserMsg = { role: 'user', content: text, timestamp: new Date().toISOString().slice(0, 19).replace('T', ' '), meta: currentTurnMeta() }
@@ -1243,11 +1259,7 @@
     const apiMessages = []
     // Only send system message on the first request (no session yet)
     if (!sessionId) {
-      if (systemPromptTemplate) {
-        apiMessages.push({ role: 'system', content: '', prompt_template: systemPromptTemplate.template_id, arguments: systemPromptTemplate.arguments })
-      } else if (systemPromptText) {
-        apiMessages.push({ role: 'system', content: systemPromptText })
-      }
+      apiMessages.push(...firstTurnSystemMessages())
     }
     apiMessages.push({ role: 'user', content: '', prompt_template: templateId, arguments: args })
     const pendingUserMsg = { role: 'user', content: '', timestamp: new Date().toISOString().slice(0, 19).replace('T', ' '), prompt_template: templateId, arguments: args, meta: currentTurnMeta() }
@@ -1405,6 +1417,12 @@
       reqBody.workspace = workspacePath
     }
     reqBody.session_id = sessionId ?? 'new'
+    // 来源标签随"创建会话"的那次请求持久化：后端在 index.json 写 labels、并把
+    // 会话挂到 tree.json 的标签根下，侧栏标签节点下立即能看到这条新会话。
+    // 只在前端 UI 上显示标签是不够的——刷新/重进后就丢了。
+    // 只在创建会话那一次带上：会话已存在时标签已经在 index.json 里了。
+    const sourceLabels = sourceLabelsForRequest({ sessionId, origin: systemPromptOrigin })
+    if (sourceLabels) reqBody.source_labels = sourceLabels
     // 远程执行：remote_env = 子环境 id（后端持久化到 meta.remote_env；
     // 会话工具全部来自子端，保持子端原始工具名）。终端运行在子端，
     // 本地终端注册表没有该状态——后端会问子端 /v1/terminals 自动追加
@@ -2550,6 +2568,8 @@
     shouldScrollToBottom = false
     workspacePath = defaultWorkspacePath
     loadDraftFor(null)
+    // 草稿会话不再属于上一个来源标签；标签"发起新会话"会在其后单独写入
+    systemPromptOrigin = ''
     // 新会话默认本地执行（决策：会话级绑定不跨会话继承）
     selectedRemoteEnvId = ''
     clearRemoteBinding()
@@ -2589,6 +2609,9 @@
     if (memory) parts.push(`【标签「${label}」聚合记忆】\n${memory}`)
     systemPromptText = parts.join('\n\n')
     systemPromptTemplate = null
+    // 来源标记：首轮请求带 label_origin + source_labels，后端把标签上下文与代理
+    // 系统提示词合并进同一条 system，并把来源标签持久化到新建的会话上。
+    systemPromptOrigin = label
     if (config.model_id) {
       selectedModelId = config.model_id
       try { localStorage.setItem(STORAGE_MODEL_KEY, config.model_id) } catch { /* 存储异常不影响套用 */ }
@@ -2950,7 +2973,7 @@
           </button>
           <button class="sp-cancel" onclick={cancelAddAgent}>✕</button>
         {/if}
-        <button class="sp-clear" onclick={() => { systemPromptText = ''; systemPromptTemplate = null; addAgentMode = false }}>✕</button>
+        <button class="sp-clear" onclick={() => { systemPromptText = ''; systemPromptTemplate = null; systemPromptOrigin = ''; addAgentMode = false }}>✕</button>
       </div>
     </div>
   {/if}

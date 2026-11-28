@@ -8,10 +8,21 @@
   import SessionCategoryNode from './SessionCategoryNode.svelte'
   import { locateTerminalEnvNode } from '$lib/terminalChain.js'
   import { parseLabels } from '$lib/labels.js'
+  import { SESSION_FLAGS, sessionFlagLabel, sameFlag } from '$lib/session-flags.js'
+  import { collectLabelCandidates, appendLabelToList } from '$lib/session-label-candidates.js'
+  import {
+    CLIENT_TOOL_STATUS,
+    applyLabelRename,
+    factsFromRow,
+    mergeFacts,
+    projectRow,
+  } from '$lib/session-facts.js'
 
   const SESSION_PAGE_SIZE = 100
 
-  let sessionList = $state([])
+  // 列表接口返回的原始行：只承载"哪些会话属于这个分类的这一页"。标题 / 旗标 /
+  // 标签 / 推理状态不在这里，它们在 sessionFacts 里按 session_id 共享一份（见下）。
+  let sessionRows = $state([])
   let sessionError = $state('')
   let sessionLoading = $state(false)
   let sessionLoadingMore = $state(false)
@@ -83,16 +94,35 @@
   let sessionTerminalTarget = $state(null)   // {node, path}；null=环境无节点
   let sessionTerminalCollapsed = $state(new Set())  // 默认全展开，点击可临时收起
 
-  // 标题设定/生成对话框状态
+  // 「设置标题」「设置标签」两项末尾的 ··· 面板：主区域照常打开对话框，··· 悬停
+  // 打开右侧子面板。旗标面板只做旗标（点选即时保存），标签面板只做候选追加。
+  let sessionFlagMenuOpen = $state(false)
+  let sessionFlagMenuBusy = $state(false)
+  let sessionFlagMenuError = $state('')
+  let sessionLabelsMenuOpen = $state(false)
+  let sessionLabelsMenuBusy = $state(false)
+  let sessionLabelsMenuError = $state('')
+
+  // 标题对话框状态（会话「…」菜单里的「设置标题」）：只有标题输入框，旗标不在这里改。
   let titleDialogOpen = $state(false)
   let titleDialogSid = $state(null)
   let titleDialogValue = $state('')
   let titleDialogLoading = $state(false)
   let titleDialogError = $state('')
   let titleDialogInput = $state(null)
-  // 标签草稿：与模型/工具/AI代理的标签输入同一套 parseLabels 语义
-  // （半角/全角逗号、空白均可分隔）。确认时整组替换会话标签。
-  let titleDialogLabels = $state('')
+
+  // 标签对话框状态（「设置标签」）：只有输入框 + 保存/取消；追加走 ··· 面板，删除
+  // 只能在输入框里改（半角/全角逗号、空白都是分隔符，与模型/工具标签输入同一语义）。
+  let labelsDialogOpen = $state(false)
+  let labelsDialogSid = $state(null)
+  let labelsDialogValue = $state('')
+  let labelsDialogLoading = $state(false)
+  let labelsDialogError = $state('')
+  let labelsDialogInput = $state(null)
+
+  // ··· 标签面板的候选：森林里的全部标签节点（去重 + 稳定排序），缺数据时打开面板
+  // 按需 loadCategoryTree()；点选即追加的当前状态见 menuSessionLabelSet()。
+  const labelCandidates = $derived(collectLabelCandidates(categoryTree))
 
   // hover 弹出菜单状态：鼠标悬停到 ... 按钮即弹出，悬停在菜单上保持显示
   let hoverBtnId = $state(null)   // 当前鼠标悬停的 ... 按钮 session id
@@ -104,52 +134,147 @@
   let dragStartX = 0        // mousedown 时的 clientX
   let dragStartWidth = 0    // mousedown 时的侧边栏宽度
 
-  // --- Session Status Stream ---
-  // Maps session_id -> status string from SSE events
-  let sessionStatuses = $state({})
+  // --- 会话权威事实（Session Facts / Session Status Stream）---------------------
+  // 同一个 session 会同时挂在「主题分类 / 工作区目录 / 标签 / 历史月份」等多个列表下：
+  // 每个列表各自分页、各自刷新，而 SSE 的状态事件与 init 快照根本不区分分类。标题、
+  // 旗标、标签、推理状态一旦只写回"当前这一行的副本"，同一会话在不同分类里的副本就会
+  // 各自漂移 —— 在主题下改完名切到标签页仍是旧名；某个分类里晚到的列表响应会把另一个
+  // 分类刚收到的 streaming / client_tool_calls 盖回上一轮的 done_success_unread。
+  // 服务端的权威同样只有一份（index.json 的元数据 + 内存里的 _session_statuses），所以
+  // 前端也只维护一份按 session_id 索引的事实，列表行只是它在"某分类某页"下的投影：
+  // 切分类、翻页、SSE、刷新快照读写的是同一份。字段级胜出规则（新值赢旧值、用户改名
+  // 不被自动标题降级、快照不许倒退实时状态）在 $lib/session-facts.js 的 mergeFacts 里，
+  // 纯函数、可脱离组件单测。
+  // 共享事实字典：session_id -> 权威事实。用普通对象而不是 Map —— Svelte 的 $state
+  // 对「对象属性写入 / 删除」的追踪是可靠的，而 Map.set() 不会让只读 .get() 的派生值
+  // 重算（svelte 5.55 实测）：事实改了、行却不改，正是「切分类不一致」的来源之一。
+  let sessionFacts = $state({})
+  // 「某个 key 首次写入」这种新增属性同样可能不在派生依赖里，投影显式读这个版本号：
+  // 每次写事实都 bump，保证「事实变了，行一定重算」。
+  let factsRev = $state(0)
+  // 渲染入口：所有读取都走这份投影，切换分类 / 翻页 / 搜索时同一会话自动带上新事实。
+  let sessionList = $derived(projectSessionRows())
+
+  function factKey(id) { return String(id ?? '') }
+
+  function projectSessionRows() {
+    void factsRev   // 依赖事实版本号，见上
+    return sessionRows.map(row => projectRow(row, sessionFacts[factKey(row.session_id)] ?? null))
+  }
   // 本次页面会话内「衍生会话 -> 原会话 ID」的记录，仅用于在条目前显示来源标记。
-  // 普通 Map 即可：写入时机总在 sessionList 重新赋值之前，渲染时读取即可见。
+  // 普通 Map 即可：写入时机总在 sessionRows 重新赋值之前，渲染时读取即可见。
   const forkParents = new Map()
 
-  function _applyStatusToSessionList(sid, status) {
-    sessionStatuses[sid] = status
-    const idx = sessionList.findIndex(s => s.session_id === sid)
-    if (idx >= 0) {
-      // Update existing entry's status
-      sessionList = sessionList.map(s =>
-        s.session_id === sid ? { ...s, _status: status } : s
-      )
-    } else if (status === 'streaming' && !(directoryOpen && selectedCategory)) {
-      // New session detected via SSE before newSessionCreated fires —
-      // add it immediately so the user sees it during inference.
-      // Title is a placeholder (session_id); it will be updated by
-      // the newSessionCreated effect or a title_update SSE event.
-      sessionList = [{ session_id: sid, title: sid, _status: status }, ...sessionList]
+  /**
+   * 写入一个会话的权威事实。``at`` 是这条事实的"可采信时刻"：SSE 用收到时刻、用户
+   * 写入用服务端确认时刻、列表 / 快照响应用**请求发起时刻**（响应不可能比它自己的
+   * 请求更早，晚到的旧响应因此天然输给请求期间到达的事件）。
+   */
+  function patchFacts(sid, patch, opts = {}) {
+    if (!sid || !patch) return
+    // 第三个参数可以简写成来源字符串（'user' | 'sse' | 'snapshot' | 'local'），
+    // 也可以传 { at, kind }：列表/快照必须显式带"请求发起时刻"。
+    const options = typeof opts === 'string' ? { kind: opts } : (opts || {})
+    const at = Number(options.at) || Date.now()
+    const next = mergeFacts(
+      sessionFacts[factKey(sid)],
+      { ...patch, updatedAt: at, statusAt: options.statusAt || at },
+      { session_id: sid, at, kind: options.kind || 'user' },
+    )
+    if (next) {
+      sessionFacts[factKey(sid)] = next
+      factsRev += 1
+    }
+  }
+
+  /** 列表 / 快照响应整批种进事实表：整页共用"请求发起时刻"。 */
+  function seedFacts(rows, requestedAt) {
+    for (const row of rows || []) {
+      const patch = factsFromRow(row)
+      if (!patch) continue
+      patchFacts(row.session_id, patch, { at: requestedAt, kind: 'snapshot' })
+    }
+  }
+
+  /**
+   * 会话被确认不存在（删除成功 / 下载拿到 404）：从当前页与所有分类缓存里一并移除，
+   * 并清掉共享事实。只删当前分类那一行会留下"历史里没了、工作区里还在"的不一致。
+   */
+  function forgetSession(sessionId) {
+    if (!sessionId) return
+    sessionRows = sessionRows.filter(row => row.session_id !== sessionId)
+    delete sessionFacts[factKey(sessionId)]
+    factsRev += 1
+    for (const [key, view] of Array.from(categorySessionViews.entries())) {
+      if (!Array.isArray(view?.rows)) continue
+      if (!view.rows.some(row => row?.session_id === sessionId)) continue
+      categorySessionViews.set(key, {
+        ...view,
+        rows: view.rows.filter(row => row.session_id !== sessionId),
+      })
+    }
+    if (Array.isArray(recentSessionView?.rows)
+        && recentSessionView.rows.some(row => row?.session_id === sessionId)) {
+      recentSessionView = {
+        ...recentSessionView,
+        rows: recentSessionView.rows.filter(row => row.session_id !== sessionId),
+      }
+    }
+  }
+
+  /**
+   * 标签改名后同步事实层：同一会话在任何分类下都立即显示新标签；目标标签已存在时
+   * 按后端的同名合并语义去重（顺序保持不变，列表不跳）。原始行与分类缓存里可能还
+   * 残留旧标签（facts 尚未建立时），一并改写。
+   */
+  function renameLabelInFacts(from, to) {
+    if (!from || !to || from === to) return
+    let touched = false
+    for (const sid of Object.keys(sessionFacts)) {
+      const facts = sessionFacts[sid]
+      if (!Array.isArray(facts?.labels) || !facts.labels.includes(from)) continue
+      sessionFacts[sid] = {
+        ...facts,
+        labels: applyLabelRename(facts.labels, from, to),
+        updatedAt: Date.now(),
+      }
+      touched = true
+    }
+    if (touched) factsRev += 1
+    const fix = rows => (rows || []).map(row => (
+      Array.isArray(row?.labels) && row.labels.includes(from)
+        ? { ...row, labels: applyLabelRename(row.labels, from, to) }
+        : row
+    ))
+    sessionRows = fix(sessionRows)
+    for (const [key, view] of Array.from(categorySessionViews.entries())) {
+      if (Array.isArray(view?.rows)) {
+        categorySessionViews.set(key, { ...view, rows: fix(view.rows) })
+      }
+    }
+    if (Array.isArray(recentSessionView?.rows)) {
+      recentSessionView = { ...recentSessionView, rows: fix(recentSessionView.rows) }
+    }
+  }
+
+  /** 状态事件（SSE 实时事件与 init 快照）→ 权威事实。 */
+  function applySessionStatus(sid, status) {
+    if (!sid || typeof status !== 'string' || !status) return
+    patchFacts(sid, { status }, { kind: 'sse' })
+    // 推理中的新会话：SSE 会早于 newSessionCreated 到达，先补一行占位，标题由
+    // title_update 或随后的列表刷新补全，否则用户看不到"正在推理"的会话。
+    if (status === 'streaming' && !(directoryOpen && selectedCategory)
+        && !sessionRows.some(row => row.session_id === sid)) {
+      sessionRows = [{ session_id: sid, title: sid }, ...sessionRows]
     }
   }
 
   // 经 SSE 收到的权威标题（title_update / 终态 done_* 事件 / init 快照）。
-  // 应用整表列表响应时与请求发起时间比较，防止陈旧响应（在标题生成完成
-  // 前取数）覆盖更新的 SSE 标题，让临时用户消息标题残留到刷新页面。
-  // sid -> { title, titleGiven: boolean|null, at: number }
-  let sseTitles = {}
-
+  // 事实按 session_id 共享，所以一个标题同时生效于所有分类下的条目；用户手填过的
+  // 标题不会被这里回填的自动标题降级（胜出规则见 session-facts.js 的 mergeFacts）。
   function applySseTitle(sid, title, titleGiven) {
     if (!sid || !title) return
-    sseTitles[sid] = {
-      title,
-      titleGiven: typeof titleGiven === 'boolean' ? titleGiven : null,
-      at: Date.now(),
-    }
-    sessionList = sessionList.map(s =>
-      s.session_id === sid
-        ? {
-            ...s,
-            title,
-            title_given: typeof titleGiven === 'boolean' ? titleGiven : s.title_given,
-          }
-        : s
-    )
+    patchFacts(sid, { title, titleGiven }, { kind: 'sse' })
   }
 
   let _unsubscribeSessionEvents = null
@@ -159,21 +284,25 @@
     _unsubscribeSessionEvents = subscribeSessionEvents(
       (data) => {
         if (data.event === 'init') {
-          // Merge all statuses from init snapshot
+          // init 快照：一次种进服务端当前的全部状态与权威标题。重连后错过的
+          // 事件（包括别的标签页触发的推理）都由这里补齐，且不区分分类。
           const sids = data.sessions || {}
           const titles = data.titles || {}
           for (const [sid, status] of Object.entries(sids)) {
-            _applyStatusToSessionList(sid, status)
+            applySessionStatus(sid, status)
             // init 快照附带权威标题：重连后补回那些错过了终态事件的
             // 会话的侧边栏标题。
             const info = titles[sid]
             if (info && info.title) applySseTitle(sid, info.title, info.title_given)
           }
         } else if (data.event === 'message') {
-          _applyStatusToSessionList(data.session_id, data.status)
+          applySessionStatus(data.session_id, data.status)
           // 终态事件携带后端权威标题（AI 生成或原始标题）：推理结束后
           // 恢复侧边栏条目的标题，避免临时用户消息标题残留到刷新页面。
-          if (data.title && typeof data.status === 'string' && data.status.startsWith('done_')) {
+          // client_tool_calls 也带标题（后端同样从 index.json 取），等待中的
+          // 蓝色条目同样要在每个分类显示同一个标题。
+          if (data.title && typeof data.status === 'string'
+              && (data.status.startsWith('done_') || data.status === CLIENT_TOOL_STATUS)) {
             applySseTitle(data.session_id, data.title, data.title_given)
           }
         } else if (data.event === 'title_update') {
@@ -203,9 +332,11 @@
    * Combines status with active state.
    */
   function getSessionStatusClass(entry) {
-    const status = entry._status || sessionStatuses[entry.session_id] || ''
+    const status = entry._status || ''
     if (status === 'streaming') return 'status-streaming'
     if (status === 'paused') return 'status-paused'
+    // 等待客户端工具回传：蓝色，既不是"推理中"的橙色也不是"已成功结束"的绿色。
+    if (status === CLIENT_TOOL_STATUS) return 'status-client-tool'
     if (status === 'done_success_unread') return 'status-done-success-unread'
     if (status === 'done_error_unread') return 'status-done-error-unread'
     return ''
@@ -225,9 +356,9 @@
     if (append && (!sessionHasMore || sessionLoading || sessionLoadingMore)) return
 
     const requestToken = ++sessionLoadToken
-    // 请求发起时刻：用于与 SSE 标题的接收时间比较——若请求期间收到更新的
-    // SSE 标题（title_update / 终态 done 事件），说明响应可能在标题生成
-    // 完成前取数，属于陈旧数据。
+    // 请求发起时刻：一份响应不可能比它自己的请求更早，所以这个时刻就是这份快照
+    // 的"可采信上界"。事实按这个时刻写入，晚到的旧响应自然输给请求期间到达的
+    // SSE 事件（标题与状态都是同一套规则，见 session-facts.js 的 mergeFacts）。
     const requestedAt = Date.now()
     const requestedCategory = directoryOpen ? selectedCategory : ''
     const requestedSearch = activeSearchQuery
@@ -238,7 +369,7 @@
       sessionLoading = true
       sessionPage = 1
       sessionHasMore = true
-      sessionList = []
+      sessionRows = []
     }
     sessionError = ''
     try {
@@ -246,43 +377,26 @@
         ? await sessions.search(requestedSearch, nextPage, SESSION_PAGE_SIZE)
         : await sessions.list(nextPage, SESSION_PAGE_SIZE, requestedCategory)
       if (requestToken !== sessionLoadToken) return
-      // A list response contains persisted metadata but no live inference
-      // status. Preserve the SSE snapshot/events that may have arrived while
-      // this request was in flight; otherwise replacing sessionList briefly or
-      // permanently drops the streaming style.
-      const incoming = (data.sessions ?? []).map(entry => {
-        // 请求发起后经 SSE 收到更新的标题时优先使用它，避免陈旧响应
-        // 把已恢复的权威标题覆盖回临时用户消息标题。
-        const live = sseTitles[entry.session_id]
-        const liveFresh = live && live.at > requestedAt
-        return {
-          ...entry,
-          title: liveFresh ? live.title : entry.title,
-          title_given: liveFresh && live.titleGiven !== null
-            ? live.titleGiven
-            : entry.title_given,
-          _status: sessionStatuses[entry.session_id]
-            || sessionList.find(current => current.session_id === entry.session_id)?._status
-            || entry._status
-            // 持久化回退：服务重启或全新页面加载时没有 SSE 实时状态，
-            // index.json 里持久化的 paused 标记必须接管，否则暂停中的会话
-            // 与“结束且已读”的会话毫无区别，极易被忽略。
-            || (entry.status === 'paused' ? 'paused' : undefined),
-        }
-      })
+      // 列表响应带的是持久化元数据 + 取数那一刻的状态覆盖（_status）。先把整页
+      // 种进按 session_id 共享的权威事实，再只更新"本分类这一页"的原始行：事实层
+      // 已经记住的更新值（请求期间到达的 streaming / client_tool_calls / 用户改名）
+      // 不会被这份快照抹掉，反过来快照也不会保留已经作废的旧标题。
+      const incoming = (data.sessions ?? []).map(entry => ({ ...entry }))
+      seedFacts(incoming, requestedAt)
       if (append) {
-        sessionList = mergeSessionLists(sessionList, incoming)
+        sessionRows = mergeSessionLists(sessionRows, incoming)
       } else {
         // A just-created inference is announced as streaming before its initial
         // user message has necessarily reached conversation.json/session index.
         // Keep those SSE-only rows until a later list response can supply the
         // persisted title and metadata.
         const incomingIds = new Set(incoming.map(entry => entry.session_id))
-        const liveOnly = requestedCategory ? [] : sessionList.filter(entry =>
+        const liveOnly = requestedCategory ? [] : sessionRows.filter(entry =>
           !incomingIds.has(entry.session_id)
-          && (sessionStatuses[entry.session_id] === 'streaming' || entry._status === 'streaming')
+          && (entry._status === 'streaming'
+              || sessionFacts[factKey(entry.session_id)]?.status === 'streaming')
         )
-        sessionList = [...liveOnly, ...incoming]
+        sessionRows = [...liveOnly, ...incoming]
       }
       sessionPage = data.page ?? nextPage
       sessionHasMore = Boolean(data.has_more)
@@ -324,7 +438,10 @@
 
   function currentSessionView() {
     return {
-      sessionList: sessionList.map(entry => ({ ...entry })),
+      // 缓存"这个分类看哪几行、什么顺序、翻到第几页"——不缓存标题/旗标/标签/状态：
+      // 那些是按 session_id 共享的权威事实，切回本分类时重新投影，别处改名/进入
+      // 推理后这里自然一致（旧实现把整行含标题一起缓存，切回来就是陈旧副本）。
+      rows: sessionRows.map(entry => ({ ...entry })),
       sessionError,
       sessionPage,
       sessionHasMore,
@@ -345,7 +462,7 @@
   async function restoreSessionView(view) {
     if (!view?.loaded) return false
     sessionLoadToken++
-    sessionList = view.sessionList.map(entry => ({ ...entry }))
+    sessionRows = (view.rows ?? []).map(entry => ({ ...entry }))
     sessionError = view.sessionError || ''
     sessionPage = view.sessionPage || 1
     sessionHasMore = Boolean(view.sessionHasMore)
@@ -498,7 +615,7 @@
 
   function clearSessionListState() {
     sessionLoadToken++
-    sessionList = []
+    sessionRows = []
     sessionError = ''
     sessionPage = 1
     sessionHasMore = false
@@ -648,7 +765,7 @@
       // 都只是这一次传输坏了，会话在磁盘上好好的。曾经一次 501 让侧边栏条目
       // 当场消失、刷新又回来 —— 前端不能凭一次失败的传输状态删除 UI 状态。
       if (err.status === 404) {
-        sessionList = sessionList.filter(s => s.session_id !== sessionId)
+        forgetSession(sessionId)
       }
     } finally {
       clearTimeout(progressDelay)
@@ -686,6 +803,12 @@
       sessionDirectoryMenuLoading = false
       sessionDirectoryMenuError = ''
       menuSessionDirectories = []
+      sessionFlagMenuOpen = false
+      sessionFlagMenuBusy = false
+      sessionFlagMenuError = ''
+      sessionLabelsMenuOpen = false
+      sessionLabelsMenuBusy = false
+      sessionLabelsMenuError = ''
     }
     menuOpenId = sid
   }
@@ -716,6 +839,12 @@
     sessionTerminalError = ''
     sessionTerminalTarget = null
     sessionTerminalCollapsed = new Set()
+    sessionFlagMenuOpen = false
+    sessionFlagMenuBusy = false
+    sessionFlagMenuError = ''
+    sessionLabelsMenuOpen = false
+    sessionLabelsMenuBusy = false
+    sessionLabelsMenuError = ''
     hoverBtnId = null
     hoverMenuId = null
     if (closeTimer) {
@@ -882,6 +1011,11 @@
     void executionAnalysisLoading
     void executionAnalysisError
     void executionAnalysisData
+    void sessionFlagMenuOpen
+    void sessionFlagMenuError
+    void sessionLabelsMenuOpen
+    void sessionLabelsMenuError
+    void labelCandidates.length
     void clampMenuIntoView()
   })
 
@@ -895,6 +1029,8 @@
     void sessionDirectoryMenuOpen
     void executionAnalysisOpen
     void sessionTerminalMenuOpen
+    void sessionFlagMenuOpen
+    void sessionLabelsMenuOpen
     applySubmenuPlacement()
   })
 
@@ -938,6 +1074,8 @@
     userMessageMenuOpen = false
     sessionDirectoryMenuOpen = false
     sessionTerminalMenuOpen = false
+    sessionFlagMenuOpen = false
+    sessionLabelsMenuOpen = false
     executionAnalysisOpen = true
     executionAnalysisLoading = true
     executionAnalysisError = ''
@@ -990,6 +1128,8 @@
     userMessageMenuOpen = false
     executionAnalysisOpen = false
     sessionTerminalMenuOpen = false
+    sessionFlagMenuOpen = false
+    sessionLabelsMenuOpen = false
     sessionDirectoryMenuOpen = true
     sessionDirectoryMenuLoading = true
     sessionDirectoryMenuError = ''
@@ -1043,6 +1183,8 @@
     sessionDirectoryMenuOpen = false
     executionAnalysisOpen = false
     sessionTerminalMenuOpen = false
+    sessionFlagMenuOpen = false
+    sessionLabelsMenuOpen = false
     userMessageMenuOpen = true
     userMessageMenuLoading = true
     userMessageMenuError = ''
@@ -1128,6 +1270,8 @@
     userMessageMenuOpen = false
     sessionDirectoryMenuOpen = false
     executionAnalysisOpen = false
+    sessionFlagMenuOpen = false
+    sessionLabelsMenuOpen = false
     sessionTerminalMenuOpen = true
     sessionTerminalLoading = true
     sessionTerminalError = ''
@@ -1308,6 +1452,52 @@
     }
   }
 
+  // 重命名标签：改名传播到携带该标签的全部会话（后端同步 index.json/tree.json
+  // 与标签聚合文档）。前端只校验"单个标签名"这一条（与后端 clean_label 同规则），
+  // 其余规则留在后端，避免两侧漂移。
+  const LABEL_SEPARATOR_RE = /[,，;；\s]/
+  let labelRenameDialog = $state(null)   // { from, to, error, busy }
+
+  function openLabelRenameDialog() {
+    const m = labelMenu
+    closeLabelMenu()
+    if (!m) return
+    labelRenameDialog = { from: m.label, to: m.label, error: '', busy: false }
+  }
+
+  function closeLabelRenameDialog() {
+    if (labelRenameDialog) labelRenameDialog = null
+  }
+
+  async function submitLabelRename() {
+    const d = labelRenameDialog
+    if (!d || d.busy) return
+    const from = String(d.from || '').trim()
+    const to = String(d.to || '').trim()
+    if (!to || LABEL_SEPARATOR_RE.test(to)) {
+      d.error = t('labelRenameInvalid')
+      return
+    }
+    if (to === from) {
+      // 同名 = 空操作，不打扰后端
+      closeLabelRenameDialog()
+      return
+    }
+    d.busy = true
+    try {
+      const res = await sessions.renameLabel(from, to)
+      closeLabelRenameDialog()
+      // 事实层里的标签立即改写：同一会话在任何分类下都同时显示新标签，不等刷新。
+      renameLabelInFacts(from, to)
+      setLabelStatus(t('labelRenameDone', { from, to, count: res?.session_count ?? 0 }))
+      // 标签根与其下会话都变了：强制重建分类树，旧标签节点随之消失
+      void loadCategoryTree(true)
+    } catch (err) {
+      d.error = err?.message || t('labelRenameFailed')
+      d.busy = false
+    }
+  }
+
   function closeTerminalMenu() {
     if (terminalMenu) terminalMenu = null
   }
@@ -1440,9 +1630,113 @@
     }
   }
 
-  // "设置标题与标签"：弹出对话框，标题与标签各自预填当前值。
-  // 标题留空确定 = 走模型生成标题的原逻辑；非空确定 = 人工设定标题。
-  // 标签整组替换（空 = 清空），编辑分隔符语义与模型/工具/AI代理一致。
+  // --- 「设置标题」/「设置标签」两项末尾 ··· 的右侧子面板 ---------------------------
+  // 复用「用户消息 / 所属目录 / 终端」那套 ··· 模式：入口是菜单项右侧的 ···，面板
+  // fixed 挂在菜单右边，视口边缘的定位与向上翻转仍由 applySubmenuPlacement +
+  // submenuStyle 计算（面板是 .session-dropdown 的 DOM 子节点，鼠标从 ··· 移到面板
+  // 不会触发菜单的 mouseleave，所以不会中途关掉；键盘 Enter/Space 走 onclick 同样能开）。
+  function openSessionFlagMenu(e, sessionId) {
+    e.stopPropagation()
+    cancelClose()
+    if (!sessionId || menuOpenId !== sessionId || sessionFlagMenuOpen) return
+    applySubmenuPlacement()
+    userMessageMenuOpen = false
+    sessionDirectoryMenuOpen = false
+    sessionTerminalMenuOpen = false
+    executionAnalysisOpen = false
+    sessionLabelsMenuOpen = false
+    sessionLabelsMenuError = ''
+    sessionFlagMenuError = ''
+    sessionFlagMenuOpen = true
+  }
+
+  async function openSessionLabelsMenu(e, sessionId) {
+    e.stopPropagation()
+    cancelClose()
+    if (!sessionId || menuOpenId !== sessionId || sessionLabelsMenuOpen) return
+    applySubmenuPlacement()
+    userMessageMenuOpen = false
+    sessionDirectoryMenuOpen = false
+    sessionTerminalMenuOpen = false
+    executionAnalysisOpen = false
+    sessionFlagMenuOpen = false
+    sessionFlagMenuError = ''
+    sessionLabelsMenuError = ''
+    sessionLabelsMenuOpen = true
+    // 候选来自森林里的全部标签节点。用户可能从没打开过「所属目录」面板，那时 tree
+    // 还没拉过 —— 这里按需补一次（非 force：有缓存就直接复用，不重复请求）。
+    await loadCategoryTree()
+    if (menuOpenId !== sessionId || !sessionLabelsMenuOpen) return
+    if (categoryTreeError && categoryTree.length === 0) {
+      // 候选一条都取不到时才插横幅说明原因（默默显示空面板会让用户以为「没有标签」）；
+      // 树里已有候选时，不必为了一次失败的刷新在面板顶部挂红字。
+      sessionLabelsMenuError = `${t('labelCandidatesLoadFailed')}: ${categoryTreeError}`
+    }
+  }
+
+  // ··· 面板里要标的当前状态一律从共享事实投影出来的 sessionList 读：所以在别的分类
+  // 改过、或 SSE 推过之后，面板里的选中态也跟着变。
+  function menuSessionRow() {
+    if (menuOpenId === null) return null
+    return sessionList.find(s => s.session_id === menuOpenId) || null
+  }
+  function menuSessionFlag() {
+    return sessionFlagLabel(menuSessionRow()?.flag)
+  }
+  function menuSessionLabelSet() {
+    const labels = menuSessionRow()?.labels
+    return new Set((Array.isArray(labels) ? labels : []).map(x => String(x).trim()))
+  }
+
+  // 点旗标 = 立刻落盘：先请求、成功之后才写共享事实（失败不乐观显示），写完 factsRev
+  // 递增 → 所有分类下的同一条目和面板里的选中态一起更新。再点当前旗标不写盘，
+  // 清除旗标只能选「无旗标」。
+  async function handleSessionFlagPick(e, flag) {
+    e.stopPropagation()
+    const sid = menuOpenId
+    if (!sid || sessionFlagMenuBusy) return
+    if (sameFlag(menuSessionFlag(), flag)) return
+    sessionFlagMenuBusy = true
+    sessionFlagMenuError = ''
+    try {
+      const result = await sessions.setFlag(sid, flag)
+      patchFacts(sid, { flag: typeof result?.flag === 'string' ? result.flag : flag }, 'user')
+    } catch (err) {
+      if (menuOpenId === sid) sessionFlagMenuError = err.message || t('sessionFlagMenuFailed')
+    } finally {
+      if (menuOpenId === sid) sessionFlagMenuBusy = false
+    }
+  }
+
+  // 点候选 = 在当前会话的标签后面追加一个并落盘。setLabels 是「整组替换」语义，所以
+  // 基准值必须取共享事实里的最新数组：连续点选不会把刚加上的那些丢掉（每次都是
+  // 最新数组 + 新标签）。已持有的标签点击原样返回 → 既不重复也不删除，也不发请求；
+  // 删除标签只能在「设置标签」对话框里改输入框再保存。
+  async function handleSessionLabelPick(e, label) {
+    e.stopPropagation()
+    const sid = menuOpenId
+    if (!sid || sessionLabelsMenuBusy) return
+    const entry = sessionList.find(s => s.session_id === sid)
+    const current = Array.isArray(entry?.labels) ? entry.labels : []
+    const next = appendLabelToList(current, label)
+    if (next.length === current.length) return
+    sessionLabelsMenuBusy = true
+    sessionLabelsMenuError = ''
+    try {
+      const result = await sessions.setLabels(sid, next)
+      const saved = Array.isArray(result?.labels) ? result.labels : next
+      patchFacts(sid, { labels: saved }, 'user')
+      // 刷新森林（新标签立刻成为候选）+ 标签模式下的会话列表
+      await refreshTreeAndLabelView()
+    } catch (err) {
+      if (menuOpenId === sid) sessionLabelsMenuError = err.message || t('setLabelsFailed')
+    } finally {
+      if (menuOpenId === sid) sessionLabelsMenuBusy = false
+    }
+  }
+
+  // 「设置标题」：只改标题（留空确定 = 模型生成；非空确定 = 人工设定）。
+  // 旗标不在这里改，它走上面「设置标题」项末尾 ··· 的旗标面板 + /flag。
   function handleOpenTitleDialog(e, sid) {
     e.stopPropagation()
     closeMenu()
@@ -1451,7 +1745,6 @@
     const current = entry?.title
     titleDialogSid = sid
     titleDialogValue = current && current !== sid ? current : ''
-    titleDialogLabels = (entry?.labels || []).join(', ')
     titleDialogError = ''
     titleDialogLoading = false
     titleDialogOpen = true
@@ -1475,29 +1768,23 @@
     const sid = titleDialogSid
     if (!sid) return
     const title = titleDialogValue.trim()
-    // parseLabels：与模型/工具/AI代理标签输入完全相同的分隔与清洗语义。
-    const labels = parseLabels(titleDialogLabels)
     titleDialogLoading = true
     titleDialogError = ''
     try {
-      const result = await sessions.generateTitle(sid, title, labels)
+      // labels 传 null：请求体不带 labels 键；旗标一概不碰（连响应回传的 flag 也不写
+      // 回事实）—— 旗标只有 ··· 面板与 SSE 两个写入方，免得旧响应把新旗标退回旧值。
+      const result = await sessions.generateTitle(sid, title, null)
       if (result && result.status === 'success') {
-        // 更新本地列表中的标题与标签
-        const nextLabels = Array.isArray(result.labels) ? result.labels : labels
-        sessionList = sessionList.map(s =>
-          s.session_id === sid
-            ? { ...s, title: result.title, title_given: !!result.title_given, labels: nextLabels }
-            : s
-        )
+        const titleGiven = typeof result.title_given === 'boolean'
+          ? result.title_given
+          : Boolean(title)
+        patchFacts(sid, {
+          title: result.title,
+          titleGiven,
+          ...(Array.isArray(result.labels) ? { labels: result.labels } : {}),
+        }, 'user')
         // 标签根挂载已在后端同步；刷新森林，并让标签模式下的会话列表即时对齐
-        await loadCategoryTree(true)
-        if (viewMode === 'labels' && selectedCategory) {
-          const labelsRootNow = findRootByKind(categoryTree, 'labels')
-          const stillMounted = (labelsRootNow?.children || [])
-            .some(c => c && String(c.id) === String(selectedCategory).split('/')[1])
-          if (stillMounted) await loadSessions()
-          else { selectedCategory = ''; clearSessionListState() }
-        }
+        await refreshTreeAndLabelView()
       }
       titleDialogOpen = false
       titleDialogSid = null
@@ -1515,6 +1802,82 @@
     } else if (e.key === 'Escape') {
       e.preventDefault()
       closeTitleDialog()
+    }
+  }
+
+  // 「设置标签」对话框：只有输入框 + 保存/取消（候选列表已挪到 ··· 面板，点选即追加）。
+  // 保存 = 整组替换（走 /labels 专用接口，后端只写 labels 并同步树里所有分类副本），
+  // 标题与旗标一概不动；要删标签就在输入框里删掉再保存。
+  function handleOpenLabelsDialog(e, sid) {
+    e.stopPropagation()
+    closeMenu()
+    if (labelsDialogOpen && labelsDialogSid === sid) return
+    const entry = sessionList.find(s => s.session_id === sid)
+    labelsDialogSid = sid
+    labelsDialogValue = (entry?.labels || []).join(', ')
+    labelsDialogError = ''
+    labelsDialogLoading = false
+    labelsDialogOpen = true
+    tick().then(() => {
+      if (labelsDialogInput) {
+        labelsDialogInput.focus()
+        labelsDialogInput.select()
+      }
+    })
+  }
+
+  function closeLabelsDialog() {
+    if (labelsDialogLoading) return
+    labelsDialogOpen = false
+    labelsDialogSid = null
+    labelsDialogValue = ''
+    labelsDialogError = ''
+  }
+
+  function handleLabelsDialogKeydown(e) {
+    if (e.key === 'Enter') {
+      e.preventDefault()
+      confirmLabelsDialog()
+    } else if (e.key === 'Escape') {
+      e.preventDefault()
+      closeLabelsDialog()
+    }
+  }
+
+  async function confirmLabelsDialog() {
+    if (labelsDialogLoading) return
+    const sid = labelsDialogSid
+    if (!sid) return
+    // parseLabels：与模型/工具/AI代理标签输入完全相同的分隔与清洗语义
+    const labels = parseLabels(labelsDialogValue)
+    labelsDialogLoading = true
+    labelsDialogError = ''
+    try {
+      const result = await sessions.setLabels(sid, labels)
+      const nextLabels = Array.isArray(result?.labels) ? result.labels : labels
+      // 只更新 labels：标题与旗标保持原样（后端这条路径也不会改它们）。走共享事实，
+      // 于是标签模式里刚挂载/摘掉的根、以及其它分类下的同一条目都同步。
+      patchFacts(sid, { labels: nextLabels }, 'user')
+      await refreshTreeAndLabelView()
+      labelsDialogOpen = false
+      labelsDialogSid = null
+      labelsDialogValue = ''
+    } catch (err) {
+      labelsDialogError = err.message || t('setLabelsFailed')
+    } finally {
+      labelsDialogLoading = false
+    }
+  }
+
+  // 标题 / 标签写回后刷新森林，并让标签模式下的会话列表即时对齐
+  async function refreshTreeAndLabelView() {
+    await loadCategoryTree(true)
+    if (viewMode === 'labels' && selectedCategory) {
+      const labelsRootNow = findRootByKind(categoryTree, 'labels')
+      const stillMounted = (labelsRootNow?.children || [])
+        .some(c => c && String(c.id) === String(selectedCategory).split('/')[1])
+      if (stillMounted) await loadSessions()
+      else { selectedCategory = ''; clearSessionListState() }
     }
   }
 
@@ -1541,7 +1904,7 @@
     if (!confirm(t(hasTitle ? 'confirmDeleteSession' : 'confirmDeleteSessionById', { title, id: sid }))) return
     try {
       await sessions.delete(sid)
-      sessionList = sessionList.filter(s => s.session_id !== sid)
+      forgetSession(sid)
       // 通知 ChatPage 同步清空右侧面板
       if (currentSession.sessionId === sid) {
         sessionDeleted.sessionId = sid
@@ -1651,15 +2014,13 @@
         // 避免破坏当前过滤结果；清空搜索后会正常显示所有会话。
         const searchable = `${title} ${firstMsg || ''} ${sid}`.toLowerCase()
         if (!(directoryOpen && selectedCategory) && (!activeSearchQuery || searchable.includes(activeSearchQuery.toLowerCase()))) {
-          sessionList = [{ session_id: sid, title }, ...sessionList]
+          sessionRows = [{ session_id: sid, title }, ...sessionRows]
         }
-      } else {
-        // Session already in list (added by SSE streaming event with placeholder
-        // title). Update the title with the proper one from onInit.
-        sessionList = sessionList.map(s =>
-          s.session_id === sid ? { ...s, title } : s
-        )
       }
+      // 标题走共享事实（条目已由 SSE streaming 事件插过占位行时也要补上真标题）。
+      // 这是 ChatPage 的本地乐观值（首条用户消息），不是服务端事实：kind='local'
+      // 保证它不会冒充"用户手填标题"去挡住后续服务端自动标题。
+      patchFacts(sid, { title }, 'local')
       // 重置状态，避免重复处理
       newSessionCreated.sessionId = null
       newSessionCreated.firstUserMessage = null
@@ -1682,10 +2043,12 @@
       // 时插入，避免破坏当前过滤结果。
       const searchable = `${title} ${sid}`.toLowerCase()
       if (!(directoryOpen && selectedCategory) && (!activeSearchQuery || searchable.includes(activeSearchQuery.toLowerCase()))) {
-        sessionList = [{ session_id: sid, title }, ...sessionList]
+        sessionRows = [{ session_id: sid, title }, ...sessionRows]
       }
     }
     // 消费掉信号：失败也消费，避免反复重试同一个 fork 结果。
+    // 衍生会话的标题由服务端写进 index.json（title_given=true），按权威事实记录。
+    patchFacts(sid, { title, titleGiven: true }, 'user')
     sessionForked.sessionId = null
     sessionForked.parentSessionId = null
     sessionForked.title = null
@@ -1741,6 +2104,38 @@
     <button class="terminal-node-menu-item" role="menuitem" onclick={runLabelNewSession}>
       <span class="menu-emoji">✨</span>{t('labelNewSession')}
     </button>
+    <!-- 菜单项就叫「重命名」（用户要求），对话框里才说明是「重命名标签」 -->
+    <button class="terminal-node-menu-item" role="menuitem" onclick={openLabelRenameDialog}>
+      <span class="menu-emoji">✏️</span>{t('rename')}
+    </button>
+  </div>
+{/if}
+
+<!-- 标签重命名对话框：改名传播到携带该标签的全部会话；聚合文档只在成员集合没变时
+     搬迁，并入已有标签时旧标签与目标标签两边一起作废（下次发起会话自动重算） -->
+{#if labelRenameDialog}
+  <div class="terminal-layer-backdrop" onclick={closeLabelRenameDialog}>
+    <div class="terminal-layer-dialog" role="dialog" aria-modal="true" onclick={(e) => e.stopPropagation()}>
+      <div class="terminal-layer-title">{t('labelRenameTitle', { label: labelRenameDialog.from })}</div>
+      <label class="terminal-layer-field">
+        <span>{t('labelRename')}</span>
+        <input
+          type="text"
+          bind:value={labelRenameDialog.to}
+          placeholder={t('labelRenamePlaceholder')}
+          disabled={labelRenameDialog.busy}
+          onkeydown={(e) => { if (e.key === 'Enter') submitLabelRename(); if (e.key === 'Escape') closeLabelRenameDialog() }}
+        />
+      </label>
+      <div class="terminal-layer-hint">{t('labelRenameHint')}</div>
+      {#if labelRenameDialog.error}
+        <div class="terminal-layer-error">{labelRenameDialog.error}</div>
+      {/if}
+      <div class="terminal-layer-actions">
+        <button class="terminal-layer-btn" onclick={closeLabelRenameDialog} disabled={labelRenameDialog.busy}>{t('cancel')}</button>
+        <button class="terminal-layer-btn primary" onclick={submitLabelRename} disabled={labelRenameDialog.busy}>{t('confirm')}</button>
+      </div>
+    </div>
   </div>
 {/if}
 
@@ -1881,14 +2276,123 @@
           {/if}
         </div>
       {/if}
-    <button
-      class="session-dropdown-item"
-      role="menuitem"
-      onclick={(e) => handleOpenTitleDialog(e, menuOpenId)}
-    >
-     <span class="menu-emoji">🖋️</span>
-      {t('generateTitle')}
-    </button>
+    <!-- 「设置标题」「设置标签」各是一个 submenu-row：主区域（左边整块）点击仍打开
+         原来的对话框，末尾 ··· 才展开右侧子面板 —— 交互/样式沿用「用户消息」「所属
+         目录」那套：面板 fixed 挂在菜单右侧、视口边缘翻转复用 applySubmenuPlacement。
+         两个 handler 各自 stopPropagation，主区域与 ··· 互不串事件。 -->
+    <div class="session-dropdown-submenu-row" class:active={sessionFlagMenuOpen}>
+      <button
+        class="session-dropdown-item session-dropdown-action-label"
+        role="menuitem"
+        onclick={(e) => handleOpenTitleDialog(e, menuOpenId)}
+      >
+        <span class="menu-emoji">🖋️</span>
+        {t('generateTitle')}
+      </button>
+      <button
+        class="submenu-more-btn"
+        aria-label={t('sessionFlagMoreAria')}
+        aria-haspopup="menu"
+        aria-expanded={sessionFlagMenuOpen}
+        onclick={(e) => openSessionFlagMenu(e, menuOpenId)}
+        onmouseenter={(e) => openSessionFlagMenu(e, menuOpenId)}
+      >···</button>
+    </div>
+    {#if sessionFlagMenuOpen}
+      <div
+        class="user-message-submenu session-flag-submenu"
+        role="menu"
+        aria-label={t('sessionFlagMenuLabel')}
+        style={submenuStyle(submenuPanelWidth(260))}
+      >
+        <p class="user-message-submenu-hint">{t('sessionFlagMenuHint')}</p>
+        {#if sessionFlagMenuError}
+          <div class="user-message-submenu-status error">{sessionFlagMenuError}</div>
+        {/if}
+        <div class="user-message-list session-flag-list" role="group" aria-label={t('sessionFlagMenuLabel')}>
+          <button
+            class="session-flag-item {menuSessionFlag() === '' ? 'active' : ''}"
+            type="button"
+            role="menuitemradio"
+            aria-checked={menuSessionFlag() === ''}
+            title={t('sessionFlagNone')}
+            disabled={sessionFlagMenuBusy}
+            onclick={(e) => handleSessionFlagPick(e, '')}
+          >
+            <span class="session-flag-item-label">{t('sessionFlagNone')}</span>
+            {#if menuSessionFlag() === ''}<span class="menu-check">✓</span>{/if}
+          </button>
+          {#each SESSION_FLAGS as flag (flag)}
+            <button
+              class="session-flag-item {sameFlag(menuSessionFlag(), flag) ? 'active' : ''}"
+              type="button"
+              role="menuitemradio"
+              aria-checked={sameFlag(menuSessionFlag(), flag)}
+              title={t('sessionFlagTip')}
+              disabled={sessionFlagMenuBusy}
+              onclick={(e) => handleSessionFlagPick(e, flag)}
+            >
+              <span class="session-flag-item-emoji">{flag}</span>
+              {#if sameFlag(menuSessionFlag(), flag)}<span class="menu-check">✓</span>{/if}
+            </button>
+          {/each}
+        </div>
+      </div>
+    {/if}
+    <div class="session-dropdown-submenu-row" class:active={sessionLabelsMenuOpen}>
+      <button
+        class="session-dropdown-item session-dropdown-action-label"
+        role="menuitem"
+        onclick={(e) => handleOpenLabelsDialog(e, menuOpenId)}
+      >
+        <span class="menu-emoji">🏷️</span>
+        {t('sessionSetLabels')}
+      </button>
+      <button
+        class="submenu-more-btn"
+        aria-label={t('sessionLabelsMoreAria')}
+        aria-haspopup="menu"
+        aria-expanded={sessionLabelsMenuOpen}
+        onclick={(e) => openSessionLabelsMenu(e, menuOpenId)}
+        onmouseenter={(e) => openSessionLabelsMenu(e, menuOpenId)}
+      >···</button>
+    </div>
+    {#if sessionLabelsMenuOpen}
+      <div
+        class="user-message-submenu session-label-submenu"
+        role="menu"
+        aria-label={t('sessionLabelsMenuLabel')}
+        style={submenuStyle(submenuPanelWidth(320))}
+      >
+        <p class="user-message-submenu-hint">{t('sessionLabelsMenuHint')}</p>
+        {#if sessionLabelsMenuError}
+          <div class="user-message-submenu-status error">{sessionLabelsMenuError}</div>
+        {/if}
+        {#if labelCandidates.length === 0}
+          <div class="user-message-submenu-status">
+            {categoryTreeLoading ? t('loading') : t('labelCandidatesEmpty')}
+          </div>
+        {:else}
+          <div class="user-message-list">
+            {#each labelCandidates as label (label)}
+              {@const held = menuSessionLabelSet().has(label)}
+              <button
+                class="user-message-item session-label-item {held ? 'active' : ''}"
+                type="button"
+                role="menuitemcheckbox"
+                aria-checked={held}
+                title={t('sessionLabelPickTitle')}
+                disabled={sessionLabelsMenuBusy}
+                onclick={(e) => handleSessionLabelPick(e, label)}
+              >
+                <span class="session-label-name">{label}</span>
+                {#if held}<span class="menu-check">✓</span>{/if}
+              </button>
+            {/each}
+          </div>
+        {/if}
+      </div>
+    {/if}
     <button
       class="session-dropdown-item"
       role="menuitem"
@@ -2064,14 +2568,7 @@
         maxlength="100"
         onkeydown={handleTitleDialogKeydown}
       />
-      <p class="title-dialog-hint">{t('titleDialogLabelsHint')}</p>
-      <input
-        class="title-dialog-input"
-        type="text"
-        bind:value={titleDialogLabels}
-        placeholder={t('titleDialogLabelsPlaceholder')}
-        onkeydown={handleTitleDialogKeydown}
-      />
+
       {#if titleDialogError}
         <div class="title-dialog-error">{titleDialogError}</div>
       {/if}
@@ -2081,6 +2578,39 @@
         </button>
         <button class="title-dialog-btn title-dialog-confirm" disabled={titleDialogLoading} onclick={confirmTitleDialog}>
           {titleDialogLoading ? t('loading') : t('confirm')}
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+<!-- 标签设定对话框：只有输入框 + 保存/取消。候选标签在「设置标签」项末尾 ···
+     的悬停面板里点选即追加；这里保存 = 整组替换，删除标签只能改输入框后保存。 -->
+{#if labelsDialogOpen}
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div class="title-dialog-overlay" onclick={(e) => { e.stopPropagation(); closeLabelsDialog() }}>
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div class="title-dialog" role="dialog" aria-modal="true" onclick={(e) => e.stopPropagation()}>
+      <h3 class="title-dialog-title">🏷️ {t('sessionSetLabels')}</h3>
+      <p class="title-dialog-hint">{t('titleDialogLabelsHint')}</p>
+      <input
+        class="title-dialog-input"
+        type="text"
+        bind:this={labelsDialogInput}
+        bind:value={labelsDialogValue}
+        placeholder={t('titleDialogLabelsPlaceholder')}
+        onkeydown={handleLabelsDialogKeydown}
+      />
+
+      {#if labelsDialogError}
+        <div class="title-dialog-error">{labelsDialogError}</div>
+      {/if}
+      <div class="title-dialog-actions">
+        <button class="title-dialog-btn title-dialog-cancel" disabled={labelsDialogLoading} onclick={closeLabelsDialog}>
+          {t('cancel')}
+        </button>
+        <button class="title-dialog-btn title-dialog-confirm" disabled={labelsDialogLoading} onclick={confirmLabelsDialog}>
+          {labelsDialogLoading ? t('loading') : t('confirm')}
         </button>
       </div>
     </div>
@@ -2241,6 +2771,11 @@
                 {#if forkParents.has(entry.session_id)}
                   <!-- 衍生出来的会话：悬停可以看到它是从哪条会话复制出来的 -->
                   <span class="session-fork" title={t('forkSource').replace('{id}', forkParents.get(entry.session_id))}>⑂</span>
+                {/if}
+                {#if sessionFlagLabel(entry.flag)}
+                  <!-- 旗标读的是 index.json 里的会话级字段：会话在几个分类下都有副本
+                       也只有一份，所以切换分类 / 刷新页面显示一致 -->
+                  <span class="session-row-flag" title={t('sessionFlagTip')}>{sessionFlagLabel(entry.flag)}</span>
                 {/if}
                 {getSessionDisplay(entry).display}
                 {#if awaitingUserAnswer.sessionIds.includes(entry.session_id)}
@@ -2540,6 +3075,13 @@
     color: var(--paused);
     font-weight: 600;
   }
+  /* 等待客户端工具回传：蓝色加粗非斜体。既不是「推理中」（橙色斜体），也不是
+     「成功结束未读」（绿色）——这一轮并没有结束，只是把动作交给了浏览器执行，
+     结果回传后同一轮继续；后端也会拒绝 done_success_unread 抹掉这个状态。 */
+  .session-item.status-client-tool {
+    color: var(--primary);
+    font-weight: 600;
+  }
   .session-menu-btn {
     position: absolute;
     right: 6px;
@@ -2798,6 +3340,8 @@
   @keyframes awaiting-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
   /* 衍生会话的来源标记：放在标题前，悬停显示「衍生自 …」 */
   .session-fork { margin-right: .3rem; font-size: .9em; opacity: .65; vertical-align: -0.1em; }
+  /* 会话旗标（index.json 的 flag 字段，单选封闭枚举）：一份数据，多处显示一致 */
+  .session-row-flag { margin-right: .35rem; font-size: .9em; vertical-align: -0.05em; }
 
   .menu-emoji {
     display: inline-flex;
@@ -2878,6 +3422,62 @@
   .title-dialog-input:focus {
     border-color: var(--text-secondary);
   }
+  /* 「设置标题」项末尾 ··· 的旗标面板：竖向列表，点选即落盘（不再经过对话框） */
+  .session-dropdown-submenu-row > .session-dropdown-item.session-dropdown-action-label {
+    flex: 1;
+    min-width: 0;
+  }
+  .user-message-submenu-hint {
+    flex-shrink: 0;
+    margin: 0;
+    padding: 10px 12px 8px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text-secondary);
+    font-size: 0.75rem;
+    line-height: 1.4;
+  }
+  .session-flag-list {
+    display: flex;
+    flex-direction: column;
+  }
+  .session-flag-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    padding: 7px 12px;
+    border: none;
+    background: none;
+    color: var(--text);
+    font: inherit;
+    font-size: 0.86rem;
+    text-align: left;
+    cursor: pointer;
+  }
+  .session-flag-item:hover { background: var(--border); }
+  .session-flag-item.active {
+    background: var(--bg-hover);
+    box-shadow: inset 2px 0 0 var(--accent, var(--text-secondary));
+  }
+  .session-flag-item:disabled { cursor: default; opacity: .55; }
+  .session-flag-item-emoji { font-size: 1.15rem; line-height: 1.2; }
+  /* 「设置标签」项末尾 ··· 的标签候选面板：竖向列表，点选即追加；已持有的打勾 */
+  .session-label-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .session-label-item.active {
+    background: var(--bg-hover);
+    box-shadow: inset 2px 0 0 var(--accent, var(--text-secondary));
+  }
+  .session-label-name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .session-label-item:disabled { cursor: default; opacity: .55; }
   .title-dialog-error {
     margin-top: 10px;
     font-size: 0.8rem;
@@ -2972,6 +3572,8 @@
     font-size: 0.85rem;
   }
   .terminal-layer-error { color: #c0392b; font-size: 0.8rem; }
+  /* 对话框里的辅助说明（标签重命名等）：次要文字，不参与提交 */
+  .terminal-layer-hint { color: var(--text-secondary); font-size: 0.75rem; line-height: 1.45; }
   .terminal-layer-actions { display: flex; justify-content: flex-end; gap: 8px; }
   .terminal-layer-btn {
     padding: 7px 14px;
