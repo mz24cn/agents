@@ -39,6 +39,7 @@ from runtime.models import (
 from runtime.server_state import (
     answered_client_tool_call_ids,
     begin_session_stream,
+    SESSION_STATUS_CLIENT_TOOL_CALLS,
     clear_infer_control,
     claim_client_tool_answers,
     close_infer_loop,
@@ -1843,13 +1844,35 @@ class HandlerInferMixin:
                     [m.to_dict() for m in collected_messages if hasattr(m, "to_dict")],
                     _client_names,
                 )
-                if client_handoff and client_connected:
-                    _sse_write({
-                        "role": "status",
-                        "source": "system",
-                        "status": "client_tool_calls",
-                        "client_tool_calls": client_handoff,
-                    })
+                if client_handoff:
+                    if client_connected:
+                        _sse_write({
+                            "role": "status",
+                            "source": "system",
+                            "status": "client_tool_calls",
+                            "client_tool_calls": client_handoff,
+                        })
+                    # The sidebar needs a status that says "this round is still
+                    # open": the model handed the work to the browser, and until
+                    # the result comes back the round is neither inferring
+                    # (orange) nor finished (green).  Set it HERE, before
+                    # finalize and the terminal transition: the terminal
+                    # ``done_success_unread`` is then refused by
+                    # ``transition_session_stream_status`` rather than flashing
+                    # green for the few hundred milliseconds until the tool
+                    # answer starts the next generation.
+                    #
+                    # The status belongs to the session, not to this connection.
+                    # If the browser dropped the SSE a moment before the handoff,
+                    # the round is still waiting all the same (reopening the
+                    # session restores the unanswered calls), so resting it in
+                    # green would lie -- and the SSE ``init`` snapshot a reload
+                    # then reads would come back green too.
+                    if session_id is not None:
+                        transition_session_stream_status(
+                            session_id, cancel_event,
+                            SESSION_STATUS_CLIENT_TOOL_CALLS,
+                        )
 
             # Reconcile file snapshots before announcing completion so a
             # client fetching the journal immediately after [DONE] sees the

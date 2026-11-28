@@ -69,6 +69,7 @@ _SERVER_STARTED_AT = datetime.datetime.now(datetime.timezone.utc).isoformat()
 _SERVER_INSTANCE_ID = uuid.uuid4().hex
 
 from runtime.server_state import (
+    SESSION_STATUS_CLIENT_TOOL_CALLS,
     _broadcast_session_status,
     _load_function_from_file,
     _session_event_subscribers,
@@ -3113,13 +3114,20 @@ class HandlerApiMixin:
         """POST /v1/sessions/{session_id}/read — 将指定会话标记为已读。"""
         self._drain_request_body()   # this endpoint never reads a body
         was_unread = False
+        settled_to = "idle"
         with _session_state_lock:
             if session_id in _unread_sessions:
                 del _unread_sessions[session_id]
-                _session_statuses[session_id] = "idle"
                 was_unread = True
+                # 「已读」只清未读徽章。等待客户端工具回传的那一轮**还没结束**：读一
+                # 眼就降级成 idle 会让侧边栏丢掉这一轮仍开着的唯一信号，所以保持蓝
+                # 色，只重发一次状态让其它浏览器同样停止徽章闪烁。
+                if _session_statuses.get(session_id) == SESSION_STATUS_CLIENT_TOOL_CALLS:
+                    settled_to = SESSION_STATUS_CLIENT_TOOL_CALLS
+                else:
+                    _session_statuses[session_id] = "idle"
         if was_unread:
-            _broadcast_session_status(session_id, "idle")
+            _broadcast_session_status(session_id, settled_to)
         self._send_json_response(200, {"ok": True})
 
     def _handle_delete_session(self, session_id: str) -> None:

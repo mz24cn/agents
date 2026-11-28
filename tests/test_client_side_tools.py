@@ -51,7 +51,9 @@ from runtime.registry import ModelRegistry, ToolRegistry
 from runtime.runtime import Runtime
 from runtime.server import RuntimeHTTPServer
 from runtime.server_state import (
+    SESSION_STATUS_CLIENT_TOOL_CALLS,
     answered_client_tool_call_ids,
+    get_session_status,
     pending_client_tool_calls,
 )
 
@@ -604,6 +606,75 @@ def test_streaming_handoff_is_observable_by_tool_name(tmp_path) -> None:
     assert handoff_frames[0]["client_tool_calls"] == [{
         "id": declared[0]["id"], "name": "probe", "arguments": "{}",
     }]
+
+
+def test_handoff_rests_the_session_in_the_waiting_status(tmp_path) -> None:
+    """The sidebar's snapshot says "waiting" — and turns green only for real.
+
+    ``client_tool_calls`` is a *session* status, not a property of the one
+    inference generation that emitted it: the generation is over, the round is
+    not.  The ``done_success_unread`` that finally runs in the same ``finally``
+    block must therefore not recolour the row.  Asserted through
+    ``GET /v1/sessions`` (the snapshot a refreshed page reads, ``_status``
+    included) rather than only the in-memory layer, so a reload, a category
+    switch and a live SSE event all agree; and through the follow-up round, so
+    the normal green path is still intact after the browser answers.
+    """
+    streams = [
+        _sse_tool_calls([("probe", "call_w1", "{}")]),
+        _sse_content("answered, all good"),
+    ]
+    with _fake_model_server(streams) as (api_base, _seen):
+        with _running_server(tmp_path, api_base) as (srv, _chats_dir):
+            base = f"http://127.0.0.1:{srv.port}"
+
+            def _stream(payload: dict) -> list[dict]:
+                req = urllib.request.Request(
+                    base + "/v1/infer/stream",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    raw = resp.read().decode("utf-8", "replace")
+                return [
+                    json.loads(line[6:]) for line in raw.splitlines()
+                    if line.startswith("data: ") and line[6:] != "[DONE]"
+                ]
+
+            def _status_of(session_id: str) -> str | None:
+                status, listing = _get_json(base, "/v1/sessions")
+                assert status == 200, listing
+                row = next((s for s in listing["sessions"]
+                            if s.get("session_id") == session_id), None)
+                assert row is not None, listing
+                return row.get("_status")
+
+            first = _stream({
+                "model_id": "test-model",
+                "tool_ids": [f"{CLIENT_SIDE_TOOL_TYPE}-probe"],
+                "workspace": str(tmp_path),
+                "session_id": "new",
+                "messages": [{"role": "user", "content": "probe it"}],
+            })
+            session_id = next(f["session_id"] for f in first if f.get("session_id"))
+
+            assert get_session_status(session_id) == SESSION_STATUS_CLIENT_TOOL_CALLS
+            assert _status_of(session_id) == SESSION_STATUS_CLIENT_TOOL_CALLS
+
+            # 浏览器执行完工具把结果回传：新一轮 generation 接管，正常完成时绿色照常。
+            _stream({
+                "model_id": "test-model",
+                "tool_ids": [f"{CLIENT_SIDE_TOOL_TYPE}-probe"],
+                "workspace": str(tmp_path),
+                "session_id": session_id,
+                "messages": [{
+                    "role": "tool", "name": "probe",
+                    "tool_use_id": "call_w1", "content": "probe says ok",
+                }],
+            })
+
+            assert get_session_status(session_id) == "done_success_unread"
+            assert _status_of(session_id) == "done_success_unread"
 
 
 def test_server_only_rounds_still_loop_as_before() -> None:

@@ -1667,15 +1667,38 @@ def _load_function_from_file(file_path: str, func_name: str) -> Callable:
 # ---------------------------------------------------------------------------
 # Session Status Stream – in-memory state
 # ---------------------------------------------------------------------------
-# Set of session_ids that are currently streaming (registered/cancelled per request).
+#: A run that stops because the model asked for **client-side** tools has not
+#: actually finished: the browser has to execute them and post the results back
+#: before the answer can continue.  The status vocabulary had no word for "the
+#: server is waiting for the client", so the nearest existing value won by
+#: default -- ``done_success_unread``, the green "completed successfully"
+#: colour -- which is exactly the wrong signal: the user reads green, leaves the
+#: session, and the run sits waiting unnoticed.  Kept as a constant because
+#: three places now have to agree on the spelling: the inference path emits it,
+#: the sidebar colours it blue, and the list endpoints replay it as ``_status``.
+#: It is deliberately in-memory only: the *generation* really did end (its slot
+#: is released, so stop/pause have nothing left to interrupt), while the
+#: *conversation round* is still open -- the durable inferring marker is already
+#: cleared, and after a restart the pending calls are recovered from
+#: conversation.json rather than from a status string.
+SESSION_STATUS_CLIENT_TOOL_CALLS = "client_tool_calls"
+
+#: Statuses meaning "a generation ended and the user has not looked at it yet":
+#: they set the unread marker, the sidebar badge, and carry the canonical title
+#: on the SSE frame.  The client-tool wait is the most urgent member of this
+#: set -- nothing can move forward until the user's browser acts.
+UNREAD_SESSION_STATUSES = ("done_success_unread", "done_error_unread",
+                           SESSION_STATUS_CLIENT_TOOL_CALLS)
+
 # Maps session_id -> status string: "streaming" | "paused" | "done_success_unread" | "done_error_unread"
+# | "client_tool_calls" (see SESSION_STATUS_CLIENT_TOOL_CALLS above)
 # "paused" is a resting soft-stop state reached at an inference round boundary (see
 # take_infer_boundary_action); the conversation on disk is complete and a later
 # inference continues from it like any other next round.
 # "idle" state means session is neither active nor unread (i.e. viewed or just completed-and-read).
 _session_statuses: dict[str, str] = {}
 # Set of session_ids that have completed but whose result has not been "viewed" yet.
-# Entries are status strings: "done_success_unread" or "done_error_unread".
+# Entries are status strings: see UNREAD_SESSION_STATUSES.
 _unread_sessions: dict[str, str] = {}
 # List of subscriber callbacks for session-event SSE connections.
 # Each entry is a callable(data: dict) -> bool; returns False if write failed (caller removes).
@@ -2090,20 +2113,41 @@ def transition_session_stream_status(
     The SSE frame itself — canonical title lookup (a disk read of index.json
     for done_* statuses) plus JSON encoding — is built *before* the locks are
     taken, and the enqueue is a non-blocking queue put, so the critical
-    section performs no I/O and no serialization work.
+    section performs no I/O and no serialization work. The single exception is
+    the client-tool guard below: rebuilding a ``client_tool_calls`` frame reads
+    no disk (only ``done_*`` frames carry the title), so it stays I/O-free.
+
+    A run that stopped because the model called client-side tools rests in
+    ``client_tool_calls``. The *generation* has ended, but the *conversation
+    round* is still open — the browser must run the tool and post the result
+    back, and the next generation continues the same round. Announcing
+    ``done_success_unread`` for such a run would colour the sidebar green (the
+    round looks finished), then orange again a moment later when the tool
+    result comes back. Green therefore never overwrites the waiting state;
+    ``done_error_unread`` still does, because an abort genuinely ends the
+    round and must be visible.
     """
     # Built without holding any lock: for done_* statuses this reads the
     # session title from index.json. Persistence (including auto title
     # generation) has already completed before this transition is reached, so
     # the title is final whether it is read before or after the mutation.
     frame = _build_session_status_frame(session_id, status)
+    replaced_frame = None
     with _session_stream_lock:
         stream = _session_streams.get(session_id)
         if stream is None or stream.get("cancel_event") is not owner_event:
             return False
         with _session_state_lock:
+            if (_session_statuses.get(session_id) == SESSION_STATUS_CLIENT_TOOL_CALLS
+                    and status == "done_success_unread"):
+                # Keep the waiting state and re-broadcast it: late subscribers
+                # that missed the handoff event still land on blue, and the
+                # unread marker stays exactly one entry (the handoff already
+                # set it), so badges do not churn.
+                status = SESSION_STATUS_CLIENT_TOOL_CALLS
+                replaced_frame = _build_session_status_frame(session_id, status)
             _session_statuses[session_id] = status
-            if status in {"done_success_unread", "done_error_unread"}:
+            if status in UNREAD_SESSION_STATUSES:
                 _unread_sessions[session_id] = status
             else:
                 _unread_sessions.pop(session_id, None)
@@ -2111,7 +2155,7 @@ def transition_session_stream_status(
         # begin/status transition therefore always appears after this event.
         # send_fn implementations are non-blocking queue puts, so no I/O
         # happens here.
-        _enqueue_session_event_frame(frame)
+        _enqueue_session_event_frame(replaced_frame or frame)
         return True
 
 
@@ -4258,13 +4302,17 @@ def _build_session_status_frame(session_id: str, status: str) -> str:
     (``title`` / ``title_given``) from index.json.  Persistence (including
     any auto title generation) has already completed before these statuses
     are broadcast, so the frontend can restore the sidebar title directly
-    from the event.
+    from the event.  ``client_tool_calls`` joins them: the waiting row must
+    show the same title in every category, and the re-broadcast that follows a
+    refused green transition happens after the round's persistence, when the
+    title is final.
 
     This may perform disk I/O (title lookup) and must therefore be called
     *without* holding ``_session_stream_lock`` / ``_session_state_lock``.
     """
     data = {"status": status}
-    if status in ("done_success_unread", "done_error_unread"):
+    if status in ("done_success_unread", "done_error_unread",
+                  SESSION_STATUS_CLIENT_TOOL_CALLS):
         info = snapshot_session_titles([session_id]).get(session_id)
         if info is not None:
             data["title"] = info["title"]
