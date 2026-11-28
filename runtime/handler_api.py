@@ -3262,6 +3262,9 @@ class HandlerApiMixin:
         ``labels`` 键（列表）与标题正交：出现即整组替换会话标签
         （空列表 = 清空），同步 index.json 与 tree.json 标签根；响应
         总是回带当前 labels。
+        ``flag`` 键不在这里写：旗标走 ``POST /v1/sessions/{id}/flag``（单选封闭枚举），
+        本接口只读不改；两个成功响应都回带 index.json 里当前的 ``flag``，前端据此
+        刷新行数据，改标题前后看到的旗标必然一致。
         """
         session_manager = self.server.session_manager  # type: ignore[attr-defined]
         given = ""
@@ -3290,29 +3293,31 @@ class HandlerApiMixin:
                     session_id, labels_body)
             if given:
                 title = session_manager.set_title_manually(session_id, given)
+                entry_now = session_manager.get_session_entry(session_id) or {}
                 if not labels_provided:
-                    labels_now = list((session_manager._read_index().get(session_id)
-                                       or {}).get("labels") or [])
+                    labels_now = list(entry_now.get("labels") or [])
                 self._send_json_response(200, {
                     "status": "success",
                     "session_id": session_id,
                     "title": title,
                     "title_given": True,
                     "labels": labels_now,
+                    "flag": str(entry_now.get("flag") or ""),
                 })
             else:
                 # 强制生成标题（跳过 token 阈值检查）
                 title = session_manager.generate_title_forced(session_id)
                 if title:
+                    entry_now = session_manager.get_session_entry(session_id) or {}
                     if not labels_provided:
-                        labels_now = list((session_manager._read_index().get(session_id)
-                                           or {}).get("labels") or [])
+                        labels_now = list(entry_now.get("labels") or [])
                     self._send_json_response(200, {
                         "status": "success",
                         "session_id": session_id,
                         "title": title,
                         "title_given": False,
                         "labels": labels_now,
+                        "flag": str(entry_now.get("flag") or ""),
                     })
                 else:
                     self._send_json_error(500, f"Failed to generate title for session: {session_id}")
@@ -3337,10 +3342,51 @@ class HandlerApiMixin:
         except FileNotFoundError:
             self._send_json_error(404, f"Session not found: {session_id}")
             return
+        # 标签接口只动标签：把 index 里当前的标题/旗标一并回带（前端直接采用服务端
+        # 值刷新行），既证明"改标签不改标题/旗标"，也避免本地猜测与 index 漂移。
+        entry = session_manager.get_session_entry(session_id) or {}
         self._send_json_response(200, {
             "status": "success",
             "session_id": session_id,
             "labels": labels,
+            "title": str(entry.get("title") or ""),
+            "title_given": bool(entry.get("title_given")),
+            "flag": str(entry.get("flag") or ""),
+        })
+
+    def _handle_set_session_flag(self, session_id: str) -> None:
+        """POST /v1/sessions/{session_id}/flag — 设置/清除会话旗标（单选旗标）。
+
+        请求体 ``{"flag": "🚩"}``；``""`` 或 ``null`` = 清除旗标。**缺少 ``flag``
+        键**按用法错误处理（400），否则"忘了传"会被静默解读成"想清除"。
+
+        旗标写在 index.json 的 ``flag`` 字段（与会话标题同一份元数据）：同一会话在
+        多个分类下有副本也只有一份，切换分类/刷新后一致。响应回带 index 里的
+        title/labels，供前端以服务端元数据为准刷新列表。
+        """
+        session_manager = self.server.session_manager  # type: ignore[attr-defined]
+        body = self._read_json_body()
+        if body is None:
+            return  # 错误响应已发送
+        if not isinstance(body, dict) or "flag" not in body:
+            self._send_json_error(400, 'body must be {"flag": "..."}（空串 = 清除旗标）')
+            return
+        try:
+            flag = session_manager.set_session_flag(session_id, body.get("flag"))
+        except FileNotFoundError:
+            self._send_json_error(404, f"Session not found: {session_id}")
+            return
+        except ValueError as exc:
+            self._send_json_error(400, str(exc))
+            return
+        entry = session_manager.get_session_entry(session_id) or {}
+        self._send_json_response(200, {
+            "status": "success",
+            "session_id": session_id,
+            "flag": flag,
+            "title": str(entry.get("title") or ""),
+            "title_given": bool(entry.get("title_given")),
+            "labels": list(entry.get("labels") or []),
         })
 
     def _handle_label_summarize(self) -> None:
@@ -3369,6 +3415,42 @@ class HandlerApiMixin:
             self._send_json_error(500, f"Failed to summarize label: {label}")
             return
         self._send_json_response(200, {"status": "success", "doc": doc})
+
+    def _handle_rename_label(self) -> None:
+        """POST /v1/sessions/labels/rename — 重命名标签并传播到全部原标签会话。
+
+        body: ``{from: 原标签, to: 新标签}``（兼容 ``old``/``new``、
+        ``old_label``/``new_label`` 键名）。语义边界见
+        :meth:`SessionManager.rename_label`：入参校验、目标标签已存在时按标签
+        集合合并去重、index/tree 同步；标签聚合文档只在成员集合没变时迁移，
+        并入已有标签时旧标签与目标标签两边一起失效（响应体的 ``doc`` 回报
+        ``moved``/``removed_old``/``invalidated_target``/``membership_changed``）。
+        """
+        from runtime.session_manager import LabelNotFound
+        session_manager = self.server.session_manager  # type: ignore[attr-defined]
+        body = self._read_json_body()
+        if body is None:
+            return
+        if not isinstance(body, dict):
+            self._send_json_error(400, "body must be {from: '...', to: '...'}")
+            return
+        old = body.get("from", body.get("old", body.get("old_label")))
+        new = body.get("to", body.get("new", body.get("new_label")))
+        try:
+            result = session_manager.rename_label(old, new)
+        except LabelNotFound as exc:
+            self._send_json_error(404, str(exc))
+            return
+        except ValueError as exc:
+            self._send_json_error(400, str(exc))
+            return
+        except Exception as exc:  # noqa: BLE001 - 统一映射 500
+            logger.warning("label rename failed (%s -> %s): %s", old, new, exc)
+            self._send_json_error(500, f"Failed to rename label: {old}")
+            return
+        payload = {"status": "success"}
+        payload.update(result)
+        self._send_json_response(200, payload)
 
     def _handle_label_get(self) -> None:
         """GET /v1/sessions/labels?label=… — 读取标签聚合文档（可能为 null）。"""

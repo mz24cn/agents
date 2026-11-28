@@ -66,6 +66,12 @@ from runtime.server_state import (
     try_close_infer_loop,
     transition_session_stream_status,
 )
+from runtime.session_manager import clean_labels
+from runtime.system_context import (
+    is_plain_system_message,
+    label_origin_of,
+    merge_first_turn_system_messages,
+)
 
 logger = logging.getLogger("runtime.server")
 
@@ -468,6 +474,11 @@ class HandlerInferMixin:
         # Skip per-agent prompt for group chat — each agent gets its own system
         # prompt in group_chat.py.  Group chat still gets a shared default system
         # prompt so it appears in conversation.json.
+        #
+        # 合并而非覆盖：带来源标记的系统消息（标签节点"发起新会话"注入的标签聚合
+        # 摘要/记忆）必须与代理系统提示词共存，代理提示词在前、来源上下文在后，
+        # 两者随后由装配/协议层并入同一条 system。不带标记的系统消息（用户自选的
+        # 提示词模板）仍按原语义被代理自己的提示词替换。
         is_group_chat = len(agent_ids) > 1
         if primary_agent_id and not is_group_chat:
             raw_sid = body.get("session_id") or None
@@ -482,17 +493,16 @@ class HandlerInferMixin:
                 else:
                     sys_msg = None
                 if sys_msg:
-                    msgs = body.get("messages", [])
-                    # Remove any existing system message, then prepend agent's
-                    msgs = [m for m in msgs if m.get("role") != "system"]
-                    body["messages"] = [sys_msg] + msgs
+                    body["messages"] = merge_first_turn_system_messages(
+                        body.get("messages", []), [sys_msg])
 
         if is_group_chat:
             raw_sid = body.get("session_id") or None
             if raw_sid in ("new", None):
                 msgs = body.get("messages", [])
-                existing_system = any(m.get("role") == "system" for m in msgs)
-                if not existing_system:
+                # 只在没有"其它"系统提示词时补默认群聊提示词；标签来源的那条不算
+                # "其它"——它必须与默认提示词同时进入 system，而不是互相压制。
+                if not any(is_plain_system_message(m) for m in msgs):
                     from runtime.group_chat import build_agents_markdown, _GC_DEFAULT_PROMPT
                     agents_md = build_agents_markdown(
                         agent_ids,
@@ -500,7 +510,8 @@ class HandlerInferMixin:
                         include_user_row=True,
                     )
                     default_prompt = _GC_DEFAULT_PROMPT.replace("{{AGENTS}}", agents_md)
-                    body["messages"] = [{"role": "system", "content": default_prompt}] + msgs
+                    body["messages"] = merge_first_turn_system_messages(
+                        msgs, [{"role": "system", "content": default_prompt}])
 
         if "model_id" not in body:
             self._send_json_error(400, "Missing required field: model_id")
@@ -568,16 +579,32 @@ class HandlerInferMixin:
             if raw_session_id == "new":
                 try:
                     session_id = context_manager.create_session()
-                    # 提取第一条用户消息文本作为初始标题
+                    # 提取第一条用户消息文本作为初始标题；同时收集请求里带来源
+                    # 标记的系统消息（标签节点"发起新会话"注入的标签聚合），来源
+                    # 标签随创建请求一起落到 index.json，而不是只在 UI 上显示。
                     first_user_msg: Optional[str] = None
+                    label_origins: list = []
                     if "messages" in body:
                         for m in body["messages"]:
-                            if m.get("role") == "user":
+                            if not isinstance(m, dict):
+                                continue
+                            role = m.get("role")
+                            if role == "system":
+                                origin = label_origin_of(m)
+                                if origin and origin not in label_origins:
+                                    label_origins.append(origin)
+                                continue
+                            if role == "user" and first_user_msg is None:
                                 content = m.get("content", "")
                                 if isinstance(content, str) and content.strip():
                                     first_user_msg = content.strip()
-                                break
-                    self.server.session_manager.on_session_created(session_id, first_user_msg)  # type: ignore[attr-defined]
+                    source_labels = clean_labels(body.get("source_labels"))
+                    for origin in label_origins:
+                        if origin not in source_labels:
+                            source_labels.append(origin)
+                    self.server.session_manager.on_session_created(  # type: ignore[attr-defined]
+                        session_id, first_user_msg, source_labels=source_labels
+                    )
                     use_session = True
                 except OSError as exc:
                     self._send_json_error(500, f"Failed to create session: {exc}")

@@ -23,6 +23,80 @@ logger = logging.getLogger("runtime.session_manager")
 # 标题生成请求中附带的分类目录上限（避免 prompt 过长）
 MAX_CATEGORY_LIST = 300
 
+#: 标签分隔符：与前端 ``parseLabels`` 及 ``set_session_labels`` 的兜底切分同一套
+#: 规则。标签本身不能含这些字符，否则一个标签会被拆成多个。
+LABEL_SEPARATORS_RE = re.compile(r"[,，;；\s]+")
+
+
+class LabelNotFound(ValueError):
+    """按名字定位标签时未命中：没有任何会话携带该标签（API 侧映射为 404）。"""
+
+
+def clean_labels(labels) -> list[str]:
+    """清洗标签列表：按分隔符再切分、去空白、保序去重。
+
+    调用方（前端脚本/API）即便没有预分割，全角/半角逗号、分号、空白也能拆开。
+    """
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw in labels or []:
+        for item in LABEL_SEPARATORS_RE.split(str(raw)):
+            item = item.strip()
+            if item and item not in seen:
+                seen.add(item)
+                cleaned.append(item)
+    return cleaned
+
+
+def clean_label(value) -> str:
+    """清洗单个标签名（重命名入参）：非空且不含分隔符。
+
+    含分隔符的入参会被语义拆成多个标签，作为"一个标签名"处理时含义不明，
+    因此直接拒绝而不是静默取第一段。
+    """
+    raw = str(value if value is not None else "").strip()
+    if not raw:
+        raise ValueError("label is required")
+    parts = [p for p in LABEL_SEPARATORS_RE.split(raw) if p]
+    if len(parts) != 1:
+        raise ValueError(f"label must be a single label without separators: {raw!r}")
+    return parts[0]
+
+
+#: 会话旗标（Sidebar「设置标题」对话框里的单选旗标字符）。存进 index.json 条目的
+#: ``flag`` 字段——与会话标题同属 index 元数据：同一会话可能被挂在多个分类副本
+#: （主题/工作区/标签/终端/历史）下，但树节点只存会话 ID，旗标只有 index 这一份，
+#: 因此切换分类或刷新页面读到的必然一致。
+#: 旧数据没有该键 —— 一律按"无旗标"读取，不做迁移，也不写回。
+SESSION_FLAGS: tuple[str, ...] = (
+    "🚩", "🏴", "🏳️", "🔴", "🟠", "🟡", "🟢", "🔵", "🟣", "🟤", "✅", "⚠️",
+)
+
+#: 变体选择符 U+FE0F 的有无不改变旗标身份（``🏳️`` 与 ``🏳``、``⚠️`` 与 ``⚠``
+#: 是同一个），故再按"去掉 VS16"的形式索引一遍，两种写法都归一到上面的规范写法。
+_FLAG_ALIASES: dict[str, str] = {
+    **{flag: flag for flag in SESSION_FLAGS},
+    **{flag.replace("\ufe0f", ""): flag for flag in SESSION_FLAGS},
+}
+
+
+def clean_flag(value) -> str:
+    """清洗单个旗标：返回 ``SESSION_FLAGS`` 中的规范写法；空/None → ``""``（清除）。
+
+    旗标是封闭的单选集合（前端只提供这些字符），后端同样把关，避免任意文本进入
+    ``flag`` 字段后破坏列表展示与后续按旗标筛选的语义。
+
+    Raises:
+        ValueError: 不在候选集内。
+    """
+    raw = str(value if value is not None else "").strip()
+    if not raw:
+        return ""
+    canonical = _FLAG_ALIASES.get(raw) or _FLAG_ALIASES.get(raw.replace("\ufe0f", ""))
+    if not canonical:
+        raise ValueError(f"unknown flag: {raw!r}")
+    return canonical
+
 
 def _iter_string_children(node: dict):
     """深度优先产出 node 子树中所有字符串叶子（会话 ID）。"""
@@ -780,17 +854,7 @@ class SessionManager:
         FileNotFoundError）。tree.json 不存在或没有标签根时只更新索引——
         下次构建/事实刷新会按索引重建标签根。
         """
-        cleaned: list[str] = []
-        seen: set[str] = set()
-        for raw in labels or []:
-            # 服务端兜底与前端 parseLabels 同规则的再切分：调用方即便没有
-            # 预分割（比如脚本直接 POST 一整串），全角/半角逗号、分号、空白
-            # 也能拆开。
-            for item in re.split(r"[,，;；\s]+", str(raw)):
-                item = item.strip()
-                if item and item not in seen:
-                    seen.add(item)
-                    cleaned.append(item)
+        cleaned = clean_labels(labels)
         index = self._read_index()
         entry = index.get(session_id)
         if not isinstance(entry, dict):
@@ -802,6 +866,132 @@ class SessionManager:
         self._write_index(index)
         self._sync_tree_labels(session_id, cleaned)
         return cleaned
+
+    def get_session_entry(self, session_id: str) -> Optional[dict]:
+        """index.json 里该会话的元数据副本（title/labels/flag/…）；不在册返回 None。
+
+        会话可能被挂在多个分类副本（主题/工作区/标签/终端/历史）下，但树节点只存
+        会话 ID —— 标题、标签、旗标一律以 index.json 这一份为准。接口回带这份元数据
+        前端就能直接采用服务端值，不必在本地猜测"改标签会不会动标题"。
+        """
+        entry = self._read_index().get(str(session_id))
+        return dict(entry) if isinstance(entry, dict) else None
+
+    def set_session_flag(self, session_id: str, flag) -> str:
+        """设置/清除会话旗标（index.json 条目的 ``flag`` 字段）；返回规范化后的旗标。
+
+        只在 index 落盘一次：同一会话在多个分类下有副本时也只有一份，切换分类或
+        刷新页面后显示必然一致（不会只改到某个树节点）。清除时**删掉该键**而不是
+        写空串，旧数据形状保持不变（老会话本来就没有 ``flag`` 键）。
+
+        Raises:
+            ValueError: 旗标不在 ``SESSION_FLAGS`` 候选集内。
+            FileNotFoundError: 会话不在 index.json（与标题/标签接口一致的 404 语义）。
+        """
+        cleaned = clean_flag(flag)
+        index = self._read_index()
+        entry = index.get(session_id)
+        if not isinstance(entry, dict):
+            raise FileNotFoundError(f"Session not in index: {session_id}")
+        if cleaned:
+            entry["flag"] = cleaned
+        else:
+            entry.pop("flag", None)
+        self._write_index(index)
+        logger.info("set_session_flag: 旗标 %s (session=%s)",
+                    cleaned or "(已清除)", session_id)
+        return cleaned
+
+    def sessions_with_label(self, label: str) -> list[str]:
+        """index.json 中携带该标签的会话 ID（按 ID 升序，结果稳定）。"""
+        label = str(label or "").strip()
+        if not label:
+            return []
+        out: list[str] = []
+        for sid, entry in (self._read_index() or {}).items():
+            if not isinstance(entry, dict):
+                continue
+            if label in clean_labels(entry.get("labels")):
+                out.append(str(sid))
+        return sorted(out)
+
+    def rename_label(self, old_label, new_label) -> dict:
+        """重命名标签：把携带 ``old_label`` 的**所有**会话改挂 ``new_label``。
+
+        边界决策：
+          * 入参先按 ``clean_label`` 校验：非空、不含分隔符（否则一个名字会被
+            语义拆成多个标签，直接 400 而不是静默取第一段）。
+          * 目标标签已存在时按"标签集合"语义合并去重：``new_label`` 占据
+            ``old_label`` 原本的位置；若该会话别处已有 ``new_label``，则只是
+            去掉 ``old_label``，不会把标签写两遍。
+          * index.json 与 tree.json 同步：受影响会话逐个 ``_sync_tree_labels``，
+            旧标签节点失去全部会话后被剪除。
+          * 标签聚合文档（DATA_DIR/labels/）：成员集合没变时换名搬迁；同名合并时
+            **两侧都失效**（目标摘要已不再覆盖全部成员，留着它就是错误旧摘要），
+            下一次"发起新会话"读不到文档会自动重算；迁移失败只告警，不回滚已
+            完成的改名。
+          * ``old_label`` 不存在 → LabelNotFound（API 侧 404）；同名重命名是
+            幂等空操作，返回 changed=False。
+        """
+        old = clean_label(old_label)
+        new = clean_label(new_label)
+        affected = self.sessions_with_label(old)
+        if old == new:
+            # 幂等：同名不做任何写盘，但仍回报当前携带者。
+            return {
+                "from": old, "to": new, "changed": False,
+                "session_ids": affected, "session_count": len(affected),
+                "labels": {}, "doc": None,
+            }
+        if not affected:
+            raise LabelNotFound(f"label not found: {old}")
+        # 目标标签在改名前是否已经有自己的成员。这决定聚合文档能不能搬家：
+        # 有成员就意味着改名并进来之后成员集合变大，任何一份摘要都覆盖不全，
+        # 必须作废重算而不是换名继续用（目标没有聚合文档也一样 —— 搬过来的
+        # 摘要说的还是原来那批会话）。必须在写 index/tree 之前读。
+        preexisting_target = self.sessions_with_label(new)
+
+        index = self._read_index()
+        updated: dict[str, list[str]] = {}
+        for sid in affected:
+            entry = index.get(sid)
+            if not isinstance(entry, dict):
+                continue
+            merged = clean_labels(
+                [new if str(lbl).strip() == old else lbl
+                 for lbl in (entry.get("labels") or [])])
+            if merged:
+                entry["labels"] = merged
+            else:
+                entry.pop("labels", None)
+            updated[sid] = merged
+
+        self._write_index(index)
+        for sid, labels in updated.items():
+            self._sync_tree_labels(sid, labels)
+
+        doc_result: dict = {"old_existed": False, "target_existed": False,
+                            "moved": False, "removed_old": False,
+                            "invalidated_target": False,
+                            "membership_changed": bool(preexisting_target)}
+        try:
+            from runtime import label_store
+            # 搬家只发生在成员集合没变的情况下；session_ids 一律按改名后的实际
+            # 成员刷新（目标标签原本有会话时那个并集才是这个标签的成员）。
+            doc_result.update(label_store.rename_label_doc(
+                old, new,
+                session_ids=sorted(set(preexisting_target) | set(updated)),
+                membership_changed=bool(preexisting_target)))
+        except Exception as exc:  # noqa: BLE001 - 聚合文档是派生缓存，不阻塞改名
+            logger.warning("rename_label: 迁移标签聚合文档失败 (%s -> %s): %s",
+                           old, new, exc)
+            doc_result["error"] = str(exc)
+
+        return {
+            "from": old, "to": new, "changed": True,
+            "session_ids": sorted(updated), "session_count": len(updated),
+            "labels": updated, "doc": doc_result,
+        }
 
     def _sync_tree_labels(self, session_id: str, labels: list[str]) -> bool:
         """把 tree.json 标签根与该会话的 labels 对齐（就地编辑后原子保存）。"""
@@ -1042,12 +1232,16 @@ class SessionManager:
     # 公共方法
     # ------------------------------------------------------------------
 
-    def on_session_created(self, session_id: str, first_user_message: Optional[str] = None) -> None:
+    def on_session_created(self, session_id: str, first_user_message: Optional[str] = None,
+                           source_labels: Optional[list] = None) -> None:
         """新会话创建后调用，在 index.json 中新增对应的 SessionIndexEntry。
 
         Args:
             session_id: 新创建的会话 ID。
             first_user_message: 用户的第一条消息文本，用作初始标题（可选）。
+            source_labels: 来源标签（标签节点"发起新会话"时随请求带上）。非空时在
+                建档同一步写入 index.json 的 ``labels`` 并挂载 tree.json 标签根，
+                而不是只在前端草稿上显示一次；失败只告警，不回滚已建的会话。
         """
         from runtime.common import now_iso
         now = now_iso()
@@ -1078,6 +1272,15 @@ class SessionManager:
             self.ensure_session_facts(session_id)
         except Exception as exc:
             logger.warning("on_session_created: 补挂事实根失败 (session=%s): %s", session_id, exc)
+        # 来源标签：与建档同步落 index.json + tree.json 标签根。放在事实根之后，
+        # 保证标签挂载不会被事实根的节点重建覆盖。
+        cleaned = clean_labels(source_labels)
+        if cleaned:
+            try:
+                self.set_session_labels(session_id, cleaned)
+            except Exception as exc:  # noqa: BLE001 - 建档已成功，标签不阻塞推理
+                logger.warning("on_session_created: 来源标签落盘失败 (session=%s): %s",
+                               session_id, exc)
 
     def on_session_forked(
         self,

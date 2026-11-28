@@ -565,9 +565,17 @@ export const sessions = {
   // labels 非 null = 整组替换会话标签（[] = 清空）；null = 不动标签。
   generateTitle: (sessionId, title = '', labels = null) => request('POST', `/v1/sessions/${encodeURIComponent(sessionId)}/generate-title`, { title, ...(labels !== null ? { labels } : {}) }),
   setLabels:     (sessionId, labels) => request('POST', `/v1/sessions/${encodeURIComponent(sessionId)}/labels`, { labels }),
+  // 单选旗标（🚩🏴🏳️🔴🟠🟡🟢🔵🟣🟤✅⚠️）：写 index.json 的 flag 字段，'' = 清除。
+  // 旗标与会话标题同一份元数据，同一会话在多个分类下有副本时也只有一份。
+  setFlag:       (sessionId, flag = '') => request('POST', `/v1/sessions/${encodeURIComponent(sessionId)}/flag`, { flag }),
   // 标签聚合：合并该标签全部会话的概要/记忆 + 统计常用配置（存 DATA_DIR/labels/）。
   summarizeLabel: (label)    => request('POST', '/v1/sessions/labels/summarize', { label }),
   labelDoc:      (label)     => request('GET',    `/v1/sessions/labels?label=${encodeURIComponent(label)}`),
+  // 标签重命名：把携带 old 标签的所有会话改挂 new 标签（index.json/tree.json 同步）。
+  // 目标标签已存在时按标签集合语义合并去重；聚合文档只在成员集合没变时搬迁，并入
+  // 已有标签时旧标签与目标标签两边一起作废（下次"发起新会话"读不到文档会自动重算，
+  // 否则留下的都是缺成员的陈旧摘要）。
+  renameLabel:   (from, to)  => request('POST', '/v1/sessions/labels/rename', { from, to }),
   regenerateSummary: (sessionId) => request('POST',   `/v1/sessions/${encodeURIComponent(sessionId)}/regenerate-summary`),
   // workspace：会话当前认定的工作区。服务端以 journal manifest 记录的工作区为准，
   // 这个值只作兜底（manifest 没记 workspace 的老会话）——不传的话服务端会退回

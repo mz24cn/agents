@@ -274,7 +274,10 @@ _ROUTES: dict[str, list] = {
         (re.compile(r"^/v1/sessions/frames/close$"), "_handle_session_frames_close", ()),
         (re.compile(r"^/v1/sessions/([^/]+)/generate-title$"), "_handle_generate_session_title", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/sessions/([^/]+)/labels$"), "_handle_set_session_labels", (urllib.parse.unquote,)),
+        # 单选旗标（🚩🏴…）：写在 index.json 的 flag 字段，与标题同一份元数据。
+        (re.compile(r"^/v1/sessions/([^/]+)/flag$"), "_handle_set_session_flag", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/sessions/labels/summarize$"), "_handle_label_summarize", ()),
+        (re.compile(r"^/v1/sessions/labels/rename$"), "_handle_rename_label", ()),
         (re.compile(r"^/v1/sessions/([^/]+)/regenerate-summary$"), "_handle_regenerate_session_summary", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/sessions/([^/]+)/read$"), "_handle_mark_session_read", (urllib.parse.unquote,)),
         (re.compile(r"^/v1/sessions/([^/]+)/revoke$"), "_handle_revoke_session", (urllib.parse.unquote,)),

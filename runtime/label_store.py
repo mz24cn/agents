@@ -67,6 +67,81 @@ def save_label_doc(doc: dict) -> str:
     return path
 
 
+def delete_label_doc(label: str) -> bool:
+    """删除某标签的聚合文档；不存在返回 False（幂等）。"""
+    try:
+        os.remove(label_doc_path(label))
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        logger.warning("delete_label_doc 失败 (label=%s): %s", label, exc)
+        return False
+
+
+def rename_label_doc(old_label: str, new_label: str, session_ids=None,
+                     membership_changed: bool = False) -> dict:
+    """标签改名后迁移/失效聚合文档，绝不让错误的旧摘要继续被读到。
+
+    聚合文档（``summary`` / ``memory`` / ``config``）是对"该标签下全部会话"的
+    一次 LLM 合成产物，它的**成员集合**就是它成立的前提。改名传播之后成员集合
+    可能变化，前提变了的摘要就是错的摘要 —— 留着它比没有更危险（"发起新会话"
+    会把它当标签上下文注入 system）。因此规则按成员集合是否改变来分：
+
+      * 成员集合没变（目标标签原本没有别的会话，``membership_changed=False``）
+        → 只是标签名换了：换名搬迁，并按改名后该标签的实际成员刷新
+        ``session_ids``/``session_count``。
+      * 成员集合变了（目标标签本来就有别的会话，无论它有没有文档）→ 改名的
+        会话并进来后，哪一份摘要都覆盖不全：两边都**失效**（删除），下一次
+        "发起新会话"读不到文档会自动重算，"生成概要和记忆"也可手动重算。
+        合并两份 LLM 产物只会产出一份没人核对过的摘要，不可取；只搬文档、只刷
+        id 列表同样不可取 —— 摘要说的还是原来那批会话。
+      * 只有新文档（旧标签没做过聚合）→ 同样理由：新文档现在漏掉了改名并入的
+        会话，必须失效。
+
+    返回 ``{old_existed, target_existed, moved, removed_old,
+    invalidated_target, membership_changed}``。
+    """
+    old = str(old_label or "").strip()
+    new = str(new_label or "").strip()
+    result = {"old_existed": False, "target_existed": False,
+              "moved": False, "removed_old": False,
+              "invalidated_target": False,
+              "membership_changed": bool(membership_changed)}
+    if not old or not new or old == new:
+        return result
+    old_doc = load_label_doc(old)
+    result["old_existed"] = old_doc is not None
+    target_doc = load_label_doc(new)
+    result["target_existed"] = target_doc is not None
+    if old_doc is None:
+        # 旧标签没有聚合文档：改名并入的会话没有任何摘要支撑，目标文档却已经
+        # 不再覆盖全部成员 —— 同样必须失效，不能继续端出缺成员的旧摘要。
+        if result["target_existed"]:
+            result["invalidated_target"] = delete_label_doc(new)
+        return result
+    if result["target_existed"] or membership_changed:
+        # 成员集合变了：目标标签本来就有别的会话时，手心里这份摘要覆盖不全，
+        # 换个名字挂着它同样是错误摘要（只刷 session_ids 也骗不过人：摘要说的
+        # 还是原来那批会话）。删掉，让下一次读取触发重算。
+        if result["target_existed"]:
+            result["invalidated_target"] = delete_label_doc(new)
+        result["removed_old"] = delete_label_doc(old)
+        return result
+    old_doc["label"] = new
+    old_doc["renamed_from"] = old
+    if session_ids is not None:
+        sids = [str(s) for s in session_ids]
+        old_doc["session_ids"] = sids
+        old_doc["session_count"] = len(sids)
+    old_doc["updated_at"] = datetime.now().astimezone().isoformat(
+        timespec="seconds")
+    save_label_doc(old_doc)
+    result["moved"] = True
+    result["removed_old"] = delete_label_doc(old)
+    return result
+
+
 def label_session_ids(session_manager, label: str) -> list[str]:
     """该标签在 tree.json 标签根下的会话；根缺失时回退扫描 index.json。"""
     for top in session_manager.get_category_tree().get("tree") or []:
